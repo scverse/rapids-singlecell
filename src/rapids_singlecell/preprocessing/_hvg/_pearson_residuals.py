@@ -71,15 +71,22 @@ def _highly_variable_pearson_residuals(
             nnz_per_gene = cp.sum(X_batch != 0, axis=0).ravel()
         nonzero_genes = cp.array(nnz_per_gene >= 1)
         X_batch = X_batch[:, nonzero_genes]
+        # Per Lause-Berens-Kobak 2021, the clip threshold is `sqrt(N)` over the
+        # cells entering the residual computation — so per-batch when `batch_key`
+        # is set. We use a loop-local `clip_batch` so the default is recomputed
+        # each iteration; reassigning the outer `clip` parameter would freeze
+        # the first batch's value for every subsequent batch.
         if clip is None:
             n = X_batch.shape[0]
-            clip = cp.sqrt(n, dtype=dtype)
-        if clip < 0:
+            clip_batch = cp.sqrt(n, dtype=dtype)
+        else:
+            clip_batch = clip
+        if clip_batch < 0:
             raise ValueError("Pearson residuals require `clip>=0` or `clip=None`.")
 
         n_cells = X_batch.shape[0]
         n_genes = X_batch.shape[1]
-        clip_val = float(clip)
+        clip_val = float(clip_batch)
         inv_theta = 1.0 / theta
         residual_gene_var = cp.zeros(n_genes, dtype=dtype, order="C")
         stream = cp.cuda.get_current_stream().ptr

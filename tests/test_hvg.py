@@ -397,6 +397,101 @@ def test_highly_variable_genes_pearson_residuals_batch(n_top_genes, dtype):
     assert len(cudata.var) == n_genes
 
 
+def test_pearson_residuals_batch_clip_scoped_per_batch(monkeypatch):
+    """The per-batch Pearson-residual clip threshold must be ``sqrt(n_cells_in_batch)``
+    (Lause-Berens-Kobak 2021). Before the fix at
+    ``preprocessing/_hvg/_pearson_residuals.py:74-76`` the function-scoped
+    ``clip`` variable was reassigned in the first batch iteration and reused
+    for every subsequent batch — so a small batch silently inherited a large
+    batch's clip value. This test instruments the underlying CUDA bindings to
+    capture each batch's clip and asserts they differ.
+    """
+    from rapids_singlecell._cuda import _pr_cuda as _pr
+
+    rng = np.random.default_rng(0)
+    n_big, n_small, n_genes = 5000, 200, 200
+    counts = (rng.random((n_big + n_small, n_genes)) < 0.05).astype(np.int32)
+    counts *= rng.integers(1, 31, size=counts.shape, dtype=np.int32)
+    cudata = AnnData(X=cpx.scipy.sparse.csr_matrix(csr_matrix(counts.astype(np.float32))))
+    cudata.obs["batch"] = np.array(["big"] * n_big + ["small"] * n_small)
+    cudata.obs["batch"] = cudata.obs["batch"].astype("category")
+
+    captured_clips = []
+    original_csc = _pr.csc_hvg_res
+    original_dense = _pr.dense_hvg_res
+
+    def spy_csc(*args, **kwargs):
+        captured_clips.append(float(kwargs.get("clip", -1)))
+        return original_csc(*args, **kwargs)
+
+    def spy_dense(*args, **kwargs):
+        captured_clips.append(float(kwargs.get("clip", -1)))
+        return original_dense(*args, **kwargs)
+
+    monkeypatch.setattr(_pr, "csc_hvg_res", spy_csc)
+    monkeypatch.setattr(_pr, "dense_hvg_res", spy_dense)
+
+    rsc.pp.highly_variable_genes(
+        cudata,
+        flavor="pearson_residuals",
+        n_top_genes=100,
+        batch_key="batch",
+        check_values=False,
+    )
+
+    assert len(captured_clips) >= 2, (
+        f"expected >= 2 per-batch kernel calls, got {len(captured_clips)}"
+    )
+    distinct = {round(c, 1) for c in captured_clips}
+    expected_big = round(float(np.sqrt(n_big)), 1)
+    expected_small = round(float(np.sqrt(n_small)), 1)
+    assert distinct == {expected_big, expected_small}, (
+        f"expected per-batch clips {{{expected_small}, {expected_big}}}; "
+        f"got {sorted(distinct)} across calls {captured_clips}. Each batch "
+        f"must receive sqrt(n_cells_in_batch), not the first batch's value."
+    )
+
+
+def test_pearson_residuals_batch_order_invariant():
+    """Renaming batch labels A<->B on identical data must not change the HVG
+    output. Before the fix, the first batch (alphabetically) defined the clip
+    used for all subsequent batches, so the result depended silently on
+    ``np.unique`` sort order.
+    """
+    rng = np.random.default_rng(0)
+    n_big, n_small, n_genes = 5000, 200, 200
+    counts = (rng.random((n_big + n_small, n_genes)) < 0.05).astype(np.int32)
+    counts *= rng.integers(1, 31, size=counts.shape, dtype=np.int32)
+    X = csr_matrix(counts.astype(np.float32))
+
+    a1 = AnnData(X=cpx.scipy.sparse.csr_matrix(X.copy()))
+    a1.obs["batch"] = np.array(["A"] * n_big + ["B"] * n_small)
+    a1.obs["batch"] = a1.obs["batch"].astype("category")
+    rsc.pp.highly_variable_genes(
+        a1, flavor="pearson_residuals", n_top_genes=100,
+        batch_key="batch", check_values=False,
+    )
+
+    a2 = AnnData(X=cpx.scipy.sparse.csr_matrix(X.copy()))
+    a2.obs["batch"] = np.array(["B"] * n_big + ["A"] * n_small)
+    a2.obs["batch"] = a2.obs["batch"].astype("category")
+    rsc.pp.highly_variable_genes(
+        a2, flavor="pearson_residuals", n_top_genes=100,
+        batch_key="batch", check_values=False,
+    )
+
+    np.testing.assert_allclose(
+        a1.var["residual_variances"].to_numpy(),
+        a2.var["residual_variances"].to_numpy(),
+        atol=1e-5,
+        err_msg=(
+            "Swapping batch labels A<->B changed residual_variances on "
+            "identical data. The first batch's clip is leaking into later "
+            "batches via the function-scoped `clip` variable."
+        ),
+    )
+
+
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("sparse", [True, False])
 def test_poisson_gene_selection_compare_to_scvi(dtype, sparse):
