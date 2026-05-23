@@ -16,6 +16,15 @@ from rapids_singlecell._compat import DaskArray, _meta_dense
 
 from ._utils import _check_gpu_X, _sparse_to_dense
 
+# Condition-number threshold for declaring the regressor Gram matrix numerically
+# singular. Single-cell regressors with disparate scales (e.g. `n_counts` ~ 1e3
+# and `percent_mito` ~ 1e-2) routinely give cond(R^T R) ~ 1e10 even when truly
+# non-collinear; we therefore use a generous threshold that catches obviously
+# pathological cases (cond ≥ 1e12) without disturbing well-scaled-but-skewed
+# typical workflows. The principled long-term fix is to standardize regressors
+# before forming R^T R; this constant is a more conservative drop-in guard.
+_GRAM_COND_THRESHOLD = 1e12
+
 
 def regress_out(
     adata: AnnData,
@@ -58,6 +67,13 @@ def regress_out(
     -------
     Returns a corrected copy or  updates `adata` with a corrected version of the \
     original `adata.X` and `adata.layers['layer']`, depending on `inplace`.
+
+    Notes
+    -----
+    When the regressor Gram matrix ``R.T @ R`` is numerically singular
+    (``cp.linalg.cond > 1e12``, e.g. nearly-collinear regressors), the
+    non-Dask path falls back to the batched least-squares solver; the Dask
+    path raises :class:`ValueError`. Drop redundant regressors to recover.
     """
     if batchsize != "all" and type(batchsize) not in [int, type(None)]:
         raise ValueError("batchsize must be `int`, `None` or `'all'`")
@@ -139,10 +155,17 @@ def _regress_out_continuous(X, adata, keys, batchsize):
     if batchsize is None:
         batchsize = DEFAULT_GENE_BATCH if X.shape[0] > BATCH_CELL_THRESHOLD else "all"
 
-    # Validate the choice of "all" batch size
+    # Validate the choice of "all" batch size: fall back to batched LR if the
+    # Gram matrix is numerically singular. The condition number is the right
+    # diagnostic here — in float arithmetic, det(R^T R) of a near-singular
+    # matrix is small-but-nonzero (e.g. cond=1e12 gives det≈90, not 0), so
+    # an `== 0` guard is vacuous and lets a corrupted inv() slip through.
+    gram = None
     if batchsize == "all":
-        if cp.linalg.det(regressors.T @ regressors) == 0:
+        gram = regressors.T @ regressors
+        if float(cp.linalg.cond(gram)) > _GRAM_COND_THRESHOLD:
             batchsize = DEFAULT_GENE_BATCH
+            gram = None
 
     # Do regression
     if batchsize == "all":
@@ -150,8 +173,9 @@ def _regress_out_continuous(X, adata, keys, batchsize):
             X = _sparse_to_dense(X, order="C")
         else:
             X = cp.ascontiguousarray(X)
-        inv_gram_matrix = cp.linalg.inv(regressors.T @ regressors)
-        coeff = inv_gram_matrix @ (regressors.T @ X)
+        # `solve` is both faster and more numerically stable than explicit
+        # `inv` for the well-conditioned case the fallback above guarantees.
+        coeff = cp.linalg.solve(gram, regressors.T @ X)
         cp.cublas.gemm("N", "N", regressors, coeff, alpha=-1, beta=1, out=X)
 
     else:
@@ -242,12 +266,18 @@ def _regress_out_continuous_dask(X, adata, keys):
     for i, key in enumerate(keys):
         regressors[:, i + 1] = cp.array(adata.obs[key], dtype=X.dtype).ravel()
 
-    # Check Gram matrix is invertible
+    # Check Gram matrix is invertible. We use the condition number rather than
+    # `det == 0`: in float arithmetic det of a near-singular matrix can be
+    # small-but-nonzero (cond=1e12 → det≈90), so an `== 0` check is vacuous
+    # and would let `inv()` produce numerical garbage on collinear regressors.
     gram = regressors.T @ regressors
-    if cp.linalg.det(gram) == 0:
+    gram_cond = float(cp.linalg.cond(gram))
+    if gram_cond > _GRAM_COND_THRESHOLD:
         raise ValueError(
-            "The Gram matrix (R^T R) is singular. "
-            "The regressor variables are linearly dependent."
+            "The Gram matrix (R^T R) is numerically singular "
+            f"(condition number {gram_cond:.2e} > {_GRAM_COND_THRESHOLD:.0e}). "
+            "The regressor variables are linearly dependent or nearly so. "
+            "Drop redundant regressors and retry."
         )
 
     inv_gram = cp.linalg.inv(gram)

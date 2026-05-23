@@ -36,7 +36,11 @@ def test_regress_out_ordinal(dtype):
     if dtype == "float32":
         cp.testing.assert_allclose(cupy, rapids, atol=1e-5)
     else:
-        cp.testing.assert_allclose(cupy, rapids, atol=1e-7)
+        # batchsize="all" now uses `cp.linalg.solve` (more stable than the
+        # previous `inv() @ ...`); batchsize=100 uses cuML's batched SVD.
+        # The two converge to within ~3e-7 at f64 — slightly looser than the
+        # previous atol=1e-7 which compared two `inv`-based paths.
+        cp.testing.assert_allclose(cupy, rapids, atol=1e-6)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
@@ -94,6 +98,83 @@ def test_regress_out_categorical(dtype, sparse_format):
         cp.testing.assert_allclose(adata.X, cp.array(adata_sc.X), atol=1e-5)
     else:
         cp.testing.assert_allclose(adata.X, cp.array(adata_sc.X), atol=1e-7)
+
+
+def test_regress_out_near_singular_regressors_dask_raises():
+    """The Dask path doesn't have a clean batched fallback, so when the Gram
+    matrix is numerically singular it should raise ValueError with a useful
+    message (rather than silently producing garbage from an unstable ``inv``).
+    """
+    import dask.array as da
+
+    from rapids_singlecell.preprocessing._regress_out import (
+        _regress_out_continuous_dask,
+    )
+
+    rng = np.random.default_rng(0)
+    n_cells, n_genes = 5000, 20
+    X_cp = cp.asarray(rng.standard_normal((n_cells, n_genes)).astype("float32"))
+    X_dask = da.from_array(X_cp, chunks=(1000, n_genes))
+    k1 = rng.uniform(0.5, 10.0, size=n_cells).astype("float32")
+    # Tight collinearity to ensure cond > 1e12 (same shape as the dense test)
+    k2 = k1 + (1e-6 * rng.standard_normal(n_cells)).astype("float32")
+
+    # Build a minimal AnnData stand-in: only obs is used by the dask helper.
+    adata = AnnData(X=cp.asarray(X_cp))
+    adata.obs["k1"] = k1
+    adata.obs["k2"] = k2
+
+    with pytest.raises(ValueError, match="numerically singular"):
+        _regress_out_continuous_dask(X_dask, adata, ["k1", "k2"])
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_regress_out_near_singular_regressors_no_garbage(dtype):
+    """When the user passes near-collinear regressors, the Gram matrix is
+    numerically singular and ``cp.linalg.det == 0`` is a vacuous guard
+    (e.g. cond=1e12 → det≈90, not 0). Before the fix, the
+    ``batchsize="all"`` path called ``cp.linalg.inv`` on the near-singular
+    Gram and produced residuals on the order of 1e+5 (vs ~1 from the input).
+
+    The fix detects ill-conditioning via the condition number and falls back
+    to the batched SVD path. This test confirms:
+      1. No NaN / Inf in the output.
+      2. Residuals stay bounded (max |residual| ≤ some-multiple-of-input-stdev),
+         instead of exploding to 1e+5 as the bug produced.
+    """
+    rng = np.random.default_rng(0)
+    n_cells, n_genes = 5000, 50
+    X = rng.standard_normal((n_cells, n_genes)).astype(dtype)
+    k1 = rng.uniform(0.5, 10.0, size=n_cells).astype(dtype)
+    # Near-collinear with k1 — cond(R^T R) ~ 1e12, det ~ 1e2 (so `det == 0`
+    # would NOT have fired — the bug condition).
+    k2 = k1 + (1e-5 * rng.standard_normal(n_cells)).astype(dtype)
+
+    adata = AnnData(X=cp.asarray(X))
+    adata.obs["k1"] = k1
+    adata.obs["k2"] = k2
+
+    rsc.pp.regress_out(adata, keys=["k1", "k2"], batchsize="all")
+    out = cp.asnumpy(adata.X)
+
+    # Property 1: no NaN/Inf
+    assert np.isfinite(out).all(), (
+        "regress_out produced NaN/Inf on near-singular regressors — the "
+        "`det == 0` guard let an unstable `cp.linalg.inv` slip through. The "
+        "fix should detect this via `cp.linalg.cond` and fall back."
+    )
+
+    # Property 2: residuals stay in the same order as the input. The input has
+    # std ≈ 1, so residuals should be O(1). Before the fix, |residuals| reached
+    # ~1.6e+5; after the fix they're bounded by < 100x input.
+    max_abs_res = float(np.abs(out).max())
+    max_abs_in = float(np.abs(X).max())
+    assert max_abs_res < 100 * max_abs_in, (
+        f"regress_out residuals exploded: max |residual| = {max_abs_res:.2e} "
+        f"vs max |input| = {max_abs_in:.2e}. The `det == 0` guard at "
+        f"_regress_out.py was vacuous for near-singular regressors. After the "
+        f"fix this should drop dramatically (residuals stay O(input))."
+    )
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
