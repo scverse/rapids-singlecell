@@ -57,6 +57,13 @@ def _pbmc3k_normalized() -> AnnData:
     return pbmc
 
 
+def _gpu_orthogonality_error(Q: cp.ndarray, *, rows_are_vectors: bool) -> float:
+    Q64 = Q.astype(cp.float64, copy=False)
+    k = Q.shape[0] if rows_are_vectors else Q.shape[1]
+    gram = Q64 @ Q64.T if rows_are_vectors else Q64.T @ Q64
+    return float(cp.linalg.norm(gram - cp.eye(k, dtype=cp.float64)).get())
+
+
 # =============================================================================
 # Basic PCA correctness tests
 # =============================================================================
@@ -176,6 +183,104 @@ def test_sparse_solver_reproducibility(svd_solver):
         rtol=1e-10,
         atol=1e-10,
     )
+
+
+def test_lanczos_rotated_clustered_spectrum():
+    """Lanczos handles clustered singular values in a non-diagonal sparse matrix."""
+    m, n, k = 64, 48, 8
+    expected = np.asarray(
+        [10.0, 9.9995, 9.999, 9.5, 9.4995, 9.0, 8.5, 8.0],
+        dtype=np.float32,
+    )
+    all_s = np.concatenate([expected, np.asarray([0.75, 0.25], dtype=np.float32)])
+
+    indptr = [0]
+    indices = []
+    values = []
+    for block in range(len(all_s) // 2):
+        col0 = 2 * block
+        s0, s1 = all_s[2 * block], all_s[2 * block + 1]
+        theta = 0.17 + 0.11 * block
+        phi = 0.31 + 0.07 * block
+        cu, su = np.cos(theta), np.sin(theta)
+        cv, sv = np.cos(phi), np.sin(phi)
+        block_values = [
+            cu * s0 * cv + su * s1 * sv,
+            cu * s0 * sv - su * s1 * cv,
+            su * s0 * cv - cu * s1 * sv,
+            su * s0 * sv + cu * s1 * cv,
+        ]
+        indices.extend([col0, col0 + 1])
+        values.extend(block_values[:2])
+        indptr.append(len(values))
+        indices.extend([col0, col0 + 1])
+        values.extend(block_values[2:])
+        indptr.append(len(values))
+    indptr.extend([len(values)] * (m + 1 - len(indptr)))
+
+    A = cusparse.csr_matrix(
+        (
+            cp.asarray(values, dtype=cp.float32),
+            cp.asarray(indices, dtype=cp.int32),
+            cp.asarray(indptr, dtype=cp.int32),
+        ),
+        shape=(m, n),
+    )
+
+    U, S, Vt = lanczos_svd(
+        A,
+        k=k,
+        ncv=20,
+        tol=1e-5,
+        max_iter=120,
+        random_state=2027,
+    )
+
+    cp.testing.assert_allclose(S, cp.asarray(expected), atol=2e-3, rtol=0)
+    assert _gpu_orthogonality_error(U, rows_are_vectors=False) < 2e-3
+    assert _gpu_orthogonality_error(Vt, rows_are_vectors=True) < 2e-3
+    residual = cp.linalg.norm(A @ Vt.T - U * S[cp.newaxis, :]) / S[0]
+    assert float(residual.get()) < 1e-4
+
+
+@pytest.mark.parametrize("shape", [(96, 28), (24, 96)])
+def test_lanczos_rank_deficient_and_edge_shapes(shape):
+    """Lanczos handles rank-deficient, tall, and wide sparse inputs."""
+    diag = cp.zeros(min(shape), dtype=cp.float32)
+    diag[:8] = cp.asarray([12, 8, 6, 3, 1, 0, 0, 0], dtype=diag.dtype)
+    A = cusparse.diags(diag, offsets=0, shape=shape, format="csr")
+
+    U, S, Vt = lanczos_svd(
+        A,
+        k=4,
+        ncv=12,
+        tol=1e-5,
+        max_iter=80,
+        random_state=2026,
+    )
+
+    cp.testing.assert_allclose(S, diag[:4], atol=2e-3, rtol=0)
+    assert _gpu_orthogonality_error(U, rows_are_vectors=False) < 2e-3
+    assert _gpu_orthogonality_error(Vt, rows_are_vectors=True) < 2e-3
+    residual = cp.linalg.norm(A @ Vt.T - U * S[cp.newaxis, :]) / S[0]
+    assert float(residual.get()) < 1e-4
+
+
+def test_lanczos_non_convergence_raises():
+    """Lanczos reports non-convergence instead of returning partial vectors."""
+    diag = cp.zeros(40, dtype=cp.float32)
+    diag[:6] = cp.asarray([10, 9, 8, 7, 6, 5], dtype=diag.dtype)
+    A = cusparse.diags(diag, offsets=0, shape=(64, 40), format="csr")
+
+    with pytest.raises(RuntimeError, match="failed to converge"):
+        lanczos_svd(
+            A,
+            k=4,
+            ncv=6,
+            tol=0,
+            max_iter=1,
+            random_state=2026,
+        )
 
 
 # =============================================================================

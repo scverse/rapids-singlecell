@@ -176,8 +176,9 @@ def lanczos_svd(
     """
     Compute the largest k singular values and vectors for a sparse matrix.
 
-    This function uses Lanczos bidiagonalization with implicit restarts
-    optimized for GPU execution with CuPy.
+    This function uses Lanczos bidiagonalization with implicit restarts,
+    Ritz-vector locking, full CGS2 reorthogonalization, and optional final
+    ``A @ V`` refinement. It is optimized for GPU execution with CuPy.
 
     Parameters
     ----------
@@ -187,8 +188,8 @@ def lanczos_svd(
     k
         Number of singular values and vectors to compute.
     ncv
-        Number of Lanczos vectors generated. Must be greater than k.
-        Default is min(max(3*k, 50), min(m,n)).
+        Number of Lanczos vectors generated. Must be at least k after
+        clamping. If None, a matrix-shape dependent default is selected.
     tol
         Tolerance for convergence.
     max_iter
@@ -209,22 +210,37 @@ def lanczos_svd(
     """
     m, n = A.shape
     dtype = A.dtype
+    min_dim = min(m, n)
+
+    if k <= 0 or k >= min_dim:
+        msg = f"k must satisfy 1 <= k < min(A.shape), got k={k}, shape={A.shape}"
+        raise ValueError(msg)
+    if tol < 0:
+        msg = f"tol must be non-negative, got {tol}"
+        raise ValueError(msg)
+    if max_iter <= 0:
+        msg = f"max_iter must be positive, got {max_iter}"
+        raise ValueError(msg)
 
     if ncv is None:
-        # Balance between restart cost and per-iteration cost
-        # Larger ncv = fewer restarts but more orthogonalization work per iteration
+        # Balance restart count against orthogonalization and memory cost.
+        # The large-matrix defaults mirror the RAFT production path: small k
+        # gets enough room for stable locking without overpaying in SpMV work;
+        # larger k needs a wider subspace to avoid excessive restarts.
         if m > 100000:
-            # For large matrices with mean-centering (PCA use case):
-            # - Small k (k<75): ~2.5*k works well
-            # - Larger k: need ~3.9*k to minimize restarts (empirically tuned)
             if k < 75:
-                ncv = min(int(2.5 * k), min(m, n))
+                ncv = (22 * k + 9) // 10
             else:
-                ncv = min(int(3.9 * k), min(m, n))
+                ncv = int(3.9 * k)
         else:
-            ncv = min(max(3 * k, 50), min(m, n))
+            ncv = max(3 * k, 50)
 
-    ncv = max(ncv, k + 10)
+    ncv = int(ncv)
+    ncv = max(ncv, k)
+    ncv = min(ncv, min_dim - 1)
+    if ncv < k:
+        msg = "ncv must be at least k after clamping"
+        raise ValueError(msg)
 
     rng = cp.random.RandomState(random_state if random_state is not None else 0)
 
@@ -240,9 +256,13 @@ def lanczos_svd(
     v_start = rng.standard_normal(n).astype(dtype)
 
     while n_locked < k and total_iter < max_iter:
+        active_ncv = min(ncv, min_dim - n_locked - 1)
+        if active_ncv <= 0:
+            break
+
         alphas, betas = _lanczos_bidiag(
             A,
-            ncv=ncv,
+            ncv=active_ncv,
             v_start=v_start,
             U_full=U_full,
             V_full=V_full,
@@ -252,9 +272,9 @@ def lanczos_svd(
         )
 
         # SVD of Bidiagonal Matrix
-        B = cp.zeros((ncv, ncv), dtype=dtype)
+        B = cp.zeros((active_ncv, active_ncv), dtype=dtype)
         cp.fill_diagonal(B, alphas)
-        cp.fill_diagonal(B[:-1, 1:], betas[1:ncv])
+        cp.fill_diagonal(B[:-1, 1:], betas[1:active_ncv])
 
         p, s, qt = cp.linalg.svd(B)
 
@@ -265,11 +285,11 @@ def lanczos_svd(
         qt = qt[idx, :]
 
         # Error estimates
-        resid = betas[ncv] * cp.abs(p[ncv - 1, :])
+        resid = betas[active_ncv] * cp.abs(p[active_ncv - 1, :])
         max_s = s[0] if s.shape[0] > 0 else 1.0
 
         converged_indices = []
-        for i in range(min(k - n_locked + 2, ncv)):
+        for i in range(min(k - n_locked + 2, active_ncv)):
             if resid[i] < tol * max_s:
                 converged_indices.append(i)
 
@@ -282,8 +302,11 @@ def lanczos_svd(
             good_idx = cp.array(converged_indices)
 
             # Compute Ritz vectors
-            u_ritz = cp.dot(U_full[:, n_locked : n_locked + ncv], p[:, good_idx])
-            v_ritz = cp.dot(qt[good_idx, :], V_full[:, n_locked : n_locked + ncv].T).T
+            u_ritz = cp.dot(U_full[:, n_locked : n_locked + active_ncv], p[:, good_idx])
+            v_ritz = cp.dot(
+                qt[good_idx, :],
+                V_full[:, n_locked : n_locked + active_ncv].T,
+            ).T
 
             # Store locked vectors
             start = n_locked
@@ -299,21 +322,31 @@ def lanczos_svd(
 
             # Restart from best non-converged
             best_nc = 0
-            for i in range(ncv):
+            for i in range(active_ncv):
                 if i not in converged_indices:
                     best_nc = i
                     break
 
-            v_start = cp.dot(V_full[:, n_locked : n_locked + ncv], qt[best_nc, :].T)
+            v_start = cp.dot(
+                V_full[:, n_locked : n_locked + active_ncv],
+                qt[best_nc, :].T,
+            )
         else:
             # Thick restart
-            k_mix = min(k - n_locked, ncv)
+            k_mix = min(k - n_locked, active_ncv)
             weights = cp.ones(k_mix, dtype=dtype)
             combo_small = cp.dot(qt[:k_mix, :].T, weights)
-            v_start = cp.dot(V_full[:, n_locked : n_locked + ncv], combo_small)
+            v_start = cp.dot(
+                V_full[:, n_locked : n_locked + active_ncv],
+                combo_small,
+            )
 
         v_start /= cp.linalg.norm(v_start)
         total_iter += 1
+
+    if n_locked < k:
+        msg = "lanczos_svd failed to converge all requested components within max_iter"
+        raise RuntimeError(msg)
 
     # Final extraction
     final_U = U_full[:, :k].copy()
