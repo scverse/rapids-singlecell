@@ -16,6 +16,10 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 _LOG_2PI = float(np.log(2.0 * np.pi))
+_PACKED_READOUT_MAX_GUIDES = 32
+_PACKED_READOUT_MIN_ASSIGNABLE_CELLS = 250_000
+_GROUPED_READOUT_MAX_GUIDES = 128
+_SUBSET_READOUT_MAX_ASSIGNABLE_FRACTION = 0.25
 
 
 class GuideAssignment:
@@ -132,7 +136,7 @@ class GuideAssignment:
         max_iter: int = 90,
         tol: float = 1e-4,
         posterior_threshold: float = 0.645,
-        backend: str = "cupy",
+        backend: str = "auto",
     ) -> np.ndarray | None:
         """Assign gRNAs using a GPU-accelerated Poisson–Gaussian mixture model.
 
@@ -169,10 +173,11 @@ class GuideAssignment:
             Minimum posterior probability of the Gaussian component required
             for a raw UMI count to define the assignment threshold.
         backend
-            Backend for fitting and assignment. ``"cupy"`` uses the existing
-            CuPy EM and threshold implementation, ``"cuda"`` uses the
-            nanobind/CUDA EM + threshold kernel, and ``"auto"`` tries CUDA
-            with a CuPy fallback.
+            Backend for fitting and assignment. ``"auto"`` tries the
+            nanobind/CUDA EM + threshold kernel and falls back to the CuPy
+            implementation if the extension is unavailable. ``"cuda"``
+            requires the CUDA extension, and ``"cupy"`` uses the temporary
+            CuPy reference path.
 
         Returns
         -------
@@ -229,6 +234,22 @@ class GuideAssignment:
                     posterior_threshold=posterior_threshold,
                 )
 
+        for col in [
+            "poisson_rate",
+            "gaussian_mean",
+            "gaussian_std",
+            "mix_probs_0",
+            "mix_probs_1",
+            "threshold",
+            "weight_Poisson",
+            "weight_Normal",
+            "lambda",
+            "mu",
+            "scale",
+        ]:
+            if col not in adata.var.columns:
+                adata.var[col] = np.nan
+
         if len(valid_guides) == 0:
             warnings.warn(
                 "No guides have enough expressing cells for mixture model fitting.",
@@ -250,22 +271,6 @@ class GuideAssignment:
         sigma_cpu = cp.asnumpy(sigma.ravel())
         pi0_cpu = cp.asnumpy(pi0.ravel())
 
-        for col in [
-            "poisson_rate",
-            "gaussian_mean",
-            "gaussian_std",
-            "mix_probs_0",
-            "mix_probs_1",
-            "threshold",
-            "weight_Poisson",
-            "weight_Normal",
-            "lambda",
-            "mu",
-            "scale",
-        ]:
-            if col not in adata.var.columns:
-                adata.var[col] = np.nan
-
         thresholds_cpu = cp.asnumpy(thresholds.ravel())
         for i, g in enumerate(valid_guides):
             adata.var.iloc[g, adata.var.columns.get_loc("poisson_rate")] = lam_cpu[i]
@@ -286,31 +291,156 @@ class GuideAssignment:
             adata.var.iloc[g, adata.var.columns.get_loc("mu")] = mu_cpu[i]
             adata.var.iloc[g, adata.var.columns.get_loc("scale")] = sigma_cpu[i]
 
-        # Map assignments back to (n_cells, n_guides) result
-        assignments_cpu = cp.asnumpy(assignments)  # (n_valid_guides, n_cells)
-
-        result = pd.DataFrame(data=False, index=adata.obs_names, columns=var_names)
-        for i, g in enumerate(valid_guides):
-            result.iloc[:, g] = assignments_cpu[i]
-
-        # Build final assignment series
-        series = pd.Series(no_grna_assigned_key, index=adata.obs_names)
-        num_assigned = result.sum(axis=1)
-        multi_mask = (num_assigned > 0) & (num_assigned <= max_assignments_per_cell)
-        if multi_mask.any():
-            series.loc[multi_mask] = result.loc[multi_mask].apply(
-                lambda row: multiple_grna_assignment_string.join(
-                    row.index[row].tolist()
-                ),
-                axis=1,
-            )
-        series.loc[num_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
+        valid_var_names = var_names[np.asarray(valid_guides, dtype=np.intp)]
+        series_values = _assignments_to_labels(
+            assignments,
+            valid_var_names,
+            max_assignments_per_cell=max_assignments_per_cell,
+            no_grna_assigned_key=no_grna_assigned_key,
+            multiple_grna_assigned_key=multiple_grna_assigned_key,
+            multiple_grna_assignment_string=multiple_grna_assignment_string,
+        )
 
         if only_return_results:
-            return series.values
+            return series_values
 
-        adata.obs[assigned_guides_key] = series.values
+        adata.obs[assigned_guides_key] = series_values
         return None
+
+
+def _assignments_to_labels(
+    assignments: cp.ndarray | np.ndarray,
+    guide_names: np.ndarray,
+    *,
+    max_assignments_per_cell: int,
+    no_grna_assigned_key: str,
+    multiple_grna_assigned_key: str,
+    multiple_grna_assignment_string: str,
+) -> np.ndarray:
+    """Convert guide-by-cell assignments to pertpy-style cell labels.
+
+    The dispatcher keeps all label creation in one place:
+    high-guide GPU count gating, packed small-guide patterns, grouped
+    medium-guide readout, and the exact fallback.
+    """
+    n_guides, n_cells = assignments.shape
+
+    if isinstance(assignments, cp.ndarray) and n_guides > _GROUPED_READOUT_MAX_GUIDES:
+        num_guides_assigned_gpu = assignments.sum(axis=0)
+        assignable_gpu = (num_guides_assigned_gpu > 0) & (
+            num_guides_assigned_gpu <= max_assignments_per_cell
+        )
+        assignable_count_gpu = cp.count_nonzero(assignable_gpu)
+        assignable_count = int(assignable_count_gpu.item())
+
+        negative_count = int(cp.count_nonzero(num_guides_assigned_gpu == 0).item())
+        if assignable_count == 0:
+            if negative_count == 0:
+                return np.full(n_cells, multiple_grna_assigned_key, dtype=object)
+            if negative_count == n_cells:
+                return np.full(n_cells, no_grna_assigned_key, dtype=object)
+
+            num_guides_assigned = cp.asnumpy(num_guides_assigned_gpu)
+            labels = np.empty(n_cells, dtype=object)
+            labels[num_guides_assigned == 0] = no_grna_assigned_key
+            labels[num_guides_assigned > max_assignments_per_cell] = (
+                multiple_grna_assigned_key
+            )
+            return labels
+
+        assignable_fraction = assignable_count / n_cells
+        if assignable_fraction <= _SUBSET_READOUT_MAX_ASSIGNABLE_FRACTION:
+            assignable_idx_gpu = cp.flatnonzero(assignable_gpu)
+            assignable_idx = cp.asnumpy(assignable_idx_gpu)
+            subset_assignments = cp.asnumpy(assignments[:, assignable_idx_gpu])
+
+            num_guides_assigned = cp.asnumpy(num_guides_assigned_gpu)
+            labels = np.empty(n_cells, dtype=object)
+            labels[num_guides_assigned == 0] = no_grna_assigned_key
+            labels[num_guides_assigned > max_assignments_per_cell] = (
+                multiple_grna_assigned_key
+            )
+            labels[assignable_idx] = _assignments_to_labels(
+                subset_assignments,
+                guide_names,
+                no_grna_assigned_key=no_grna_assigned_key,
+                max_assignments_per_cell=max_assignments_per_cell,
+                multiple_grna_assigned_key=multiple_grna_assigned_key,
+                multiple_grna_assignment_string=multiple_grna_assignment_string,
+            )
+            return labels
+
+    if isinstance(assignments, cp.ndarray):
+        assignments = cp.asnumpy(assignments)
+
+    num_guides_assigned = assignments.sum(axis=0)
+
+    assignable = (num_guides_assigned > 0) & (
+        num_guides_assigned <= max_assignments_per_cell
+    )
+    assignable_count = int(assignable.sum())
+    if (
+        guide_names.size <= _PACKED_READOUT_MAX_GUIDES
+        and assignable_count >= _PACKED_READOUT_MIN_ASSIGNABLE_CELLS
+    ):
+        labels = np.empty(n_cells, dtype=object)
+        labels[num_guides_assigned == 0] = no_grna_assigned_key
+        labels[(num_guides_assigned > 0) & ~assignable] = multiple_grna_assigned_key
+
+        packed = np.packbits(assignments[:, assignable].T, axis=1, bitorder="little")
+        padded = np.zeros(
+            (packed.shape[0], np.dtype(np.uint64).itemsize), dtype=np.uint8
+        )
+        padded[:, : packed.shape[1]] = packed
+        codes = padded.view(np.uint64).ravel()
+
+        unique_codes, inverse = np.unique(codes, return_inverse=True)
+        unique_labels = np.empty(unique_codes.size, dtype=object)
+        guide_bits = np.arange(guide_names.size, dtype=np.uint64)
+        one = np.uint64(1)
+        for i, code in enumerate(unique_codes):
+            selected = ((code >> guide_bits) & one).astype(bool)
+            unique_labels[i] = multiple_grna_assignment_string.join(
+                guide_names[selected].tolist()
+            )
+
+        labels[assignable] = unique_labels[inverse]
+        return labels
+
+    labels = np.empty(n_cells, dtype=object)
+    labels[num_guides_assigned == 0] = no_grna_assigned_key
+
+    single_assignment = num_guides_assigned == 1
+    if single_assignment.any():
+        labels[single_assignment] = guide_names[
+            np.argmax(assignments[:, single_assignment], axis=0)
+        ]
+
+    multi_assignment = assignable & (num_guides_assigned > 1)
+    if guide_names.size <= _GROUPED_READOUT_MAX_GUIDES:
+        max_join_count = min(max_assignments_per_cell, guide_names.size)
+        for n_assigned in range(2, max_join_count + 1):
+            cell_indices = np.flatnonzero(num_guides_assigned == n_assigned)
+            if cell_indices.size == 0:
+                continue
+            _rows, guide_indices = np.nonzero(assignments[:, cell_indices].T)
+            guide_indices = guide_indices.reshape(cell_indices.size, n_assigned)
+            labels[cell_indices] = [
+                multiple_grna_assignment_string.join(guide_names[row].tolist())
+                for row in guide_indices
+            ]
+        labels[num_guides_assigned > max_assignments_per_cell] = (
+            multiple_grna_assigned_key
+        )
+        return labels
+
+    for cell_idx in np.flatnonzero(multi_assignment):
+        labels[cell_idx] = multiple_grna_assignment_string.join(
+            guide_names[assignments[:, cell_idx]].tolist()
+        )
+
+    labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
+    return labels
 
 
 def _prepare_batched_data(
