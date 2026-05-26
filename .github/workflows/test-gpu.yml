@@ -68,6 +68,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
     env:
@@ -130,6 +131,7 @@ jobs:
     continue-on-error: true  # Prerelease failures don't fail the workflow
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
     env:
