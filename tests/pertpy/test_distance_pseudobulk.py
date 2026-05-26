@@ -394,7 +394,7 @@ def test_pseudobulk_pearson_constant_mean_group_yields_nan() -> None:
 
 @pytest.mark.parametrize("metric", PSEUDOBULK_METRICS)
 def test_pseudobulk_single_group(metric: str) -> None:
-    """K=1 pairwise returns a 1×1 zero matrix; onesided returns a scalar zero."""
+    """K=1 pairwise returns a 1x1 zero matrix; onesided returns a scalar zero."""
     rng = np.random.default_rng(0)
     X = rng.normal(size=(10, 5)).astype(np.float32)
     adata = _make_adata(X, [10])
