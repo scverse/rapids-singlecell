@@ -144,7 +144,7 @@ class GuideAssignment:
         only_return_results: bool = False,
         max_iter: int = 90,
         tol: float = 1e-4,
-        posterior_threshold: float = 0.645,
+        posterior_threshold: float = 0.5,
     ) -> np.ndarray | None:
         """Assign gRNAs using a GPU-accelerated Poisson–Gaussian mixture model.
 
@@ -152,10 +152,8 @@ class GuideAssignment:
         to the log₂-transformed non-zero counts of each guide simultaneously
         using batched Expectation-Maximization on GPU. Like crispat's
         Poisson-Gaussian assignment, the fitted model is converted to an
-        integer raw-count threshold. The default posterior cutoff is slightly
-        conservative to calibrate the GPU EM approximation against crispat's
-        Pyro SVI outputs; set ``posterior_threshold=0.5`` for the literal
-        crispat threshold rule.
+        integer raw-count threshold. The default posterior cutoff matches
+        pertpy's crispat-style threshold rule.
 
         Parameters
         ----------
