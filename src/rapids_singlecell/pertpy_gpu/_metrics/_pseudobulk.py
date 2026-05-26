@@ -8,10 +8,11 @@ from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
 
 from rapids_singlecell.get import X_to_GPU, aggregate
+from rapids_singlecell.preprocessing._utils import _get_mean_var
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 from ._base_metric import BaseMetric
-from ._kernels._pseudobulk import (
+from ._utils._pseudobulk import (
     paired_abs_mean,
     paired_squared,
     pairwise_abs_mean,
@@ -22,9 +23,22 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import numpy as np
+    from scipy.sparse import csc_matrix as csc_matrix_cpu
+    from scipy.sparse import csr_matrix as csr_matrix_cpu
+
+    _MatrixLike = (
+        np.ndarray
+        | cp.ndarray
+        | csr_matrix_cpu
+        | csc_matrix_cpu
+        | cp_sparse.csr_matrix
+        | cp_sparse.csc_matrix
+    )
+    _GPUMatrixLike = cp.ndarray | cp_sparse.csr_matrix | cp_sparse.csc_matrix
 
 
-def _as_gpu_data(data):
+def _as_gpu_data(data: pd.DataFrame | _MatrixLike) -> _GPUMatrixLike:
+    """Unwrap pandas DataFrames before delegating to :func:`X_to_GPU`."""
     if isinstance(data, pd.DataFrame):
         data = data.to_numpy()
     return X_to_GPU(data)
@@ -118,13 +132,12 @@ class PseudobulkMetric(BaseMetric):
 
     def _array_mean(self, X) -> cp.ndarray:
         X_gpu = _as_gpu_data(X)
-        if cp_sparse.issparse(X_gpu):
-            X_gpu = X_gpu.toarray()
         if X_gpu.ndim != 2:
             raise ValueError("Input arrays must be two-dimensional.")
-        if len(X_gpu) == 0:
+        if X_gpu.shape[0] == 0:
             raise ValueError("Neither X nor Y can be empty.")
-        return cp.mean(X_gpu, axis=0, keepdims=True, dtype=cp.float64)
+        mean, _ = _get_mean_var(X_gpu, axis=0)
+        return mean.reshape(1, -1)
 
     def _distance_between_means(
         self,

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import cupy as cp
 
 from rapids_singlecell._cuda import _pseudobulk_cuda as _pb
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 
 def _to_f64_contig(X: cp.ndarray) -> cp.ndarray:
     return cp.ascontiguousarray(X.astype(cp.float64, copy=False))
-
-
-def _stream_ptr() -> int:
-    return cp.cuda.get_current_stream().ptr
 
 
 def _check_paired(X: cp.ndarray, Y: cp.ndarray) -> None:
@@ -36,7 +37,9 @@ def _check_pairwise(X: cp.ndarray, Y: cp.ndarray) -> None:
         )
 
 
-def paired_squared(X: cp.ndarray, Y: cp.ndarray) -> cp.ndarray:
+def _paired_impl(
+    X: cp.ndarray, Y: cp.ndarray, kernel: Callable[..., None]
+) -> cp.ndarray:
     _check_paired(X, Y)
     X = _to_f64_contig(X)
     Y = _to_f64_contig(Y)
@@ -44,73 +47,51 @@ def paired_squared(X: cp.ndarray, Y: cp.ndarray) -> cp.ndarray:
     out = cp.empty(n_pairs, dtype=cp.float64)
     if out.size == 0:
         return out
-    _pb.paired_squared(
+    kernel(
         X,
         Y,
         out=out,
         n_pairs=int(n_pairs),
         n_features=int(n_features),
-        stream=_stream_ptr(),
+        stream=cp.cuda.get_current_stream().ptr,
     )
     return out
+
+
+def _pairwise_impl(
+    X: cp.ndarray, Y: cp.ndarray, kernel: Callable[..., None]
+) -> cp.ndarray:
+    _check_pairwise(X, Y)
+    X = _to_f64_contig(X)
+    Y = _to_f64_contig(Y)
+    n_x, n_features = X.shape
+    n_y = Y.shape[0]
+    out = cp.empty((n_x, n_y), dtype=cp.float64)
+    if out.size == 0:
+        return out
+    kernel(
+        X,
+        Y,
+        out=out,
+        n_x=int(n_x),
+        n_y=int(n_y),
+        n_features=int(n_features),
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    return out
+
+
+def paired_squared(X: cp.ndarray, Y: cp.ndarray) -> cp.ndarray:
+    return _paired_impl(X, Y, _pb.paired_squared)
 
 
 def paired_abs_mean(X: cp.ndarray, Y: cp.ndarray) -> cp.ndarray:
-    _check_paired(X, Y)
-    X = _to_f64_contig(X)
-    Y = _to_f64_contig(Y)
-    n_pairs, n_features = X.shape
-    out = cp.empty(n_pairs, dtype=cp.float64)
-    if out.size == 0:
-        return out
-    _pb.paired_abs_mean(
-        X,
-        Y,
-        out=out,
-        n_pairs=int(n_pairs),
-        n_features=int(n_features),
-        stream=_stream_ptr(),
-    )
-    return out
+    return _paired_impl(X, Y, _pb.paired_abs_mean)
 
 
 def pairwise_squared(X: cp.ndarray, Y: cp.ndarray) -> cp.ndarray:
-    _check_pairwise(X, Y)
-    X = _to_f64_contig(X)
-    Y = _to_f64_contig(Y)
-    n_x, n_features = X.shape
-    n_y = Y.shape[0]
-    out = cp.empty((n_x, n_y), dtype=cp.float64)
-    if out.size == 0:
-        return out
-    _pb.pairwise_squared(
-        X,
-        Y,
-        out=out,
-        n_x=int(n_x),
-        n_y=int(n_y),
-        n_features=int(n_features),
-        stream=_stream_ptr(),
-    )
-    return out
+    return _pairwise_impl(X, Y, _pb.pairwise_squared)
 
 
 def pairwise_abs_mean(X: cp.ndarray, Y: cp.ndarray) -> cp.ndarray:
-    _check_pairwise(X, Y)
-    X = _to_f64_contig(X)
-    Y = _to_f64_contig(Y)
-    n_x, n_features = X.shape
-    n_y = Y.shape[0]
-    out = cp.empty((n_x, n_y), dtype=cp.float64)
-    if out.size == 0:
-        return out
-    _pb.pairwise_abs_mean(
-        X,
-        Y,
-        out=out,
-        n_x=int(n_x),
-        n_y=int(n_y),
-        n_features=int(n_features),
-        stream=_stream_ptr(),
-    )
-    return out
+    return _pairwise_impl(X, Y, _pb.pairwise_abs_mean)

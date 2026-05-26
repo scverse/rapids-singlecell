@@ -267,7 +267,7 @@ _KERNEL_FEATURE_SIZES = [1, 3, 8, 17, 64, 257]
 @pytest.mark.parametrize("n_features", _KERNEL_FEATURE_SIZES)
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 def test_paired_squared_kernel_matches_cupy(n_features: int, dtype) -> None:
-    from rapids_singlecell.pertpy_gpu._metrics._kernels._pseudobulk import (
+    from rapids_singlecell.pertpy_gpu._metrics._utils._pseudobulk import (
         paired_squared,
     )
 
@@ -281,7 +281,7 @@ def test_paired_squared_kernel_matches_cupy(n_features: int, dtype) -> None:
 @pytest.mark.parametrize("n_features", _KERNEL_FEATURE_SIZES)
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 def test_pairwise_squared_kernel_matches_cupy(n_features: int, dtype) -> None:
-    from rapids_singlecell.pertpy_gpu._metrics._kernels._pseudobulk import (
+    from rapids_singlecell.pertpy_gpu._metrics._utils._pseudobulk import (
         pairwise_squared,
     )
 
@@ -295,7 +295,7 @@ def test_pairwise_squared_kernel_matches_cupy(n_features: int, dtype) -> None:
 @pytest.mark.parametrize("n_features", _KERNEL_FEATURE_SIZES)
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 def test_paired_abs_mean_kernel_matches_cupy(n_features: int, dtype) -> None:
-    from rapids_singlecell.pertpy_gpu._metrics._kernels._pseudobulk import (
+    from rapids_singlecell.pertpy_gpu._metrics._utils._pseudobulk import (
         paired_abs_mean,
     )
 
@@ -309,7 +309,7 @@ def test_paired_abs_mean_kernel_matches_cupy(n_features: int, dtype) -> None:
 @pytest.mark.parametrize("n_features", _KERNEL_FEATURE_SIZES)
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 def test_pairwise_abs_mean_kernel_matches_cupy(n_features: int, dtype) -> None:
-    from rapids_singlecell.pertpy_gpu._metrics._kernels._pseudobulk import (
+    from rapids_singlecell.pertpy_gpu._metrics._utils._pseudobulk import (
         pairwise_abs_mean,
     )
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdint>
 
 static constexpr int WARP_SIZE = 32;
@@ -13,10 +14,14 @@ __device__ __forceinline__ double pseudobulk_elem(double x, double y) {
     if constexpr (Op == PseudobulkOp::Squared) {
         return diff * diff;
     } else {
-        return diff >= 0.0 ? diff : -diff;
+        return fabs(diff);
     }
 }
 
+// Post-reduction step applied to the summed pseudobulk_elem<Op> over features.
+//   Squared -> identity: callers consume the raw sum (Euclidean takes sqrt; MSE
+//   divides by n). AbsMean -> divide by n_features to produce the mean absolute
+//   difference (MAE).
 template <PseudobulkOp Op>
 __device__ __forceinline__ double pseudobulk_finalize(double acc,
                                                       int64_t n_features) {
