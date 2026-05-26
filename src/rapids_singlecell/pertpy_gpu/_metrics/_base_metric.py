@@ -7,6 +7,7 @@ import cupy as cp
 import numpy as np
 
 from rapids_singlecell._utils import parse_device_ids
+from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -68,6 +69,62 @@ class BaseMetric(ABC):
         if isinstance(data, (cp.ndarray, np.ndarray)):
             return data
         return np.asarray(data)
+
+    @staticmethod
+    def _parse_contrasts(adata: AnnData, contrasts) -> tuple[str, list[str]]:
+        """Validate a contrasts DataFrame and decompose its columns.
+
+        Returns ``(groupby, split_by)`` per the layout enforced by
+        :meth:`Distance.validate_contrasts` — first column is the groupby,
+        ``"reference"`` is reserved, and every remaining column is a
+        stratification filter.
+        """
+        from rapids_singlecell.pertpy_gpu._distance import Distance
+
+        Distance.validate_contrasts(adata, contrasts)
+        groupby = contrasts.columns[0]
+        split_by = [c for c in contrasts.columns if c not in (groupby, "reference")]
+        return groupby, split_by
+
+    def _resolve_onesided_inputs(
+        self,
+        adata: AnnData,
+        groupby: str,
+        selected_group: str | Sequence[str],
+        groups: Sequence[str] | None,
+    ) -> tuple[list[str], bool, list[str] | None]:
+        """Validate `selected_group`, normalize to a list, compute `needed` groups.
+
+        Asserts that ``groupby`` is categorical and that every entry in
+        ``selected_group`` is one of its categories.
+
+        Returns
+        -------
+        selected_groups
+            ``selected_group`` normalized to ``list[str]``.
+        single_control
+            ``True`` if ``selected_group`` was a single string (caller uses
+            this to decide whether to return a Series or a DataFrame).
+        needed
+            Union of ``groups`` and ``selected_groups`` when ``groups`` was
+            given; ``None`` otherwise (= use all categories).
+        """
+        _assert_categorical_obs(adata, key=groupby)
+
+        single_control = isinstance(selected_group, str)
+        selected_groups = [selected_group] if single_control else list(selected_group)
+
+        missing = set(selected_groups) - set(adata.obs[groupby].cat.categories.values)
+        if missing:
+            raise ValueError(
+                f"Selected groups {missing} not found in groupby '{groupby}'"
+            )
+
+        needed = None
+        if groups is not None:
+            needed = list(set(groups) | set(selected_groups))
+
+        return selected_groups, single_control, needed
 
     @abstractmethod
     def pairwise(

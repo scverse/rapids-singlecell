@@ -27,6 +27,8 @@
 
         ~Distance.pairwise
         ~Distance.onesided_distances
+        ~Distance.contrast_distances
+        ~Distance.create_contrasts
         ~Distance.bootstrap
 
     .. automethod:: __call__
@@ -34,6 +36,10 @@
     .. automethod:: pairwise
         :no-index:
     .. automethod:: onesided_distances
+        :no-index:
+    .. automethod:: contrast_distances
+        :no-index:
+    .. automethod:: create_contrasts
         :no-index:
     .. automethod:: bootstrap
         :no-index:
