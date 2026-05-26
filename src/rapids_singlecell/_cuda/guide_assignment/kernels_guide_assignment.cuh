@@ -72,6 +72,15 @@ __device__ inline float normal_log_prob(float value, float mu, float sigma) {
     return -0.5f * z * z - logf(sigma) - 0.5f * log_2pi;
 }
 
+template <bool F_ORDER>
+__device__ inline float load_guide_count(const float* __restrict__ X, int cell,
+                                         int guide, int n_cells, int n_guides) {
+    long long idx = F_ORDER ? static_cast<long long>(guide) * n_cells + cell
+                            : static_cast<long long>(cell) * n_guides + guide;
+    return X[idx];
+}
+
+template <bool F_ORDER>
 __global__ void assign_threshold_dense_kernel(
     const float* __restrict__ X, const int* __restrict__ valid_guides,
     const float* __restrict__ lam, const float* __restrict__ mu,
@@ -87,7 +96,8 @@ __global__ void assign_threshold_dense_kernel(
 
     int local_max = 0;
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-        float count = X[cell * n_guides + guide];
+        float count =
+            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
         int count_int = static_cast<int>(ceilf(count));
         local_max = max(local_max, count_int);
     }
@@ -122,12 +132,14 @@ __global__ void assign_threshold_dense_kernel(
 
     bool has_threshold = !isnan(guide_threshold);
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-        float count = X[cell * n_guides + guide];
+        float count =
+            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
         assignments[valid_idx * n_cells + cell] =
             has_threshold && count >= guide_threshold;
     }
 }
 
+template <bool F_ORDER>
 __global__ void fit_assign_dense_kernel(
     const float* __restrict__ X, bool* __restrict__ assignments,
     float* __restrict__ thresholds, float* __restrict__ lam_out,
@@ -156,11 +168,9 @@ __global__ void fit_assign_dense_kernel(
     int local_nz = 0;
     int local_max_raw = 0;
 
-    // TODO: Template this kernel on C/F layout. One block scans one guide, so
-    // F-order input would make the cell loop contiguous instead of strided by
-    // n_guides.
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-        float count = X[cell * n_guides + guide];
+        float count =
+            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
         if (count > 0.0f) {
             float log_count = log2f(count);
             local_sum += log_count;
@@ -208,7 +218,8 @@ __global__ void fit_assign_dense_kernel(
     __syncthreads();
 
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-        float count = X[cell * n_guides + guide];
+        float count =
+            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
         if (count > 0.0f) {
             int bin = min(max(static_cast<int>(ceilf(count)), 1), HIST_BINS);
             atomicAdd(&count_hist[bin], 1);
@@ -248,7 +259,8 @@ __global__ void fit_assign_dense_kernel(
         float safe_pi1 = 1.0f - safe_pi0;
 
         for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-            float count = X[cell * n_guides + guide];
+            float count =
+                load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
             if (count <= 0.0f) continue;
 
             float y = log2f(count);
@@ -344,7 +356,8 @@ __global__ void fit_assign_dense_kernel(
 
     bool has_threshold = !isnan(guide_threshold);
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-        float count = X[cell * n_guides + guide];
+        float count =
+            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
         assignments[guide * n_cells + cell] =
             has_threshold && count >= guide_threshold;
     }

@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from anndata import AnnData
+from cupyx.scipy.sparse import csc_matrix as gpu_csc
 from cupyx.scipy.sparse import csr_matrix as gpu_csr
 
 import rapids_singlecell as rsc
@@ -83,6 +84,21 @@ def test_assign_by_threshold_sparse(guide_adata_sparse: AnnData) -> None:
         X = X.get()
 
     expected = (X >= 5).astype(np.int8)
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_assign_by_threshold_sparse_csc(guide_adata: AnnData) -> None:
+    adata = guide_adata.copy()
+    adata.X = gpu_csc(adata.X)
+
+    ga = rsc.ptg.GuideAssignment()
+    ga.assign_by_threshold(adata, assignment_threshold=5)
+
+    result = adata.layers["assigned_guides"]
+    assert isinstance(result, gpu_csc)
+
+    result = result.toarray().get()
+    expected = (adata.X.toarray().get() >= 5).astype(np.int8)
     np.testing.assert_array_equal(result, expected)
 
 
@@ -237,6 +253,19 @@ def test_mixture_model_stores_params(guide_adata: AnnData) -> None:
     assert guide_adata.var["threshold"].dropna().ge(1).all()
 
 
+def test_mixture_model_overwrites_existing_var_columns(guide_adata: AnnData) -> None:
+    guide_adata.var["threshold"] = pd.Categorical(["old"] * guide_adata.n_vars)
+    guide_adata.var["lambda"] = "old"
+
+    ga = rsc.ptg.GuideAssignment()
+    ga.assign_mixture_model(guide_adata)
+
+    assert pd.api.types.is_float_dtype(guide_adata.var["threshold"])
+    assert pd.api.types.is_float_dtype(guide_adata.var["lambda"])
+    assert guide_adata.var["threshold"].dropna().ge(1).all()
+    assert np.isfinite(guide_adata.var["lambda"].dropna()).all()
+
+
 def test_mixture_model_sparse_input(guide_adata_sparse: AnnData) -> None:
     ga = rsc.ptg.GuideAssignment()
     ga.assign_mixture_model(guide_adata_sparse)
@@ -246,52 +275,56 @@ def test_mixture_model_sparse_input(guide_adata_sparse: AnnData) -> None:
     assert n_assigned > 0
 
 
+@pytest.mark.parametrize("layer_kind", ["dense", "csr", "csc"])
+def test_mixture_model_layer_is_honored(guide_adata: AnnData, layer_kind: str) -> None:
+    adata = guide_adata.copy()
+    layer_counts = guide_adata.X.copy()
+    if layer_kind == "csr":
+        layer_counts = gpu_csr(layer_counts)
+    elif layer_kind == "csc":
+        layer_counts = gpu_csc(layer_counts)
+    adata.layers["raw_guides"] = layer_counts
+    adata.X = cp.zeros_like(guide_adata.X)
+
+    ga = rsc.ptg.GuideAssignment()
+    with pytest.warns(UserWarning, match="No guides"):
+        x_result = ga.assign_mixture_model(adata, only_return_results=True)
+    layer_result = ga.assign_mixture_model(
+        adata, layer="raw_guides", only_return_results=True
+    )
+
+    assert (x_result == "negative").all()
+    assert np.count_nonzero(layer_result != "negative") > 0
+
+
 def test_mixture_model_only_return_results(guide_adata: AnnData) -> None:
     ga = rsc.ptg.GuideAssignment()
+    obs_columns = guide_adata.obs.columns.copy()
+    var_columns = guide_adata.var.columns.copy()
     result = ga.assign_mixture_model(guide_adata, only_return_results=True)
 
     assert result is not None
     assert len(result) == guide_adata.n_obs
     assert isinstance(result, np.ndarray)
+    assert guide_adata.obs.columns.equals(obs_columns)
+    assert guide_adata.var.columns.equals(var_columns)
 
 
-def test_mixture_model_invalid_posterior_threshold(guide_adata: AnnData) -> None:
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"posterior_threshold": 1.0}, "posterior_threshold"),
+        ({"max_iter": 0}, "max_iter"),
+        ({"tol": 0.0}, "tol"),
+        ({"max_assignments_per_cell": 0}, "max_assignments_per_cell"),
+    ],
+)
+def test_mixture_model_invalid_args_before_data_access(
+    guide_adata: AnnData, kwargs: dict[str, float | int], match: str
+) -> None:
     ga = rsc.ptg.GuideAssignment()
-    with pytest.raises(ValueError, match="posterior_threshold"):
-        ga.assign_mixture_model(guide_adata, posterior_threshold=1.0)
-
-
-def test_mixture_model_invalid_backend(guide_adata: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    with pytest.raises(ValueError, match="backend"):
-        ga.assign_mixture_model(guide_adata, backend="not-a-backend")
-    with pytest.raises(ValueError, match="backend"):
-        ga.assign_mixture_model(guide_adata, backend="cuda_em")
-
-
-def test_mixture_model_cuda_backend_matches_cupy(guide_adata: AnnData) -> None:
-    from rapids_singlecell._cuda import _guide_assignment_cuda
-
-    if _guide_assignment_cuda is None:
-        pytest.skip("_guide_assignment_cuda extension is not available")
-
-    cupy_adata = guide_adata.copy()
-    cuda_adata = guide_adata.copy()
-    ga = rsc.ptg.GuideAssignment()
-
-    ga.assign_mixture_model(cupy_adata, backend="cupy")
-    ga.assign_mixture_model(cuda_adata, backend="cuda")
-
-    np.testing.assert_array_equal(
-        cupy_adata.obs["assigned_guide"].to_numpy(),
-        cuda_adata.obs["assigned_guide"].to_numpy(),
-    )
-    np.testing.assert_array_equal(
-        cupy_adata.var["threshold"].to_numpy(),
-        cuda_adata.var["threshold"].to_numpy(),
-    )
-    for col in ["lambda", "mu", "scale", "weight_Poisson"]:
-        assert np.isfinite(cuda_adata.var[col].dropna()).all()
+    with pytest.raises(ValueError, match=match):
+        ga.assign_mixture_model(guide_adata, layer="missing_layer", **kwargs)
 
 
 def test_mixture_model_cuda_assignments_are_bool(guide_adata: AnnData) -> None:
@@ -308,6 +341,33 @@ def test_mixture_model_cuda_assignments_are_bool(guide_adata: AnnData) -> None:
     )
 
     assert assignments.dtype == cp.bool_
+
+
+def test_mixture_model_cuda_c_and_f_layouts_match(guide_adata: AnnData) -> None:
+    from rapids_singlecell._cuda import _guide_assignment_cuda
+
+    if _guide_assignment_cuda is None:
+        pytest.skip("_guide_assignment_cuda extension is not available")
+
+    X_c = cp.ascontiguousarray(guide_adata.X.astype(cp.float32, copy=False))
+    X_f = cp.asfortranarray(guide_adata.X.astype(cp.float32, copy=False))
+
+    c_result = _fit_assign_cuda(
+        X_c,
+        max_iter=90,
+        tol=1e-4,
+        posterior_threshold=0.645,
+    )
+    f_result = _fit_assign_cuda(
+        X_f,
+        max_iter=90,
+        tol=1e-4,
+        posterior_threshold=0.645,
+    )
+
+    for c_value, f_value in zip(c_result[:-1], f_result[:-1], strict=True):
+        cp.testing.assert_array_equal(c_value, f_value)
+    assert c_result[-1] == f_result[-1]
 
 
 def test_mixture_model_skip_low_count() -> None:
