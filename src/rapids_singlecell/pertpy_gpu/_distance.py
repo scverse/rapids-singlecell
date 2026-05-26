@@ -19,6 +19,29 @@ class MeanVar(NamedTuple):
     variance: float
 
 
+Metric = Literal[
+    "edistance",
+    "euclidean",
+    "root_mean_squared_error",
+    "mse",
+    "mean_absolute_error",
+    "pearson_distance",
+    "cosine_distance",
+    "r2_distance",
+]
+
+SUPPORTED_METRICS = [
+    "edistance",
+    "euclidean",
+    "root_mean_squared_error",
+    "mse",
+    "mean_absolute_error",
+    "pearson_distance",
+    "cosine_distance",
+    "r2_distance",
+]
+
+
 class Distance:
     """
     GPU-accelerated distance computation between groups of cells.
@@ -31,11 +54,20 @@ class Distance:
         Twice the mean pairwise distance between cells of two groups minus
         the mean pairwise distance between cells within each group. See
         `Peidli et al. (2023) <https://doi.org/10.1101/2022.08.20.504663>`__.
+    - ``"euclidean"`` and ``"root_mean_squared_error"``: Euclidean distance
+        between group mean vectors.
+    - ``"mse"``: Mean squared distance between group mean vectors.
+    - ``"mean_absolute_error"``: Mean absolute distance between group mean
+        vectors.
+    - ``"pearson_distance"``: Pearson distance between group mean vectors.
+    - ``"cosine_distance"``: Cosine distance between group mean vectors.
+    - ``"r2_distance"``: One minus the coefficient of determination between
+        group mean vectors.
 
     Parameters
     ----------
     metric
-        Distance metric to use. Currently only ``"edistance"`` is supported.
+        Distance metric to use.
     layer_key
         Key in adata.layers for cell data. Mutually exclusive with ``obsm_key``.
     obsm_key
@@ -44,11 +76,17 @@ class Distance:
 
     Notes
     -----
-    The bootstrap implementation differs from pertpy: rather than precomputing
-    an n×n cell distance matrix and sampling from it, this implementation
-    resamples cells and recomputes distances from scratch each iteration.
-    This scales better for large datasets (O(n) vs O(n²) memory) and leverages
-    multi-GPU parallelism for each bootstrap iteration.
+    The ``edistance`` bootstrap implementation differs from pertpy: rather
+    than precomputing an n×n cell distance matrix and sampling from it, this
+    implementation resamples cells and recomputes distances from scratch each
+    iteration. This scales better for large datasets (O(n) vs O(n²) memory)
+    and leverages multi-GPU parallelism for each bootstrap iteration.
+
+    Only ``"edistance"`` uses multi-GPU. Pseudobulk metrics aggregate cells
+    into K group-mean vectors before computing distances, and the resulting
+    K×K kernel is cheap enough on a single GPU that distributing it is not
+    worth the cost. Passing ``multi_gpu=True`` for those metrics falls back
+    to a single device with a warning.
 
     Examples
     --------
@@ -62,7 +100,7 @@ class Distance:
 
     def __init__(
         self,
-        metric: Literal["edistance"] = "edistance",
+        metric: Metric = "edistance",
         layer_key: str | None = None,
         obsm_key: str | None = None,
     ):
@@ -92,9 +130,19 @@ class Distance:
                 layer_key=self.layer_key,
                 obsm_key=self.obsm_key,
             )
+        elif self.metric in SUPPORTED_METRICS:
+            from rapids_singlecell.pertpy_gpu._metrics._pseudobulk import (
+                PSEUDOBULK_METRICS,
+            )
+
+            self._metric_impl = PSEUDOBULK_METRICS[self.metric](
+                metric_name=self.metric,
+                layer_key=self.layer_key,
+                obsm_key=self.obsm_key,
+            )
         else:
             raise ValueError(
-                f"Unknown metric: {self.metric}. Supported metrics: ['edistance']"
+                f"Unknown metric: {self.metric}. Supported metrics: {SUPPORTED_METRICS}"
             )
 
     def _check_multi_gpu_support(
