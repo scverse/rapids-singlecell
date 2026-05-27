@@ -9,6 +9,7 @@ from cupyx.scipy.sparse import csc_matrix as gpu_csc
 from cupyx.scipy.sparse import csr_matrix as gpu_csr
 
 import rapids_singlecell as rsc
+from rapids_singlecell.get import X_to_CPU
 from rapids_singlecell.pertpy_gpu._guide_assignment import _fit_assign_cuda
 
 
@@ -54,14 +55,8 @@ def test_assign_by_threshold(guide_adata: AnnData) -> None:
     ga = rsc.ptg.GuideAssignment()
     ga.assign_by_threshold(guide_adata, assignment_threshold=5)
 
-    result = guide_adata.layers["assigned_guides"]
-    X = guide_adata.X
-    if hasattr(X, "get"):
-        X = X.get()
-    if hasattr(result, "toarray"):
-        result = result.toarray()
-    if hasattr(result, "get"):
-        result = result.get()
+    result = X_to_CPU(guide_adata.layers["assigned_guides"])
+    X = X_to_CPU(guide_adata.X)
 
     expected = (X >= 5).astype(np.int8)
     np.testing.assert_array_equal(result, expected)
@@ -71,17 +66,8 @@ def test_assign_by_threshold_sparse(guide_adata_sparse: AnnData) -> None:
     ga = rsc.ptg.GuideAssignment()
     ga.assign_by_threshold(guide_adata_sparse, assignment_threshold=5)
 
-    result = guide_adata_sparse.layers["assigned_guides"]
-    if hasattr(result, "toarray"):
-        result = result.toarray()
-    if hasattr(result, "get"):
-        result = result.get()
-
-    X = guide_adata_sparse.X
-    if hasattr(X, "toarray"):
-        X = X.toarray()
-    if hasattr(X, "get"):
-        X = X.get()
+    result = X_to_CPU(guide_adata_sparse.layers["assigned_guides"]).toarray()
+    X = X_to_CPU(guide_adata_sparse.X).toarray()
 
     expected = (X >= 5).astype(np.int8)
     np.testing.assert_array_equal(result, expected)
@@ -97,8 +83,8 @@ def test_assign_by_threshold_sparse_csc(guide_adata: AnnData) -> None:
     result = adata.layers["assigned_guides"]
     assert isinstance(result, gpu_csc)
 
-    result = result.toarray().get()
-    expected = (adata.X.toarray().get() >= 5).astype(np.int8)
+    result = X_to_CPU(result).toarray()
+    expected = (X_to_CPU(adata.X).toarray() >= 5).astype(np.int8)
     np.testing.assert_array_equal(result, expected)
 
 
@@ -112,9 +98,7 @@ def test_assign_to_max_guide(guide_adata: AnnData) -> None:
     ga.assign_to_max_guide(guide_adata, assignment_threshold=5)
 
     assigned = guide_adata.obs["assigned_guide"]
-    X = guide_adata.X
-    if hasattr(X, "get"):
-        X = X.get()
+    X = X_to_CPU(guide_adata.X)
 
     for i in range(guide_adata.n_obs):
         row = X[i]
@@ -135,9 +119,7 @@ def test_assign_to_max_guide_sparse(guide_adata_sparse: AnnData) -> None:
     ga.assign_to_max_guide(guide_adata_sparse, assignment_threshold=5)
 
     assigned = guide_adata_sparse.obs["assigned_guide"]
-    X = guide_adata_sparse.X.toarray()
-    if hasattr(X, "get"):
-        X = X.get()
+    X = X_to_CPU(guide_adata_sparse.X).toarray()
 
     for i in range(guide_adata_sparse.n_obs):
         row = X[i]
@@ -180,9 +162,7 @@ def test_mixture_model_separation(guide_adata: AnnData) -> None:
 
     # With such clear separation (Poisson(2) vs Poisson(50)),
     # most high-count cells should be positive
-    X = guide_adata.X
-    if hasattr(X, "get"):
-        X = X.get()
+    X = X_to_CPU(guide_adata.X)
 
     # For each guide, cells with count >= 20 should mostly be assigned
     for g in range(X.shape[1]):

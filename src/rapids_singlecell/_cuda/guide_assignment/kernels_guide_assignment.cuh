@@ -16,7 +16,8 @@ __device__ inline T warp_reduce_sum(T val) {
     return val;
 }
 
-__device__ inline int warp_reduce_max(int val) {
+template <typename T>
+__device__ inline T warp_reduce_max(T val) {
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         val = max(val, __shfl_down_sync(0xffffffff, val, offset));
     }
@@ -42,7 +43,8 @@ __device__ inline T block_reduce_sum_thread0(T val, T* warp_sums) {
     return val;
 }
 
-__device__ inline int block_reduce_max_thread0(int val, int* warp_maxes) {
+template <typename T>
+__device__ inline T block_reduce_max_thread0(T val, T* warp_maxes) {
     int lane = threadIdx.x & (warpSize - 1);
     int warp = threadIdx.x >> 5;
     int n_warps = (blockDim.x + warpSize - 1) / warpSize;
@@ -53,7 +55,7 @@ __device__ inline int block_reduce_max_thread0(int val, int* warp_maxes) {
     }
     __syncthreads();
 
-    val = threadIdx.x < n_warps ? warp_maxes[threadIdx.x] : 0;
+    val = threadIdx.x < n_warps ? warp_maxes[threadIdx.x] : static_cast<T>(0);
     if (warp == 0) {
         val = warp_reduce_max(val);
     }
