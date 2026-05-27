@@ -1,7 +1,19 @@
 runners:
-  - name: aws-gpu-runner
+  # Primary: T4. Cheapest, usually has capacity.
+  - name: aws-gpu-runner-g4dn
     cloud: aws
     instance_type: g4dn.xlarge
+    machine_image: ami-067a4ba2816407ee9
+    region: eu-north-1
+    preemptible:
+      - true
+      - false
+    labels:
+      - cirun-aws-gpu
+  # Fallback: A10G. cirun picks this when g4dn spot is dry.
+  - name: aws-gpu-runner-g5
+    cloud: aws
+    instance_type: g5.xlarge
     machine_image: ami-067a4ba2816407ee9
     region: eu-north-1
     preemptible:

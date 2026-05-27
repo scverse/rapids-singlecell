@@ -397,6 +397,43 @@ def test_highly_variable_genes_pearson_residuals_batch(n_top_genes, dtype):
     assert len(cudata.var) == n_genes
 
 
+def test_pearson_residuals_batch_order_invariant():
+    """HVG ranking must not depend on alphabetical batch-label order."""
+    rng = np.random.default_rng(0)
+    n_big, n_small, n_genes = 5000, 200, 200
+    counts = (rng.random((n_big + n_small, n_genes)) < 0.05).astype(np.int32)
+    counts *= rng.integers(1, 31, size=counts.shape, dtype=np.int32)
+    X = csr_matrix(counts.astype(np.float32))
+
+    a1 = AnnData(X=cpx.scipy.sparse.csr_matrix(X.copy()))
+    a1.obs["batch"] = np.array(["A"] * n_big + ["B"] * n_small)
+    a1.obs["batch"] = a1.obs["batch"].astype("category")
+    rsc.pp.highly_variable_genes(
+        a1,
+        flavor="pearson_residuals",
+        n_top_genes=100,
+        batch_key="batch",
+        check_values=False,
+    )
+
+    a2 = AnnData(X=cpx.scipy.sparse.csr_matrix(X.copy()))
+    a2.obs["batch"] = np.array(["B"] * n_big + ["A"] * n_small)
+    a2.obs["batch"] = a2.obs["batch"].astype("category")
+    rsc.pp.highly_variable_genes(
+        a2,
+        flavor="pearson_residuals",
+        n_top_genes=100,
+        batch_key="batch",
+        check_values=False,
+    )
+
+    np.testing.assert_allclose(
+        a1.var["residual_variances"].to_numpy(),
+        a2.var["residual_variances"].to_numpy(),
+        atol=1e-5,
+    )
+
+
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("sparse", [True, False])
 def test_poisson_gene_selection_compare_to_scvi(dtype, sparse):

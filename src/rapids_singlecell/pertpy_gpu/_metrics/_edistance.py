@@ -233,28 +233,9 @@ class EDistanceMetric(BaseMetric):
             Series (single control) or DataFrame (multiple controls).
             If bootstrap=True, returns tuple of (distances, distances_var).
         """
-        _assert_categorical_obs(adata, key=groupby)
-
-        # Normalize selected_group to a list, track if input was a string
-        single_control = isinstance(selected_group, str)
-        if single_control:
-            selected_groups = [selected_group]
-        else:
-            selected_groups = list(selected_group)
-
-        # Validate selected groups exist
-        all_categories = set(adata.obs[groupby].cat.categories.values)
-        for sg in selected_groups:
-            if sg not in all_categories:
-                raise ValueError(
-                    f"Selected group '{sg}' not found in groupby '{groupby}'"
-                )
-
-        # Subset to only needed groups: groups ∪ selected_groups
-        if groups is not None:
-            needed = list(set(groups) | set(selected_groups))
-        else:
-            needed = None
+        selected_groups, single_control, needed = self._resolve_onesided_inputs(
+            adata, groupby, selected_group, groups
+        )
 
         embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
             adata, groupby, needed
@@ -420,12 +401,7 @@ class EDistanceMetric(BaseMetric):
         pd.DataFrame
             Copy of the input DataFrame with an added ``edistance`` column.
         """
-        from rapids_singlecell.pertpy_gpu._distance import Distance
-
-        Distance.validate_contrasts(adata, contrasts)
-
-        groupby = contrasts.columns[0]
-        split_by = [c for c in contrasts.columns if c not in (groupby, "reference")]
+        groupby, split_by = self._parse_contrasts(adata, contrasts)
 
         embedding_raw = self._get_embedding(adata)
         device_ids = parse_device_ids(multi_gpu=multi_gpu)
