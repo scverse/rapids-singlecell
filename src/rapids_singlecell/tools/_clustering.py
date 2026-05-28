@@ -11,6 +11,8 @@ from natsort import natsorted
 from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 
+from rapids_singlecell import logging as logg
+
 from ._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -202,6 +204,7 @@ def leiden(
     """
     # Adjacency graph
 
+    start = logg.info("running Leiden clustering")
     adata = adata.copy() if copy else adata
 
     dtype = _check_dtype(dtype)
@@ -278,6 +281,14 @@ def leiden(
     }
     adata.uns[key_added]["modularity"] = (
         modularities if len(modularities) > 1 else modularities[0]
+    )
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"found {len(np.unique(groups))} clusters and added\n"
+            f"    {key_added!r}, the cluster labels (adata.obs, categorical)"
+        ),
     )
     return adata if copy else None
 
@@ -361,6 +372,7 @@ def louvain(
 
     """
     # Adjacency graph
+    start = logg.info("running Louvain clustering")
     dtype = _check_dtype(dtype)
 
     adata = adata.copy() if copy else adata
@@ -435,6 +447,14 @@ def louvain(
     }
     adata.uns[key_added]["modularity"] = (
         modularities if len(modularities) > 1 else modularities[0]
+    )
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"found {len(np.unique(groups))} clusters and added\n"
+            f"    {key_added!r}, the cluster labels (adata.obs, categorical)"
+        ),
     )
     return adata if copy else None
 

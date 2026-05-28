@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 import cupy as cp
 from anndata import AnnData
 
+from rapids_singlecell import logging as logg
+
 from ._qc import _basic_qc
 from ._utils import _check_gpu_X
 
@@ -151,7 +153,7 @@ def filter_genes(
                     if max_counts is None
                     else f"{max_counts} counts"
                 )
-            print(msg)
+            logg.info(msg)
 
     if isinstance(data, AnnData) and inplace:
         data.var["n_counts"] = sums_genes.get()
@@ -292,7 +294,7 @@ def filter_cells(
                     if max_counts is None
                     else f"{max_counts} counts"
                 )
-            print(msg)
+            logg.info(msg)
 
     if isinstance(data, AnnData) and inplace:
         data.obs["n_counts"] = sums_cells.get()
@@ -314,4 +316,4 @@ def filter_highly_variable(adata: AnnData) -> None:
     if "highly_variable" in adata.var.keys():
         adata._inplace_subset_var(adata.var["highly_variable"])
     else:
-        print("Please calculate highly variable genes first")
+        logg.warning("Please calculate highly variable genes first")

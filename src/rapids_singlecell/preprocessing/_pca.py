@@ -11,6 +11,7 @@ from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.get import _get_obs_rep
 
@@ -216,6 +217,7 @@ def pca(
             "Either your data already only consists of highly-variable genes "
             "or consider running `highly_variable_genes` first."
         )
+    start = logg.info("computing PCA")
     if copy:
         adata = adata.copy()
 
@@ -234,6 +236,8 @@ def pca(
         else:
             n_comps = 50
 
+    logg.info(f"    with {n_comps=}")
+
     # Auto-select sparse solver based on matrix dimensions
     # Lanczos is faster for large feature counts (>8000)
     # Covariance is faster for smaller matrices due to optimized kernels
@@ -243,6 +247,14 @@ def pca(
             svd_solver = "lanczos"
         else:
             svd_solver = "covariance_eigh"
+
+    if not zero_center:
+        logg.debug(
+            "    without zero-centering:\n"
+            "    the explained variance does not correspond to the exact statistical definition\n"
+            "    the first component, e.g., might be heavily influenced by different means\n"
+            "    the following components often resemble the exact PCA very closely"
+        )
 
     if isinstance(X, DaskArray):
         if chunked:
@@ -324,6 +336,15 @@ def pca(
         adata.varm[key_varm][mask_var] = _as_numpy(pca_func.components_.T)
     else:
         adata.varm[key_varm] = _as_numpy(pca_func.components_.T)
+
+    logg.info("    finished", time=start)
+    logg.debug(
+        "and added\n"
+        f"    {key_obsm!r}, the PCA coordinates (adata.obsm)\n"
+        f"    {key_varm!r}, the loadings (adata.varm)\n"
+        f"    'variance', the variance / eigenvalues (adata.uns[{key_uns!r}])\n"
+        f"    'variance_ratio', the variance ratio (adata.uns[{key_uns!r}])"
+    )
 
     if copy:
         return adata

@@ -10,6 +10,7 @@ from cuml.neighbors import NearestNeighbors
 from cupyx.scipy import sparse
 from scanpy.preprocessing._utils import sample_comb
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._compat import _random_state_kwargs
 from rapids_singlecell.preprocessing._utils import get_random_state
 
@@ -437,13 +438,13 @@ class Scrublet:
             try:
                 threshold = cast("float", threshold_minimum(self.doublet_scores_sim_))
                 if verbose:
-                    print(
+                    logg.info(
                         f"Automatically set threshold at doublet score = {threshold:.2f}"
                     )
             except Exception:  # noqa: BLE001
                 self.predicted_doublets_ = None
                 if verbose:
-                    print(
+                    logg.warning(
                         "Failed to automatically identify doublet score threshold. "
                         "Run `call_doublets` with user-specified threshold."
                     )
@@ -465,7 +466,7 @@ class Scrublet:
         )
 
         if verbose:
-            print(
+            logg.info(
                 f"Detected doublet rate = {100 * self.detected_doublet_rate_:.1f}%\n"
                 f"Estimated detectable doublet fraction = {100 * self.detectable_doublet_fraction_:.1f}%\n"
                 "Overall doublet rate:\n"

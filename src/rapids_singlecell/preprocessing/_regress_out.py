@@ -12,6 +12,7 @@ from pandas.api.types import CategoricalDtype
 from scanpy._utils import view_to_actual
 from scanpy.get import _get_obs_rep, _set_obs_rep
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._compat import DaskArray, _meta_dense
 
 from ._utils import _check_gpu_X, _sparse_to_dense
@@ -62,12 +63,16 @@ def regress_out(
     if batchsize != "all" and type(batchsize) not in [int, type(None)]:
         raise ValueError("batchsize must be `int`, `None` or `'all'`")
 
+    start = logg.info(f"regressing out {keys}")
     if isinstance(adata, AnnData):
         view_to_actual(adata)
 
     X = _get_obs_rep(adata, layer=layer)
 
     _check_gpu_X(X, allow_dask=True)
+
+    if sparse.issparse(X) or (isinstance(X, DaskArray) and sparse.issparse(X._meta)):
+        logg.info("    sparse input is densified and may lead to high memory use")
 
     if not sparse.issparse(X) and not isinstance(X, DaskArray) and inplace is False:
         X = cp.array(X)
@@ -82,6 +87,7 @@ def regress_out(
     )
 
     if categorical:
+        logg.debug("... regressing on per-gene means within categories")
         if len(keys) > 1:
             raise ValueError(
                 "Only a single categorical variable is supported for regress_out."
@@ -98,7 +104,9 @@ def regress_out(
 
     if inplace:
         _set_obs_rep(adata, X, layer=layer)
+        logg.info("    finished", time=start)
     else:
+        logg.info("    finished", time=start)
         return X
 
 

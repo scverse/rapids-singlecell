@@ -13,6 +13,7 @@ from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
 from sklearn.utils import check_random_state
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._compat import _random_state_kwargs
 from rapids_singlecell._utils import _get_logger_level
 
@@ -126,6 +127,7 @@ def umap(
             UMAP parameters `a`, `b`, and `random_state` (if specified).
     """
 
+    start = logg.info("computing UMAP")
     adata = adata.copy() if copy else adata
 
     if neighbors_key is None:
@@ -137,6 +139,12 @@ def umap(
         )
 
     neighbors = NeighborsView(adata, neighbors_key)
+
+    if "params" not in neighbors or neighbors["params"].get("method") != "rapids":
+        logg.warning(
+            f'.obsp["{neighbors["connectivities_key"]}"] have not been computed using rsc.pp.neighbors'
+        )
+
     if a is None or b is None:
         a, b = find_ab_params(spread, min_dist)
 
@@ -246,4 +254,13 @@ def umap(
     adata.obsm[key_obsm] = X_umap
 
     adata.uns[key_uns] = {"params": stored_params}
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"added\n"
+            f"    {key_obsm!r}, UMAP coordinates (adata.obsm)\n"
+            f"    {key_uns!r}, UMAP parameters (adata.uns)"
+        ),
+    )
     return adata if copy else None

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 from ._cutoffs import _Cutoffs
@@ -145,6 +146,7 @@ def highly_variable_genes(
             `highly_variable_intersection` : bool
                 If batch_key is given, this denotes the genes that are highly variable in all batches
     """
+    start = logg.info("extracting highly variable genes")
     if batch_key is not None:
         _sanitize_column(adata, batch_key)
 
@@ -205,6 +207,13 @@ def highly_variable_genes(
             )
 
         adata.uns["hvg"] = {"flavor": flavor}
+        logg.hint(
+            "added\n"
+            "    'highly_variable', boolean vector (adata.var)\n"
+            "    'means', float vector (adata.var)\n"
+            "    'dispersions', float vector (adata.var)\n"
+            "    'dispersions_norm', float vector (adata.var)"
+        )
 
         adata.var["highly_variable"] = df["highly_variable"]
         adata.var["means"] = df["means"]
@@ -218,3 +227,5 @@ def highly_variable_genes(
             adata.var["highly_variable_intersection"] = df[
                 "highly_variable_intersection"
             ]
+
+    logg.info("    finished", time=start)

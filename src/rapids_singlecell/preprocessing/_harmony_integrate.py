@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell import logging as logg
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
@@ -154,6 +156,7 @@ def harmony_integrate(
     # Resolve flavor into internal flags
     if flavor not in {"harmony1", "harmony2"}:
         raise ValueError(f"flavor must be 'harmony1' or 'harmony2', got {flavor!r}.")
+    start = logg.info(f"running Harmony ({flavor})")
     stabilized_penalty = flavor == "harmony2"
     dynamic_lambda = flavor == "harmony2"
 
@@ -248,3 +251,4 @@ def harmony_integrate(
     )
 
     adata.obsm[adjusted_basis] = harmony_out.get()
+    logg.info("    finished", time=start)

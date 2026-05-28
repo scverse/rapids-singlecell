@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import pandas as pd
 
+from rapids_singlecell import logging as logg
+
 from ._core import _RankGenes
 
 if TYPE_CHECKING:
@@ -154,6 +156,7 @@ def rank_genes_groups(
         msg = "corr_method must be either 'benjamini-hochberg' or 'bonferroni'."
         raise ValueError(msg)
 
+    start = logg.info("ranking genes")
     if method is None:
         method = "t-test"
 
@@ -198,6 +201,9 @@ def rank_genes_groups(
         comp_pts=pts,
         pre_load=pre_load,
     )
+
+    logg.debug(f"consider {groupby!r} groups:")
+    logg.debug(f"with sizes: {list(map(int, test_obj.group_sizes))}")
 
     # Determine n_genes_user
     n_genes_user = n_genes
@@ -257,6 +263,23 @@ def rank_genes_groups(
             adata.uns[key_added][col] = test_obj.stats[col].to_records(
                 index=False, column_dtypes=dtypes[col]
             )
+
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"added to `.uns[{key_added!r}]`\n"
+            "    'names', sorted np.recarray to be indexed by group ids\n"
+            "    'scores', sorted np.recarray to be indexed by group ids\n"
+            + (
+                "    'logfoldchanges', sorted np.recarray to be indexed by group ids\n"
+                "    'pvals', sorted np.recarray to be indexed by group ids\n"
+                "    'pvals_adj', sorted np.recarray to be indexed by group ids"
+                if method != "logreg"
+                else ""
+            )
+        ),
+    )
 
 
 if TYPE_CHECKING:

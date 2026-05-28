@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
@@ -174,6 +175,7 @@ def neighbors(
             neighbors.
 
     """
+    start = logg.info("computing neighbors")
     adata = adata.copy() if copy else adata
 
     if adata.is_view:
@@ -184,6 +186,10 @@ def neighbors(
             f"Invalid algorithm '{algorithm}' for KNN. "
             f"Valid options are: {get_args(_Algorithms)}."
         )
+
+    if n_neighbors > adata.shape[0]:
+        n_neighbors = 1 + int(0.5 * adata.shape[0])
+        logg.warning(f"n_obs too small: adjusting to `n_neighbors = {n_neighbors}`")
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     X_contiguous = _check_neighbors_X(X, algorithm)
@@ -243,6 +249,15 @@ def neighbors(
     adata.obsp[dists_key] = distances
     adata.obsp[conns_key] = connectivities
 
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"added to `.uns[{neighbors_key!r}]`\n"
+            f"    `.obsp[{dists_key!r}]`, distances for each pair of neighbors\n"
+            f"    `.obsp[{conns_key!r}]`, weighted adjacency matrix"
+        ),
+    )
     return adata if copy else None
 
 
@@ -370,6 +385,7 @@ def bbknn(
             f"Invalid algorithm '{algorithm}' for batch-balanced KNN. "
             f"Valid options are: {get_args(_Algorithms_bbknn)}."
         )
+    start = logg.info("computing batch-balanced neighbors")
     adata = adata.copy() if copy else adata
     if adata.is_view:
         adata._init_as_actual(adata.copy())
@@ -464,4 +480,13 @@ def bbknn(
     adata.obsp[dists_key] = distances
     adata.obsp[conns_key] = connectivities
 
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"added to `.uns[{neighbors_key!r}]`\n"
+            f"    `.obsp[{dists_key!r}]`, distances for each pair of neighbors\n"
+            f"    `.obsp[{conns_key!r}]`, weighted adjacency matrix"
+        ),
+    )
     return adata if copy else None

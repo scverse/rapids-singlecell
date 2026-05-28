@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 from anndata import AnnData
 from cupyx.scipy import sparse
-from scanpy import logging as logg
 from scanpy.get import _get_obs_rep
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell import preprocessing as pp
 
 from . import pipeline

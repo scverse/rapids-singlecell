@@ -10,6 +10,7 @@ from cupyx.scipy import sparse
 from cupyx.scipy.sparse import csr_matrix
 from scanpy.get import _get_obs_rep, _set_obs_rep
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._compat import (
     DaskArray,
     _meta_dense,
@@ -72,6 +73,7 @@ def normalize_total(
         Returns a normalized copy or  updates `adata` with a normalized version of
         the original `adata.X` and `adata.layers['layer']`, depending on `inplace`.
     """
+    start = logg.info("normalizing counts per cell")
     if copy:
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
@@ -118,6 +120,7 @@ def normalize_total(
     if inplace:
         _set_obs_rep(adata, X, layer=layer)
 
+    logg.info("    finished", time=start)
     if copy:
         return adata
     elif not inplace:
@@ -393,6 +396,7 @@ def log1p(
     in-place and returns None.
 
     """
+    start = logg.info("computing log1p")
     if copy:
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
@@ -409,6 +413,7 @@ def log1p(
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
 
+    logg.info("    finished", time=start)
     if copy:
         return adata
     elif not inplace:

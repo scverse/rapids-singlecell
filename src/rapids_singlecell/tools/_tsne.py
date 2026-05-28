@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import cuml.internals.logger as logger
 from cuml.manifold import TSNE
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._utils import _get_logger_level
 
 from ._utils import _choose_representation
@@ -85,6 +86,7 @@ def tsne(
                 `learning_rate`, `method`, `metric`, and `use_rep`.
     """
 
+    start = logg.info("computing tSNE")
     adata = adata.copy() if copy else adata
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
@@ -113,4 +115,13 @@ def tsne(
         }
     }
 
+    logg.info(
+        "    finished",
+        time=start,
+        deep=(
+            f"added\n"
+            f"    {key_obsm!r}, tSNE coordinates (adata.obsm)\n"
+            f"    {key_uns!r}, tSNE parameters (adata.uns)"
+        ),
+    )
     return adata if copy else None

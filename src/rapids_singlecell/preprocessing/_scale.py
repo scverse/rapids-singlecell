@@ -10,6 +10,7 @@ from anndata import AnnData
 from cupyx.scipy import sparse
 from scanpy._utils import view_to_actual
 
+from rapids_singlecell import logging as logg
 from rapids_singlecell._compat import (
     DaskArray,
     _meta_dense,
@@ -74,6 +75,7 @@ def scale(
     depending on `inplace`.
 
     """
+    start = logg.info("scaling data")
     if copy:
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
@@ -132,6 +134,7 @@ def scale(
         adata.var[str_mean_std[0]] = means.get()
         adata.var[str_mean_std[1]] = std.get()
 
+    logg.info("    finished", time=start)
     if copy:
         return adata
     elif not inplace:

@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-import cuml.internals.logger as logger
-
-from . import dcg, get, gr, pp, ptg, tl
+from . import dcg, get, gr, logging, pp, ptg, tl
+from ._settings import Verbosity, settings
 from ._version import __version__
+
+__all__ = [
+    "Verbosity",
+    "__version__",
+    "dcg",
+    "get",
+    "gr",
+    "logging",
+    "pp",
+    "ptg",
+    "settings",
+    "tl",
+]
 
 
 def _detect_duplicate_installation():
@@ -36,4 +48,3 @@ def _detect_duplicate_installation():
 
 
 _detect_duplicate_installation()
-logger.set_level(2)
