@@ -83,17 +83,15 @@ static void def_kernels(nb::module_& m) {
         "cost"_a, "mask_a"_a, "mask_b"_a, "g"_a, "eps"_a, "log_a"_a, "conv"_a,
         "f"_a, "omega"_a = 1.0, "stream"_a = 0);
 
-    // Fused gather + pairwise distance cost build (replaces the cuBLAS
-    // gather+GEMM). cost[b, i, j] = dist(emb[cidx_l[b, i]], emb[cidx_r[b, j]])
-    // for the chosen ``metric`` (see distances::Metric). The 2-Wasserstein cost
-    // uses SQEUCLIDEAN; the other policies are wired so callers can plug in
-    // more metrics without a new kernel.
+    // Fused gather + squared-Euclidean cost build (replaces the cuBLAS
+    // gather+GEMM): cost[b, i, j] = ||emb[cidx_l[b, i]] - emb[cidx_r[b,
+    // j]]||^2, the 2-Wasserstein cost.
     m.def(
         "build_cost",
         [](gpu_array_c<const T, Device> emb,
            gpu_array_c<const int, Device> cidx_l,
            gpu_array_c<const int, Device> cidx_r, gpu_array_c<T, Device> cost,
-           int metric, std::uintptr_t stream_ptr) {
+           std::uintptr_t stream_ptr) {
             const int B = (int)cidx_l.shape(0);
             const int N = (int)cidx_l.shape(1);
             const int M = (int)cidx_r.shape(1);
@@ -111,32 +109,13 @@ static void def_kernels(nb::module_& m) {
             // +1 padded row stride (matches the kernel) to avoid bank
             // conflicts.
             size_t shmem = (size_t)2 * TILE * (FEAT_TILE + 1) * sizeof(T);
-            switch (metric) {
-                case distances::EUCLIDEAN:
-                    sinkhorn::pairwise_cost_kernel<T, TILE, FEAT_TILE,
-                                                   distances::Euclidean<T>>
-                        <<<grid, block, shmem, stream>>>(
-                            emb.data(), cidx_l.data(), cidx_r.data(),
-                            cost.data(), N, M, D);
-                    break;
-                case distances::MANHATTAN:
-                    sinkhorn::pairwise_cost_kernel<T, TILE, FEAT_TILE,
-                                                   distances::Manhattan<T>>
-                        <<<grid, block, shmem, stream>>>(
-                            emb.data(), cidx_l.data(), cidx_r.data(),
-                            cost.data(), N, M, D);
-                    break;
-                default:
-                    sinkhorn::pairwise_cost_kernel<T, TILE, FEAT_TILE,
-                                                   distances::SqEuclidean<T>>
-                        <<<grid, block, shmem, stream>>>(
-                            emb.data(), cidx_l.data(), cidx_r.data(),
-                            cost.data(), N, M, D);
-                    break;
-            }
+            sinkhorn::pairwise_cost_kernel<T, TILE, FEAT_TILE>
+                <<<grid, block, shmem, stream>>>(emb.data(), cidx_l.data(),
+                                                 cidx_r.data(), cost.data(), N,
+                                                 M, D);
             CUDA_CHECK_LAST_ERROR(pairwise_cost_kernel);
         },
-        "emb"_a, "cidx_l"_a, "cidx_r"_a, "cost"_a, "metric"_a, "stream"_a = 0);
+        "emb"_a, "cidx_l"_a, "cidx_r"_a, "cost"_a, "stream"_a = 0);
 }
 
 template <typename Device>

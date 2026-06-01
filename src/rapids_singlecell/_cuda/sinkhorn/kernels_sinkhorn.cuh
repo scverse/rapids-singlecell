@@ -2,8 +2,6 @@
 
 #include <cuda_runtime.h>
 
-#include "../distances/distance_metrics.cuh"
-
 // Batched log-domain Sinkhorn kernels (nanobind port of the validated CuPy
 // RawKernels). One launch processes all pairs in a batch; the Python driver
 // (_sinkhorn.run_async) calls these per iteration on per-device streams to form
@@ -210,17 +208,16 @@ __global__ void update_f_kernel(
     }
 }
 
-// Build a padded distance cost tensor in one fused pass (no cuBLAS):
-//   cost[b, i, j] = Dist over the D features of the gathered cells
-//                   emb[cidx_l[b, i]] and emb[cidx_r[b, j]].
-// Block is TILE x TILE. The D features are streamed in FEAT_TILE-wide chunks:
-// each chunk caches TILE rows x FEAT_TILE features of both sides in shared
-// memory (reused TILE-fold) and accumulates into a per-thread running distance,
-// so shared memory stays bounded at 2 * TILE * FEAT_TILE * sizeof(T) regardless
-// of D (the previous full-D cache overflowed shared memory for large D). Padded
-// slots use clamped indices (masked out by the solver). The distance is a
-// plugin policy from ``distances::`` (SqEuclidean for the 2-Wasserstein cost).
-template <typename T, int TILE, int FEAT_TILE, typename Dist>
+// Build a padded squared-Euclidean cost tensor in one fused pass (no cuBLAS):
+//   cost[b, i, j] = sum_d (emb[cidx_l[b, i], d] - emb[cidx_r[b, j], d])^2
+// (the 2-Wasserstein cost). Block is TILE x TILE. The D features are streamed
+// in FEAT_TILE-wide chunks: each chunk caches TILE rows x FEAT_TILE features of
+// both sides in shared memory (reused TILE-fold) and accumulates into a
+// per-thread running sum, so shared memory stays bounded at 2 * TILE *
+// FEAT_TILE * sizeof(T) regardless of D (the previous full-D cache overflowed
+// shared memory for large D). Padded slots use clamped indices (masked out by
+// the solver).
+template <typename T, int TILE, int FEAT_TILE>
 __global__ void pairwise_cost_kernel(const T* __restrict__ emb,
                                      const int* __restrict__ cidx_l,
                                      const int* __restrict__ cidx_r,
@@ -241,7 +238,7 @@ __global__ void pairwise_cost_kernel(const T* __restrict__ emb,
     const int tid = ti * TILE + tj;
     const int nthreads = TILE * TILE;
     const int gi = i0 + ti, gj = j0 + tj;
-    T s = Dist::init();
+    T s = T(0);
     for (int f0 = 0; f0 < D; f0 += FEAT_TILE) {
         const int fcount = D - f0 < FEAT_TILE ? D - f0 : FEAT_TILE;
         for (int r = 0; r < TILE; ++r) {
@@ -256,13 +253,14 @@ __global__ void pairwise_cost_kernel(const T* __restrict__ emb,
         }
         __syncthreads();
         if (gi < N && gj < M) {
-            for (int d = 0; d < fcount; ++d)
-                Dist::acc(s, Xs[ti * FS + d], Ys[tj * FS + d]);
+            for (int d = 0; d < fcount; ++d) {
+                const T diff = Xs[ti * FS + d] - Ys[tj * FS + d];
+                s += diff * diff;
+            }
         }
         __syncthreads();
     }
-    if (gi < N && gj < M)
-        cost[((size_t)b * N + gi) * M + gj] = Dist::finalize(s);
+    if (gi < N && gj < M) cost[((size_t)b * N + gi) * M + gj] = s;
 }
 
 }  // namespace sinkhorn

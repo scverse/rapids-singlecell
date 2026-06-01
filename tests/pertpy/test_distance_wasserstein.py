@@ -542,6 +542,21 @@ def test_bootstrap_adata_method_and_multicontrol() -> None:
     assert np.all(vd.values >= 0)
 
 
+def test_bootstrap_guards() -> None:
+    """Non-positive n_bootstrap raises; an empty workload (no pairs) is a no-op."""
+    distance = Distance(metric="wasserstein")
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(10, 5)).astype(np.float32)
+    Y = rng.normal(size=(12, 5)).astype(np.float32)
+    with pytest.raises(ValueError):
+        distance.bootstrap(X, Y, n_bootstrap=0)
+    # single-group adata -> no pairs -> bootstrap pairwise must not crash
+    adata = _make_grouped_adata(n_groups=1, cells_per_group=12, seed=2)
+    mean, var = distance.pairwise(adata, "group", bootstrap=True, n_bootstrap=5)
+    assert mean.shape == (1, 1)
+    assert float(mean.iloc[0, 0]) == 0.0 and float(var.iloc[0, 0]) == 0.0
+
+
 # ---------------------------------------------------------------------------
 # edist-parity coverage: dtypes, layer_key, output/axioms, groups filtering,
 # contrasts, __call__, invalid-group. Block-size and triangle-inequality are

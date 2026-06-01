@@ -46,9 +46,6 @@ MEMORY_BUDGET_FRACTION = 0.2
 BYTES_PER_PAIR_CELL_OVERHEAD = 2
 MIN_BATCH = 1
 MAX_BATCH = 4096
-# Distance metric id for the fused cost kernel; matches distances::Metric in
-# _cuda/distances/distance_metrics.cuh. The 2-Wasserstein cost is squared-Euclidean.
-_METRIC_SQEUCLIDEAN = 0
 # Over-relaxation bounds: omega = 1 is plain Sinkhorn, (1, 2) is the classic SOR
 # convergent range. Above 2 the iteration is unstable for any problem.
 MIN_RELAXATION = 1.0
@@ -362,7 +359,6 @@ class WassersteinMetric(BaseMetric):
                         cidx_l,
                         cidx_r,
                         cost,
-                        _METRIC_SQEUCLIDEAN,
                         streams[dev].ptr,
                     )
                 units.append(
@@ -437,7 +433,12 @@ class WassersteinMetric(BaseMetric):
         the solve is later chunked. Returns per-pair ``(mean, var)`` over the
         resamples (variance is population, ddof=0, matching pertpy).
         """
+        if n_bootstrap < 1:
+            raise ValueError(f"n_bootstrap must be >= 1, got {n_bootstrap}")
         n_pairs = len(pair_left)
+        if n_pairs == 0:
+            empty = cp.zeros(0, dtype=dtype)
+            return empty, empty
         with cp.cuda.Device(device):
             emb = cp.ascontiguousarray(cp.asarray(embedding))
             offs = cp.asarray(cat_offsets)
@@ -494,9 +495,7 @@ class WassersteinMetric(BaseMetric):
                 cidx_l = cp.ascontiguousarray(cidx_l_all[u0:u1])
                 cidx_r = cp.ascontiguousarray(cidx_r_all[u0:u1])
                 cost = cp.empty((u1 - u0, max_n, max_m), dtype=dtype)
-                _sk.build_cost(
-                    emb, cidx_l, cidx_r, cost, _METRIC_SQEUCLIDEAN, stream.ptr
-                )
+                _sk.build_cost(emb, cidx_l, cidx_r, cost, stream.ptr)
                 st = make_state(
                     cost,
                     cp.ascontiguousarray(mask_a[u0:u1]),

@@ -115,9 +115,9 @@ class Distance:
         """Initialize Distance calculator with specified metric.
 
         Extra keyword arguments are forwarded to the selected metric's
-        constructor, exposing metric-specific options (e.g. ``epsilon``,
-        ``max_iter``, ``tol``, ``relaxation`` for ``metric="wasserstein"``).
-        Passing an option the chosen metric does not accept raises ``TypeError``.
+        constructor, exposing metric-specific options (e.g. ``relaxation`` for
+        ``metric="wasserstein"``). Passing an option the chosen metric does not
+        accept raises ``TypeError``.
         """
         if layer_key is not None and obsm_key is not None:
             raise ValueError(
