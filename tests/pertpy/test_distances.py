@@ -44,6 +44,25 @@ def test_distance_class_initialization() -> None:
     assert distance_custom.obsm_key == "X_custom"
 
 
+def test_unused_categories_dropped() -> None:
+    """A zero-cell (unused) category in groupby is dropped, not kept as a NaN
+    group (shared subsetting on BaseMetric handles this for all metrics)."""
+    rng = np.random.default_rng(0)
+    cpg, nf = 15, 5
+    X = np.vstack(
+        [(rng.normal(size=(cpg, nf)) + i).astype(np.float32) for i in range(3)]
+    )
+    labels = [c for c in ["g0", "g1", "g2"] for _ in range(cpg)]
+    obs = pd.DataFrame(
+        {"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}
+    )
+    adata = AnnData(X.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(X, dtype=cp.float32)
+    df = Distance(metric="edistance").pairwise(adata, groupby="group")
+    assert list(df.index) == ["g0", "g1", "g2"]  # unused 'gZ' dropped
+    assert np.all(np.isfinite(df.values))
+
+
 def test_distance_class_invalid_metric() -> None:
     """Test Distance class raises error for unsupported metrics."""
     with pytest.raises(ValueError, match="Unknown metric"):

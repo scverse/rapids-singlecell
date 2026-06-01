@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from rapids_singlecell._utils import parse_device_ids
+from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 if TYPE_CHECKING:
@@ -69,6 +69,49 @@ class BaseMetric(ABC):
         if isinstance(data, (cp.ndarray, np.ndarray)):
             return data
         return np.asarray(data)
+
+    def _subset_to_groups(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[str]]:
+        """Subset the embedding to ``groupby`` and build its category mapping.
+
+        Unused (zero-cell) categories are always dropped so they never become
+        empty groups. When ``needed_groups`` is given, only those cells are kept
+        and a requested group with no cells raises ``ValueError``.
+
+        Returns
+        -------
+        embedding
+            Cell embeddings (CuPy) for the kept cells; input dtype preserved.
+        cat_offsets, cell_indices
+            Category offsets and the cell indices grouped by category.
+        groups_list
+            Ordered group names matching the category indices.
+        """
+        obs_col = adata.obs[groupby]
+        embedding_raw = self._get_embedding(adata)
+
+        if needed_groups is not None:
+            mask = obs_col.isin(needed_groups).values
+            obs_col = obs_col[mask].cat.remove_unused_categories()
+            embedding = cp.asarray(embedding_raw[mask])
+        else:
+            obs_col = obs_col.cat.remove_unused_categories()
+            embedding = cp.asarray(embedding_raw)
+
+        groups_list = list(obs_col.cat.categories)
+        if needed_groups is not None:
+            missing = sorted(set(needed_groups) - set(groups_list))
+            if missing:
+                raise ValueError(f"No cells found for groups: {missing}")
+        group_labels = cp.array(obs_col.cat.codes.values, dtype=cp.int32)
+        cat_offsets, cell_indices = _create_category_index_mapping(
+            group_labels, len(groups_list)
+        )
+        return embedding, cat_offsets, cell_indices, groups_list
 
     @staticmethod
     def _parse_contrasts(adata: AnnData, contrasts) -> tuple[str, list[str]]:
