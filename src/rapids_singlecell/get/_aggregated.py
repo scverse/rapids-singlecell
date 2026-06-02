@@ -329,6 +329,13 @@ class Aggregate:
                 (sums, indices, indptr),
                 shape=(self.n_cells.shape[0], self.data.shape[1]),
             )
+        if "sq_sum" in funcs:
+            sq_sums = cp.zeros(nnz + 1, dtype=cp.float64)
+            _scatter_sum(src_data * src_data, index, sq_sums)
+            results["sq_sum"] = cp_sparse.csr_matrix(
+                (sq_sums, indices, indptr),
+                shape=(self.n_cells.shape[0], self.data.shape[1]),
+            )
         if "var" in funcs or "mean" in funcs:
             means = cp.zeros(nnz + 1, dtype=cp.float64)
             var = cp.zeros(nnz + 1, dtype=cp.float64)
