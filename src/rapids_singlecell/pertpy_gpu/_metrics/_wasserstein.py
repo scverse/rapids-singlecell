@@ -1,11 +1,7 @@
-"""GPU-accelerated Wasserstein distance via batched Sinkhorn.
+"""GPU-accelerated entropic 2-Wasserstein between groups of cells.
 
-Computes entropy-regularized 2-Wasserstein between groups of cells. Pairs are
-split across GPUs and solved in memory-bounded batches; each pair is oriented
-with its larger group as the columns (the OT cost is symmetric, so this is
-free) so the cooperative-reduction Sinkhorn kernels stay well parallelized even
-for very large reference groups. See ``_sinkhorn`` and the ``_sinkhorn_cuda``
-kernels.
+Pairs are split across GPUs and solved in memory-bounded batches by the ragged
+batched Sinkhorn (see ``_sinkhorn`` and the ``_sinkhorn_cuda`` kernels).
 """
 
 from __future__ import annotations
@@ -27,7 +23,6 @@ from ._sinkhorn import (
     DEFAULT_MAX_ITER,
     DEFAULT_RELAXATION,
     DEFAULT_TOL,
-    batched_sinkhorn,
     finalize,
     make_state,
     run_async,
@@ -38,33 +33,140 @@ if TYPE_CHECKING:
 
     from anndata import AnnData
 
-# Fraction of free GPU memory to use for one Sinkhorn batch.
-MEMORY_BUDGET_FRACTION = 0.2
-# Bytes per cost-matrix cell: the padded cost tensor plus the transient gather
-# buffers used to build it (the fused distance kernel only needs the cost tensor
-# plus the small gathered-index arrays).
-BYTES_PER_PAIR_CELL_OVERHEAD = 2
-MIN_BATCH = 1
+# Per-batch cost-array byte budget. Fixed, not a fraction of free memory: under
+# an RMM pool allocator cudaMemGetInfo is unreliable (degenerates the batch).
+COST_BUDGET_BYTES = 8 * 1024**3
 MAX_BATCH = 4096
-# Over-relaxation bounds: omega = 1 is plain Sinkhorn, (1, 2) is the classic SOR
-# convergent range. Above 2 the iteration is unstable for any problem.
+# Max per-device work excess over ideal before round-robin batch assignment is
+# rejected for the work-balanced split (see _plan_device_batches).
+DEVICE_WORK_IMBALANCE_TOL = 0.2
+COST_TILE = 16  # must match constexpr int TILE in sinkhorn.cu
+# Over-relaxation: omega 1 = plain Sinkhorn; (1, 2) is the convergent SOR range.
 MIN_RELAXATION = 1.0
 MAX_RELAXATION = 2.0
 
 
-def _pair_batch_size(
-    max_n: int,
-    max_m: int,
-    itemsize: int,
-) -> int:
-    """Pick a batch size so the working tensors fit in the memory budget."""
-    free, _ = cp.cuda.runtime.memGetInfo()
-    budget = int(free * MEMORY_BUDGET_FRACTION)
-    per_pair_bytes = max(max_n * max_m, 1) * itemsize * BYTES_PER_PAIR_CELL_OVERHEAD
-    if per_pair_bytes == 0:
-        return MAX_BATCH
-    batch = max(MIN_BATCH, budget // max(per_pair_bytes, 1))
-    return int(min(batch, MAX_BATCH))
+def _build_ragged_layout(
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
+    rows_h: np.ndarray,
+    cols_h: np.ndarray,
+    *,
+    n_h: np.ndarray,
+    m_h: np.ndarray,
+    dtype,
+    rng: cp.random.Generator | None = None,
+) -> dict:
+    """Build the flat ragged index layout for one batch on the current device.
+
+    ``rows_h`` / ``cols_h`` (host group indices, smaller group as rows) and
+    ``n_h`` / ``m_h`` (host sizes) drive the build. Offsets and flat lengths are
+    computed host-side so the device work never syncs (lets devices' builds
+    overlap). ``rng`` resamples cells with replacement for the bootstrap.
+    """
+    B = len(rows_h)
+    n64 = n_h.astype(np.int64)
+    m64 = m_h.astype(np.int64)
+    cost_sizes = n64 * m64
+
+    def _excl_cumsum(sizes: np.ndarray) -> tuple[np.ndarray, int]:
+        off = np.zeros(B, dtype=np.int64)
+        if B > 1:
+            off[1:] = np.cumsum(sizes)[:-1]
+        return off, int(sizes.sum())
+
+    cost_off_h, total_cost = _excl_cumsum(cost_sizes)
+    f_off_h, total_rows = _excl_cumsum(n64)
+    g_off_h, total_cols = _excl_cumsum(m64)
+
+    n = cp.asarray(n_h.astype(np.int32))
+    m = cp.asarray(m_h.astype(np.int32))
+    cost_off = cp.asarray(cost_off_h)
+    f_off = cp.asarray(f_off_h)
+    g_off = cp.asarray(g_off_h)
+
+    # Flat row/column -> pair via searchsorted on the internal start offsets.
+    row2pair = cp.searchsorted(
+        f_off[1:], cp.arange(total_rows, dtype=cp.int64), side="right"
+    ).astype(cp.int32)
+    col2pair = cp.searchsorted(
+        g_off[1:], cp.arange(total_cols, dtype=cp.int64), side="right"
+    ).astype(cp.int32)
+
+    # Flat tile schedule (one TILE x TILE tile per block in build_cost).
+    ntn_h = (n_h.astype(np.int64) + COST_TILE - 1) // COST_TILE
+    ntm_h = (m_h.astype(np.int64) + COST_TILE - 1) // COST_TILE
+    tpp_h = ntn_h * ntm_h
+    tile_off_h, total_tiles = _excl_cumsum(tpp_h)
+    tile_off = cp.asarray(tile_off_h)
+    ntm = cp.asarray(ntm_h)
+    tile_pair = cp.searchsorted(
+        tile_off[1:], cp.arange(total_tiles, dtype=cp.int64), side="right"
+    ).astype(cp.int32)
+    t_local = cp.arange(total_tiles, dtype=cp.int64) - tile_off[tile_pair]
+    ntm_p = ntm[tile_pair]
+    tile_i0 = ((t_local // ntm_p) * COST_TILE).astype(cp.int32)
+    tile_j0 = ((t_local % ntm_p) * COST_TILE).astype(cp.int32)
+
+    # Flat gather indices into cell_indices (per-pair group offset + local pos).
+    offs_row = cat_offsets[cp.asarray(rows_h)].astype(cp.int64)
+    offs_col = cat_offsets[cp.asarray(cols_h)].astype(cp.int64)
+    if rng is None:
+        loc_r = cp.arange(total_rows, dtype=cp.int64) - f_off[row2pair]
+        loc_c = cp.arange(total_cols, dtype=cp.int64) - g_off[col2pair]
+    else:
+        # Resample with replacement to each group's own size (bootstrap).
+        loc_r = (
+            rng.random(total_rows, dtype=dtype) * n[row2pair].astype(dtype)
+        ).astype(cp.int64)
+        loc_c = (
+            rng.random(total_cols, dtype=dtype) * m[col2pair].astype(dtype)
+        ).astype(cp.int64)
+    gather_f = offs_row[row2pair] + loc_r
+    gather_g = offs_col[col2pair] + loc_c
+    cidx_l = cp.ascontiguousarray(cell_indices[gather_f].astype(cp.int32))
+    cidx_r = cp.ascontiguousarray(cell_indices[gather_g].astype(cp.int32))
+
+    return {
+        "B": B,
+        "n": n,
+        "m": m,
+        "cost_off": cost_off,
+        "f_off": f_off,
+        "g_off": g_off,
+        "row2pair": row2pair,
+        "col2pair": col2pair,
+        "tile_pair": tile_pair,
+        "tile_i0": tile_i0,
+        "tile_j0": tile_j0,
+        "cidx_l": cidx_l,
+        "cidx_r": cidx_r,
+        "total_cost": total_cost,
+        "total_rows": total_rows,
+        "total_cols": total_cols,
+        "total_tiles": total_tiles,
+    }
+
+
+def _launch_build_cost(
+    emb: cp.ndarray, layout: dict, cost: cp.ndarray, stream_ptr: int
+) -> None:
+    """Fill the flat ``cost`` array for a ragged ``layout`` (one kernel launch)."""
+    _sk.build_cost(
+        emb,
+        layout["cidx_l"],
+        layout["f_off"],
+        layout["cidx_r"],
+        layout["g_off"],
+        layout["n"],
+        layout["m"],
+        layout["cost_off"],
+        layout["tile_pair"],
+        layout["tile_i0"],
+        layout["tile_j0"],
+        cost,
+        stream_ptr,
+    )
 
 
 def _split_positions_by_work(
@@ -72,13 +174,8 @@ def _split_positions_by_work(
     n_right_host: np.ndarray,
     n_devices: int,
 ) -> list[int]:
-    """Partition pair positions ``[0, n)`` into ``n_devices`` contiguous,
-    work-balanced segments and return the ``n_devices + 1`` boundaries.
-
-    Per-pair work is proportional to ``n_left * n_right`` (the cost-matrix
-    size). Splitting by cumulative work keeps each device's solve time roughly
-    equal even when groups differ a lot in size. Done entirely on the host so
-    the multi-GPU launch phase never has to sync a device to plan its batches.
+    """Partition pair positions into ``n_devices`` contiguous segments of equal
+    cumulative work (``n_left * n_right``); returns ``n_devices + 1`` boundaries.
     """
     n = len(n_left_host)
     if n_devices <= 1 or n == 0:
@@ -98,87 +195,62 @@ def _split_positions_by_work(
 def _plan_batches(
     start: int,
     stop: int,
-    n_left_host: np.ndarray,
-    n_right_host: np.ndarray,
+    n_row_host: np.ndarray,
+    n_col_host: np.ndarray,
     itemsize: int,
-) -> list[tuple[int, int, int, int]]:
-    """Split pair positions ``[start, stop)`` into memory-bounded batches.
-
-    Returns ``(batch_start, batch_stop, max_n, max_m)`` per batch, all computed
-    from the host size arrays so planning never synchronizes a device.
+) -> list[tuple[int, int]]:
+    """Greedily pack ``[start, stop)`` into ``(batch_start, batch_stop)`` batches,
+    each capped by ``COST_BUDGET_BYTES`` of true cost cells (no padding) and
+    ``MAX_BATCH`` pairs. A single oversized pair gets its own batch.
     """
-    if stop <= start:
-        return []
-    batch = _pair_batch_size(
-        int(n_left_host[start:stop].max()),
-        int(n_right_host[start:stop].max()),
-        itemsize,
-    )
+    budget_cells = max(COST_BUDGET_BYTES // itemsize, 1)
     plans = []
-    for bstart in range(start, stop, batch):
-        bstop = min(bstart + batch, stop)
-        plans.append(
-            (
-                bstart,
-                bstop,
-                int(n_left_host[bstart:bstop].max()),
-                int(n_right_host[bstart:bstop].max()),
-            )
-        )
+    i = start
+    while i < stop:
+        cells = int(n_row_host[i]) * int(n_col_host[i])
+        j = i + 1
+        while j < stop and (j - i) < MAX_BATCH:
+            nxt = int(n_row_host[j]) * int(n_col_host[j])
+            if cells + nxt > budget_cells:
+                break
+            cells += nxt
+            j += 1
+        plans.append((i, j))
+        i = j
     return plans
 
 
-def _build_cost_indices(
-    cat_offsets: cp.ndarray,
-    cell_indices: cp.ndarray,
-    pair_left: cp.ndarray,
-    pair_right: cp.ndarray,
-    *,
-    max_n: int,
-    max_m: int,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Per-pair gather indices and padding masks for the cost build.
+def _plan_device_batches(
+    n_row_host: np.ndarray,
+    n_col_host: np.ndarray,
+    itemsize: int,
+    n_devices: int,
+) -> list[list[tuple[int, int]]]:
+    """Assign batches to devices, choosing the split per workload.
 
-    This is the cheap, allocation-y host-stream part of the build, kept separate
-    from the (heavy) ``_sk.build_cost`` kernel so several devices' cost kernels
-    can be launched back-to-back and overlap — interleaving the index
-    ``cudaMalloc``s with the kernels serializes them (cudaMalloc takes a
-    process-wide driver lock).
-
-    ``max_n`` / ``max_m`` are supplied by the caller (host-computed) so this
-    never syncs a device.
-
-    Returns
-    -------
-    cidx_l, cidx_r
-        ``(B, max_n)`` / ``(B, max_m)`` int32 cell-row indices into the
-        embedding; padded slots use clamped (in-bounds) indices.
-    mask_a, mask_b
-        ``(B, max_n)`` / ``(B, max_m)`` boolean real-point masks.
+    Round-robin dealing gives equal batch counts (equal rounds, no idle tail) and
+    balances work well when batches are many and small; the work-split (equal
+    cumulative ``n*m`` per device) is needed when a few big batches would
+    otherwise land on one device. Prefer round-robin when its estimated work
+    imbalance is within ``DEVICE_WORK_IMBALANCE_TOL``, else fall back.
     """
-    group_sizes = (cat_offsets[1:] - cat_offsets[:-1]).astype(cp.int32)
-    n_left = group_sizes[pair_left]
-    n_right = group_sizes[pair_right]
-    offs_left = cat_offsets[pair_left]
-    offs_right = cat_offsets[pair_right]
+    n_pairs = len(n_row_host)
+    if n_devices <= 1 or n_pairs == 0:
+        return [_plan_batches(0, n_pairs, n_row_host, n_col_host, itemsize)]
 
-    row_range_n = cp.arange(max_n, dtype=cp.int32)[None, :]
-    row_range_m = cp.arange(max_m, dtype=cp.int32)[None, :]
+    all_batches = _plan_batches(0, n_pairs, n_row_host, n_col_host, itemsize)
+    work = n_row_host.astype(np.int64) * n_col_host.astype(np.int64)
+    round_robin = [all_batches[i::n_devices] for i in range(n_devices)]
+    loads = [sum(int(work[s:e].sum()) for (s, e) in plan) for plan in round_robin]
+    ideal = sum(loads) / n_devices
+    if ideal > 0 and max(loads) / ideal - 1 <= DEVICE_WORK_IMBALANCE_TOL:
+        return round_robin
 
-    mask_a = cp.ascontiguousarray(row_range_n < n_left[:, None])
-    mask_b = cp.ascontiguousarray(row_range_m < n_right[:, None])
-
-    # Clamp local indices to a valid in-group position for padded slots; the
-    # mask filters them out later, but indexing must stay in-bounds.
-    local_n = cp.where(mask_a, row_range_n, cp.int32(0))
-    local_m = cp.where(mask_b, row_range_m, cp.int32(0))
-
-    flat_n = (offs_left[:, None] + local_n).astype(cp.intp)
-    flat_m = (offs_right[:, None] + local_m).astype(cp.intp)
-
-    cidx_l = cp.ascontiguousarray(cell_indices[flat_n].astype(cp.int32))
-    cidx_r = cp.ascontiguousarray(cell_indices[flat_m].astype(cp.int32))
-    return cidx_l, cidx_r, mask_a, mask_b
+    bounds = _split_positions_by_work(n_row_host, n_col_host, n_devices)
+    return [
+        _plan_batches(bounds[i], bounds[i + 1], n_row_host, n_col_host, itemsize)
+        for i in range(n_devices)
+    ]
 
 
 class WassersteinMetric(BaseMetric):
@@ -201,13 +273,10 @@ class WassersteinMetric(BaseMetric):
     obsm_key
         Key in ``adata.obsm`` for embeddings (default: ``'X_pca'``).
     relaxation
-        Over-relaxation factor for the Sinkhorn updates. ``1.0`` (default) is
-        plain Sinkhorn and matches OTT-JAX. Values in ``(1, 2)`` use successive
-        over-relaxation to cut the iteration count (roughly halved near
-        ``1.5``), trading a small change in the converged value (~1e-5 relative)
-        for speed. Too large a value (problem-dependent, often around ``1.7``)
-        makes the iteration diverge — it will then hit the iteration cap and
-        warn. Leave at ``1.0`` for reference-exact results.
+        Over-relaxation factor. ``1.0`` (default) is plain Sinkhorn and matches
+        OTT-JAX. Values in ``(1, 2)`` cut the iteration count (~halved near
+        ``1.5``) for a small change in the converged value; too large diverges
+        (hits the iteration cap and warns). Leave at ``1.0`` for exact results.
 
     References
     ----------
@@ -230,8 +299,7 @@ class WassersteinMetric(BaseMetric):
                 f"relaxation must be in [{MIN_RELAXATION}, {MAX_RELAXATION}); "
                 f"got {relaxation}."
             )
-        # Solver config fixed to OTT-JAX / pertpy defaults (not user-tunable);
-        # epsilon is always auto (epsilon_scale * std(C) per pair).
+        # Fixed to OTT-JAX / pertpy defaults (not user-tunable); eps is auto.
         self.epsilon_scale = DEFAULT_EPSILON_SCALE
         self.max_iter = DEFAULT_MAX_ITER
         self.tol = DEFAULT_TOL
@@ -250,16 +318,10 @@ class WassersteinMetric(BaseMetric):
     ) -> cp.ndarray:
         """Solve all (i, j) Sinkhorn problems, returning a flat ``(n_pairs,)`` array.
 
-        Each pair is oriented so the **larger** group is the columns (M) — valid
-        because the OT cost is symmetric, ``W(a, b) = W(b, a)`` — which keeps the
-        cooperative ``update_f`` reduction on the big axis and is what makes a
-        large reference group (e.g. a 75k control) fast.
-
-        Pairs are split across ``device_ids`` (work-balanced) and each device's
-        share is solved in memory-bounded batches. Within a batch-round the
-        per-iteration launches are dispatched to every device's stream in turn
-        (an async multi-stream work queue), so the GPUs overlap with no host
-        threads; only one batch per device is resident at a time.
+        Each pair is oriented larger-group-as-columns (the OT cost is symmetric)
+        so the cooperative ``update_f`` reduction runs on the big axis. Pairs are
+        split across ``device_ids`` and solved in batch-rounds, with per-iteration
+        launches interleaved across devices' streams so the GPUs overlap.
         """
         if device_ids is None:
             device_ids = [0]
@@ -270,11 +332,10 @@ class WassersteinMetric(BaseMetric):
         pl_host = np.asarray(pair_left, dtype=np.int32)
         pr_host = np.asarray(pair_right, dtype=np.int32)
         group_sizes = (cat_offsets[1:] - cat_offsets[:-1]).astype(cp.int32)
-        # Per-pair group sizes on the host (one sync). All batch planning below
-        # is then host-only.
+        # Group sizes to host (one sync) -> all batch planning is host-only.
         n_left = group_sizes[cp.asarray(pl_host)].get()
         n_right = group_sizes[cp.asarray(pr_host)].get()
-        # Orient larger group as columns (M); rows = smaller group (N).
+        # Orient larger group as columns.
         swap = n_left > n_right
         rows = np.where(swap, pr_host, pl_host)
         cols = np.where(swap, pl_host, pr_host)
@@ -282,11 +343,7 @@ class WassersteinMetric(BaseMetric):
         n_col = np.maximum(n_left, n_right)
         itemsize = cp.dtype(dtype).itemsize
 
-        bounds = _split_positions_by_work(n_row, n_col, len(device_ids))
-        plans = [
-            _plan_batches(bounds[i], bounds[i + 1], n_row, n_col, itemsize)
-            for i in range(len(device_ids))
-        ]
+        plans = _plan_device_batches(n_row, n_col, itemsize, len(device_ids))
 
         out = cp.empty(n_pairs, dtype=dtype)
         home = device_ids[0]
@@ -301,18 +358,13 @@ class WassersteinMetric(BaseMetric):
                 streams[dev] = cp.cuda.Stream(non_blocking=True)
                 with streams[dev]:
                     inputs[dev] = (
-                        (embedding, cat_offsets, cell_indices)
-                        if dev == home
-                        else (
-                            cp.asarray(embedding),
-                            cp.asarray(cat_offsets),
-                            cp.asarray(cell_indices),
-                        )
+                        cp.ascontiguousarray(cp.asarray(embedding)),
+                        cp.asarray(cat_offsets),
+                        cp.asarray(cell_indices),
                     )
 
-        # Per-device reusable cost buffers (grow-only): reused across rounds so
-        # the per-round cost tensor isn't a fresh synchronous cudaMalloc. Safe
-        # because a round's solve finishes before the next round overwrites it.
+        # Grow-only per-device cost buffers, reused across rounds (avoids a fresh
+        # cudaMalloc per round; safe since a round finishes before the next).
         cost_bufs: dict[int, cp.ndarray] = {}
         converged = True
         for r in range(max((len(p) for p in plans), default=0)):
@@ -322,45 +374,36 @@ class WassersteinMetric(BaseMetric):
                 if r < len(plans[di])
             ]
 
-            # Phase 1 (index): per-device gather indices + masks. These do the
-            # allocations, kept separate from the cost kernel so the kernels can
-            # launch back-to-back across devices and overlap.
+            # Phases are kept separate (layout/alloc, then cost kernels, then
+            # solve) so the per-device kernels launch back-to-back and overlap.
+            # Phase 1: per-device ragged layout.
             preps = []
-            for dev, start, stop, max_n, max_m in batch:
+            for dev, start, stop in batch:
                 _, off, idx = inputs[dev]
                 with cp.cuda.Device(dev), streams[dev]:
-                    cidx_l, cidx_r, mask_a, mask_b = _build_cost_indices(
+                    layout = _build_ragged_layout(
                         off,
                         idx,
-                        cp.asarray(rows[start:stop]),
-                        cp.asarray(cols[start:stop]),
-                        max_n=max_n,
-                        max_m=max_m,
+                        rows[start:stop],
+                        cols[start:stop],
+                        n_h=n_row[start:stop],
+                        m_h=n_col[start:stop],
+                        dtype=dtype,
                     )
-                preps.append(
-                    (dev, start, stop, max_n, max_m, cidx_l, cidx_r, mask_a, mask_b)
-                )
+                preps.append((dev, start, stop, layout))
 
-            # Phase 2 (cost): launch the fused cost kernels back-to-back into the
-            # reusable buffers (no cudaMalloc between launches), so the devices'
-            # builds overlap.
+            # Phase 2: build cost into the reusable buffers.
             units: list[dict] = []
-            for dev, start, stop, max_n, max_m, cidx_l, cidx_r, ma, mb in preps:
+            for dev, start, stop, layout in preps:
                 emb = inputs[dev][0]
                 with cp.cuda.Device(dev), streams[dev]:
-                    need = (stop - start) * max_n * max_m
+                    need = layout["total_cost"]
                     buf = cost_bufs.get(dev)
                     if buf is None or buf.size < need:
                         buf = cp.empty(need, dtype=dtype)
                         cost_bufs[dev] = buf
-                    cost = buf[:need].reshape(stop - start, max_n, max_m)
-                    _sk.build_cost(
-                        emb,
-                        cidx_l,
-                        cidx_r,
-                        cost,
-                        streams[dev].ptr,
-                    )
+                    cost = buf[:need]
+                    _launch_build_cost(emb, layout, cost, streams[dev].ptr)
                 units.append(
                     {
                         "dev": dev,
@@ -368,23 +411,20 @@ class WassersteinMetric(BaseMetric):
                         "start": start,
                         "stop": stop,
                         "cost": cost,
-                        "mask_a": ma,
-                        "mask_b": mb,
+                        "layout": layout,
                     }
                 )
 
-            # Phase 3 (state): per-pair solver state (auto-eps + potentials).
+            # Phase 3: per-pair solver state.
             for u in units:
                 with cp.cuda.Device(u["dev"]), u["stream"]:
                     u["state"] = make_state(
+                        u["layout"],
                         u["cost"],
-                        u["mask_a"],
-                        u["mask_b"],
-                        epsilon=None,
                         epsilon_scale=self.epsilon_scale,
                     )
 
-            # Phase 4: async multi-stream solve over this round's units, gather.
+            # Phase 4: solve across the round's units, then gather.
             run_async(
                 units,
                 max_iter=self.max_iter,
@@ -424,14 +464,11 @@ class WassersteinMetric(BaseMetric):
     ) -> tuple[cp.ndarray, cp.ndarray]:
         """Bootstrap per-pair mean/variance of W by resampling cells.
 
-        For each pair, draw ``n_bootstrap`` resamples of both groups (cells with
-        replacement, to the group's own size) and solve W for each. The resamples
-        differ only in their gathered cell indices, so all ``n_pairs *
-        n_bootstrap`` problems are solved together by the batched Sinkhorn (in
-        memory-bounded chunks) on a single device. All resample indices are drawn
-        in one up-front RNG pass so the result is reproducible regardless of how
-        the solve is later chunked. Returns per-pair ``(mean, var)`` over the
-        resamples (variance is population, ddof=0, matching pertpy).
+        Expands the pairs into ``n_pairs * n_bootstrap`` units (resampled with
+        replacement) and solves them in deterministic memory-bounded chunks on one
+        device. Chunk boundaries don't depend on data, so the single advancing RNG
+        is reproducible for a given ``random_state``. Variance is population
+        (ddof=0), matching pertpy.
         """
         if n_bootstrap < 1:
             raise ValueError(f"n_bootstrap must be >= 1, got {n_bootstrap}")
@@ -443,66 +480,45 @@ class WassersteinMetric(BaseMetric):
             emb = cp.ascontiguousarray(cp.asarray(embedding))
             offs = cp.asarray(cat_offsets)
             cidx = cp.asarray(cell_indices)
-            group_sizes = (offs[1:] - offs[:-1]).astype(cp.int32)
-            pl = cp.asarray(np.asarray(pair_left, np.int32))
-            pr = cp.asarray(np.asarray(pair_right, np.int32))
-            n_l = group_sizes[pl]
-            n_r = group_sizes[pr]
-            # Orient the larger group as columns (M); rows = smaller (N).
-            swap = n_l > n_r
-            row_grp = cp.where(swap, pr, pl)
-            col_grp = cp.where(swap, pl, pr)
-            n_row = cp.minimum(n_l, n_r)
-            n_col = cp.maximum(n_l, n_r)
-            # Expand each pair into n_bootstrap units (pair-major).
-            nrow_u = cp.repeat(n_row, n_bootstrap)
-            ncol_u = cp.repeat(n_col, n_bootstrap)
-            orow_u = cp.repeat(offs[row_grp], n_bootstrap)
-            ocol_u = cp.repeat(offs[col_grp], n_bootstrap)
+            # Sizes/orientation on the host so the per-chunk build never syncs.
+            co_h = cp.asnumpy(offs)
+            sizes_h = np.diff(co_h)
+            pl_h = np.asarray(pair_left, dtype=np.int64)
+            pr_h = np.asarray(pair_right, dtype=np.int64)
+            n_l = sizes_h[pl_h]
+            n_r = sizes_h[pr_h]
+            swap = n_l > n_r  # orient larger group as columns
+            row_grp = np.where(swap, pr_h, pl_h)
+            col_grp = np.where(swap, pl_h, pr_h)
+            n_row = np.minimum(n_l, n_r)
+            n_col = np.maximum(n_l, n_r)
+            # Expand each pair into n_bootstrap independently-resampled units.
+            rows_u = np.repeat(row_grp, n_bootstrap)
+            cols_u = np.repeat(col_grp, n_bootstrap)
+            nrow_u = np.repeat(n_row, n_bootstrap)
+            ncol_u = np.repeat(n_col, n_bootstrap)
             n_units = n_pairs * n_bootstrap
-            max_n = int(n_row.max().get())
-            max_m = int(n_col.max().get())
-
-            # Resample local positions in [0, n) with replacement; one RNG pass
-            # over all units keeps the draw independent of the solve chunking.
-            rng = cp.random.default_rng(random_state)
-            rr = cp.arange(max_n, dtype=cp.int32)[None, :]
-            rc = cp.arange(max_m, dtype=cp.int32)[None, :]
-            mask_a = cp.ascontiguousarray(rr < nrow_u[:, None])
-            mask_b = cp.ascontiguousarray(rc < ncol_u[:, None])
-            loc_n = (
-                rng.random((n_units, max_n), dtype=dtype) * nrow_u[:, None]
-            ).astype(cp.int32)
-            loc_m = (
-                rng.random((n_units, max_m), dtype=dtype) * ncol_u[:, None]
-            ).astype(cp.int32)
-            gl = (orow_u[:, None] + cp.where(mask_a, loc_n, cp.int32(0))).astype(
-                cp.intp
-            )
-            gr = (ocol_u[:, None] + cp.where(mask_b, loc_m, cp.int32(0))).astype(
-                cp.intp
-            )
-            cidx_l_all = cidx[gl].astype(cp.int32)
-            cidx_r_all = cidx[gr].astype(cp.int32)
 
             reg = cp.empty(n_units, dtype=dtype)
             itemsize = cp.dtype(dtype).itemsize
-            chunk = _pair_batch_size(max_n, max_m, itemsize)
+            plans = _plan_batches(0, n_units, nrow_u, ncol_u, itemsize)
+            rng = cp.random.default_rng(random_state)
             stream = cp.cuda.get_current_stream()
             converged = True
-            for u0 in range(0, n_units, chunk):
-                u1 = min(u0 + chunk, n_units)
-                cidx_l = cp.ascontiguousarray(cidx_l_all[u0:u1])
-                cidx_r = cp.ascontiguousarray(cidx_r_all[u0:u1])
-                cost = cp.empty((u1 - u0, max_n, max_m), dtype=dtype)
-                _sk.build_cost(emb, cidx_l, cidx_r, cost, stream.ptr)
-                st = make_state(
-                    cost,
-                    cp.ascontiguousarray(mask_a[u0:u1]),
-                    cp.ascontiguousarray(mask_b[u0:u1]),
-                    epsilon=None,
-                    epsilon_scale=self.epsilon_scale,
+            for u0, u1 in plans:
+                layout = _build_ragged_layout(
+                    offs,
+                    cidx,
+                    rows_u[u0:u1],
+                    cols_u[u0:u1],
+                    n_h=nrow_u[u0:u1],
+                    m_h=ncol_u[u0:u1],
+                    dtype=dtype,
+                    rng=rng,
                 )
+                cost = cp.empty(layout["total_cost"], dtype=dtype)
+                _launch_build_cost(emb, layout, cost, stream.ptr)
+                st = make_state(layout, cost, epsilon_scale=self.epsilon_scale)
                 run_async(
                     [{"dev": device, "stream": stream, "state": st}],
                     max_iter=self.max_iter,
@@ -843,20 +859,35 @@ class WassersteinMetric(BaseMetric):
         if Xc.dtype != Yc.dtype:
             Yc = Yc.astype(Xc.dtype)
 
-        n_a, n_b = Xc.shape[0], Yc.shape[0]
-        sq_X = cp.sum(Xc * Xc, axis=1)
-        sq_Y = cp.sum(Yc * Yc, axis=1)
-        C = sq_X[:, None] + sq_Y[None, :] - 2.0 * (Xc @ Yc.T)
-        cost = cp.maximum(C, 0)[None, :, :]
-        mask_a = cp.ones((1, n_a), dtype=cp.bool_)
-        mask_b = cp.ones((1, n_b), dtype=cp.bool_)
-        out = batched_sinkhorn(
-            cost,
-            mask_a,
-            mask_b,
-            epsilon_scale=self.epsilon_scale,
+        n_a, n_b = int(Xc.shape[0]), int(Yc.shape[0])
+        emb = cp.ascontiguousarray(cp.concatenate([Xc, Yc], axis=0))
+        cat_offsets = cp.asarray([0, n_a, n_a + n_b], dtype=cp.int32)
+        cell_indices = cp.arange(n_a + n_b, dtype=cp.int32)
+        # Single pair (groups 0 and 1), smaller group oriented as rows.
+        if n_a <= n_b:
+            rows_h, cols_h, n_h, m_h = (0, 1, n_a, n_b)
+        else:
+            rows_h, cols_h, n_h, m_h = (1, 0, n_b, n_a)
+        layout = _build_ragged_layout(
+            cat_offsets,
+            cell_indices,
+            np.array([rows_h], dtype=np.int64),
+            np.array([cols_h], dtype=np.int64),
+            n_h=np.array([n_h], dtype=np.int64),
+            m_h=np.array([m_h], dtype=np.int64),
+            dtype=emb.dtype,
+        )
+        cost = cp.empty(layout["total_cost"], dtype=emb.dtype)
+        stream = cp.cuda.get_current_stream()
+        _launch_build_cost(emb, layout, cost, stream.ptr)
+        st = make_state(layout, cost, epsilon_scale=self.epsilon_scale)
+        run_async(
+            [{"dev": cp.cuda.runtime.getDevice(), "stream": stream, "state": st}],
             max_iter=self.max_iter,
             tol=self.tol,
-            relaxation=self.relaxation,
+            check_every=DEFAULT_CHECK_EVERY,
+            omega=self.relaxation,
         )
-        return float(out[0])
+        if not bool(st["conv"].all().get()):
+            self._warn_not_converged()
+        return float(finalize(st)[0])

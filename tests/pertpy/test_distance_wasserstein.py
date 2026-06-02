@@ -7,8 +7,16 @@ import pytest
 from anndata import AnnData
 
 from rapids_singlecell.pertpy_gpu import Distance, MeanVar
-from rapids_singlecell.pertpy_gpu._metrics._sinkhorn import batched_sinkhorn
-from rapids_singlecell.pertpy_gpu._metrics._wasserstein import WassersteinMetric
+from rapids_singlecell.pertpy_gpu._metrics._sinkhorn import (
+    finalize,
+    make_state,
+    run_async,
+)
+from rapids_singlecell.pertpy_gpu._metrics._wasserstein import (
+    WassersteinMetric,
+    _build_ragged_layout,
+    _launch_build_cost,
+)
 
 
 def _make_grouped_adata(
@@ -71,12 +79,67 @@ def _logsumexp(x, axis):
     return np.log(np.exp(x - m).sum(axis=axis)) + np.squeeze(m, axis=axis)
 
 
+def _ragged_solve(pairs, *, eps=None, max_iter=5000, tol=1e-10, omega=1.0):
+    """Solve a list of ``(X, Y)`` pairs through the ragged Sinkhorn path.
+
+    Concatenates the pairs into one embedding (each pair is two groups), builds
+    the flat no-padding layout the production code uses, and runs the solver.
+    Returns ``(reg_ot_cost (n_pairs,), state)``. ``eps`` (scalar or per-pair)
+    overrides the regularization; otherwise it is auto ``0.05 * std(C)``.
+    """
+    dtype = cp.asarray(pairs[0][0]).dtype
+    blocks = []
+    offs = [0]
+    rows_h, cols_h, n_h, m_h = [], [], [], []
+    g = 0
+    for X, Y in pairs:
+        Xc = cp.ascontiguousarray(cp.asarray(X, dtype=dtype))
+        Yc = cp.ascontiguousarray(cp.asarray(Y, dtype=dtype))
+        blocks += [Xc, Yc]
+        na, nb = int(Xc.shape[0]), int(Yc.shape[0])
+        start = offs[-1]
+        offs += [start + na, start + na + nb]
+        gx, gy = g, g + 1
+        g += 2
+        # Orient the smaller group as rows (matches the production path).
+        if na <= nb:
+            rows_h.append(gx), cols_h.append(gy), n_h.append(na), m_h.append(nb)
+        else:
+            rows_h.append(gy), cols_h.append(gx), n_h.append(nb), m_h.append(na)
+    emb = cp.ascontiguousarray(cp.concatenate(blocks, axis=0))
+    cat_offsets = cp.asarray(offs, dtype=cp.int32)
+    cell_indices = cp.arange(offs[-1], dtype=cp.int32)
+    layout = _build_ragged_layout(
+        cat_offsets,
+        cell_indices,
+        np.asarray(rows_h, dtype=np.int64),
+        np.asarray(cols_h, dtype=np.int64),
+        n_h=np.asarray(n_h, dtype=np.int64),
+        m_h=np.asarray(m_h, dtype=np.int64),
+        dtype=dtype,
+    )
+    cost = cp.empty(layout["total_cost"], dtype=dtype)
+    stream = cp.cuda.get_current_stream()
+    _launch_build_cost(emb, layout, cost, stream.ptr)
+    st = make_state(layout, cost, epsilon_scale=0.05)
+    if eps is not None:
+        st["eps"][:] = cp.asarray(eps, dtype=dtype)
+    run_async(
+        [{"dev": cp.cuda.runtime.getDevice(), "stream": stream, "state": st}],
+        max_iter=max_iter,
+        tol=tol,
+        check_every=20,
+        omega=omega,
+    )
+    return finalize(st), st
+
+
 # ---------------------------------------------------------------------------
-# Sinkhorn solver unit tests
+# Sinkhorn solver unit tests (ragged / no-padding layout)
 # ---------------------------------------------------------------------------
 
 
-def test_batched_sinkhorn_matches_cpu_reference_single_pair() -> None:
+def test_ragged_sinkhorn_matches_cpu_reference_single_pair() -> None:
     rng = np.random.default_rng(0)
     n_a, n_b, d = 25, 30, 6
     X = rng.normal(size=(n_a, d)).astype(np.float64)
@@ -85,127 +148,64 @@ def test_batched_sinkhorn_matches_cpu_reference_single_pair() -> None:
 
     eps = 0.1
     cpu_val = _cpu_sinkhorn(X, Y, eps=eps)
-
-    Xc, Yc = cp.asarray(X), cp.asarray(Y)
-    C = cp.maximum(
-        cp.sum(Xc * Xc, 1)[:, None] + cp.sum(Yc * Yc, 1)[None, :] - 2 * Xc @ Yc.T,
-        0,
-    )
-    out = batched_sinkhorn(
-        C[None, :, :],
-        cp.ones((1, n_a), dtype=cp.bool_),
-        cp.ones((1, n_b), dtype=cp.bool_),
-        epsilon=cp.asarray([eps], dtype=cp.float64),
-        max_iter=5000,
-        tol=1e-10,
-    )
+    out, _ = _ragged_solve([(X, Y)], eps=eps, max_iter=5000, tol=1e-10)
     np.testing.assert_allclose(float(out[0]), cpu_val, rtol=1e-6, atol=1e-6)
 
 
-def test_batched_sinkhorn_padding_matches_unpadded() -> None:
-    """Padded batched run must equal solving each pair separately."""
+def test_ragged_sinkhorn_batch_matches_individual() -> None:
+    """A ragged batch of heterogeneous pairs equals solving each pair alone.
+
+    The ragged layout stores every pair flat with no padding, so this is the
+    no-padding analogue of the old "padded == unpadded" check: differently sized
+    pairs packed into one batch must not contaminate each other.
+    """
     rng = np.random.default_rng(1)
     shapes = [(20, 30, 5), (40, 25, 5), (15, 50, 5), (35, 35, 5)]
-    pairs = []
-    epsilons = []
-    for n_a, n_b, d in shapes:
-        X = cp.asarray(rng.normal(size=(n_a, d)).astype(np.float64))
-        Y = cp.asarray(rng.normal(size=(n_b, d)).astype(np.float64))
-        pairs.append((X, Y))
-        C = cp.maximum(
-            cp.sum(X * X, 1)[:, None] + cp.sum(Y * Y, 1)[None, :] - 2 * X @ Y.T,
-            0,
+    pairs = [
+        (
+            rng.normal(size=(n_a, d)).astype(np.float64),
+            rng.normal(size=(n_b, d)).astype(np.float64),
         )
-        epsilons.append(0.05 * float(cp.std(C)))
+        for n_a, n_b, d in shapes
+    ]
 
-    # Solve each pair on its own
-    singles = []
-    for (X, Y), eps in zip(pairs, epsilons):
-        n_a, n_b = X.shape[0], Y.shape[0]
-        C = cp.maximum(
-            cp.sum(X * X, 1)[:, None] + cp.sum(Y * Y, 1)[None, :] - 2 * X @ Y.T,
-            0,
-        )
-        out = batched_sinkhorn(
-            C[None, :, :],
-            cp.ones((1, n_a), dtype=cp.bool_),
-            cp.ones((1, n_b), dtype=cp.bool_),
-            epsilon=cp.asarray([eps], dtype=cp.float64),
-            max_iter=10000,
-            tol=1e-10,
-        )
-        singles.append(float(out[0]))
-
-    # Padded batched
-    max_n = max(s[0] for s in shapes)
-    max_m = max(s[1] for s in shapes)
-    B = len(shapes)
-    cost = cp.zeros((B, max_n, max_m), dtype=cp.float64)
-    mask_a = cp.zeros((B, max_n), dtype=cp.bool_)
-    mask_b = cp.zeros((B, max_m), dtype=cp.bool_)
-    eps_batch = cp.zeros(B, dtype=cp.float64)
-    for b, ((X, Y), eps) in enumerate(zip(pairs, epsilons)):
-        n_a, n_b = X.shape[0], Y.shape[0]
-        C = cp.maximum(
-            cp.sum(X * X, 1)[:, None] + cp.sum(Y * Y, 1)[None, :] - 2 * X @ Y.T,
-            0,
-        )
-        cost[b, :n_a, :n_b] = C
-        mask_a[b, :n_a] = True
-        mask_b[b, :n_b] = True
-        eps_batch[b] = eps
-
-    out = batched_sinkhorn(
-        cost, mask_a, mask_b, epsilon=eps_batch, max_iter=10000, tol=1e-10
+    batched, _ = _ragged_solve(pairs, max_iter=10000, tol=1e-10)
+    singles = np.array(
+        [float(_ragged_solve([p], max_iter=10000, tol=1e-10)[0][0]) for p in pairs]
     )
-    np.testing.assert_allclose(out.get(), np.asarray(singles), rtol=1e-7, atol=1e-7)
+    np.testing.assert_allclose(batched.get(), singles, rtol=1e-7, atol=1e-7)
 
 
-def test_batched_sinkhorn_auto_epsilon_uses_std() -> None:
+def test_ragged_sinkhorn_auto_epsilon_uses_std() -> None:
     """Auto-eps should equal scale * std(C), matching OTT-JAX convention."""
     rng = np.random.default_rng(2)
-    X = cp.asarray(rng.normal(size=(30, 6)).astype(np.float64))
-    Y = cp.asarray(rng.normal(size=(40, 6)).astype(np.float64))
-    C = cp.maximum(
-        cp.sum(X * X, 1)[:, None] + cp.sum(Y * Y, 1)[None, :] - 2 * X @ Y.T,
-        0,
-    )
-    expected_eps = 0.05 * float(cp.std(C))
-    auto_val = batched_sinkhorn(
-        C[None, :, :],
-        cp.ones((1, 30), dtype=cp.bool_),
-        cp.ones((1, 40), dtype=cp.bool_),
-        max_iter=5000,
-        tol=1e-10,
-    )
-    fixed_val = batched_sinkhorn(
-        C[None, :, :],
-        cp.ones((1, 30), dtype=cp.bool_),
-        cp.ones((1, 40), dtype=cp.bool_),
-        epsilon=cp.asarray([expected_eps], dtype=cp.float64),
-        max_iter=5000,
-        tol=1e-10,
-    )
+    X = rng.normal(size=(30, 6)).astype(np.float64)
+    Y = rng.normal(size=(40, 6)).astype(np.float64)
+    C = ((X[:, None, :] - Y[None, :, :]) ** 2).sum(-1)
+    expected_eps = 0.05 * float(np.std(C))
+
+    auto_val, st = _ragged_solve([(X, Y)], max_iter=5000, tol=1e-10)
+    np.testing.assert_allclose(float(st["eps"][0]), expected_eps, rtol=1e-6)
+    fixed_val, _ = _ragged_solve([(X, Y)], eps=expected_eps, max_iter=5000, tol=1e-10)
     np.testing.assert_allclose(float(auto_val[0]), float(fixed_val[0]), rtol=1e-10)
 
 
-def test_batched_sinkhorn_input_validation() -> None:
-    """Shape/dtype/epsilon guards raise; scalar epsilon is accepted."""
-    cost = cp.ones((2, 3, 4), dtype=cp.float32)
-    ma = cp.ones((2, 3), dtype=cp.bool_)
-    mb = cp.ones((2, 4), dtype=cp.bool_)
-    with pytest.raises(ValueError):  # cost not 3-D
-        batched_sinkhorn(cp.ones((3, 4), dtype=cp.float32), ma, mb)
-    with pytest.raises(ValueError):  # mask_a shape mismatch
-        batched_sinkhorn(cost, cp.ones((2, 5), dtype=cp.bool_), mb)
-    with pytest.raises(ValueError):  # mask_b shape mismatch
-        batched_sinkhorn(cost, ma, cp.ones((2, 9), dtype=cp.bool_))
-    with pytest.raises(TypeError):  # unsupported dtype
-        batched_sinkhorn(cp.ones((2, 3, 4), dtype=cp.int32), ma, mb)
-    with pytest.raises(ValueError):  # epsilon wrong shape
-        batched_sinkhorn(cost, ma, mb, epsilon=cp.ones((5,), dtype=cp.float32))
-    out = batched_sinkhorn(cost, ma, mb, epsilon=0.5, max_iter=50)  # scalar epsilon
-    assert out.shape == (2,)
+def test_ragged_sinkhorn_rejects_non_float_cost() -> None:
+    """make_state guards the cost dtype (float32/float64 only)."""
+    cat_offsets = cp.asarray([0, 8, 18], dtype=cp.int32)
+    cell_indices = cp.arange(18, dtype=cp.int32)
+    layout = _build_ragged_layout(
+        cat_offsets,
+        cell_indices,
+        np.array([0], dtype=np.int64),
+        np.array([1], dtype=np.int64),
+        n_h=np.array([8], dtype=np.int64),
+        m_h=np.array([10], dtype=np.int64),
+        dtype=cp.float64,
+    )
+    int_cost = cp.ones(layout["total_cost"], dtype=cp.int32)
+    with pytest.raises(TypeError):
+        make_state(layout, int_cost, epsilon_scale=0.05)
 
 
 # ---------------------------------------------------------------------------

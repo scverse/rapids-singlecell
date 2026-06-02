@@ -1,37 +1,23 @@
-"""Batched log-domain Sinkhorn solver (nanobind/CUDA kernels).
+"""Batched log-domain Sinkhorn solver over a ragged (flat, no-padding) layout.
 
-Solves entropic-regularized optimal transport between many pairs of point
-clouds at once. Pairs in a batch are padded to a common shape; the per-pair
-return value matches OTT-JAX's ``reg_ot_cost``:
-
-    reg_ot_cost = f @ a + g @ b + eps * (log n_a + log n_b)   [uniform a, b]
-
-The solver is built from three CUDA kernels (the ``_sinkhorn_cuda`` nanobind
-extension): ``auto_eps`` (per-pair ``0.05 * std(C)``), ``update_g`` (parallel
-over the M axis), and ``update_f`` (one block per (pair, row), cooperative over
-the M axis). One launch handles a whole batch ("multiple Sinkhorns at once").
-
-The iteration loop lives in Python (:func:`run_async`) so it can dispatch work
-to several devices' streams without ever waiting mid-flight — an async
-multi-stream work queue. Convergence is decided per pair on the device (a
-``conv`` flag the update kernels short-circuit on); the host only reads it at
-the end of each ``check_every``-iteration super-step.
+Pairs of point clouds are stored flat with per-pair int64 offsets; the CUDA
+kernels (``_sinkhorn_cuda``: build_cost, auto_eps, update_g, update_f,
+check_convergence) solve a whole batch at once. The Python iteration loop
+(:func:`run_async`) dispatches per-iteration launches to several devices'
+streams and reads per-pair convergence at the end of each ``check_every``-step.
+The per-pair return matches OTT-JAX's ``reg_ot_cost = f@a + g@b + eps*(log n_a +
+log n_b)`` for uniform marginals.
 """
 
 from __future__ import annotations
-
-import warnings
 
 import cupy as cp
 
 from rapids_singlecell._cuda import _sinkhorn_cuda as _sk
 
-# Solver defaults. epsilon_scale and the max_iter cap match OTT-JAX / pertpy
-# (PointCloud relative-epsilon 0.05, Sinkhorn max_iterations 2000). tol is NOT
-# OTT's threshold (1e-3): OTT's threshold is a marginal-error criterion, ours is
-# the relative change in the potentials between iterations. At 1e-3 our criterion
-# yields only ~3e-4 relative error in reg_ot_cost; 1e-4 gives ~5e-6 (tighter than
-# OTT's effective default), so the result matches OTT at least as well.
+# Defaults match OTT-JAX/pertpy (eps scale 0.05, max_iter 2000). tol is our
+# potential-change criterion, not OTT's marginal threshold; 1e-4 gives ~5e-6
+# reg_ot_cost accuracy (tighter than OTT's default), so don't loosen it.
 DEFAULT_EPSILON_SCALE = 0.05
 DEFAULT_MAX_ITER = 2000
 DEFAULT_TOL = 1e-4
@@ -40,132 +26,103 @@ DEFAULT_RELAXATION = 1.0
 EPSILON_FLOOR = 1e-12
 
 
-def _validate(cost, mask_a, mask_b):
-    if cost.ndim != 3:
-        raise ValueError(f"cost must be 3-D (B, n, m), got shape {cost.shape}")
-    B, n, m = cost.shape
-    if mask_a.shape != (B, n):
-        raise ValueError(f"mask_a shape {mask_a.shape} != (B, n) = {(B, n)}")
-    if mask_b.shape != (B, m):
-        raise ValueError(f"mask_b shape {mask_b.shape} != (B, m) = {(B, m)}")
-
-
-def make_state(cost, mask_a, mask_b, *, epsilon, epsilon_scale):
-    """Build per-pair solver state on the *current* device.
-
-    ``cost`` is ``(B, N, M)``; orient the larger group as M (the caller's job)
-    for best parallelism. Returns a dict consumed by :func:`run_async`.
-    """
+def make_state(layout: dict, cost: cp.ndarray, *, epsilon_scale: float) -> dict:
+    """Build per-pair solver state (auto-eps + potentials) on the current device."""
     dtype = cost.dtype
     if dtype not in (cp.float32, cp.float64):
         raise TypeError(f"Sinkhorn supports float32/float64; got {dtype}")
-    B, N, M = cost.shape
-    cost = cp.ascontiguousarray(cost)
-    mask_a = cp.ascontiguousarray(mask_a.astype(cp.bool_))
-    mask_b = cp.ascontiguousarray(mask_b.astype(cp.bool_))
+    n = layout["n"]
+    m = layout["m"]
+    B = int(layout["B"])
+    total_rows = int(layout["total_rows"])
+    total_cols = int(layout["total_cols"])
 
-    na_s = cp.maximum(mask_a.sum(axis=1), 1).astype(dtype)
-    nb_s = cp.maximum(mask_b.sum(axis=1), 1).astype(dtype)
+    na_s = cp.maximum(n, 1).astype(dtype)
+    nb_s = cp.maximum(m, 1).astype(dtype)
     log_a = (-cp.log(na_s)).astype(dtype)
     log_b = (-cp.log(nb_s)).astype(dtype)
 
     eps = cp.empty(B, dtype=dtype)
-    if epsilon is None:
-        total = na_s * nb_s
-        _sk.auto_eps(
-            cost,
-            mask_a,
-            mask_b,
-            total,
-            float(epsilon_scale),
-            float(EPSILON_FLOOR),
-            eps,
-            cp.cuda.get_current_stream().ptr,
-        )
-    elif cp.isscalar(epsilon) or (
-        isinstance(epsilon, cp.ndarray) and epsilon.ndim == 0
-    ):
-        eps[:] = float(epsilon)
-        eps = cp.maximum(eps, dtype.type(EPSILON_FLOOR))
-    else:
-        eps = cp.ascontiguousarray(cp.asarray(epsilon, dtype=dtype))
-        if eps.shape != (B,):
-            raise ValueError(f"epsilon shape {eps.shape} != (B,) = ({B},)")
-        eps = cp.maximum(eps, dtype.type(EPSILON_FLOOR))
+    _sk.auto_eps(
+        cost,
+        layout["cost_off"],
+        n,
+        m,
+        float(epsilon_scale),
+        float(EPSILON_FLOOR),
+        eps,
+        cp.cuda.get_current_stream().ptr,
+    )
 
     return {
         "cost": cost,
-        "mask_a": mask_a,
-        "mask_b": mask_b,
+        "cost_off": layout["cost_off"],
+        "f_off": layout["f_off"],
+        "g_off": layout["g_off"],
+        "n": n,
+        "m": m,
+        "row2pair": layout["row2pair"],
+        "col2pair": layout["col2pair"],
         "na_s": na_s,
         "nb_s": nb_s,
         "log_a": log_a,
         "log_b": log_b,
         "eps": eps,
         "B": B,
-        "N": N,
-        "M": M,
         "dtype": dtype,
-        "f": cp.zeros((B, N), dtype=dtype),
-        "g": cp.zeros((B, M), dtype=dtype),
-        "f_prev": cp.empty((B, N), dtype=dtype),
-        "g_prev": cp.empty((B, M), dtype=dtype),
+        "f": cp.zeros(total_rows, dtype=dtype),
+        "g": cp.zeros(total_cols, dtype=dtype),
+        "f_prev": cp.zeros(total_rows, dtype=dtype),
+        "g_prev": cp.zeros(total_cols, dtype=dtype),
         "conv": cp.zeros(B, dtype=cp.int32),
     }
 
 
 def _step(st, *, will_check, tol, omega=DEFAULT_RELAXATION):
-    """Queue one Sinkhorn iteration on the current stream (no host sync).
-
-    ``omega`` is the over-relaxation factor passed to the update kernels;
-    ``omega == 1`` is plain Sinkhorn (Gauss-Seidel), ``omega in (1, 2)``
-    accelerates convergence but can diverge if too large.
-    """
+    """Queue one Sinkhorn iteration (no host sync). omega in [1, 2) over-relaxes."""
     f, g = st["f"], st["g"]
-    cost, ma, mb, conv, eps = (
-        st["cost"],
-        st["mask_a"],
-        st["mask_b"],
-        st["conv"],
-        st["eps"],
-    )
+    cost, conv, eps = st["cost"], st["conv"], st["eps"]
+    co, fo, go = st["cost_off"], st["f_off"], st["g_off"]
+    n, m, r2p, c2p = st["n"], st["m"], st["row2pair"], st["col2pair"]
     sp = cp.cuda.get_current_stream().ptr
     if will_check:
+        # Snapshot for the single-iteration change measured by check_convergence.
         cp.copyto(st["f_prev"], f)
         cp.copyto(st["g_prev"], g)
-    _sk.update_g(cost, ma, mb, f, eps, st["log_b"], conv, g, omega, sp)
-    _sk.update_f(cost, ma, mb, g, eps, st["log_a"], conv, f, omega, sp)
+    _sk.update_g(cost, co, n, m, f, fo, g, go, c2p, eps, st["log_b"], conv, omega, sp)
+    _sk.update_f(cost, co, m, g, go, f, fo, r2p, eps, st["log_a"], conv, omega, sp)
     if will_check:
-        ma, mb = st["mask_a"], st["mask_b"]
-        df = cp.where(ma, cp.abs(f - st["f_prev"]), 0).max(axis=1)
-        dg = cp.where(mb, cp.abs(g - st["g_prev"]), 0).max(axis=1)
-        change = cp.maximum(df, dg)
-        scale = cp.maximum(
-            cp.where(ma, cp.abs(f), 0).max(axis=1),
-            cp.where(mb, cp.abs(g), 0).max(axis=1),
+        _sk.check_convergence(
+            f, st["f_prev"], fo, n, g, st["g_prev"], go, m, float(tol), conv, sp
         )
-        crit = (change / (scale + 1) < tol).astype(cp.int32)
-        cp.maximum(st["conv"], crit, out=st["conv"])
+
+
+def _segment_sum(values: cp.ndarray, starts: cp.ndarray, total: int) -> cp.ndarray:
+    """Per-pair sum over contiguous segments via a float64 prefix-sum difference.
+
+    Deterministic (unlike atomic scatter-add, which would make the bootstrap
+    variance vary run to run) and float64-accumulated for float32 potentials.
+    """
+    pref = cp.concatenate(
+        [cp.zeros(1, dtype=cp.float64), cp.cumsum(values.astype(cp.float64))]
+    )
+    ends = cp.concatenate([starts[1:], cp.asarray([total], dtype=starts.dtype)])
+    return pref[ends] - pref[starts]
 
 
 def finalize(st) -> cp.ndarray:
     """Per-pair reg_ot_cost from the converged potentials (current stream)."""
-    f, g, ma, mb = st["f"], st["g"], st["mask_a"], st["mask_b"]
-    fa = cp.where(ma, f, 0).sum(axis=1) / st["na_s"]
-    gb = cp.where(mb, g, 0).sum(axis=1) / st["nb_s"]
-    return fa + gb + st["eps"] * (cp.log(st["na_s"]) + cp.log(st["nb_s"]))
+    na, nb = st["na_s"], st["nb_s"]
+    fsum = _segment_sum(st["f"], st["f_off"], int(st["f"].size))
+    gsum = _segment_sum(st["g"], st["g_off"], int(st["g"].size))
+    reg = fsum / na + gsum / nb + st["eps"] * (cp.log(na) + cp.log(nb))
+    return reg.astype(st["dtype"])
 
 
 def run_async(units, *, max_iter, tol, check_every, omega=DEFAULT_RELAXATION):
-    """Run the Sinkhorn loop across ``units`` as an async multi-stream queue.
-
-    ``units`` is a list of ``{"dev": int, "stream": Stream, "state": state}``.
-    Within a ``check_every``-iteration super-step the per-iteration launches are
-    dispatched to every unit's stream in turn (so the devices' work queues stay
-    fed and overlap), then all streams are synced once and per-pair convergence
-    is read back. Stops once every pair on every unit has converged.
-
-    ``omega`` is the over-relaxation factor (see :func:`_step`).
+    """Run the Sinkhorn loop across ``units`` (one per device) as a multi-stream
+    queue: dispatch ``check_every`` iters to each stream, sync, read per-pair
+    convergence, and stop once every pair on every unit has converged.
     """
     cev = max(int(check_every), 1)
     it = 0
@@ -186,66 +143,3 @@ def run_async(units, *, max_iter, tol, check_every, omega=DEFAULT_RELAXATION):
                 done = done and bool(u["state"]["conv"].all().get())
         if done:
             break
-
-
-def batched_sinkhorn(
-    cost: cp.ndarray,
-    mask_a: cp.ndarray,
-    mask_b: cp.ndarray,
-    *,
-    epsilon: cp.ndarray | float | None = None,
-    epsilon_scale: float = DEFAULT_EPSILON_SCALE,
-    max_iter: int = DEFAULT_MAX_ITER,
-    tol: float = DEFAULT_TOL,
-    check_every: int = DEFAULT_CHECK_EVERY,
-    relaxation: float = DEFAULT_RELAXATION,
-) -> cp.ndarray:
-    """Solve ``B`` padded Sinkhorn problems on the current device.
-
-    Parameters
-    ----------
-    cost
-        ``(B, N, M)`` non-negative cost tensor (squared-Euclidean for
-        2-Wasserstein). Padded entries are ignored via the masks.
-    mask_a, mask_b
-        ``(B, N)`` / ``(B, M)`` boolean masks; ``True`` for real points.
-    epsilon
-        Per-pair regularization: ``(B,)`` array, scalar, or ``None`` (auto:
-        ``epsilon_scale * std(C)`` per pair, matching OTT-JAX).
-    epsilon_scale, max_iter, tol, check_every
-        Auto-eps multiplier, iteration cap, relative tolerance, and convergence
-        check frequency.
-    relaxation
-        Over-relaxation factor ``omega``. ``1.0`` is plain Sinkhorn; values in
-        ``(1, 2)`` cut the iteration count (roughly 2x near ``1.5``) but can
-        diverge if too large for the problem.
-
-    Returns
-    -------
-    cp.ndarray
-        ``reg_ot_cost`` per pair, shape ``(B,)``.
-    """
-    _validate(cost, mask_a, mask_b)
-    st = make_state(cost, mask_a, mask_b, epsilon=epsilon, epsilon_scale=epsilon_scale)
-    units = [
-        {
-            "dev": cp.cuda.runtime.getDevice(),
-            "stream": cp.cuda.get_current_stream(),
-            "state": st,
-        }
-    ]
-    run_async(
-        units,
-        max_iter=max_iter,
-        tol=tol,
-        check_every=check_every,
-        omega=relaxation,
-    )
-    reg = finalize(st)
-    if not bool(st["conv"].all().get()):
-        warnings.warn(
-            f"Sinkhorn did not converge in {max_iter} iterations (tol={tol}).",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    return reg
