@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import numpy as np
 import pandas as pd
 from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
@@ -22,7 +23,6 @@ from ._utils._pseudobulk import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import numpy as np
     from scipy.sparse import csc_matrix as csc_matrix_cpu
     from scipy.sparse import csr_matrix as csr_matrix_cpu
 
@@ -50,6 +50,11 @@ def _subset_data(data, mask: np.ndarray):
     if isinstance(data, cp.ndarray) or cp_sparse.issparse(data):
         return data[cp.asarray(mask)]
     return data[mask]
+
+
+def _check_n_bootstrap(n_bootstrap: int) -> None:
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be a positive integer.")
 
 
 def _pairwise_squared_euclidean(
@@ -167,6 +172,247 @@ class PseudobulkMetric(BaseMetric):
         Y_mean = self._array_mean(Y)
         return float(self._distance_between_pairs(X_mean, Y_mean)[0])
 
+    # ------------------------------------------------------------------
+    # Bootstrap
+    #
+    # Pseudobulk distances depend only on the per-group mean vectors, so a
+    # bootstrap iteration just resamples cells (with replacement, each group
+    # to its own size), recomputes the K group means, and evaluates the same
+    # distance primitive used by the point estimate. We resample each group to
+    # its own size — matching the in-repo edistance bootstrap rather than
+    # pertpy, which resamples the second group to the first group's size.
+    # ------------------------------------------------------------------
+
+    def _bootstrap_structure(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+        group_names: list[str],
+    ) -> tuple[cp.ndarray, cp_sparse.csr_matrix, cp.ndarray, cp.ndarray]:
+        """Reorder cells into contiguous per-group blocks and precompute the
+        loop-invariant arrays a bootstrap needs.
+
+        Cells are ordered to match ``group_names`` (the canonical order from
+        :meth:`_get_group_means`) so a resample driven by a single generator
+        seeded with ``random_state`` produces the same draw sequence for
+        ``pairwise`` and ``onesided_distances`` whenever they cover the same
+        groups.
+
+        Returns
+        -------
+        X_sorted
+            Embedding gathered into group-contiguous order (K blocks).
+        avg_op
+            Sparse ``(K, n_cells)`` operator with ``1 / n_g`` on each group's
+            block, so ``avg_op @ X_sorted[idx]`` is the K resampled means.
+        cell_group_sizes
+            For each sorted cell, the size of its group (length ``n_cells``).
+        cell_group_offsets
+            For each sorted cell, the start offset of its group block
+            (length ``n_cells``). Resampling reduces to
+            ``floor(uniform * cell_group_sizes) + cell_group_offsets``.
+        """
+        obs_col = adata.obs[groupby]
+        data = self._get_embedding(adata)
+        if needed_groups is not None:
+            mask = obs_col.isin(needed_groups).to_numpy()
+            obs_col = obs_col[mask]
+            data = _subset_data(data, mask)
+
+        code_of = {name: idx for idx, name in enumerate(group_names)}
+        codes = obs_col.map(code_of).to_numpy().astype(np.intp)
+        order = np.argsort(codes, kind="stable")
+
+        X_sorted = _as_gpu_data(data)[cp.asarray(order)]
+
+        k = len(group_names)
+        group_sizes = np.bincount(codes, minlength=k)
+        cat_offsets = cp.asarray(
+            np.concatenate([[0], np.cumsum(group_sizes)]), dtype=cp.int64
+        )
+        group_sizes_gpu = cp.asarray(group_sizes, dtype=cp.int64)
+        avg_op = self._averaging_operator(cat_offsets, group_sizes_gpu, X_sorted.dtype)
+
+        # Per-cell helpers, materialized once and reused every iteration.
+        sizes_list = group_sizes.tolist()
+        cell_group_sizes = cp.repeat(group_sizes_gpu, sizes_list)
+        cell_group_offsets = cp.repeat(cat_offsets[:-1], sizes_list)
+        return X_sorted, avg_op, cell_group_sizes, cell_group_offsets
+
+    @staticmethod
+    def _averaging_operator(
+        cat_offsets: cp.ndarray,
+        group_sizes: cp.ndarray,
+        dtype: np.dtype,
+    ) -> cp_sparse.csr_matrix:
+        """Sparse ``(K, n_cells)`` mean operator: row ``g`` holds ``1 / n_g``
+        over its contiguous block of cells."""
+        k = group_sizes.shape[0]
+        sizes_list = group_sizes.get().tolist()
+        cell_group = cp.repeat(cp.arange(k), sizes_list)
+        inv_sizes = 1.0 / group_sizes.astype(cp.float64)
+        weights = inv_sizes[cell_group].astype(dtype)
+        n_cells = int(cat_offsets[-1])
+        col_idx = cp.arange(n_cells, dtype=cp.int32)
+        return cp_sparse.csr_matrix(
+            (weights, col_idx, cat_offsets.astype(cp.int32)),
+            shape=(k, n_cells),
+        )
+
+    @staticmethod
+    def _resample_indices(
+        rng: cp.random.Generator,
+        *,
+        cell_group_sizes: cp.ndarray,
+        cell_group_offsets: cp.ndarray,
+    ) -> cp.ndarray:
+        """Draw, per group, ``n_g`` cell positions with replacement and return
+        their global indices into the group-sorted embedding.
+
+        ``rng`` is reused across iterations — constructing a fresh generator
+        per iteration dominates the per-iteration cost for these small kernels.
+        """
+        n_cells = cell_group_sizes.shape[0]
+        if n_cells == 0:
+            return cp.empty(0, dtype=cp.int64)
+        random_floats = rng.random(n_cells, dtype=cp.float64)
+        local_idx = (random_floats * cell_group_sizes).astype(cp.int64)
+        # Guard the float-scaling against a value rounding up to n_g.
+        local_idx = cp.minimum(local_idx, cell_group_sizes - 1)
+        return local_idx + cell_group_offsets
+
+    @staticmethod
+    def _resampled_means(
+        X_sorted: cp.ndarray,
+        avg_op: cp_sparse.csr_matrix,
+        boot_idx: cp.ndarray,
+    ) -> cp.ndarray:
+        """Apply the averaging operator to a resample, yielding K means."""
+        means = avg_op @ X_sorted[boot_idx]
+        if cp_sparse.issparse(means):
+            means = means.toarray()
+        return means
+
+    def _pairwise_bootstrap(
+        self,
+        adata: AnnData,
+        groupby: str,
+        groups: Sequence[str] | None,
+        *,
+        n_bootstrap: int,
+        random_state: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        _check_n_bootstrap(n_bootstrap)
+        _, group_names = self._get_group_means(adata, groupby, groups)
+        X_sorted, avg_op, cell_group_sizes, cell_group_offsets = (
+            self._bootstrap_structure(adata, groupby, groups, group_names)
+        )
+
+        rng = cp.random.default_rng(random_state)
+        samples = []
+        for _ in range(n_bootstrap):
+            boot_idx = self._resample_indices(
+                rng,
+                cell_group_sizes=cell_group_sizes,
+                cell_group_offsets=cell_group_offsets,
+            )
+            means = self._resampled_means(X_sorted, avg_op, boot_idx)
+            samples.append(self._pairwise_from_means(means))
+
+        cube = cp.stack(samples).astype(cp.float64)
+        mean = cp.mean(cube, axis=0)
+        variance = cp.var(cube, axis=0)
+
+        df = pd.DataFrame(mean.get(), index=group_names, columns=group_names)
+        df.index.name = groupby
+        df.columns.name = groupby
+        df.name = f"pairwise {self.metric_name}"
+
+        df_var = pd.DataFrame(variance.get(), index=group_names, columns=group_names)
+        df_var.index.name = groupby
+        df_var.columns.name = groupby
+        df_var.name = f"pairwise {self.metric_name} variance"
+        return df, df_var
+
+    def _onesided_bootstrap(
+        self,
+        adata: AnnData,
+        groupby: str,
+        selected_groups: list[str],
+        *,
+        needed_groups: Sequence[str] | None,
+        n_bootstrap: int,
+        random_state: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        _check_n_bootstrap(n_bootstrap)
+        _, group_names = self._get_group_means(adata, groupby, needed_groups)
+        group_map = {name: idx for idx, name in enumerate(group_names)}
+        selected_indices = [group_map[group] for group in selected_groups]
+
+        X_sorted, avg_op, cell_group_sizes, cell_group_offsets = (
+            self._bootstrap_structure(adata, groupby, needed_groups, group_names)
+        )
+        selected = cp.asarray(selected_indices, dtype=cp.intp)
+
+        rng = cp.random.default_rng(random_state)
+        samples = []
+        for _ in range(n_bootstrap):
+            boot_idx = self._resample_indices(
+                rng,
+                cell_group_sizes=cell_group_sizes,
+                cell_group_offsets=cell_group_offsets,
+            )
+            means = self._resampled_means(X_sorted, avg_op, boot_idx)
+            distances = self._distance_between_means(means, means[selected])
+            for column, selected_idx in enumerate(selected_indices):
+                distances[selected_idx, column] = 0
+            samples.append(distances)
+
+        cube = cp.stack(samples).astype(cp.float64)
+        mean = cp.mean(cube, axis=0)
+        variance = cp.var(cube, axis=0)
+
+        distances = pd.DataFrame(mean.get(), index=group_names, columns=selected_groups)
+        distances.index.name = groupby
+        distances.columns.name = "selected_group"
+
+        variances = pd.DataFrame(
+            variance.get(), index=group_names, columns=selected_groups
+        )
+        variances.index.name = groupby
+        variances.columns.name = "selected_group"
+        return distances, variances
+
+    def bootstrap_arrays(
+        self,
+        X,
+        Y,
+        *,
+        n_bootstrap: int = 100,
+        random_state: int = 0,
+    ) -> tuple[float, float]:
+        """Bootstrap mean and variance of the distance between two arrays.
+
+        Each iteration resamples ``X`` and ``Y`` independently with
+        replacement (each to its own size) and recomputes the distance.
+        """
+        _check_n_bootstrap(n_bootstrap)
+        X_gpu = _as_gpu_data(X)
+        Y_gpu = _as_gpu_data(Y)
+        if X_gpu.shape[0] == 0 or Y_gpu.shape[0] == 0:
+            raise ValueError("Neither X nor Y can be empty.")
+
+        rng = cp.random.default_rng(random_state)
+        n_x = X_gpu.shape[0]
+        n_y = Y_gpu.shape[0]
+        distances = np.empty(n_bootstrap, dtype=np.float64)
+        for i in range(n_bootstrap):
+            x_idx = rng.integers(0, n_x, size=n_x)
+            y_idx = rng.integers(0, n_y, size=n_y)
+            distances[i] = self.compute_distance(X_gpu[x_idx], Y_gpu[y_idx])
+        return float(np.mean(distances)), float(np.var(distances))
+
     def pairwise(
         self,
         adata: AnnData,
@@ -177,10 +423,14 @@ class PseudobulkMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> pd.DataFrame:
+    ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
         if bootstrap:
-            raise NotImplementedError(
-                f"Bootstrap is not implemented for metric '{self.metric_name}'."
+            return self._pairwise_bootstrap(
+                adata,
+                groupby,
+                groups,
+                n_bootstrap=n_bootstrap,
+                random_state=random_state,
             )
 
         means, group_names = self._get_group_means(adata, groupby, groups)
@@ -202,15 +452,29 @@ class PseudobulkMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> pd.Series | pd.DataFrame:
-        if bootstrap:
-            raise NotImplementedError(
-                f"Bootstrap is not implemented for metric '{self.metric_name}'."
-            )
-
+    ) -> (
+        pd.Series
+        | pd.DataFrame
+        | tuple[pd.Series, pd.Series]
+        | tuple[pd.DataFrame, pd.DataFrame]
+    ):
         selected_groups, single_control, needed_groups = self._resolve_onesided_inputs(
             adata, groupby, selected_group, groups
         )
+
+        if bootstrap:
+            distances, variances = self._onesided_bootstrap(
+                adata,
+                groupby,
+                selected_groups,
+                needed_groups=needed_groups,
+                n_bootstrap=n_bootstrap,
+                random_state=random_state,
+            )
+            if single_control:
+                key = selected_groups[0]
+                return distances[key], variances[key]
+            return distances, variances
 
         means, group_names = self._get_group_means(adata, groupby, needed_groups)
         group_map = {name: idx for idx, name in enumerate(group_names)}
