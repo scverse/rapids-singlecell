@@ -139,7 +139,7 @@ class BaseMetric(ABC):
         """Validate `selected_group`, normalize to a list, compute `needed` groups.
 
         Asserts that ``groupby`` is categorical and that every entry in
-        ``selected_group`` is one of its categories.
+        ``selected_group`` is one of its categories with at least one cell.
 
         Returns
         -------
@@ -162,6 +162,12 @@ class BaseMetric(ABC):
             raise ValueError(
                 f"Selected groups {missing} not found in groupby '{groupby}'"
             )
+
+        empty = set(selected_groups) - set(
+            adata.obs[groupby].cat.remove_unused_categories().cat.categories.values
+        )
+        if empty:
+            raise ValueError(f"No cells found for selected groups: {sorted(empty)}")
 
         needed = None
         if groups is not None:
