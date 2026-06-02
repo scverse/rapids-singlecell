@@ -239,7 +239,12 @@ class _RankGenes:
         self._compute_stats_in_chunks = False
 
         agg = Aggregate(groupby=self.labels.cat, data=self.X)
-        result = agg.count_mean_var(dof=1)
+        # Only sum and sq_sum are needed (means/vars are derived locally below);
+        # count_nonzero is only needed when comp_pts is requested.
+        funcs = {"sum", "sq_sum"}
+        if self.comp_pts:
+            funcs.add("count_nonzero")
+        result = agg.count_mean_var(funcs, dof=1)
 
         # Map Aggregate category order → selected groups order
         cat_names = list(self.labels.cat.categories)
