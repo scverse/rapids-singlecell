@@ -1,4 +1,8 @@
 #include <cuda_runtime.h>
+#include <nanobind/stl/optional.h>
+
+#include <optional>
+
 #include "../nb_types.h"
 
 #include "kernels_aggr.cuh"
@@ -8,54 +12,79 @@ using namespace nb::literals;
 constexpr int BLOCK_SIZE_SPARSE = 64;
 constexpr int BLOCK_SIZE_DENSE = 256;
 
-template <typename T, typename IdxT>
-static inline void launch_csr_aggr(const IdxT* indptr, const IdxT* index,
-                                   const T* data, double* out, const int* cats,
-                                   const bool* mask, size_t n_cells,
-                                   size_t n_genes, size_t n_groups,
-                                   cudaStream_t stream) {
-    dim3 grid((unsigned)n_cells);
+// Expand a runtime accumulator mask (1..7) into a compile-time MASK template
+// argument. Each kernel instantiation emits only the requested atomicAdds, so
+// inactive (null) output buffers are never written. Mask 0 means no output
+// buffer was provided, which is always a caller bug.
+#define AGGR_DISPATCH_MASK(active, LAUNCH)                                   \
+    switch (active) {                                                        \
+        case 1:                                                              \
+            LAUNCH(1);                                                       \
+            break;                                                           \
+        case 2:                                                              \
+            LAUNCH(2);                                                       \
+            break;                                                           \
+        case 3:                                                              \
+            LAUNCH(3);                                                       \
+            break;                                                           \
+        case 4:                                                              \
+            LAUNCH(4);                                                       \
+            break;                                                           \
+        case 5:                                                              \
+            LAUNCH(5);                                                       \
+            break;                                                           \
+        case 6:                                                              \
+            LAUNCH(6);                                                       \
+            break;                                                           \
+        case 7:                                                              \
+            LAUNCH(7);                                                       \
+            break;                                                           \
+        default:                                                             \
+            throw std::runtime_error(                                        \
+                "aggr: at least one of out_sum/out_count/out_sqsum must be " \
+                "provided");                                                 \
+    }
+
+template <typename T, typename IdxT, int MASK>
+static inline void launch_sparse_aggr(bool is_csc, const IdxT* indptr,
+                                      const IdxT* index, const T* data,
+                                      double* out_sum, double* out_count,
+                                      double* out_sqsum, const int* cats,
+                                      const bool* mask, size_t n_cells,
+                                      size_t n_genes, cudaStream_t stream) {
     dim3 block(BLOCK_SIZE_SPARSE);
-    csr_aggr_kernel<T, IdxT><<<grid, block, 0, stream>>>(
-        indptr, index, data, out, cats, mask, n_cells, n_genes, n_groups);
-    CUDA_CHECK_LAST_ERROR(csr_aggr_kernel);
+    if (is_csc) {
+        dim3 grid((unsigned)n_genes);
+        csc_aggr_kernel<T, IdxT, MASK><<<grid, block, 0, stream>>>(
+            indptr, index, data, out_sum, out_count, out_sqsum, cats, mask,
+            n_cells, n_genes);
+        CUDA_CHECK_LAST_ERROR(csc_aggr_kernel);
+    } else {
+        dim3 grid((unsigned)n_cells);
+        csr_aggr_kernel<T, IdxT, MASK><<<grid, block, 0, stream>>>(
+            indptr, index, data, out_sum, out_count, out_sqsum, cats, mask,
+            n_cells, n_genes);
+        CUDA_CHECK_LAST_ERROR(csr_aggr_kernel);
+    }
 }
 
-template <typename T, typename IdxT>
-static inline void launch_csc_aggr(const IdxT* indptr, const IdxT* index,
-                                   const T* data, double* out, const int* cats,
-                                   const bool* mask, size_t n_cells,
-                                   size_t n_genes, size_t n_groups,
-                                   cudaStream_t stream) {
-    dim3 grid((unsigned)n_genes);
-    dim3 block(BLOCK_SIZE_SPARSE);
-    csc_aggr_kernel<T, IdxT><<<grid, block, 0, stream>>>(
-        indptr, index, data, out, cats, mask, n_cells, n_genes, n_groups);
-    CUDA_CHECK_LAST_ERROR(csc_aggr_kernel);
-}
-
-template <typename T>
-static inline void launch_dense_aggr_C(const T* data, double* out,
-                                       const int* cats, const bool* mask,
-                                       size_t n_cells, size_t n_genes,
-                                       size_t n_groups, cudaStream_t stream) {
+template <typename T, int MASK>
+static inline void launch_dense_aggr(bool is_fortran, const T* data,
+                                     double* out_sum, double* out_count,
+                                     double* out_sqsum, const int* cats,
+                                     const bool* mask, size_t n_cells,
+                                     size_t n_genes, cudaStream_t stream) {
     dim3 block(BLOCK_SIZE_DENSE);
     dim3 grid(strided_grid((long long)n_cells * n_genes, BLOCK_SIZE_DENSE));
-    dense_aggr_kernel_C<T><<<grid, block, 0, stream>>>(
-        data, out, cats, mask, n_cells, n_genes, n_groups);
-    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_C);
-}
-
-template <typename T>
-static inline void launch_dense_aggr_F(const T* data, double* out,
-                                       const int* cats, const bool* mask,
-                                       size_t n_cells, size_t n_genes,
-                                       size_t n_groups, cudaStream_t stream) {
-    dim3 block(BLOCK_SIZE_DENSE);
-    dim3 grid(strided_grid((long long)n_cells * n_genes, BLOCK_SIZE_DENSE));
-    dense_aggr_kernel_F<T><<<grid, block, 0, stream>>>(
-        data, out, cats, mask, n_cells, n_genes, n_groups);
-    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_F);
+    if (is_fortran) {
+        dense_aggr_kernel_F<T, MASK><<<grid, block, 0, stream>>>(
+            data, out_sum, out_count, out_sqsum, cats, mask, n_cells, n_genes);
+        CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_F);
+    } else {
+        dense_aggr_kernel_C<T, MASK><<<grid, block, 0, stream>>>(
+            data, out_sum, out_count, out_sqsum, cats, mask, n_cells, n_genes);
+        CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_C);
+    }
 }
 
 template <typename T, typename IdxT, typename OutIdxT>
@@ -89,25 +118,29 @@ void def_sparse_aggr(nb::module_& m) {
         "sparse_aggr",
         [](gpu_array_c<const IdxT, Device> indptr,
            gpu_array_c<const IdxT, Device> index,
-           gpu_array_c<const T, Device> data, gpu_array_c<double, Device> out,
+           gpu_array_c<const T, Device> data,
+           std::optional<gpu_array_c<double, Device>> out_sum,
+           std::optional<gpu_array_c<double, Device>> out_count,
+           std::optional<gpu_array_c<double, Device>> out_sqsum,
            gpu_array_c<const int, Device> cats,
            gpu_array_c<const bool, Device> mask, size_t n_cells, size_t n_genes,
-           size_t n_groups, bool is_csc, std::uintptr_t stream) {
-            if (is_csc) {
-                launch_csc_aggr<T, IdxT>(indptr.data(), index.data(),
-                                         data.data(), out.data(), cats.data(),
-                                         mask.data(), n_cells, n_genes,
-                                         n_groups, (cudaStream_t)stream);
-            } else {
-                launch_csr_aggr<T, IdxT>(indptr.data(), index.data(),
-                                         data.data(), out.data(), cats.data(),
-                                         mask.data(), n_cells, n_genes,
-                                         n_groups, (cudaStream_t)stream);
-            }
+           bool is_csc, std::uintptr_t stream) {
+            double* ps = out_sum ? out_sum->data() : nullptr;
+            double* pc = out_count ? out_count->data() : nullptr;
+            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
+            int active = (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) |
+                         (pq ? AGGR_SQSUM : 0);
+#define LAUNCH(M)                                                     \
+    launch_sparse_aggr<T, IdxT, M>(                                   \
+        is_csc, indptr.data(), index.data(), data.data(), ps, pc, pq, \
+        cats.data(), mask.data(), n_cells, n_genes, (cudaStream_t)stream)
+            AGGR_DISPATCH_MASK(active, LAUNCH);
+#undef LAUNCH
         },
-        "indptr"_a, "index"_a, "data"_a, nb::kw_only(), "out"_a, "cats"_a,
-        "mask"_a, "n_cells"_a, "n_genes"_a, "n_groups"_a, "is_csc"_a,
-        "stream"_a = 0);
+        "indptr"_a, "index"_a, "data"_a, nb::kw_only(),
+        "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
+        "out_sqsum"_a = nb::none(), "cats"_a, "mask"_a, "n_cells"_a,
+        "n_genes"_a, "is_csc"_a, "stream"_a = 0);
 }
 
 template <typename T, typename DataContig, typename Device>
@@ -115,21 +148,28 @@ void def_dense_aggr(nb::module_& m) {
     m.def(
         "dense_aggr",
         [](gpu_array_contig<const T, Device, DataContig> data,
-           gpu_array_c<double, Device> out, gpu_array_c<const int, Device> cats,
+           std::optional<gpu_array_c<double, Device>> out_sum,
+           std::optional<gpu_array_c<double, Device>> out_count,
+           std::optional<gpu_array_c<double, Device>> out_sqsum,
+           gpu_array_c<const int, Device> cats,
            gpu_array_c<const bool, Device> mask, size_t n_cells, size_t n_genes,
-           size_t n_groups, bool is_fortran, std::uintptr_t stream) {
-            if constexpr (std::is_same_v<DataContig, nb::f_contig>) {
-                launch_dense_aggr_F<T>(data.data(), out.data(), cats.data(),
-                                       mask.data(), n_cells, n_genes, n_groups,
-                                       (cudaStream_t)stream);
-            } else {
-                launch_dense_aggr_C<T>(data.data(), out.data(), cats.data(),
-                                       mask.data(), n_cells, n_genes, n_groups,
-                                       (cudaStream_t)stream);
-            }
+           bool is_fortran, std::uintptr_t stream) {
+            double* ps = out_sum ? out_sum->data() : nullptr;
+            double* pc = out_count ? out_count->data() : nullptr;
+            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
+            int active = (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) |
+                         (pq ? AGGR_SQSUM : 0);
+            constexpr bool is_f = std::is_same_v<DataContig, nb::f_contig>;
+#define LAUNCH(M)                                                       \
+    launch_dense_aggr<T, M>(is_f, data.data(), ps, pc, pq, cats.data(), \
+                            mask.data(), n_cells, n_genes,              \
+                            (cudaStream_t)stream)
+            AGGR_DISPATCH_MASK(active, LAUNCH);
+#undef LAUNCH
         },
-        "data"_a, nb::kw_only(), "out"_a, "cats"_a, "mask"_a, "n_cells"_a,
-        "n_genes"_a, "n_groups"_a, "is_fortran"_a, "stream"_a = 0);
+        "data"_a, nb::kw_only(), "out_sum"_a = nb::none(),
+        "out_count"_a = nb::none(), "out_sqsum"_a = nb::none(), "cats"_a,
+        "mask"_a, "n_cells"_a, "n_genes"_a, "is_fortran"_a, "stream"_a = 0);
 }
 
 template <typename T, typename IdxT, typename OutIdxT, typename Device>
