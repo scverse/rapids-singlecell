@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import numpy as np
 import pandas as pd
 from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
 
+from rapids_singlecell._utils import _create_category_index_mapping
 from rapids_singlecell.get import X_to_GPU, aggregate
 from rapids_singlecell.preprocessing._utils import _get_mean_var
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
@@ -22,7 +24,6 @@ from ._utils._pseudobulk import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import numpy as np
     from scipy.sparse import csc_matrix as csc_matrix_cpu
     from scipy.sparse import csr_matrix as csr_matrix_cpu
 
@@ -50,6 +51,11 @@ def _subset_data(data, mask: np.ndarray):
     if isinstance(data, cp.ndarray) or cp_sparse.issparse(data):
         return data[cp.asarray(mask)]
     return data[mask]
+
+
+def _check_n_bootstrap(n_bootstrap: int) -> None:
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be a positive integer.")
 
 
 def _pairwise_squared_euclidean(
@@ -167,6 +173,216 @@ class PseudobulkMetric(BaseMetric):
         Y_mean = self._array_mean(Y)
         return float(self._distance_between_pairs(X_mean, Y_mean)[0])
 
+    def _subset_to_groups(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+    ) -> tuple[_GPUMatrixLike, cp.ndarray, cp.ndarray, list[str]]:
+        _assert_categorical_obs(adata, key=groupby)
+
+        obs_col = adata.obs[groupby]
+        data = self._get_embedding(adata)
+        if needed_groups is not None:
+            mask = obs_col.isin(needed_groups).to_numpy()
+            obs_col = obs_col[mask].cat.remove_unused_categories()
+            data = _subset_data(data, mask)
+
+        groups_list = list(obs_col.cat.categories)
+        group_labels = cp.asarray(obs_col.cat.codes.to_numpy(), dtype=cp.int32)
+        cat_offsets, cell_indices = _create_category_index_mapping(
+            group_labels, len(groups_list)
+        )
+        return _as_gpu_data(data), cat_offsets, cell_indices, groups_list
+
+    def _bootstrap_sample_cells(
+        self,
+        *,
+        cat_offsets: cp.ndarray,
+        cell_indices: cp.ndarray,
+        group_sizes_gpu: cp.ndarray,
+        seed: int,
+    ) -> cp.ndarray:
+        """Generate a bootstrap sample using edistance-style index semantics."""
+        rng = cp.random.default_rng(seed)
+        total_cells = cell_indices.shape[0]
+
+        if total_cells == 0:
+            return cell_indices
+
+        random_floats = rng.random(total_cells, dtype=cp.float32)
+        group_sizes_list = group_sizes_gpu.get().tolist()
+        cell_group_sizes = cp.repeat(group_sizes_gpu, group_sizes_list)
+        bootstrap_local_idx = (random_floats * cell_group_sizes).astype(cp.int32)
+        cell_group_offsets = cp.repeat(cat_offsets[:-1], group_sizes_list)
+        bootstrap_global_idx = bootstrap_local_idx + cell_group_offsets
+        return cell_indices[bootstrap_global_idx]
+
+    def _pairwise_bootstrap(
+        self,
+        adata: AnnData,
+        groupby: str,
+        groups: Sequence[str] | None,
+        *,
+        n_bootstrap: int,
+        random_state: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        _check_n_bootstrap(n_bootstrap)
+        embedding, cat_offsets, cell_indices, group_names = self._subset_to_groups(
+            adata, groupby, groups
+        )
+        group_sizes = cp.diff(cat_offsets)
+        group_sizes_cpu = group_sizes.get().astype(np.intp, copy=False)
+        boot_obs = pd.DataFrame(
+            {
+                groupby: pd.Categorical(
+                    np.repeat(group_names, group_sizes_cpu),
+                    categories=group_names,
+                )
+            }
+        )
+        boot_obs.index = boot_obs.index.astype(str)
+
+        mean = None
+        m2 = None
+        for i in range(n_bootstrap):
+            boot_cell_indices = self._bootstrap_sample_cells(
+                cat_offsets=cat_offsets,
+                cell_indices=cell_indices,
+                group_sizes_gpu=group_sizes,
+                seed=random_state + i,
+            )
+            tmp = AnnData(X=embedding[boot_cell_indices], obs=boot_obs.copy())
+            aggregated = aggregate(tmp, by=groupby, func="mean")
+            means = aggregated.layers["mean"]
+            if cp_sparse.issparse(means):
+                means = means.toarray()
+            distances = self._pairwise_from_means(means)
+            distances = distances.astype(cp.float64, copy=False)
+            if mean is None:
+                mean = distances.copy()
+                m2 = cp.zeros_like(distances)
+            else:
+                assert m2 is not None
+                count = i + 1
+                delta = distances - mean
+                mean = mean + delta / count
+                m2 = m2 + delta * (distances - mean)
+
+        assert mean is not None and m2 is not None
+        variance = m2 / n_bootstrap
+
+        df = pd.DataFrame(mean.get(), index=group_names, columns=group_names)
+        df.index.name = groupby
+        df.columns.name = groupby
+        df.name = f"pairwise {self.metric_name}"
+
+        df_var = pd.DataFrame(variance.get(), index=group_names, columns=group_names)
+        df_var.index.name = groupby
+        df_var.columns.name = groupby
+        df_var.name = f"pairwise {self.metric_name} variance"
+        return df, df_var
+
+    def _onesided_bootstrap(
+        self,
+        adata: AnnData,
+        groupby: str,
+        selected_groups: list[str],
+        *,
+        needed_groups: Sequence[str] | None,
+        n_bootstrap: int,
+        random_state: int,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        _check_n_bootstrap(n_bootstrap)
+        embedding, cat_offsets, cell_indices, group_names = self._subset_to_groups(
+            adata, groupby, needed_groups
+        )
+        group_map = {name: idx for idx, name in enumerate(group_names)}
+        selected_indices = [group_map[group] for group in selected_groups]
+        selected = cp.asarray(selected_indices, dtype=cp.intp)
+        group_sizes = cp.diff(cat_offsets)
+        group_sizes_cpu = group_sizes.get().astype(np.intp, copy=False)
+        boot_obs = pd.DataFrame(
+            {
+                groupby: pd.Categorical(
+                    np.repeat(group_names, group_sizes_cpu),
+                    categories=group_names,
+                )
+            }
+        )
+        boot_obs.index = boot_obs.index.astype(str)
+
+        mean = None
+        m2 = None
+        for i in range(n_bootstrap):
+            boot_cell_indices = self._bootstrap_sample_cells(
+                cat_offsets=cat_offsets,
+                cell_indices=cell_indices,
+                group_sizes_gpu=group_sizes,
+                seed=random_state + i,
+            )
+            tmp = AnnData(X=embedding[boot_cell_indices], obs=boot_obs.copy())
+            aggregated = aggregate(tmp, by=groupby, func="mean")
+            means = aggregated.layers["mean"]
+            if cp_sparse.issparse(means):
+                means = means.toarray()
+            distances = self._distance_between_means(means, means[selected])
+            for column, selected_idx in enumerate(selected_indices):
+                distances[selected_idx, column] = 0
+            distances = distances.astype(cp.float64, copy=False)
+            if mean is None:
+                mean = distances.copy()
+                m2 = cp.zeros_like(distances)
+            else:
+                assert m2 is not None
+                count = i + 1
+                delta = distances - mean
+                mean = mean + delta / count
+                m2 = m2 + delta * (distances - mean)
+
+        assert mean is not None and m2 is not None
+        variance = m2 / n_bootstrap
+
+        distances = pd.DataFrame(mean.get(), index=group_names, columns=selected_groups)
+        distances.index.name = groupby
+        distances.columns.name = "selected_group"
+
+        variances = pd.DataFrame(
+            variance.get(), index=group_names, columns=selected_groups
+        )
+        variances.index.name = groupby
+        variances.columns.name = "selected_group"
+        return distances, variances
+
+    def bootstrap_arrays(
+        self,
+        X,
+        Y,
+        *,
+        n_bootstrap: int = 100,
+        random_state: int = 0,
+    ) -> tuple[float, float]:
+        """Bootstrap mean and variance of the distance between two arrays.
+
+        Each iteration resamples ``X`` and ``Y`` independently with
+        replacement (each to its own size) and recomputes the distance.
+        """
+        _check_n_bootstrap(n_bootstrap)
+        X_gpu = _as_gpu_data(X)
+        Y_gpu = _as_gpu_data(Y)
+        if X_gpu.shape[0] == 0 or Y_gpu.shape[0] == 0:
+            raise ValueError("Neither X nor Y can be empty.")
+
+        rng = cp.random.default_rng(random_state)
+        n_x = X_gpu.shape[0]
+        n_y = Y_gpu.shape[0]
+        distances = np.empty(n_bootstrap, dtype=np.float64)
+        for i in range(n_bootstrap):
+            x_idx = rng.integers(0, n_x, size=n_x)
+            y_idx = rng.integers(0, n_y, size=n_y)
+            distances[i] = self.compute_distance(X_gpu[x_idx], Y_gpu[y_idx])
+        return float(np.mean(distances)), float(np.var(distances))
+
     def pairwise(
         self,
         adata: AnnData,
@@ -177,10 +393,14 @@ class PseudobulkMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> pd.DataFrame:
+    ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
         if bootstrap:
-            raise NotImplementedError(
-                f"Bootstrap is not implemented for metric '{self.metric_name}'."
+            return self._pairwise_bootstrap(
+                adata,
+                groupby,
+                groups,
+                n_bootstrap=n_bootstrap,
+                random_state=random_state,
             )
 
         means, group_names = self._get_group_means(adata, groupby, groups)
@@ -202,15 +422,29 @@ class PseudobulkMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> pd.Series | pd.DataFrame:
-        if bootstrap:
-            raise NotImplementedError(
-                f"Bootstrap is not implemented for metric '{self.metric_name}'."
-            )
-
+    ) -> (
+        pd.Series
+        | pd.DataFrame
+        | tuple[pd.Series, pd.Series]
+        | tuple[pd.DataFrame, pd.DataFrame]
+    ):
         selected_groups, single_control, needed_groups = self._resolve_onesided_inputs(
             adata, groupby, selected_group, groups
         )
+
+        if bootstrap:
+            distances, variances = self._onesided_bootstrap(
+                adata,
+                groupby,
+                selected_groups,
+                needed_groups=needed_groups,
+                n_bootstrap=n_bootstrap,
+                random_state=random_state,
+            )
+            if single_control:
+                key = selected_groups[0]
+                return distances[key], variances[key]
+            return distances, variances
 
         means, group_names = self._get_group_means(adata, groupby, needed_groups)
         group_map = {name: idx for idx, name in enumerate(group_names)}

@@ -407,3 +407,207 @@ def test_pseudobulk_single_group(metric: str) -> None:
         adata, groupby="group", selected_group="g0"
     )
     assert os.loc["g0"] == pytest.approx(0.0, abs=1e-7)
+
+
+# ============================================================================
+# Bootstrap
+# ============================================================================
+
+# r2_distance is asymmetric in onesided (ss_tot keyed off the row group), so
+# its onesided bootstrap is not the symmetrized pairwise row.
+SYMMETRIC_PSEUDOBULK_METRICS = tuple(
+    m for m in PSEUDOBULK_METRICS if m != "r2_distance"
+)
+
+
+@pytest.fixture
+def bootstrap_adata() -> tuple[AnnData, np.ndarray, np.ndarray]:
+    """Larger, well-separated dataset for stable bootstrap statistics."""
+    rng = np.random.default_rng(11)
+    n_groups, cells_per_group, n_features = 3, 60, 6
+    blocks = [
+        rng.normal(loc=i * 0.8, size=(cells_per_group, n_features))
+        for i in range(n_groups)
+    ]
+    X = np.vstack(blocks).astype(np.float32)
+    groups = np.array(
+        [f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)]
+    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups)})
+    adata = AnnData(X.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(X)
+    return adata, X, groups
+
+
+@pytest.mark.parametrize("metric", PSEUDOBULK_METRICS)
+def test_pseudobulk_pairwise_bootstrap_structure(
+    metric: str,
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    adata, _, _ = bootstrap_adata
+    result = Distance(metric=metric).pairwise(
+        adata, groupby="group", bootstrap=True, n_bootstrap=20, random_state=42
+    )
+
+    assert isinstance(result, tuple)
+    distances, variances = result
+    assert isinstance(distances, pd.DataFrame)
+    assert isinstance(variances, pd.DataFrame)
+    assert distances.shape == variances.shape == (3, 3)
+    assert list(distances.index) == list(variances.index)
+
+    # Self-distance mean and variance are 0; variances are non-negative.
+    np.testing.assert_allclose(np.diag(distances.values), 0, atol=1e-7)
+    np.testing.assert_allclose(np.diag(variances.values), 0, atol=1e-7)
+    assert np.all(variances.values >= 0)
+    # Off-diagonal variance is strictly positive for separated groups.
+    off_diag = ~np.eye(3, dtype=bool)
+    assert np.all(variances.values[off_diag] > 0)
+
+
+@pytest.mark.parametrize("metric", PSEUDOBULK_METRICS)
+def test_pseudobulk_bootstrap_reproducible(
+    metric: str,
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    adata, _, _ = bootstrap_adata
+    dist = Distance(metric=metric)
+    m1, v1 = dist.pairwise(
+        adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=7
+    )
+    m2, v2 = dist.pairwise(
+        adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=7
+    )
+    # Same seed reproduces results up to GPU float-accumulation noise.
+    np.testing.assert_allclose(m1.values, m2.values, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(v1.values, v2.values, rtol=1e-5, atol=1e-6)
+
+    # A different seed gives a genuinely different resample.
+    m3, _ = dist.pairwise(
+        adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=8
+    )
+    assert not np.allclose(m1.values, m3.values)
+
+
+@pytest.mark.parametrize("metric", PSEUDOBULK_METRICS)
+def test_pseudobulk_onesided_bootstrap_returns_tuple(
+    metric: str,
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    adata, _, _ = bootstrap_adata
+    result = Distance(metric=metric).onesided_distances(
+        adata,
+        groupby="group",
+        selected_group="g0",
+        bootstrap=True,
+        n_bootstrap=20,
+        random_state=42,
+    )
+    assert isinstance(result, tuple)
+    distances, variances = result
+    assert isinstance(distances, pd.Series)
+    assert isinstance(variances, pd.Series)
+    assert len(distances) == len(variances) == 3
+
+    assert distances.loc["g0"] == pytest.approx(0.0, abs=1e-7)
+    assert variances.loc["g0"] == pytest.approx(0.0, abs=1e-7)
+    assert np.all(variances.values >= 0)
+
+
+def test_pseudobulk_onesided_bootstrap_multiple_controls(
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    adata, _, _ = bootstrap_adata
+    distances, variances = Distance(metric="euclidean").onesided_distances(
+        adata,
+        groupby="group",
+        selected_group=["g0", "g1"],
+        bootstrap=True,
+        n_bootstrap=15,
+        random_state=3,
+    )
+    assert isinstance(distances, pd.DataFrame)
+    assert isinstance(variances, pd.DataFrame)
+    assert list(distances.columns) == ["g0", "g1"]
+    assert distances.loc["g0", "g0"] == pytest.approx(0.0, abs=1e-7)
+    assert distances.loc["g1", "g1"] == pytest.approx(0.0, abs=1e-7)
+
+
+@pytest.mark.parametrize("metric", SYMMETRIC_PSEUDOBULK_METRICS)
+def test_pseudobulk_onesided_bootstrap_matches_pairwise(
+    metric: str,
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    """With the same seed, the onesided row equals the pairwise column
+    (symmetric metrics): both resample identical group means."""
+    adata, _, _ = bootstrap_adata
+    dist = Distance(metric=metric)
+    pw_mean, pw_var = dist.pairwise(
+        adata, groupby="group", bootstrap=True, n_bootstrap=20, random_state=42
+    )
+    os_mean, os_var = dist.onesided_distances(
+        adata,
+        groupby="group",
+        selected_group="g0",
+        bootstrap=True,
+        n_bootstrap=20,
+        random_state=42,
+    )
+    np.testing.assert_allclose(
+        os_mean.values, pw_mean.loc[:, "g0"].values, rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        os_var.values, pw_var.loc[:, "g0"].values, rtol=1e-5, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("metric", TRUE_PSEUDOBULK_METRICS)
+def test_pseudobulk_bootstrap_mean_close_to_point_estimate(
+    metric: str,
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    """Bootstrap mean tracks the point estimate for low-bias metrics."""
+    adata, _, _ = bootstrap_adata
+    dist = Distance(metric=metric)
+    point = dist.pairwise(adata, groupby="group")
+    boot_mean, _ = dist.pairwise(
+        adata, groupby="group", bootstrap=True, n_bootstrap=100, random_state=0
+    )
+    off_diag = ~np.eye(3, dtype=bool)
+    np.testing.assert_allclose(
+        boot_mean.values[off_diag], point.values[off_diag], rtol=0.3
+    )
+
+
+@pytest.mark.parametrize("metric", PSEUDOBULK_METRICS)
+def test_pseudobulk_bootstrap_arrays(
+    metric: str,
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    """Distance.bootstrap(X, Y) returns a reproducible MeanVar for arrays."""
+    _, X, groups = bootstrap_adata
+    A = X[groups == "g0"]
+    B = X[groups == "g1"]
+    dist = Distance(metric=metric)
+
+    result = dist.bootstrap(A, B, n_bootstrap=50, random_state=1)
+    assert result.variance >= 0
+
+    again = dist.bootstrap(A, B, n_bootstrap=50, random_state=1)
+    assert result.mean == again.mean
+    assert result.variance == again.variance
+
+
+def test_pseudobulk_bootstrap_rejects_nonpositive_n_bootstrap(
+    bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
+) -> None:
+    adata, X, groups = bootstrap_adata
+    dist = Distance(metric="euclidean")
+    with pytest.raises(ValueError, match="n_bootstrap"):
+        dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=0)
+    with pytest.raises(ValueError, match="n_bootstrap"):
+        dist.onesided_distances(
+            adata, groupby="group", selected_group="g0", bootstrap=True, n_bootstrap=0
+        )
+    with pytest.raises(ValueError, match="n_bootstrap"):
+        dist.bootstrap(X[groups == "g0"], X[groups == "g1"], n_bootstrap=0)
