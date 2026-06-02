@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from pydantic import BeforeValidator, model_validator
+from pydantic_settings import SettingsConfigDict
 from scverse_misc import Settings
 
 from .verbosity import Verbosity
@@ -36,6 +37,8 @@ class _RscSettings(
     exported_object_name="settings",
     docstring_style="numpy",
 ):
+    model_config = SettingsConfigDict(extra="ignore")
+
     verbosity: Annotated[Verbosity, BeforeValidator(_coerce_verbosity)] = (
         Verbosity.warning
     )
