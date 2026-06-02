@@ -12,7 +12,6 @@ import pandas as pd
 from rapids_singlecell._cuda import _edistance_cuda as _ed
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
-    _create_category_index_mapping,
     _split_pairs,
 )
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
@@ -54,50 +53,6 @@ class EDistanceMetric(BaseMetric):
     ):
         """Initialize energy distance metric."""
         super().__init__(layer_key=layer_key, obsm_key=obsm_key)
-
-    def _subset_to_groups(
-        self,
-        adata: AnnData,
-        groupby: str,
-        needed_groups: Sequence[str] | None,
-    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[str]]:
-        """Subset embedding and category mapping to only the needed groups.
-
-        Parameters
-        ----------
-        adata
-            Annotated data matrix
-        groupby
-            Key in adata.obs for grouping
-        needed_groups
-            Group names to keep
-
-        Returns
-        -------
-        embedding
-            Cell embeddings for the subset
-        cat_offsets
-            Category offsets for the subset
-        cell_indices
-            Cell indices for the subset
-        groups_list
-            Ordered group names matching the category indices
-        """
-        obs_col = adata.obs[groupby]
-        embedding_raw = self._get_embedding(adata)
-
-        if needed_groups is not None:
-            mask = obs_col.isin(needed_groups).values
-            obs_col = obs_col[mask].cat.remove_unused_categories()
-            embedding = cp.asarray(embedding_raw[mask])
-        else:
-            embedding = cp.asarray(embedding_raw)
-
-        groups_list = list(obs_col.cat.categories)
-        group_labels = cp.array(obs_col.cat.codes.values, dtype=cp.int32)
-        k = len(groups_list)
-        cat_offsets, cell_indices = _create_category_index_mapping(group_labels, k)
-        return embedding, cat_offsets, cell_indices, groups_list
 
     def pairwise(
         self,
