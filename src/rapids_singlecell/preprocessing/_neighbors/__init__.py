@@ -187,6 +187,9 @@ def neighbors(
             f"Valid options are: {get_args(_Algorithms)}."
         )
 
+    if adata.shape[0] == 0:
+        raise ValueError("Cannot compute neighbors on empty AnnData (`n_obs == 0`).")
+
     if n_neighbors > adata.shape[0]:
         n_neighbors = 1 + int(0.5 * adata.shape[0])
         logg.warning(f"n_obs too small: adjusting to `n_neighbors = {n_neighbors}`")

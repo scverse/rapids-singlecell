@@ -101,7 +101,7 @@ class _LogFormatter(logging.Formatter):
             self._style._fmt = "--> {message}"
         elif record.levelno == DEBUG:
             self._style._fmt = "    {message}"
-        if record.time_passed:
+        if record.time_passed is not None:
             if record.time_passed.microseconds:
                 record.time_passed = timedelta(
                     seconds=int(record.time_passed.total_seconds())
@@ -112,7 +112,7 @@ class _LogFormatter(logging.Formatter):
                 )
             else:
                 self._style._fmt += " ({time_passed})"
-        if record.deep:
+        if record.deep is not None:
             record.msg = f"{record.msg}: {record.deep}"
         result = logging.Formatter.format(self, record)
         self._style._fmt = format_orig
