@@ -17,7 +17,11 @@ if TYPE_CHECKING:
 
 
 def draw_graph(
-    adata: AnnData, *, init_pos: str | bool | None = None, max_iter: int = 500
+    adata: AnnData,
+    *,
+    init_pos: str | bool | None = None,
+    max_iter: int = 500,
+    random_state: int | None = 0,
 ) -> None:
     """
     Force-directed graph drawing :cite:p:`Fruchterman1991,Jacomy2014`.
@@ -41,6 +45,10 @@ def draw_graph(
             No error occurs when the algorithm terminates in this manner.
             Good short-term quality can be achieved with 50-100 iterations.
             Above 1000 iterations is discouraged.
+        random_state
+            Random state to use when initializing layout and generating
+            samples. Defaults to 0. If `None` is passed, a hash of process id,
+            time, and hostname is used by `cugraph`.
 
     Returns
     -------
@@ -59,9 +67,11 @@ def draw_graph(
         case str() if init_pos in adata.obsm:
             init_coords = adata.obsm[init_pos]
         case str() if init_pos == "paga":
+            if random_state is None:
+                random_state = np.random.default_rng()
             init_coords = get_init_pos_from_paga(
                 adata,
-                **_random_state_kwargs(get_init_pos_from_paga, 0),
+                **_random_state_kwargs(get_init_pos_from_paga, random_state),
                 neighbors_key="connectivities",
             )
         case _:
@@ -95,12 +105,12 @@ def draw_graph(
         scaling_ratio=2.0,
         strong_gravity_mode=False,
         gravity=1.0,
-        random_state=0,
+        random_state=random_state,
     )
     positions = positions.sort_values("vertex").reset_index(drop=True)
     positions = cp.vstack((positions["x"].to_cupy(), positions["y"].to_cupy())).T
     layout = "fa"
     adata.uns["draw_graph"] = {}
-    adata.uns["draw_graph"]["params"] = {"layout": layout, "random_state": 0}
+    adata.uns["draw_graph"]["params"] = {"layout": layout, "random_state": random_state}
     key_added = f"X_draw_graph_{layout}"
     adata.obsm[key_added] = positions.get()  # Format output
