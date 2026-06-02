@@ -41,11 +41,17 @@ def _cuml_level_for(verbosity_level: int) -> object:
     return _cuml_logger.level_enum.error
 
 
-class _RootLogger(logging.RootLogger):
-    def __init__(self, level: int):
-        super().__init__(level)
-        self.propagate = False
-        _RootLogger.manager = logging.Manager(self)
+class _RsLogger(logging.Logger):
+    """Standard-hierarchy logger with scanpy-style ``time``/``deep`` helpers.
+
+    Unlike scanpy's isolated root logger, this lives in the normal
+    :mod:`logging` hierarchy and *propagates* to the stdlib root, so rsc log
+    records are visible to standard tooling (an application's logging config,
+    pytest's ``caplog``) like any other library logger -- while the package's
+    own :class:`_LogFormatter` handler still renders nicely formatted output.
+    Verbosity is enforced on the handler, not the logger, so the logger stays
+    permissive and capture tools see every record they ask for.
+    """
 
     def log(
         self,
@@ -126,7 +132,28 @@ def _default_logfile() -> TextIO:
     return sys.stdout if in_ipython else sys.stderr
 
 
-_root_logger = _RootLogger(WARNING)
+# The package's handler enforces verbosity; the logger stays permissive (see
+# _RsLogger). This tracks the current verbosity for handlers installed before
+# ``settings`` is initialised.
+_HANDLER_LEVEL = WARNING
+
+
+def _make_root_logger() -> _RsLogger:
+    prev_cls = logging.getLoggerClass()
+    logging.setLoggerClass(_RsLogger)
+    try:
+        logger = logging.getLogger("rapids_singlecell")
+    finally:
+        logging.setLoggerClass(prev_cls)
+    # Permissive level: records are always created and propagate to the stdlib
+    # root, so verbosity (enforced on the handler) never hides records from
+    # ``caplog`` or an application's logging configuration.
+    logger.setLevel(DEBUG)
+    logger.propagate = True
+    return logger
+
+
+_root_logger = _make_root_logger()
 
 
 def _install_handler(stream: TextIO) -> None:
@@ -135,13 +162,19 @@ def _install_handler(stream: TextIO) -> None:
         handler.close()
     h = logging.StreamHandler(stream)
     h.setFormatter(_LogFormatter())
-    h.setLevel(_root_logger.level)
+    h.setLevel(_HANDLER_LEVEL)
     _root_logger.addHandler(h)
 
 
 def _set_log_level(level: int) -> None:
-    """Apply ``level`` to the rsc root logger and propagate to cuml."""
-    _root_logger.setLevel(level)
+    """Apply ``level`` to the rsc handler(s) and propagate to cuml.
+
+    The level gates the package's handler rather than the logger, so the logger
+    stays permissive and standard capture tools (``caplog`` etc.) keep seeing
+    every record while verbosity still controls what is written to the stream.
+    """
+    global _HANDLER_LEVEL
+    _HANDLER_LEVEL = level
     for h in list(_root_logger.handlers):
         h.setLevel(level)
     try:

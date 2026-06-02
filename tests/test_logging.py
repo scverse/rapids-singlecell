@@ -17,14 +17,6 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture(autouse=True)
-def _caplog_adapter(caplog: pytest.LogCaptureFixture) -> Generator[None, None, None]:
-    """Attach caplog's handler to rsc's non-propagating root logger."""
-    log._root_logger.addHandler(caplog.handler)
-    yield
-    log._root_logger.removeHandler(caplog.handler)
-
-
-@pytest.fixture(autouse=True)
 def _reset_verbosity() -> Generator[None, None, None]:
     """Restore default verbosity after each test."""
     original = s.verbosity
@@ -32,14 +24,30 @@ def _reset_verbosity() -> Generator[None, None, None]:
     s.verbosity = original
 
 
-def test_defaults(caplog: pytest.LogCaptureFixture) -> None:
-    """Default verbosity is warning and a StreamHandler is installed at that level."""
+@pytest.fixture(autouse=True)
+def _restore_handler() -> Generator[None, None, None]:
+    """Reinstate a fresh handler on the real stream after each test.
+
+    Several tests point the handler at a captured stream (``capsys``) that is
+    closed on teardown; reinstalling here avoids leaving a closed-stream
+    handler that would raise ``I/O operation on closed file`` for later logs.
+    """
+    yield
+    log._install_handler(log._default_logfile())
+
+
+def test_defaults() -> None:
+    """Default verbosity is warning and a StreamHandler enforces it.
+
+    The logger itself stays permissive so records always propagate to the
+    stdlib root (and are visible to ``caplog``/logging config); verbosity is
+    enforced on the handler.
+    """
     assert Verbosity.warning == 1
 
-    # the handler installed by `rsc.logging` (excluding caplog's adapter handler)
-    [handler] = (h for h in log._root_logger.handlers if h is not caplog.handler)
+    [handler] = log._root_logger.handlers
     assert isinstance(handler, StreamHandler)
-    assert log._root_logger.level == s.verbosity.level
+    assert handler.level == s.verbosity.level
 
 
 def test_records(caplog: pytest.LogCaptureFixture) -> None:
@@ -50,11 +58,11 @@ def test_records(caplog: pytest.LogCaptureFixture) -> None:
     log.hint("3")
     log.debug("4")
     assert caplog.record_tuples == [
-        ("root", 40, "0"),
-        ("root", 30, "1"),
-        ("root", 20, "2"),
-        ("root", 15, "3"),
-        ("root", 10, "4"),
+        ("rapids_singlecell", 40, "0"),
+        ("rapids_singlecell", 30, "1"),
+        ("rapids_singlecell", 20, "2"),
+        ("rapids_singlecell", 15, "3"),
+        ("rapids_singlecell", 10, "4"),
     ]
 
 
