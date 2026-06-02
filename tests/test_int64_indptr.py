@@ -743,21 +743,24 @@ def test_sparse_aggr(dtype, is_csc):
     outs = {}
     for idx_dtype in (np.int32, np.int64):
         A = _make_csc(dtype, idx_dtype) if is_csc else _make_csr(dtype, idx_dtype)
-        out = cp.zeros((3, n_groups, N_COLS), dtype=cp.float64)
+        out_sum = cp.zeros((n_groups, N_COLS), dtype=cp.float64)
+        out_count = cp.zeros((n_groups, N_COLS), dtype=cp.float64)
+        out_sqsum = cp.zeros((n_groups, N_COLS), dtype=cp.float64)
         _aggr.sparse_aggr(
             A.indptr,
             A.indices,
             A.data,
-            out=out,
+            out_sum=out_sum,
+            out_count=out_count,
+            out_sqsum=out_sqsum,
             cats=cats,
             mask=mask,
             n_cells=N_ROWS,
             n_genes=N_COLS,
-            n_groups=n_groups,
             is_csc=is_csc,
             stream=_stream(),
         )
-        outs[idx_dtype] = out
+        outs[idx_dtype] = cp.stack([out_sum, out_count, out_sqsum])
     _eq(outs[np.int32], outs[np.int64])
 
 

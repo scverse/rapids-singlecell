@@ -2,39 +2,44 @@
 
 #include <cuda_runtime.h>
 
+// Compile-time selector for which raw accumulators a kernel writes. Combined as
+// a bitmask so each kernel instantiation emits only the atomicAdds (and only
+// touches the output buffers) that the caller actually requested. A null buffer
+// pointer is never dereferenced because its bit is absent from MASK.
+constexpr int AGGR_SUM = 1;    // sum of values
+constexpr int AGGR_COUNT = 2;  // count of nonzero entries
+constexpr int AGGR_SQSUM = 4;  // sum of squared values
+
 // sparse -> dense aggregate (CSR by cells), mask per cell, cats per cell
-template <typename T, typename IdxT>
-__global__ void csr_aggr_kernel(const IdxT* __restrict__ indptr,
-                                const IdxT* __restrict__ index,
-                                const T* __restrict__ data,
-                                double* __restrict__ out,
-                                const int* __restrict__ cats,
-                                const bool* __restrict__ mask, size_t n_cells,
-                                size_t n_genes, size_t n_groups) {
+template <typename T, typename IdxT, int MASK>
+__global__ void csr_aggr_kernel(
+    const IdxT* __restrict__ indptr, const IdxT* __restrict__ index,
+    const T* __restrict__ data, double* __restrict__ out_sum,
+    double* __restrict__ out_count, double* __restrict__ out_sqsum,
+    const int* __restrict__ cats, const bool* __restrict__ mask, size_t n_cells,
+    size_t n_genes) {
     size_t cell = blockIdx.x;
     if (cell >= n_cells || !mask[cell]) return;
     IdxT cell_start = indptr[cell];
     IdxT cell_end = indptr[cell + 1];
     size_t group = static_cast<size_t>(cats[cell]);
     for (IdxT p = cell_start + threadIdx.x; p < cell_end; p += blockDim.x) {
-        size_t gene_pos = static_cast<size_t>(index[p]);
+        size_t idx = group * n_genes + static_cast<size_t>(index[p]);
         double v = static_cast<double>(data[p]);
-        atomicAdd(&out[group * n_genes + gene_pos], v);
-        atomicAdd(&out[group * n_genes + gene_pos + n_genes * n_groups], 1.0);
-        atomicAdd(&out[group * n_genes + gene_pos + 2 * n_genes * n_groups],
-                  v * v);
+        if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
+        if constexpr (MASK & AGGR_COUNT) atomicAdd(&out_count[idx], 1.0);
+        if constexpr (MASK & AGGR_SQSUM) atomicAdd(&out_sqsum[idx], v * v);
     }
 }
 
 // sparse -> dense aggregate (CSC by genes), mask per cell, cats per cell
-template <typename T, typename IdxT>
-__global__ void csc_aggr_kernel(const IdxT* __restrict__ indptr,
-                                const IdxT* __restrict__ index,
-                                const T* __restrict__ data,
-                                double* __restrict__ out,
-                                const int* __restrict__ cats,
-                                const bool* __restrict__ mask, size_t n_cells,
-                                size_t n_genes, size_t n_groups) {
+template <typename T, typename IdxT, int MASK>
+__global__ void csc_aggr_kernel(
+    const IdxT* __restrict__ indptr, const IdxT* __restrict__ index,
+    const T* __restrict__ data, double* __restrict__ out_sum,
+    double* __restrict__ out_count, double* __restrict__ out_sqsum,
+    const int* __restrict__ cats, const bool* __restrict__ mask, size_t n_cells,
+    size_t n_genes) {
     size_t gene = blockIdx.x;
     if (gene >= n_genes) return;
     IdxT gene_start = indptr[gene];
@@ -43,10 +48,11 @@ __global__ void csc_aggr_kernel(const IdxT* __restrict__ indptr,
         size_t cell = static_cast<size_t>(index[p]);
         if (!mask[cell]) continue;
         size_t group = static_cast<size_t>(cats[cell]);
+        size_t idx = group * n_genes + gene;
         double v = static_cast<double>(data[p]);
-        atomicAdd(&out[group * n_genes + gene], v);
-        atomicAdd(&out[group * n_genes + gene + n_genes * n_groups], 1.0);
-        atomicAdd(&out[group * n_genes + gene + 2 * n_genes * n_groups], v * v);
+        if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
+        if constexpr (MASK & AGGR_COUNT) atomicAdd(&out_count[idx], 1.0);
+        if constexpr (MASK & AGGR_SQSUM) atomicAdd(&out_sqsum[idx], v * v);
     }
 }
 
@@ -93,13 +99,14 @@ __global__ void sparse_var_kernel(const IdxT* __restrict__ indptr,
 }
 
 // dense C-order aggregator
-template <typename T>
+template <typename T, int MASK>
 __global__ void dense_aggr_kernel_C(const T* __restrict__ data,
-                                    double* __restrict__ out,
+                                    double* __restrict__ out_sum,
+                                    double* __restrict__ out_count,
+                                    double* __restrict__ out_sqsum,
                                     const int* __restrict__ cats,
                                     const bool* __restrict__ mask,
-                                    size_t n_cells, size_t n_genes,
-                                    size_t n_groups) {
+                                    size_t n_cells, size_t n_genes) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     size_t N = n_cells * n_genes;
@@ -110,11 +117,12 @@ __global__ void dense_aggr_kernel_C(const T* __restrict__ data,
             size_t group = static_cast<size_t>(cats[cell]);
             double v = static_cast<double>(data[cell * n_genes + gene]);
             if (v != 0.0) {
-                atomicAdd(&out[group * n_genes + gene], v);
-                atomicAdd(&out[group * n_genes + gene + n_genes * n_groups],
-                          1.0);
-                atomicAdd(&out[group * n_genes + gene + 2 * n_genes * n_groups],
-                          v * v);
+                size_t idx = group * n_genes + gene;
+                if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
+                if constexpr (MASK & AGGR_COUNT)
+                    atomicAdd(&out_count[idx], 1.0);
+                if constexpr (MASK & AGGR_SQSUM)
+                    atomicAdd(&out_sqsum[idx], v * v);
             }
         }
         i += stride;
@@ -122,13 +130,14 @@ __global__ void dense_aggr_kernel_C(const T* __restrict__ data,
 }
 
 // dense F-order aggregator
-template <typename T>
+template <typename T, int MASK>
 __global__ void dense_aggr_kernel_F(const T* __restrict__ data,
-                                    double* __restrict__ out,
+                                    double* __restrict__ out_sum,
+                                    double* __restrict__ out_count,
+                                    double* __restrict__ out_sqsum,
                                     const int* __restrict__ cats,
                                     const bool* __restrict__ mask,
-                                    size_t n_cells, size_t n_genes,
-                                    size_t n_groups) {
+                                    size_t n_cells, size_t n_genes) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     size_t N = n_cells * n_genes;
@@ -139,11 +148,12 @@ __global__ void dense_aggr_kernel_F(const T* __restrict__ data,
             size_t group = static_cast<size_t>(cats[cell]);
             double v = static_cast<double>(data[gene * n_cells + cell]);
             if (v != 0.0) {
-                atomicAdd(&out[group * n_genes + gene], v);
-                atomicAdd(&out[group * n_genes + gene + n_genes * n_groups],
-                          1.0);
-                atomicAdd(&out[group * n_genes + gene + 2 * n_genes * n_groups],
-                          v * v);
+                size_t idx = group * n_genes + gene;
+                if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
+                if constexpr (MASK & AGGR_COUNT)
+                    atomicAdd(&out_count[idx], 1.0);
+                if constexpr (MASK & AGGR_SQSUM)
+                    atomicAdd(&out_sqsum[idx], v * v);
             }
         }
         i += stride;
