@@ -49,7 +49,9 @@ import importlib.metadata as md
 
 target = sys.argv[1]
 bad = []
-for name in ("cuda-bindings", "cuda-python", "cuda-core"):
+# cuda-bindings and cuda-python track the CUDA major in their version.
+# (cuda-core is intentionally excluded: it uses its own 0.x versioning.)
+for name in ("cuda-bindings", "cuda-python"):
     try:
         version = md.version(name)
     except md.PackageNotFoundError:
