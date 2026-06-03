@@ -7,7 +7,7 @@ channels:
 dependencies:
  - rapids=26.04
  - python=3.14
- - cuda-version=12.9
+ - cuda-version=12.8
  - cudnn
  - cutensor
  - cusparselt

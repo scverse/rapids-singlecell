@@ -135,7 +135,7 @@ jobs:
           docker build -t "${{ matrix.cibw_image }}" -f "${{ matrix.dockerfile }}" docker
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.1.4
+        uses: pypa/cibuildwheel@v3.4.1
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
           CIBW_BUILD: 'cp312-*'
@@ -167,7 +167,7 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude libcublas.so.${{ matrix.cuda_major }} --exclude libcublasLt.so.${{ matrix.cuda_major }} --exclude libcudart.so.${{ matrix.cuda_major }} --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cibw-wheels-${{ matrix.os }}-cu${{ matrix.cuda_major }}-${{ strategy.job-index }}
           path: ./wheelhouse/*.whl
@@ -179,7 +179,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build sdist
         run: pipx run build --sdist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cibw-sdist
           path: dist/*.tar.gz
@@ -195,7 +195,7 @@ jobs:
       matrix:
         cuda_major: ["12", "13"]
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: cibw-wheels-*-cu${{ matrix.cuda_major }}-*
           path: dist
@@ -211,7 +211,7 @@ jobs:
       id-token: write
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: cibw-sdist
           path: dist
