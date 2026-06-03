@@ -259,8 +259,8 @@ __global__ void ovo_rank_huge_kernel(
 }
 
 // ============================================================================
-// Tier 1 fused kernel: smem bitonic sort + binary search rank sums
-// For small groups (< ~2K cells).  No CUB, no global memory sort buffers.
+// LARGE-band fused kernel: smem bitonic sort + binary search rank sums
+// For groups up to OVO_LARGE_MAX cells.  No CUB, no global memory sort buffers.
 // Grid: (n_cols, n_groups), Block: min(large_padded, 512)
 // Shared memory: large_padded floats + 32 doubles (warp reduction)
 // ============================================================================
@@ -282,7 +282,7 @@ __global__ void ovo_rank_large_kernel(
     int g_end = grp_offsets[grp + 1];
     int n_grp = g_end - g_start;
 
-    // Size-gated dispatch: when co-launched with the Tier 0 warp kernel we
+    // Size-gated dispatch: when co-launched with the WARP kernel we
     // skip groups it's already handling.  Each group owns its own
     // rank_sums row, so the two kernels' writes never alias.
     if (n_grp <= skip_n_grp_le) return;
@@ -402,7 +402,7 @@ __global__ void ovo_rank_large_kernel(
 }
 
 // ============================================================================
-// Tier 2 helper: tie contribution of the sorted reference alone.
+// MEDIUM-band helper: tie contribution of the sorted reference alone.
 // One block per column.  The medium unsorted-rank kernel uses this as a base
 // and only adds group-only/overlap deltas from the unsorted group values.
 // ============================================================================
@@ -561,7 +561,7 @@ __global__ void ovo_rank_small_kernel(
 }
 
 // ============================================================================
-// Tier 2 fused kernel: no-sort direct rank for medium groups.
+// MEDIUM-band fused kernel: no-sort direct rank for medium groups.
 //
 // Avoids the smem bitonic sort for groups in (skip_n_grp_le,
 // max_n_grp_le].  Ranks are computed from ref binary searches plus an
@@ -667,7 +667,7 @@ __global__ void ovo_rank_medium_kernel(
 }
 
 // ============================================================================
-// Warp-scoped tie correction for Tier 0.
+// Warp-scoped tie correction for the WARP band.
 //
 // Sorted values live in a 32-lane register (one per lane, with unused lanes
 // carrying +INF).  Walks unique values via lane-step differentials and
@@ -833,7 +833,7 @@ __device__ __forceinline__ double warp_tie_delta(const float* ref_col,
 }
 
 // ============================================================================
-// Tier 0 fused kernel: warp-per-(col, group) pair, 8 warps packed per block.
+// WARP-band kernel: warp-per-(col, group) pair, 8 warps packed per block.
 //
 // Each warp independently:
 //   1. Loads ≤ 32 group values into a single register (one per lane,
@@ -844,7 +844,7 @@ __device__ __forceinline__ double warp_tie_delta(const float* ref_col,
 //   4. Warp-shuffle reduces to lane 0 and writes rank_sums / tie_corr.
 //
 // 8 (col, group) pairs per block cuts block count 8× vs the block-per-pair
-// Tier 1, and the lack of __syncthreads / smem sort lets each warp run
+// LARGE band, and the lack of __syncthreads / smem sort lets each warp run
 // independently at full throughput.
 //
 // Grid: (n_cols, ceil(n_groups / 8)), Block: 256.
@@ -871,7 +871,7 @@ __global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
     int n_grp = g_end - g_start;
 
     // This kernel only handles groups that fit in a single warp (one value
-    // per lane).  Larger groups are delegated to Tier 1/3 in a co-launched
+    // per lane).  Larger groups are delegated to LARGE/HUGE in a co-launched
     // kernel; since each group owns its own row in rank_sums/tie_corr, the
     // two kernels interlace into the output without conflict.
     if (n_grp > OVO_WARP_MAX) return;
@@ -949,7 +949,7 @@ __global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
         int n_eq_grp_total = n_eq_grp_offset + n_eq_grp_after;
         // Contribution: rank = n_lt_ref + n_lt_grp + (n_eq_ref +
         // n_eq_grp_total + 1) / 2, but we sum per lane so each tie lane
-        // gets the same mid-rank.  This matches the Tier 1 accumulation.
+        // gets the same mid-rank.  This matches the LARGE-band accumulation.
         local_sum = (double)(n_lt_ref + n_lt_grp) +
                     ((double)(n_eq_ref + n_eq_grp_total) + 1.0) / 2.0;
     }

@@ -310,10 +310,16 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
     int seg_start = col_seg_offsets[col];
     int seg_end = col_seg_offsets[col + 1];
 
+    // Packed layout matching cast_accumulate_smem_config, which sizes the
+    // dynamic smem as (1 + compute_sq_sums + compute_nnz) * n_groups doubles.
+    // s_nnz must follow only the arrays that are actually present: using a
+    // fixed 2*n_groups offset over-runs the allocation when sq-sums is off but
+    // nnz is on (the host OVR pts path), corrupting/faulting at larger
+    // n_groups.
     extern __shared__ double smem[];
     double* s_sum = smem;
     double* s_sq = smem + n_groups;
-    double* s_nnz = smem + 2 * n_groups;
+    double* s_nnz = smem + (compute_sq_sums ? 2 : 1) * n_groups;
 
     for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
         s_sum[g] = 0.0;

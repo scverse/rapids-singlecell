@@ -877,6 +877,93 @@ def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
             )
 
 
+# Regression guard for a shared-memory OOB write in the host sparse OVR
+# cast-and-accumulate kernel: it placed the per-group nnz accumulator at a fixed
+# 2*n_groups smem offset, but cast_accumulate_smem_config packs only the enabled
+# arrays -- and the host OVR path runs with sq-sums OFF, nnz ON (pts=True). The
+# overrun was benign at tiny n_groups (it landed in rounded smem slack, and the
+# write/read used the same wrong offset so values stayed self-consistent) but
+# caused an illegal memory access once n_groups grew past ~25. n_groups=50 +
+# pts=True is the faulting regime, with the smem (non-gmem) accumulator still
+# selected. Covers both host sparse formats (the ones that crashed) plus the
+# dense/device formats for full parity.
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
+)
+def test_wilcoxon_ovr_pts_many_groups_match_scanpy(fmt):
+    adata_gpu = _make_sized_groups_adata([40] * 50, n_genes=8, seed=4)
+    adata_cpu = adata_gpu.copy()
+    adata_gpu.X = _to_format(adata_gpu.X, fmt)
+
+    kw = {
+        "groupby": "group",
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": "rest",
+        "tie_correct": True,
+        "pts": True,
+        "n_genes": 8,
+    }
+    rsc.tl.rank_genes_groups(adata_gpu, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **kw)
+
+    gpu = adata_gpu.uns["rank_genes_groups"]
+    cpu = adata_cpu.uns["rank_genes_groups"]
+    for field in ("scores", "pvals"):
+        for group in gpu[field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(gpu[field][group], dtype=float),
+                np.asarray(cpu[field][group], dtype=float),
+                rtol=1e-13,
+                atol=1e-15,
+                equal_nan=True,
+            )
+    gpu_pts, cpu_pts = gpu["pts"], cpu["pts"]
+    assert list(gpu_pts.columns) == list(cpu_pts.columns)
+    for col in gpu_pts.columns:
+        np.testing.assert_allclose(
+            gpu_pts[col].values, cpu_pts[col].values, rtol=1e-13, atol=1e-15
+        )
+
+
+# Companion to test_wilcoxon_ovr_many_groups_gmem_formats_agree, with pts=True:
+# at gmem scale (n_groups > ~3056) the global cast-accumulate and the
+# analytic-zero rank kernel both drive the per-group nnz path. scanpy's
+# 3000+-group build is too slow for an in-suite parity check, so we assert every
+# storage format agrees, including the pts fraction-expressing matrix.
+def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
+    adata = _make_sized_groups_adata([26] * 3100, n_genes=6, seed=5)
+    ref = None
+    for fmt in ("numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"):
+        a = adata.copy()
+        a.X = _to_format(adata.X, fmt)
+        rsc.tl.rank_genes_groups(
+            a,
+            "group",
+            method="wilcoxon",
+            use_raw=False,
+            reference="rest",
+            tie_correct=True,
+            pts=True,
+            n_genes=6,
+        )
+        r = a.uns["rank_genes_groups"]
+        cur = {
+            field: np.vstack(
+                [np.asarray(r[field][n], dtype=float) for n in r[field].dtype.names]
+            )
+            for field in ("scores", "pvals")
+        }
+        cur["pts"] = r["pts"].values
+        if ref is None:
+            ref = cur
+            continue
+        for field in ("scores", "pvals", "pts"):
+            np.testing.assert_allclose(
+                cur[field], ref[field], rtol=1e-13, atol=1e-15, equal_nan=True
+            )
+
+
 @pytest.mark.parametrize(
     ("groups", "reference"),
     [

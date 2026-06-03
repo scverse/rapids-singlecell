@@ -52,21 +52,22 @@ __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
 }
 
 /**
- * Tier 1 dispatch: when the largest group fits in shared memory, a fused
+ * LARGE-band dispatch: when the largest group fits in shared memory, a fused
  * bitonic-sort + binary-search kernel handles the whole group per block.
- * Otherwise we fall back to CUB segmented sort plus the pre-sorted rank
- * kernel.  This struct bundles the sizing knobs derived from the host-side
- * group offsets so each streaming impl can drop a 15-line prep block.
+ * Otherwise we fall back to the HUGE band (CUB segmented sort plus the
+ * pre-sorted rank kernel).  This struct bundles the sizing knobs derived from
+ * the host-side group offsets so each streaming impl can drop a 15-line prep
+ * block.
  */
 struct OvoTierPlan {
     int max_grp_size = 0;
     int min_grp_size = 0;
     bool run_warp = false;  // any group fits in one warp (≤ OVO_WARP_MAX)
     bool run_large =
-        false;  // any group needs > tier0 but fits in tier1 smem sort
+        false;  // any group needs > WARP but fits the LARGE smem-sort band
     bool above_warp = false;    // at least one group exceeds OVO_WARP_MAX
-    bool run_small = false;     // any group needs Tier 0.5: (T0, T0_64]
-    bool run_medium = false;    // any group needs Tier 2: (T0_64, T2]
+    bool run_small = false;     // SMALL band: (OVO_WARP_MAX, OVO_SMALL_MAX]
+    bool run_medium = false;    // MEDIUM band: (OVO_SMALL_MAX, OVO_MEDIUM_MAX]
     bool above_medium = false;  // at least one group exceeds OVO_MEDIUM_MAX
     int large_padded = 0;
     int large_tpb = 0;
@@ -101,12 +102,12 @@ static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
     }
     if (n_groups == 0) c.min_grp_size = 0;
 
-    // run_warp: Tier 0 kernel is worth running (at least one group small
+    // run_warp: WARP kernel is worth running (at least one group small
     // enough to benefit from the warp path).
     c.run_warp = (c.min_grp_size <= OVO_WARP_MAX);
-    // above_warp: at least one group needs a non-Tier-0 kernel.
+    // above_warp: at least one group needs a non-WARP kernel.
     c.above_warp = (c.max_grp_size > OVO_WARP_MAX);
-    // run_large: the fused smem-sort fast path (for groups > T0 but ≤ T1).
+    // run_large: the fused smem-sort fast path (groups > WARP but ≤ LARGE).
     c.run_large = c.above_warp && (c.max_grp_size <= OVO_LARGE_MAX);
     if (c.run_large) {
         c.large_padded = 1;
@@ -115,8 +116,8 @@ static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
         c.large_smem = (size_t)c.large_padded * sizeof(float) +
                        WARP_REDUCE_BUF * sizeof(double);
         // Adapt to the device: if the fused-sort buffer would exceed the
-        // per-block shared-memory limit, fall back to the tier-3 CUB segmented
-        // sort (which has no smem cap) rather than launching a kernel that
+        // per-block shared-memory limit, fall back to the HUGE-band CUB
+        // segmented sort (no smem cap) rather than launching a kernel that
         // would fail. Never triggers at the current threshold (~16.6KB), but
         // keeps the dispatch correct if the threshold or device limit changes.
         if (c.large_smem > wilcoxon_max_smem_per_block()) {
@@ -138,7 +139,7 @@ static std::vector<int> make_sort_group_ids(const int* h_grp_offsets,
     return ids;
 }
 
-// Tier 0 kernel launcher: 8 warps × 32 threads per block, one (col, group)
+// WARP kernel launcher: 8 warps × 32 threads per block, one (col, group)
 // pair per warp.  grid.y covers ceil(K/8) pair rows.
 static inline void launch_ovo_warp(const float* ref_sorted,
                                    const float* grp_dense,
