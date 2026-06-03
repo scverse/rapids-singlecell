@@ -8,8 +8,9 @@
  * reference slice.  This mirrors the fast host-CSR path and avoids redoing the
  * reference dense extraction + segmented sort for every column sub-batch.
  */
+template <typename IndptrT = int>
 static void ovo_streaming_csr_impl(
-    const float* csr_data, const int* csr_indices, const int* csr_indptr,
+    const float* csr_data, const int* csr_indices, const IndptrT* csr_indptr,
     const int* ref_row_ids, const int* grp_row_ids, const int* grp_offsets,
     double* rank_sums, double* tie_corr, int n_ref, int n_all_grp, int n_cols,
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
@@ -301,8 +302,9 @@ static void ovo_streaming_csr_impl(
  * Like the CSR variant, but extracts rows via lookup maps so it can operate on
  * native CSC input without converting the whole matrix.
  */
+template <typename IndptrT = int>
 static void ovo_streaming_csc_impl(
-    const float* csc_data, const int* csc_indices, const int* csc_indptr,
+    const float* csc_data, const int* csc_indices, const IndptrT* csc_indptr,
     const int* ref_row_map, const int* grp_row_map, const int* grp_offsets,
     double* rank_sums, double* tie_corr, int n_ref, int n_all_grp, int n_cols,
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {

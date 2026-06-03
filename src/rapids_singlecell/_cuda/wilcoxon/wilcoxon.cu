@@ -15,19 +15,6 @@
 
 using namespace nb::literals;
 
-static inline void launch_ovr_rank_dense(
-    const float* sorted_vals, const int* sorter, const int* group_codes,
-    double* rank_sums, double* tie_corr, int n_rows, int n_cols, int n_groups,
-    bool compute_tie_corr, cudaStream_t stream) {
-    int threads_per_block = round_up_to_warp(n_rows);
-    dim3 block(threads_per_block);
-    dim3 grid(n_cols);
-    ovr_rank_dense_kernel<<<grid, block, 0, stream>>>(
-        sorted_vals, sorter, group_codes, rank_sums, tie_corr, n_rows, n_cols,
-        n_groups, compute_tie_corr);
-    CUDA_CHECK_LAST_ERROR(ovr_rank_dense_kernel);
-}
-
 static void launch_ovr_rank_dense_streaming(
     const float* block, const int* group_codes, double* rank_sums,
     double* tie_corr, int n_rows, int n_cols, int n_groups,
@@ -149,11 +136,11 @@ static void launch_ovr_rank_dense_streaming(
     for (int s = 0; s < n_streams; ++s) cudaStreamDestroy(streams[s]);
 }
 
-static void launch_ovo_rank_dense_tiered_impl(
-    const float* ref_data, bool ref_is_sorted, const float* grp_data,
-    const int* grp_offsets, double* rank_sums, double* tie_corr, int n_ref,
-    int n_all_grp, int n_cols, int n_groups, bool compute_tie_corr,
-    int sub_batch_cols, cudaStream_t upstream_stream) {
+static void launch_ovo_rank_dense_tiered_unsorted_ref(
+    const float* ref_data, const float* grp_data, const int* grp_offsets,
+    double* rank_sums, double* tie_corr, int n_ref, int n_all_grp, int n_cols,
+    int n_groups, bool compute_tie_corr, int sub_batch_cols,
+    cudaStream_t upstream_stream) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0 || n_groups == 0) return;
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
 
@@ -201,7 +188,7 @@ static void launch_ovo_rank_dense_tiered_impl(
             doff, doff + 1, BEGIN_BIT, END_BIT);
     }
     size_t ref_cub_temp_bytes = 0;
-    if (!ref_is_sorted) {
+    {
         auto* fk = reinterpret_cast<float*>(1);
         auto* doff = reinterpret_cast<int*>(1);
         cub::DeviceSegmentedRadixSort::SortKeys(
@@ -244,15 +231,9 @@ static void launch_ovo_rank_dense_tiered_impl(
     };
     std::vector<StreamBuf> bufs(n_streams);
     for (int s = 0; s < n_streams; ++s) {
-        if (ref_is_sorted) {
-            bufs[s].ref_sorted = nullptr;
-            bufs[s].ref_seg_offsets = nullptr;
-            bufs[s].ref_cub_temp = nullptr;
-        } else {
-            bufs[s].ref_sorted = pool.alloc<float>(sub_ref_items);
-            bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
-            bufs[s].ref_cub_temp = pool.alloc<uint8_t>(ref_cub_temp_bytes);
-        }
+        bufs[s].ref_sorted = pool.alloc<float>(sub_ref_items);
+        bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
+        bufs[s].ref_cub_temp = pool.alloc<uint8_t>(ref_cub_temp_bytes);
         bufs[s].grp_cub_temp =
             needs_tier3 ? pool.alloc<uint8_t>(grp_cub_temp_bytes) : nullptr;
         bufs[s].ref_tie_sums =
@@ -296,15 +277,13 @@ static void launch_ovo_rank_dense_tiered_impl(
         auto& buf = bufs[s];
         const float* ref_sub = ref_data + (size_t)col * n_ref;
         const float* grp_sub = grp_data + (size_t)col * n_all_grp;
-        if (!ref_is_sorted) {
-            upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
-            size_t temp = ref_cub_temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                buf.ref_cub_temp, temp, ref_sub, buf.ref_sorted,
-                sb_ref_items_actual, sb_cols, buf.ref_seg_offsets,
-                buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream);
-            ref_sub = buf.ref_sorted;
-        }
+        upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
+        size_t ref_temp = ref_cub_temp_bytes;
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            buf.ref_cub_temp, ref_temp, ref_sub, buf.ref_sorted,
+            sb_ref_items_actual, sb_cols, buf.ref_seg_offsets,
+            buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream);
+        ref_sub = buf.ref_sorted;
 
         int skip_le = 0;
         bool run_tier0 = t1.use_tier0;
@@ -396,51 +375,9 @@ static void launch_ovo_rank_dense_tiered_impl(
     for (int s = 0; s < n_streams; ++s) cudaStreamDestroy(streams[s]);
 }
 
-static void launch_ovo_rank_dense_tiered(
-    const float* ref_sorted, const float* grp_data, const int* grp_offsets,
-    double* rank_sums, double* tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int sub_batch_cols,
-    cudaStream_t upstream_stream) {
-    launch_ovo_rank_dense_tiered_impl(ref_sorted, true, grp_data, grp_offsets,
-                                      rank_sums, tie_corr, n_ref, n_all_grp,
-                                      n_cols, n_groups, compute_tie_corr,
-                                      sub_batch_cols, upstream_stream);
-}
-
-static void launch_ovo_rank_dense_tiered_unsorted_ref(
-    const float* ref_data, const float* grp_data, const int* grp_offsets,
-    double* rank_sums, double* tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int sub_batch_cols,
-    cudaStream_t upstream_stream) {
-    launch_ovo_rank_dense_tiered_impl(ref_data, false, grp_data, grp_offsets,
-                                      rank_sums, tie_corr, n_ref, n_all_grp,
-                                      n_cols, n_groups, compute_tie_corr,
-                                      sub_batch_cols, upstream_stream);
-}
-
 template <typename Device>
 void register_bindings(nb::module_& m) {
     m.doc() = "CUDA kernels for Wilcoxon rank-sum test";
-
-    m.def(
-        "ovo_rank_dense_tiered",
-        [](gpu_array_f<const float, Device> ref_sorted,
-           gpu_array_f<const float, Device> grp_data,
-           gpu_array_c<const int, Device> grp_offsets,
-           gpu_array_c<double, Device> rank_sums,
-           gpu_array_c<double, Device> tie_corr, int n_ref, int n_all_grp,
-           int n_cols, int n_groups, bool compute_tie_corr, int sub_batch_cols,
-           std::uintptr_t stream) {
-            launch_ovo_rank_dense_tiered(ref_sorted.data(), grp_data.data(),
-                                         grp_offsets.data(), rank_sums.data(),
-                                         tie_corr.data(), n_ref, n_all_grp,
-                                         n_cols, n_groups, compute_tie_corr,
-                                         sub_batch_cols, (cudaStream_t)stream);
-        },
-        "ref_sorted"_a, "grp_data"_a, "grp_offsets"_a, "rank_sums"_a,
-        "tie_corr"_a, nb::kw_only(), "n_ref"_a, "n_all_grp"_a, "n_cols"_a,
-        "n_groups"_a, "compute_tie_corr"_a, "sub_batch_cols"_a = SUB_BATCH_COLS,
-        "stream"_a = 0);
 
     m.def(
         "ovo_rank_dense_tiered_unsorted_ref",
@@ -461,23 +398,6 @@ void register_bindings(nb::module_& m) {
         "tie_corr"_a, nb::kw_only(), "n_ref"_a, "n_all_grp"_a, "n_cols"_a,
         "n_groups"_a, "compute_tie_corr"_a, "sub_batch_cols"_a = SUB_BATCH_COLS,
         "stream"_a = 0);
-
-    m.def(
-        "ovr_rank_dense",
-        [](gpu_array_f<const float, Device> sorted_vals,
-           gpu_array_f<const int, Device> sorter,
-           gpu_array_c<const int, Device> group_codes,
-           gpu_array_c<double, Device> rank_sums,
-           gpu_array_c<double, Device> tie_corr, int n_rows, int n_cols,
-           int n_groups, bool compute_tie_corr, std::uintptr_t stream) {
-            launch_ovr_rank_dense(sorted_vals.data(), sorter.data(),
-                                  group_codes.data(), rank_sums.data(),
-                                  tie_corr.data(), n_rows, n_cols, n_groups,
-                                  compute_tie_corr, (cudaStream_t)stream);
-        },
-        "sorted_vals"_a, "sorter"_a, "group_codes"_a, "rank_sums"_a,
-        "tie_corr"_a, nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_groups"_a,
-        "compute_tie_corr"_a, "stream"_a = 0);
 
     m.def(
         "ovr_rank_dense_streaming",

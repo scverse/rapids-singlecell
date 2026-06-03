@@ -104,9 +104,6 @@ using gpu_array_contig = nb::ndarray<T, Device, Contig>;
 template <typename T>
 using host_array = nb::ndarray<T, nb::numpy, nb::ndim<1>>;
 
-template <typename T>
-using host_array_2d = nb::ndarray<T, nb::numpy, nb::ndim<2>>;
-
 // Register bindings for both regular CUDA and managed-memory arrays.
 // Usage:
 //   template <typename Device>

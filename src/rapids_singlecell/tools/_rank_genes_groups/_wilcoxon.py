@@ -258,7 +258,77 @@ def _wilcoxon_scores(
     return rank_sums - n_group * (n_group + 1.0) / 2.0
 
 
-def _host_sparse_fn_and_arrays(module, base_name: str, X, *, support_idx64: bool):
+def _z_scores_pvals(
+    rank_sums: cp.ndarray,
+    expected: cp.ndarray,
+    variance: cp.ndarray,
+    sizes: cp.ndarray,
+    *,
+    use_continuity: bool,
+    return_u_values: bool,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Shared Wilcoxon normal-approximation epilogue -> (scores, p_values)."""
+    diff = rank_sums - expected
+    if use_continuity:
+        diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
+    z = diff / cp.sqrt(variance)
+    cp.nan_to_num(z, copy=False)
+    p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
+    scores = _wilcoxon_scores(rank_sums, sizes, z, return_u_values=return_u_values)
+    return scores, p_values
+
+
+def _ovr_z_pvals(
+    rank_sums: cp.ndarray,
+    group_sizes_dev: cp.ndarray,
+    rest_sizes: cp.ndarray,
+    n_cells: int,
+    tie_corr: cp.ndarray,
+    *,
+    use_continuity: bool,
+    return_u_values: bool,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Group-vs-rest scores/p-values (tie_corr is ones when not correcting)."""
+    expected = group_sizes_dev[:, None] * (n_cells + 1) / 2.0
+    variance = tie_corr[None, :] * group_sizes_dev[:, None] * rest_sizes[:, None]
+    variance *= (n_cells + 1) / 12.0
+    return _z_scores_pvals(
+        rank_sums,
+        expected,
+        variance,
+        group_sizes_dev,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+    )
+
+
+def _ovo_z_pvals(
+    rank_sums: cp.ndarray,
+    test_sizes: cp.ndarray,
+    n_ref: int,
+    tie_corr_arr: cp.ndarray,
+    *,
+    tie_correct: bool,
+    use_continuity: bool,
+    return_u_values: bool,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Group-vs-reference scores/p-values from rank sums and tie correction."""
+    n_combined = test_sizes + n_ref
+    expected = test_sizes[:, None] * (n_combined[:, None] + 1) / 2.0
+    variance = test_sizes[:, None] * n_ref * (n_combined[:, None] + 1) / 12.0
+    if tie_correct:
+        variance = variance * tie_corr_arr
+    return _z_scores_pvals(
+        rank_sums,
+        expected,
+        variance,
+        test_sizes,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+    )
+
+
+def _host_sparse_fn_and_arrays(module, base_name: str, X):
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype == np.float64:
         is_f64 = True
@@ -273,21 +343,20 @@ def _host_sparse_fn_and_arrays(module, base_name: str, X, *, support_idx64: bool
         )
         raise TypeError(msg)
 
-    is_idx64 = support_idx64 and X.indices.dtype == np.int64
+    # Row/column indices always fit int32 (cells and genes are < 2^31); only the
+    # indptr (cumulative nnz) can need int64. Mirrors the rest of the sparse code.
     is_i64 = X.indptr.dtype == np.int64
     suffix = ""
     if is_f64:
         suffix += "_f64"
-    if is_idx64:
-        suffix += "_idx64"
     if is_i64:
         suffix += "_i64"
     fn = getattr(module, base_name + suffix)
-    indices_arr = X.indices if is_idx64 else X.indices.astype(np.int32, copy=False)
+    indices_arr = X.indices.astype(np.int32, copy=False)
     return fn, data_arr, indices_arr
 
 
-def _device_sparse_arrays_i32_f32(X):
+def _device_sparse_arrays_f32(X):
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype == np.float32 or data_dtype == np.float64:
         pass
@@ -300,21 +369,21 @@ def _device_sparse_arrays_i32_f32(X):
         )
         raise TypeError(msg)
 
-    if X.indptr.dtype != cp.int32:
-        max_indptr = int(cp.asnumpy(X.indptr[-1]))
-        if max_indptr > np.iinfo(np.int32).max:
-            warnings.warn(
-                "Wilcoxon device sparse path requires int32 indptr for CUDA "
-                "kernels; falling back to the bounded dense chunk path because "
-                f"nnz={max_indptr} exceeds int32.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-            return None
     data = X.data.astype(cp.float32, copy=False)
+    # Row/column indices fit int32 (cells and genes are < 2^31); indptr
+    # (cumulative nnz) may need int64, which the *_i64 device kernels handle.
     indices = X.indices.astype(cp.int32, copy=False)
-    indptr = X.indptr.astype(cp.int32, copy=False)
+    if X.indptr.dtype == cp.int64:
+        indptr = X.indptr
+    else:
+        indptr = X.indptr.astype(cp.int32, copy=False)
     return data, indices, indptr
+
+
+def _device_sparse_fn(module, base_name: str, indptr: cp.ndarray):
+    """Select the device kernel binding, using the int64-indptr variant if needed."""
+    suffix = "_i64" if indptr.dtype == cp.int64 else ""
+    return getattr(module, base_name + suffix)
 
 
 def _column_totals_for_host_matrix(
@@ -503,7 +572,7 @@ def _wilcoxon_vs_rest(
                 csc = csc.copy()
                 csc.sort_indices()
             csc_host_fn, data_arr, indices_arr = _host_sparse_fn_and_arrays(
-                _wcs, "ovr_sparse_csc_host", csc, support_idx64=True
+                _wcs, "ovr_sparse_csc_host", csc
             )
             csc_host_fn(
                 data_arr,
@@ -530,7 +599,7 @@ def _wilcoxon_vs_rest(
                 csr = csr.copy()
                 csr.sort_indices()
             csr_host_fn, data_arr, indices_arr = _host_sparse_fn_and_arrays(
-                _wcs, "ovr_sparse_csr_host", csr, support_idx64=True
+                _wcs, "ovr_sparse_csr_host", csr
             )
             csr_host_fn(
                 data_arr,
@@ -573,82 +642,74 @@ def _wilcoxon_vs_rest(
                 total_nnz=total_nnz,
             )
 
-        expected = group_sizes_dev[:, None] * (n_cells + 1) / 2.0
-        variance = tie_corr[None, :] * group_sizes_dev[:, None] * rest_sizes[:, None]
-        variance *= (n_cells + 1) / 12.0
-        diff = rank_sums - expected
-        if use_continuity:
-            diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-        z = diff / cp.sqrt(variance)
-        cp.nan_to_num(z, copy=False)
-        p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-        scores_host = _wilcoxon_scores(
-            rank_sums, group_sizes_dev, z, return_u_values=return_u_values
-        ).get()
+        scores, p_values = _ovr_z_pvals(
+            rank_sums,
+            group_sizes_dev,
+            rest_sizes,
+            n_cells,
+            tie_corr,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
+        )
+        scores_host = scores.get()
         p_host = p_values.get()
         return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
 
     if cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X):
-        sparse_arrays = _device_sparse_arrays_i32_f32(X)
-        if sparse_arrays is not None:
-            data, indices, indptr = sparse_arrays
-            group_codes_gpu = cp.asarray(rg.group_codes, dtype=cp.int32)
-            group_sizes_dev = cp.asarray(group_sizes, dtype=cp.float64)
-            rest_sizes = n_cells - group_sizes_dev
-            rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
-            tie_corr = cp.ones(n_total_genes, dtype=cp.float64)
-            if cpsp.isspmatrix_csc(X):
-                _wcs.ovr_sparse_csc_device(
-                    data,
-                    indices,
-                    indptr,
-                    group_codes_gpu,
-                    group_sizes_dev,
-                    rank_sums,
-                    tie_corr,
-                    n_rows=n_cells,
-                    n_cols=n_total_genes,
-                    n_groups=n_groups,
-                    compute_tie_corr=tie_correct,
-                    sub_batch_cols=OVR_DEVICE_CSC_SUB_BATCH,
-                )
-            else:
-                sparse_X = X
-                if not sparse_X.has_sorted_indices:
-                    sparse_X = sparse_X.copy()
-                    sparse_X.sort_indices()
-                    data, indices, indptr = _device_sparse_arrays_i32_f32(sparse_X)
-                _wcs.ovr_sparse_csr_device(
-                    data,
-                    indices,
-                    indptr,
-                    group_codes_gpu,
-                    group_sizes_dev,
-                    rank_sums,
-                    tie_corr,
-                    n_rows=n_cells,
-                    n_cols=n_total_genes,
-                    n_groups=n_groups,
-                    compute_tie_corr=tie_correct,
-                    sub_batch_cols=OVR_DEVICE_CSR_SUB_BATCH,
-                )
-
-            expected = group_sizes_dev[:, None] * (n_cells + 1) / 2.0
-            variance = (
-                tie_corr[None, :] * group_sizes_dev[:, None] * rest_sizes[:, None]
+        data, indices, indptr = _device_sparse_arrays_f32(X)
+        group_codes_gpu = cp.asarray(rg.group_codes, dtype=cp.int32)
+        group_sizes_dev = cp.asarray(group_sizes, dtype=cp.float64)
+        rest_sizes = n_cells - group_sizes_dev
+        rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
+        tie_corr = cp.ones(n_total_genes, dtype=cp.float64)
+        if cpsp.isspmatrix_csc(X):
+            _device_sparse_fn(_wcs, "ovr_sparse_csc_device", indptr)(
+                data,
+                indices,
+                indptr,
+                group_codes_gpu,
+                group_sizes_dev,
+                rank_sums,
+                tie_corr,
+                n_rows=n_cells,
+                n_cols=n_total_genes,
+                n_groups=n_groups,
+                compute_tie_corr=tie_correct,
+                sub_batch_cols=OVR_DEVICE_CSC_SUB_BATCH,
             )
-            variance *= (n_cells + 1) / 12.0
-            diff = rank_sums - expected
-            if use_continuity:
-                diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-            z = diff / cp.sqrt(variance)
-            cp.nan_to_num(z, copy=False)
-            p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-            scores_host = _wilcoxon_scores(
-                rank_sums, group_sizes_dev, z, return_u_values=return_u_values
-            ).get()
-            p_host = p_values.get()
-            return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
+        else:
+            sparse_X = X
+            if not sparse_X.has_sorted_indices:
+                sparse_X = sparse_X.copy()
+                sparse_X.sort_indices()
+                data, indices, indptr = _device_sparse_arrays_f32(sparse_X)
+            _device_sparse_fn(_wcs, "ovr_sparse_csr_device", indptr)(
+                data,
+                indices,
+                indptr,
+                group_codes_gpu,
+                group_sizes_dev,
+                rank_sums,
+                tie_corr,
+                n_rows=n_cells,
+                n_cols=n_total_genes,
+                n_groups=n_groups,
+                compute_tie_corr=tie_correct,
+                sub_batch_cols=OVR_DEVICE_CSR_SUB_BATCH,
+            )
+
+        scores, p_values = _ovr_z_pvals(
+            rank_sums,
+            group_sizes_dev,
+            rest_sizes,
+            n_cells,
+            tie_corr,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
+        )
+        scores_host = scores.get()
+        p_host = p_values.get()
+        return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
 
     group_codes_gpu = cp.asarray(rg.group_codes, dtype=cp.int32)
 
@@ -697,18 +758,14 @@ def _wilcoxon_vs_rest(
             sub_batch_cols=OVR_DENSE_SUB_BATCH,
             stream=cp.cuda.get_current_stream().ptr,
         )
-        expected = group_sizes_dev[:, None] * (n_cells + 1) / 2.0
-        variance = tie_corr[None, :] * group_sizes_dev[:, None] * rest_sizes[:, None]
-        variance *= (n_cells + 1) / 12.0
-        std = cp.sqrt(variance)
-        diff = rank_sums - expected
-        if use_continuity:
-            diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-        z = diff / std
-        cp.nan_to_num(z, copy=False)
-        p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-        scores = _wilcoxon_scores(
-            rank_sums, group_sizes_dev, z, return_u_values=return_u_values
+        scores, p_values = _ovr_z_pvals(
+            rank_sums,
+            group_sizes_dev,
+            rest_sizes,
+            n_cells,
+            tie_corr,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
         )
 
         scores_host = scores.get()
@@ -835,7 +892,7 @@ def _wilcoxon_with_reference(
             grp_row_map = np.full(X.shape[0], -1, dtype=np.int32)
             grp_row_map[all_grp_row_ids] = np.arange(n_all_grp, dtype=np.int32)
             csc_host_fn, data_arr, indices_arr = _host_sparse_fn_and_arrays(
-                _wcs, "ovo_streaming_csc_host", csc, support_idx64=True
+                _wcs, "ovo_streaming_csc_host", csc
             )
             csc_host_fn(
                 data_arr,
@@ -866,7 +923,7 @@ def _wilcoxon_with_reference(
             # Host CSR gather scans each row's native index list and tolerates
             # unsorted row indices; avoid a full CSR copy just to sort.
             csr_host_fn, data_arr, indices_arr = _host_sparse_fn_and_arrays(
-                _wcs, "ovo_streaming_csr_host", csr, support_idx64=True
+                _wcs, "ovo_streaming_csr_host", csr
             )
             csr_host_fn(
                 data_arr,
@@ -915,19 +972,14 @@ def _wilcoxon_with_reference(
                     compute_vars=compute_vars,
                 )
 
-        n_combined = test_sizes + n_ref
-        expected = test_sizes[:, None] * (n_combined[:, None] + 1) / 2.0
-        variance = test_sizes[:, None] * n_ref * (n_combined[:, None] + 1) / 12.0
-        if tie_correct:
-            variance = variance * tie_corr_arr
-        diff = rank_sums - expected
-        if use_continuity:
-            diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-        z = diff / cp.sqrt(variance)
-        cp.nan_to_num(z, copy=False)
-        p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-        scores = _wilcoxon_scores(
-            rank_sums, test_sizes, z, return_u_values=return_u_values
+        scores, p_values = _ovo_z_pvals(
+            rank_sums,
+            test_sizes,
+            n_ref,
+            tie_corr_arr,
+            tie_correct=tie_correct,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
         )
         if rg._store_wilcoxon_gpu_result:
             rg._wilcoxon_gpu_result = (
@@ -949,80 +1001,73 @@ def _wilcoxon_with_reference(
         if cpsp.isspmatrix_csr(sparse_X) and not sparse_X.has_sorted_indices:
             sparse_X = sparse_X.copy()
             sparse_X.sort_indices()
-        sparse_arrays = _device_sparse_arrays_i32_f32(sparse_X)
-        if sparse_arrays is not None:
-            data, indices, indptr = sparse_arrays
-            offsets_gpu = cp.asarray(offsets_np, dtype=cp.int32)
-            rank_sums = cp.empty((n_test, n_total_genes), dtype=cp.float64)
-            tie_corr_arr = cp.ones((n_test, n_total_genes), dtype=cp.float64)
+        data, indices, indptr = _device_sparse_arrays_f32(sparse_X)
+        offsets_gpu = cp.asarray(offsets_np, dtype=cp.int32)
+        rank_sums = cp.empty((n_test, n_total_genes), dtype=cp.float64)
+        tie_corr_arr = cp.ones((n_test, n_total_genes), dtype=cp.float64)
 
-            if cpsp.isspmatrix_csc(sparse_X):
-                ref_row_map = np.full(X.shape[0], -1, dtype=np.int32)
-                ref_row_map[ref_row_ids] = np.arange(n_ref, dtype=np.int32)
-                grp_row_map = np.full(X.shape[0], -1, dtype=np.int32)
-                grp_row_map[all_grp_row_ids] = np.arange(n_all_grp, dtype=np.int32)
-                _wcs.ovo_streaming_csc_device(
-                    data,
-                    indices,
-                    indptr,
-                    cp.asarray(ref_row_map),
-                    cp.asarray(grp_row_map),
-                    offsets_gpu,
-                    rank_sums,
-                    tie_corr_arr,
-                    n_ref=n_ref,
-                    n_all_grp=n_all_grp,
-                    n_cols=n_total_genes,
-                    n_groups=n_test,
-                    compute_tie_corr=tie_correct,
-                    sub_batch_cols=OVO_DEVICE_SPARSE_SUB_BATCH,
-                )
-            else:
-                _wcs.ovo_streaming_csr_device(
-                    data,
-                    indices,
-                    indptr,
-                    cp.asarray(ref_row_ids, dtype=cp.int32),
-                    cp.asarray(all_grp_row_ids, dtype=cp.int32),
-                    offsets_gpu,
-                    rank_sums,
-                    tie_corr_arr,
-                    n_ref=n_ref,
-                    n_all_grp=n_all_grp,
-                    n_cols=n_total_genes,
-                    n_groups=n_test,
-                    compute_tie_corr=tie_correct,
-                    sub_batch_cols=OVO_DEVICE_SPARSE_SUB_BATCH,
-                )
-
-            n_combined = test_sizes + n_ref
-            expected = test_sizes[:, None] * (n_combined[:, None] + 1) / 2.0
-            variance = test_sizes[:, None] * n_ref * (n_combined[:, None] + 1) / 12.0
-            if tie_correct:
-                variance = variance * tie_corr_arr
-            diff = rank_sums - expected
-            if use_continuity:
-                diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-            z = diff / cp.sqrt(variance)
-            cp.nan_to_num(z, copy=False)
-            p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-            scores = _wilcoxon_scores(
-                rank_sums, test_sizes, z, return_u_values=return_u_values
+        if cpsp.isspmatrix_csc(sparse_X):
+            ref_row_map = np.full(X.shape[0], -1, dtype=np.int32)
+            ref_row_map[ref_row_ids] = np.arange(n_ref, dtype=np.int32)
+            grp_row_map = np.full(X.shape[0], -1, dtype=np.int32)
+            grp_row_map[all_grp_row_ids] = np.arange(n_all_grp, dtype=np.int32)
+            _device_sparse_fn(_wcs, "ovo_streaming_csc_device", indptr)(
+                data,
+                indices,
+                indptr,
+                cp.asarray(ref_row_map),
+                cp.asarray(grp_row_map),
+                offsets_gpu,
+                rank_sums,
+                tie_corr_arr,
+                n_ref=n_ref,
+                n_all_grp=n_all_grp,
+                n_cols=n_total_genes,
+                n_groups=n_test,
+                compute_tie_corr=tie_correct,
+                sub_batch_cols=OVO_DEVICE_SPARSE_SUB_BATCH,
             )
-            if rg._store_wilcoxon_gpu_result:
-                rg._wilcoxon_gpu_result = (
-                    np.asarray(test_group_indices, dtype=np.intp),
-                    scores,
-                    p_values,
-                    None,
-                )
-                return []
-            scores_host = scores.get()
-            p_host = p_values.get()
-            return [
-                (group_index, scores_host[slot], p_host[slot])
-                for slot, group_index in enumerate(test_group_indices)
-            ]
+        else:
+            _device_sparse_fn(_wcs, "ovo_streaming_csr_device", indptr)(
+                data,
+                indices,
+                indptr,
+                cp.asarray(ref_row_ids, dtype=cp.int32),
+                cp.asarray(all_grp_row_ids, dtype=cp.int32),
+                offsets_gpu,
+                rank_sums,
+                tie_corr_arr,
+                n_ref=n_ref,
+                n_all_grp=n_all_grp,
+                n_cols=n_total_genes,
+                n_groups=n_test,
+                compute_tie_corr=tie_correct,
+                sub_batch_cols=OVO_DEVICE_SPARSE_SUB_BATCH,
+            )
+
+        scores, p_values = _ovo_z_pvals(
+            rank_sums,
+            test_sizes,
+            n_ref,
+            tie_corr_arr,
+            tie_correct=tie_correct,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
+        )
+        if rg._store_wilcoxon_gpu_result:
+            rg._wilcoxon_gpu_result = (
+                np.asarray(test_group_indices, dtype=np.intp),
+                scores,
+                p_values,
+                None,
+            )
+            return []
+        scores_host = scores.get()
+        p_host = p_values.get()
+        return [
+            (group_index, scores_host[slot], p_host[slot])
+            for slot, group_index in enumerate(test_group_indices)
+        ]
 
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
 
@@ -1067,20 +1112,14 @@ def _wilcoxon_with_reference(
             stream=cp.cuda.get_current_stream().ptr,
         )
 
-        n_combined = test_sizes + n_ref
-        expected = test_sizes[:, None] * (n_combined[:, None] + 1) / 2.0
-        variance = test_sizes[:, None] * n_ref * (n_combined[:, None] + 1) / 12.0
-        if tie_correct:
-            variance = variance * tie_corr
-        std = cp.sqrt(variance)
-        diff = rank_sums - expected
-        if use_continuity:
-            diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-        z = diff / std
-        cp.nan_to_num(z, copy=False)
-        p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-        scores = _wilcoxon_scores(
-            rank_sums, test_sizes, z, return_u_values=return_u_values
+        scores, p_values = _ovo_z_pvals(
+            rank_sums,
+            test_sizes,
+            n_ref,
+            tie_corr,
+            tie_correct=tie_correct,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
         )
 
         scores_host[:, start:stop] = scores.get()

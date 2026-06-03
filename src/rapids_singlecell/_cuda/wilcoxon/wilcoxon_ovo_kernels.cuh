@@ -28,20 +28,20 @@ __global__ void build_tier3_seg_begin_end_offsets_kernel(
  * One block per column, threads scatter matching nonzeros.
  * Output must be pre-zeroed.
  */
-template <typename IndexT = int>
+template <typename IndexT = int, typename IndptrT = int>
 __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
                                           const IndexT* __restrict__ indices,
-                                          const int* __restrict__ indptr,
+                                          const IndptrT* __restrict__ indptr,
                                           const int* __restrict__ row_map,
                                           float* __restrict__ out, int n_target,
                                           int col_start) {
     int col_local = blockIdx.x;
     int col = col_start + col_local;
 
-    int start = indptr[col];
-    int end = indptr[col + 1];
+    IndptrT start = indptr[col];
+    IndptrT end = indptr[col + 1];
 
-    for (int p = start + threadIdx.x; p < end; p += blockDim.x) {
+    for (IndptrT p = start + threadIdx.x; p < end; p += blockDim.x) {
         int out_row = row_map[(int)indices[p]];
         if (out_row >= 0) {
             out[(long long)col_local * n_target + out_row] = data[p];

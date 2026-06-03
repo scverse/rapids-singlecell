@@ -530,16 +530,17 @@ static void ovr_sparse_csr_host_streaming_impl(
 // Sparse-aware CSC OVR streaming (sort only stored nonzeros)
 // ============================================================================
 
+template <typename IndptrT = int>
 static void ovr_sparse_csc_streaming_impl(
-    const float* csc_data, const int* csc_indices, const int* csc_indptr,
+    const float* csc_data, const int* csc_indices, const IndptrT* csc_indptr,
     const int* group_codes, const double* group_sizes, double* rank_sums,
     double* tie_corr, int n_rows, int n_cols, int n_groups,
     bool compute_tie_corr, int sub_batch_cols) {
     if (n_rows == 0 || n_cols == 0) return;
 
     // Read indptr to host for batch planning
-    std::vector<int> h_indptr(n_cols + 1);
-    cudaMemcpy(h_indptr.data(), csc_indptr, (n_cols + 1) * sizeof(int),
+    std::vector<IndptrT> h_indptr(n_cols + 1);
+    cudaMemcpy(h_indptr.data(), csc_indptr, (n_cols + 1) * sizeof(IndptrT),
                cudaMemcpyDeviceToHost);
 
     int n_streams = N_STREAMS;
@@ -608,8 +609,8 @@ static void ovr_sparse_csc_streaming_impl(
         auto stream = streams[s];
         auto& buf = bufs[s];
 
-        int ptr_start = h_indptr[col];
-        int ptr_end = h_indptr[col + sb_cols];
+        IndptrT ptr_start = h_indptr[col];
+        IndptrT ptr_end = h_indptr[col + sb_cols];
         int batch_nnz = checked_int_span((size_t)(ptr_end - ptr_start),
                                          "OVR device CSC active batch nnz");
 
@@ -689,8 +690,9 @@ static void ovr_sparse_csc_streaming_impl(
  *
  * Compared to the dense CSR path, sort work drops by ~1/sparsity.
  */
+template <typename IndptrT = int>
 static void ovr_sparse_csr_streaming_impl(
-    const float* csr_data, const int* csr_indices, const int* csr_indptr,
+    const float* csr_data, const int* csr_indices, const IndptrT* csr_indptr,
     const int* group_codes, const double* group_sizes, double* rank_sums,
     double* tie_corr, int n_rows, int n_cols, int n_groups,
     bool compute_tie_corr, int sub_batch_cols) {

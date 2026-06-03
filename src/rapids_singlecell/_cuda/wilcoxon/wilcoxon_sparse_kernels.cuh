@@ -240,97 +240,6 @@ static size_t cast_accumulate_smem_config(int n_groups, bool compute_sq_sums,
 }
 
 /**
- * Pre-sort cast-and-accumulate kernel for dense OVR host streaming.
- *
- * Reads a sub-batch block in its native host dtype (InT = float or double),
- * writes a float32 copy used as the sort input, and accumulates per-group
- * sum, sum-of-squares and nonzero counts in float64.  Stats are derived
- * from the original-precision values so float64 host input keeps its
- * precision while the sort still runs on float32 keys.
- *
- * Block-per-column layout (grid: (sb_cols,), block: (tpb,)).
- * Shared memory: 3 * n_groups doubles (s_sum, s_sq, s_nnz).
- */
-template <typename InT>
-__global__ void ovr_cast_and_accumulate_dense_kernel(
-    const InT* __restrict__ block_in, float* __restrict__ block_f32_out,
-    const int* __restrict__ group_codes, double* __restrict__ group_sums,
-    double* __restrict__ group_sq_sums, double* __restrict__ group_nnz,
-    int n_rows, int sb_cols, int n_groups, bool compute_sq_sums = true,
-    bool compute_nnz = true) {
-    int col = blockIdx.x;
-    if (col >= sb_cols) return;
-
-    extern __shared__ double smem[];
-    double* s_sum = smem;
-    double* s_sq = smem + n_groups;
-    double* s_nnz = smem + 2 * n_groups;
-
-    for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
-        s_sum[g] = 0.0;
-        if (compute_sq_sums) s_sq[g] = 0.0;
-        if (compute_nnz) s_nnz[g] = 0.0;
-    }
-    __syncthreads();
-
-    const InT* src = block_in + (size_t)col * n_rows;
-    float* dst = block_f32_out + (size_t)col * n_rows;
-
-    for (int r = threadIdx.x; r < n_rows; r += blockDim.x) {
-        InT v_in = src[r];
-        double v = (double)v_in;
-        dst[r] = (float)v_in;
-        int g = group_codes[r];
-        if (g < n_groups) {
-            atomicAdd(&s_sum[g], v);
-            if (compute_sq_sums) atomicAdd(&s_sq[g], v * v);
-            if (compute_nnz && v != 0.0) atomicAdd(&s_nnz[g], 1.0);
-        }
-    }
-    __syncthreads();
-
-    for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
-        group_sums[(size_t)g * sb_cols + col] = s_sum[g];
-        if (compute_sq_sums) {
-            group_sq_sums[(size_t)g * sb_cols + col] = s_sq[g];
-        }
-        if (compute_nnz) {
-            group_nnz[(size_t)g * sb_cols + col] = s_nnz[g];
-        }
-    }
-}
-
-template <typename InT>
-__global__ void ovr_cast_and_accumulate_dense_global_kernel(
-    const InT* __restrict__ block_in, float* __restrict__ block_f32_out,
-    const int* __restrict__ group_codes, double* __restrict__ group_sums,
-    double* __restrict__ group_sq_sums, double* __restrict__ group_nnz,
-    int n_rows, int sb_cols, int n_groups, bool compute_sq_sums = true,
-    bool compute_nnz = true) {
-    int col = blockIdx.x;
-    if (col >= sb_cols) return;
-
-    const InT* src = block_in + (size_t)col * n_rows;
-    float* dst = block_f32_out + (size_t)col * n_rows;
-
-    for (int r = threadIdx.x; r < n_rows; r += blockDim.x) {
-        InT v_in = src[r];
-        double v = (double)v_in;
-        dst[r] = (float)v_in;
-        int g = group_codes[r];
-        if (g < n_groups) {
-            atomicAdd(&group_sums[(size_t)g * sb_cols + col], v);
-            if (compute_sq_sums) {
-                atomicAdd(&group_sq_sums[(size_t)g * sb_cols + col], v * v);
-            }
-            if (compute_nnz && v != 0.0) {
-                atomicAdd(&group_nnz[(size_t)g * sb_cols + col], 1.0);
-            }
-        }
-    }
-}
-
-/**
  * Pre-sort cast-and-accumulate kernel for sparse OVR host streaming.
  *
  * Sub-batch CSC data is laid out contiguously: values for column c live
@@ -422,40 +331,6 @@ __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
                 atomicAdd(&group_nnz[(size_t)g * sb_cols + col], 1.0);
             }
         }
-    }
-}
-
-template <typename InT>
-static void launch_ovr_cast_and_accumulate_dense(
-    const InT* d_block_orig, float* d_block_f32, const int* d_group_codes,
-    double* d_group_sums, double* d_group_sq_sums, double* d_group_nnz,
-    int n_rows, int sb_cols, int n_groups, bool compute_sq_sums,
-    bool compute_nnz, int tpb, size_t smem_cast, bool use_gmem,
-    cudaStream_t stream) {
-    if (use_gmem) {
-        size_t stats_items = (size_t)n_groups * sb_cols;
-        cudaMemsetAsync(d_group_sums, 0, stats_items * sizeof(double), stream);
-        if (compute_sq_sums) {
-            cudaMemsetAsync(d_group_sq_sums, 0, stats_items * sizeof(double),
-                            stream);
-        }
-        if (compute_nnz) {
-            cudaMemsetAsync(d_group_nnz, 0, stats_items * sizeof(double),
-                            stream);
-        }
-        ovr_cast_and_accumulate_dense_global_kernel<InT>
-            <<<sb_cols, tpb, 0, stream>>>(
-                d_block_orig, d_block_f32, d_group_codes, d_group_sums,
-                d_group_sq_sums, d_group_nnz, n_rows, sb_cols, n_groups,
-                compute_sq_sums, compute_nnz);
-        CUDA_CHECK_LAST_ERROR(ovr_cast_and_accumulate_dense_global_kernel);
-    } else {
-        ovr_cast_and_accumulate_dense_kernel<InT>
-            <<<sb_cols, tpb, smem_cast, stream>>>(
-                d_block_orig, d_block_f32, d_group_codes, d_group_sums,
-                d_group_sq_sums, d_group_nnz, n_rows, sb_cols, n_groups,
-                compute_sq_sums, compute_nnz);
-        CUDA_CHECK_LAST_ERROR(ovr_cast_and_accumulate_dense_kernel);
     }
 }
 

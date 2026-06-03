@@ -48,7 +48,7 @@ extern "C" __global__ void group_chunk_stats(
     const int n_groups,
     const bool compute_nnz
 ) {
-    const long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     const long long total = static_cast<long long>(n_rows) * n_cols;
     if (idx >= total) {
         return;
@@ -180,7 +180,6 @@ class _RankGenes:
         self.vars_rest: np.ndarray | None = None
         self.pts_rest: np.ndarray | None = None
 
-        self.stats: pd.DataFrame | None = None
         self.stats_arrays: dict[str, object] | None = None
         self._store_wilcoxon_gpu_result = False
         self._wilcoxon_gpu_result: (
@@ -540,7 +539,6 @@ class _RankGenes:
                 "var_names": np.asarray(self.var_names),
                 "gene_indices": np.empty((0, n_genes_user), dtype=np.intp),
             }
-            self.stats = None
             return
 
         if self._wilcoxon_gpu_result is not None:
@@ -634,6 +632,22 @@ class _RankGenes:
         cp.put_along_axis(corrected, order, corrected_sorted, axis=1)
         return corrected
 
+    def _logfoldchanges_into(
+        self, arrays: dict, group_indices: np.ndarray, top_idx: np.ndarray
+    ) -> None:
+        mean_group = self.means[group_indices]
+        if self.ireference is None:
+            mean_rest = self.means_rest[group_indices]
+        else:
+            mean_rest = self.means[self.ireference][None, :]
+        foldchanges = (self.expm1_func(mean_group) + EPS) / (
+            self.expm1_func(mean_rest) + EPS
+        )
+        logfoldchanges = np.log2(foldchanges)
+        arrays["logfoldchanges"] = np.take_along_axis(
+            logfoldchanges, top_idx, axis=1
+        ).astype(np.float32, copy=False)
+
     def _compute_statistics_arrays(
         self,
         test_results: list[tuple[int, NDArray, NDArray]],
@@ -673,21 +687,9 @@ class _RankGenes:
             arrays["pvals_adj"] = np.take_along_axis(pvals_adj, top_idx, axis=1)
 
         if self.means is not None:
-            mean_group = self.means[group_indices]
-            if self.ireference is None:
-                mean_rest = self.means_rest[group_indices]
-            else:
-                mean_rest = self.means[self.ireference][None, :]
-            foldchanges = (self.expm1_func(mean_group) + EPS) / (
-                self.expm1_func(mean_rest) + EPS
-            )
-            logfoldchanges = np.log2(foldchanges)
-            arrays["logfoldchanges"] = np.take_along_axis(
-                logfoldchanges, top_idx, axis=1
-            ).astype(np.float32, copy=False)
+            self._logfoldchanges_into(arrays, group_indices, top_idx)
 
         self.stats_arrays = arrays
-        self.stats = None
 
     def _compute_statistics_gpu_arrays(
         self,
@@ -740,18 +742,6 @@ class _RankGenes:
                 )
             )
         elif self.means is not None:
-            mean_group = self.means[group_indices]
-            if self.ireference is None:
-                mean_rest = self.means_rest[group_indices]
-            else:
-                mean_rest = self.means[self.ireference][None, :]
-            foldchanges = (self.expm1_func(mean_group) + EPS) / (
-                self.expm1_func(mean_rest) + EPS
-            )
-            logfoldchanges = np.log2(foldchanges)
-            arrays["logfoldchanges"] = np.take_along_axis(
-                logfoldchanges, top_idx, axis=1
-            ).astype(np.float32, copy=False)
+            self._logfoldchanges_into(arrays, group_indices, top_idx)
 
         self.stats_arrays = arrays
-        self.stats = None

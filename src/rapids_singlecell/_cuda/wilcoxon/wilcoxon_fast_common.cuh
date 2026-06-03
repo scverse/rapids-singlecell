@@ -304,10 +304,10 @@ static inline void upload_linear_offsets(int* d_offsets, int n_segments,
 // CSR → dense F-order extraction (templated on data type)
 // ============================================================================
 
-template <typename T>
+template <typename T, typename IndptrT = int>
 __global__ void csr_extract_dense_kernel(const T* __restrict__ data,
                                          const int* __restrict__ indices,
-                                         const int* __restrict__ indptr,
+                                         const IndptrT* __restrict__ indptr,
                                          const int* __restrict__ row_ids,
                                          T* __restrict__ out, int n_target,
                                          int col_start, int col_stop) {
@@ -315,49 +315,22 @@ __global__ void csr_extract_dense_kernel(const T* __restrict__ data,
     if (tid >= n_target) return;
 
     int row = row_ids[tid];
-    int rs = indptr[row];
-    int re = indptr[row + 1];
+    IndptrT rs = indptr[row];
+    IndptrT re = indptr[row + 1];
 
-    int lo = rs, hi = re;
+    IndptrT lo = rs, hi = re;
     while (lo < hi) {
-        int m = lo + ((hi - lo) >> 1);
+        IndptrT m = lo + ((hi - lo) >> 1);
         if (indices[m] < col_start)
             lo = m + 1;
         else
             hi = m;
     }
 
-    for (int p = lo; p < re; ++p) {
+    for (IndptrT p = lo; p < re; ++p) {
         int c = indices[p];
         if (c >= col_stop) break;
         out[(long long)(c - col_start) * n_target + tid] = data[p];
-    }
-}
-
-template <typename T>
-__global__ void csr_extract_dense_identity_rows_kernel(
-    const T* __restrict__ data, const int* __restrict__ indices,
-    const int* __restrict__ indptr, T* __restrict__ out, int n_target,
-    int col_start, int col_stop) {
-    int row = blockIdx.x;
-    if (row >= n_target) return;
-
-    int rs = indptr[row];
-    int re = indptr[row + 1];
-
-    int lo = rs, hi = re;
-    while (lo < hi) {
-        int m = lo + ((hi - lo) >> 1);
-        if (indices[m] < col_start)
-            lo = m + 1;
-        else
-            hi = m;
-    }
-
-    for (int p = lo + threadIdx.x; p < re; p += blockDim.x) {
-        int c = indices[p];
-        if (c >= col_stop) break;
-        out[(long long)(c - col_start) * n_target + row] = data[p];
     }
 }
 

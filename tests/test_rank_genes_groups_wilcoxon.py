@@ -83,9 +83,11 @@ def test_rank_genes_groups_complex_values_raise(fmt):
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
 
 
-def test_device_sparse_int64_indptr_overflow_warns():
+def test_device_sparse_int64_indptr_selects_i64_kernel():
+    from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
     from rapids_singlecell.tools._rank_genes_groups._wilcoxon import (
-        _device_sparse_arrays_i32_f32,
+        _device_sparse_arrays_f32,
+        _device_sparse_fn,
     )
 
     class FakeSparse:
@@ -93,8 +95,72 @@ def test_device_sparse_int64_indptr_overflow_warns():
         indices = cp.asarray([0], dtype=cp.int32)
         indptr = cp.asarray([0, np.iinfo(np.int32).max + 1], dtype=cp.int64)
 
-    with pytest.warns(RuntimeWarning, match="requires int32 indptr"):
-        assert _device_sparse_arrays_i32_f32(FakeSparse()) is None
+    # int64 indptr is preserved (no truncation, no dense fallback); the row
+    # indices stay int32 because cells/genes are always < 2^31.
+    data, indices, indptr = _device_sparse_arrays_f32(FakeSparse())
+    assert indptr.dtype == cp.int64
+    assert indices.dtype == cp.int32
+    assert data.dtype == cp.float32
+
+    # Dispatch routes an int64 indptr to the *_i64 kernel binding, int32 to base.
+    assert (
+        _device_sparse_fn(_wcs, "ovr_sparse_csc_device", indptr)
+        is _wcs.ovr_sparse_csc_device_i64
+    )
+    assert (
+        _device_sparse_fn(_wcs, "ovr_sparse_csc_device", indices)
+        is _wcs.ovr_sparse_csc_device
+    )
+
+
+@pytest.mark.parametrize("layout", ["csc", "csr"])
+def test_device_ovr_sparse_i64_indptr_matches_i32(layout):
+    # cupyx coerces small matrices to int32 indptr, so int64 support is only
+    # reachable for nnz > 2^31. Exercise the int64-templated kernels directly
+    # with a hand-built int64 indptr and assert bit-parity with the int32 path.
+    from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
+
+    rng = np.random.default_rng(0)
+    n_rows, n_cols, n_groups = 120, 10, 4
+    dense = np.abs(rng.standard_normal((n_rows, n_cols))).astype(np.float32)
+    dense[dense < 0.6] = 0.0
+    mat = sp.csc_matrix(dense) if layout == "csc" else sp.csr_matrix(dense)
+    mat.sort_indices()
+    gcodes = rng.integers(0, n_groups, n_rows).astype(np.int32)
+    gsizes = np.bincount(gcodes, minlength=n_groups).astype(np.float64)
+
+    data = cp.asarray(mat.data, dtype=cp.float32)
+    indices = cp.asarray(mat.indices, dtype=cp.int32)
+    g = cp.asarray(gcodes)
+    gs = cp.asarray(gsizes)
+    base = getattr(_wcs, f"ovr_sparse_{layout}_device")
+    i64 = getattr(_wcs, f"ovr_sparse_{layout}_device_i64")
+
+    def run(indptr_dtype, fn):
+        indptr = cp.asarray(mat.indptr, dtype=indptr_dtype)
+        rs = cp.empty((n_groups, n_cols), dtype=cp.float64)
+        tc = cp.ones(n_cols, dtype=cp.float64)
+        fn(
+            data,
+            indices,
+            indptr,
+            g,
+            gs,
+            rs,
+            tc,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            n_groups=n_groups,
+            compute_tie_corr=True,
+            sub_batch_cols=64,
+        )
+        cp.cuda.get_current_stream().synchronize()
+        return rs.get(), tc.get()
+
+    rs32, tc32 = run(cp.int32, base)
+    rs64, tc64 = run(cp.int64, i64)
+    np.testing.assert_array_equal(rs32, rs64)
+    np.testing.assert_array_equal(tc32, tc64)
 
 
 def test_rank_genes_groups_structured_results_get_df_and_h5ad_match_scanpy(tmp_path):
