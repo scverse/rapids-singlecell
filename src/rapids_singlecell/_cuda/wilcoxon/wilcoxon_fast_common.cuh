@@ -8,6 +8,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cub/device/device_segmented_radix_sort.cuh>
+
 #include "../nb_types.h"  // for CUDA_CHECK_LAST_ERROR
 
 void* wilcoxon_rmm_allocate(size_t bytes);
@@ -49,13 +51,60 @@ constexpr int TIER1_GROUP_THRESHOLD = 2500;
 // 512 MB per stream dense slab + same for sorted copy ≈ 1 GB / stream.
 constexpr size_t GROUP_DENSE_BUDGET_ITEMS = 128 * 1024 * 1024;
 
+// Query CUB device-segmented-radix-sort scratch size with a dummy launch.
+// Every Wilcoxon sort uses float keys and (for SortPairs) int values/offsets.
+static inline size_t cub_segmented_sortkeys_temp_bytes(int num_items,
+                                                       int num_segments) {
+    size_t bytes = 0;
+    auto* fk = reinterpret_cast<float*>(1);
+    auto* doff = reinterpret_cast<int*>(1);
+    cub::DeviceSegmentedRadixSort::SortKeys(nullptr, bytes, fk, fk, num_items,
+                                            num_segments, doff, doff + 1,
+                                            BEGIN_BIT, END_BIT);
+    return bytes;
+}
+
+template <typename ValT = int>
+static inline size_t cub_segmented_sortpairs_temp_bytes(int num_items,
+                                                        int num_segments) {
+    size_t bytes = 0;
+    auto* fk = reinterpret_cast<float*>(1);
+    auto* v = reinterpret_cast<ValT*>(1);
+    auto* off = reinterpret_cast<int*>(1);
+    cub::DeviceSegmentedRadixSort::SortPairs(nullptr, bytes, fk, fk, v, v,
+                                             num_items, num_segments, off,
+                                             off + 1, BEGIN_BIT, END_BIT);
+    return bytes;
+}
+
+// Universal CUDA static per-block shared-memory floor; safe fallback if the
+// device query fails.
+constexpr size_t WILCOXON_FALLBACK_SMEM_PER_BLOCK = 48 * 1024;
+
+// CRITICAL device-limit query that powers every smem/gmem and tier decision.
+// Returns the per-block shared-memory limit (cached per device). Consumed by
+// ovr_smem_config, sparse_ovr_smem_config, cast_accumulate_smem_config, and
+// make_tier1_config to decide when accumulators/sorts no longer fit in smem and
+// must fall back to global memory or CUB. DO NOT hardcode a smem value in place
+// of this call -- the gmem-fallback thresholds (e.g. sparse OVR ~3056 groups)
+// auto-scale with the GPU because of it; falls back to 48 KB if the query
+// fails.
 static inline size_t wilcoxon_max_smem_per_block() {
     int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return WILCOXON_FALLBACK_SMEM_PER_BLOCK;
+    }
+    static thread_local int cached_dev = -1;
+    static thread_local size_t cached_smem = 0;
+    if (device == cached_dev) return cached_smem;
     int max_smem = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock,
-                           device);
-    return (size_t)max_smem;
+    if (cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock,
+                               device) != cudaSuccess) {
+        return WILCOXON_FALLBACK_SMEM_PER_BLOCK;
+    }
+    cached_dev = device;
+    cached_smem = (size_t)max_smem;
+    return cached_smem;
 }
 
 static inline int checked_cub_items(size_t count, const char* context) {

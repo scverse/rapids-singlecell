@@ -49,6 +49,16 @@ __global__ void csr_scatter_to_csc_kernel(
     }
 }
 
+// CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
+//
+// Decide smem-vs-gmem for the DENSE OVR rank kernel
+// (rank_sums_from_sorted_kernel). Per-block accumulator is one double per group
+// plus a 32-slot warp buffer, i.e. (n_groups + 32) doubles. When that exceeds
+// the per-block smem limit (~48 KB) the kernel must fall back to a
+// global-memory accumulator (use_gmem=true). With a 48 KB limit this flips at
+// roughly n_groups > 6112. Not dead: a kernel launched in smem mode with an
+// oversized request simply fails to launch. Limit is device-queried via
+// wilcoxon_max_smem_per_block(), so it auto-scales.
 static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(n_groups + 32) * sizeof(double);
     if (need <= wilcoxon_max_smem_per_block()) {
@@ -61,8 +71,19 @@ static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
 }
 
 /**
- * Decide smem-vs-gmem for the sparse OVR rank kernel.  Two accumulator
- * arrays (grp_sums + grp_nz_count) of size n_groups each plus warp buf.
+ * CRITICAL — DO NOT REMOVE the gmem branch. This is the load-bearing path for
+ * Perturb-seq / pooled-CRISPR DE, where n_groups is in the thousands.
+ *
+ * Decide smem-vs-gmem for the sparse OVR rank kernel. The per-block accumulator
+ * is two double arrays of size n_groups (grp_sums + grp_nz_count) plus a
+ * 32-slot warp buffer, i.e. (2*n_groups + 32) doubles. When that exceeds the
+ * per-block shared-memory limit (~48 KB) the kernel CANNOT launch in smem mode,
+ * so we set use_gmem=true and rank_sums_sparse_ovr_kernel accumulates in a
+ * caller-provided global-memory buffer instead. With a 48 KB limit this flips
+ * at roughly n_groups > 3056. Reviewers/static analysis have twice mistaken
+ * this fallback for dead code; it is the ONLY path that works at large
+ * n_groups. The limit is queried per device via wilcoxon_max_smem_per_block(),
+ * so the threshold auto-scales with the GPU.
  */
 static size_t sparse_ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(2 * n_groups + 32) * sizeof(double);

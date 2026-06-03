@@ -74,6 +74,19 @@ struct Tier1Config {
     size_t tier1_smem = 0;
 };
 
+// SINGLE source of truth for OVO tier dispatch, used by EVERY OVO path:
+// dense (wilcoxon.cu) AND all four sparse OVO impls (host/device CSC/CSR),
+// which extract ref+group rows to dense per sub-batch and then call this.
+// Scans per-group sizes once and returns which size-gated tiers to co-launch:
+//   Tier 0   (<=32, TIER0_GROUP_THRESHOLD):    ovo_warp_sort_rank_kernel
+//   Tier 0.5 (<=64, TIER0_64_GROUP_THRESHOLD): ovo_small64_sort_rank_kernel
+//   Tier 2   (<=512, TIER2_GROUP_THRESHOLD):   ovo_medium_unsorted_rank_kernel
+//   Tier 1   (<=2500, TIER1_GROUP_THRESHOLD):  ovo_fused_sort_rank_kernel (smem
+//   sort) Tier 3   (>2500):                          CUB segmented sort +
+//   batched_rank_sums_presorted_kernel
+// Tiers cooperate via skip_n_grp_le: a larger tier skips groups a smaller tier
+// already handled. Tier 1 is device-adapted: if its fused-sort smem footprint
+// would exceed wilcoxon_max_smem_per_block() it is disabled in favor of Tier 3.
 static Tier1Config make_tier1_config(const int* h_grp_offsets, int n_groups) {
     Tier1Config c;
     c.min_grp_size = INT_MAX;
@@ -104,6 +117,14 @@ static Tier1Config make_tier1_config(const int* h_grp_offsets, int n_groups) {
         c.tier1_tpb = std::min(c.padded_grp_size, MAX_THREADS_PER_BLOCK);
         c.tier1_smem = (size_t)c.padded_grp_size * sizeof(float) +
                        WARP_REDUCE_BUF * sizeof(double);
+        // Adapt to the device: if the fused-sort buffer would exceed the
+        // per-block shared-memory limit, fall back to the tier-3 CUB segmented
+        // sort (which has no smem cap) rather than launching a kernel that
+        // would fail. Never triggers at the current threshold (~16.6KB), but
+        // keeps the dispatch correct if the threshold or device limit changes.
+        if (c.tier1_smem > wilcoxon_max_smem_per_block()) {
+            c.use_tier1 = false;
+        }
     }
     return c;
 }

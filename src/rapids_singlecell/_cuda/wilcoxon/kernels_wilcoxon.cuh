@@ -30,6 +30,11 @@ __device__ __forceinline__ double wilcoxon_block_sum(double val,
  * SortPairs. One block owns one column, walks tie runs, and accumulates the
  * average ranks per group without materializing a full rank matrix.
  */
+// Dense OVR rank kernel. One block per column; walks sorted tie runs and
+// accumulates average ranks per group without materializing a rank matrix.
+// The `use_gmem` flag (set by ovr_smem_config) selects shared- vs
+// global-memory group accumulators -- CRITICAL: the use_gmem path is REQUIRED
+// when n_groups is large (does NOT fit in smem) and must not be removed.
 __global__ void rank_sums_from_sorted_kernel(
     const float* __restrict__ sorted_vals,
     const int* __restrict__ sorted_row_idx, const int* __restrict__ group_codes,

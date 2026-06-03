@@ -748,6 +748,135 @@ def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt, pre_load):
             )
 
 
+def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
+    """AnnData with exact per-group sizes (drives OVO tier selection by max size)."""
+    rng = np.random.default_rng(seed)
+    n_obs = int(sum(group_sizes))
+    X = np.abs(rng.standard_normal((n_obs, n_genes))).astype(np.float32)
+    X[X < 0.3] = 0.0  # zeros create tie groups, exercising tie correction
+    labels = np.concatenate(
+        [np.full(sz, f"g{i}", dtype=object) for i, sz in enumerate(group_sizes)]
+    )
+    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_genes)])
+    adata = sc.AnnData(X=X, obs=obs, var=var)
+    adata.uns["log1p"] = {"base": None}
+    return adata
+
+
+# Tier thresholds (wilcoxon_fast_common.cuh): tier0<=32, tier0_64<=64,
+# tier2<=512, tier1(fused smem sort)<=2500, tier3(CUB segmented sort)>2500.
+# Group sizes in the standard blobs datasets are <=~70, so tier1/tier3 are
+# otherwise never exercised. These force a single large test group.
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
+)
+@pytest.mark.parametrize("tie_correct", [False, True])
+@pytest.mark.parametrize("big", [700, 3000], ids=["tier1_fused", "tier3_cub"])
+def test_wilcoxon_ovo_large_group_tiers_match_scanpy(fmt, tie_correct, big):
+    # g0 = reference, g1 = the large test group that drives tier selection.
+    adata_gpu = _make_sized_groups_adata([60, big, 45], n_genes=6, seed=1)
+    adata_cpu = adata_gpu.copy()
+    adata_gpu.X = _to_format(adata_gpu.X, fmt)
+
+    kw = {
+        "groupby": "group",
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": "g0",
+        "tie_correct": tie_correct,
+        "n_genes": 6,
+    }
+    rsc.tl.rank_genes_groups(adata_gpu, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **kw)
+
+    gpu = adata_gpu.uns["rank_genes_groups"]
+    cpu = adata_cpu.uns["rank_genes_groups"]
+    for field in ("scores", "pvals"):
+        for group in gpu[field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(gpu[field][group], dtype=float),
+                np.asarray(cpu[field][group], dtype=float),
+                rtol=1e-13,
+                atol=1e-15,
+                equal_nan=True,
+            )
+
+
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
+)
+def test_wilcoxon_ovo_mixed_tier_sizes_match_scanpy(fmt):
+    # Groups spanning tier0 (20), tier0_64 (50) and tier2 (300) co-launched with
+    # tie_correct=True, pinning the skip_le boundaries and the ref_tie_sums gate.
+    adata_gpu = _make_sized_groups_adata([80, 20, 50, 300], n_genes=6, seed=2)
+    adata_cpu = adata_gpu.copy()
+    adata_gpu.X = _to_format(adata_gpu.X, fmt)
+
+    kw = {
+        "groupby": "group",
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": "g0",
+        "tie_correct": True,
+        "n_genes": 6,
+    }
+    rsc.tl.rank_genes_groups(adata_gpu, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **kw)
+
+    gpu = adata_gpu.uns["rank_genes_groups"]
+    cpu = adata_cpu.uns["rank_genes_groups"]
+    for field in ("scores", "pvals"):
+        for group in gpu[field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(gpu[field][group], dtype=float),
+                np.asarray(cpu[field][group], dtype=float),
+                rtol=1e-13,
+                atol=1e-15,
+                equal_nan=True,
+            )
+
+
+# n_groups > ~3056 makes the per-block smem for the sparse-OVR accumulator
+# ((2*n_groups+32) doubles) exceed the 48KB static limit, so sparse_ovr_smem_config
+# (and the dense ovr_smem_config) fall back to the global-memory accumulator.
+# This is the perturbation regime (thousands of guides vs rest). scanpy's
+# 3000+-group DataFrame build is O(n_groups^2) and too slow for an in-suite
+# parity check; gmem-vs-scanpy parity is verified out-of-band (<=2e-15). Here we
+# guard that every storage format (incl. the dense reference kernel) agrees at
+# gmem scale, with and without tie correction.
+@pytest.mark.parametrize("tie_correct", [False, True])
+def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
+    adata = _make_sized_groups_adata([26] * 3100, n_genes=6, seed=3)
+    ref = None
+    for fmt in ("numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"):
+        a = adata.copy()
+        a.X = _to_format(adata.X, fmt)
+        rsc.tl.rank_genes_groups(
+            a,
+            "group",
+            method="wilcoxon",
+            use_raw=False,
+            reference="rest",
+            tie_correct=tie_correct,
+            n_genes=6,
+        )
+        r = a.uns["rank_genes_groups"]
+        cur = {
+            field: np.vstack(
+                [np.asarray(r[field][n], dtype=float) for n in r[field].dtype.names]
+            )
+            for field in ("scores", "pvals")
+        }
+        if ref is None:
+            ref = cur
+            continue
+        for field in ("scores", "pvals"):
+            np.testing.assert_allclose(
+                cur[field], ref[field], rtol=1e-13, atol=1e-15, equal_nan=True
+            )
+
+
 @pytest.mark.parametrize(
     ("groups", "reference"),
     [

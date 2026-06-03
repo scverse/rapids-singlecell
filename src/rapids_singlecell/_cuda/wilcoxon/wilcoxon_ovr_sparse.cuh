@@ -34,11 +34,8 @@ static void ovr_sparse_csc_host_streaming_impl(
     if (max_nnz > 0) {
         int max_nnz_i32 =
             checked_cub_items(max_nnz, "OVR host CSC sparse sub-batch nnz");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* iv = reinterpret_cast<IndexT*>(1);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            nullptr, cub_temp_bytes, fk, fk, iv, iv, max_nnz_i32,
-            sub_batch_cols, iv, iv + 1, BEGIN_BIT, END_BIT);
+        cub_temp_bytes = cub_segmented_sortpairs_temp_bytes<IndexT>(
+            max_nnz_i32, sub_batch_cols);
     }
 
     std::vector<cudaStream_t> streams(n_streams);
@@ -305,11 +302,8 @@ static void ovr_sparse_csr_host_streaming_impl(
     if (max_batch_nnz > 0) {
         int max_batch_nnz_i32 = checked_cub_items(
             max_batch_nnz, "OVR host CSR sparse sub-batch nnz");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* iv = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            nullptr, cub_temp_bytes, fk, fk, iv, iv, max_batch_nnz_i32,
-            sub_batch_cols, iv, iv + 1, BEGIN_BIT, END_BIT);
+        cub_temp_bytes = cub_segmented_sortpairs_temp_bytes(max_batch_nnz_i32,
+                                                            sub_batch_cols);
     }
 
     int tpb = UTIL_BLOCK_SIZE;
@@ -560,11 +554,8 @@ static void ovr_sparse_csc_streaming_impl(
     if (max_nnz > 0) {
         int max_nnz_i32 =
             checked_cub_items(max_nnz, "OVR device CSC sparse sub-batch nnz");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* iv = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            nullptr, cub_temp_bytes, fk, fk, iv, iv, max_nnz_i32,
-            sub_batch_cols, iv, iv + 1, BEGIN_BIT, END_BIT);
+        cub_temp_bytes =
+            cub_segmented_sortpairs_temp_bytes(max_nnz_i32, sub_batch_cols);
     }
 
     std::vector<cudaStream_t> streams(n_streams);
@@ -744,11 +735,8 @@ static void ovr_sparse_csr_streaming_impl(
     if (max_batch_nnz > 0) {
         int max_batch_nnz_i32 = checked_cub_items(
             max_batch_nnz, "OVR device CSR sparse sub-batch nnz");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* iv = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            nullptr, cub_temp_bytes, fk, fk, iv, iv, max_batch_nnz_i32,
-            sub_batch_cols, iv, iv + 1, BEGIN_BIT, END_BIT);
+        cub_temp_bytes = cub_segmented_sortpairs_temp_bytes(max_batch_nnz_i32,
+                                                            sub_batch_cols);
     }
 
     int n_streams = N_STREAMS;
@@ -756,11 +744,18 @@ static void ovr_sparse_csr_streaming_impl(
 
     // CSR path needs 4 sort arrays per stream (scatter intermediates +
     // CUB output).  Fit stream count to available GPU memory.
+    bool rank_use_gmem = false;
+    size_t smem_bytes = sparse_ovr_smem_config(n_groups, rank_use_gmem);
     size_t per_stream_bytes =
         max_batch_nnz * (2 * sizeof(float) + 2 * sizeof(int)) +
         (sub_batch_cols + 1 + sub_batch_cols) * sizeof(int) + cub_temp_bytes +
         (size_t)n_groups * sub_batch_cols * sizeof(double) +
         sub_batch_cols * sizeof(double);
+    if (rank_use_gmem) {
+        // gmem rank fallback (n_groups too large for smem): per-stream
+        // d_nz_scratch accumulator, same size as sub_rank_sums.
+        per_stream_bytes += (size_t)n_groups * sub_batch_cols * sizeof(double);
+    }
 
     size_t free_mem = 0, total_mem = 0;
     cudaMemGetInfo(&free_mem, &total_mem);
@@ -773,8 +768,6 @@ static void ovr_sparse_csr_streaming_impl(
     for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
 
     int tpb = UTIL_BLOCK_SIZE;
-    bool rank_use_gmem = false;
-    size_t smem_bytes = sparse_ovr_smem_config(n_groups, rank_use_gmem);
     int scatter_blocks = (n_rows + tpb - 1) / tpb;
 
     struct StreamBuf {

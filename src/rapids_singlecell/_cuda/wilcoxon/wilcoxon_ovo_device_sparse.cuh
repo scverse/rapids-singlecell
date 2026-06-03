@@ -70,11 +70,8 @@ static void ovo_streaming_csr_impl(
         int max_grp_seg =
             checked_int_product((size_t)n_sort_groups, (size_t)sub_batch_cols,
                                 "OVO device CSR group segment count");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* doff = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, cub_grp_bytes, fk, fk, sub_grp_items_i32, max_grp_seg,
-            doff, doff + 1, BEGIN_BIT, END_BIT);
+        cub_grp_bytes =
+            cub_segmented_sortkeys_temp_bytes(sub_grp_items_i32, max_grp_seg);
         cub_temp_bytes = cub_grp_bytes;
     }
 
@@ -158,12 +155,8 @@ static void ovo_streaming_csr_impl(
 
         upload_linear_offsets(d_ref_seg_offsets, cache_cols, n_ref, ref_stream);
 
-        size_t ref_cub_bytes = 0;
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* doff = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, ref_cub_bytes, fk, fk, cache_ref_items_i32, cache_cols,
-            doff, doff + 1, BEGIN_BIT, END_BIT);
+        size_t ref_cub_bytes =
+            cub_segmented_sortkeys_temp_bytes(cache_ref_items_i32, cache_cols);
         ScopedCudaBuffer ref_cub_temp_buf(ref_cub_bytes);
         size_t ref_temp = ref_cub_bytes;
         cub::DeviceSegmentedRadixSort::SortKeys(
@@ -339,25 +332,16 @@ static void ovo_streaming_csc_impl(
     int sub_grp_items_i32 =
         checked_cub_items(sub_grp_items, "OVO device CSC group sub-batch");
 
-    size_t cub_ref_bytes = 0;
-    {
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* doff = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, cub_ref_bytes, fk, fk, sub_ref_items_i32, sub_batch_cols,
-            doff, doff + 1, BEGIN_BIT, END_BIT);
-    }
+    size_t cub_ref_bytes =
+        cub_segmented_sortkeys_temp_bytes(sub_ref_items_i32, sub_batch_cols);
     size_t cub_temp_bytes = cub_ref_bytes;
     if (needs_tier3) {
         size_t cub_grp_bytes = 0;
         int max_grp_seg =
             checked_int_product((size_t)n_sort_groups, (size_t)sub_batch_cols,
                                 "OVO device CSC group segment count");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* doff = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, cub_grp_bytes, fk, fk, sub_grp_items_i32, max_grp_seg,
-            doff, doff + 1, BEGIN_BIT, END_BIT);
+        cub_grp_bytes =
+            cub_segmented_sortkeys_temp_bytes(sub_grp_items_i32, max_grp_seg);
         cub_temp_bytes = std::max(cub_ref_bytes, cub_grp_bytes);
     }
 

@@ -31,6 +31,15 @@
  *
  * Grid: (sb_cols,)   Block: (tpb,)
  */
+// HEADLINE sparse-OVR optimization (OVR-only). Ranks ONLY stored positive
+// values; all zeros (stored + implicit n_rows-nnz) are treated as one leading
+// tie block ranked analytically at (total_zero+1)/2, and each group's zero
+// contribution is applied in closed form. Cost is O(nnz log nnz) per column,
+// not O(n_rows log n_rows). The `use_gmem` flag selects shared- vs
+// global-memory accumulators (see sparse_ovr_smem_config) -- CRITICAL: the
+// use_gmem path is REQUIRED for large n_groups (Perturb-seq) and must not be
+// removed. Validity relies on the upstream rejection of explicit negative
+// sparse values, which guarantees zeros form the first tie block.
 template <typename IndexT = int>
 __global__ void rank_sums_sparse_ovr_kernel(
     const float* __restrict__ sorted_vals,
@@ -227,6 +236,15 @@ __global__ void rank_sums_sparse_ovr_kernel(
     }
 }
 
+// CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
+//
+// Decide smem-vs-gmem for the sparse-OVR stats cast-and-accumulate kernel
+// (sums / sq-sums / nnz). Needs n_arrays*n_groups doubles in smem; when that
+// exceeds the per-block limit, use_gmem=true selects
+// ovr_cast_and_accumulate_sparse_global_kernel, which accumulates directly in
+// global memory. Same large-n_groups workloads that drive
+// sparse_ovr_smem_config to gmem also drive this one; both fallbacks are
+// load-bearing, not dead.
 static size_t cast_accumulate_smem_config(int n_groups, bool compute_sq_sums,
                                           bool compute_nnz, bool& use_gmem) {
     int n_arrays = 1 + (compute_sq_sums ? 1 : 0) + (compute_nnz ? 1 : 0);
@@ -302,6 +320,11 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
     }
 }
 
+// CRITICAL — DO NOT REMOVE. Global-memory variant of the stats accumulator,
+// selected by cast_accumulate_smem_config when n_groups is too large for the
+// smem version. Required for Perturb-seq-scale n_groups; the smem kernel cannot
+// launch when its (n_arrays*n_groups) double buffer exceeds the per-block
+// limit.
 template <typename InT, typename IndexT = int>
 __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
     const InT* __restrict__ data_in, float* __restrict__ data_f32_out,

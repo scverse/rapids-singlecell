@@ -30,14 +30,8 @@ static void launch_ovr_rank_dense_streaming(
     size_t sub_items = (size_t)n_rows * sub_batch_cols;
     int sub_items_i32 = checked_cub_items(sub_items, "Dense OVR sub-batch");
 
-    size_t cub_temp_bytes = 0;
-    {
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* iv = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            nullptr, cub_temp_bytes, fk, fk, iv, iv, sub_items_i32,
-            sub_batch_cols, iv, iv + 1, BEGIN_BIT, END_BIT);
-    }
+    size_t cub_temp_bytes =
+        cub_segmented_sortpairs_temp_bytes(sub_items_i32, sub_batch_cols);
 
     std::vector<cudaStream_t> streams(n_streams);
     for (int i = 0; i < n_streams; ++i) {
@@ -181,20 +175,11 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         int max_grp_seg =
             checked_int_product((size_t)n_sort_groups, (size_t)sub_batch_cols,
                                 "Dense OVO group segment count");
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* doff = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, grp_cub_temp_bytes, fk, fk, sub_grp_items_i32, max_grp_seg,
-            doff, doff + 1, BEGIN_BIT, END_BIT);
+        grp_cub_temp_bytes =
+            cub_segmented_sortkeys_temp_bytes(sub_grp_items_i32, max_grp_seg);
     }
-    size_t ref_cub_temp_bytes = 0;
-    {
-        auto* fk = reinterpret_cast<float*>(1);
-        auto* doff = reinterpret_cast<int*>(1);
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, ref_cub_temp_bytes, fk, fk, sub_ref_items_i32,
-            sub_batch_cols, doff, doff + 1, BEGIN_BIT, END_BIT);
-    }
+    size_t ref_cub_temp_bytes =
+        cub_segmented_sortkeys_temp_bytes(sub_ref_items_i32, sub_batch_cols);
 
     std::vector<cudaStream_t> streams(n_streams);
     for (int i = 0; i < n_streams; ++i) {
