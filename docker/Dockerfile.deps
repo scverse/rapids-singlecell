@@ -6,6 +6,8 @@ FROM nvidia/cuda:${CUDA_VER}-devel-${LINUX_VER}
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ARG PYTHON_VER=3.13
+# Re-declare after FROM so it is available to RUN steps (passed by docker.yml build-args)
+ARG CUDA_VER=13.0.2
 
 ENV PATH=/opt/conda/bin:$PATH
 ENV PYTHON_VERSION=${PYTHON_VER}
@@ -33,6 +35,41 @@ set -x
 mamba env update -n base -f rsc_rapids.yml
 mamba install -y -n base pytest -c conda-forge
 mamba clean --all -y
+EOF
+
+RUN <<EOF
+# Guard against cu12/cu13 package mixing (see issue #677): fail the build if any
+# installed CUDA Python package's major version does not match the image's CUDA major.
+set -x
+CUDA_MAJOR="${CUDA_VER%%.*}"
+echo "Verifying all CUDA packages match CUDA major ${CUDA_MAJOR}"
+/opt/conda/bin/python - "${CUDA_MAJOR}" <<'PY'
+import sys
+import importlib.metadata as md
+
+target = sys.argv[1]
+bad = []
+# cuda-bindings and cuda-python track the CUDA major in their version.
+# (cuda-core is intentionally excluded: it uses its own 0.x versioning.)
+for name in ("cuda-bindings", "cuda-python"):
+    try:
+        version = md.version(name)
+    except md.PackageNotFoundError:
+        continue
+    if version.split(".")[0] != target:
+        bad.append(f"{name}=={version} (expected CUDA {target}.x)")
+# cupy wheels encode the CUDA major in the project name
+for name in ("cupy-cuda12x", "cupy-cuda13x"):
+    try:
+        md.version(name)
+    except md.PackageNotFoundError:
+        continue
+    if name != f"cupy-cuda{target}x":
+        bad.append(f"{name} installed (expected cupy-cuda{target}x)")
+if bad:
+    sys.exit("ERROR: CUDA major mismatch in cu%s image:\n  - %s" % (target, "\n  - ".join(bad)))
+print(f"OK: all CUDA packages match CUDA {target}.x")
+PY
 EOF
 
 RUN <<EOF
