@@ -33,18 +33,18 @@ constexpr int WARP_REDUCE_BUF = 32;
 // amortised 8× across (col, group) work items.  This path is the fast
 // route for per-celltype perturbation-style workloads where most test
 // groups have only a few dozen cells.
-constexpr int TIER0_GROUP_THRESHOLD = 32;
+constexpr int OVO_WARP_MAX = 32;
 // Second small-group tier for perturbation workloads where most groups are
 // slightly larger than one warp.  Uses one compact shared-memory sort block per
 // (column, group), avoiding the heavier Tier 2 in-group scan.
-constexpr int TIER0_64_GROUP_THRESHOLD = 64;
+constexpr int OVO_SMALL_MAX = 64;
 // Medium-group cutoff for the unsorted direct-rank kernel.  For perturbation
 // workloads most groups sit below this range, where avoiding a full smem
 // bitonic sort wins despite the O(n^2) in-group count.
-constexpr int TIER2_GROUP_THRESHOLD = 512;
+constexpr int OVO_MEDIUM_MAX = 512;
 // Max group size for the fused smem-sort rank kernel (Tier 1 fast path).
 // Beyond this, fall back to CUB segmented sort + binary-search rank kernel.
-constexpr int TIER1_GROUP_THRESHOLD = 2500;
+constexpr int OVO_LARGE_MAX = 2500;
 // Per-stream dense slab budget (float32 items).  Dynamic sub-batching sizes
 // each group's column batch so that (n_g × eff_sb_cols) ≤ this.  Bigger =
 // fewer kernel launches; smaller = less per-stream memory.  128M items × 4B =
@@ -84,11 +84,11 @@ constexpr size_t WILCOXON_FALLBACK_SMEM_PER_BLOCK = 48 * 1024;
 // CRITICAL device-limit query that powers every smem/gmem and tier decision.
 // Returns the per-block shared-memory limit (cached per device). Consumed by
 // ovr_smem_config, sparse_ovr_smem_config, cast_accumulate_smem_config, and
-// make_tier1_config to decide when accumulators/sorts no longer fit in smem and
-// must fall back to global memory or CUB. DO NOT hardcode a smem value in place
-// of this call -- the gmem-fallback thresholds (e.g. sparse OVR ~3056 groups)
-// auto-scale with the GPU because of it; falls back to 48 KB if the query
-// fails.
+// make_ovo_tier_plan to decide when accumulators/sorts no longer fit in smem
+// and must fall back to global memory or CUB. DO NOT hardcode a smem value in
+// place of this call -- the gmem-fallback thresholds (e.g. sparse OVR ~3056
+// groups) auto-scale with the GPU because of it; falls back to 48 KB if the
+// query fails.
 static inline size_t wilcoxon_max_smem_per_block() {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {

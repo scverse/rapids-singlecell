@@ -155,7 +155,7 @@ __device__ __forceinline__ void compute_tie_correction_parallel(
 // sorted grp_col values within each thread's stride.
 // ============================================================================
 
-__global__ void batched_rank_sums_presorted_kernel(
+__global__ void ovo_rank_huge_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_sorted,
     const int* __restrict__ grp_offsets, double* __restrict__ rank_sums,
     double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
@@ -168,7 +168,7 @@ __global__ void batched_rank_sums_presorted_kernel(
     int g_end = grp_offsets[grp + 1];
     int n_grp = g_end - g_start;
 
-    // Size-gated dispatch (see ovo_fused_sort_rank_kernel for the contract).
+    // Size-gated dispatch (see ovo_rank_large_kernel for the contract).
     if (n_grp <= skip_n_grp_le) return;
 
     if (n_grp == 0) {
@@ -261,11 +261,11 @@ __global__ void batched_rank_sums_presorted_kernel(
 // ============================================================================
 // Tier 1 fused kernel: smem bitonic sort + binary search rank sums
 // For small groups (< ~2K cells).  No CUB, no global memory sort buffers.
-// Grid: (n_cols, n_groups), Block: min(padded_grp_size, 512)
-// Shared memory: padded_grp_size floats + 32 doubles (warp reduction)
+// Grid: (n_cols, n_groups), Block: min(large_padded, 512)
+// Shared memory: large_padded floats + 32 doubles (warp reduction)
 // ============================================================================
 
-__global__ void ovo_fused_sort_rank_kernel(
+__global__ void ovo_rank_large_kernel(
     const float* __restrict__ ref_sorted,  // F-order (n_ref, n_cols) sorted
     const float* __restrict__ grp_dense,   // F-order (n_all_grp, n_cols)
                                            // unsorted
@@ -273,7 +273,7 @@ __global__ void ovo_fused_sort_rank_kernel(
     double* __restrict__ rank_sums,        // (n_groups, n_cols) row-major
     double* __restrict__ tie_corr,         // (n_groups, n_cols) row-major
     int n_ref, int n_all_grp, int n_cols, int n_groups, bool compute_tie_corr,
-    int padded_grp_size, int skip_n_grp_le /*= 0*/) {
+    int large_padded, int skip_n_grp_le /*= 0*/) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
@@ -295,23 +295,23 @@ __global__ void ovo_fused_sort_rank_kernel(
         return;
     }
 
-    // Shared memory: [padded_grp_size floats | 32 doubles for warp reduction]
+    // Shared memory: [large_padded floats | 32 doubles for warp reduction]
     extern __shared__ char smem_raw[];
     float* grp_smem = (float*)smem_raw;
-    double* warp_buf = (double*)(smem_raw + padded_grp_size * sizeof(float));
+    double* warp_buf = (double*)(smem_raw + large_padded * sizeof(float));
 
     // Load group data into shared memory, pad with +INF
     const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x)
         grp_smem[i] = grp_col[i];
-    for (int i = n_grp + threadIdx.x; i < padded_grp_size; i += blockDim.x)
+    for (int i = n_grp + threadIdx.x; i < large_padded; i += blockDim.x)
         grp_smem[i] = __int_as_float(0x7f800000);  // +INF
     __syncthreads();
 
     // Bitonic sort in shared memory
-    for (int k = 2; k <= padded_grp_size; k <<= 1) {
+    for (int k = 2; k <= large_padded; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = threadIdx.x; i < padded_grp_size; i += blockDim.x) {
+            for (int i = threadIdx.x; i < large_padded; i += blockDim.x) {
                 int ixj = i ^ j;
                 if (ixj > i) {
                     bool asc = ((i & k) == 0);
@@ -439,7 +439,7 @@ __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
     if (threadIdx.x == 0) ref_tie_sums[col] = total;
 }
 
-__global__ void ovo_small64_sort_rank_kernel(
+__global__ void ovo_rank_small_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
@@ -452,24 +452,24 @@ __global__ void ovo_small64_sort_rank_kernel(
     int g_start = grp_offsets[grp];
     int g_end = grp_offsets[grp + 1];
     int n_grp = g_end - g_start;
-    if (n_grp <= skip_n_grp_le || n_grp > TIER0_64_GROUP_THRESHOLD) return;
+    if (n_grp <= skip_n_grp_le || n_grp > OVO_SMALL_MAX) return;
 
-    __shared__ float grp_smem[TIER0_64_GROUP_THRESHOLD];
+    __shared__ float grp_smem[OVO_SMALL_MAX];
     __shared__ double warp_buf[WARP_REDUCE_BUF];
 
     const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
     const float POS_INF = __int_as_float(0x7f800000);
-    if (threadIdx.x < TIER0_64_GROUP_THRESHOLD) {
+    if (threadIdx.x < OVO_SMALL_MAX) {
         grp_smem[threadIdx.x] =
             (threadIdx.x < n_grp) ? grp_col[threadIdx.x] : POS_INF;
     }
     __syncthreads();
 
-    for (int k = 2; k <= TIER0_64_GROUP_THRESHOLD; k <<= 1) {
+    for (int k = 2; k <= OVO_SMALL_MAX; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
             int i = threadIdx.x;
             int ixj = i ^ j;
-            if (i < TIER0_64_GROUP_THRESHOLD && ixj > i) {
+            if (i < OVO_SMALL_MAX && ixj > i) {
                 bool asc = ((i & k) == 0);
                 float a = grp_smem[i], b = grp_smem[ixj];
                 if (asc ? (a > b) : (a < b)) {
@@ -569,7 +569,7 @@ __global__ void ovo_small64_sort_rank_kernel(
 // ref_tie_sums[col] and adds only group-only / ref-overlap deltas.
 // ============================================================================
 
-__global__ void ovo_medium_unsorted_rank_kernel(
+__global__ void ovo_rank_medium_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
@@ -675,10 +675,9 @@ __global__ void ovo_medium_unsorted_rank_kernel(
 // sync is __syncwarp — no smem, no __syncthreads.
 // ============================================================================
 
-__device__ __forceinline__ double tier0_tie_sum_warp(const float* ref_col,
-                                                     int n_ref, float v_lane,
-                                                     int n_grp,
-                                                     unsigned int active_mask) {
+__device__ __forceinline__ double warp_tie_sum(const float* ref_col, int n_ref,
+                                               float v_lane, int n_grp,
+                                               unsigned int active_mask) {
     int lane = threadIdx.x & 31;
     double local_tie = 0.0;
 
@@ -708,7 +707,7 @@ __device__ __forceinline__ double tier0_tie_sum_warp(const float* ref_col,
         // the result.
         int cnt_grp = 0;
 #pragma unroll
-        for (int lane_i = 0; lane_i < TIER0_GROUP_THRESHOLD; ++lane_i) {
+        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
             float vi = __shfl_sync(0xffffffff, v_lane, lane_i);
             if (is_first && lane_i < n_grp && vi == v) ++cnt_grp;
         }
@@ -752,7 +751,7 @@ __device__ __forceinline__ double tier0_tie_sum_warp(const float* ref_col,
         // group values consume the count.
         int cnt = 0;
 #pragma unroll
-        for (int lane_i = 0; lane_i < TIER0_GROUP_THRESHOLD; ++lane_i) {
+        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
             int src_lane = (lane_i < n_grp) ? lane_i : 0;
             float vi = __shfl_sync(active_mask, v_lane, src_lane);
             if (first_in_grp && !in_ref && lane_i >= lane && lane_i < n_grp &&
@@ -773,9 +772,10 @@ __device__ __forceinline__ double tier0_tie_sum_warp(const float* ref_col,
     return local_tie;  // meaningful on lane 0.
 }
 
-__device__ __forceinline__ double tier0_tie_delta_warp(
-    const float* ref_col, int n_ref, float v_lane, int n_grp,
-    unsigned int active_mask) {
+__device__ __forceinline__ double warp_tie_delta(const float* ref_col,
+                                                 int n_ref, float v_lane,
+                                                 int n_grp,
+                                                 unsigned int active_mask) {
     int lane = threadIdx.x & 31;
     double local_delta = 0.0;
 
@@ -789,7 +789,7 @@ __device__ __forceinline__ double tier0_tie_delta_warp(
 
         int cnt_grp = 0;
 #pragma unroll
-        for (int lane_i = 0; lane_i < TIER0_GROUP_THRESHOLD; ++lane_i) {
+        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
             int src_lane = (lane_i < n_grp) ? lane_i : 0;
             float vi = __shfl_sync(active_mask, v_lane, src_lane);
             if (lane_i < n_grp && vi == v) ++cnt_grp;
@@ -850,12 +850,14 @@ __device__ __forceinline__ double tier0_tie_delta_warp(
 // Grid: (n_cols, ceil(n_groups / 8)), Block: 256.
 // ============================================================================
 
-__global__ void ovo_warp_sort_rank_kernel(
-    const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
-    const int* __restrict__ grp_offsets,
-    const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
-    double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr) {
+__global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
+                                     const float* __restrict__ grp_dense,
+                                     const int* __restrict__ grp_offsets,
+                                     const double* __restrict__ ref_tie_sums,
+                                     double* __restrict__ rank_sums,
+                                     double* __restrict__ tie_corr, int n_ref,
+                                     int n_all_grp, int n_cols, int n_groups,
+                                     bool compute_tie_corr) {
     constexpr int WARPS_PER_BLOCK = 8;
     int warp_id = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
@@ -872,7 +874,7 @@ __global__ void ovo_warp_sort_rank_kernel(
     // per lane).  Larger groups are delegated to Tier 1/3 in a co-launched
     // kernel; since each group owns its own row in rank_sums/tie_corr, the
     // two kernels interlace into the output without conflict.
-    if (n_grp > TIER0_GROUP_THRESHOLD) return;
+    if (n_grp > OVO_WARP_MAX) return;
 
     if (n_grp == 0) {
         if (lane == 0) {
@@ -932,7 +934,7 @@ __global__ void ovo_warp_sort_rank_kernel(
         int n_eq_grp_offset = 0;  // tied lanes strictly before this one
         int n_eq_grp_after = 1;   // count self
 #pragma unroll
-        for (int lane_i = 0; lane_i < TIER0_GROUP_THRESHOLD; ++lane_i) {
+        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
             if (lane_i >= n_grp) continue;
             float vi = __shfl_sync(active_mask, v, lane_i);
             if (lane_i < lane) {
@@ -964,9 +966,9 @@ __global__ void ovo_warp_sort_rank_kernel(
     double tie_sum;
     if (ref_tie_sums != nullptr) {
         tie_sum = ref_tie_sums[col] +
-                  tier0_tie_delta_warp(ref_col, n_ref, x, n_grp, active_mask);
+                  warp_tie_delta(ref_col, n_ref, x, n_grp, active_mask);
     } else {
-        tie_sum = tier0_tie_sum_warp(ref_col, n_ref, x, n_grp, active_mask);
+        tie_sum = warp_tie_sum(ref_col, n_ref, x, n_grp, active_mask);
     }
     if (lane == 0) {
         int n = n_ref + n_grp;

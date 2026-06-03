@@ -236,6 +236,33 @@ __global__ void rank_sums_sparse_ovr_kernel(
     }
 }
 
+// Shared sparse-OVR rank launch, used by all four sparse OVR impls (they differ
+// only in how they produce the sorted nonzeros and how they scatter results).
+// Optionally zeroes the global-memory accumulators, then launches the
+// analytic-zero rank kernel. use_gmem is the CRITICAL large-n_groups /
+// perturbation fallback (see sparse_ovr_smem_config) — DO NOT drop the gmem
+// branch. ValT is the sorted-row-index type (int everywhere today).
+template <typename ValT = int>
+static inline void launch_ovr_sparse_rank(
+    const float* sorted_vals, const ValT* sorted_row_idx,
+    const int* col_seg_offsets, const int* group_codes,
+    const double* group_sizes, double* rank_sums, double* tie_corr,
+    double* nz_count_scratch, int n_rows, int sb_cols, int n_groups, int tpb,
+    size_t smem_bytes, bool compute_tie_corr, bool use_gmem,
+    cudaStream_t stream) {
+    if (use_gmem) {
+        cudaMemsetAsync(rank_sums, 0,
+                        (size_t)n_groups * sb_cols * sizeof(double), stream);
+        cudaMemsetAsync(nz_count_scratch, 0,
+                        (size_t)n_groups * sb_cols * sizeof(double), stream);
+    }
+    rank_sums_sparse_ovr_kernel<ValT><<<sb_cols, tpb, smem_bytes, stream>>>(
+        sorted_vals, sorted_row_idx, col_seg_offsets, group_codes, group_sizes,
+        rank_sums, tie_corr, nz_count_scratch, n_rows, sb_cols, n_groups,
+        compute_tie_corr, use_gmem);
+    CUDA_CHECK_LAST_ERROR(rank_sums_sparse_ovr_kernel);
+}
+
 // CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
 //
 // Decide smem-vs-gmem for the sparse-OVR stats cast-and-accumulate kernel

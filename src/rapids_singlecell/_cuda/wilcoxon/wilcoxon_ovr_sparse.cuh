@@ -182,21 +182,11 @@ static void ovr_sparse_csc_host_streaming_impl(
         }
 
         // Sparse rank kernel (stats already captured above)
-        if (rank_use_gmem) {
-            cudaMemsetAsync(buf.d_rank_sums, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-            cudaMemsetAsync(buf.d_nz_scratch, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-        }
-        rank_sums_sparse_ovr_kernel<IndexT>
-            <<<sb_cols, tpb, smem_bytes, stream>>>(
-                buf.keys_out, buf.vals_out, buf.d_seg_offsets, d_group_codes,
-                d_group_sizes, buf.d_rank_sums, buf.d_tie_corr,
-                buf.d_nz_scratch, n_rows, sb_cols, n_groups, compute_tie_corr,
-                rank_use_gmem);
-        CUDA_CHECK_LAST_ERROR(rank_sums_sparse_ovr_kernel);
+        launch_ovr_sparse_rank<IndexT>(
+            buf.keys_out, buf.vals_out, buf.d_seg_offsets, d_group_codes,
+            d_group_sizes, buf.d_rank_sums, buf.d_tie_corr, buf.d_nz_scratch,
+            n_rows, sb_cols, n_groups, tpb, smem_bytes, compute_tie_corr,
+            rank_use_gmem, stream);
 
         // D2D: scatter sub-batch results into caller's GPU buffers
         cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
@@ -465,20 +455,11 @@ static void ovr_sparse_csr_host_streaming_impl(
                 stream);
         }
 
-        if (rank_use_gmem) {
-            cudaMemsetAsync(buf.sub_rank_sums, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-            cudaMemsetAsync(buf.d_nz_scratch, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-        }
-        rank_sums_sparse_ovr_kernel<int><<<sb_cols, tpb, smem_bytes, stream>>>(
+        launch_ovr_sparse_rank<int>(
             buf.keys_out, buf.vals_out, buf.col_offsets, d_group_codes,
             d_group_sizes, buf.sub_rank_sums, buf.sub_tie_corr,
-            buf.d_nz_scratch, n_rows, sb_cols, n_groups, compute_tie_corr,
-            rank_use_gmem);
-        CUDA_CHECK_LAST_ERROR(rank_sums_sparse_ovr_kernel);
+            buf.d_nz_scratch, n_rows, sb_cols, n_groups, tpb, smem_bytes,
+            compute_tie_corr, rank_use_gmem, stream);
 
         cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
                           buf.sub_rank_sums, sb_cols * sizeof(double),
@@ -626,19 +607,11 @@ static void ovr_sparse_csc_streaming_impl(
         }
 
         // Sparse rank kernel (handles implicit zeros analytically)
-        if (rank_use_gmem) {
-            cudaMemsetAsync(buf.sub_rank_sums, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-            cudaMemsetAsync(buf.d_nz_scratch, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-        }
-        rank_sums_sparse_ovr_kernel<int><<<sb_cols, tpb, smem_bytes, stream>>>(
-            buf.keys_out, buf.vals_out, buf.seg_offsets, group_codes,
-            group_sizes, buf.sub_rank_sums, buf.sub_tie_corr, buf.d_nz_scratch,
-            n_rows, sb_cols, n_groups, compute_tie_corr, rank_use_gmem);
-        CUDA_CHECK_LAST_ERROR(rank_sums_sparse_ovr_kernel);
+        launch_ovr_sparse_rank<int>(buf.keys_out, buf.vals_out, buf.seg_offsets,
+                                    group_codes, group_sizes, buf.sub_rank_sums,
+                                    buf.sub_tie_corr, buf.d_nz_scratch, n_rows,
+                                    sb_cols, n_groups, tpb, smem_bytes,
+                                    compute_tie_corr, rank_use_gmem, stream);
 
         // Scatter results to global output
         cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
@@ -837,19 +810,11 @@ static void ovr_sparse_csr_streaming_impl(
         }
 
         // Sparse rank kernel (handles implicit zeros analytically)
-        if (rank_use_gmem) {
-            cudaMemsetAsync(buf.sub_rank_sums, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-            cudaMemsetAsync(buf.d_nz_scratch, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
-        }
-        rank_sums_sparse_ovr_kernel<int><<<sb_cols, tpb, smem_bytes, stream>>>(
-            buf.keys_out, buf.vals_out, buf.col_offsets, group_codes,
-            group_sizes, buf.sub_rank_sums, buf.sub_tie_corr, buf.d_nz_scratch,
-            n_rows, sb_cols, n_groups, compute_tie_corr, rank_use_gmem);
-        CUDA_CHECK_LAST_ERROR(rank_sums_sparse_ovr_kernel);
+        launch_ovr_sparse_rank<int>(buf.keys_out, buf.vals_out, buf.col_offsets,
+                                    group_codes, group_sizes, buf.sub_rank_sums,
+                                    buf.sub_tie_corr, buf.d_nz_scratch, n_rows,
+                                    sb_cols, n_groups, tpb, smem_bytes,
+                                    compute_tie_corr, rank_use_gmem, stream);
 
         // Scatter results to global output
         cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),

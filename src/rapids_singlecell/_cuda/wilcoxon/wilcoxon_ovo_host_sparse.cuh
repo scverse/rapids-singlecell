@@ -19,18 +19,15 @@ static void ovo_streaming_csc_host_impl(
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
     // ---- Tier dispatch from host offsets ----
-    auto t1 = make_tier1_config(h_grp_offsets, n_groups);
+    auto t1 = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool use_tier1 = t1.any_above_t2 && t1.use_tier1;
-    bool needs_tier3 = t1.any_above_t2 && !use_tier1;
-    int padded_grp_size = t1.padded_grp_size;
-    int tier1_tpb = t1.tier1_tpb;
-    size_t tier1_smem = t1.tier1_smem;
+    bool run_large = t1.above_medium && t1.run_large;
+    bool run_huge = t1.above_medium && !run_large;
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
-    if (needs_tier3) {
+    if (run_huge) {
         h_sort_group_ids =
-            make_sort_group_ids(h_grp_offsets, n_groups, TIER2_GROUP_THRESHOLD);
+            make_sort_group_ids(h_grp_offsets, n_groups, OVO_MEDIUM_MAX);
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
@@ -49,7 +46,7 @@ static void ovo_streaming_csc_host_impl(
     size_t cub_ref_bytes =
         cub_segmented_sortkeys_temp_bytes(sub_ref_items_i32, sub_batch_cols);
     size_t cub_temp_bytes = cub_ref_bytes;
-    if (needs_tier3) {
+    if (run_huge) {
         int max_grp_seg =
             checked_int_product((size_t)n_sort_groups, (size_t)sub_batch_cols,
                                 "OVO host CSC group segment count");
@@ -103,7 +100,7 @@ static void ovo_streaming_csc_host_impl(
                cudaMemcpyHostToDevice);
     cudaMemcpy(d_stats_codes, h_stats_codes, n_rows * sizeof(int),
                cudaMemcpyHostToDevice);
-    if (needs_tier3) {
+    if (run_huge) {
         d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());
         cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
                    h_sort_group_ids.size() * sizeof(int),
@@ -142,8 +139,7 @@ static void ovo_streaming_csc_host_impl(
         bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
         bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
         bufs[s].ref_tie_sums =
-            (compute_tie_corr &&
-             (t1.use_tier0 || t1.any_tier0_64 || t1.any_tier2))
+            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium))
                 ? pool.alloc<double>(sub_batch_cols)
                 : nullptr;
         bufs[s].d_rank_sums =
@@ -156,7 +152,7 @@ static void ovo_streaming_csc_host_impl(
             compute_sq_sums ? (size_t)n_groups_stats * sub_batch_cols : 1);
         bufs[s].d_group_nnz = pool.alloc<double>(
             compute_nnz ? (size_t)n_groups_stats * sub_batch_cols : 1);
-        if (needs_tier3) {
+        if (run_huge) {
             bufs[s].grp_sorted = pool.alloc<float>(sub_grp_items);
             int max_grp_seg = checked_int_product(
                 (size_t)n_sort_groups, (size_t)sub_batch_cols,
@@ -242,74 +238,14 @@ static void ovo_streaming_csc_host_impl(
         CUDA_CHECK_LAST_ERROR(csc_extract_mapped_kernel);
 
         // ---- Tier dispatch: sort grp + rank ----
-        int skip_le = 0;
-        bool run_tier0 = t1.use_tier0;
-        bool run_tier0_64 = t1.any_tier0_64;
-        bool run_tier2 = t1.any_tier2;
-        if (compute_tie_corr && (run_tier0 || run_tier0_64 || run_tier2)) {
-            launch_ref_tie_sums(buf.ref_sorted, buf.ref_tie_sums, n_ref,
-                                sb_cols, stream);
-        }
-        if (run_tier0) {
-            launch_tier0(buf.ref_sorted, buf.grp_dense, d_grp_offsets,
-                         buf.ref_tie_sums, buf.d_rank_sums, buf.d_tie_corr,
-                         n_ref, n_all_grp, sb_cols, n_groups, compute_tie_corr,
-                         stream);
-            if (t1.any_above_t0) skip_le = TIER0_GROUP_THRESHOLD;
-        }
-        if (run_tier0_64) {
-            launch_tier0_64(buf.ref_sorted, buf.grp_dense, d_grp_offsets,
-                            buf.ref_tie_sums, buf.d_rank_sums, buf.d_tie_corr,
-                            n_ref, n_all_grp, sb_cols, n_groups,
-                            compute_tie_corr, skip_le, stream);
-            if (t1.max_grp_size > TIER0_64_GROUP_THRESHOLD) {
-                skip_le = TIER0_64_GROUP_THRESHOLD;
-            }
-        }
-        if (run_tier2) {
-            launch_tier2_medium(buf.ref_sorted, buf.grp_dense, d_grp_offsets,
-                                buf.ref_tie_sums, buf.d_rank_sums,
-                                buf.d_tie_corr, n_ref, n_all_grp, sb_cols,
-                                n_groups, compute_tie_corr, skip_le, stream);
-        }
-
-        int upper_skip_le = t1.any_above_t2 ? TIER2_GROUP_THRESHOLD : skip_le;
-        if (t1.any_above_t2 && use_tier1) {
-            dim3 grid(sb_cols, n_groups);
-            ovo_fused_sort_rank_kernel<<<grid, tier1_tpb, tier1_smem, stream>>>(
-                buf.ref_sorted, buf.grp_dense, d_grp_offsets, buf.d_rank_sums,
-                buf.d_tie_corr, n_ref, n_all_grp, sb_cols, n_groups,
-                compute_tie_corr, padded_grp_size, upper_skip_le);
-            CUDA_CHECK_LAST_ERROR(ovo_fused_sort_rank_kernel);
-        } else if (needs_tier3) {
-            int sb_grp_seg =
-                checked_int_product((size_t)n_sort_groups, (size_t)sb_cols,
-                                    "OVO host CSC active group segment count");
-            {
-                int blk = (sb_grp_seg + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
-                build_tier3_seg_begin_end_offsets_kernel<<<blk, UTIL_BLOCK_SIZE,
-                                                           0, stream>>>(
-                    d_grp_offsets, d_sort_group_ids, buf.grp_seg_offsets,
-                    buf.grp_seg_ends, n_all_grp, n_sort_groups, sb_cols);
-                CUDA_CHECK_LAST_ERROR(build_tier3_seg_begin_end_offsets_kernel);
-            }
-            {
-                size_t temp = cub_temp_bytes;
-                cub::DeviceSegmentedRadixSort::SortKeys(
-                    buf.cub_temp, temp, buf.grp_dense, buf.grp_sorted,
-                    sb_grp_actual, sb_grp_seg, buf.grp_seg_offsets,
-                    buf.grp_seg_ends, BEGIN_BIT, END_BIT, stream);
-            }
-            {
-                dim3 grid(sb_cols, n_groups);
-                batched_rank_sums_presorted_kernel<<<grid, tpb_rank, 0,
-                                                     stream>>>(
-                    buf.ref_sorted, buf.grp_sorted, d_grp_offsets,
-                    buf.d_rank_sums, buf.d_tie_corr, n_ref, n_all_grp, sb_cols,
-                    n_groups, compute_tie_corr, upper_skip_le);
-                CUDA_CHECK_LAST_ERROR(batched_rank_sums_presorted_kernel);
-            }
-        }
+        OvoTierScratch sc{buf.ref_tie_sums,    buf.d_rank_sums,
+                          buf.d_tie_corr,      buf.grp_sorted,
+                          buf.grp_seg_offsets, buf.grp_seg_ends,
+                          buf.cub_temp};
+        ovo_dispatch_tiers(buf.ref_sorted, buf.grp_dense, d_grp_offsets, t1, sc,
+                           d_sort_group_ids, n_sort_groups, cub_temp_bytes,
+                           sb_grp_actual, tpb_rank, n_ref, n_all_grp, sb_cols,
+                           n_groups, compute_tie_corr, stream);
 
         // ---- D2D: scatter sub-batch results into caller's GPU buffers ----
         cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
@@ -632,8 +568,8 @@ static void ovo_streaming_csr_host_impl(
     cudaStreamDestroy(ref_stream);
 
     // ---- Phase 2: Per-pack streaming ----
-    auto t1 = make_tier1_config(h_grp_offsets, n_test);
-    bool may_need_cub = (t1.max_grp_size > TIER1_GROUP_THRESHOLD);
+    auto t1 = make_ovo_tier_plan(h_grp_offsets, n_test);
+    bool may_need_cub = (t1.max_grp_size > OVO_LARGE_MAX);
 
     constexpr int MAX_GROUP_STREAMS = 4;
     int n_streams = MAX_GROUP_STREAMS;
@@ -707,17 +643,17 @@ static void ovo_streaming_csr_host_impl(
         const Pack& pack = packs[p];
         int K = pack.end - pack.first;
         if (K == 0 || pack.n_rows == 0) continue;
-        Tier1Config pack_t1 = make_tier1_config(h_grp_offsets + pack.first, K);
+        OvoTierPlan pack_t1 = make_ovo_tier_plan(h_grp_offsets + pack.first, K);
         int pack_tpb_rank = round_up_to_warp(
             std::min(pack_t1.max_grp_size, MAX_THREADS_PER_BLOCK));
-        bool pack_has_above_t2 = pack_t1.max_grp_size > TIER2_GROUP_THRESHOLD;
-        int pack_tier3_skip_le =
-            pack_has_above_t2 ? TIER2_GROUP_THRESHOLD : TIER0_GROUP_THRESHOLD;
+        bool pack_has_above_t2 = pack_t1.max_grp_size > OVO_MEDIUM_MAX;
+        int pack_huge_skip_le =
+            pack_has_above_t2 ? OVO_MEDIUM_MAX : OVO_WARP_MAX;
         std::vector<int> h_sort_group_ids;
         int pack_n_sort_groups = K;
-        if (pack_t1.any_above_t0 && !pack_t1.use_tier1) {
+        if (pack_t1.above_warp && !pack_t1.run_large) {
             h_sort_group_ids = make_sort_group_ids(h_grp_offsets + pack.first,
-                                                   K, pack_tier3_skip_le);
+                                                   K, pack_huge_skip_le);
             pack_n_sort_groups = (int)h_sort_group_ids.size();
         }
 
@@ -725,7 +661,7 @@ static void ovo_streaming_csr_host_impl(
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
 
-        if (pack_t1.any_above_t0 && !pack_t1.use_tier1) {
+        if (pack_t1.above_warp && !pack_t1.run_large) {
             cudaMemcpyAsync(buf.d_sort_group_ids, h_sort_group_ids.data(),
                             h_sort_group_ids.size() * sizeof(int),
                             cudaMemcpyHostToDevice, stream);
@@ -798,77 +734,15 @@ static void ovo_streaming_csr_host_impl(
 
             const float* ref_sub = d_ref_sorted + (size_t)col * n_ref;
 
-            int skip_le = 0;
-            bool run_tier0 = pack_t1.use_tier0;
-            bool run_tier0_64 = pack_t1.any_tier0_64;
-            bool run_tier2 = pack_t1.any_tier2;
-            if (compute_tie_corr && (run_tier0 || run_tier0_64 || run_tier2)) {
-                launch_ref_tie_sums(ref_sub, buf.d_ref_tie_sums, n_ref, sb_cols,
-                                    stream);
-            }
-            if (run_tier0) {
-                launch_tier0(ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
-                             buf.d_ref_tie_sums, buf.d_rank_sums,
-                             buf.d_tie_corr, n_ref, pack_rows, sb_cols, K,
-                             compute_tie_corr, stream);
-                if (pack_t1.any_above_t0) skip_le = TIER0_GROUP_THRESHOLD;
-            }
-            if (run_tier0_64) {
-                launch_tier0_64(
-                    ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
-                    buf.d_ref_tie_sums, buf.d_rank_sums, buf.d_tie_corr, n_ref,
-                    pack_rows, sb_cols, K, compute_tie_corr, skip_le, stream);
-                if (pack_t1.max_grp_size > TIER0_64_GROUP_THRESHOLD) {
-                    skip_le = TIER0_64_GROUP_THRESHOLD;
-                }
-            }
-            if (run_tier2) {
-                launch_tier2_medium(
-                    ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
-                    buf.d_ref_tie_sums, buf.d_rank_sums, buf.d_tie_corr, n_ref,
-                    pack_rows, sb_cols, K, compute_tie_corr, skip_le, stream);
-            }
-
-            int upper_skip_le =
-                pack_has_above_t2 ? TIER2_GROUP_THRESHOLD : skip_le;
-            if (pack_has_above_t2 && pack_t1.use_tier1) {
-                dim3 grid(sb_cols, K);
-                ovo_fused_sort_rank_kernel<<<grid, pack_t1.tier1_tpb,
-                                             pack_t1.tier1_smem, stream>>>(
-                    ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
-                    buf.d_rank_sums, buf.d_tie_corr, n_ref, pack_rows, sb_cols,
-                    K, compute_tie_corr, pack_t1.padded_grp_size,
-                    upper_skip_le);
-                CUDA_CHECK_LAST_ERROR(ovo_fused_sort_rank_kernel);
-            } else if (pack_has_above_t2) {
-                int n_seg = checked_int_product(
-                    (size_t)pack_n_sort_groups, (size_t)sb_cols,
-                    "OVO host CSR active group segment count");
-                {
-                    int blk = (n_seg + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
-                    build_tier3_seg_begin_end_offsets_kernel<<<
-                        blk, UTIL_BLOCK_SIZE, 0, stream>>>(
-                        buf.d_pack_grp_offsets, buf.d_sort_group_ids,
-                        buf.d_grp_seg_offsets, buf.d_grp_seg_ends, pack_rows,
-                        pack_n_sort_groups, sb_cols);
-                    CUDA_CHECK_LAST_ERROR(
-                        build_tier3_seg_begin_end_offsets_kernel);
-                }
-                {
-                    size_t temp = cub_grp_bytes;
-                    cub::DeviceSegmentedRadixSort::SortKeys(
-                        buf.cub_temp, temp, buf.d_grp_dense, buf.d_grp_sorted,
-                        sb_items, n_seg, buf.d_grp_seg_offsets,
-                        buf.d_grp_seg_ends, BEGIN_BIT, END_BIT, stream);
-                }
-                dim3 grid(sb_cols, K);
-                batched_rank_sums_presorted_kernel<<<grid, pack_tpb_rank, 0,
-                                                     stream>>>(
-                    ref_sub, buf.d_grp_sorted, buf.d_pack_grp_offsets,
-                    buf.d_rank_sums, buf.d_tie_corr, n_ref, pack_rows, sb_cols,
-                    K, compute_tie_corr, upper_skip_le);
-                CUDA_CHECK_LAST_ERROR(batched_rank_sums_presorted_kernel);
-            }
+            OvoTierScratch sc{buf.d_ref_tie_sums,    buf.d_rank_sums,
+                              buf.d_tie_corr,        buf.d_grp_sorted,
+                              buf.d_grp_seg_offsets, buf.d_grp_seg_ends,
+                              buf.cub_temp};
+            ovo_dispatch_tiers(ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
+                               pack_t1, sc, buf.d_sort_group_ids,
+                               pack_n_sort_groups, cub_grp_bytes, sb_items,
+                               pack_tpb_rank, n_ref, pack_rows, sb_cols, K,
+                               compute_tie_corr, stream);
 
             cudaMemcpy2DAsync(d_rank_sums + (size_t)pack.first * n_cols + col,
                               n_cols * sizeof(double), buf.d_rank_sums,
