@@ -366,3 +366,402 @@ __global__ void m_step_finalize_cov_cublas_kernel(const T* __restrict__ N_k,
         if (i != j) cov[j * d + i] = v;
     }
 }
+
+// ----------------------------------------------------------------------------
+// Full-covariance precision-Cholesky helpers.
+//
+// Ported from cuML's GMM (``ML::GMM::detail``, Apache-2.0): used by the batched
+// precision-Cholesky path that turns covariances into the upper precision
+// factor with one ``potrfBatched`` + one ``trsmBatched``.
+//
+//   set_identity_batched_kernel : each component's (d, d) buffer -> identity,
+//   so
+//       the triangular solve ``L X = I`` yields ``X = L^{-1}``.
+//   log_det_full_kernel         : log_det[k] = Σ_i log(prec_chol[k, i, i]); the
+//       diagonal of the upper precision factor equals ``1 / L_ii``, so this is
+//       ``-Σ_i log(L_ii)`` (sklearn's precision-Cholesky log-det term).
+// ----------------------------------------------------------------------------
+constexpr int FULL_LOGDET_THREADS = 256;
+
+template <typename T>
+__global__ void set_identity_batched_kernel(T* __restrict__ A, int d, int K) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)K * d * d;
+    if (idx >= total) return;
+    size_t within = idx % ((size_t)d * d);
+    int i = (int)(within / d);
+    int j = (int)(within % d);
+    A[idx] = (i == j) ? T(1) : T(0);
+}
+
+template <typename T>
+__global__ void log_det_full_kernel(const T* __restrict__ prec_chol, int d,
+                                    int K, T* __restrict__ log_det) {
+    int k = blockIdx.x;
+    int tid = threadIdx.x;
+    if (k >= K) return;
+
+    __shared__ T sh[FULL_LOGDET_THREADS];
+    T local = T(0);
+    const T* pc_k = prec_chol + (size_t)k * d * d;
+    for (int i = tid; i < d; i += blockDim.x)
+        local += log(pc_k[(size_t)i * d + i]);
+    sh[tid] = local;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (tid < off) sh[tid] += sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) log_det[k] = sh[0];
+}
+
+// ----------------------------------------------------------------------------
+// Batched per-segment 2-component spherical-Gaussian EM, component 0 pinned.
+//
+// One CUDA block per segment ("gene" in Mixscape): segment g owns the values
+// pvec[offsets[g] : offsets[g+1]]. Component 0 (control) is fixed at
+// (m0[g], v0[g]); component 1 (perturbed) is free, initialized at
+// (m1_init[g], v1_init[g]) with uniform mixing weights. The whole EM runs in
+// the block (block-reduced sufficient statistics, in-kernel convergence on the
+// mean log-likelihood) for the 2-component (K=2, d=1) spherical mixture, and
+// writes the component-1 posterior per cell (== Mixscape's KO probability) plus
+// the fitted (m1, v1, w1) per segment. Adapted from GuideAssignment's
+// fit_assign_dense_kernel block-per-unit design (Apache-2.0).
+// ----------------------------------------------------------------------------
+constexpr int MIXSCAPE_EM_THREADS = 256;
+
+// Reduce four per-thread partials to their block sums, broadcast to every
+// thread (used by the fused projection+EM kernel for counts, dot products and
+// EM sufficient statistics). One reduction pass over a (4, threads) buffer.
+template <typename T>
+__device__ inline void block_reduce4(T a, T b, T c, T d,
+                                     T red[4][MIXSCAPE_EM_THREADS], T* out) {
+    int tid = threadIdx.x;
+    red[0][tid] = a;
+    red[1][tid] = b;
+    red[2][tid] = c;
+    red[3][tid] = d;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            red[0][tid] += red[0][tid + off];
+            red[1][tid] += red[1][tid + off];
+            red[2][tid] += red[2][tid + off];
+            red[3][tid] += red[3][tid + off];
+        }
+        __syncthreads();
+    }
+    out[0] = red[0][0];
+    out[1] = red[1][0];
+    out[2] = red[2][0];
+    out[3] = red[3][0];
+    __syncthreads();
+}
+
+template <typename T>
+__global__ void mixscape_em_batched_kernel(
+    const T* __restrict__ pvec, const int* __restrict__ offsets,
+    const T* __restrict__ m0, const T* __restrict__ v0,
+    const T* __restrict__ m1_init, const T* __restrict__ v1_init, int n_genes,
+    int max_iter, T tol, T reg_covar, T* __restrict__ resp1,
+    T* __restrict__ m1_out, T* __restrict__ v1_out, T* __restrict__ w1_out) {
+    int g = blockIdx.x;
+    if (g >= n_genes) return;
+    int tid = threadIdx.x;
+    int start = offsets[g];
+    int end = offsets[g + 1];
+    int n = end - start;
+
+    const T HALF_LOG2PI = T(0.91893853320467274178);
+    const T WEIGHT_FLOOR = T(1e-10);
+
+    __shared__ T red[4][MIXSCAPE_EM_THREADS];
+    __shared__ T s_m1, s_v1, s_w1, s_prev;
+    __shared__ int s_done;
+
+    if (n <= 0) {
+        if (tid == 0) {
+            m1_out[g] = m1_init[g];
+            v1_out[g] = v1_init[g];
+            w1_out[g] = T(0.5);
+        }
+        return;
+    }
+    if (tid == 0) {
+        s_m1 = m1_init[g];
+        s_v1 = fmax(v1_init[g], reg_covar);
+        s_w1 = T(0.5);
+        s_prev = -T(1e30);
+        s_done = 0;
+    }
+    __syncthreads();
+
+    const T cm0 = m0[g];
+    const T cv0 = fmax(v0[g], reg_covar);
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        T m1 = s_m1, v1 = s_v1, w1 = s_w1, w0 = T(1) - w1;
+        T c0 = log(fmax(w0, WEIGHT_FLOOR)) - T(0.5) * log(cv0) - HALF_LOG2PI;
+        T c1 = log(fmax(w1, WEIGHT_FLOOR)) - T(0.5) * log(v1) - HALF_LOG2PI;
+        T inv2v0 = T(0.5) / cv0, inv2v1 = T(0.5) / v1;
+
+        T lN1 = 0, lS1 = 0, lS2 = 0, lLL = 0;
+        for (int i = start + tid; i < end; i += blockDim.x) {
+            T y = pvec[i];
+            T d0 = y - cm0, d1 = y - m1;
+            T lp0 = c0 - inv2v0 * d0 * d0;
+            T lp1 = c1 - inv2v1 * d1 * d1;
+            T mx = fmax(lp0, lp1);
+            T se = exp(lp0 - mx) + exp(lp1 - mx);
+            T llc = mx + log(se);
+            T r1 = exp(lp1 - llc);
+            lN1 += r1;
+            lS1 += r1 * y;
+            lS2 += r1 * y * y;
+            lLL += llc;
+        }
+        red[0][tid] = lN1;
+        red[1][tid] = lS1;
+        red[2][tid] = lS2;
+        red[3][tid] = lLL;
+        __syncthreads();
+        for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+            if (tid < off) {
+                red[0][tid] += red[0][tid + off];
+                red[1][tid] += red[1][tid + off];
+                red[2][tid] += red[2][tid + off];
+                red[3][tid] += red[3][tid + off];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            T N1 = red[0][0], S1 = red[1][0], S2 = red[2][0], LL = red[3][0];
+            T meanll = LL / T(n);
+            if (fabs(meanll - s_prev) < tol) {
+                s_done = 1;
+            } else {
+                s_prev = meanll;
+                T inv = T(1) / fmax(N1, T(1e-12));
+                T nm1 = S1 * inv;
+                T nv1 = S2 * inv - nm1 * nm1 + reg_covar;
+                s_w1 = N1 / T(n);
+                s_m1 = nm1;
+                s_v1 = fmax(nv1, reg_covar);
+            }
+        }
+        __syncthreads();
+        if (s_done) break;
+    }
+
+    // Final E-step with the converged parameters: write the component-1
+    // posterior (Mixscape reads probabilities[:, 1] directly as post_prob).
+    T m1 = s_m1, v1 = s_v1, w1 = s_w1, w0 = T(1) - w1;
+    T c0 = log(fmax(w0, WEIGHT_FLOOR)) - T(0.5) * log(cv0) - HALF_LOG2PI;
+    T c1 = log(fmax(w1, WEIGHT_FLOOR)) - T(0.5) * log(v1) - HALF_LOG2PI;
+    T inv2v0 = T(0.5) / cv0, inv2v1 = T(0.5) / v1;
+    for (int i = start + tid; i < end; i += blockDim.x) {
+        T y = pvec[i];
+        T d0 = y - cm0, d1 = y - m1;
+        T lp0 = c0 - inv2v0 * d0 * d0;
+        T lp1 = c1 - inv2v1 * d1 * d1;
+        resp1[i] = T(1) / (T(1) + exp(lp0 - lp1));
+    }
+    if (tid == 0) {
+        m1_out[g] = m1;
+        v1_out[g] = v1;
+        w1_out[g] = w1;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Fused projection + statistics + EM, one block per (active) gene.
+//
+// For each gene in ``active_genes`` this computes, entirely in-block, one
+// Mixscape outer-iteration step on the gene's cells:
+//   1. guide_mean[j] over the currently-perturbed cells, vec = guide_mean -
+//   nt_mean
+//   2. pvec[cell] = (dat[cell] . vec) / (vec . vec)
+//   3. control/guide statistics (m0, v0, m1, v1; ddof=1) from pvec
+//   4. the 2-component spherical EM (component 0 pinned to control)
+//   5. the component-1 posterior per cell.
+// The Python outer loop only updates labels/guide_sel and re-launches, so the
+// per-gene projection + GMM that dominated the host loop now run on the GPU.
+//
+// Ragged layout: gene g owns dat[dat_offsets[g] : ...] as an (n_g, k_g)
+// row-major block, cells [cell_offsets[g] : cell_offsets[g+1]] in the per-cell
+// arrays, and features [feat_offsets[g] : ...] in nt_cells_mean. ``vec`` lives
+// in dynamic shared memory sized to max_k by the launcher.
+// ----------------------------------------------------------------------------
+template <typename T>
+__global__ void mixscape_project_em_kernel(
+    const T* __restrict__ dat, const long long* __restrict__ dat_offsets,
+    const int* __restrict__ n_per_gene, const int* __restrict__ k_per_gene,
+    const int* __restrict__ cell_offsets, const int* __restrict__ feat_offsets,
+    const T* __restrict__ nt_cells_mean, const bool* __restrict__ guide_sel,
+    const bool* __restrict__ nt_in_all, const int* __restrict__ active_genes,
+    int n_active, int max_iter, T tol, T reg_covar,
+    T* __restrict__ pvec_scratch, T* __restrict__ resp1) {
+    int a = blockIdx.x;
+    if (a >= n_active) return;
+    int g = active_genes[a];
+    int tid = threadIdx.x;
+    int n = n_per_gene[g];
+    int k = k_per_gene[g];
+    if (n <= 0 || k <= 0) return;
+
+    const T* dat_g = dat + dat_offsets[g];
+    const T* ntm_g = nt_cells_mean + feat_offsets[g];
+    int cell0 = cell_offsets[g];
+    const bool* guide_g = guide_sel + cell0;
+    const bool* nt_g = nt_in_all + cell0;
+    T* pvec_g = pvec_scratch + cell0;
+    T* resp_g = resp1 + cell0;
+
+    extern __shared__ char smem[];
+    T* vec = reinterpret_cast<T*>(smem);  // (k,)
+
+    const T HALF_LOG2PI = T(0.91893853320467274178);
+    const T WEIGHT_FLOOR = T(1e-10);
+    const T MIN_VAR = T(1e-12);
+
+    __shared__ T red[4][MIXSCAPE_EM_THREADS];
+    __shared__ T s_ng, s_nnt, s_dotvv;
+    __shared__ T s_m0, s_v0, s_m1, s_v1, s_w1, s_prev;
+    __shared__ int s_done;
+    T out[4];
+
+    // 1. guide / control counts.
+    {
+        T lg = 0, lnt = 0;
+        for (int cell = tid; cell < n; cell += blockDim.x) {
+            lg += guide_g[cell] ? T(1) : T(0);
+            lnt += nt_g[cell] ? T(1) : T(0);
+        }
+        block_reduce4(lg, lnt, T(0), T(0), red, out);
+        if (tid == 0) {
+            s_ng = out[0];
+            s_nnt = out[1];
+        }
+    }
+    __syncthreads();
+    T n_guide = s_ng, n_nt = s_nnt;
+    T inv_ng = T(1) / fmax(n_guide, T(1));
+
+    // 2. vec[j] = mean over perturbed cells of dat[:, j] - nt_cells_mean[j].
+    for (int j = tid; j < k; j += blockDim.x) {
+        T s = 0;
+        for (int cell = 0; cell < n; ++cell)
+            if (guide_g[cell]) s += dat_g[(size_t)cell * k + j];
+        vec[j] = s * inv_ng - ntm_g[j];
+    }
+    __syncthreads();
+
+    // 3. dotvv = vec . vec.
+    {
+        T ld = 0;
+        for (int j = tid; j < k; j += blockDim.x) ld += vec[j] * vec[j];
+        block_reduce4(ld, T(0), T(0), T(0), red, out);
+        if (tid == 0) s_dotvv = out[0];
+    }
+    __syncthreads();
+    // Guard the degenerate case vec . vec == 0 (guide mean == control mean
+    // across all features) so pvec stays finite instead of NaN.
+    T inv_dot = T(1) / fmax(s_dotvv, MIN_VAR);
+
+    // 4. pvec[cell] = (dat[cell] . vec) / dotvv.
+    for (int cell = tid; cell < n; cell += blockDim.x) {
+        const T* row = dat_g + (size_t)cell * k;
+        T s = 0;
+        for (int j = 0; j < k; ++j) s += row[j] * vec[j];
+        pvec_g[cell] = s * inv_dot;
+    }
+    __syncthreads();
+
+    // 5. control/guide statistics (ddof=1) -> init mixture parameters.
+    {
+        T snt = 0, snt2 = 0, sg = 0, sg2 = 0;
+        for (int cell = tid; cell < n; cell += blockDim.x) {
+            T y = pvec_g[cell];
+            if (nt_g[cell]) {
+                snt += y;
+                snt2 += y * y;
+            }
+            if (guide_g[cell]) {
+                sg += y;
+                sg2 += y * y;
+            }
+        }
+        block_reduce4(snt, snt2, sg, sg2, red, out);
+        if (tid == 0) {
+            T Snt = out[0], Snt2 = out[1], Sg = out[2], Sg2 = out[3];
+            s_m0 = Snt / fmax(n_nt, T(1));
+            s_m1 = Sg / fmax(n_guide, T(1));
+            T v0 = (n_nt > T(1)) ? (Snt2 - Snt * Snt / n_nt) / (n_nt - T(1))
+                                 : MIN_VAR;
+            T v1 = (n_guide > T(1))
+                       ? (Sg2 - Sg * Sg / n_guide) / (n_guide - T(1))
+                       : MIN_VAR;
+            s_v0 = fmax(v0, MIN_VAR);
+            s_v1 = fmax(v1, MIN_VAR);
+            s_w1 = T(0.5);
+            s_prev = -T(1e30);
+            s_done = 0;
+        }
+    }
+    __syncthreads();
+
+    // 6. EM with component 0 pinned to (m0, v0).
+    T cm0 = s_m0, cv0 = fmax(s_v0, reg_covar);
+    for (int iter = 0; iter < max_iter; ++iter) {
+        T m1 = s_m1, v1 = s_v1, w1 = s_w1, w0 = T(1) - w1;
+        T c0 = log(fmax(w0, WEIGHT_FLOOR)) - T(0.5) * log(cv0) - HALF_LOG2PI;
+        T c1 = log(fmax(w1, WEIGHT_FLOOR)) - T(0.5) * log(v1) - HALF_LOG2PI;
+        T inv2v0 = T(0.5) / cv0, inv2v1 = T(0.5) / v1;
+        T lN1 = 0, lS1 = 0, lS2 = 0, lLL = 0;
+        for (int cell = tid; cell < n; cell += blockDim.x) {
+            T y = pvec_g[cell];
+            T d0 = y - cm0, d1 = y - m1;
+            T lp0 = c0 - inv2v0 * d0 * d0;
+            T lp1 = c1 - inv2v1 * d1 * d1;
+            T mx = fmax(lp0, lp1);
+            T se = exp(lp0 - mx) + exp(lp1 - mx);
+            T llc = mx + log(se);
+            T r1 = exp(lp1 - llc);
+            lN1 += r1;
+            lS1 += r1 * y;
+            lS2 += r1 * y * y;
+            lLL += llc;
+        }
+        block_reduce4(lN1, lS1, lS2, lLL, red, out);
+        if (tid == 0) {
+            T N1 = out[0], S1 = out[1], S2 = out[2], LL = out[3];
+            T meanll = LL / T(n);
+            if (fabs(meanll - s_prev) < tol) {
+                s_done = 1;
+            } else {
+                s_prev = meanll;
+                T inv = T(1) / fmax(N1, T(1e-12));
+                T nm1 = S1 * inv;
+                T nv1 = S2 * inv - nm1 * nm1 + reg_covar;
+                s_w1 = N1 / T(n);
+                s_m1 = nm1;
+                s_v1 = fmax(nv1, reg_covar);
+            }
+        }
+        __syncthreads();
+        if (s_done) break;
+    }
+
+    // 7. final E-step: component-1 posterior per cell.
+    T m1 = s_m1, v1 = s_v1, w1 = s_w1, w0 = T(1) - w1;
+    T c0 = log(fmax(w0, WEIGHT_FLOOR)) - T(0.5) * log(cv0) - HALF_LOG2PI;
+    T c1 = log(fmax(w1, WEIGHT_FLOOR)) - T(0.5) * log(v1) - HALF_LOG2PI;
+    T inv2v0 = T(0.5) / cv0, inv2v1 = T(0.5) / v1;
+    for (int cell = tid; cell < n; cell += blockDim.x) {
+        T y = pvec_g[cell];
+        T d0 = y - cm0, d1 = y - m1;
+        T lp0 = c0 - inv2v0 * d0 * d0;
+        T lp1 = c1 - inv2v1 * d1 * d1;
+        resp_g[cell] = T(1) / (T(1) + exp(lp0 - lp1));
+    }
+}

@@ -545,3 +545,27 @@ def test_cuda_runs_large_feature_count():
 
     assert labels.shape == (360,)
     assert labels.dtype == cp.int32
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize(("K", "d"), [(3, 5), (4, 10), (2, 20)])
+def test_precision_cholesky_full(dtype, K, d):
+    """The cuSOLVER precision-Cholesky returns the upper precision factor U with
+    ``U Uᵀ == Σ⁻¹`` and ``log_det == Σ_i log U_ii == -½ log det(Σ)``."""
+    rng = np.random.default_rng(K * 100 + d)
+    a = rng.standard_normal((K, d, d)).astype(dtype)
+    cov = cp.asarray(np.einsum("kij,klj->kil", a, a) + d * np.eye(d, dtype=dtype))
+
+    prec_chol, log_det = _precision_cholesky(cov)
+    assert prec_chol.dtype == cp.dtype(dtype)
+
+    precision = cp.einsum("kij,klj->kil", prec_chol, prec_chol)  # U Uᵀ
+    ident = cp.einsum("kij,kjl->kil", cov, precision)  # Σ (U Uᵀ) == I
+    eye = cp.broadcast_to(cp.eye(d, dtype=dtype), (K, d, d))
+    assert float(cp.max(cp.abs(ident - eye))) < (5e-3 if dtype == np.float32 else 1e-8)
+
+    diag_logdet = cp.log(cp.diagonal(prec_chol, axis1=1, axis2=2)).sum(axis=1)
+    _, slogdet = cp.linalg.slogdet(cov)
+    tol = 1e-2 if dtype == np.float32 else 1e-7
+    assert float(cp.max(cp.abs(log_det - diag_logdet))) < tol
+    assert float(cp.max(cp.abs(log_det - (-0.5 * slogdet)))) < tol

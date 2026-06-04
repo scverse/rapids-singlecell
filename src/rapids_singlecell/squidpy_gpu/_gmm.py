@@ -1,9 +1,12 @@
-"""Full-covariance GMM for the CellCharter niche flavor.
+"""GPU Gaussian mixture models.
 
-The public behavior mirrors :class:`sklearn.mixture.GaussianMixture` with
-``covariance_type="full"``. EM is CUDA-only: CuPy is used for array handling and
-the precision-Cholesky factorization, while E-step and M-step work is delegated
-to the nanobind/CUDA extension.
+``gmm_fit_predict`` is the full-covariance GMM behind the CellCharter niche
+flavor, mirroring :class:`sklearn.mixture.GaussianMixture` with
+``covariance_type="full"``. ``spherical_gmm_fit_batched`` fits many independent
+two-component, fixed-control-component spherical mixtures in a single launch
+(the GMM behind :class:`~rapids_singlecell.ptg.Mixscape`). EM is CUDA-only --
+E-step, M-step and the precision-Cholesky all run in the nanobind/CUDA
+extension; CuPy only handles array allocation and orchestration.
 """
 
 from __future__ import annotations
@@ -12,12 +15,12 @@ from typing import Literal
 
 import cupy as cp
 import numpy as np
-from cupyx.scipy.linalg import solve_triangular
 
 from rapids_singlecell._cuda import _gmm_cuda as _gc
 
 _GMMInit = Literal["kmeans", "random_from_data", "sklearn_kmeans"]
 _EStepRoute = Literal["fused", "cublas"]
+_CovarianceType = Literal["full"]
 
 _KMEANS_MAX_ITER = 100
 _SKLEARN_SEEDED_KMEANS_MAX_ITER = 300
@@ -170,6 +173,7 @@ def gmm_fit_predict(
     X: cp.ndarray,
     n_components: int,
     *,
+    covariance_type: _CovarianceType = "full",
     random_state: int = 0,
     max_iter: int = 100,
     tol: float = 1e-3,
@@ -177,7 +181,7 @@ def gmm_fit_predict(
     init: _GMMInit = "kmeans",
     kmeans_n_init: int = 1,
 ) -> cp.ndarray:
-    """Fit a full-covariance GMM and return cluster labels.
+    """Fit a Gaussian mixture model and return cluster labels.
 
     Parameters
     ----------
@@ -185,6 +189,10 @@ def gmm_fit_predict(
         GPU matrix with observations in rows and features in columns.
     n_components
         Number of mixture components.
+    covariance_type
+        Covariance parameterization; only ``"full"`` (the CellCharter flavor)
+        is supported. The spherical, fixed-control-component mixture used by
+        Mixscape lives in :func:`spherical_gmm_fit_batched`.
     random_state
         Seed used by the selected initialization strategy.
     max_iter
@@ -206,6 +214,8 @@ def gmm_fit_predict(
         raise ValueError("n_components must be >= 1.")
     if int(kmeans_n_init) < 1:
         raise ValueError("kmeans_n_init must be >= 1.")
+    if covariance_type != "full":
+        raise ValueError(f"covariance_type must be 'full', got {covariance_type!r}")
 
     X = cp.ascontiguousarray(X)
     weights, means, covariances = _initialize_parameters(
@@ -457,20 +467,29 @@ def _restore_empty_components(
 
 
 def _precision_cholesky(covariances: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
-    """Return sklearn-oriented precision Cholesky without forming an inverse."""
-    cov_chol = cp.linalg.cholesky(covariances)
-    eye = cp.broadcast_to(
-        cp.eye(covariances.shape[-1], dtype=covariances.dtype),
-        covariances.shape,
+    """Return sklearn-oriented precision Cholesky without forming an inverse.
+
+    Delegates to the batched cuSOLVER ``potrfBatched`` + cuBLAS ``trsmBatched``
+    kernel (ported from cuML's GMM): one C++ call per EM iteration with a single
+    host sync, yielding the row-major upper precision factor ``U`` (``U Uᵀ =
+    Σ⁻¹``) and ``log_det[k] = Σ_i log U[k, i, i]`` -- the same result as the
+    previous ``cp.linalg.cholesky`` + ``solve_triangular`` path.
+    """
+    covariances = cp.ascontiguousarray(covariances)
+    K, d, _ = covariances.shape
+    prec_chol = cp.empty((K, d, d), dtype=covariances.dtype)
+    log_det = cp.empty(K, dtype=covariances.dtype)
+    _gc.precision_cholesky_full(
+        covariances,
+        prec_chol,
+        log_det,
+        d=int(d),
+        K=int(K),
+        stream=cp.cuda.get_current_stream().ptr,
+        cublas_handle=cp.cuda.device.get_cublas_handle(),
+        cusolver_handle=cp.cuda.device.get_cusolver_handle(),
     )
-    cov_chol_inv = solve_triangular(cov_chol, eye, lower=True)
-    return (
-        cp.ascontiguousarray(cov_chol_inv.transpose(0, 2, 1)),
-        -cp.sum(
-            cp.log(cp.diagonal(cov_chol, axis1=1, axis2=2)),
-            axis=1,
-        ),
-    )
+    return prec_chol, log_det
 
 
 def _m_step(
@@ -518,3 +537,71 @@ def _choose_e_step(d: int, dtype) -> _EStepRoute:
     if dtype == np.dtype("float64"):
         return "cublas" if d > _CUDA_FUSED_FLOAT64_MAX_D else "fused"
     return "cublas" if d >= _CUDA_CUBLAS_E_STEP_MIN_D else "fused"
+
+
+def spherical_gmm_fit_batched(
+    pvec: cp.ndarray,
+    offsets: cp.ndarray,
+    *,
+    m0: cp.ndarray,
+    v0: cp.ndarray,
+    m1_init: cp.ndarray,
+    v1_init: cp.ndarray,
+    max_iter: int = 100,
+    tol: float = 1e-3,
+    reg_covar: float = 1e-6,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Fit many independent 2-component spherical GMMs (component 0 pinned).
+
+    Each segment ``g`` owns the contiguous slice ``pvec[offsets[g]:offsets[g+1]]``
+    and is fit by one CUDA block running the full EM in-kernel, so all segments
+    fit in a single launch. Component 0 is fixed at ``(m0[g], v0[g])``; component
+    1 starts at ``(m1_init[g], v1_init[g])`` with uniform mixing weights. This is
+    the GMM behind Mixscape (one CUDA block per gene); the fused
+    projection+EM variant (``_gmm_cuda.mixscape_project_em``) shares the same
+    in-kernel EM.
+
+    Parameters
+    ----------
+    pvec
+        Flat, gene-blocked 1-D projection values.
+    offsets
+        CSR-style segment boundaries of shape ``(n_segments + 1,)``.
+    m0, v0
+        Fixed component-0 (control) mean and variance per segment.
+    m1_init, v1_init
+        Component-1 (perturbed) initial mean and variance per segment.
+    max_iter, tol, reg_covar
+        EM controls (max iterations, mean-log-likelihood tolerance, variance
+        regularization).
+
+    Returns
+    -------
+    The per-cell component-1 posterior (same layout as ``pvec``) and the fitted
+    per-segment ``m1``, ``v1`` and ``w1``.
+    """
+    dtype = pvec.dtype
+    n_genes = int(offsets.shape[0] - 1)
+    total = int(pvec.shape[0])
+    resp1 = cp.empty(total, dtype=dtype)
+    m1_out = cp.empty(n_genes, dtype=dtype)
+    v1_out = cp.empty(n_genes, dtype=dtype)
+    w1_out = cp.empty(n_genes, dtype=dtype)
+    _gc.spherical_gmm_fit_batched(
+        cp.ascontiguousarray(pvec),
+        cp.ascontiguousarray(offsets.astype(cp.int32, copy=False)),
+        cp.ascontiguousarray(m0.astype(dtype, copy=False)),
+        cp.ascontiguousarray(v0.astype(dtype, copy=False)),
+        cp.ascontiguousarray(m1_init.astype(dtype, copy=False)),
+        cp.ascontiguousarray(v1_init.astype(dtype, copy=False)),
+        resp1,
+        m1_out,
+        v1_out,
+        w1_out,
+        n_genes=n_genes,
+        max_iter=int(max_iter),
+        tol=float(tol),
+        reg_covar=float(reg_covar),
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    return resp1, m1_out, v1_out, w1_out

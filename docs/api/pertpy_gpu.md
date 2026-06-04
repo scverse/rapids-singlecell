@@ -73,3 +73,32 @@
     .. automethod:: assign_mixture_model
         :no-index:
 ```
+
+## Mixscape
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    Mixscape
+```
+
+```{eval-rst}
+.. autoclass:: Mixscape
+    :no-index:
+
+    .. rubric:: Methods
+
+    .. autosummary::
+
+        ~Mixscape.perturbation_signature
+        ~Mixscape.mixscape
+        ~Mixscape.lda
+
+    .. automethod:: perturbation_signature
+        :no-index:
+    .. automethod:: mixscape
+        :no-index:
+    .. automethod:: lda
+        :no-index:
+```
