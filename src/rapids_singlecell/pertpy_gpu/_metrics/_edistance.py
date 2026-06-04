@@ -793,19 +793,16 @@ class EDistanceMetric(BaseMetric):
                 continue
 
             n_chunk_pairs = len(chunk_left)
-            # The source arrays already live on the first device; other devices
-            # get a copy via cp.asarray.
-            on_first = device_id == device_ids[0]
+            # cp.asarray is a no-op when the array already lives on the current
+            # device (the source arrays are on the first device) and copies it
+            # across otherwise, so the same call handles every device.
             with cp.cuda.Device(device_id):
                 streams[device_id] = cp.cuda.Stream(non_blocking=True)
 
                 with streams[device_id]:
-                    dev_off = cat_offsets if on_first else cp.asarray(cat_offsets)
-                    dev_idx = cell_indices if on_first else cp.asarray(cell_indices)
-
                     data = {
-                        "off": dev_off,
-                        "idx": dev_idx,
+                        "off": cp.asarray(cat_offsets),
+                        "idx": cp.asarray(cell_indices),
                         "pair_left": cp.asarray(chunk_left),
                         "pair_right": cp.asarray(chunk_right),
                         "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
@@ -813,21 +810,11 @@ class EDistanceMetric(BaseMetric):
                         "device_id": device_id,
                     }
                     if is_sparse:
-                        data["data"] = (
-                            embedding.data if on_first else cp.asarray(embedding.data)
-                        )
-                        data["indices"] = (
-                            embedding.indices
-                            if on_first
-                            else cp.asarray(embedding.indices)
-                        )
-                        data["indptr"] = (
-                            embedding.indptr
-                            if on_first
-                            else cp.asarray(embedding.indptr)
-                        )
+                        data["data"] = cp.asarray(embedding.data)
+                        data["indices"] = cp.asarray(embedding.indices)
+                        data["indptr"] = cp.asarray(embedding.indptr)
                     else:
-                        data["emb"] = embedding if on_first else cp.asarray(embedding)
+                        data["emb"] = cp.asarray(embedding)
                     device_data.append(data)
 
         # Phase 2: Synchronize data transfers, then launch kernels

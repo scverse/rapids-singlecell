@@ -56,6 +56,9 @@ class Distance:
         Twice the mean pairwise distance between cells of two groups minus
         the mean pairwise distance between cells within each group. See
         `Peidli et al. (2023) <https://doi.org/10.1101/2022.08.20.504663>`__.
+        Accepts dense embeddings (e.g. ``obsm_key="X_pca"``) or sparse CSR
+        expression data (a sparse layer or ``layer_key="X"``), which is
+        densified inside the kernel rather than on the host.
     - ``"euclidean"`` and ``"root_mean_squared_error"``: Euclidean distance
         between group mean vectors.
     - ``"mse"``: Mean squared distance between group mean vectors.
@@ -75,7 +78,8 @@ class Distance:
     metric
         Distance metric to use.
     layer_key
-        Key in adata.layers for cell data. Mutually exclusive with ``obsm_key``.
+        Key in adata.layers for cell data, or ``"X"`` to use ``adata.X``.
+        Mutually exclusive with ``obsm_key``.
     obsm_key
         Key in adata.obsm for embeddings. Mutually exclusive with ``layer_key``.
         Defaults to ``"X_pca"`` if neither is specified.
