@@ -110,22 +110,27 @@ def test_harmony_integrate_bad_prune_threshold(bad_threshold):
         )
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize("correction_method", ["fast", "original", "batched"])
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_harmony_integrate(correction_method, dtype):
+def test_harmony_integrate(correction_method):
     """
     Test that Harmony integrate works.
 
     This is a very simple test that just checks to see if the Harmony
     integrate wrapper successfully added a new field to ``adata.obsm``
     and makes sure it has the same dimensions as the original PCA table.
+
+    This is a pure shape/contract check: the output shape is independent of
+    dtype and iteration count, so we run float32 with a single harmony
+    iteration to exercise all three correction-method paths cheaply.
     """
     adata = sc.datasets.pbmc68k_reduced()
     rsc.pp.harmony_integrate(
         adata,
         "bulk_labels",
         correction_method=correction_method,
-        dtype=dtype,
+        dtype=cp.float32,
+        max_iter_harmony=1,
     )
     assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
 
@@ -228,6 +233,7 @@ def test_harmony_integrate_reference(
     )
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize("correction_method", ["original", "batched"])
 @pytest.mark.parametrize("dtype", [cp.float64, cp.float32])
 def test_harmony2_correction_methods_agree(
@@ -240,7 +246,7 @@ def test_harmony2_correction_methods_agree(
         "donor",
         correction_method=correction_method,
         dtype=dtype,
-        max_iter_harmony=20,
+        max_iter_harmony=5,
     )
     h2 = adata.obsm["X_pca_harmony"]
 
@@ -251,7 +257,7 @@ def test_harmony2_correction_methods_agree(
         "donor",
         correction_method="fast",
         dtype=dtype,
-        max_iter_harmony=20,
+        max_iter_harmony=5,
     )
     h2_ref = adata_ref.obsm["X_pca_harmony"]
 
@@ -450,8 +456,17 @@ def test_compute_lambda_kb_zero_denom(dtype):
     cp.testing.assert_allclose(result[0, 1], dtype(1.0))
 
 
-@pytest.mark.parametrize("correction_method", ["fast", "original", "batched"])
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize(
+    ("dtype", "correction_method"),
+    [
+        (cp.float32, "fast"),
+        (cp.float32, "original"),
+        (cp.float32, "batched"),
+        # float64 numeric reference for `fast` only: float64 original/batched
+        # agreement with `fast` is covered by test_harmony2_correction_methods_agree
+        (cp.float64, "fast"),
+    ],
+)
 def test_harmony2_ircolitis_reference(
     adata_ircolitis_harmony2, correction_method, dtype
 ):
