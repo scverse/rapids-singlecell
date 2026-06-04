@@ -477,18 +477,39 @@ def _precision_cholesky(covariances: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray
     """
     covariances = cp.ascontiguousarray(covariances)
     K, d, _ = covariances.shape
-    prec_chol = cp.empty((K, d, d), dtype=covariances.dtype)
-    log_det = cp.empty(K, dtype=covariances.dtype)
+    dtype = covariances.dtype
+    # All buffers are allocated here (CuPy) and passed in; the kernel allocates
+    # nothing. cov_work is the copy potrf factorizes in place.
+    cov_work = covariances.copy()
+    prec_chol = cp.empty((K, d, d), dtype=dtype)
+    log_det = cp.empty(K, dtype=dtype)
+    dev_info = cp.empty(K, dtype=cp.int32)
+    # Device pointer arrays into each component's (d, d) block.
+    block = cp.arange(K, dtype=cp.uint64) * cp.uint64(d * d * dtype.itemsize)
+    dA = cov_work.data.ptr + block
+    dB = prec_chol.data.ptr + block
     _gc.precision_cholesky_full(
-        covariances,
+        cov_work,
         prec_chol,
         log_det,
+        dev_info,
+        dA=int(dA.data.ptr),
+        dB=int(dB.data.ptr),
         d=int(d),
         K=int(K),
         stream=cp.cuda.get_current_stream().ptr,
         cublas_handle=cp.cuda.device.get_cublas_handle(),
         cusolver_handle=cp.cuda.device.get_cusolver_handle(),
     )
+    # Read back the per-component potrf info (this sync also keeps dA/dB alive
+    # through the launch) and surface a non-positive-definite covariance.
+    info = cp.asnumpy(dev_info)
+    bad = np.flatnonzero(info != 0)
+    if bad.size:
+        raise ValueError(
+            f"Precision Cholesky failed: covariance component {int(bad[0])} is "
+            "not positive definite. Increase reg_covar or scale the input."
+        )
     return prec_chol, log_det
 
 

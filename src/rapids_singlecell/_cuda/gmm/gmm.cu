@@ -7,7 +7,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include "../cublas_helpers.cuh"
 #include "../nb_types.h"
@@ -90,58 +89,26 @@ inline cublasStatus_t trsm_batched<double>(
                               lda, Barray, ldb, batch);
 }
 
-// Full-covariance precision-Cholesky: covariances (K, d, d) -> upper precision
-// factor prec_chol (K, d, d) and log_det (K,), in one potrfBatched + one
-// trsmBatched (a single host sync for the positive-definite check). The
-// column-major L^{-1} from the solve is, read row-major, the upper precision
-// factor U with U Uᵀ = Σ⁻¹ -- matching sklearn's _compute_precision_cholesky
-// and rsc's previous CuPy ``solve_triangular(L, I).T``. Ported from cuML's
-// ML::GMM::precision_cholesky_full_batched (Apache-2.0), using raw cuBLAS /
-// cuSOLVER handles instead of raft::handle_t.
+// Full-covariance precision-Cholesky: factorize each covariance and solve for
+// the upper precision factor prec_chol (K, d, d) with U Uᵀ = Σ⁻¹ (matching
+// sklearn's _compute_precision_cholesky), writing log_det (K,). The caller
+// (Python) owns every buffer and nothing is allocated here: cov_work is a copy
+// of the covariances that potrf overwrites; dA/dB are device pointer arrays
+// into cov_work / prec_chol; positive-definiteness is checked by reading
+// dev_info after the next sync. Ported from cuML's ML::GMM (Apache-2.0).
 template <typename T>
-static inline void launch_precision_cholesky_full(
-    const T* covariances, T* prec_chol, T* log_det, int d, int K,
-    cudaStream_t stream, cublasHandle_t cublas, cusolverDnHandle_t solver) {
+static inline void launch_precision_cholesky_full(T* cov_work, T* prec_chol,
+                                                  T* log_det, int* dev_info,
+                                                  T** dA, T** dB, int d, int K,
+                                                  cudaStream_t stream,
+                                                  cublasHandle_t cublas,
+                                                  cusolverDnHandle_t solver) {
     if (d == 0 || K == 0) return;
     const size_t cov_elems = (size_t)K * d * d;
-
-    // Stream-ordered scratch (no implicit device-wide sync).
-    T* cov_work = nullptr;
-    T** dA = nullptr;
-    T** dB = nullptr;
-    int* dev_info = nullptr;
-    cuda_check_runtime(
-        cudaMallocAsync(&cov_work, cov_elems * sizeof(T), stream),
-        "cudaMallocAsync(cov_work)");
-    cuda_check_runtime(cudaMallocAsync(&dA, sizeof(T*) * K, stream),
-                       "cudaMallocAsync(dA)");
-    cuda_check_runtime(cudaMallocAsync(&dB, sizeof(T*) * K, stream),
-                       "cudaMallocAsync(dB)");
-    cuda_check_runtime(cudaMallocAsync(&dev_info, sizeof(int) * K, stream),
-                       "cudaMallocAsync(dev_info)");
-
-    // potrf factorizes in place, so leave the caller's covariances intact.
-    cuda_check_runtime(
-        cudaMemcpyAsync(cov_work, covariances, cov_elems * sizeof(T),
-                        cudaMemcpyDeviceToDevice, stream),
-        "cudaMemcpyAsync(cov_work)");
-
-    std::vector<T*> hA(K), hB(K);
-    for (int k = 0; k < K; ++k) {
-        hA[k] = cov_work + (size_t)k * d * d;
-        hB[k] = prec_chol + (size_t)k * d * d;
-    }
-    cuda_check_runtime(cudaMemcpyAsync(dA, hA.data(), sizeof(T*) * K,
-                                       cudaMemcpyHostToDevice, stream),
-                       "cudaMemcpyAsync(dA)");
-    cuda_check_runtime(cudaMemcpyAsync(dB, hB.data(), sizeof(T*) * K,
-                                       cudaMemcpyHostToDevice, stream),
-                       "cudaMemcpyAsync(dB)");
-
     cublas_check_status(cublasSetStream(cublas, stream), "cublasSetStream");
     cusolver_check(cusolverDnSetStream(solver, stream), "cusolverDnSetStream");
 
-    // Lower Cholesky of each covariance (in place on cov_work).
+    // Lower Cholesky of each covariance, in place on cov_work (via dA).
     cusolver_check(
         potrf_batched<T>(solver, CUBLAS_FILL_MODE_LOWER, d, dA, d, dev_info, K),
         "potrfBatched");
@@ -152,7 +119,7 @@ static inline void launch_precision_cholesky_full(
            dim3(CHOL_FILL_THREADS), 0, stream>>>(prec_chol, d, K);
     CUDA_CHECK_LAST_ERROR(set_identity_batched_kernel);
 
-    // Solve L X = I -> X = L^{-1} (written into prec_chol).
+    // Solve L X = I -> X = L^{-1} (written into prec_chol via dB).
     const T one = T(1);
     cublas_check_status(
         trsm_batched<T>(cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
@@ -164,29 +131,6 @@ static inline void launch_precision_cholesky_full(
         <<<dim3((unsigned int)K), dim3(FULL_LOGDET_THREADS), 0, stream>>>(
             prec_chol, d, K, log_det);
     CUDA_CHECK_LAST_ERROR(log_det_full_kernel);
-
-    // One host sync to surface a non-positive-definite covariance.
-    std::vector<int> h_info(K);
-    cuda_check_runtime(cudaMemcpyAsync(h_info.data(), dev_info, sizeof(int) * K,
-                                       cudaMemcpyDeviceToHost, stream),
-                       "cudaMemcpyAsync(dev_info)");
-    cuda_check_runtime(cudaStreamSynchronize(stream),
-                       "cudaStreamSynchronize(precision_cholesky)");
-    // Best-effort stream-ordered cleanup; free return codes are not checked so
-    // a failure here never masks an already-computed result.
-    cudaFreeAsync(cov_work, stream);
-    cudaFreeAsync(dA, stream);
-    cudaFreeAsync(dB, stream);
-    cudaFreeAsync(dev_info, stream);
-    for (int k = 0; k < K; ++k) {
-        if (h_info[k] != 0) {
-            throw std::runtime_error(
-                "Precision Cholesky failed: covariance component " +
-                std::to_string(k) +
-                " is not positive definite. Increase reg_covar or scale the "
-                "input data.");
-        }
-    }
 }
 
 template <typename T, int D>
@@ -458,15 +402,37 @@ static inline void launch_mixscape_project_em(
     if (n_active == 0 || max_k == 0) return;
     dim3 block(MIXSCAPE_EM_THREADS);
     dim3 grid(n_active);
-    size_t shmem = (size_t)max_k * sizeof(T);
-    if (shmem > DEFAULT_DYNAMIC_SMEM_LIMIT) {
+    size_t dyn_shmem = (size_t)max_k * sizeof(T);
+    // Opt-in is needed when STATIC + DYNAMIC shared exceeds the 48KB default,
+    // not just the dynamic ``vec`` buffer: the kernel also reserves static
+    // shared (the (4, threads) reduction buffer). Query both and fail loudly
+    // if even the opt-in maximum is too small.
+    cudaFuncAttributes attr{};
+    cuda_check_runtime(
+        cudaFuncGetAttributes(&attr, mixscape_project_em_kernel<T>),
+        "cudaFuncGetAttributes(mixscape_project_em_kernel)");
+    size_t total_shmem = attr.sharedSizeBytes + dyn_shmem;
+    if (total_shmem > DEFAULT_DYNAMIC_SMEM_LIMIT) {
+        int device = 0;
+        cuda_check_runtime(cudaGetDevice(&device), "cudaGetDevice");
+        int max_optin = 0;
+        cuda_check_runtime(
+            cudaDeviceGetAttribute(
+                &max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
+            "cudaDeviceGetAttribute(MaxSharedMemoryPerBlockOptin)");
+        if (total_shmem > (size_t)max_optin) {
+            throw std::runtime_error(
+                "mixscape_project_em requires " + std::to_string(total_shmem) +
+                " B of shared memory (max " + std::to_string(max_optin) +
+                " B); too many DE genes per gene.");
+        }
         cuda_check_runtime(
             cudaFuncSetAttribute(mixscape_project_em_kernel<T>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int)shmem),
+                                 (int)dyn_shmem),
             "cudaFuncSetAttribute(mixscape_project_em_kernel)");
     }
-    mixscape_project_em_kernel<T><<<grid, block, shmem, stream>>>(
+    mixscape_project_em_kernel<T><<<grid, block, dyn_shmem, stream>>>(
         dat, dat_offsets, n_per_gene, k_per_gene, cell_offsets, feat_offsets,
         nt_cells_mean, guide_sel, nt_in_all, active_genes, n_active, max_iter,
         tol, reg_covar, pvec_scratch, resp1);
@@ -531,17 +497,20 @@ template <typename T, typename Device>
 void def_precision_cholesky_full(nb::module_& m) {
     m.def(
         "precision_cholesky_full",
-        [](gpu_array_c<const T, Device> covariances,
-           gpu_array_c<T, Device> prec_chol, gpu_array_c<T, Device> log_det,
-           int d, int K, std::uintptr_t stream, std::uintptr_t cublas_handle,
+        [](gpu_array_c<T, Device> cov_work, gpu_array_c<T, Device> prec_chol,
+           gpu_array_c<T, Device> log_det, gpu_array_c<int, Device> dev_info,
+           std::uintptr_t dA, std::uintptr_t dB, int d, int K,
+           std::uintptr_t stream, std::uintptr_t cublas_handle,
            std::uintptr_t cusolver_handle) {
             launch_precision_cholesky_full<T>(
-                covariances.data(), prec_chol.data(), log_det.data(), d, K,
-                (cudaStream_t)stream, (cublasHandle_t)cublas_handle,
+                cov_work.data(), prec_chol.data(), log_det.data(),
+                dev_info.data(), (T**)dA, (T**)dB, d, K, (cudaStream_t)stream,
+                (cublasHandle_t)cublas_handle,
                 (cusolverDnHandle_t)cusolver_handle);
         },
-        "covariances"_a, "prec_chol"_a, "log_det"_a, nb::kw_only(), "d"_a,
-        "K"_a, "stream"_a = 0, "cublas_handle"_a, "cusolver_handle"_a);
+        "cov_work"_a, "prec_chol"_a, "log_det"_a, "dev_info"_a, nb::kw_only(),
+        "dA"_a, "dB"_a, "d"_a, "K"_a, "stream"_a = 0, "cublas_handle"_a,
+        "cusolver_handle"_a);
 }
 
 template <typename Device>

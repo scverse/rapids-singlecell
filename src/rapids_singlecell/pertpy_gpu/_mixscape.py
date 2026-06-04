@@ -534,6 +534,9 @@ class Mixscape:
             gene_mask = (pert_sub == gene) | (pert_sub == control)
             gene_subset = _scale_gpu(X_sub[cp.asarray(gene_mask)])
             n_pcs = min(n_comps, min(gene_subset.shape) - 1)
+            if n_pcs < 1:
+                # Too few cells or genes for a meaningful per-gene PCA.
+                continue
             pca = PCA(n_components=n_pcs)
             pca.fit(gene_subset)
             loadings = cp.asarray(pca.components_, dtype=X_proj_base.dtype).T
@@ -820,6 +823,12 @@ def _lda_fit_transform_gpu(
     ).T @ scalings
     _, s2, vt2 = cp.linalg.svd(between, full_matrices=False)
     rank2 = 0 if s2.size == 0 else int(cp.sum(s2 > tol * s2[0]).item())
+    if rank < 1 or rank2 < 1:
+        raise ValueError(
+            "LDA failed: the within- or between-class scatter is rank-deficient "
+            "(no discriminant directions found). This usually means too few "
+            "cells, collinear features, or insufficient class separation."
+        )
     scalings = scalings @ vt2.T[:, :rank2]
 
     embedding = (X - xbar) @ scalings
