@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cstdint>
 #include "../nb_types.h"
 #include <nanobind/stl/tuple.h>
 
@@ -105,11 +106,14 @@ static void launch_edistance_kernel(const T* embedding, const int* cat_offsets,
                                     cudaStream_t stream) {
     dim3 grid(num_pairs, blocks_per_pair);
     dim3 block(block_size);
-    edistance_kernel<T, CELL_TILE, FEAT_TILE>
-        <<<grid, block, shared_mem, stream>>>(
-            embedding, cat_offsets, cell_indices, pair_left, pair_right,
-            pairwise_sums, n_features, blocks_per_pair);
-    CUDA_CHECK_LAST_ERROR(edistance_kernel);
+    DenseLoader<T, CELL_TILE, FEAT_TILE> loader{embedding, cell_indices,
+                                                n_features};
+    edistance_kernel_impl<T, CELL_TILE, FEAT_TILE,
+                          DenseLoader<T, CELL_TILE, FEAT_TILE>>
+        <<<grid, block, shared_mem, stream>>>(loader, cat_offsets, pair_left,
+                                              pair_right, pairwise_sums,
+                                              n_features, blocks_per_pair);
+    CUDA_CHECK_LAST_ERROR(edistance_kernel_impl);
 }
 
 // Dispatch to correct tile size specialization for float32
@@ -184,6 +188,140 @@ static void dispatch_f64(const double* embedding, const int* cat_offsets,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sparse (CSR) variants: same tiling/config as the dense kernel, but cells are
+// read from CSR (data, indices, indptr) and densified into shared on the fly.
+// IndptrT is int (int32) or int64_t so nnz > 2^31-1 is addressable.
+// ---------------------------------------------------------------------------
+
+template <typename T, int CELL_TILE, int FEAT_TILE, typename IndptrT>
+static void launch_edistance_sparse_kernel(
+    const T* data, const int* indices, const IndptrT* indptr,
+    const int* cat_offsets, const int* cell_indices, const int* pair_left,
+    const int* pair_right, T* pairwise_sums, int num_pairs, int n_features,
+    int blocks_per_pair, int block_size, size_t shared_mem,
+    cudaStream_t stream) {
+    dim3 grid(num_pairs, blocks_per_pair);
+    dim3 block(block_size);
+    SparseLoader<T, CELL_TILE, FEAT_TILE, IndptrT> loader{data, indices, indptr,
+                                                          cell_indices};
+    edistance_kernel_impl<T, CELL_TILE, FEAT_TILE,
+                          SparseLoader<T, CELL_TILE, FEAT_TILE, IndptrT>>
+        <<<grid, block, shared_mem, stream>>>(loader, cat_offsets, pair_left,
+                                              pair_right, pairwise_sums,
+                                              n_features, blocks_per_pair);
+    CUDA_CHECK_LAST_ERROR(edistance_kernel_impl);
+}
+
+// Dispatch to correct tile size specialization for sparse float32
+template <typename IndptrT>
+static void dispatch_f32_sparse(const float* data, const int* indices,
+                                const IndptrT* indptr, const int* cat_offsets,
+                                const int* cell_indices, const int* pair_left,
+                                const int* pair_right, float* pairwise_sums,
+                                int num_pairs, int n_features,
+                                int blocks_per_pair, int cell_tile,
+                                int feat_tile, int block_size,
+                                size_t shared_mem, cudaStream_t stream) {
+    if (cell_tile == 64) {
+        if (feat_tile == 25) {
+            launch_edistance_sparse_kernel<float, 64, 25, IndptrT>(
+                data, indices, indptr, cat_offsets, cell_indices, pair_left,
+                pair_right, pairwise_sums, num_pairs, n_features,
+                blocks_per_pair, block_size, shared_mem, stream);
+        } else {
+            launch_edistance_sparse_kernel<float, 64, 16, IndptrT>(
+                data, indices, indptr, cat_offsets, cell_indices, pair_left,
+                pair_right, pairwise_sums, num_pairs, n_features,
+                blocks_per_pair, block_size, shared_mem, stream);
+        }
+    } else {
+        if (feat_tile == 64) {
+            launch_edistance_sparse_kernel<float, 32, 64, IndptrT>(
+                data, indices, indptr, cat_offsets, cell_indices, pair_left,
+                pair_right, pairwise_sums, num_pairs, n_features,
+                blocks_per_pair, block_size, shared_mem, stream);
+        } else if (feat_tile == 50) {
+            launch_edistance_sparse_kernel<float, 32, 50, IndptrT>(
+                data, indices, indptr, cat_offsets, cell_indices, pair_left,
+                pair_right, pairwise_sums, num_pairs, n_features,
+                blocks_per_pair, block_size, shared_mem, stream);
+        } else {
+            launch_edistance_sparse_kernel<float, 32, 32, IndptrT>(
+                data, indices, indptr, cat_offsets, cell_indices, pair_left,
+                pair_right, pairwise_sums, num_pairs, n_features,
+                blocks_per_pair, block_size, shared_mem, stream);
+        }
+    }
+}
+
+// Dispatch to correct tile size specialization for sparse float64
+template <typename IndptrT>
+static void dispatch_f64_sparse(const double* data, const int* indices,
+                                const IndptrT* indptr, const int* cat_offsets,
+                                const int* cell_indices, const int* pair_left,
+                                const int* pair_right, double* pairwise_sums,
+                                int num_pairs, int n_features,
+                                int blocks_per_pair, int cell_tile,
+                                int feat_tile, int block_size,
+                                size_t shared_mem, cudaStream_t stream) {
+    (void)cell_tile;  // always 16 for f64
+    if (feat_tile == 64) {
+        launch_edistance_sparse_kernel<double, 16, 64, IndptrT>(
+            data, indices, indptr, cat_offsets, cell_indices, pair_left,
+            pair_right, pairwise_sums, num_pairs, n_features, blocks_per_pair,
+            block_size, shared_mem, stream);
+    } else if (feat_tile == 50) {
+        launch_edistance_sparse_kernel<double, 16, 50, IndptrT>(
+            data, indices, indptr, cat_offsets, cell_indices, pair_left,
+            pair_right, pairwise_sums, num_pairs, n_features, blocks_per_pair,
+            block_size, shared_mem, stream);
+    } else {
+        launch_edistance_sparse_kernel<double, 16, 32, IndptrT>(
+            data, indices, indptr, cat_offsets, cell_indices, pair_left,
+            pair_right, pairwise_sums, num_pairs, n_features, blocks_per_pair,
+            block_size, shared_mem, stream);
+    }
+}
+
+template <typename T, typename Device, typename IndptrT>
+void def_compute_distances_sparse(nb::module_& m, const char* name) {
+    m.def(
+        name,
+        [](gpu_array_c<const T, Device> data,
+           gpu_array_c<const int, Device> indices,
+           gpu_array_c<const IndptrT, Device> indptr,
+           gpu_array_c<const int, Device> cat_offsets,
+           gpu_array_c<const int, Device> cell_indices,
+           gpu_array_c<const int, Device> pair_left,
+           gpu_array_c<const int, Device> pair_right,
+           gpu_array_c<T, Device> pairwise_sums, int num_pairs, int n_features,
+           int blocks_per_pair, int cell_tile, int feat_tile, int block_size,
+           int shared_mem, std::uintptr_t stream) {
+            if constexpr (std::is_same_v<T, double>) {
+                dispatch_f64_sparse<IndptrT>(
+                    data.data(), indices.data(), indptr.data(),
+                    cat_offsets.data(), cell_indices.data(), pair_left.data(),
+                    pair_right.data(), pairwise_sums.data(), num_pairs,
+                    n_features, blocks_per_pair, cell_tile, feat_tile,
+                    block_size, static_cast<size_t>(shared_mem),
+                    reinterpret_cast<cudaStream_t>(stream));
+            } else {
+                dispatch_f32_sparse<IndptrT>(
+                    data.data(), indices.data(), indptr.data(),
+                    cat_offsets.data(), cell_indices.data(), pair_left.data(),
+                    pair_right.data(), pairwise_sums.data(), num_pairs,
+                    n_features, blocks_per_pair, cell_tile, feat_tile,
+                    block_size, static_cast<size_t>(shared_mem),
+                    reinterpret_cast<cudaStream_t>(stream));
+            }
+        },
+        "data"_a, "indices"_a, "indptr"_a, "cat_offsets"_a, "cell_indices"_a,
+        "pair_left"_a, "pair_right"_a, "pairwise_sums"_a, "num_pairs"_a,
+        "n_features"_a, "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a,
+        "block_size"_a, "shared_mem"_a, "stream"_a = 0);
+}
+
 template <typename T, typename Device>
 void def_compute_distances(nb::module_& m) {
     m.def(
@@ -223,6 +361,17 @@ void register_bindings(nb::module_& m) {
     // IMPORTANT: f64 must be defined before f32 for proper overload dispatch.
     def_compute_distances<double, Device>(m);
     def_compute_distances<float, Device>(m);
+
+    // Sparse (CSR) variants. int32 indptr -> compute_distances_sparse;
+    // int64 indptr -> compute_distances_sparse_i64. f64 before f32.
+    def_compute_distances_sparse<double, Device, int>(
+        m, "compute_distances_sparse");
+    def_compute_distances_sparse<float, Device, int>(
+        m, "compute_distances_sparse");
+    def_compute_distances_sparse<double, Device, int64_t>(
+        m, "compute_distances_sparse_i64");
+    def_compute_distances_sparse<float, Device, int64_t>(
+        m, "compute_distances_sparse_i64");
 }
 
 NB_MODULE(_edistance_cuda, m) {

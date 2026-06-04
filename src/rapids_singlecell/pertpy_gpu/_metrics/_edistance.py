@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 import cupy as cp
+import cupyx.scipy.sparse as cpsp
 import numpy as np
 import pandas as pd
 
@@ -16,10 +18,98 @@ from rapids_singlecell._utils import (
 )
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
-from ._base_metric import BaseMetric, parse_device_ids
+from ._base_metric import BaseMetric, _is_sparse, parse_device_ids
 
 if TYPE_CHECKING:
     from anndata import AnnData
+
+
+# Largest int32 indptr value; beyond this the CSR offsets need int64.
+_INT32_MAX = np.iinfo(np.int32).max
+
+
+@dataclass(frozen=True)
+class _CSRData:
+    """A row-subset of a CSR matrix on GPU, fed to the sparse edistance kernel.
+
+    Holds canonical (column-sorted) CSR arrays for the cells of the requested
+    groups. ``indptr`` is int32 when ``nnz`` fits, else int64; ``indices`` are
+    always int32 (gene columns) and ``data`` is float32 or float64. Exposes
+    ``.dtype`` and ``.shape`` so it is a drop-in for the dense embedding array
+    everywhere except the kernel launch.
+    """
+
+    data: cp.ndarray
+    indices: cp.ndarray
+    indptr: cp.ndarray
+    n_rows: int
+    n_features: int
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self.data.dtype
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.n_rows, self.n_features)
+
+
+def _build_csr_source(embedding_raw, selector) -> _CSRData:
+    """Move a (host or device) sparse matrix to GPU and subset its rows.
+
+    ``selector`` is a boolean mask, an integer row-index array, or ``None``
+    (keep all rows). Rows are kept in ``selector`` order so the caller's
+    ``cell_indices`` line up. The result is canonical CSR (column-sorted).
+    """
+    from rapids_singlecell.get._anndata import X_to_GPU
+
+    # cupyx CSR only stores float/complex/bool data, so cast unsupported dtypes
+    # (e.g. integer raw counts) to float32 BEFORE the GPU transfer. The kernel
+    # itself only has float32/float64 specializations.
+    if embedding_raw.dtype not in (np.float32, np.float64):
+        embedding_raw = embedding_raw.astype(np.float32)
+
+    X = X_to_GPU(embedding_raw)
+    if not cpsp.isspmatrix_csr(X):
+        X = X.tocsr()
+
+    if selector is not None:
+        rows = selector
+        if getattr(rows, "dtype", None) == np.bool_:
+            rows = np.flatnonzero(rows)
+        X = X[cp.asarray(rows)]
+        if not cpsp.isspmatrix_csr(X):
+            X = X.tocsr()
+
+    X.sort_indices()
+
+    n_rows, n_features = X.shape
+    indices = cp.ascontiguousarray(X.indices.astype(cp.int32, copy=False))
+    nnz = int(X.nnz)
+    indptr_dtype = cp.int64 if nnz > _INT32_MAX else cp.int32
+    indptr = cp.ascontiguousarray(X.indptr.astype(indptr_dtype, copy=False))
+    data = cp.ascontiguousarray(X.data)
+
+    return _CSRData(
+        data=data,
+        indices=indices,
+        indptr=indptr,
+        n_rows=int(n_rows),
+        n_features=int(n_features),
+    )
+
+
+def _materialize_source(embedding_raw, selector):
+    """Materialize the subset as a dense cupy array (dense input) or a
+    :class:`_CSRData` bundle (sparse input).
+
+    ``selector`` is a boolean mask, an integer row-index array, or ``None``.
+    """
+    if _is_sparse(embedding_raw):
+        return _build_csr_source(embedding_raw, selector)
+    if selector is None:
+        return cp.asarray(embedding_raw)
+    return cp.asarray(embedding_raw[selector])
 
 
 class EDistanceMetric(BaseMetric):
@@ -53,6 +143,26 @@ class EDistanceMetric(BaseMetric):
     ):
         """Initialize energy distance metric."""
         super().__init__(layer_key=layer_key, obsm_key=obsm_key)
+
+    def _load_source(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+    ) -> tuple[cp.ndarray | _CSRData, cp.ndarray, cp.ndarray, list[str]]:
+        """Load the cell data for ``groupby``, dense or sparse.
+
+        Dense input returns a CuPy array; sparse (CSR/CSC) input returns a
+        :class:`_CSRData` bundle that the kernel densifies on the fly. Both
+        share the category mapping built by :meth:`_subset_indices`, so the
+        downstream means/bootstrap/contrast math is layout-agnostic.
+        """
+        embedding_raw = self._get_embedding(adata)
+        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(
+            adata, groupby, needed_groups
+        )
+        source = _materialize_source(embedding_raw, mask)
+        return source, cat_offsets, cell_indices, groups_list
 
     def pairwise(
         self,
@@ -107,7 +217,7 @@ class EDistanceMetric(BaseMetric):
         """
         _assert_categorical_obs(adata, key=groupby)
 
-        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
+        embedding, cat_offsets, cell_indices, groups_list = self._load_source(
             adata, groupby, groups
         )
         k = len(groups_list)
@@ -192,7 +302,7 @@ class EDistanceMetric(BaseMetric):
             adata, groupby, selected_group, groups
         )
 
-        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
+        embedding, cat_offsets, cell_indices, groups_list = self._load_source(
             adata, groupby, needed
         )
         k = len(groups_list)
@@ -409,8 +519,13 @@ class EDistanceMetric(BaseMetric):
         cat_offsets = cp.array(offsets, dtype=cp.int32)
         original_indices = np.concatenate(all_cell_idx)
 
-        # Subset before GPU transfer when not all cells are referenced
-        if len(original_indices) < int(len(embedding_raw) * 0.7):
+        # Subset the referenced cells. For sparse input always row-subset into a
+        # CSR bundle (the kernel densifies on the fly); for dense input only
+        # subset when most cells are unused, else transfer the whole array.
+        if _is_sparse(embedding_raw):
+            embedding = _materialize_source(embedding_raw, original_indices)
+            cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
+        elif len(original_indices) < int(len(embedding_raw) * 0.7):
             embedding = cp.asarray(embedding_raw[original_indices])
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         else:
@@ -655,6 +770,8 @@ class EDistanceMetric(BaseMetric):
         _, n_features = embedding.shape
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
 
+        is_sparse = isinstance(embedding, _CSRData)
+
         # Split pairs across devices with load balancing
         pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
 
@@ -676,31 +793,42 @@ class EDistanceMetric(BaseMetric):
                 continue
 
             n_chunk_pairs = len(chunk_left)
+            # The source arrays already live on the first device; other devices
+            # get a copy via cp.asarray.
+            on_first = device_id == device_ids[0]
             with cp.cuda.Device(device_id):
                 streams[device_id] = cp.cuda.Stream(non_blocking=True)
 
                 with streams[device_id]:
-                    if device_id == device_ids[0]:
-                        dev_emb = embedding
-                        dev_off = cat_offsets
-                        dev_idx = cell_indices
-                    else:
-                        dev_emb = cp.asarray(embedding)
-                        dev_off = cp.asarray(cat_offsets)
-                        dev_idx = cp.asarray(cell_indices)
+                    dev_off = cat_offsets if on_first else cp.asarray(cat_offsets)
+                    dev_idx = cell_indices if on_first else cp.asarray(cell_indices)
 
-                    device_data.append(
-                        {
-                            "emb": dev_emb,
-                            "off": dev_off,
-                            "idx": dev_idx,
-                            "pair_left": cp.asarray(chunk_left),
-                            "pair_right": cp.asarray(chunk_right),
-                            "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
-                            "n_pairs": n_chunk_pairs,
-                            "device_id": device_id,
-                        }
-                    )
+                    data = {
+                        "off": dev_off,
+                        "idx": dev_idx,
+                        "pair_left": cp.asarray(chunk_left),
+                        "pair_right": cp.asarray(chunk_right),
+                        "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
+                        "n_pairs": n_chunk_pairs,
+                        "device_id": device_id,
+                    }
+                    if is_sparse:
+                        data["data"] = (
+                            embedding.data if on_first else cp.asarray(embedding.data)
+                        )
+                        data["indices"] = (
+                            embedding.indices
+                            if on_first
+                            else cp.asarray(embedding.indices)
+                        )
+                        data["indptr"] = (
+                            embedding.indptr
+                            if on_first
+                            else cp.asarray(embedding.indptr)
+                        )
+                    else:
+                        data["emb"] = embedding if on_first else cp.asarray(embedding)
+                    device_data.append(data)
 
         # Phase 2: Synchronize data transfers, then launch kernels
         for data in device_data:
@@ -720,22 +848,47 @@ class EDistanceMetric(BaseMetric):
                 cell_tile, feat_tile, block_size, shared_mem = config
                 blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
 
-                _ed.compute_distances(
-                    data["emb"],
-                    data["off"],
-                    data["idx"],
-                    data["pair_left"],
-                    data["pair_right"],
-                    data["sums"],
-                    data["n_pairs"],
-                    n_features,
-                    blocks_per_pair,
-                    cell_tile,
-                    feat_tile,
-                    block_size,
-                    shared_mem,
-                    cp.cuda.get_current_stream().ptr,
-                )
+                if is_sparse:
+                    # int64 indptr -> _i64 binding; int32 -> default.
+                    if data["indptr"].dtype == cp.int64:
+                        kernel = _ed.compute_distances_sparse_i64
+                    else:
+                        kernel = _ed.compute_distances_sparse
+                    kernel(
+                        data["data"],
+                        data["indices"],
+                        data["indptr"],
+                        data["off"],
+                        data["idx"],
+                        data["pair_left"],
+                        data["pair_right"],
+                        data["sums"],
+                        data["n_pairs"],
+                        n_features,
+                        blocks_per_pair,
+                        cell_tile,
+                        feat_tile,
+                        block_size,
+                        shared_mem,
+                        cp.cuda.get_current_stream().ptr,
+                    )
+                else:
+                    _ed.compute_distances(
+                        data["emb"],
+                        data["off"],
+                        data["idx"],
+                        data["pair_left"],
+                        data["pair_right"],
+                        data["sums"],
+                        data["n_pairs"],
+                        n_features,
+                        blocks_per_pair,
+                        cell_tile,
+                        feat_tile,
+                        block_size,
+                        shared_mem,
+                        cp.cuda.get_current_stream().ptr,
+                    )
 
         # Phase 3: Synchronize all devices
         for data in device_data:
