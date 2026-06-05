@@ -31,49 +31,36 @@ static inline void launch_l2_row_normalize(const T* src, T* dst, int n_rows,
     CUDA_CHECK_LAST_ERROR(l2_row_normalize_kernel);
 }
 
+template <typename T, typename Device>
+void def_normalize(nb::module_& m) {
+    m.def(
+        "normalize",
+        [](gpu_array_c<T, Device> X, long long rows, long long cols,
+           std::uintptr_t stream) {
+            launch_normalize<T>(X.data(), rows, cols, (cudaStream_t)stream);
+        },
+        "X"_a, nb::kw_only(), "rows"_a, "cols"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_l2_row_normalize(nb::module_& m) {
+    m.def(
+        "l2_row_normalize",
+        [](gpu_array_c<const T, Device> src, gpu_array_c<T, Device> dst,
+           int n_rows, int n_cols, std::uintptr_t stream) {
+            launch_l2_row_normalize<T>(src.data(), dst.data(), n_rows, n_cols,
+                                       (cudaStream_t)stream);
+        },
+        "src"_a, nb::kw_only(), "dst"_a, "n_rows"_a, "n_cols"_a,
+        "stream"_a = 0);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
-    // normalize - float32
-    m.def(
-        "normalize",
-        [](gpu_array_c<float, Device> X, long long rows, long long cols,
-           std::uintptr_t stream) {
-            launch_normalize<float>(X.data(), rows, cols, (cudaStream_t)stream);
-        },
-        "X"_a, nb::kw_only(), "rows"_a, "cols"_a, "stream"_a = 0);
-
-    // normalize - float64
-    m.def(
-        "normalize",
-        [](gpu_array_c<double, Device> X, long long rows, long long cols,
-           std::uintptr_t stream) {
-            launch_normalize<double>(X.data(), rows, cols,
-                                     (cudaStream_t)stream);
-        },
-        "X"_a, nb::kw_only(), "rows"_a, "cols"_a, "stream"_a = 0);
-
-    // l2_row_normalize - float32
-    m.def(
-        "l2_row_normalize",
-        [](gpu_array_c<const float, Device> src, gpu_array_c<float, Device> dst,
-           int n_rows, int n_cols, std::uintptr_t stream) {
-            launch_l2_row_normalize<float>(src.data(), dst.data(), n_rows,
-                                           n_cols, (cudaStream_t)stream);
-        },
-        "src"_a, nb::kw_only(), "dst"_a, "n_rows"_a, "n_cols"_a,
-        "stream"_a = 0);
-
-    // l2_row_normalize - float64
-    m.def(
-        "l2_row_normalize",
-        [](gpu_array_c<const double, Device> src,
-           gpu_array_c<double, Device> dst, int n_rows, int n_cols,
-           std::uintptr_t stream) {
-            launch_l2_row_normalize<double>(src.data(), dst.data(), n_rows,
-                                            n_cols, (cudaStream_t)stream);
-        },
-        "src"_a, nb::kw_only(), "dst"_a, "n_rows"_a, "n_cols"_a,
-        "stream"_a = 0);
+    def_normalize<float, Device>(m);
+    def_normalize<double, Device>(m);
+    def_l2_row_normalize<float, Device>(m);
+    def_l2_row_normalize<double, Device>(m);
 }
 
 NB_MODULE(_harmony_normalize_cuda, m) {

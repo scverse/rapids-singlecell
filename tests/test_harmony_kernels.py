@@ -10,7 +10,13 @@ from rapids_singlecell._cuda import (
     _harmony_clustering_cuda as _cl,
 )
 from rapids_singlecell._cuda import (
+    _harmony_colsum_cuda as _colsum,
+)
+from rapids_singlecell._cuda import (
     _harmony_correction_cuda as _corr,
+)
+from rapids_singlecell._cuda import (
+    _harmony_kmeans_cuda as _km,
 )
 from rapids_singlecell._cuda import (
     _harmony_normalize_cuda as _norm,
@@ -23,7 +29,13 @@ from rapids_singlecell._cuda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    _norm is None or _pen is None or _scatter is None,
+    _norm is None
+    or _pen is None
+    or _scatter is None
+    or _colsum is None
+    or _km is None
+    or _cl is None
+    or _corr is None,
     reason="Harmony CUDA modules not available",
 )
 
@@ -233,6 +245,49 @@ def test_gather_int(n):
 
     expected = src[idx]
     cp.testing.assert_array_equal(dst, expected)
+
+
+# ---------- colsum ----------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rows", [0, 1, 257, 4096])
+def test_colsum_columns_multiple_cols_per_block(dtype, rows):
+    rng = cp.random.default_rng(123)
+    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
+    cols = n_sm * 8 + 17
+    x = rng.standard_normal((rows, cols), dtype=dtype)
+    out = cp.zeros(cols, dtype=dtype)
+
+    _colsum.colsum(x, out=out, rows=rows, cols=cols)
+    cp.cuda.Device().synchronize()
+
+    atol = 5e-4 if dtype == np.float32 else 1e-12
+    rtol = 1e-4 if dtype == np.float32 else 1e-5
+    expected_np = cp.asnumpy(x).sum(axis=0)
+    cp.testing.assert_allclose(out, cp.asarray(expected_np), atol=atol, rtol=rtol)
+
+
+# ---------- kmeans_err ----------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("n", [0, 1, 257, 8192])
+def test_kmeans_err_offset_contiguous(dtype, n):
+    r_base = cp.arange(n + 1, dtype=dtype)
+    dot_base = cp.linspace(dtype(0.1), dtype(0.9), n + 1, dtype=dtype)
+    r = r_base[1:]
+    dot = dot_base[1:]
+    out = cp.zeros(1, dtype=dtype)
+
+    _km.kmeans_err(r, dot=dot, n=n, out=out)
+    cp.cuda.Device().synchronize()
+
+    r_np = cp.asnumpy(r)
+    dot_np = cp.asnumpy(dot)
+    expected_np = np.sum(r_np * dtype(2) * (dtype(1) - dot_np), dtype=dtype)
+    atol = 1e-4 if dtype == np.float32 else 1e-10
+    cp.testing.assert_allclose(out[0], dtype(expected_np), atol=atol, rtol=1e-5)
 
 
 # ---------- compute_objective ----------

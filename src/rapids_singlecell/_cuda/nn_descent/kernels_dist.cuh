@@ -37,7 +37,7 @@ __global__ void compute_distances_cosine_kernel(
         float v = data[base1 + d];
         sum_i1 += v * v;  // powf(v, 2)
     }
-    float norm_i1 = sqrtf(sum_i1);
+    float inv_norm_i1 = (sum_i1 > 0.0f) ? rsqrtf(sum_i1) : 0.0f;
     for (long long j = 0; j < n_neighbors; ++j) {
         long long i2 = static_cast<long long>(pairs[i1 * n_neighbors + j]);
         float dot = 0.0f;
@@ -47,10 +47,10 @@ __global__ void compute_distances_cosine_kernel(
             float v1 = data[base1 + d];
             float v2 = data[base2 + d];
             dot += v1 * v2;
-            sum_i2 += v2 * v2;  // powf(v2, 2)
+            sum_i2 += v2 * v2;
         }
-        float denom = norm_i1 * sqrtf(sum_i2);
-        out[i1 * n_neighbors + j] = 1.0f - (denom > 0.0f ? dot / denom : 0.0f);
+        float inv_norm_i2 = (sum_i2 > 0.0f) ? rsqrtf(sum_i2) : 0.0f;
+        out[i1 * n_neighbors + j] = 1.0f - dot * inv_norm_i1 * inv_norm_i2;
     }
 }
 

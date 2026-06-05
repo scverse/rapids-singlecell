@@ -9,7 +9,6 @@ using namespace nb::literals;
 // Size constants
 static constexpr int WARP_SIZE = 32;
 static constexpr int FLOAT32_SIZE = 4;
-static constexpr int INT32_SIZE = 4;
 
 // Cell tile sizes for B-tile caching (2 floats per cell = 8 bytes)
 // Larger tiles reduce iterations but increase shared memory usage
@@ -39,7 +38,7 @@ static size_t compute_shared_mem(int cell_tile, int l_pad,
                                  int warps_per_block) {
     size_t b_tile_bytes = static_cast<size_t>(cell_tile) * 2 * FLOAT32_SIZE;
     size_t warp_hist_bytes =
-        static_cast<size_t>(warps_per_block) * l_pad * INT32_SIZE;
+        static_cast<size_t>(warps_per_block) * l_pad * sizeof(cooc_count_t);
     return b_tile_bytes + warp_hist_bytes;
 }
 
@@ -114,7 +113,7 @@ template <int CELL_TILE>
 static void launch_csr_catpairs_kernel(
     const float* spatial, const float* thresholds, const int* cat_offsets,
     const int* cell_indices, const int* pair_left, const int* pair_right,
-    int* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
+    cooc_count_t* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
     int l_pad, int block_size, size_t shared_mem, cudaStream_t stream) {
     dim3 grid(num_pairs, blocks_per_pair);
     dim3 block(block_size);
@@ -130,7 +129,7 @@ static void launch_csr_catpairs_kernel(
 static void dispatch_csr_catpairs(
     const float* spatial, const float* thresholds, const int* cat_offsets,
     const int* cell_indices, const int* pair_left, const int* pair_right,
-    int* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
+    cooc_count_t* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
     int cell_tile, int block_size, size_t shared_mem, cudaStream_t stream) {
     // Compute l_pad (padded to multiple of 32)
     int l_pad = ((l_val + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -186,9 +185,9 @@ static void dispatch_csr_catpairs(
 // Pairwise kernel launch
 static inline void launch_count_pairwise(const float* spatial,
                                          const float* thresholds,
-                                         const int* labels, int* result, int n,
-                                         int k, int l_val,
-                                         cudaStream_t stream) {
+                                         const int* labels,
+                                         cooc_count_t* result, int n, int k,
+                                         int l_val, cudaStream_t stream) {
     dim3 grid(n);
     dim3 block(32);
     occur_count_kernel_pairwise<<<grid, block, 0, stream>>>(
@@ -197,8 +196,8 @@ static inline void launch_count_pairwise(const float* spatial,
 }
 
 // Shared memory reduction launch
-static inline bool launch_reduce_shared(const int* result, float* out, int k,
-                                        int l_val, int format,
+static inline bool launch_reduce_shared(const cooc_count_t* result, float* out,
+                                        int k, int l_val, int format,
                                         cudaStream_t stream) {
     int device = 0;
     cudaGetDevice(&device);
@@ -220,9 +219,10 @@ static inline bool launch_reduce_shared(const int* result, float* out, int k,
 }
 
 // Global memory reduction launch
-static inline void launch_reduce_global(const int* result, float* inter_out,
-                                        float* out, int k, int l_val,
-                                        int format, cudaStream_t stream) {
+static inline void launch_reduce_global(const cooc_count_t* result,
+                                        float* inter_out, float* out, int k,
+                                        int l_val, int format,
+                                        cudaStream_t stream) {
     dim3 grid(l_val);
     dim3 block(32);
     size_t smem = static_cast<size_t>(k) * sizeof(float);
@@ -241,9 +241,9 @@ void register_bindings(nb::module_& m) {
            gpu_array_c<const int, Device> cell_indices,
            gpu_array_c<const int, Device> pair_left,
            gpu_array_c<const int, Device> pair_right,
-           gpu_array_c<int, Device> counts, int num_pairs, int k, int l_val,
-           int blocks_per_pair, int cell_tile, int block_size, int shared_mem,
-           std::uintptr_t stream) {
+           gpu_array_c<cooc_count_t, Device> counts, int num_pairs, int k,
+           int l_val, int blocks_per_pair, int cell_tile, int block_size,
+           int shared_mem, std::uintptr_t stream) {
             dispatch_csr_catpairs(
                 spatial.data(), thresholds.data(), cat_offsets.data(),
                 cell_indices.data(), pair_left.data(), pair_right.data(),
@@ -261,7 +261,7 @@ void register_bindings(nb::module_& m) {
         [](gpu_array_c<const float, Device> spatial,
            gpu_array_c<const float, Device> thresholds,
            gpu_array_c<const int, Device> labels,
-           gpu_array_c<int, Device> result, int n, int k, int l_val,
+           gpu_array_c<cooc_count_t, Device> result, int n, int k, int l_val,
            std::uintptr_t stream) {
             launch_count_pairwise(spatial.data(), thresholds.data(),
                                   labels.data(), result.data(), n, k, l_val,
@@ -272,7 +272,7 @@ void register_bindings(nb::module_& m) {
 
     m.def(
         "reduce_shared",
-        [](gpu_array_c<const int, Device> result,
+        [](gpu_array_c<const cooc_count_t, Device> result,
            gpu_array_c<float, Device> out, int k, int l_val, int format,
            std::uintptr_t stream) {
             return launch_reduce_shared(result.data(), out.data(), k, l_val,
@@ -283,7 +283,7 @@ void register_bindings(nb::module_& m) {
 
     m.def(
         "reduce_global",
-        [](gpu_array_c<const int, Device> result,
+        [](gpu_array_c<const cooc_count_t, Device> result,
            gpu_array_c<float, Device> inter_out, gpu_array_c<float, Device> out,
            int k, int l_val, int format, std::uintptr_t stream) {
             launch_reduce_global(result.data(), inter_out.data(), out.data(), k,

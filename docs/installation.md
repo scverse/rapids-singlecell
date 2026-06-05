@@ -202,7 +202,17 @@ Then run the following command to execute the container:
 ```bash
 apptainer run --nv rsc.sif
 ```
+### Running on HPC systems with SLURM
 
+When running on HPC systems via SLURM, conda must be explicitly activated before running Python scripts. Use `apptainer exec` instead of `apptainer run`:
+
+```bash
+apptainer exec --nv \
+    --bind /path/to/your/data:/path/to/your/data \
+    rsc.sif \
+    bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate base && python"
+```
+Without sourcing conda first, `CONDA_PREFIX` will be unset and CuPy will fail to locate the CUDA libraries inside the container, resulting in a `TypeError: expected str, bytes or os.PathLike object, not NoneType` error.
 
 # System requirements
 

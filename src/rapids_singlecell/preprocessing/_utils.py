@@ -308,6 +308,7 @@ def _check_gpu_X(X, *, require_cf=False, allow_dask=False, allow_csc=True):
         else:
             X.sort_indices()
             X.sum_duplicates()
+            return True
     else:
         raise TypeError(
             "The input is not a CuPy ndarray or CuPy sparse matrix. "

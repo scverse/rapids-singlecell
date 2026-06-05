@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <type_traits>
 
 // ---- L2 row normalize ----
 // One block per row. Writes to separate output buffer.
@@ -42,13 +41,9 @@ __global__ void l2_row_normalize_kernel(const T* __restrict__ src,
         for (int offset = 16; offset > 0; offset >>= 1)
             val += __shfl_down_sync(0xffffffff, val, offset);
         if (threadIdx.x == 0) {
-            T norm = val;
-            if constexpr (std::is_same<T, float>::value)
-                norm = sqrtf(norm);
-            else
-                norm = sqrt(norm);
-            if (norm < T(1e-12)) norm = T(1e-12);
-            warp_sums[0] = T(1) / norm;
+            T inv_norm = rsqrt(val);
+            if (inv_norm > T(1e12)) inv_norm = T(1e12);
+            warp_sums[0] = inv_norm;
         }
     }
     __syncthreads();

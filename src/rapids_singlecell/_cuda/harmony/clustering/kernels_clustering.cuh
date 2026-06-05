@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <type_traits>
 
 // ---- Fused entropy kernel ----
 // One block per row. Row-normalize R, accumulate x*log(x+eps), atomicAdd scaled
@@ -44,10 +43,7 @@ __global__ void entropy_kernel(const T* __restrict__ R, T sigma, int n_cells,
     T entropy = T(0);
     for (int col = threadIdx.x; col < n_clusters; col += blockDim.x) {
         T x = R_row[col] * inv_rsum;
-        if constexpr (std::is_same<T, float>::value)
-            entropy += x * logf(x + T(1e-12));
-        else
-            entropy += x * log(x + T(1e-12));
+        entropy += x * log(x + T(1e-12));
     }
 
 #pragma unroll
@@ -83,12 +79,7 @@ __global__ void diversity_kernel(const T* __restrict__ O,
         int batch = i / n_clusters;
         T numer = Stabilized ? (O[i] + E[i] + T(1)) : (O[i] + T(1));
         T ratio = numer / (E[i] + T(1));
-        T log_val;
-        if constexpr (std::is_same<T, float>::value)
-            log_val = logf(ratio);
-        else
-            log_val = log(ratio);
-        acc += theta[batch] * O[i] * log_val;
+        acc += theta[batch] * O[i] * log(ratio);
     }
 
 #pragma unroll

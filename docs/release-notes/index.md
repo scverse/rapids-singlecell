@@ -8,6 +8,12 @@
 ```
 
 ## Version 0.15.0
+```{include} /release-notes/0.15.3.md
+```
+```{include} /release-notes/0.15.2.md
+```
+```{include} /release-notes/0.15.1.md
+```
 ```{include} /release-notes/0.15.0.md
 ```
 

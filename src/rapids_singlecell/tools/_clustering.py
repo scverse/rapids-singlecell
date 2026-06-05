@@ -229,8 +229,9 @@ def leiden(
         resolutions = [resolution]
     else:
         resolutions = resolution
+    modularities = []
     for resolution in resolutions:
-        leiden_parts, _ = culeiden(
+        leiden_parts, modularity = culeiden(
             g,
             resolution=resolution,
             random_state=random_state,
@@ -241,6 +242,7 @@ def leiden(
             leiden_parts = leiden_parts.to_backend("pandas").compute()
         else:
             leiden_parts = leiden_parts.to_pandas()
+        modularities.append(modularity)
 
         # Format output
         groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
@@ -270,10 +272,13 @@ def leiden(
     # store information on the clustering parameters
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
-        "resolution": resolutions,
+        "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
         "random_state": random_state,
         "n_iterations": n_iterations,
     }
+    adata.uns[key_added]["modularity"] = (
+        modularities if len(modularities) > 1 else modularities[0]
+    )
     return adata if copy else None
 
 
@@ -383,8 +388,9 @@ def louvain(
         resolutions = [resolution]
     else:
         resolutions = resolution
+    modularities = []
     for resolution in resolutions:
-        louvain_parts, _ = culouvain(
+        louvain_parts, modularity = culouvain(
             g,
             resolution=resolution,
             max_level=n_iterations,
@@ -394,6 +400,7 @@ def louvain(
             louvain_parts = louvain_parts.to_backend("pandas").compute()
         else:
             louvain_parts = louvain_parts.to_pandas()
+        modularities.append(modularity)
 
         # Format output
         groups = louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
@@ -422,10 +429,13 @@ def louvain(
         Comms.destroy()
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
-        "resolution": resolutions,
+        "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
         "n_iterations": n_iterations,
         "threshold": threshold,
     }
+    adata.uns[key_added]["modularity"] = (
+        modularities if len(modularities) > 1 else modularities[0]
+    )
     return adata if copy else None
 
 

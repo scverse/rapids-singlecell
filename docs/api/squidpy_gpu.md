@@ -25,4 +25,5 @@ The backend exposes RAPIDS-singlecell's {mod}`rapids_singlecell.gr` functions fo
     gr.spatial_autocorr
     gr.co_occurrence
     gr.ligrec
+    gr.calculate_niche
 ```

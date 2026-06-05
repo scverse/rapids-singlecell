@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <vector>
 
@@ -29,9 +30,10 @@ constexpr int SCATTER_SHARED_CELLS_PER_BLOCK = 64;
 // ---------- Launch helpers ----------
 
 // 1D grid size capped at BLOCKS_PER_SM blocks/SM
-static inline int grid_1d(int n, int n_sm) {
-    return std::min(n_sm * BLOCKS_PER_SM,
-                    (n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D);
+static inline int grid_1d(long long n, int n_sm) {
+    long long blocks = (n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
+    return std::max(1, std::min(n_sm * BLOCKS_PER_SM,
+                                (int)std::min<long long>(blocks, INT_MAX)));
 }
 
 // Block dim rounded up to nearest warp, capped at MAX_BLOCK_DIM
@@ -47,8 +49,12 @@ static size_t get_cub_sort_temp_bytes(int n_cells) {
     size_t bytes = 0;
     auto* du = reinterpret_cast<unsigned int*>(1);
     auto* di = reinterpret_cast<int*>(1);
-    cub::DeviceRadixSort::SortPairs(nullptr, bytes, du, du, di, di, n_cells, 0,
-                                    32);
+    cudaError_t status = cub::DeviceRadixSort::SortPairs(
+        nullptr, bytes, du, du, di, di, n_cells, 0, 32);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("cub sort temp query failed: ") +
+                                 cudaGetErrorString(status));
+    }
     return bytes;
 }
 
@@ -95,8 +101,10 @@ static inline void colsum_dispatch(int algo, cublasHandle_t handle, const T* A,
             break;
         }
         default:  // COLSUM_GEMM
-            cublas_gemv<T>(handle, CUBLAS_OP_N, cols, rows, &one, A, cols,
-                           ones_vec, 1, &zero, out, 1);
+            cublas_check_status(
+                cublas_gemv<T>(handle, CUBLAS_OP_N, cols, rows, &one, A, cols,
+                               ones_vec, 1, &zero, out, 1),
+                "cublas_gemv(colsum)");
             break;
     }
 }
@@ -121,9 +129,9 @@ static inline void scatter_add_to_O(const T* R_buf, const int* cats_in,
     } else {
         size_t N = (size_t)current_bs * n_clusters;
         scatter_add_kernel<T>
-            <<<(int)((N + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-               stream>>>(R_buf, cats_in, (size_t)current_bs, (size_t)n_clusters,
-                         (size_t)switcher, O);
+            <<<grid_1d((long long)N, n_sm), BLOCK_DIM_1D, 0, stream>>>(
+                R_buf, cats_in, (size_t)current_bs, (size_t)n_clusters,
+                (size_t)switcher, O);
         CUDA_CHECK_LAST_ERROR(scatter_add_kernel);
     }
 }
@@ -172,6 +180,7 @@ struct ClusteringArgs {
     unsigned int seed;
     bool stabilized;
     cudaStream_t stream;
+    cublasHandle_t handle;
 };
 
 // ---------- Standalone objective computation ----------
@@ -194,7 +203,7 @@ static T compute_objective_impl(const T* R, const T* similarities, const T* O,
     {
         size_t n = (size_t)n_cells * n_clusters;
         kmeans_err_kernel<T>
-            <<<grid_1d((int)n, n_sm), BLOCK_DIM_1D, 0, stream>>>(
+            <<<grid_1d((long long)n, n_sm), BLOCK_DIM_1D, 0, stream>>>(
                 R, similarities, n, obj_scalar);
         CUDA_CHECK_LAST_ERROR(kmeans_err_kernel);
     }
@@ -233,9 +242,8 @@ template <typename T>
 static void clustering_loop_impl(const ClusteringArgs<T>& a) {
     size_t cub_temp_bytes = get_cub_sort_temp_bytes(a.n_cells);
 
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-    cublasSetStream(handle, a.stream);
+    cublasHandle_t handle = a.handle;
+    cublas_check_status(cublasSetStream(handle, a.stream), "cublasSetStream");
 
     T term = T(-2) / a.sigma;
     T one = T(1), zero = T(0);
@@ -261,9 +269,11 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
 
     for (int iter = 0; iter < a.max_iter; iter++) {
         // ---- Centroids: Y = R^T @ Z_norm, then L2-normalize ----
-        cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, a.n_pcs, a.n_clusters,
-                       a.n_cells, &one, a.Z_norm, a.n_pcs, a.R, a.n_clusters,
-                       &zero, a.Y, a.n_pcs);
+        cublas_check_status(
+            cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, a.n_pcs,
+                           a.n_clusters, a.n_cells, &one, a.Z_norm, a.n_pcs,
+                           a.R, a.n_clusters, &zero, a.Y, a.n_pcs),
+            "cublas_gemm(centroids)");
 
         l2_row_normalize_kernel<T>
             <<<a.n_clusters, warp_aligned_bdim(a.n_pcs), 0, a.stream>>>(
@@ -271,9 +281,12 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
         CUDA_CHECK_LAST_ERROR(l2_row_normalize_kernel);
 
         // ---- Similarities: Z_norm @ Y_norm^T ----
-        cublas_gemm<T>(handle, CUBLAS_OP_T, CUBLAS_OP_N, a.n_clusters,
-                       a.n_cells, a.n_pcs, &one, a.Y_norm, a.n_pcs, a.Z_norm,
-                       a.n_pcs, &zero, a.similarities, a.n_clusters);
+        cublas_check_status(
+            cublas_gemm<T>(handle, CUBLAS_OP_T, CUBLAS_OP_N, a.n_clusters,
+                           a.n_cells, a.n_pcs, &one, a.Y_norm, a.n_pcs,
+                           a.Z_norm, a.n_pcs, &zero, a.similarities,
+                           a.n_clusters),
+            "cublas_gemm(similarities)");
 
         // ---- Shuffle: random permutation via PCG hash + radix sort ----
         pcg_hash_kernel<<<grid_1d(a.n_cells, n_sm), BLOCK_DIM_1D, 0,
@@ -283,9 +296,13 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
             a.idx_list, a.n_cells);
         CUDA_CHECK_LAST_ERROR(iota_kernel);
 
-        cub::DeviceRadixSort::SortPairs(
+        cudaError_t sort_status = cub::DeviceRadixSort::SortPairs(
             a.cub_temp, cub_temp_bytes, a.sort_keys, a.sort_keys_alt,
             a.idx_list, a.idx_list_alt, a.n_cells, 0, 32, a.stream);
+        if (sort_status != cudaSuccess) {
+            throw std::runtime_error(std::string("cub radix sort failed: ") +
+                                     cudaGetErrorString(sort_status));
+        }
 
         // ---- Block loop: update R in mini-batches ----
         for (int pos = 0; pos < a.n_cells; pos += a.block_size) {
@@ -293,7 +310,7 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
             const int* block_idx = a.idx_list_alt + pos;
 
             // Gather block: R[idx] -> R_out_buffer, cats[idx] -> cats_in
-            gather_rows_kernel<T><<<grid_1d(bs * a.n_clusters, n_sm),
+            gather_rows_kernel<T><<<grid_1d((long long)bs * a.n_clusters, n_sm),
                                     BLOCK_DIM_1D, 0, a.stream>>>(
                 a.R, block_idx, a.R_out_buffer, bs, a.n_clusters);
             CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
@@ -336,9 +353,10 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
 
             // Write back and add new contribution: O += scatter(R_out), E +=
             // Pr_b @ R_out_sum
-            scatter_rows_kernel<T><<<grid_1d(bs * a.n_clusters, n_sm),
-                                     BLOCK_DIM_1D, 0, a.stream>>>(
-                a.R_out_buffer, block_idx, a.R, bs, a.n_clusters);
+            scatter_rows_kernel<T>
+                <<<grid_1d((long long)bs * a.n_clusters, n_sm), BLOCK_DIM_1D, 0,
+                   a.stream>>>(a.R_out_buffer, block_idx, a.R, bs,
+                               a.n_clusters);
             CUDA_CHECK_LAST_ERROR(scatter_rows_kernel);
             colsum_dispatch<T>(a.colsum_algo, handle, a.R_out_buffer,
                                a.R_out_sum, a.ones_vec, bs, a.n_clusters, n_sm,
@@ -372,7 +390,6 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
     T final_obj = objectives.empty() ? T(0) : objectives.back();
     cudaMemcpyAsync(a.last_obj, &final_obj, sizeof(T), cudaMemcpyHostToDevice,
                     a.stream);
-    cublasDestroy(handle);
 }
 
 // ---------- Nanobind bindings ----------
@@ -400,7 +417,7 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<T, Device> last_obj, int n_cells, int n_pcs,
            int n_clusters, int n_batches, int block_size, int colsum_algo,
            double sigma, double tol, int max_iter, unsigned int seed,
-           bool stabilized, std::uintptr_t stream) {
+           bool stabilized, std::uintptr_t stream, std::uintptr_t handle) {
             ClusteringArgs<T> a{
                 Z_norm.data(),
                 R.data(),
@@ -437,6 +454,7 @@ static void register_clustering_loop(nb::module_& m) {
                 seed,
                 stabilized,
                 (cudaStream_t)stream,
+                (cublasHandle_t)handle,
             };
             clustering_loop_impl(a);
         },
@@ -447,7 +465,7 @@ static void register_clustering_loop(nb::module_& m) {
         "obj_scalar"_a, "ones_vec"_a, "last_obj"_a, "n_cells"_a, "n_pcs"_a,
         "n_clusters"_a, "n_batches"_a, "block_size"_a, "colsum_algo"_a,
         "sigma"_a, "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a,
-        "stream"_a = 0);
+        "stream"_a = 0, "handle"_a);
 }
 
 template <typename T, typename Device>

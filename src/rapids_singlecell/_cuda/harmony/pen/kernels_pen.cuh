@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <type_traits>
 
 // ---- Penalty kernel ----
 // Stabilized=false: penalty = pow((E+1) / (O+1), theta)       [Harmony1]
@@ -18,10 +17,7 @@ __global__ void penalty_kernel(const T* __restrict__ E, const T* __restrict__ O,
     T denom = Stabilized ? (O[i] + E[i] + T(1)) : (O[i] + T(1));
     T ratio = (E[i] + T(1)) / denom;
     T th = theta[batch];
-    if constexpr (std::is_same<T, float>::value)
-        penalty[i] = powf(ratio, th);
-    else
-        penalty[i] = pow(ratio, th);
+    penalty[i] = pow(ratio, th);
 }
 
 // ---- Fused penalty + normalize ----
@@ -45,11 +41,7 @@ __global__ void fused_pen_norm_kernel(const T* __restrict__ similarities,
     T local_sum = T(0);
     for (int col = threadIdx.x; col < n_cols; col += blockDim.x) {
         T sim = similarities[sim_row * n_cols + col];
-        T val;
-        if constexpr (std::is_same<T, float>::value)
-            val = expf(term * (T(1) - sim));
-        else
-            val = exp(term * (T(1) - sim));
+        T val = exp(term * (T(1) - sim));
         val *= penalty[(size_t)cat * n_cols + col];
         R_out[(size_t)row * n_cols + col] = val;
         local_sum += val;

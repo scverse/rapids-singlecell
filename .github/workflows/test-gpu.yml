@@ -17,9 +17,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: flying-sheep/check@v1
-        with:
-          success: ${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+      - name: Require push to main or 'run-gpu-ci' label
+        if: ${{ !(github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-gpu-ci')) }}
+        run: |
+          echo "::error::GPU CI requires a push to main or the 'run-gpu-ci' label on the PR."
+          exit 1
 
   get-envs:
     runs-on: ubuntu-latest
@@ -32,7 +34,7 @@ jobs:
         with:
           filter: blob:none
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: false
       - id: get-envs
@@ -68,6 +70,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
     env:
@@ -79,7 +82,7 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           python-version: ${{ matrix.env.python }}
 
@@ -130,6 +133,7 @@ jobs:
     continue-on-error: true  # Prerelease failures don't fail the workflow
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
     env:
@@ -141,7 +145,7 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           python-version: ${{ matrix.env.python }}
 
@@ -166,11 +170,13 @@ jobs:
     name: Remove 'run-gpu-ci' Label
     runs-on: ubuntu-latest
     if: ${{ always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+    permissions:
+      pull-requests: write
     steps:
-      - uses: actions-ecosystem/action-remove-labels@v1
-        with:
-          labels: 'run-gpu-ci'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove 'run-gpu-ci' label
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-gpu-ci" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   stable-dev-green:
     name: CI-Pass
@@ -180,9 +186,12 @@ jobs:
       - test-stable-dev
     runs-on: ubuntu-latest
     steps:
-      - uses: re-actors/alls-green@release/v1
-        with:
-          jobs: ${{ toJSON(needs) }}
+      - name: Check required jobs succeeded
+        run: |
+          if [[ "${{ needs.get-envs.result }}" != "success" || "${{ needs.test-stable-dev.result }}" != "success" ]]; then
+            echo "::error::Required jobs did not succeed (get-envs=${{ needs.get-envs.result }}, test-stable-dev=${{ needs.test-stable-dev.result }})."
+            exit 1
+          fi
 
   all-green:
     name: All Tests Green
@@ -193,7 +202,9 @@ jobs:
       - test-prerelease
     runs-on: ubuntu-latest
     steps:
-      - uses: re-actors/alls-green@release/v1
-        with:
-          allowed-failures: test-prerelease
-          jobs: ${{ toJSON(needs) }}
+      - name: Check required jobs succeeded (test-prerelease allowed to fail)
+        run: |
+          if [[ "${{ needs.get-envs.result }}" != "success" || "${{ needs.test-stable-dev.result }}" != "success" ]]; then
+            echo "::error::Required jobs did not succeed (get-envs=${{ needs.get-envs.result }}, test-stable-dev=${{ needs.test-stable-dev.result }})."
+            exit 1
+          fi

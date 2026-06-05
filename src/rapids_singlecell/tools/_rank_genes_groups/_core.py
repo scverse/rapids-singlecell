@@ -167,16 +167,28 @@ class _RankGenes:
         self._compute_stats_in_chunks = False
 
         agg = Aggregate(groupby=self.labels.cat, data=self.X)
-        result = agg.count_mean_var(dof=1)
+        # Only sum and sq_sum are needed (means/vars are derived locally below);
+        # count_nonzero is only needed when comp_pts is requested.
+        funcs = {"sum", "sq_sum"}
+        if self.comp_pts:
+            funcs.add("count_nonzero")
+        result = agg.count_mean_var(funcs, dof=1)
 
         # Map Aggregate category order → selected groups order
         cat_names = list(self.labels.cat.categories)
         cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
         order = [cat_to_idx[str(name)] for name in self.groups_order]
 
+        # Aggregate returns stats per ALL categories. Slice to selected groups
+        # for per-group means/vars; keep the all-category arrays for "rest"
+        # stats so the totals stay correct when ``groups`` is a strict subset.
+        sums_all = result["sum"]
+        sq_sums_all = result["sq_sum"]
+        nnz_all = result["count_nonzero"] if self.comp_pts else None
+
         n = cp.asarray(self.group_sizes, dtype=cp.float64)[:, None]
-        sums = result["sum"][order]
-        sq_sums = result["sq_sum"][order]
+        sums = sums_all[order]
+        sq_sums = sq_sums_all[order]
 
         # Compute means and variances from raw sums (all on GPU)
         means = sums / n
@@ -184,23 +196,28 @@ class _RankGenes:
         vars_ = cp.maximum(group_ss / cp.maximum(n - 1, 1), 0)
 
         if self.comp_pts:
-            pts = result["count_nonzero"][order].astype(cp.float64) / n
+            pts = nnz_all[order].astype(cp.float64) / n
         else:
             pts = None
 
-        # Compute rest statistics if reference='rest'
+        # Compute rest statistics if reference='rest' — "rest" means every
+        # cell in ``groupby`` not in this group, including cells in
+        # categories that weren't selected via ``groups=``.
         if self.ireference is None:
-            n_rest = n.sum() - n
-            means_rest = (sums.sum(axis=0) - sums) / n_rest
-            rest_ss = (sq_sums.sum(axis=0) - sq_sums) - n_rest * means_rest**2
+            n_total = agg.n_cells.sum()
+            n_rest = n_total - n
+            means_rest = (sums_all.sum(axis=0) - sums) / n_rest
+            rest_ss = (sq_sums_all.sum(axis=0) - sq_sums) - n_rest * means_rest**2
             vars_rest = cp.maximum(rest_ss / cp.maximum(n_rest - 1, 1), 0)
 
             self.means_rest = cp.asnumpy(means_rest)
             self.vars_rest = cp.asnumpy(vars_rest)
 
             if self.comp_pts:
-                total_count = (pts * n).sum(axis=0)
-                self.pts_rest = cp.asnumpy((total_count - pts * n) / n_rest)
+                nnz_total = nnz_all.sum(axis=0)
+                self.pts_rest = cp.asnumpy(
+                    (nnz_total - nnz_all[order]).astype(cp.float64) / n_rest
+                )
             else:
                 self.pts_rest = None
         else:

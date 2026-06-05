@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+static constexpr int COLSUM_ATOMIC_TILE_COLS = 32;
+
 template <typename T>
 __global__ void colsum_kernel(const T* __restrict__ A, T* __restrict__ out,
                               size_t rows, size_t cols) {
@@ -24,6 +26,7 @@ __global__ void colsum_kernel(const T* __restrict__ A, T* __restrict__ out,
                 val += __shfl_down_sync(0xffffffff, val, off);
             if (threadIdx.x == 0) out[col] = val;
         }
+        __syncthreads();
     }
 }
 
@@ -34,15 +37,16 @@ template <typename T>
 __global__ void colsum_atomic_kernel(const T* __restrict__ A,
                                      T* __restrict__ out, size_t rows,
                                      size_t cols, size_t rows_per_tile) {
-    __shared__ T col_sums[32];
+    __shared__ T col_sums[COLSUM_ATOMIC_TILE_COLS];
 
-    size_t col = blockIdx.x * 32 + threadIdx.y;
+    size_t col = blockIdx.x * COLSUM_ATOMIC_TILE_COLS + threadIdx.y;
     size_t start_row = blockIdx.y * rows_per_tile;
     size_t end_row = start_row + rows_per_tile;
     if (end_row > rows) end_row = rows;
 
     // Initialize shared memory
-    if (threadIdx.x < 32) col_sums[threadIdx.x] = (T)0;
+    if (threadIdx.y == 0 && threadIdx.x < COLSUM_ATOMIC_TILE_COLS)
+        col_sums[threadIdx.x] = (T)0;
     __syncthreads();
 
     // Each thread accumulates multiple rows
@@ -60,13 +64,13 @@ __global__ void colsum_atomic_kernel(const T* __restrict__ A,
         acc += __shfl_down_sync(0xffffffff, acc, off);
 
     // Lane 0 of each warp accumulates into shared memory
-    if (threadIdx.x == 0 && threadIdx.y < 32)
+    if (threadIdx.x == 0 && threadIdx.y < COLSUM_ATOMIC_TILE_COLS)
         atomicAdd(&col_sums[threadIdx.y], acc);
     __syncthreads();
 
     // First warp writes to global memory (one atomic per column)
-    if (threadIdx.x == 0 && threadIdx.y < 32) {
-        size_t out_col = blockIdx.x * 32 + threadIdx.y;
+    if (threadIdx.x == 0 && threadIdx.y < COLSUM_ATOMIC_TILE_COLS) {
+        size_t out_col = blockIdx.x * COLSUM_ATOMIC_TILE_COLS + threadIdx.y;
         if (out_col < cols && col_sums[threadIdx.y] != (T)0)
             atomicAdd(&out[out_col], col_sums[threadIdx.y]);
     }

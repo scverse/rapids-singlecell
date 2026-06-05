@@ -2,9 +2,9 @@
 
 #include <cuda_runtime.h>
 
-template <typename T, bool C_ORDER>
-__global__ void sparse2dense_kernel(const int* __restrict__ indptr,
-                                    const int* __restrict__ index,
+template <typename T, typename IdxT, bool C_ORDER>
+__global__ void sparse2dense_kernel(const IdxT* __restrict__ indptr,
+                                    const IdxT* __restrict__ index,
                                     const T* __restrict__ data,
                                     T* __restrict__ out, long long major,
                                     long long minor) {
@@ -20,7 +20,7 @@ __global__ void sparse2dense_kernel(const int* __restrict__ indptr,
         for (long long col = (long long)blockIdx.y * blockDim.y + threadIdx.y;
              col < nnz_row; col += stride_y) {
             long long idx = (long long)index[start + col];
-            if (idx >= minor) {
+            if (idx < 0 || idx >= minor) {
                 continue;
             }
             long long res_index;

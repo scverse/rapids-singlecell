@@ -90,6 +90,46 @@ def test_normalize_pearson_residuals_values(sparsity_func, dtype, theta, clip):
         assert np.min(output_X) >= -clip
 
 
+@pytest.mark.parametrize(
+    "sparsity_func", [csr_matrix, csc_matrix], ids=lambda x: x.__name__
+)
+@pytest.mark.parametrize("theta", [100.0, np.inf])
+def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
+    """Regression test: float64 precision of the sparse Pearson-residual kernels.
+
+    ``sparse_norm_res_csr_kernel`` / ``sparse_norm_res_csc_kernel`` (in
+    ``_cuda/pr/kernels_pr.cuh``) previously divided by the single-precision
+    intrinsic ``sqrtf``. Because the kernels are templated on the element
+    type, a ``float64`` instantiation silently narrowed the variance term
+    to ``float32``, capping accuracy at ~7 significant digits regardless of
+    the requested dtype. The ``rtol``/``atol`` of 1e-9 below is tight enough
+    to fail on a single-precision result and pass on a genuine float64 one.
+    """
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(0.3, size=(300, 200)).astype(np.float64)
+    # ensure every gene and cell has a nonzero total so mu > 0 everywhere
+    counts[0, :] += 1
+    counts[:, 0] += 1
+    X = cp.asarray(counts)
+
+    # analytic float64 reference residuals (no clipping)
+    ns = cp.sum(X, axis=1)
+    ps = cp.sum(X, axis=0) / cp.sum(X)
+    mu = cp.outer(ns, ps)
+    if np.isinf(theta):
+        reference = (X - mu) / cp.sqrt(mu)
+    else:
+        reference = (X - mu) / cp.sqrt(mu + mu**2 / theta)
+
+    cudata = AnnData(X=sparsity_func(X, dtype=np.float64))
+    output = rsc.pp.normalize_pearson_residuals(
+        cudata, theta=theta, clip=np.inf, inplace=False
+    )
+
+    # the buggy `sqrtf` path is only ~1e-7 accurate; 1e-9 cleanly separates it
+    cp.testing.assert_allclose(output, reference, rtol=1e-9, atol=1e-9)
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.parametrize("base", [None, 2, 10])

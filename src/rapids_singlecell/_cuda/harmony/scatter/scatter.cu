@@ -18,7 +18,7 @@ static inline void launch_scatter_add(const T* v, const int* cats,
                                       cudaStream_t stream) {
     dim3 block(BLOCK_DIM_1D);
     size_t N = n_cells * n_pcs;
-    dim3 grid((unsigned)((N + block.x - 1) / block.x));
+    dim3 grid(strided_grid((long long)N, BLOCK_DIM_1D));
     scatter_add_kernel<T>
         <<<grid, block, 0, stream>>>(v, cats, n_cells, n_pcs, switcher, a);
     CUDA_CHECK_LAST_ERROR(scatter_add_kernel);
@@ -79,8 +79,8 @@ static inline void launch_gather_rows(const T* src, const int* idx, T* dst,
                                       cudaStream_t stream) {
     size_t n = (size_t)n_rows * n_cols;
     gather_rows_kernel<T>
-        <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-           stream>>>(src, idx, dst, n_rows, n_cols);
+        <<<strided_grid((long long)n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
+            src, idx, dst, n_rows, n_cols);
     CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
 }
 
@@ -90,204 +90,139 @@ static inline void launch_scatter_rows(const T* src, const int* idx, T* dst,
                                        cudaStream_t stream) {
     size_t n = (size_t)n_rows * n_cols;
     scatter_rows_kernel<T>
-        <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-           stream>>>(src, idx, dst, n_rows, n_cols);
+        <<<strided_grid((long long)n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
+            src, idx, dst, n_rows, n_cols);
     CUDA_CHECK_LAST_ERROR(scatter_rows_kernel);
 }
 
 static inline void launch_gather_int(const int* src, const int* idx, int* dst,
                                      int n, cudaStream_t stream) {
-    gather_int_kernel<<<(n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D, BLOCK_DIM_1D, 0,
+    gather_int_kernel<<<strided_grid(n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
                         stream>>>(src, idx, dst, n);
     CUDA_CHECK_LAST_ERROR(gather_int_kernel);
 }
 
+template <typename T, typename Device>
+void def_scatter_add(nb::module_& m) {
+    m.def(
+        "scatter_add",
+        [](gpu_array_c<const T, Device> v, gpu_array_c<const int, Device> cats,
+           size_t n_cells, size_t n_pcs, size_t switcher,
+           gpu_array_c<T, Device> a, std::uintptr_t stream) {
+            launch_scatter_add<T>(v.data(), cats.data(), n_cells, n_pcs,
+                                  switcher, a.data(), (cudaStream_t)stream);
+        },
+        "v"_a, nb::kw_only(), "cats"_a, "n_cells"_a, "n_pcs"_a, "switcher"_a,
+        "a"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_aggregated_matrix(nb::module_& m) {
+    m.def(
+        "aggregated_matrix",
+        [](gpu_array_c<T, Device> aggregated_matrix,
+           gpu_array_c<const T, Device> sum, T top_corner, int n_batches,
+           std::uintptr_t stream) {
+            launch_aggregated_matrix<T>(aggregated_matrix.data(), sum.data(),
+                                        top_corner, n_batches,
+                                        (cudaStream_t)stream);
+        },
+        "aggregated_matrix"_a, nb::kw_only(), "sum"_a, "top_corner"_a,
+        "n_batches"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_scatter_add_shared(nb::module_& m) {
+    m.def(
+        "scatter_add_shared",
+        [](gpu_array_c<const T, Device> v, gpu_array_c<const int, Device> cats,
+           int n_cells, int n_pcs, int n_batches, int switcher,
+           gpu_array_c<T, Device> a, int n_blocks, std::uintptr_t stream) {
+            launch_scatter_add_shared<T>(v.data(), cats.data(), n_cells, n_pcs,
+                                         n_batches, switcher, a.data(),
+                                         n_blocks, (cudaStream_t)stream);
+        },
+        "v"_a, nb::kw_only(), "cats"_a, "n_cells"_a, "n_pcs"_a, "n_batches"_a,
+        "switcher"_a, "a"_a, "n_blocks"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_scatter_add_cat0(nb::module_& m) {
+    m.def(
+        "scatter_add_cat0",
+        [](gpu_array_c<const T, Device> v, int n_cells, int n_pcs,
+           gpu_array_c<T, Device> a, gpu_array_c<const T, Device> bias,
+           std::uintptr_t stream) {
+            launch_scatter_add_cat0<T>(v.data(), n_cells, n_pcs, a.data(),
+                                       bias.data(), (cudaStream_t)stream);
+        },
+        "v"_a, nb::kw_only(), "n_cells"_a, "n_pcs"_a, "a"_a, "bias"_a,
+        "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_scatter_add_block(nb::module_& m) {
+    m.def(
+        "scatter_add_block",
+        [](gpu_array_c<const T, Device> v,
+           gpu_array_c<const int, Device> cat_offsets,
+           gpu_array_c<const int, Device> cell_indices, int n_cells, int n_pcs,
+           int n_batches, gpu_array_c<T, Device> a,
+           gpu_array_c<const T, Device> bias, std::uintptr_t stream) {
+            launch_scatter_add_block<T>(
+                v.data(), cat_offsets.data(), cell_indices.data(), n_cells,
+                n_pcs, n_batches, a.data(), bias.data(), (cudaStream_t)stream);
+        },
+        "v"_a, nb::kw_only(), "cat_offsets"_a, "cell_indices"_a, "n_cells"_a,
+        "n_pcs"_a, "n_batches"_a, "a"_a, "bias"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_gather_rows(nb::module_& m) {
+    m.def(
+        "gather_rows",
+        [](gpu_array_c<const T, Device> src, gpu_array_c<const int, Device> idx,
+           gpu_array_c<T, Device> dst, int n_rows, int n_cols,
+           std::uintptr_t stream) {
+            launch_gather_rows<T>(src.data(), idx.data(), dst.data(), n_rows,
+                                  n_cols, (cudaStream_t)stream);
+        },
+        "src"_a, nb::kw_only(), "idx"_a, "dst"_a, "n_rows"_a, "n_cols"_a,
+        "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_scatter_rows(nb::module_& m) {
+    m.def(
+        "scatter_rows",
+        [](gpu_array_c<const T, Device> src, gpu_array_c<const int, Device> idx,
+           gpu_array_c<T, Device> dst, int n_rows, int n_cols,
+           std::uintptr_t stream) {
+            launch_scatter_rows<T>(src.data(), idx.data(), dst.data(), n_rows,
+                                   n_cols, (cudaStream_t)stream);
+        },
+        "src"_a, nb::kw_only(), "idx"_a, "dst"_a, "n_rows"_a, "n_cols"_a,
+        "stream"_a = 0);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
-    // scatter_add - float32
-    m.def(
-        "scatter_add",
-        [](gpu_array_c<const float, Device> v,
-           gpu_array_c<const int, Device> cats, size_t n_cells, size_t n_pcs,
-           size_t switcher, gpu_array_c<float, Device> a,
-           std::uintptr_t stream) {
-            launch_scatter_add<float>(v.data(), cats.data(), n_cells, n_pcs,
-                                      switcher, a.data(), (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "cats"_a, "n_cells"_a, "n_pcs"_a, "switcher"_a,
-        "a"_a, "stream"_a = 0);
+    def_scatter_add<float, Device>(m);
+    def_scatter_add<double, Device>(m);
+    def_aggregated_matrix<float, Device>(m);
+    def_aggregated_matrix<double, Device>(m);
+    def_scatter_add_shared<float, Device>(m);
+    def_scatter_add_shared<double, Device>(m);
+    def_scatter_add_cat0<float, Device>(m);
+    def_scatter_add_cat0<double, Device>(m);
+    def_scatter_add_block<float, Device>(m);
+    def_scatter_add_block<double, Device>(m);
+    def_gather_rows<float, Device>(m);
+    def_gather_rows<double, Device>(m);
+    def_scatter_rows<float, Device>(m);
+    def_scatter_rows<double, Device>(m);
 
-    // scatter_add - float64
-    m.def(
-        "scatter_add",
-        [](gpu_array_c<const double, Device> v,
-           gpu_array_c<const int, Device> cats, size_t n_cells, size_t n_pcs,
-           size_t switcher, gpu_array_c<double, Device> a,
-           std::uintptr_t stream) {
-            launch_scatter_add<double>(v.data(), cats.data(), n_cells, n_pcs,
-                                       switcher, a.data(),
-                                       (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "cats"_a, "n_cells"_a, "n_pcs"_a, "switcher"_a,
-        "a"_a, "stream"_a = 0);
-
-    // aggregated_matrix - float32
-    m.def(
-        "aggregated_matrix",
-        [](gpu_array_c<float, Device> aggregated_matrix,
-           gpu_array_c<const float, Device> sum, float top_corner,
-           int n_batches, std::uintptr_t stream) {
-            launch_aggregated_matrix<float>(aggregated_matrix.data(),
-                                            sum.data(), top_corner, n_batches,
-                                            (cudaStream_t)stream);
-        },
-        "aggregated_matrix"_a, nb::kw_only(), "sum"_a, "top_corner"_a,
-        "n_batches"_a, "stream"_a = 0);
-
-    // aggregated_matrix - float64
-    m.def(
-        "aggregated_matrix",
-        [](gpu_array_c<double, Device> aggregated_matrix,
-           gpu_array_c<const double, Device> sum, double top_corner,
-           int n_batches, std::uintptr_t stream) {
-            launch_aggregated_matrix<double>(aggregated_matrix.data(),
-                                             sum.data(), top_corner, n_batches,
-                                             (cudaStream_t)stream);
-        },
-        "aggregated_matrix"_a, nb::kw_only(), "sum"_a, "top_corner"_a,
-        "n_batches"_a, "stream"_a = 0);
-
-    // scatter_add_shared - float32
-    m.def(
-        "scatter_add_shared",
-        [](gpu_array_c<const float, Device> v,
-           gpu_array_c<const int, Device> cats, int n_cells, int n_pcs,
-           int n_batches, int switcher, gpu_array_c<float, Device> a,
-           int n_blocks, std::uintptr_t stream) {
-            launch_scatter_add_shared<float>(
-                v.data(), cats.data(), n_cells, n_pcs, n_batches, switcher,
-                a.data(), n_blocks, (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "cats"_a, "n_cells"_a, "n_pcs"_a, "n_batches"_a,
-        "switcher"_a, "a"_a, "n_blocks"_a, "stream"_a = 0);
-
-    // scatter_add_shared - float64
-    m.def(
-        "scatter_add_shared",
-        [](gpu_array_c<const double, Device> v,
-           gpu_array_c<const int, Device> cats, int n_cells, int n_pcs,
-           int n_batches, int switcher, gpu_array_c<double, Device> a,
-           int n_blocks, std::uintptr_t stream) {
-            launch_scatter_add_shared<double>(
-                v.data(), cats.data(), n_cells, n_pcs, n_batches, switcher,
-                a.data(), n_blocks, (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "cats"_a, "n_cells"_a, "n_pcs"_a, "n_batches"_a,
-        "switcher"_a, "a"_a, "n_blocks"_a, "stream"_a = 0);
-
-    // scatter_add_cat0 - float32
-    m.def(
-        "scatter_add_cat0",
-        [](gpu_array_c<const float, Device> v, int n_cells, int n_pcs,
-           gpu_array_c<float, Device> a, gpu_array_c<const float, Device> bias,
-           std::uintptr_t stream) {
-            launch_scatter_add_cat0<float>(v.data(), n_cells, n_pcs, a.data(),
-                                           bias.data(), (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "n_cells"_a, "n_pcs"_a, "a"_a, "bias"_a,
-        "stream"_a = 0);
-
-    // scatter_add_cat0 - float64
-    m.def(
-        "scatter_add_cat0",
-        [](gpu_array_c<const double, Device> v, int n_cells, int n_pcs,
-           gpu_array_c<double, Device> a,
-           gpu_array_c<const double, Device> bias, std::uintptr_t stream) {
-            launch_scatter_add_cat0<double>(v.data(), n_cells, n_pcs, a.data(),
-                                            bias.data(), (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "n_cells"_a, "n_pcs"_a, "a"_a, "bias"_a,
-        "stream"_a = 0);
-
-    // scatter_add_block - float32
-    m.def(
-        "scatter_add_block",
-        [](gpu_array_c<const float, Device> v,
-           gpu_array_c<const int, Device> cat_offsets,
-           gpu_array_c<const int, Device> cell_indices, int n_cells, int n_pcs,
-           int n_batches, gpu_array_c<float, Device> a,
-           gpu_array_c<const float, Device> bias, std::uintptr_t stream) {
-            launch_scatter_add_block<float>(
-                v.data(), cat_offsets.data(), cell_indices.data(), n_cells,
-                n_pcs, n_batches, a.data(), bias.data(), (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "cat_offsets"_a, "cell_indices"_a, "n_cells"_a,
-        "n_pcs"_a, "n_batches"_a, "a"_a, "bias"_a, "stream"_a = 0);
-
-    // scatter_add_block - float64
-    m.def(
-        "scatter_add_block",
-        [](gpu_array_c<const double, Device> v,
-           gpu_array_c<const int, Device> cat_offsets,
-           gpu_array_c<const int, Device> cell_indices, int n_cells, int n_pcs,
-           int n_batches, gpu_array_c<double, Device> a,
-           gpu_array_c<const double, Device> bias, std::uintptr_t stream) {
-            launch_scatter_add_block<double>(
-                v.data(), cat_offsets.data(), cell_indices.data(), n_cells,
-                n_pcs, n_batches, a.data(), bias.data(), (cudaStream_t)stream);
-        },
-        "v"_a, nb::kw_only(), "cat_offsets"_a, "cell_indices"_a, "n_cells"_a,
-        "n_pcs"_a, "n_batches"_a, "a"_a, "bias"_a, "stream"_a = 0);
-
-    // gather_rows - float32
-    m.def(
-        "gather_rows",
-        [](gpu_array_c<const float, Device> src,
-           gpu_array_c<const int, Device> idx, gpu_array_c<float, Device> dst,
-           int n_rows, int n_cols, std::uintptr_t stream) {
-            launch_gather_rows<float>(src.data(), idx.data(), dst.data(),
-                                      n_rows, n_cols, (cudaStream_t)stream);
-        },
-        "src"_a, nb::kw_only(), "idx"_a, "dst"_a, "n_rows"_a, "n_cols"_a,
-        "stream"_a = 0);
-
-    // gather_rows - float64
-    m.def(
-        "gather_rows",
-        [](gpu_array_c<const double, Device> src,
-           gpu_array_c<const int, Device> idx, gpu_array_c<double, Device> dst,
-           int n_rows, int n_cols, std::uintptr_t stream) {
-            launch_gather_rows<double>(src.data(), idx.data(), dst.data(),
-                                       n_rows, n_cols, (cudaStream_t)stream);
-        },
-        "src"_a, nb::kw_only(), "idx"_a, "dst"_a, "n_rows"_a, "n_cols"_a,
-        "stream"_a = 0);
-
-    // scatter_rows - float32
-    m.def(
-        "scatter_rows",
-        [](gpu_array_c<const float, Device> src,
-           gpu_array_c<const int, Device> idx, gpu_array_c<float, Device> dst,
-           int n_rows, int n_cols, std::uintptr_t stream) {
-            launch_scatter_rows<float>(src.data(), idx.data(), dst.data(),
-                                       n_rows, n_cols, (cudaStream_t)stream);
-        },
-        "src"_a, nb::kw_only(), "idx"_a, "dst"_a, "n_rows"_a, "n_cols"_a,
-        "stream"_a = 0);
-
-    // scatter_rows - float64
-    m.def(
-        "scatter_rows",
-        [](gpu_array_c<const double, Device> src,
-           gpu_array_c<const int, Device> idx, gpu_array_c<double, Device> dst,
-           int n_rows, int n_cols, std::uintptr_t stream) {
-            launch_scatter_rows<double>(src.data(), idx.data(), dst.data(),
-                                        n_rows, n_cols, (cudaStream_t)stream);
-        },
-        "src"_a, nb::kw_only(), "idx"_a, "dst"_a, "n_rows"_a, "n_cols"_a,
-        "stream"_a = 0);
-
-    // gather_int
+    // gather_int is not overloaded (int only)
     m.def(
         "gather_int",
         [](gpu_array_c<const int, Device> src,

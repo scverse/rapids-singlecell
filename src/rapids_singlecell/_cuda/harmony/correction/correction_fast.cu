@@ -27,7 +27,7 @@ static void correction_fast_impl(
     // workspace (per-cluster sized)
     T* Z, T* inv_mat, T* R_col, T* Phi_t_diag_R_X, T* W,
     // gmem workspace
-    T* g_factor, T* g_P_row0, cudaStream_t stream) {
+    T* g_factor, T* g_P_row0, cudaStream_t stream, cublasHandle_t handle) {
     int nb1 = n_batches + 1;
     int bdim = std::min(MAX_BLOCK_DIM,
                         std::max(WARP_SIZE, (n_batches + WARP_SIZE - 1) /
@@ -37,10 +37,7 @@ static void correction_fast_impl(
     cudaMemcpyAsync(Z, X, (size_t)n_cells * n_pcs * sizeof(T),
                     cudaMemcpyDeviceToDevice, stream);
 
-    // cuBLAS handle for GEMM/GEMV calls
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-    cublasSetStream(handle, stream);
+    cublas_check_status(cublasSetStream(handle, stream), "cublasSetStream");
 
     T one = T(1), zero = T(0);
 
@@ -53,8 +50,8 @@ static void correction_fast_impl(
 
         // R_col = R[:, k]
         gather_column_kernel<T>
-            <<<(n_cells + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D, BLOCK_DIM_1D, 0,
-               stream>>>(R, R_col, k, n_cells, n_clusters);
+            <<<strided_grid(n_cells, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
+                R, R_col, k, n_cells, n_clusters);
         CUDA_CHECK_LAST_ERROR(gather_column_kernel);
 
         // Zero Phi_t_diag_R_X
@@ -70,8 +67,10 @@ static void correction_fast_impl(
             CUDA_CHECK_LAST_ERROR(scatter_add_kernel_with_bias_cat0);
         } else {
             // cuBLAS GEMV: Phi_t_diag_R_X[0,:] = X^T @ R_col
-            cublas_gemv(handle, CUBLAS_OP_N, n_pcs, n_cells, &one, X, n_pcs,
-                        R_col, 1, &zero, Phi_t_diag_R_X, 1);
+            cublas_check_status(
+                cublas_gemv<T>(handle, CUBLAS_OP_N, n_pcs, n_cells, &one, X,
+                               n_pcs, R_col, 1, &zero, Phi_t_diag_R_X, 1),
+                "cublas_gemv(correction_fast row0)");
         }
 
         // Rows 1..n_batches: per-batch biased scatter-add
@@ -89,8 +88,11 @@ static void correction_fast_impl(
         // Row-major: C(nb1,n_pcs) = A(nb1,nb1) @ B(nb1,n_pcs)
         // cuBLAS col-major trick: C_cm(n_pcs,nb1) = B_cm(n_pcs,nb1) @
         // A_cm(nb1,nb1)
-        cublas_gemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n_pcs, nb1, nb1, &one,
-                    Phi_t_diag_R_X, n_pcs, inv_mat, nb1, &zero, W, n_pcs);
+        cublas_check_status(
+            cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_N, n_pcs, nb1, nb1,
+                           &one, Phi_t_diag_R_X, n_pcs, inv_mat, nb1, &zero, W,
+                           n_pcs),
+            "cublas_gemm(correction_fast W)");
 
         // W[0, :] = 0
         cudaMemsetAsync(W, 0, n_pcs * sizeof(T), stream);
@@ -99,13 +101,11 @@ static void correction_fast_impl(
         {
             long long n = (long long)n_cells * n_pcs;
             harmony_correction_kernel<T>
-                <<<(n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D, BLOCK_DIM_1D, 0,
-                   stream>>>(Z, W, cats, R_col, n_cells, n_pcs);
+                <<<strided_grid(n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
+                    Z, W, cats, R_col, n_cells, n_pcs);
             CUDA_CHECK_LAST_ERROR(harmony_correction_kernel);
         }
     }
-
-    cublasDestroy(handle);
 }
 
 // ---- nanobind registration ----
@@ -126,18 +126,18 @@ static void register_correction_fast(nb::module_& m) {
            gpu_array_c<T, Device> W,
            // gmem workspace
            gpu_array_c<T, Device> g_factor, gpu_array_c<T, Device> g_P_row0,
-           std::uintptr_t stream) {
+           std::uintptr_t stream, std::uintptr_t handle) {
             correction_fast_impl<T>(
                 X.data(), R.data(), O.data(), cats.data(), cat_offsets.data(),
                 cell_indices.data(), lambda_kb.data(), n_cells, n_pcs,
                 n_clusters, n_batches, Z.data(), inv_mat.data(), R_col.data(),
                 Phi_t_diag_R_X.data(), W.data(), g_factor.data(),
-                g_P_row0.data(), (cudaStream_t)stream);
+                g_P_row0.data(), (cudaStream_t)stream, (cublasHandle_t)handle);
         },
         "X"_a, nb::kw_only(), "R"_a, "O"_a, "cats"_a, "cat_offsets"_a,
         "cell_indices"_a, "lambda_kb"_a, "n_cells"_a, "n_pcs"_a, "n_clusters"_a,
         "n_batches"_a, "Z"_a, "inv_mat"_a, "R_col"_a, "Phi_t_diag_R_X"_a, "W"_a,
-        "g_factor"_a, "g_P_row0"_a, "stream"_a = 0);
+        "g_factor"_a, "g_P_row0"_a, "stream"_a = 0, "handle"_a);
 
     // Expose single-cluster inv_mat computation for testing
     m.def(

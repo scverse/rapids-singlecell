@@ -27,6 +27,8 @@
 
         ~Distance.pairwise
         ~Distance.onesided_distances
+        ~Distance.contrast_distances
+        ~Distance.create_contrasts
         ~Distance.bootstrap
 
     .. automethod:: __call__
@@ -35,6 +37,39 @@
         :no-index:
     .. automethod:: onesided_distances
         :no-index:
+    .. automethod:: contrast_distances
+        :no-index:
+    .. automethod:: create_contrasts
+        :no-index:
     .. automethod:: bootstrap
+        :no-index:
+```
+
+## GuideAssignment
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    GuideAssignment
+```
+
+```{eval-rst}
+.. autoclass:: GuideAssignment
+    :no-index:
+
+    .. rubric:: Methods
+
+    .. autosummary::
+
+        ~GuideAssignment.assign_by_threshold
+        ~GuideAssignment.assign_to_max_guide
+        ~GuideAssignment.assign_mixture_model
+
+    .. automethod:: assign_by_threshold
+        :no-index:
+    .. automethod:: assign_to_max_guide
+        :no-index:
+    .. automethod:: assign_mixture_model
         :no-index:
 ```

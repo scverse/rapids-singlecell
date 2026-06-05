@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from rapids_singlecell._utils import parse_device_ids
+from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
+from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -15,6 +16,14 @@ if TYPE_CHECKING:
 
 # Re-export for backwards compatibility
 __all__ = ["BaseMetric", "parse_device_ids"]
+
+
+def _is_sparse(x) -> bool:
+    """True for a host (scipy) or device (cupyx) sparse matrix."""
+    import cupyx.scipy.sparse as cpsp
+    import scipy.sparse as sp
+
+    return sp.issparse(x) or cpsp.issparse(x)
 
 
 class BaseMetric(ABC):
@@ -54,20 +63,152 @@ class BaseMetric(ABC):
         self.layer_key = layer_key
         self.obsm_key = obsm_key
 
-    def _get_embedding(self, adata: AnnData) -> np.ndarray | cp.ndarray:
-        """Get embedding from adata using layer_key or obsm_key.
+    def _get_embedding(self, adata: AnnData):
+        """Get the cell data from adata using ``layer_key`` or ``obsm_key``.
 
-        Returns the embedding in its original format (numpy or cupy).
-        Preserves the input dtype (float32 or float64) for precision control.
+        ``layer_key="X"`` selects ``adata.X``. Dense data is returned as-is
+        (numpy or cupy); sparse data (scipy or cupyx CSR/CSC) is returned
+        unchanged so the caller can route it through the sparse path. The
+        input dtype (float32 or float64) is preserved for precision control.
         """
-        if self.layer_key is not None:
+        if self.layer_key == "X":
+            data = adata.X
+        elif self.layer_key is not None:
             data = adata.layers[self.layer_key]
         else:
             data = adata.obsm[self.obsm_key]
 
         if isinstance(data, (cp.ndarray, np.ndarray)):
             return data
+        if _is_sparse(data):
+            return data
         return np.asarray(data)
+
+    def _subset_to_groups(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[str]]:
+        """Subset the embedding to ``groupby`` and build its category mapping.
+
+        Unused (zero-cell) categories are always dropped so they never become
+        empty groups. When ``needed_groups`` is given, only those cells are kept
+        and a requested group with no cells raises ``ValueError``.
+
+        Returns
+        -------
+        embedding
+            Cell embeddings (CuPy) for the kept cells; input dtype preserved.
+        cat_offsets, cell_indices
+            Category offsets and the cell indices grouped by category.
+        groups_list
+            Ordered group names matching the category indices.
+        """
+        embedding_raw = self._get_embedding(adata)
+        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(
+            adata, groupby, needed_groups
+        )
+        if mask is not None:
+            embedding = cp.asarray(embedding_raw[mask])
+        else:
+            embedding = cp.asarray(embedding_raw)
+        return embedding, cat_offsets, cell_indices, groups_list
+
+    def _subset_indices(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+    ) -> tuple[np.ndarray | None, cp.ndarray, cp.ndarray, list[str]]:
+        """Build the category mapping for ``groupby``, layout-independent.
+
+        Returns ``(mask, cat_offsets, cell_indices, groups_list)`` where ``mask``
+        is the boolean row selector (``None`` when all cells are kept). Unused
+        (zero-cell) categories are always dropped, and a requested group with no
+        cells raises ``ValueError``. The embedding materialization (dense or
+        sparse) is left to the caller so both layouts share this logic.
+        """
+        obs_col = adata.obs[groupby]
+        if needed_groups is not None:
+            mask = obs_col.isin(needed_groups).values
+            obs_col = obs_col[mask].cat.remove_unused_categories()
+        else:
+            mask = None
+            obs_col = obs_col.cat.remove_unused_categories()
+
+        groups_list = list(obs_col.cat.categories)
+        if needed_groups is not None:
+            missing = sorted(set(needed_groups) - set(groups_list))
+            if missing:
+                raise ValueError(f"No cells found for groups: {missing}")
+        group_labels = cp.array(obs_col.cat.codes.values, dtype=cp.int32)
+        cat_offsets, cell_indices = _create_category_index_mapping(
+            group_labels, len(groups_list)
+        )
+        return mask, cat_offsets, cell_indices, groups_list
+
+    @staticmethod
+    def _parse_contrasts(adata: AnnData, contrasts) -> tuple[str, list[str]]:
+        """Validate a contrasts DataFrame and decompose its columns.
+
+        Returns ``(groupby, split_by)`` per the layout enforced by
+        :meth:`Distance.validate_contrasts` — first column is the groupby,
+        ``"reference"`` is reserved, and every remaining column is a
+        stratification filter.
+        """
+        from rapids_singlecell.pertpy_gpu._distance import Distance
+
+        Distance.validate_contrasts(adata, contrasts)
+        groupby = contrasts.columns[0]
+        split_by = [c for c in contrasts.columns if c not in (groupby, "reference")]
+        return groupby, split_by
+
+    def _resolve_onesided_inputs(
+        self,
+        adata: AnnData,
+        groupby: str,
+        selected_group: str | Sequence[str],
+        groups: Sequence[str] | None,
+    ) -> tuple[list[str], bool, list[str] | None]:
+        """Validate `selected_group`, normalize to a list, compute `needed` groups.
+
+        Asserts that ``groupby`` is categorical and that every entry in
+        ``selected_group`` is one of its categories with at least one cell.
+
+        Returns
+        -------
+        selected_groups
+            ``selected_group`` normalized to ``list[str]``.
+        single_control
+            ``True`` if ``selected_group`` was a single string (caller uses
+            this to decide whether to return a Series or a DataFrame).
+        needed
+            Union of ``groups`` and ``selected_groups`` when ``groups`` was
+            given; ``None`` otherwise (= use all categories).
+        """
+        _assert_categorical_obs(adata, key=groupby)
+
+        single_control = isinstance(selected_group, str)
+        selected_groups = [selected_group] if single_control else list(selected_group)
+
+        missing = set(selected_groups) - set(adata.obs[groupby].cat.categories.values)
+        if missing:
+            raise ValueError(
+                f"Selected groups {missing} not found in groupby '{groupby}'"
+            )
+
+        empty = set(selected_groups) - set(
+            adata.obs[groupby].cat.remove_unused_categories().cat.categories.values
+        )
+        if empty:
+            raise ValueError(f"No cells found for selected groups: {sorted(empty)}")
+
+        needed = None
+        if groups is not None:
+            needed = list(set(groups) | set(selected_groups))
+
+        return selected_groups, single_control, needed
 
     @abstractmethod
     def pairwise(

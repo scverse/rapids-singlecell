@@ -150,6 +150,63 @@ def test_rank_genes_groups_ttest_subset_and_bonferroni(reference, method):
 
 
 @pytest.mark.parametrize(
+    ("groups", "reference"),
+    [
+        (["0"], "rest"),
+        (["0", "2"], "rest"),
+        (["0"], "1"),
+        (["0", "2"], "1"),
+    ],
+)
+@pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
+def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference):
+    np.random.seed(42)
+    adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
+    adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
+    adata_cpu = adata_gpu.copy()
+
+    rsc.tl.rank_genes_groups(
+        adata_gpu,
+        "blobs",
+        method=method,
+        groups=groups,
+        reference=reference,
+        use_raw=False,
+    )
+    sc.tl.rank_genes_groups(
+        adata_cpu,
+        "blobs",
+        method=method,
+        groups=groups,
+        reference=reference,
+        use_raw=False,
+    )
+
+    gpu_result = adata_gpu.uns["rank_genes_groups"]
+    cpu_result = adata_cpu.uns["rank_genes_groups"]
+
+    assert gpu_result["names"].dtype.names == cpu_result["names"].dtype.names
+    for group in gpu_result["names"].dtype.names:
+        gpu_names = list(gpu_result["names"][group])
+        cpu_names = list(cpu_result["names"][group])
+        for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+            gpu_map = dict(
+                zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float))
+            )
+            cpu_map = dict(
+                zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float))
+            )
+            for gene, gpu_val in gpu_map.items():
+                np.testing.assert_allclose(
+                    gpu_val,
+                    cpu_map[gene],
+                    rtol=1e-6,
+                    atol=1e-8,
+                    err_msg=f"{field} mismatch for gene {gene} group {group}",
+                )
+
+
+@pytest.mark.parametrize(
     "reference_before,reference_after",
     [("rest", "rest"), ("1", "One")],
 )

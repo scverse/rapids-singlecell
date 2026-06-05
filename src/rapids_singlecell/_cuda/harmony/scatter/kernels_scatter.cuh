@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <type_traits>
 
 template <typename T>
@@ -8,20 +9,20 @@ __global__ void scatter_add_kernel(const T* __restrict__ v,
                                    const int* __restrict__ cats, size_t n_cells,
                                    size_t n_pcs, size_t switcher,
                                    T* __restrict__ a) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     size_t N = n_cells * n_pcs;
-    if (i >= N) return;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < N;
+         i += (size_t)blockDim.x * gridDim.x) {
+        size_t row = i / n_pcs;
+        size_t col = i % n_pcs;
 
-    size_t row = i / n_pcs;
-    size_t col = i % n_pcs;
+        size_t cat = static_cast<size_t>(cats[row]);
+        size_t out_index = cat * n_pcs + col;
 
-    size_t cat = static_cast<size_t>(cats[row]);
-    size_t out_index = cat * n_pcs + col;
-
-    if (switcher == 0)
-        atomicAdd(&a[out_index], -v[i]);
-    else
-        atomicAdd(&a[out_index], v[i]);
+        if (switcher == 0)
+            atomicAdd(&a[out_index], -v[i]);
+        else
+            atomicAdd(&a[out_index], v[i]);
+    }
 }
 
 template <typename T>
@@ -65,10 +66,16 @@ __global__ void scatter_add_kernel_with_bias_cat0(const T* __restrict__ v,
 
     for (int i = start_cell + threadIdx.x; i < end_cell; i += blockDim.x) {
         size_t base = static_cast<size_t>(i) * n_pcs + pc0;
-        VecPC vv = *(const VecPC*)(v + base);
+        const T* ptr = v + base;
         T bb = __ldg(bias + i);
-        acc0 += (T)vv.x * bb;
-        if (has_pc1) acc1 += (T)vv.y * bb;
+        if (has_pc1 && (((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0)) {
+            VecPC vv = *(const VecPC*)ptr;
+            acc0 += (T)vv.x * bb;
+            acc1 += (T)vv.y * bb;
+        } else {
+            acc0 += ptr[0] * bb;
+            if (has_pc1) acc1 += ptr[1] * bb;
+        }
     }
 
 #pragma unroll
@@ -195,10 +202,16 @@ __global__ void scatter_add_kernel_with_bias_block(
     for (int i = start_idx + threadIdx.x; i < end_idx; i += blockDim.x) {
         int cell_idx = cell_indices[i];
         size_t in_index = static_cast<size_t>(cell_idx) * n_pcs + pc0;
-        VecPC vv = *(const VecPC*)(v + in_index);
+        const T* ptr = v + in_index;
         T bb = __ldg(bias + cell_idx);
-        acc0 += (T)vv.x * bb;
-        if (has_pc1) acc1 += (T)vv.y * bb;
+        if (has_pc1 && (((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0)) {
+            VecPC vv = *(const VecPC*)ptr;
+            acc0 += (T)vv.x * bb;
+            acc1 += (T)vv.y * bb;
+        } else {
+            acc0 += ptr[0] * bb;
+            if (has_pc1) acc1 += ptr[1] * bb;
+        }
     }
 
 #pragma unroll
@@ -284,7 +297,7 @@ __global__ void scatter_rows_kernel(const T* __restrict__ src,
 __global__ void gather_int_kernel(const int* __restrict__ src,
                                   const int* __restrict__ idx,
                                   int* __restrict__ dst, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x)
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long)blockDim.x * gridDim.x)
         dst[i] = src[idx[i]];
 }

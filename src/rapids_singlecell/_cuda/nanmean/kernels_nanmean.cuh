@@ -2,31 +2,32 @@
 
 #include <cuda_runtime.h>
 
-template <typename T>
-__global__ void nan_mean_minor_kernel(const int* __restrict__ index,
+template <typename T, typename IdxT>
+__global__ void nan_mean_minor_kernel(const IdxT* __restrict__ index,
                                       const T* __restrict__ data,
                                       double* __restrict__ means,
                                       int* __restrict__ nans,
-                                      const bool* __restrict__ mask, int nnz) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nnz) {
-        return;
-    }
-    int minor_pos = index[idx];
-    if (mask[minor_pos] == false) {
-        return;
-    }
-    T v = data[idx];
-    if (isnan((double)v)) {
-        atomicAdd(&nans[minor_pos], 1);
-    } else {
-        atomicAdd(&means[minor_pos], (double)v);
+                                      const bool* __restrict__ mask,
+                                      long long nnz) {
+    const long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < nnz; idx += stride) {
+        IdxT minor_pos = index[idx];
+        if (mask[minor_pos] == false) {
+            continue;
+        }
+        T v = data[idx];
+        if (isnan((double)v)) {
+            atomicAdd(&nans[minor_pos], 1);
+        } else {
+            atomicAdd(&means[minor_pos], (double)v);
+        }
     }
 }
 
-template <typename T>
-__global__ void nan_mean_major_kernel(const int* __restrict__ indptr,
-                                      const int* __restrict__ index,
+template <typename T, typename IdxT>
+__global__ void nan_mean_major_kernel(const IdxT* __restrict__ indptr,
+                                      const IdxT* __restrict__ index,
                                       const T* __restrict__ data,
                                       double* __restrict__ means,
                                       int* __restrict__ nans,
@@ -36,8 +37,8 @@ __global__ void nan_mean_major_kernel(const int* __restrict__ indptr,
     if (major_idx >= major) {
         return;
     }
-    int start_idx = indptr[major_idx];
-    int stop_idx = indptr[major_idx + 1];
+    IdxT start_idx = indptr[major_idx];
+    IdxT stop_idx = indptr[major_idx + 1];
 
     __shared__ double mean_place[64];
     __shared__ int nan_place[64];
@@ -46,9 +47,9 @@ __global__ void nan_mean_major_kernel(const int* __restrict__ indptr,
     nan_place[threadIdx.x] = 0;
     __syncthreads();
 
-    for (int minor_idx = start_idx + threadIdx.x; minor_idx < stop_idx;
+    for (IdxT minor_idx = start_idx + threadIdx.x; minor_idx < stop_idx;
          minor_idx += blockDim.x) {
-        int gene_number = index[minor_idx];
+        IdxT gene_number = index[minor_idx];
         if (mask[gene_number]) {
             T v = data[minor_idx];
             if (isnan((double)v)) {

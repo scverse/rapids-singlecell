@@ -196,7 +196,7 @@ def _co_occurrence_helper(
 
     # Fallback to the standard kernel if fast=False or shared memory was insufficient
     if not use_fast_kernel:
-        counts = cp.zeros((k, k, l_val * 2), dtype=cp.int32)
+        counts = cp.zeros((k, k, l_val * 2), dtype=cp.uint64)
         _co.count_pairwise(
             spatial,
             thresholds=thresholds,
@@ -283,10 +283,24 @@ def _co_occurrence_gpu(
         of shape (k, k, l_val), and use_fast_kernel indicates if the optimized
         kernel was used (False means shared memory was insufficient).
     """
+    kernel_configs = {}
+    valid_device_ids = []
+    for device_id in device_ids:
+        with cp.cuda.Device(device_id):
+            kernel_config = _co.get_kernel_config(l_val, n_cells, k)
+        if kernel_config is not None:
+            kernel_configs[device_id] = kernel_config
+            valid_device_ids.append(device_id)
+
+    if not valid_device_ids:
+        return cp.zeros((k, k, l_val), dtype=cp.uint64), False
+
+    device_ids = valid_device_ids
     n_devices = len(device_ids)
+    source_device_id = spatial.device.id
 
     # Split pairs across devices with load balancing
-    group_sizes = cp.diff(cat_offsets)
+    group_sizes = cp.diff(cat_offsets).astype(cp.int64)
     pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
 
     # Phase 1: Create streams and start async data transfer to all devices
@@ -305,7 +319,7 @@ def _co_occurrence_gpu(
 
             with streams[device_id]:
                 # Replicate data to this device (async on stream)
-                if device_id == device_ids[0]:
+                if device_id == source_device_id:
                     dev_spatial = spatial
                     dev_thresholds = thresholds
                     dev_cat_offsets = cat_offsets
@@ -321,7 +335,7 @@ def _co_occurrence_gpu(
                 dev_pair_right = cp.asarray(chunk_right)
 
                 # Initialize local counts array
-                dev_counts = cp.zeros((k, k, l_val), dtype=cp.int32)
+                dev_counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
 
                 device_data.append(
                     {
@@ -347,12 +361,7 @@ def _co_occurrence_gpu(
             # Wait for data transfer to complete on this device
             streams[device_id].synchronize()
 
-            # Get kernel configuration for this device
-            kernel_config = _co.get_kernel_config(l_val, n_cells, k)
-            if kernel_config is None:
-                # Shared memory insufficient, fall back to pairwise kernel
-                return cp.zeros((k, k, l_val), dtype=cp.int32), False
-
+            kernel_config = kernel_configs[device_id]
             cell_tile, _l_pad, block_size, shared_mem = kernel_config
             blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
 
@@ -383,7 +392,7 @@ def _co_occurrence_gpu(
 
     # Phase 4: Aggregate counts on first device
     with cp.cuda.Device(device_ids[0]):
-        counts = cp.zeros((k, k, l_val), dtype=cp.int32)
+        counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
         for data in device_data:
             if data is not None:
                 dev0_counts = cp.asarray(data["counts"])

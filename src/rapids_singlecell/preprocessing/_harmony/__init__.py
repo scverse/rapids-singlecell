@@ -446,6 +446,7 @@ def _clustering(
         seed=random_state & 0xFFFFFFFF,
         stabilized=stabilized_penalty,
         stream=cp.cuda.get_current_stream().ptr,
+        handle=cp.cuda.device.get_cublas_handle(),
     )
     objectives_harmony.append(float(cpp_workspace["last_obj"][0]))
 
@@ -617,6 +618,7 @@ def _correction_fast(
         g_factor=g_factor,
         g_P_row0=g_P_row0,
         stream=cp.cuda.get_current_stream().ptr,
+        handle=cp.cuda.device.get_cublas_handle(),
     )
     return Z
 
@@ -674,6 +676,7 @@ def _correction_batched(
         X_sorted=X_sorted,
         R_sorted=R_sorted,
         stream=cp.cuda.get_current_stream().ptr,
+        handle=cp.cuda.device.get_cublas_handle(),
     )
     return Z
 

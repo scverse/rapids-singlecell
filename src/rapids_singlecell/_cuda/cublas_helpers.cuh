@@ -2,6 +2,20 @@
 
 #include <cublas_v2.h>
 
+#include <stdexcept>
+#include <string>
+
+// ---------- cublas_check_status ----------
+
+static inline void cublas_check_status(cublasStatus_t status,
+                                       const char* what) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(what) +
+                                 " failed with cuBLAS status " +
+                                 std::to_string(static_cast<int>(status)));
+    }
+}
+
 // ---------- cublas_gemm ----------
 
 template <typename T>

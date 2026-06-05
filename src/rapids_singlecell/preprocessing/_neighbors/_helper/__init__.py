@@ -130,30 +130,63 @@ def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:
     return knn_dist
 
 
-def _trimming(cnts: cp_sparse.csr_matrix, trim: int) -> cp_sparse.csr_matrix:
+# Empirically, the block-cooperative CUB sort kernel is faster for trim >= 100;
+# below this threshold the per-thread top-k kernel has less launch overhead.
+_TRIM_SORT_THRESHOLD = 100
+
+
+def _trimming(
+    cnts: cp_sparse.csr_matrix,
+    trim: int,
+    *,
+    kernel: str = "auto",
+) -> cp_sparse.csr_matrix:
     from rapids_singlecell._cuda._bbknn_cuda import (
         cut_smaller,
         find_top_k_per_row,
+        find_top_k_per_row_sorted,
+        sort_tile_size,
     )
 
     n_rows = cnts.shape[0]
     vals_gpu = cp.zeros(n_rows, dtype=cp.float32)
+    stream = cp.cuda.get_current_stream().ptr
 
-    find_top_k_per_row(
-        cnts.data,
-        cnts.indptr,
-        n_rows=cnts.shape[0],
-        trim=trim,
-        vals=vals_gpu,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
+    if kernel == "auto":
+        if trim >= _TRIM_SORT_THRESHOLD:
+            max_row_nnz = int(cp.diff(cnts.indptr).max().get())
+            kernel = "sorted" if max_row_nnz <= sort_tile_size() else "thread"
+        else:
+            kernel = "thread"
+
+    if kernel == "sorted":
+        find_top_k_per_row_sorted(
+            cnts.data,
+            cnts.indptr,
+            n_rows=n_rows,
+            trim=trim,
+            vals=vals_gpu,
+            stream=stream,
+        )
+    elif kernel == "thread":
+        find_top_k_per_row(
+            cnts.data,
+            cnts.indptr,
+            n_rows=n_rows,
+            trim=trim,
+            vals=vals_gpu,
+            stream=stream,
+        )
+    else:
+        raise ValueError(f"Unknown trim kernel: {kernel!r}")
+
     cut_smaller(
         cnts.indptr,
         cnts.indices,
         cnts.data,
         vals=vals_gpu,
-        n_rows=cnts.shape[0],
-        stream=cp.cuda.get_current_stream().ptr,
+        n_rows=n_rows,
+        stream=stream,
     )
     cnts.eliminate_zeros()
     return cnts

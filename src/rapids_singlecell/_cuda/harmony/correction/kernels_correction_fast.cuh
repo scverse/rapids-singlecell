@@ -128,7 +128,8 @@ template <typename T>
 __global__ void gather_column_kernel(const T* __restrict__ src,
                                      T* __restrict__ dst, int col, int n_rows,
                                      int n_cols) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_rows) return;
-    dst[i] = src[(size_t)i * n_cols + col];
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n_rows; i += (long long)blockDim.x * gridDim.x) {
+        dst[i] = src[(size_t)i * n_cols + col];
+    }
 }
