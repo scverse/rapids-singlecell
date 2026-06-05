@@ -368,18 +368,16 @@ __global__ void m_step_finalize_cov_cublas_kernel(const T* __restrict__ N_k,
 }
 
 // ----------------------------------------------------------------------------
-// Full-covariance precision-Cholesky helpers.
-//
-// Ported from cuML's GMM (``ML::GMM::detail``, Apache-2.0): used by the batched
-// precision-Cholesky path that turns covariances into the upper precision
-// factor with one ``potrfBatched`` + one ``trsmBatched``.
+// Full-covariance precision-Cholesky helpers for the batched path that turns
+// covariances into the upper precision factor with one ``potrfBatched`` + one
+// ``trsmBatched``.
 //
 //   set_identity_batched_kernel : each component's (d, d) buffer -> identity,
 //   so
 //       the triangular solve ``L X = I`` yields ``X = L^{-1}``.
 //   log_det_full_kernel         : log_det[k] = Σ_i log(prec_chol[k, i, i]); the
 //       diagonal of the upper precision factor equals ``1 / L_ii``, so this is
-//       ``-Σ_i log(L_ii)`` (sklearn's precision-Cholesky log-det term).
+//       ``-Σ_i log(L_ii)`` (the precision-Cholesky log-det term).
 // ----------------------------------------------------------------------------
 constexpr int FULL_LOGDET_THREADS = 256;
 
@@ -425,8 +423,7 @@ __global__ void log_det_full_kernel(const T* __restrict__ prec_chol, int d,
 // the block (block-reduced sufficient statistics, in-kernel convergence on the
 // mean log-likelihood) for the 2-component (K=2, d=1) spherical mixture, and
 // writes the component-1 posterior per cell (== Mixscape's KO probability) plus
-// the fitted (m1, v1, w1) per segment. Adapted from GuideAssignment's
-// fit_assign_dense_kernel block-per-unit design (Apache-2.0).
+// the fitted (m1, v1, w1) per segment.
 // ----------------------------------------------------------------------------
 constexpr int MIXSCAPE_EM_THREADS = 256;
 

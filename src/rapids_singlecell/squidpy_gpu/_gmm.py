@@ -467,20 +467,17 @@ def _restore_empty_components(
 
 
 def _precision_cholesky(covariances: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
-    """Return sklearn-oriented precision Cholesky without forming an inverse.
+    """Return the sklearn-oriented upper precision Cholesky without an inverse.
 
-    Delegates to the batched cuSOLVER ``potrfBatched`` + cuBLAS ``trsmBatched``
-    kernel (ported from cuML's GMM): one C++ call per EM iteration with a single
-    host sync, yielding the row-major upper precision factor ``U`` (``U Uᵀ =
-    Σ⁻¹``) and ``log_det[k] = Σ_i log U[k, i, i]`` -- the same result as the
-    previous ``cp.linalg.cholesky`` + ``solve_triangular`` path.
+    A single batched cuSOLVER ``potrfBatched`` + cuBLAS ``trsmBatched`` call
+    yields the row-major upper precision factor ``U`` (``U Uᵀ = Σ⁻¹``) and
+    ``log_det[k] = Σ_i log U[k, i, i]``.
     """
-    covariances = cp.ascontiguousarray(covariances)
     K, d, _ = covariances.shape
     dtype = covariances.dtype
-    # All buffers are allocated here (CuPy) and passed in; the kernel allocates
-    # nothing. cov_work is the copy potrf factorizes in place.
-    cov_work = covariances.copy()
+    # All buffers are CuPy-owned and passed in; the kernel allocates nothing.
+    # cov_work is the C-contiguous copy potrf factorizes in place.
+    cov_work = cp.array(covariances, dtype=dtype, order="C", copy=True)
     prec_chol = cp.empty((K, d, d), dtype=dtype)
     log_det = cp.empty(K, dtype=dtype)
     dev_info = cp.empty(K, dtype=cp.int32)

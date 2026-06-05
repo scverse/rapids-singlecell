@@ -42,8 +42,7 @@ static inline void cusolver_check(cusolverStatus_t status, const char* what) {
 }
 
 // Typed wrappers for the batched Cholesky (cuSOLVER) and triangular solve
-// (cuBLAS) used by the full-covariance precision-Cholesky. Ported from cuML's
-// GMM (ML::GMM, Apache-2.0).
+// (cuBLAS) used by the full-covariance precision-Cholesky.
 template <typename T>
 static inline cusolverStatus_t potrf_batched(cusolverDnHandle_t h,
                                              cublasFillMode_t uplo, int nn,
@@ -95,7 +94,7 @@ inline cublasStatus_t trsm_batched<double>(
 // (Python) owns every buffer and nothing is allocated here: cov_work is a copy
 // of the covariances that potrf overwrites; dA/dB are device pointer arrays
 // into cov_work / prec_chol; positive-definiteness is checked by reading
-// dev_info after the next sync. Ported from cuML's ML::GMM (Apache-2.0).
+// dev_info after the next sync.
 template <typename T>
 static inline void launch_precision_cholesky_full(T* cov_work, T* prec_chol,
                                                   T* log_det, int* dev_info,
