@@ -147,6 +147,7 @@ __global__ void e_step_log_prob_large_d_thread64_kernel(
         sh_const = T(-0.5) * T(d) * log_2pi_const<T>() + log_det_half[k] +
                    log(weights[k]);
     }
+    __syncthreads();
 
     T local_mahal = T(0);
     const T* pc = prec_chol + (size_t)k * d * d;
@@ -271,7 +272,7 @@ __global__ void e_step_normalize_kernel(
     // pass 1: max over K
     T local_max = -CUDART_INF_F;
     for (int k = tid; k < K; k += blockDim.x) {
-        T v = log_prob[n_idx * K + k];
+        T v = log_prob[(size_t)n_idx * K + k];
         if (v > local_max) local_max = v;
     }
     // warp + block reduce max
@@ -286,7 +287,7 @@ __global__ void e_step_normalize_kernel(
     // pass 2: sum exp(log_prob - max)
     T local_sum = T(0);
     for (int k = tid; k < K; k += blockDim.x) {
-        local_sum += exp(log_prob[n_idx * K + k] - mx);
+        local_sum += exp(log_prob[(size_t)n_idx * K + k] - mx);
     }
     for (int off = 16; off > 0; off >>= 1)
         local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
@@ -300,7 +301,8 @@ __global__ void e_step_normalize_kernel(
 
     // pass 3: write normalized responsibilities
     for (int k = tid; k < K; k += blockDim.x) {
-        resp[n_idx * K + k] = exp(log_prob[n_idx * K + k] - log_total);
+        resp[(size_t)n_idx * K + k] =
+            exp(log_prob[(size_t)n_idx * K + k] - log_total);
     }
 }
 
@@ -334,7 +336,7 @@ __global__ void weighted_center_kernel(const T* __restrict__ X,
 
     int row = idx / d;
     int col = idx - (size_t)row * d;
-    T r = resp[row * K + k];
+    T r = resp[(size_t)row * K + k];
     centered[idx] = sqrt(r) * (X[idx] - means[k * d + col]);
 }
 

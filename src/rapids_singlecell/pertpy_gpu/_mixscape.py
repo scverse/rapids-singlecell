@@ -82,6 +82,9 @@ class Mixscape:
             ``ref_selection_mode="split_by"``.
         n_neighbors
             Number of control neighbors used for ``ref_selection_mode="nn"``.
+            Capped to the number of control cells available in each split, so a
+            split with fewer controls than ``n_neighbors`` still runs (pertpy
+            would error).
         use_rep
             Representation to use for neighbor selection. ``"X"`` or any
             ``.obsm`` key. If ``None``, ``.X`` is used when ``n_vars`` is below
@@ -376,6 +379,9 @@ class Mixscape:
                     (var_to_idx[g] for g in de_genes if g in var_to_idx),
                     dtype=np.int64,
                 )
+                if de_genes_indices.size == 0:
+                    class_arr[orig_mask] = f"{gene} NP"
+                    continue
                 # Gather the (n_all, k) sub-matrix directly; X[all_mask][:, de]
                 # would first materialize the full (n_all, n_vars) row slice.
                 all_idx = cp.asarray(np.flatnonzero(all_mask))
@@ -651,7 +657,9 @@ class Mixscape:
         layer
             Layer used for differential expression. ``None`` uses ``.X``.
         n_comps
-            Number of principal components per gene subspace.
+            Number of principal components per gene subspace. Reduced per gene
+            to ``min(n_comps, min(cells, genes) - 1)``; genes that leave fewer
+            than one component are skipped rather than raising (pertpy errors).
         min_de_genes
             Minimum number of differentially expressed genes to test a gene.
         logfc_threshold
@@ -1048,7 +1056,7 @@ def _lda_fit_transform_gpu(
     rank = int(cp.sum(s > tol).item())
     scalings = (vt[:rank] / std).T / s[:rank]
 
-    between_fac = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
+    between_fac = dtype.type(1.0 if n_classes == 1 else 1.0 / (n_classes - 1))
     between = (
         (cp.sqrt((n_samples * priors) * between_fac)) * (means - xbar).T
     ).T @ scalings

@@ -177,6 +177,48 @@ def test_gpu_lda_matches_sklearn():
         assert np.allclose(a, b, atol=1e-10) or np.allclose(a, -b, atol=1e-10)
 
 
+def test_lda_multiclass():
+    """End-to-end ``lda()`` with more than two perturbation classes: the
+    embedding must have ``n_classes - 1`` (>=2) discriminant components, which
+    the single-target ``test_lda`` fixture (n_components == 1) cannot exercise.
+    """
+    rng = np.random.default_rng(0)
+    n_ctrl, n_ko, n_genes = 80, 60, 40
+    de_blocks = {  # each target knocks out a distinct, non-overlapping gene block
+        "gene_a": slice(0, 10),
+        "gene_b": slice(10, 20),
+        "gene_c": slice(20, 30),
+    }
+    blocks = [rng.normal(1.0, 0.3, (n_ctrl, n_genes))]
+    labels = ["NT"] * n_ctrl
+    for gene, sl in de_blocks.items():
+        ko = rng.normal(1.0, 0.3, (n_ko, n_genes))
+        ko[:, sl] += 5.0  # strong, gene-specific knockout signal
+        blocks.append(ko)
+        labels += [gene] * n_ko
+    X = np.vstack(blocks).astype(np.float32)
+    obs = pd.DataFrame(
+        {"gene_target": labels}, index=[str(i) for i in range(X.shape[0])]
+    )
+    var = pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])
+    adata = anndata.AnnData(X=sparse.csr_matrix(X), obs=obs, var=var)
+    adata.layers["X_pert"] = adata.X.copy()
+
+    ms = rsc.ptg.Mixscape()
+    ms.mixscape(adata, pert_key="gene_target", control="NT", test_method="t-test")
+    ms.lda(
+        adata,
+        pert_key="gene_target",
+        control="NT",
+        test_method="t-test",
+        min_de_genes=3,
+    )
+
+    emb = adata.uns["mixscape_lda"]
+    assert emb.ndim == 2
+    assert emb.shape[1] >= 2  # >2 classes -> multiple discriminant components
+
+
 def test_perturbation_signature_writes_layer(mixscape_adata):
     rsc.ptg.Mixscape().perturbation_signature(
         mixscape_adata, pert_key="gene_target", control="NT"
@@ -211,11 +253,10 @@ def test_mixscape_output_schema(mixscape_adata):
     )
     for key in ("mixscape_class", "mixscape_class_global", "mixscape_class_p_ko"):
         assert key in adata.obs
-    assert set(adata.obs["mixscape_class_global"].unique()) <= {
-        "NT",
-        "KO",
-        "NP",
-    }
+    classes = set(adata.obs["mixscape_class_global"].unique())
+    assert classes <= {"NT", "KO", "NP"}
+    # classification must actually separate cells, not collapse to all-NT
+    assert {"KO", "NP"} & classes
     assert adata.obs["mixscape_class_p_ko"].dtype.kind == "f"
     # uns["mixscape"][gene][category] is a per-cell projection DataFrame.
     assert isinstance(adata.uns["mixscape"], dict)
@@ -225,11 +266,11 @@ def test_mixscape_output_schema(mixscape_adata):
     assert "pvec" in frame.columns
 
 
-@pytest.mark.parametrize("knn_algorithm", ["brute", "ivfflat"])
+@pytest.mark.parametrize("knn_algorithm", ["brute", "ivfflat", "cagra", "ivfpq"])
 def test_perturbation_signature_knn_backends(knn_algorithm):
-    """The brute and approximate cuVS neighbor backends both run and write X_pert."""
+    """Every advertised neighbor backend runs and writes a finite X_pert."""
     rng = np.random.default_rng(0)
-    n = 600
+    n = 2000
     X = np.clip(rng.normal(0, 1, size=(n, 30)), 0, None).astype(np.float32)
     obs = pd.DataFrame(
         {"pert": (["control"] * (n // 2) + ["g"] * (n - n // 2))},
@@ -246,12 +287,35 @@ def test_perturbation_signature_knn_backends(knn_algorithm):
         n_neighbors=15,
         knn_algorithm=knn_algorithm,
     )
-    assert adata.layers["X_pert"].shape == adata.shape
+    xp = rsc.get.X_to_CPU(adata.layers["X_pert"])
+    assert xp.shape == adata.shape
+    assert np.all(np.isfinite(xp))
 
 
 def test_mixscape_split_by():
-    """split_by computes the signature and classification per group."""
-    adata, _obs, _pert, _groups = _make_deterministic()
+    """split_by conditions per group: with strong, group-specific baselines, the
+    planted KO cells are predominantly called KO within each group."""
+    rng = np.random.default_rng(0)
+    n_per, n_genes = 50, 60
+    blocks, pert, group, is_ko = [], [], [], []
+    for grp, base in (("A", 0.0), ("B", 8.0)):  # very different baselines per group
+        nt = rng.normal(base, 0.5, (n_per, n_genes))
+        ko = rng.normal(base, 0.5, (n_per, n_genes))
+        ko[:, :20] += 5.0  # strong knockout signal on 20 genes
+        npe = rng.normal(base, 0.5, (n_per, n_genes))  # escaped: no signal
+        blocks += [nt, ko, npe]
+        pert += ["control"] * n_per + ["geneX"] * (2 * n_per)
+        group += [grp] * (3 * n_per)
+        is_ko += [False] * n_per + [True] * n_per + [False] * n_per
+    X = np.vstack(blocks).astype(np.float32)
+    obs = pd.DataFrame(
+        {"perturbation": pert, "group": group},
+        index=[str(i) for i in range(X.shape[0])],
+    )
+    adata = anndata.AnnData(
+        X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    )
+
     ms = rsc.ptg.Mixscape()
     ms.perturbation_signature(
         adata,
@@ -267,7 +331,12 @@ def test_mixscape_split_by():
         split_by="group",
         test_method="t-test",
     )
-    assert "mixscape_class_global" in adata.obs
+    glob = adata.obs["mixscape_class_global"].to_numpy()
+    is_ko = np.array(is_ko)
+    group = np.array(group)
+    for grp in ("A", "B"):
+        ko_cells = is_ko & (group == grp)
+        assert (glob[ko_cells] == "KO").mean() > 0.7
 
 
 def test_signature_no_control_in_split_warns():
@@ -347,9 +416,11 @@ def test_mixscale_strong_vs_weak(mixscale_adata):
         adata, pert_key="gene_target", control="NT", test_method="t-test"
     )
     scores = adata.obs["mixscale_score"].to_numpy()
+    # Strong and weak share the 'GeneA' label (one model is fit over both), so
+    # require a clear margin rather than a bare inequality.
     strong_mean = np.abs(scores[100:200]).mean()  # GeneA strong KO
     weak_mean = np.abs(scores[200:300]).mean()  # GeneA weak KO
-    assert strong_mean > weak_mean
+    assert strong_mean > 1.5 * weak_mean
 
 
 def test_mixscale_multiple_perturbations(mixscale_adata):
@@ -435,6 +506,77 @@ def test_mixscale_matches_pertpy(mixscape_adata):
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def _ref_mixscale_gene(block, is_guide, is_nt, *, do_scale):
+    """NumPy reference for one gene's Mixscale score (pertpy's formula): z-score
+    each column, project onto the (guide-mean − control-mean) direction, then
+    standardize each guide cell's projection against the control distribution."""
+    x = block.astype(np.float64)
+    n, k = x.shape
+    if do_scale:
+        cmean = x.mean(0)
+        sd = x.std(0, ddof=1)
+        sd = np.where(sd == 0.0, 1.0, sd)
+    else:
+        cmean = np.zeros(k)
+        sd = np.ones(k)
+    vec = (x[is_guide].mean(0) - x[is_nt].mean(0)) / sd
+    dotvv = float(vec @ vec)
+    pvec = ((x - cmean) / sd) @ vec / max(dotvv, 1e-12)
+    nt = pvec[is_nt]
+    nt_mean = nt.mean()
+    nt_std = nt.std(ddof=0) or 1.0
+    out = np.zeros(n)
+    out[is_guide] = (pvec[is_guide] - nt_mean) / nt_std
+    return out
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_mixscale_matches_numpy_reference(dtype):
+    """The batched scoring kernel matches an independent NumPy implementation of
+    pertpy's Mixscale formula, per gene, at float32 and float64. This is the
+    executed numerical-parity check (test_mixscale_matches_pertpy only runs once
+    pertpy ships Mixscape.mixscale)."""
+    from rapids_singlecell.pertpy_gpu._mixscape import _project_scores_batched
+
+    rng = np.random.default_rng(0)
+    n_obs, n_vars = 600, 40
+    X = rng.normal(0.0, 1.0, (n_obs, n_vars)).astype(dtype)
+    ctrl = np.arange(0, 200)  # control cells, shared across genes
+    genes = {
+        0: (np.arange(200, 350), np.array([1, 4, 7, 9, 12], dtype=np.int32)),
+        1: (np.arange(350, 600), np.array([2, 5, 8, 20, 31, 33], dtype=np.int32)),
+    }
+    for gi, (guide, cols) in genes.items():
+        X[np.ix_(guide, cols)] += 2.0 + gi  # plant a clear perturbation direction
+
+    gene_jobs: list[dict] = []
+    ref = np.zeros(n_obs)
+    for guide, cols in genes.values():
+        rows = np.concatenate([ctrl, guide]).astype(np.int32)
+        is_guide = np.concatenate(
+            [np.zeros(ctrl.size, bool), np.ones(guide.size, bool)]
+        )
+        nt_in_all = ~is_guide
+        gene_jobs.append(
+            {
+                "row_ids": rows,
+                "col_ids": cols,
+                "is_guide": is_guide,
+                "nt_in_all": nt_in_all,
+            }
+        )
+        block_scores = _ref_mixscale_gene(
+            X[rows][:, cols], is_guide, nt_in_all, do_scale=True
+        )
+        ref[guide] = block_scores[is_guide]
+
+    Xg = cp.asarray(X)
+    scores = cp.zeros(n_obs, dtype=Xg.dtype)
+    _project_scores_batched(Xg, gene_jobs, scores, do_scale=True)
+    atol = 2e-3 if dtype == np.float32 else 1e-9
+    np.testing.assert_allclose(cp.asnumpy(scores), ref, atol=atol)
 
 
 def test_mixscale_no_scale(mixscale_adata):

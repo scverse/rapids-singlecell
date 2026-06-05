@@ -55,7 +55,11 @@ def _ref_fixed_spherical_em(pvec, m0, v0, m1, v1, *, max_iter, tol, reg_covar):
         v1 = max((r1 * pvec * pvec).sum() * inv - m1 * m1 + reg_covar, reg_covar)
 
     lp0, lp1 = _components(w1, m1, v1)
-    resp1 = 1.0 / (1.0 + np.exp(lp0 - lp1))
+    # Stable posterior via the same logsumexp used in the EM loop above
+    # (the naive 1/(1+exp(lp0-lp1)) overflows on degenerate segments).
+    mx = np.maximum(lp0, lp1)
+    ll = mx + np.log(np.exp(lp0 - mx) + np.exp(lp1 - mx))
+    resp1 = np.exp(lp1 - ll)
     return resp1, m1, v1, w1
 
 
@@ -152,3 +156,59 @@ def test_batched_spherical_single_segment_shapes():
     assert r1.shape == (pvec.shape[0],)
     assert m1.shape == v1.shape == w1.shape == (1,)
     assert np.all((cp.asnumpy(r1) >= 0.0) & (cp.asnumpy(r1) <= 1.0))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_batched_spherical_degenerate_segments(dtype):
+    """Empty, tiny (n<=2) and zero-variance segments stay finite (the kernel's
+    guarded/floored branches), and match the reference where it is defined."""
+    seg0 = np.concatenate(
+        [
+            np.random.default_rng(3).normal(0, 1, 300),
+            np.random.default_rng(4).normal(4, 1, 300),
+        ]
+    )
+    seg1 = np.array([], dtype=float)  # empty (offsets[g]==offsets[g+1])
+    seg2 = np.full(50, 2.0)  # zero variance (all identical)
+    seg3 = np.array([0.0, 5.0])  # tiny (n=2)
+    segs = [seg0, seg1, seg2, seg3]
+    pvec = np.concatenate(segs).astype(dtype)
+    sizes = [s.size for s in segs]
+    offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int32)
+    m0 = np.zeros(4, dtype)
+    v0 = np.ones(4, dtype)
+    m1i = np.array([4.0, 0.0, 2.0, 5.0], dtype)
+    v1i = np.ones(4, dtype)
+
+    r1, m1, v1, w1 = spherical_gmm_fit_batched(
+        cp.asarray(pvec),
+        cp.asarray(offsets),
+        m0=cp.asarray(m0),
+        v0=cp.asarray(v0),
+        m1_init=cp.asarray(m1i),
+        v1_init=cp.asarray(v1i),
+        max_iter=100,
+        tol=1e-6,
+        reg_covar=1e-6,
+    )
+    r1 = cp.asnumpy(r1)
+    # every output is finite and posteriors are valid probabilities
+    assert np.all(np.isfinite(r1)) and np.all((r1 >= 0.0) & (r1 <= 1.0))
+    for arr in (m1, v1, w1):
+        assert np.all(np.isfinite(cp.asnumpy(arr)))
+    # well-conditioned segments (bimodal + tiny) match the NumPy reference
+    for gi in (0, 3):
+        s, e = int(offsets[gi]), int(offsets[gi + 1])
+        ref, *_ = _ref_fixed_spherical_em(
+            pvec[s:e],
+            float(m0[gi]),
+            float(v0[gi]),
+            float(m1i[gi]),
+            float(v1i[gi]),
+            max_iter=100,
+            tol=1e-6,
+            reg_covar=1e-6,
+        )
+        np.testing.assert_allclose(
+            r1[s:e], ref, atol=2e-3 if dtype == np.float32 else 1e-6
+        )
