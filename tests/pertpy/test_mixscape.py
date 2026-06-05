@@ -290,3 +290,148 @@ def test_signature_no_control_in_split_warns():
             split_by="group",
             ref_selection_mode="split_by",
         )
+
+
+@pytest.fixture
+def mixscale_adata() -> anndata.AnnData:
+    """Synthetic screen with strong and weak knockouts for mixscale scoring.
+
+    Mirrors pertpy's mixscale fixture: 100 non-targeting controls, then for
+    GeneA 100 strong-KO and 100 weak-KO cells (effect on the first 20 genes),
+    and 50 GeneB cells (moderate effect on genes 20-39). The planted gradient
+    lets a continuous score separate strong from weak knockdowns.
+    """
+    rng = np.random.default_rng(42)
+    n_genes = 200
+    n_cells = 350
+    X = rng.standard_normal((n_cells, n_genes)).astype(np.float32)
+    X[100:200, :20] -= 3.0  # GeneA strong KO
+    X[200:300, :20] -= 1.0  # GeneA weak KO
+    X[300:350, 20:40] -= 2.0  # GeneB moderate
+    labels = ["NT"] * 100 + ["GeneA"] * 200 + ["GeneB"] * 50
+    obs = pd.DataFrame(
+        {"gene_target": labels}, index=[f"Cell_{i}" for i in range(n_cells)]
+    )
+    var = pd.DataFrame(index=[f"Gene_{i}" for i in range(n_genes)])
+    adata = anndata.AnnData(X=X, obs=obs, var=var)
+    adata.layers["X_pert"] = adata.X.copy()
+    return adata
+
+
+def test_mixscale_basic_scoring(mixscale_adata):
+    """mixscale runs, writes a float score column, and controls score 0."""
+    adata = mixscale_adata
+    rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test"
+    )
+    assert "mixscale_score" in adata.obs
+    assert adata.obs["mixscale_score"].dtype.kind == "f"
+    nt_scores = adata.obs.loc[adata.obs["gene_target"] == "NT", "mixscale_score"]
+    assert (nt_scores == 0).all()
+
+
+def test_mixscale_perturbed_cells_nonzero(mixscale_adata):
+    """Perturbed cells receive non-zero scores."""
+    adata = mixscale_adata
+    rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test"
+    )
+    ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
+    assert ko.abs().mean() > 0
+
+
+def test_mixscale_strong_vs_weak(mixscale_adata):
+    """Strongly perturbed cells get larger absolute scores than weak ones."""
+    adata = mixscale_adata
+    rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test"
+    )
+    scores = adata.obs["mixscale_score"].to_numpy()
+    strong_mean = np.abs(scores[100:200]).mean()  # GeneA strong KO
+    weak_mean = np.abs(scores[200:300]).mean()  # GeneA weak KO
+    assert strong_mean > weak_mean
+
+
+def test_mixscale_multiple_perturbations(mixscale_adata):
+    """Every target gene with enough DE genes is scored."""
+    adata = mixscale_adata
+    rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test"
+    )
+    for gene in ("GeneA", "GeneB"):
+        s = adata.obs.loc[adata.obs["gene_target"] == gene, "mixscale_score"]
+        assert s.abs().mean() > 0
+
+
+def test_mixscale_custom_column_name(mixscale_adata):
+    adata = mixscale_adata
+    rsc.ptg.Mixscape().mixscale(
+        adata,
+        pert_key="gene_target",
+        control="NT",
+        test_method="t-test",
+        new_class_name="my_score",
+    )
+    assert "my_score" in adata.obs
+    assert "mixscale_score" not in adata.obs
+
+
+def test_mixscale_copy_mode(mixscale_adata):
+    adata = mixscale_adata
+    result = rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test", copy=True
+    )
+    assert result is not None
+    assert result is not adata
+    assert "mixscale_score" in result.obs
+    assert "mixscale_score" not in adata.obs
+
+
+def test_mixscale_requires_signature(mixscale_adata):
+    del mixscale_adata.layers["X_pert"]
+    with pytest.raises(KeyError, match="X_pert"):
+        rsc.ptg.Mixscape().mixscale(
+            mixscale_adata, pert_key="gene_target", control="NT", test_method="t-test"
+        )
+
+
+def test_mixscale_sparse_input(mixscale_adata):
+    """Sparse layers score the same as dense (matrix is densified internally)."""
+    adata = mixscale_adata
+    adata.layers["X_pert"] = sparse.csr_matrix(adata.layers["X_pert"])
+    rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test"
+    )
+    pert = adata.obs.loc[adata.obs["gene_target"] != "NT", "mixscale_score"]
+    assert not np.isnan(pert.to_numpy()).any()
+
+
+def test_mixscale_matches_pertpy(mixscape_adata):
+    """Continuous scores match pertpy's mixscale to numerical precision.
+
+    Skips until the installed pertpy ships ``Mixscape.mixscale`` (PR #945).
+    """
+    pt = pytest.importorskip("pertpy")
+    if not hasattr(pt.tl.Mixscape, "mixscale"):
+        pytest.skip("installed pertpy has no Mixscape.mixscale")
+
+    ad_rsc = mixscape_adata
+    ad_rsc.layers["X_pert"] = ad_rsc.X.copy()
+    ad_pt = ad_rsc.copy()
+
+    rsc.ptg.Mixscape().mixscale(
+        ad_rsc, pert_key="gene_target", control="NT", test_method="t-test"
+    )
+    pt.tl.Mixscape().mixscale(
+        ad_pt,
+        pert_key="gene_target",
+        control="NT",
+        layer="X_pert",
+        test_method="t-test",
+    )
+    np.testing.assert_allclose(
+        ad_rsc.obs["mixscale_score"].to_numpy(dtype=float),
+        ad_pt.obs["mixscale_score"].to_numpy(dtype=float),
+        rtol=1e-5,
+        atol=1e-5,
+    )

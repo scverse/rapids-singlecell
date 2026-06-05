@@ -120,7 +120,13 @@ jobs:
             scikit-build-core cmake ninja nanobind
           CIBW_TEST_SKIP: "*"
           CIBW_TEST_COMMAND: ""
-          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude libcublas.so.${{ matrix.cuda_major }} --exclude libcublasLt.so.${{ matrix.cuda_major }} --exclude libcudart.so.${{ matrix.cuda_major }} --exclude libcusolver.so.${{ matrix.cuda_major }} -w {dest_dir} {wheel}"
+          # Exclude CUDA libs by SONAME glob (auditwheel >=6.2): the runtime
+          # stack (CuPy / nvidia-* wheels) provides them. Globs are version
+          # agnostic -- cusolver's SONAME is libcusolver.so.11 on CUDA 12 but
+          # .12 on CUDA 13, and nvJitLink is .12 vs .13, so pinning to the CUDA
+          # major would graft the wrong (or no) lib. nvJitLink is cusolver's
+          # transitive dependency and must be excluded too.
+          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 
       - uses: actions/upload-artifact@v7

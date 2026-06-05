@@ -16,7 +16,8 @@ RUN yum -y install dnf-plugins-core && \
         libcusparse-12-2 \
         libcusparse-devel-12-2 \
         libcusolver-12-2 \
-        libcusolver-devel-12-2 && \
+        libcusolver-devel-12-2 \
+        libnvjitlink-12-2 && \
     yum clean all
 
 ENV CUDA_HOME=/usr/local/cuda

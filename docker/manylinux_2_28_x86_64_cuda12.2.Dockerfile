@@ -8,7 +8,9 @@ RUN yum -y install gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ && \
 RUN yum -y install dnf-plugins-core && \
     dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && \
     yum -y clean all && yum -y makecache && \
-    # Install only what you actually link against
+    # Install what you link against, plus cusolver's runtime nvJitLink dependency
+    # (cusolver's ELF NEEDs libnvJitLink but its RPM does not declare it, so it
+    # must be installed explicitly or the nanobind stub-generation import fails).
     yum -y install \
       cuda-nvcc-12-2 \
       cuda-cudart-12-2 \
@@ -18,7 +20,8 @@ RUN yum -y install dnf-plugins-core && \
       libcusparse-12-2 \
       libcusparse-devel-12-2 \
       libcusolver-12-2 \
-      libcusolver-devel-12-2 && \
+      libcusolver-devel-12-2 \
+      libnvjitlink-12-2 && \
     yum clean all
 
 ENV CUDA_HOME=/usr/local/cuda

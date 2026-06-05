@@ -431,6 +431,197 @@ class Mixscape:
             return adata
         return None
 
+    def mixscale(
+        self,
+        adata: AnnData,
+        pert_key: str,
+        control: str,
+        *,
+        new_class_name: str = "mixscale_score",
+        layer: str | None = None,
+        min_de_genes: int = 5,
+        max_de_genes: int = 100,
+        logfc_threshold: float = 0.25,
+        de_layer: str | None = None,
+        test_method: str = "wilcoxon",
+        scale: bool = True,
+        split_by: str | None = None,
+        pval_cutoff: float = 5e-2,
+        perturbation_type: str = "KO",
+        copy: bool = False,
+    ) -> AnnData | None:
+        """Continuous perturbation efficiency scores (Mixscale).
+
+        Unlike :meth:`mixscape`, which performs a binary knocked-out/non-perturbed
+        classification with a Gaussian mixture, this assigns each cell a
+        *continuous* perturbation-efficiency score: the scalar projection of its
+        perturbation signature onto the per-gene perturbation direction
+        (mean perturbed minus mean control), z-score standardized relative to the
+        non-targeting control distribution. This is useful for CRISPRi/CRISPRa
+        screens where cells show a gradient of perturbation strength rather than a
+        binary knockout. Control cells receive a score of 0.
+
+        Implements Jiang, Dalgarno et al., "Systematic reconstruction of molecular
+        pathway signatures using scalable single-cell perturbation screens",
+        Nature Cell Biology (2025), following pertpy's
+        :meth:`~pertpy.tools.Mixscape.mixscale`.
+
+        Parameters
+        ----------
+        adata
+            The annotated data object.
+        pert_key
+            The column of ``.obs`` with target gene labels.
+        control
+            Control category in ``pert_key``.
+        new_class_name
+            Name of the ``.obs`` column for the continuous score.
+        layer
+            Layer used for scoring. Defaults to ``.layers["X_pert"]``.
+        min_de_genes
+            Minimum number of differentially expressed genes required to score a
+            gene; genes with fewer are skipped.
+        max_de_genes
+            Maximum number of (top-ranked) differentially expressed genes used to
+            define the perturbation direction.
+        logfc_threshold
+            Minimum absolute log fold change for a gene to count as
+            differentially expressed.
+        de_layer
+            Layer used for differential expression. ``None`` uses ``.X``.
+        test_method
+            Differential-expression test passed to
+            :func:`rapids_singlecell.tl.rank_genes_groups`.
+        scale
+            Scale the per-gene sub-matrix before computing scores.
+        split_by
+            ``.obs`` column with a condition/cell-type annotation if
+            perturbations are condition specific.
+        pval_cutoff
+            Adjusted p-value cutoff for differentially expressed genes.
+        perturbation_type
+            Accepted for ``pertpy.tl.Mixscape.mixscale`` API compatibility; has no
+            effect on the continuous score.
+        copy
+            Whether to return a copy of ``adata``.
+
+        Returns
+        -------
+        Returns the modified copy if ``copy=True``, otherwise writes
+        ``adata.obs[new_class_name]`` in place and returns ``None``. Higher
+        absolute values indicate a stronger perturbation effect; control cells
+        and any gene that cannot be scored receive 0.
+        """
+        if copy:
+            adata = adata.copy()
+
+        if split_by is None:
+            split_masks = [np.ones(adata.n_obs, dtype=bool)]
+            categories = ["all"]
+        else:
+            split_obs = adata.obs[split_by]
+            categories = list(split_obs.unique())
+            split_masks = [
+                (split_obs == category).to_numpy() for category in categories
+            ]
+
+        perturbation_markers = self._get_perturbation_markers(
+            adata,
+            split_masks=split_masks,
+            categories=categories,
+            pert_key=pert_key,
+            control=control,
+            layer=de_layer,
+            pval_cutoff=pval_cutoff,
+            min_de_genes=min_de_genes,
+            logfc_threshold=logfc_threshold,
+            test_method=test_method,
+        )
+
+        if layer is not None:
+            X = X_to_GPU(adata.layers[layer])
+        else:
+            try:
+                X = X_to_GPU(adata.layers["X_pert"])
+            except KeyError:
+                raise KeyError(
+                    "No 'X_pert' found in .layers! Please run perturbation_signature "
+                    "first to calculate the perturbation signature!"
+                ) from None
+        X = _to_dense_gpu(X)
+
+        var_names = np.asarray(adata.var_names)
+        var_to_idx = {name: i for i, name in enumerate(var_names)}
+        # Integer codes let every per-gene cell mask be built with a fast integer
+        # comparison over the full obs, and no cells are ever copied out of adata.
+        pert_cat = adata.obs[pert_key].astype("category")
+        codes = pert_cat.cat.codes.to_numpy()
+        cat_names = [str(c) for c in pert_cat.cat.categories]
+        control_code = {name: i for i, name in enumerate(cat_names)}.get(control, -1)
+
+        # Scores accumulate in one flat array (control cells stay 0.0) written to
+        # adata.obs once at the end. float64 matches pertpy's `obs[...] = 0.0`.
+        scores = np.zeros(adata.n_obs, dtype=np.float64)
+
+        for split, split_mask in enumerate(split_masks):
+            category = categories[split]
+            nt_mask = (codes == control_code) & split_mask
+            split_gene_codes = sorted(set(codes[split_mask].tolist()) - {control_code})
+
+            for gene_code in split_gene_codes:
+                gene = cat_names[gene_code]
+                de_genes = perturbation_markers[category, gene]
+                if len(de_genes) == 0:
+                    continue
+                # Keep only the top-ranked DE genes (markers are score-ranked).
+                if len(de_genes) > max_de_genes:
+                    de_genes = de_genes[:max_de_genes]
+                de_genes_indices = np.fromiter(
+                    (var_to_idx[g] for g in de_genes if g in var_to_idx),
+                    dtype=np.int64,
+                )
+                if de_genes_indices.size == 0:
+                    continue
+
+                orig_mask = (codes == gene_code) & split_mask
+                all_mask = orig_mask | nt_mask
+                nt_in_all_np = nt_mask[all_mask]
+                if not nt_in_all_np.any():
+                    # No control cells: cannot define a perturbation direction.
+                    continue
+
+                # Gather the (n_all, k) sub-matrix directly; X[all_mask][:, de]
+                # would first materialize the full (n_all, n_vars) row slice.
+                all_idx = cp.asarray(np.flatnonzero(all_mask))
+                dat = X[all_idx[:, None], cp.asarray(de_genes_indices)[None, :]]
+                if scale:
+                    dat = _scale_gpu(dat)
+
+                orig_in_all = cp.asarray(orig_mask[all_mask])
+                nt_in_all = cp.asarray(nt_in_all_np)
+
+                # Perturbation direction = mean(guide) - mean(control); then
+                # scalar-project every cell: pvec = dat @ vec / ||vec||^2.
+                vec = dat[orig_in_all].mean(axis=0) - dat[nt_in_all].mean(axis=0)
+                vec_norm_sq = vec @ vec
+                if float(vec_norm_sq) == 0.0:
+                    continue
+                pvec = (dat @ vec) / vec_norm_sq
+
+                # Z-score the guide projections against the control distribution.
+                # ``.std()`` uses ddof=0 (population std), matching pertpy/numpy.
+                nt_scores = pvec[nt_in_all]
+                nt_mean = nt_scores.mean()
+                nt_std = nt_scores.std()
+                nt_std = cp.where(nt_std == 0, dat.dtype.type(1.0), nt_std)
+                scores[orig_mask] = cp.asnumpy((pvec[orig_in_all] - nt_mean) / nt_std)
+
+        adata.obs[new_class_name] = scores
+
+        if copy:
+            return adata
+        return None
+
     def lda(
         self,
         adata: AnnData,

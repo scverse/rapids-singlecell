@@ -93,11 +93,14 @@
 
         ~Mixscape.perturbation_signature
         ~Mixscape.mixscape
+        ~Mixscape.mixscale
         ~Mixscape.lda
 
     .. automethod:: perturbation_signature
         :no-index:
     .. automethod:: mixscape
+        :no-index:
+    .. automethod:: mixscale
         :no-index:
     .. automethod:: lda
         :no-index:
