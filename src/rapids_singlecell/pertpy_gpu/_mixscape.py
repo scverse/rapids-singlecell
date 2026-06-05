@@ -559,10 +559,10 @@ class Mixscape:
         cat_names = [str(c) for c in pert_cat.cat.categories]
         control_code = {name: i for i, name in enumerate(cat_names)}.get(control, -1)
 
-        # Scores accumulate in one flat array (control cells stay 0.0) written to
-        # adata.obs once at the end. float64 matches pertpy's `obs[...] = 0.0`.
-        scores = np.zeros(adata.n_obs, dtype=np.float64)
-
+        # One job per scorable gene (indices + masks, cheap host work); the
+        # gather, scaling, projection and z-score for all genes then run in a
+        # single batched kernel that reads each block straight from X.
+        gene_jobs: list[dict] = []
         for split, split_mask in enumerate(split_masks):
             category = categories[split]
             nt_mask = (codes == control_code) & split_mask
@@ -578,7 +578,7 @@ class Mixscape:
                     de_genes = de_genes[:max_de_genes]
                 de_genes_indices = np.fromiter(
                     (var_to_idx[g] for g in de_genes if g in var_to_idx),
-                    dtype=np.int64,
+                    dtype=np.int32,
                 )
                 if de_genes_indices.size == 0:
                     continue
@@ -590,33 +590,23 @@ class Mixscape:
                     # No control cells: cannot define a perturbation direction.
                     continue
 
-                # Gather the (n_all, k) sub-matrix directly; X[all_mask][:, de]
-                # would first materialize the full (n_all, n_vars) row slice.
-                all_idx = cp.asarray(np.flatnonzero(all_mask))
-                dat = X[all_idx[:, None], cp.asarray(de_genes_indices)[None, :]]
-                if scale:
-                    dat = _scale_gpu(dat)
+                gene_jobs.append(
+                    {
+                        "row_ids": np.flatnonzero(all_mask).astype(np.int32),
+                        "col_ids": de_genes_indices,
+                        "is_guide": orig_mask[all_mask],
+                        "nt_in_all": nt_in_all_np,
+                    }
+                )
 
-                orig_in_all = cp.asarray(orig_mask[all_mask])
-                nt_in_all = cp.asarray(nt_in_all_np)
-
-                # Perturbation direction = mean(guide) - mean(control); then
-                # scalar-project every cell: pvec = dat @ vec / ||vec||^2.
-                vec = dat[orig_in_all].mean(axis=0) - dat[nt_in_all].mean(axis=0)
-                vec_norm_sq = vec @ vec
-                if float(vec_norm_sq) == 0.0:
-                    continue
-                pvec = (dat @ vec) / vec_norm_sq
-
-                # Z-score the guide projections against the control distribution.
-                # ``.std()`` uses ddof=0 (population std), matching pertpy/numpy.
-                nt_scores = pvec[nt_in_all]
-                nt_mean = nt_scores.mean()
-                nt_std = nt_scores.std()
-                nt_std = cp.where(nt_std == 0, dat.dtype.type(1.0), nt_std)
-                scores[orig_mask] = cp.asnumpy((pvec[orig_in_all] - nt_mean) / nt_std)
-
-        adata.obs[new_class_name] = scores
+        # Control cells stay 0; the kernel writes only guide cells. float64
+        # output matches pertpy's ``obs[...] = 0.0`` column.
+        scores_gpu = cp.zeros(adata.n_obs, dtype=X.dtype)
+        if gene_jobs:
+            _project_scores_batched(X, gene_jobs, scores_gpu, do_scale=scale)
+        adata.obs[new_class_name] = cp.asnumpy(scores_gpu).astype(
+            np.float64, copy=False
+        )
 
         if copy:
             return adata
@@ -973,6 +963,54 @@ def _scale_gpu(dat: cp.ndarray) -> cp.ndarray:
     std = cp.sqrt(dat.var(axis=0, ddof=1))
     std = cp.where(std == 0, dat.dtype.type(1.0), std)
     return (dat - mean) / std
+
+
+def _project_scores_batched(
+    X: cp.ndarray, gene_jobs: list[dict], scores_gpu: cp.ndarray, *, do_scale: bool
+) -> None:
+    """Batched Mixscale scoring for all genes in one kernel launch.
+
+    Flattens each gene's cell indices, DE-gene indices and guide/control masks
+    into gene-blocked buffers and runs ``_mixscale_cuda.project_score`` once,
+    writing each guide cell's standardized score into ``scores_gpu`` at its obs
+    index (controls stay 0; the scatter is race-free, one gene per guide cell).
+    """
+    from rapids_singlecell._cuda import _mixscale_cuda as _msc
+
+    # Kernel indexes X row-major; ensure C-order (no-op if already contiguous).
+    X = cp.ascontiguousarray(X)
+
+    n_genes = len(gene_jobs)
+    n_list = np.array([job["row_ids"].shape[0] for job in gene_jobs], dtype=np.int64)
+    k_list = np.array([job["col_ids"].shape[0] for job in gene_jobs], dtype=np.int64)
+    cell_off = np.concatenate([[0], np.cumsum(n_list)]).astype(np.int32)
+    feat_off = np.concatenate([[0], np.cumsum(k_list)]).astype(np.int32)
+    max_k = int(k_list.max())
+
+    row_ids = cp.asarray(np.concatenate([job["row_ids"] for job in gene_jobs]))
+    col_ids = cp.asarray(np.concatenate([job["col_ids"] for job in gene_jobs]))
+    is_guide = cp.asarray(np.concatenate([job["is_guide"] for job in gene_jobs]))
+    nt_flat = cp.asarray(np.concatenate([job["nt_in_all"] for job in gene_jobs]))
+    pvec_scratch = cp.empty(int(cell_off[-1]), dtype=X.dtype)
+
+    _msc.project_score(
+        X,
+        int(X.shape[1]),
+        row_ids,
+        col_ids,
+        cp.asarray(n_list.astype(np.int32)),
+        cp.asarray(k_list.astype(np.int32)),
+        cp.asarray(cell_off),
+        cp.asarray(feat_off),
+        is_guide,
+        nt_flat,
+        pvec_scratch,
+        scores_gpu,
+        n_genes=n_genes,
+        max_k=max_k,
+        do_scale=do_scale,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
 
 
 def _lda_fit_transform_gpu(
