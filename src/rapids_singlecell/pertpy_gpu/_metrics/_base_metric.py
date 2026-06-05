@@ -18,6 +18,14 @@ if TYPE_CHECKING:
 __all__ = ["BaseMetric", "parse_device_ids"]
 
 
+def _is_sparse(x) -> bool:
+    """True for a host (scipy) or device (cupyx) sparse matrix."""
+    import cupyx.scipy.sparse as cpsp
+    import scipy.sparse as sp
+
+    return sp.issparse(x) or cpsp.issparse(x)
+
+
 class BaseMetric(ABC):
     """
     Abstract base class for distance metrics.
@@ -55,18 +63,24 @@ class BaseMetric(ABC):
         self.layer_key = layer_key
         self.obsm_key = obsm_key
 
-    def _get_embedding(self, adata: AnnData) -> np.ndarray | cp.ndarray:
-        """Get embedding from adata using layer_key or obsm_key.
+    def _get_embedding(self, adata: AnnData):
+        """Get the cell data from adata using ``layer_key`` or ``obsm_key``.
 
-        Returns the embedding in its original format (numpy or cupy).
-        Preserves the input dtype (float32 or float64) for precision control.
+        ``layer_key="X"`` selects ``adata.X``. Dense data is returned as-is
+        (numpy or cupy); sparse data (scipy or cupyx CSR/CSC) is returned
+        unchanged so the caller can route it through the sparse path. The
+        input dtype (float32 or float64) is preserved for precision control.
         """
-        if self.layer_key is not None:
+        if self.layer_key == "X":
+            data = adata.X
+        elif self.layer_key is not None:
             data = adata.layers[self.layer_key]
         else:
             data = adata.obsm[self.obsm_key]
 
         if isinstance(data, (cp.ndarray, np.ndarray)):
+            return data
+        if _is_sparse(data):
             return data
         return np.asarray(data)
 
@@ -91,16 +105,37 @@ class BaseMetric(ABC):
         groups_list
             Ordered group names matching the category indices.
         """
-        obs_col = adata.obs[groupby]
         embedding_raw = self._get_embedding(adata)
+        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(
+            adata, groupby, needed_groups
+        )
+        if mask is not None:
+            embedding = cp.asarray(embedding_raw[mask])
+        else:
+            embedding = cp.asarray(embedding_raw)
+        return embedding, cat_offsets, cell_indices, groups_list
 
+    def _subset_indices(
+        self,
+        adata: AnnData,
+        groupby: str,
+        needed_groups: Sequence[str] | None,
+    ) -> tuple[np.ndarray | None, cp.ndarray, cp.ndarray, list[str]]:
+        """Build the category mapping for ``groupby``, layout-independent.
+
+        Returns ``(mask, cat_offsets, cell_indices, groups_list)`` where ``mask``
+        is the boolean row selector (``None`` when all cells are kept). Unused
+        (zero-cell) categories are always dropped, and a requested group with no
+        cells raises ``ValueError``. The embedding materialization (dense or
+        sparse) is left to the caller so both layouts share this logic.
+        """
+        obs_col = adata.obs[groupby]
         if needed_groups is not None:
             mask = obs_col.isin(needed_groups).values
             obs_col = obs_col[mask].cat.remove_unused_categories()
-            embedding = cp.asarray(embedding_raw[mask])
         else:
+            mask = None
             obs_col = obs_col.cat.remove_unused_categories()
-            embedding = cp.asarray(embedding_raw)
 
         groups_list = list(obs_col.cat.categories)
         if needed_groups is not None:
@@ -111,7 +146,7 @@ class BaseMetric(ABC):
         cat_offsets, cell_indices = _create_category_index_mapping(
             group_labels, len(groups_list)
         )
-        return embedding, cat_offsets, cell_indices, groups_list
+        return mask, cat_offsets, cell_indices, groups_list
 
     @staticmethod
     def _parse_contrasts(adata: AnnData, contrasts) -> tuple[str, list[str]]:
