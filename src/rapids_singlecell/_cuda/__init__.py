@@ -35,6 +35,7 @@ __all__ = [
     "_kde_cuda",
     "_ligrec_cuda",
     "_mean_var_cuda",
+    "_mixscale_cuda",
     "_nanmean_cuda",
     "_nn_descent_cuda",
     "_norm_cuda",

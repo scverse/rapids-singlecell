@@ -8,7 +8,7 @@ import rapids_singlecell as rsc
 
 
 @pytest.mark.parametrize("clustering_function", [rsc.tl.leiden, rsc.tl.louvain])
-def test_dask_clustering(client, clustering_function):
+def test_dask_clustering(dist_client, clustering_function):
     adata = pbmc3k_processed()
     clustering_function(adata, use_dask=True, key_added="test_dask")
     clustering_function(adata, key_added="test_no_dask")
@@ -22,7 +22,7 @@ def test_dask_clustering(client, clustering_function):
 
 @pytest.mark.parametrize("clustering_function", [rsc.tl.leiden, rsc.tl.louvain])
 @pytest.mark.parametrize("resolution", [0.1, [0.5, 1.0]])
-def test_dask_clustering_resolution(client, clustering_function, resolution):
+def test_dask_clustering_resolution(dist_client, clustering_function, resolution):
     adata = pbmc3k_processed()
     clustering_function(
         adata, use_dask=True, key_added="test_dask", resolution=resolution

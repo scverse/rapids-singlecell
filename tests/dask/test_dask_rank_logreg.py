@@ -48,7 +48,7 @@ def _compare_top_genes(result1, result2, top_n=10, min_overlap=9):
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_rank_genes_groups_logreg(client, data_kind, dtype):
+def test_rank_genes_groups_logreg(dist_client, data_kind, dtype):
     if data_kind == "dense":
         adata = pbmc68k_reduced()
         adata.X = adata.X.astype(dtype)
