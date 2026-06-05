@@ -117,14 +117,11 @@ struct DenseLaunch {
     void run() const {
         dim3 grid(num_pairs, blocks_per_pair);
         dim3 block(block_size);
-        DenseLoader<T, CELL_TILE, FEAT_TILE> loader{embedding, cell_indices,
-                                                    n_features};
-        edistance_kernel_impl<T, CELL_TILE, FEAT_TILE,
-                              DenseLoader<T, CELL_TILE, FEAT_TILE>>
+        edistance_kernel<T, CELL_TILE, FEAT_TILE>
             <<<grid, block, shared_mem, stream>>>(
-                loader, cat_offsets, pair_left, pair_right, pairwise_sums,
-                n_features, blocks_per_pair);
-        CUDA_CHECK_LAST_ERROR(edistance_kernel_impl);
+                embedding, cat_offsets, cell_indices, pair_left, pair_right,
+                pairwise_sums, n_features, blocks_per_pair);
+        CUDA_CHECK_LAST_ERROR(edistance_kernel);
     }
 };
 
@@ -146,14 +143,11 @@ struct SparseLaunch {
     void run() const {
         dim3 grid(num_pairs, blocks_per_pair);
         dim3 block(block_size);
-        SparseLoader<T, CELL_TILE, FEAT_TILE, IndptrT> loader{
-            data, indices, indptr, cell_indices};
-        edistance_kernel_impl<T, CELL_TILE, FEAT_TILE,
-                              SparseLoader<T, CELL_TILE, FEAT_TILE, IndptrT>>
+        edistance_sparse_kernel<T, CELL_TILE, FEAT_TILE, IndptrT>
             <<<grid, block, shared_mem, stream>>>(
-                loader, cat_offsets, pair_left, pair_right, pairwise_sums,
-                n_features, blocks_per_pair);
-        CUDA_CHECK_LAST_ERROR(edistance_kernel_impl);
+                data, indices, indptr, cat_offsets, cell_indices, pair_left,
+                pair_right, pairwise_sums, n_features, blocks_per_pair);
+        CUDA_CHECK_LAST_ERROR(edistance_sparse_kernel);
     }
 };
 
