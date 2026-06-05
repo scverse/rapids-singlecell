@@ -23,13 +23,13 @@ static inline void launch_mixscale_project_score(
     const T* X, long long n_vars, const int* row_ids, const int* col_ids,
     const int* n_per_gene, const int* k_per_gene, const int* cell_offsets,
     const int* feat_offsets, const bool* is_guide, const bool* nt_in_all,
-    int n_genes, int max_k, bool do_scale, T* pvec_scratch, T* scores_out,
+    int n_genes, int max_k, bool do_scale, double* pvec_scratch, T* scores_out,
     cudaStream_t stream) {
     if (n_genes == 0 || max_k == 0) return;
     dim3 block(MIXSCALE_THREADS);
     dim3 grid(n_genes);
-    // Dynamic shared holds vec, col_mean, col_std (3 x k each).
-    size_t dyn_shmem = (size_t)3 * max_k * sizeof(T);
+    // Dynamic shared holds vec, col_mean, col_std (3 x k each, double).
+    size_t dyn_shmem = (size_t)3 * max_k * sizeof(double);
     // Opt in to >48KB shared only when the dynamic buffers plus the static
     // reduction buffer exceed the default.
     cudaFuncAttributes attr{};
@@ -77,7 +77,7 @@ void def_project_score(nb::module_& m) {
            gpu_array_c<const int, Device> feat_offsets,
            gpu_array_c<const bool, Device> is_guide,
            gpu_array_c<const bool, Device> nt_in_all,
-           gpu_array_c<T, Device> pvec_scratch,
+           gpu_array_c<double, Device> pvec_scratch,
            gpu_array_c<T, Device> scores_out, int n_genes, int max_k,
            bool do_scale, std::uintptr_t stream) {
             launch_mixscale_project_score<T>(

@@ -991,7 +991,9 @@ def _project_scores_batched(
     col_ids = cp.asarray(np.concatenate([job["col_ids"] for job in gene_jobs]))
     is_guide = cp.asarray(np.concatenate([job["is_guide"] for job in gene_jobs]))
     nt_flat = cp.asarray(np.concatenate([job["nt_in_all"] for job in gene_jobs]))
-    pvec_scratch = cp.empty(int(cell_off[-1]), dtype=X.dtype)
+    # double scratch: the kernel accumulates projections/stats in 64-bit so
+    # float32 inputs keep full precision (matches mean_var's accumulation).
+    pvec_scratch = cp.empty(int(cell_off[-1]), dtype=cp.float64)
 
     _msc.project_score(
         X,

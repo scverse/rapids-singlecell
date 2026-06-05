@@ -435,3 +435,66 @@ def test_mixscale_matches_pertpy(mixscape_adata):
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_mixscale_no_scale(mixscale_adata):
+    """The scale=False path runs and produces finite, non-zero perturbed scores."""
+    adata = mixscale_adata
+    rsc.ptg.Mixscape().mixscale(
+        adata, pert_key="gene_target", control="NT", test_method="t-test", scale=False
+    )
+    assert not np.isnan(adata.obs["mixscale_score"].to_numpy()).any()
+    ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
+    assert ko.abs().mean() > 0
+
+
+def test_mixscale_float32_matches_float64():
+    """float32 scores match the float64 result (in-kernel 64-bit accumulation)."""
+    rng = np.random.default_rng(0)
+    n_genes, n = 200, 120
+    X = rng.standard_normal((2 * n, n_genes)).astype(np.float64)
+    X[n:, :40] -= 2.0
+    obs = pd.DataFrame(
+        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    ad64 = anndata.AnnData(X=X, obs=obs, var=var)
+    ad64.layers["X_pert"] = ad64.X.copy()
+    ad32 = anndata.AnnData(X=X.astype(np.float32), obs=obs.copy(), var=var.copy())
+    ad32.layers["X_pert"] = ad32.X.copy()
+    for ad_ in (ad64, ad32):
+        rsc.ptg.Mixscape().mixscale(
+            ad_, pert_key="pert", control="NT", test_method="t-test"
+        )
+    np.testing.assert_allclose(
+        ad32.obs["mixscale_score"].to_numpy(dtype=float),
+        ad64.obs["mixscale_score"].to_numpy(dtype=float),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+def test_mixscale_large_de_set_shared_mem_optin():
+    """Many DE genes per perturbation exercise the >48KB dynamic shared-mem
+    opt-in path (3 * k * 8 bytes exceeds the 48KB default for k > ~1700)."""
+    rng = np.random.default_rng(0)
+    n_genes, n = 2500, 120
+    X = rng.standard_normal((2 * n, n_genes)).astype(np.float32)
+    X[n:] -= 2.0  # every gene differentially expressed in the guide group
+    obs = pd.DataFrame(
+        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    adata = anndata.AnnData(X=X, obs=obs, var=var)
+    adata.layers["X_pert"] = adata.X.copy()
+    rsc.ptg.Mixscape().mixscale(
+        adata,
+        pert_key="pert",
+        control="NT",
+        test_method="t-test",
+        max_de_genes=n_genes,
+    )
+    g = adata.obs.loc[adata.obs["pert"] == "g", "mixscale_score"].to_numpy()
+    assert g.shape[0] == n
+    assert not np.isnan(g).any()
+    assert np.abs(g).mean() > 0
