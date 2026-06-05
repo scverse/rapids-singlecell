@@ -98,13 +98,13 @@ jobs:
           # extension against librmm. Add the matching wheel to the isolated
           # PEP 517 build requirements after selecting the CUDA package variant.
           for dep in (
-              f'    "librmm-cu{other}>=25.10",\n',
-              f'    "rmm-cu{other}>=25.10",\n',
+              f'    "librmm-cu{other}>=25.12",\n',
+              f'    "rmm-cu{other}>=25.12",\n',
           ):
               text = text.replace(dep, "")
-          rmm_build_req = f'    "librmm-cu{cuda}>=25.10",\n'
+          rmm_build_req = f'    "librmm-cu{cuda}>=25.12",\n'
           build_system_text = text.split("[project]", 1)[0]
-          if f'"librmm-cu{cuda}>=25.10"' not in build_system_text:
+          if f'"librmm-cu{cuda}>=25.12"' not in build_system_text:
               text = text.replace(
                   ']\nbuild-backend = "scikit_build_core.build"',
                   f'{rmm_build_req}]\nbuild-backend = "scikit_build_core.build"',
@@ -164,7 +164,6 @@ jobs:
             echo "[rsc-build] marker=$(cat build/.librmm_dir)"
           CIBW_TEST_SKIP: "*"
           CIBW_TEST_COMMAND: ""
-          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude libcublas.so.${{ matrix.cuda_major }} --exclude libcublasLt.so.${{ matrix.cuda_major }} --exclude libcudart.so.${{ matrix.cuda_major }} --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
           # Exclude CUDA libs by SONAME glob (auditwheel >=6.2): the runtime
           # stack (CuPy / nvidia-* wheels) provides them. Globs are version
           # agnostic -- cusolver's SONAME is libcusolver.so.11 on CUDA 12 but
@@ -172,7 +171,10 @@ jobs:
           # major would graft the wrong (or no) lib. cusolver's transitive deps
           # (cublasLt, cusparse ~186MB, nvJitLink) are reached by auditwheel's
           # tree walk and must each be excluded or they bloat the wheel.
-          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}"
+          # librmm.so / librapids_logger.so are also excluded: they are NOT in
+          # the CuPy/nvidia stack but are provided by the librmm / rapids_logger
+          # wheels at runtime, so we must not bundle them into our wheel.
+          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 
       - uses: actions/upload-artifact@v7
