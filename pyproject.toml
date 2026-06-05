@@ -7,7 +7,11 @@ requires = [
     # Generic isolated source builds default to CUDA 12. CUDA wheel builds
     # rewrite this to the matching cu12/cu13 package; CUDA 13 source builds
     # should build in an existing RAPIDS env with --no-build-isolation.
-    "librmm-cu12>=25.10",
+    # 25.12 floor: the Wilcoxon scratch allocator uses the resource-ref API
+    # (get_current_device_resource_ref().allocate_sync), and the flat
+    # <rmm/mr/per_device_resource.hpp> header path only exists from 25.12
+    # onward (25.10 kept it under rmm/mr/device/). Builds through RMM 26.06+.
+    "librmm-cu12>=25.12",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -39,19 +43,19 @@ dependencies = [
 [project.optional-dependencies]
 rapids-cu13 = [
     "cupy-cuda13x",
-    "cudf-cu13>=25.10",
-    "cuml-cu13>=25.10",
-    "cugraph-cu13>=25.10",
-    "cuvs-cu13>=25.10",
-    "librmm-cu13>=25.10",
+    "cudf-cu13>=25.12",
+    "cuml-cu13>=25.12",
+    "cugraph-cu13>=25.12",
+    "cuvs-cu13>=25.12",
+    "librmm-cu13>=25.12",
 ]
 rapids-cu12 = [
     "cupy-cuda12x",
-    "cudf-cu12>=25.10",
-    "cuml-cu12>=25.10",
-    "cugraph-cu12>=25.10",
-    "cuvs-cu12>=25.10",
-    "librmm-cu12>=25.10",
+    "cudf-cu12>=25.12",
+    "cuml-cu12>=25.12",
+    "cugraph-cu12>=25.12",
+    "cuvs-cu12>=25.12",
+    "librmm-cu12>=25.12",
 ]
 
 doc = [
