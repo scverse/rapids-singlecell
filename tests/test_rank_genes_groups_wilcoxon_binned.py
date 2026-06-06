@@ -428,21 +428,39 @@ class TestWilcoxonBinnedEdgeCases:
             assert np.all(pvals >= 0)
             assert np.all(pvals <= 1)
 
-    def test_sparse_negative_values_raises(self, adata_blobs):
-        """Sparse input with negative values should raise ValueError."""
+    def test_sparse_negative_values_fallback(self, adata_blobs):
+        """Sparse input with negatives must not use the sparse histogram (which
+        assigns implicit zeros to bin 0, valid only for nonnegative data); it
+        falls back to the dense histogram, so the result matches the dense run.
+        """
         import cupy as cp
         import cupyx.scipy.sparse as cpsp
 
         adata = adata_blobs.copy()
         rsc.get.anndata_to_GPU(adata)
-        # Make sparse with negative values
-        dense = cp.array(adata.X)
+        dense = cp.asarray(adata.X, dtype=cp.float64)
         dense[:, 0] = -1.0
-        adata.X = cpsp.csr_matrix(dense)
 
-        with pytest.raises(ValueError, match="Sparse input contains negative values"):
-            rsc.tl.rank_genes_groups(
-                adata, "blobs", method="wilcoxon_binned", use_raw=False
+        sparse_adata = adata.copy()
+        sparse_adata.X = cpsp.csr_matrix(dense)
+        dense_adata = adata.copy()
+        dense_adata.X = dense
+
+        rsc.tl.rank_genes_groups(
+            sparse_adata, "blobs", method="wilcoxon_binned", use_raw=False
+        )
+        rsc.tl.rank_genes_groups(
+            dense_adata, "blobs", method="wilcoxon_binned", use_raw=False
+        )
+
+        sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
+        dn_scores = dense_adata.uns["rank_genes_groups"]["scores"]
+        for group in sp_scores.dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(sp_scores[group], dtype=float),
+                np.asarray(dn_scores[group], dtype=float),
+                rtol=1e-13,
+                atol=1e-13,
             )
 
     def test_log1p_warning(self, adata_blobs):

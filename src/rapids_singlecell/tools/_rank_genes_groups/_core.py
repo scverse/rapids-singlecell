@@ -13,63 +13,8 @@ from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.get._aggregated import Aggregate
 from rapids_singlecell.preprocessing._utils import _check_gpu_X
 
-from ._utils import EPS, _check_sparse_nonnegative, _select_groups
+from ._utils import EPS, _reject_complex, _select_groups, _sparse_has_negative
 
-_FDR_BH_REVERSE_CUMMIN_KERNEL = cp.RawKernel(
-    r"""
-extern "C" __global__ void fdr_bh_reverse_cummin(double* values, const int n_cols) {
-    const int row = blockIdx.x;
-    double running = 1.0;
-    double* row_values = values + static_cast<size_t>(row) * n_cols;
-    for (int col = n_cols - 1; col >= 0; --col) {
-        double value = row_values[col];
-        if (!(value == value)) {
-            value = 1.0;
-        }
-        if (value < running) {
-            running = value;
-        }
-        row_values[col] = running;
-    }
-}
-""",
-    "fdr_bh_reverse_cummin",
-)
-_GROUP_CHUNK_STATS_KERNEL = cp.RawKernel(
-    r"""
-extern "C" __global__ void group_chunk_stats(
-    const double* block,
-    const int* group_codes,
-    double* group_sums,
-    double* group_sum_sq,
-    double* group_nnz,
-    const int n_rows,
-    const int n_cols,
-    const int n_groups,
-    const bool compute_nnz
-) {
-    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const long long total = static_cast<long long>(n_rows) * n_cols;
-    if (idx >= total) {
-        return;
-    }
-    const int row = idx % n_rows;
-    const int col = idx / n_rows;
-    const int group = group_codes[row];
-    if (group < 0 || group >= n_groups) {
-        return;
-    }
-    const double value = block[idx];
-    const long long out = static_cast<long long>(group) * n_cols + col;
-    atomicAdd(group_sums + out, value);
-    atomicAdd(group_sum_sq + out, value * value);
-    if (compute_nnz && value != 0.0) {
-        atomicAdd(group_nnz + out, 1.0);
-    }
-}
-""",
-    "group_chunk_stats",
-)
 _RANK_SORT_MIN_ELEMENTS = 1_000_000
 _RANK_SORT_MAX_WORKERS = 64
 
@@ -154,8 +99,6 @@ class _RankGenes:
             self.X = self.X[:, mask_var]
             self.var_names = self.var_names[mask_var]
 
-        _check_sparse_nonnegative(self.X)
-
         self.pre_load = pre_load
 
         self.ireference = None
@@ -181,6 +124,7 @@ class _RankGenes:
         self.pts_rest: np.ndarray | None = None
 
         self.stats_arrays: dict[str, object] | None = None
+        self._sparse_negative_fallback = False
         self._store_wilcoxon_gpu_result = False
         self._wilcoxon_gpu_result: (
             tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None] | None
@@ -324,23 +268,16 @@ class _RankGenes:
         group_nnz = (
             cp.zeros((n_groups, n_cols), dtype=cp.float64) if self.comp_pts else None
         )
-        n_items = n_cells * n_cols
-        threads = 256
-        blocks = (n_items + threads - 1) // threads
-        _GROUP_CHUNK_STATS_KERNEL(
-            (blocks,),
-            (threads,),
-            (
-                block,
-                group_codes_dev,
-                group_sums,
-                group_sum_sq,
-                group_nnz if group_nnz is not None else group_sums,
-                np.int32(n_cells),
-                np.int32(n_cols),
-                np.int32(n_groups),
-                self.comp_pts,
-            ),
+        from rapids_singlecell._cuda import _rank_stats_cuda as _rs
+
+        _rs.group_chunk_stats(
+            block,
+            group_codes_dev,
+            group_sums,
+            group_sum_sq,
+            group_nnz if group_nnz is not None else group_sums,
+            compute_nnz=bool(self.comp_pts),
+            stream=cp.cuda.get_current_stream().ptr,
         )
 
         # Means
@@ -490,6 +427,17 @@ class _RankGenes:
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
+        # The optimized sparse Wilcoxon paths inject implicit zeros analytically
+        # as a tie at the column minimum (valid only for nonnegative data).
+        # t-test/logreg are mean/variance/model-based and sign-agnostic. For the
+        # Wilcoxon methods we reject complex input and, when sparse data holds
+        # negatives, fall back to the dense full-sort ranking (correct for any
+        # sign) rather than erroring -- so e.g. signed sparse data still ranks
+        # correctly, just via the dense path.
+        self._sparse_negative_fallback = False
+        if method in {"wilcoxon", "wilcoxon_binned"}:
+            _reject_complex(self.X)
+            self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if self.pre_load or method in {
             "t-test",
             "t-test_overestim_var",
@@ -623,10 +571,10 @@ class _RankGenes:
         corrected_sorted *= corrected_sorted.shape[1] / cp.arange(
             1, corrected_sorted.shape[1] + 1, dtype=cp.float64
         )
-        _FDR_BH_REVERSE_CUMMIN_KERNEL(
-            (corrected_sorted.shape[0],),
-            (1,),
-            (corrected_sorted, np.int32(corrected_sorted.shape[1])),
+        from rapids_singlecell._cuda import _rank_stats_cuda as _rs
+
+        _rs.fdr_bh_reverse_cummin(
+            corrected_sorted, stream=cp.cuda.get_current_stream().ptr
         )
         corrected = cp.empty_like(corrected_sorted)
         cp.put_along_axis(corrected, order, corrected_sorted, axis=1)

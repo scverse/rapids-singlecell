@@ -423,7 +423,6 @@ static void ovo_streaming_csr_host_impl(
         checked_int_span(pk.nnz, "OVO host CSR pack compacted nnz");
         if (pk.sb_cols > max_pack_sb_cols) max_pack_sb_cols = pk.sb_cols;
     }
-    int max_group_rows = max_pack_rows;
     size_t max_sub_items = (size_t)max_pack_items;
     if (max_pack_rows == 0) return;
 

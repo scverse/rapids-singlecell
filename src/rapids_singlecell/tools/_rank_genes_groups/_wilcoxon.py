@@ -71,9 +71,17 @@ def _maybe_preload_host_dense(rg: _RankGenes) -> None:
 
 
 def _get_dense_column_block_f32(X, start: int, stop: int) -> cp.ndarray:
-    """Extract a dense column block as F-order float32 CuPy memory."""
+    """Extract a dense column block as F-order float32 CuPy memory.
+
+    For sparse X (the negative-values dense fallback) the column window is
+    densified on the fly via the shared CSR/CSC densify path, so no full-matrix
+    dense materialization happens.
+    """
     if isinstance(X, np.ndarray | cp.ndarray):
         return cp.asarray(X[:, start:stop], dtype=cp.float32, order="F")
+    if sp.issparse(X) or cpsp.issparse(X):
+        block = _get_column_block(X, start, stop)  # float64 F-order chunk
+        return cp.asfortranarray(block.astype(cp.float32, copy=False))
     raise TypeError(f"Expected dense matrix, got {type(X)}")
 
 
@@ -539,7 +547,9 @@ def _wilcoxon_vs_rest(
                 stacklevel=4,
             )
 
-    host_sparse = isinstance(X, sp.spmatrix | sp.sparray)
+    host_sparse = (
+        isinstance(X, sp.spmatrix | sp.sparray) and not rg._sparse_negative_fallback
+    )
     if host_sparse:
         if X.format not in {"csr", "csc"}:
             raise TypeError(
@@ -655,7 +665,9 @@ def _wilcoxon_vs_rest(
         p_host = p_values.get()
         return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
 
-    if cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X):
+    if (
+        cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X)
+    ) and not rg._sparse_negative_fallback:
         data, indices, indptr = _device_sparse_arrays_f32(X)
         group_codes_gpu = cp.asarray(rg.group_codes, dtype=cp.int32)
         group_sizes_dev = cp.asarray(group_sizes, dtype=cp.float64)
@@ -847,7 +859,9 @@ def _wilcoxon_with_reference(
         )
     )
 
-    host_sparse = isinstance(X, sp.spmatrix | sp.sparray)
+    host_sparse = (
+        isinstance(X, sp.spmatrix | sp.sparray) and not rg._sparse_negative_fallback
+    )
     if host_sparse:
         if X.format not in {"csr", "csc"}:
             raise TypeError(
@@ -996,7 +1010,9 @@ def _wilcoxon_with_reference(
             for slot, group_index in enumerate(test_group_indices)
         ]
 
-    if cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X):
+    if (
+        cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X)
+    ) and not rg._sparse_negative_fallback:
         sparse_X = X
         if cpsp.isspmatrix_csr(sparse_X) and not sparse_X.has_sorted_indices:
             sparse_X = sparse_X.copy()

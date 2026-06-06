@@ -43,6 +43,7 @@ __all__ = [
     "_pv_cuda",
     "_qc_cuda",
     "_qc_dask_cuda",
+    "_rank_stats_cuda",
     "_scale_cuda",
     "_sparse2dense_cuda",
     "_spca_cuda",

@@ -33,31 +33,49 @@ def _make_nonnegative(adata):
     return adata
 
 
+# The optimized sparse Wilcoxon paths inject implicit zeros analytically as a tie
+# at the column minimum, which is valid only for nonnegative data. With negatives
+# present they must NOT be used; instead the ranking falls back to the dense
+# full-sort path (correct for any sign), so the result matches running the same
+# method on the dense matrix. (t-test/t-test_overestim_var/logreg never need this
+# and accept signed sparse data directly -- e.g. mixscape's LDA t-test.)
 @pytest.mark.parametrize(
     "method",
-    ["t-test", "t-test_overestim_var", "wilcoxon", "wilcoxon_binned", "logreg"],
+    ["wilcoxon", "wilcoxon_binned"],
 )
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
-def test_rank_genes_groups_sparse_negative_values_raise(method, fmt):
+def test_rank_genes_groups_sparse_negative_values_fallback(method, fmt):
     X = np.array(
         [
             [-1.0, 0.0, 2.0],
             [0.0, 1.0, 0.0],
             [2.0, 0.0, 1.0],
             [0.0, 3.0, 0.0],
+            [-2.0, 1.0, 0.0],
+            [1.0, 0.0, 3.0],
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
-    adata = sc.AnnData(
-        X=_to_format(X, fmt),
-        obs=pd.DataFrame(
-            {"group": pd.Categorical(["a", "a", "b", "b"], categories=["a", "b"])}
-        ),
-        var=pd.DataFrame(index=["g0", "g1", "g2"]),
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(list("aaabbb"), categories=["a", "b"])})
+    var = pd.DataFrame(index=["g0", "g1", "g2"])
 
-    with pytest.raises(ValueError, match="Sparse input contains negative values"):
-        rsc.tl.rank_genes_groups(adata, "group", method=method, use_raw=False)
+    sparse_adata = sc.AnnData(X=_to_format(X, fmt), obs=obs.copy(), var=var.copy())
+    dense_fmt = "cupy_dense" if fmt.startswith("cupy") else "numpy_dense"
+    dense_adata = sc.AnnData(X=_to_format(X, dense_fmt), obs=obs.copy(), var=var.copy())
+
+    rsc.tl.rank_genes_groups(sparse_adata, "group", method=method, use_raw=False)
+    rsc.tl.rank_genes_groups(dense_adata, "group", method=method, use_raw=False)
+
+    # Sparse-with-negatives falls back to the dense ranking -> identical result.
+    sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
+    dn_scores = dense_adata.uns["rank_genes_groups"]["scores"]
+    for group in sp_scores.dtype.names:
+        np.testing.assert_allclose(
+            np.asarray(sp_scores[group], dtype=float),
+            np.asarray(dn_scores[group], dtype=float),
+            rtol=1e-13,
+            atol=1e-13,
+        )
 
 
 @pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "cupy_dense", "cupy_csr"])

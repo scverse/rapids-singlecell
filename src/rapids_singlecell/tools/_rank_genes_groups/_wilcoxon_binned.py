@@ -11,7 +11,7 @@ import numpy as np
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._cuda import _wilcoxon_binned_cuda as _wb
 
-from ._utils import MIN_GROUP_SIZE_WARNING
+from ._utils import MIN_GROUP_SIZE_WARNING, _get_column_block
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -212,6 +212,7 @@ def wilcoxon_binned(
         "tie_correct": tie_correct,
         "use_continuity": use_continuity,
         "ireference": ireference,
+        "force_dense": rg._sparse_negative_fallback,
     }
 
     # Pre-allocate output
@@ -258,13 +259,27 @@ def process_gene_batch(
     tie_correct: bool = False,
     use_continuity: bool = False,
     ireference: int | None = None,
+    force_dense: bool = False,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Process one gene batch, dispatching on Dask vs in-memory."""
     n_hist_groups = n_cells_per_group_hist.shape[0]
     n_genes_batch = stop - start
 
     is_sparse = False
-    if isinstance(X, DaskArray):
+    if force_dense and cpsp.issparse(X):
+        # Negative-values fallback: the sparse histogram assigns implicit zeros
+        # to bin 0, which is correct only for nonnegative data. Densify the
+        # column window (chunked, no full materialization) and use the dense
+        # histogram, whose bins span the full [min, max] range.
+        hist = _launch_dense(
+            _get_column_block(X, start, stop),
+            group_codes,
+            n_hist_groups,
+            n_bins=n_bins,
+            bin_low=bin_low,
+            inv_bin_width=inv_bin_width,
+        )
+    elif isinstance(X, DaskArray):
         hist = _process_dask(
             X,
             start=start,

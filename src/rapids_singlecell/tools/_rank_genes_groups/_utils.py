@@ -19,23 +19,8 @@ MAX_THREADS_PER_BLOCK = 512
 MIN_GROUP_SIZE_WARNING = 25
 
 
-def _nonnegative_error(prefix: str) -> ValueError:
-    msg = (
-        f"{prefix} contains negative values. rank_genes_groups expects "
-        "nonnegative expression values; use raw counts or log1p/log-normalized "
-        "expression, not scaled or centered data."
-    )
-    return ValueError(msg)
-
-
-def _check_sparse_nonnegative(X) -> None:
-    """Reject inputs with negative values where an eager check is cheap.
-
-    Sparse rank_genes_groups code treats missing entries as true expression
-    zeros. Optimized sparse Wilcoxon paths may rank explicit nonzeros and add
-    implicit zeros analytically, which is only valid when explicit sparse
-    values are nonnegative expression values.
-    """
+def _reject_complex(X) -> None:
+    """Reject complex expression values (unsupported by every rank method)."""
     dtype = None
     if sp.issparse(X) or cpsp.issparse(X):
         dtype = np.dtype(X.data.dtype)
@@ -45,12 +30,21 @@ def _check_sparse_nonnegative(X) -> None:
         msg = "rank_genes_groups does not support complex expression values."
         raise TypeError(msg)
 
-    if sp.issparse(X):
-        if X.nnz > 0 and float(X.data.min()) < 0:
-            raise _nonnegative_error("Sparse input")
-    elif cpsp.issparse(X):
-        if X.nnz > 0 and float(X.data.min()) < 0:
-            raise _nonnegative_error("Sparse input")
+
+def _sparse_has_negative(X) -> bool:
+    """Whether X is a sparse matrix holding an explicit negative value.
+
+    The optimized sparse Wilcoxon paths rank explicit nonzeros and add the
+    implicit (structural) zeros analytically as a tie at the column minimum,
+    which is correct only when every stored value is nonnegative (counts /
+    log1p-normalized data). With a negative stored value the implicit zeros are
+    no longer the minimum, so that analytic ranking is wrong and the caller
+    must fall back to the dense full-sort path (valid for any sign). Dense
+    inputs and the t-test/logreg methods never need this.
+    """
+    if sp.issparse(X) or cpsp.issparse(X):
+        return X.nnz > 0 and float(X.data.min()) < 0
+    return False
 
 
 def _select_groups(
@@ -174,9 +168,43 @@ def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray
     return _sparse_to_dense(csc_chunk, order="F").astype(cp.float64)
 
 
+def _csr_tile_to_dense_block(X, start: int, stop: int) -> cp.ndarray:
+    """Densify a CSR column window [start, stop) straight into an F-order
+    float64 block via a single fused CSR->dense kernel, skipping the CSR->CSC
+    tile rebuild that ``X[:, start:stop].tocsc()`` (host) / ``X[:, start:stop]``
+    (device) would do. For device CSR the index arrays are already on the GPU,
+    so there is no transfer.
+    """
+    from rapids_singlecell._cuda import _rank_stats_cuda as _rs
+
+    n_rows = X.shape[0]
+    out = cp.zeros((n_rows, stop - start), dtype=cp.float64, order="F")
+    if X.nnz == 0:
+        return out
+    _rs.csr_tile_to_dense(
+        cp.asarray(X.indptr),
+        cp.asarray(X.indices),
+        cp.asarray(X.data),
+        out,
+        col_lb=int(start),
+        col_ub=int(stop),
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    return out
+
+
 def _get_column_block(X, start: int, stop: int) -> cp.ndarray:
     """Extract a column block as a dense F-order float64 CuPy array."""
     match X:
+        # Device CSR: the fused csr_tile_to_dense kernel densifies the window in
+        # one pass with no transfer (index arrays are already on the GPU) -- the
+        # big win. Host CSR is intentionally NOT routed here: doing so would
+        # re-transfer the whole CSR every chunk (only ~1.15x and worse with more
+        # chunks); host data should be moved to the device once upstream
+        # (`X_to_GPU`) so it lands in this fast device branch, otherwise it falls
+        # through to the `.tocsc()` path below.
+        case cpsp.csr_matrix():
+            return _csr_tile_to_dense_block(X, start, stop)
         case sp.csc_matrix() | sp.csc_array():
             return _csc_columns_to_gpu(X, start, stop, X.shape[0])
         case sp.spmatrix() | sp.sparray():
