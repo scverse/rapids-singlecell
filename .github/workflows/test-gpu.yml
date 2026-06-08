@@ -108,21 +108,21 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() && contains(matrix.env.name, 'stable') }}
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           report_type: test_results
           files: test-data/test-results.xml
           use_oidc: false
-          fail_ci_if_error: false
+          fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload coverage data
         if: contains(matrix.env.name, 'stable')
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: test-data/coverage.xml
           use_oidc: false
-          fail_ci_if_error: false
+          fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
   test-prerelease:
