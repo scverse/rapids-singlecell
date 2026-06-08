@@ -73,7 +73,7 @@ jobs:
         RAPIDS_VER:
           - "26.04"
         CUDA_SUFFIX:
-          - { ver: "12.8.0", label: "cuda12", pkg: "cu12" }
+          - { ver: "12.9.1", label: "cuda12", pkg: "cu12" }
           - { ver: "13.0.2", label: "cuda13", pkg: "cu13" }
     name: Build Docker images (${{ matrix.CUDA_SUFFIX.label }})
     runs-on: ubuntu-latest
