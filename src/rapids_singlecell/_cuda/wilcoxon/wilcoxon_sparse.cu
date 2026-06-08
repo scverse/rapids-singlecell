@@ -30,6 +30,7 @@ void register_sparse_bindings(nb::module_& m) {
            gpu_array_c<double, Device> rank_sums,                             \
            gpu_array_c<double, Device> tie_corr, int n_rows, int n_cols,      \
            int n_groups, bool compute_tie_corr, int sub_batch_cols) {         \
+            if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             IMPL(data.data(), indices.data(), indptr.data(),                  \
                  group_codes.data(), group_sizes.data(), rank_sums.data(),    \
                  tie_corr.data(), n_rows, n_cols, n_groups, compute_tie_corr, \
@@ -64,6 +65,7 @@ void register_sparse_bindings(nb::module_& m) {
            gpu_array_c<double, Device> d_group_nnz, int n_rows, int n_cols,   \
            int n_groups, bool compute_tie_corr, bool compute_sq_sums,         \
            bool compute_nnz, int sub_batch_cols) {                            \
+            if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             ovr_sparse_csc_host_streaming_impl<InT, IndexT, IndptrT>(         \
                 h_data.data(), h_indices.data(), h_indptr.data(),             \
                 h_group_codes.data(), h_group_sizes.data(),                   \
@@ -102,6 +104,7 @@ void register_sparse_bindings(nb::module_& m) {
            gpu_array_c<double, Device> d_group_nnz, int n_rows, int n_cols,   \
            int n_groups, bool compute_tie_corr, bool compute_sq_sums,         \
            bool compute_nnz, int sub_batch_cols) {                            \
+            if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             ovr_sparse_csr_host_streaming_impl<InT, IndexT, IndptrT>(         \
                 h_data.data(), h_indices.data(), h_indptr.data(),             \
                 h_group_codes.data(), h_group_sizes.data(),                   \
@@ -139,6 +142,7 @@ void register_sparse_bindings(nb::module_& m) {
            gpu_array_c<double, Device> tie_corr, int n_ref, int n_all_grp,    \
            int n_cols, int n_groups, bool compute_tie_corr,                   \
            int sub_batch_cols) {                                              \
+            if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             IMPL(data.data(), indices.data(), indptr.data(), ref_rows.data(), \
                  grp_rows.data(), grp_offsets.data(), rank_sums.data(),       \
                  tie_corr.data(), n_ref, n_all_grp, n_cols, n_groups,         \
@@ -176,6 +180,7 @@ void register_sparse_bindings(nb::module_& m) {
            int n_rows, int n_cols, int n_groups, int n_groups_stats,          \
            bool compute_tie_corr, bool compute_sq_sums, bool compute_nnz,     \
            int sub_batch_cols) {                                              \
+            if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             ovo_streaming_csc_host_impl<InT, IndexT, IndptrT>(                \
                 h_data.data(), h_indices.data(), h_indptr.data(),             \
                 h_ref_row_map.data(), h_grp_row_map.data(),                   \
@@ -216,6 +221,7 @@ void register_sparse_bindings(nb::module_& m) {
            int n_ref, int n_all_grp, int n_cols, int n_test,                   \
            int n_groups_stats, bool compute_tie_corr, bool compute_sq_sums,    \
            bool compute_nnz, bool compute_sums, int sub_batch_cols) {          \
+            if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;          \
             ovo_streaming_csr_host_impl<InT, IndexT, IndptrT>(                 \
                 h_data.data(), h_indices.data(), h_indptr.data(), n_full_rows, \
                 h_ref_row_ids.data(), n_ref, h_grp_row_ids.data(),             \

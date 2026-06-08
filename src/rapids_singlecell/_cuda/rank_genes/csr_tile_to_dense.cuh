@@ -24,12 +24,15 @@ __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
     }
     const long long row_start = static_cast<long long>(indptr[row]);
     const long long row_end = static_cast<long long>(indptr[row + 1]);
+    // Keep column ids in IndexT: narrowing a 64-bit IndexT to int would
+    // truncate large column ids and misplace writes.
+    const IndexT lb = static_cast<IndexT>(col_lb);
+    const IndexT ub = static_cast<IndexT>(col_ub);
     for (long long k = row_start; k < row_end; ++k) {
-        const int col = static_cast<int>(indices[k]);
-        if (col >= col_lb && col < col_ub) {
-            atomicAdd(
-                &out[static_cast<long long>(col - col_lb) * n_cells + row],
-                static_cast<double>(data[k]));
+        const IndexT col = indices[k];
+        if (col >= lb && col < ub) {
+            atomicAdd(&out[static_cast<long long>(col - lb) * n_cells + row],
+                      static_cast<double>(data[k]));
         }
     }
 }

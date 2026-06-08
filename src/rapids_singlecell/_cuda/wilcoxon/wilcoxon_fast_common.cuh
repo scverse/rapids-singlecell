@@ -58,9 +58,10 @@ static inline size_t cub_segmented_sortkeys_temp_bytes(int num_items,
     size_t bytes = 0;
     auto* fk = reinterpret_cast<float*>(1);
     auto* doff = reinterpret_cast<int*>(1);
-    cub::DeviceSegmentedRadixSort::SortKeys(nullptr, bytes, fk, fk, num_items,
-                                            num_segments, doff, doff + 1,
-                                            BEGIN_BIT, END_BIT);
+    cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
+                   nullptr, bytes, fk, fk, num_items, num_segments, doff,
+                   doff + 1, BEGIN_BIT, END_BIT),
+               "CUB SortKeys temp-size query");
     return bytes;
 }
 
@@ -71,9 +72,10 @@ static inline size_t cub_segmented_sortpairs_temp_bytes(int num_items,
     auto* fk = reinterpret_cast<float*>(1);
     auto* v = reinterpret_cast<ValT*>(1);
     auto* off = reinterpret_cast<int*>(1);
-    cub::DeviceSegmentedRadixSort::SortPairs(nullptr, bytes, fk, fk, v, v,
-                                             num_items, num_segments, off,
-                                             off + 1, BEGIN_BIT, END_BIT);
+    cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
+                   nullptr, bytes, fk, fk, v, v, num_items, num_segments, off,
+                   off + 1, BEGIN_BIT, END_BIT),
+               "CUB SortPairs temp-size query");
     return bytes;
 }
 

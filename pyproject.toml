@@ -172,8 +172,15 @@ sdist.include = [ "src/rapids_singlecell/_version.py" ]
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]
+# Exclude CUDA libs by SONAME glob (auditwheel >= 6.2): suffixes are version-
+# dependent (cusolver is libcusolver.so.11 on CUDA 12 but .12 on CUDA 13), so a
+# `.*` glob stays correct across CUDA majors where hardcoded `.12`/`.13` would
+# miss variants and bundle ~186MB (cublasLt, cusparse, nvJitLink) that CuPy
+# provides at runtime. librmm.so / librapids_logger.so come from the librmm /
+# rapids_logger wheels. Keep this list in sync with CIBW_REPAIR_WHEEL_COMMAND in
+# .github/workflows/publish.yml (that env var overrides this block in CI).
 repair-wheel-command = [
-    "auditwheel repair --exclude libcublas.so.12 --exclude libcublas.so.13 --exclude libcublasLt.so.12 --exclude libcublasLt.so.13 --exclude libcudart.so.12 --exclude libcudart.so.13 --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
+    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
     "pipx run abi3audit --strict --report {wheel}",
 ]
 [tool.cibuildwheel.macos]

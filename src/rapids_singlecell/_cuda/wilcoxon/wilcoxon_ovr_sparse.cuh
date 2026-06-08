@@ -174,11 +174,12 @@ static void ovr_sparse_csc_host_streaming_impl(
         // CUB sort only stored nonzeros (float32 keys)
         if (batch_nnz > 0) {
             size_t temp = cub_temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                buf.cub_temp, temp, buf.d_sparse_data_f32, buf.keys_out,
-                buf.d_sparse_indices, buf.vals_out, batch_nnz, sb_cols,
-                buf.d_seg_offsets, buf.d_seg_offsets + 1, BEGIN_BIT, END_BIT,
-                stream);
+            cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
+                           buf.cub_temp, temp, buf.d_sparse_data_f32,
+                           buf.keys_out, buf.d_sparse_indices, buf.vals_out,
+                           batch_nnz, sb_cols, buf.d_seg_offsets,
+                           buf.d_seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
+                       "host CSC OVR segmented sort");
         }
 
         // Sparse rank kernel (stats already captured above)
@@ -448,11 +449,12 @@ static void ovr_sparse_csr_host_streaming_impl(
 
         if (batch_nnz > 0) {
             size_t temp = cub_temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                buf.cub_temp, temp, buf.csc_vals_f32, buf.keys_out,
-                buf.csc_row_idx, buf.vals_out, batch_nnz, sb_cols,
-                buf.col_offsets, buf.col_offsets + 1, BEGIN_BIT, END_BIT,
-                stream);
+            cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
+                           buf.cub_temp, temp, buf.csc_vals_f32, buf.keys_out,
+                           buf.csc_row_idx, buf.vals_out, batch_nnz, sb_cols,
+                           buf.col_offsets, buf.col_offsets + 1, BEGIN_BIT,
+                           END_BIT, stream),
+                       "host CSR OVR segmented sort");
         }
 
         launch_ovr_sparse_rank<int>(
@@ -599,11 +601,12 @@ static void ovr_sparse_csc_streaming_impl(
         // Sort only stored values (keys=data, vals=row_indices)
         if (batch_nnz > 0) {
             size_t temp = cub_temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                buf.cub_temp, temp, csc_data + ptr_start, buf.keys_out,
-                csc_indices + ptr_start, buf.vals_out, batch_nnz, sb_cols,
-                buf.seg_offsets, buf.seg_offsets + 1, BEGIN_BIT, END_BIT,
-                stream);
+            cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
+                           buf.cub_temp, temp, csc_data + ptr_start,
+                           buf.keys_out, csc_indices + ptr_start, buf.vals_out,
+                           batch_nnz, sb_cols, buf.seg_offsets,
+                           buf.seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
+                       "device CSC OVR segmented sort");
         }
 
         // Sparse rank kernel (handles implicit zeros analytically)
@@ -803,10 +806,12 @@ static void ovr_sparse_csr_streaming_impl(
 
             // CUB sort only the nonzeros
             size_t temp = cub_temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                buf.cub_temp, temp, buf.csc_vals, buf.keys_out, buf.csc_row_idx,
-                buf.vals_out, batch_nnz, sb_cols, buf.col_offsets,
-                buf.col_offsets + 1, BEGIN_BIT, END_BIT, stream);
+            cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
+                           buf.cub_temp, temp, buf.csc_vals, buf.keys_out,
+                           buf.csc_row_idx, buf.vals_out, batch_nnz, sb_cols,
+                           buf.col_offsets, buf.col_offsets + 1, BEGIN_BIT,
+                           END_BIT, stream),
+                       "device CSR OVR segmented sort");
         }
 
         // Sparse rank kernel (handles implicit zeros analytically)

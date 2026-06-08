@@ -111,6 +111,34 @@ if (RSC_BUILD_EXTENSIONS)
   else()
     find_package(rmm CONFIG REQUIRED)
   endif()
+
+  # CCCL 3.3.0 (shipped by RAPIDS 26.04) declares the
+  # cudaDevAttrHostNumaMemoryPoolsSupported device-attribute specialization under
+  # `_CCCL_CTK_AT_LEAST(12, 6)`, but the CUDA runtime only added that enum in 12.9.
+  # So compiling the RMM/CCCL-including TUs (the Wilcoxon scratch allocator) against
+  # a CUDA 12.6-12.8 toolkit fails with a cryptic
+  # `error: the global scope has no "cudaDevAttrHostNumaMemoryPoolsSupported"`.
+  # CCCL fixed the guard to `_CCCL_CTK_AT_LEAST(12, 9)` after 3.3.0 (cccl PR #7838),
+  # so RAPIDS >= 26.06 (CCCL > 3.3.0) closes the gap -- only flag the buggy CCCL.
+  # Fail fast with an actionable message. Prebuilt wheels are unaffected: they are
+  # built on CUDA 12.2 (below the guard), so the enum is never referenced.
+  set(_rsc_cccl_buggy_numa_guard TRUE)
+  if (DEFINED CCCL_VERSION AND CCCL_VERSION VERSION_GREATER 3.3.0)
+    set(_rsc_cccl_buggy_numa_guard FALSE)
+  endif()
+  if (NOT RSC_SKIP_CUDA_VERSION_CHECK
+      AND _rsc_cccl_buggy_numa_guard
+      AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.6
+      AND CUDAToolkit_VERSION VERSION_LESS 12.9)
+    message(FATAL_ERROR
+      "Cannot build rapids_singlecell from source with CUDA ${CUDAToolkit_VERSION} against "
+      "CCCL ${CCCL_VERSION} (RAPIDS 26.04): it references cudaDevAttrHostNumaMemoryPoolsSupported, "
+      "which the CUDA 12.6-12.8 toolkit does not define (NVIDIA added it in 12.9). "
+      "Use CUDA >= 12.9 (or <= 12.5), upgrade to RAPIDS >= 26.06 (CCCL > 3.3.0 fixes the guard), "
+      "or install the prebuilt wheel (pip install rapids-singlecell-cu12). "
+      "If your toolkit does define this enum, override with -DRSC_SKIP_CUDA_VERSION_CHECK=ON.")
+  endif()
+
   message(STATUS "Using RMM for CUDA extension scratch allocations")
   message(STATUS "Building for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 else()

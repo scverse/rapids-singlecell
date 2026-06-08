@@ -20,6 +20,12 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
  * Scatter CSR nonzeros into CSC layout for columns [col_start, col_stop).
  * write_pos[c - col_start] must be initialized to the prefix-sum offset
  * for column c.  Each thread atomically claims a unique destination slot.
+ *
+ * PRECONDITION: each row's `indices` must be sorted ascending. The binary
+ * search for col_start and the `break` at col_stop both depend on it; unsorted
+ * rows would silently drop or misplace nonzeros. Every caller enforces this --
+ * the Python dispatch calls `sort_indices()` on the CSR/CSC input before
+ * invoking the streaming impls that launch this kernel.
  */
 template <typename InT, typename IndexT, typename IndptrT>
 __global__ void csr_scatter_to_csc_kernel(

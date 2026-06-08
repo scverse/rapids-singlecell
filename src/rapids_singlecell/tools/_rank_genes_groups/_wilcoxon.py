@@ -354,6 +354,10 @@ def _host_sparse_fn_and_arrays(module, base_name: str, X):
     # Row/column indices always fit int32 (cells and genes are < 2^31); only the
     # indptr (cumulative nnz) can need int64. Mirrors the rest of the sparse code.
     is_i64 = X.indptr.dtype == np.int64
+    # The *_f64 binding only changes the host pointer dtype so float64 data can
+    # be passed without a host-side copy; it still ranks in float32 on-device
+    # (the kernels cast InT -> float before the segmented sort). See
+    # _device_sparse_arrays_f32 for why float32 ranking is the uniform design.
     suffix = ""
     if is_f64:
         suffix += "_f64"
@@ -365,6 +369,15 @@ def _host_sparse_fn_and_arrays(module, base_name: str, X):
 
 
 def _device_sparse_arrays_f32(X):
+    """Cast device-sparse arrays for the Wilcoxon kernels.
+
+    Wilcoxon ranking sorts float32 keys on every path -- the sparse fast paths
+    AND the dense fallback (``_get_dense_column_block_f32``); the CUB segmented
+    sort is float-keyed throughout. Casting ``X.data`` to float32 here therefore
+    does not diverge from any float64 ranking path, because there is none. For
+    count data float32 is exact (integer values < 2**24) and scanpy parity holds
+    at 1e-13. float64 input is accepted only to spare the caller a pre-cast.
+    """
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype == np.float32 or data_dtype == np.float64:
         pass
@@ -869,7 +882,9 @@ def _wilcoxon_with_reference(
                 f"full-matrix conversion from {X.format!r}."
             )
 
-        rank_sums = cp.empty((n_test, n_total_genes), dtype=cp.float64)
+        # zeros, not empty: an all-empty test batch (n_all_grp == 0)
+        # short-circuits the kernel without writing rank_sums.
+        rank_sums = cp.zeros((n_test, n_total_genes), dtype=cp.float64)
         tie_corr_arr = cp.ones((n_test, n_total_genes), dtype=cp.float64)
         n_groups_stats = n_test + 1
         compute_vars = False
@@ -1019,7 +1034,9 @@ def _wilcoxon_with_reference(
             sparse_X.sort_indices()
         data, indices, indptr = _device_sparse_arrays_f32(sparse_X)
         offsets_gpu = cp.asarray(offsets_np, dtype=cp.int32)
-        rank_sums = cp.empty((n_test, n_total_genes), dtype=cp.float64)
+        # zeros, not empty: an all-empty test batch (n_all_grp == 0)
+        # short-circuits the kernel without writing rank_sums.
+        rank_sums = cp.zeros((n_test, n_total_genes), dtype=cp.float64)
         tie_corr_arr = cp.ones((n_test, n_total_genes), dtype=cp.float64)
 
         if cpsp.isspmatrix_csc(sparse_X):
@@ -1110,8 +1127,10 @@ def _wilcoxon_with_reference(
 
         ref_f32 = cp.asarray(ref_block, dtype=cp.float32, order="F")
         grp_f32 = cp.asarray(grp_block, dtype=cp.float32, order="F")
-        rank_sums = cp.empty((n_test, n_cols), dtype=cp.float64)
-        tie_corr = cp.empty((n_test, n_cols), dtype=cp.float64)
+        # zeros/ones, not empty: an all-empty test batch (n_all_grp == 0)
+        # short-circuits the kernel, leaving these outputs unwritten.
+        rank_sums = cp.zeros((n_test, n_cols), dtype=cp.float64)
+        tie_corr = cp.ones((n_test, n_cols), dtype=cp.float64)
 
         _wc.ovo_rank_dense_tiered_unsorted_ref(
             ref_f32,

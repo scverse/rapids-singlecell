@@ -21,6 +21,19 @@ inline void cuda_check_last_error(const char* kernel_name) {
 
 #define CUDA_CHECK_LAST_ERROR(kernel_name) cuda_check_last_error(#kernel_name)
 
+/// Check a cudaError_t returned directly by a CUDA/CUB API call.
+/// Unlike CUDA_CHECK_LAST_ERROR (which inspects cudaGetLastError after a
+/// <<<...>>> launch), this validates the status a function call returns -- e.g.
+/// cub::DeviceSegmentedRadixSort::SortKeys or cudaStreamSynchronize -- so a
+/// failed call surfaces here with a clear label instead of as corrupted output
+/// at a later synchronization point.
+inline void cuda_check(cudaError_t err, const char* what) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string(what) +
+                                 " failed: " + cudaGetErrorString(err));
+    }
+}
+
 /// Per-axis cached cap on `gridDim.{x,y,z}`. These differ in CUDA:
 ///   gridDim.x: 2^31-1 on CC 3.0+
 ///   gridDim.y: 65535 on most GPUs

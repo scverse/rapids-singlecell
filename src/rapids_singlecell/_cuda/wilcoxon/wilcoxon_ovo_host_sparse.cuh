@@ -223,10 +223,11 @@ static void ovo_streaming_csc_host_impl(
         upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
         {
             size_t temp = cub_temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                buf.cub_temp, temp, buf.ref_dense, buf.ref_sorted,
-                sb_ref_actual, sb_cols, buf.ref_seg_offsets,
-                buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream);
+            cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
+                           buf.cub_temp, temp, buf.ref_dense, buf.ref_sorted,
+                           sb_ref_actual, sb_cols, buf.ref_seg_offsets,
+                           buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
+                       "host CSC OVO ref segmented sort");
         }
 
         // ---- Extract grp from CSC via row_map ----
@@ -559,10 +560,13 @@ static void ovo_streaming_csr_host_impl(
         ScopedCudaBuffer cub_temp_buf(ref_cub_bytes);
         upload_linear_offsets(d_ref_seg, n_cols, n_ref, ref_stream);
         size_t temp = ref_cub_bytes;
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            cub_temp_buf.data(), temp, d_ref_dense, d_ref_sorted, ref_items_i32,
-            n_cols, d_ref_seg, d_ref_seg + 1, BEGIN_BIT, END_BIT, ref_stream);
-        cudaStreamSynchronize(ref_stream);
+        cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
+                       cub_temp_buf.data(), temp, d_ref_dense, d_ref_sorted,
+                       ref_items_i32, n_cols, d_ref_seg, d_ref_seg + 1,
+                       BEGIN_BIT, END_BIT, ref_stream),
+                   "host CSR OVO ref segmented sort");
+        cuda_check(cudaStreamSynchronize(ref_stream),
+                   "host CSR OVO ref sort sync");
     }  // ref scratch drops here
     cudaStreamDestroy(ref_stream);
 

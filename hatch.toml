@@ -38,6 +38,14 @@ overrides.matrix.deps.extra-dependencies = [
     { if = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
+    # numpy 2.5 dropped the `np.row_stack` alias that numba-cuda still calls, so
+    # `import rapids_singlecell` fails on numpy>=2.5. Only the prerelease-allowing
+    # envs can pull it; cap below 2.5 (`<2.5.0a0` so it also excludes 2.5.0rcN
+    # under UV_PRERELEASE=allow). Drop once numba-cuda no longer needs the alias.
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numpy<2.5.0a0" },
 ]
 overrides.matrix.cuda.extra-dependencies = [
     { if = [ "13" ], value = "cuml-cu13<26.8" },

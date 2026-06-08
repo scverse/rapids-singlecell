@@ -7,6 +7,24 @@
 - NVIDIA GPU with CUDA support
 - [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
 - A RAPIDS environment (e.g., conda `rapids-26.04` or pip-installed RAPIDS)
+- **CUDA toolkit ≥ 12.9, or ≤ 12.5, for building from source** (see note below)
+
+```{important}
+**On RAPIDS 26.04, building from source needs CUDA ≥ 12.9 (or ≤ 12.5) on CUDA 12.**
+RAPIDS 26.04 ships CCCL 3.3.0, which references the `cudaDevAttrHostNumaMemoryPoolsSupported`
+device attribute whenever the toolkit is ≥ 12.6, but NVIDIA only added that enum in
+CUDA 12.9. So compiling the RMM/CCCL-using kernels (the Wilcoxon scratch allocator)
+against a **CUDA 12.6–12.8** toolkit fails with
+`error: the global scope has no "cudaDevAttrHostNumaMemoryPoolsSupported"`.
+
+This is an upstream CCCL guard bug, **fixed in CCCL > 3.3.0 (RAPIDS ≥ 26.06)** — so
+the gap only affects RAPIDS 26.04. CUDA 13.x is unaffected. If you're on RAPIDS 26.04
++ CUDA 12.6–12.8, either build with CUDA ≥ 12.9 (or ≤ 12.5), upgrade to RAPIDS ≥ 26.06,
+or just use the **prebuilt wheel** (`pip install rapids-singlecell-cu12`) — wheels are
+built on CUDA 12.2 (below the guard), so the enum is never referenced and they run fine
+on any CUDA 12.x runtime, including 12.6–12.8. The build emits an actionable error in
+this range; override only if your toolkit defines the enum with `-DRSC_SKIP_CUDA_VERSION_CHECK=ON`.
+```
 
 ### Clone and install
 

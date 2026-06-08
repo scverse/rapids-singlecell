@@ -74,6 +74,22 @@ static void def_csr_tile_to_dense(nb::module_& m) {
             if (n_cells <= 0 || col_ub <= col_lb) {
                 return;
             }
+            if (col_lb < 0) {
+                throw std::invalid_argument(
+                    "csr_tile_to_dense: col_lb must be non-negative");
+            }
+            if (indices.shape(0) != data.shape(0)) {
+                throw std::invalid_argument(
+                    "csr_tile_to_dense: indices and data must have equal "
+                    "length");
+            }
+            if (out.ndim() != 2 || static_cast<int>(out.shape(0)) != n_cells ||
+                static_cast<long long>(out.shape(1)) <
+                    static_cast<long long>(col_ub) - col_lb) {
+                throw std::invalid_argument(
+                    "csr_tile_to_dense: out must be a (n_cells, >= col_ub - "
+                    "col_lb) array");
+            }
             constexpr int CSR_TILE_BLOCK = 128;
             const unsigned int grid =
                 (static_cast<unsigned int>(n_cells) + CSR_TILE_BLOCK - 1) /
@@ -122,12 +138,38 @@ void register_bindings(nb::module_& m) {
            gpu_array_c<double, Device> group_sum_sq,
            gpu_array_c<double, Device> group_nnz, bool compute_nnz,
            std::uintptr_t stream) {
+            if (block.ndim() != 2 || group_sums.ndim() != 2 ||
+                group_sum_sq.ndim() != 2) {
+                throw std::invalid_argument(
+                    "group_chunk_stats: block, group_sums and group_sum_sq "
+                    "must be 2-D");
+            }
             const int n_rows = static_cast<int>(block.shape(0));
             const int n_cols = static_cast<int>(block.shape(1));
             const int n_groups = static_cast<int>(group_sums.shape(0));
             const long long total = static_cast<long long>(n_rows) * n_cols;
             if (total <= 0) {
                 return;
+            }
+            if (static_cast<int>(group_codes.shape(0)) != n_rows) {
+                throw std::invalid_argument(
+                    "group_chunk_stats: group_codes length must equal block "
+                    "rows");
+            }
+            if (static_cast<int>(group_sum_sq.shape(0)) != n_groups ||
+                static_cast<int>(group_sums.shape(1)) != n_cols ||
+                static_cast<int>(group_sum_sq.shape(1)) != n_cols) {
+                throw std::invalid_argument(
+                    "group_chunk_stats: group_sums and group_sum_sq must be "
+                    "(n_groups, n_cols)");
+            }
+            if (compute_nnz &&
+                (group_nnz.ndim() != 2 ||
+                 static_cast<int>(group_nnz.shape(0)) != n_groups ||
+                 static_cast<int>(group_nnz.shape(1)) != n_cols)) {
+                throw std::invalid_argument(
+                    "group_chunk_stats: group_nnz must be (n_groups, n_cols) "
+                    "when compute_nnz is set");
             }
             const unsigned int grid = strided_grid(total, GROUP_STATS_BLOCK);
             group_chunk_stats_kernel<<<grid, GROUP_STATS_BLOCK, 0,
