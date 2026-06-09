@@ -10,10 +10,8 @@
 
 #include <cub/device/device_segmented_radix_sort.cuh>
 
-#include "../nb_types.h"  // for CUDA_CHECK_LAST_ERROR
-
-void* wilcoxon_rmm_allocate(size_t bytes);
-void wilcoxon_rmm_deallocate(void* ptr, size_t bytes);
+#include "../nb_types.h"     // for CUDA_CHECK_LAST_ERROR
+#include "../rmm_scratch.h"  // rmm_allocate, RmmScratchPool, ScopedCudaBuffer
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_THREADS_PER_BLOCK = 512;
@@ -178,60 +176,6 @@ struct HostRegisterGuard {
         }
         return *this;
     }
-};
-
-// ---------------------------------------------------------------------------
-// Small allocation pool for temporary CUDA buffers. Uses the current RMM device
-// resource so scratch participates in the same pool as CuPy/RAPIDS allocations.
-// ---------------------------------------------------------------------------
-struct RmmScratchPool {
-    struct Allocation {
-        void* ptr = nullptr;
-        size_t bytes = 0;
-    };
-    std::vector<Allocation> bufs;
-
-    ~RmmScratchPool() {
-        for (Allocation alloc : bufs) {
-            if (!alloc.ptr) continue;
-            wilcoxon_rmm_deallocate(alloc.ptr, alloc.bytes);
-        }
-    }
-
-    template <typename T>
-    T* alloc(size_t count) {
-        if (count == 0) count = 1;
-        if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
-            throw std::runtime_error(
-                "Wilcoxon scratch allocation size overflow");
-        }
-        size_t bytes = count * sizeof(T);
-        void* ptr = wilcoxon_rmm_allocate(bytes);
-        bufs.push_back({ptr, bytes});
-        return static_cast<T*>(ptr);
-    }
-};
-
-struct ScopedCudaBuffer {
-    void* ptr = nullptr;
-    size_t bytes = 0;
-
-    explicit ScopedCudaBuffer(size_t requested_bytes) {
-        bytes = requested_bytes == 0 ? 1 : requested_bytes;
-        ptr = wilcoxon_rmm_allocate(bytes);
-    }
-
-    ~ScopedCudaBuffer() {
-        if (!ptr) return;
-        wilcoxon_rmm_deallocate(ptr, bytes);
-    }
-
-    void* data() {
-        return ptr;
-    }
-
-    ScopedCudaBuffer(const ScopedCudaBuffer&) = delete;
-    ScopedCudaBuffer& operator=(const ScopedCudaBuffer&) = delete;
 };
 
 static inline int round_up_to_warp(int n) {

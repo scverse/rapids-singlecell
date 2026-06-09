@@ -188,6 +188,20 @@ function(add_nb_cuda_module target src)
   endif()
 endfunction()
 
+# An RMM-backed nanobind CUDA module: add_nb_cuda_module plus the shared RMM
+# scratch allocator (rmm_scratch.cu) and the rmm::rmm link. librmm.so is resolved
+# at runtime via the cuML preload (rapids_singlecell/__init__.py imports cuML
+# before these extensions, loading librmm into the process), so no INSTALL_RPATH
+# is needed. Reusable by any module that needs RMM device scratch.
+function(add_rmm_cuda_module target src)
+  add_nb_cuda_module(${target} ${src})
+  if (RSC_BUILD_EXTENSIONS)
+    target_sources(${target} PRIVATE
+        src/rapids_singlecell/_cuda/rmm_scratch.cu)
+    target_link_libraries(${target} PRIVATE rmm::rmm)
+  endif()
+endfunction()
+
 if (RSC_BUILD_EXTENSIONS)
   # CUDA modules
   add_nb_cuda_module(_mean_var_cuda     src/rapids_singlecell/_cuda/mean_var/mean_var.cu)
@@ -217,12 +231,8 @@ if (RSC_BUILD_EXTENSIONS)
   add_nb_cuda_module(_pseudobulk_cuda   src/rapids_singlecell/_cuda/pseudobulk/pseudobulk.cu)
   add_nb_cuda_module(_hvg_cuda          src/rapids_singlecell/_cuda/hvg/hvg.cu)
   add_nb_cuda_module(_kde_cuda          src/rapids_singlecell/_cuda/kde/kde.cu)
-  add_nb_cuda_module(_wilcoxon_cuda     src/rapids_singlecell/_cuda/wilcoxon/wilcoxon.cu)
-  target_sources(_wilcoxon_cuda PRIVATE src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_rmm.cu)
-  target_link_libraries(_wilcoxon_cuda PRIVATE rmm::rmm)
-  add_nb_cuda_module(_wilcoxon_sparse_cuda src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_sparse.cu)
-  target_sources(_wilcoxon_sparse_cuda PRIVATE src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_rmm.cu)
-  target_link_libraries(_wilcoxon_sparse_cuda PRIVATE rmm::rmm)
+  add_rmm_cuda_module(_wilcoxon_cuda        src/rapids_singlecell/_cuda/wilcoxon/wilcoxon.cu)
+  add_rmm_cuda_module(_wilcoxon_sparse_cuda src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_sparse.cu)
   add_nb_cuda_module(_rank_stats_cuda   src/rapids_singlecell/_cuda/rank_genes/rank_stats.cu)
   # Harmony CUDA modules
   add_nb_cuda_module(_harmony_scatter_cuda   src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu)

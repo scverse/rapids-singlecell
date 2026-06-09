@@ -49,6 +49,7 @@ __all__ = [
     "_spca_cuda",
     "_wilcoxon_binned_cuda",
     "_wilcoxon_cuda",
+    "_wilcoxon_sparse_cuda",
 ]
 
 
