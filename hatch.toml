@@ -40,14 +40,14 @@ overrides.matrix.deps.extra-dependencies = [
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
 ]
 overrides.matrix.cuda.extra-dependencies = [
-    { if = [ "13" ], value = "cuml-cu13<26.8" },
-    { if = [ "13" ], value = "cudf-cu13<26.8" },
-    { if = [ "13" ], value = "cugraph-cu13<26.8" },
-    { if = [ "13" ], value = "cuvs-cu13<26.8" },
-    { if = [ "12" ], value = "cuml-cu12<26.8" },
-    { if = [ "12" ], value = "cudf-cu12<26.8" },
-    { if = [ "12" ], value = "cugraph-cu12<26.8" },
-    { if = [ "12" ], value = "cuvs-cu12<26.8" },
+    { if = [ "13" ], value = "cuml-cu13<26.10" },
+    { if = [ "13" ], value = "cudf-cu13<26.10" },
+    { if = [ "13" ], value = "cugraph-cu13<26.10" },
+    { if = [ "13" ], value = "cuvs-cu13<26.10" },
+    { if = [ "12" ], value = "cuml-cu12<26.10" },
+    { if = [ "12" ], value = "cudf-cu12<26.10" },
+    { if = [ "12" ], value = "cugraph-cu12<26.10" },
+    { if = [ "12" ], value = "cuvs-cu12<26.10" },
 ]
 
 ## For prerelease we rely on UV_PRERELEASE + nightly index; features select cu12/cu13
