@@ -25,11 +25,6 @@ _MIXTURE_MODEL_VAR_COLUMNS = [
     "mix_probs_0",
     "mix_probs_1",
     "threshold",
-    "weight_Poisson",
-    "weight_Normal",
-    "lambda",
-    "mu",
-    "scale",
 ]
 
 
@@ -38,9 +33,8 @@ class GuideAssignment:
 
     Provides threshold-based and mixture-model-based methods for assigning
     cells to guide RNAs, compatible with pertpy's ``GuideAssignment`` API.
-    The mixture model follows crispat's Poisson-Gaussian assignment rule
-    while using batched EM on GPU instead of per-guide Pyro SVI, yielding
-    orders-of-magnitude speedup.
+    The mixture model fits a Poisson-Gaussian mixture per guide with batched
+    EM on GPU, yielding orders-of-magnitude speedup.
     """
 
     def assign_by_threshold(
@@ -150,10 +144,9 @@ class GuideAssignment:
 
         Fits a two-component mixture (Poisson background + Gaussian signal)
         to the log₂-transformed non-zero counts of each guide simultaneously
-        using batched Expectation-Maximization on GPU. Like crispat's
-        Poisson-Gaussian assignment, the fitted model is converted to an
-        integer raw-count threshold. The default posterior cutoff matches
-        pertpy's crispat-style threshold rule.
+        using batched Expectation-Maximization on GPU. The fitted model is
+        converted to an integer raw-count threshold; the default posterior
+        cutoff matches pertpy's threshold rule.
 
         Parameters
         ----------
@@ -255,11 +248,6 @@ class GuideAssignment:
         adata.var.loc[valid_var_index, "mix_probs_0"] = pi0_cpu
         adata.var.loc[valid_var_index, "mix_probs_1"] = 1.0 - pi0_cpu
         adata.var.loc[valid_var_index, "threshold"] = thresholds_cpu
-        adata.var.loc[valid_var_index, "weight_Poisson"] = pi0_cpu
-        adata.var.loc[valid_var_index, "weight_Normal"] = 1.0 - pi0_cpu
-        adata.var.loc[valid_var_index, "lambda"] = lam_cpu
-        adata.var.loc[valid_var_index, "mu"] = mu_cpu
-        adata.var.loc[valid_var_index, "scale"] = sigma_cpu
 
         adata.obs[assigned_guides_key] = series_values
         return None
