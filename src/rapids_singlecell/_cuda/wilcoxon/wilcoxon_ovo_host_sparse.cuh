@@ -12,10 +12,9 @@ static void ovo_streaming_csc_host_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
     const int* h_ref_row_map, const int* h_grp_row_map,
     const int* h_grp_offsets, const int* h_stats_codes, double* d_rank_sums,
-    double* d_tie_corr, double* d_group_sums, double* d_group_sq_sums,
-    double* d_group_nnz, int n_ref, int n_all_grp, int n_rows, int n_cols,
-    int n_groups, int n_groups_stats, bool compute_tie_corr,
-    bool compute_sq_sums, bool compute_nnz, int sub_batch_cols) {
+    double* d_tie_corr, double* d_group_sums, double* d_group_nnz, int n_ref,
+    int n_all_grp, int n_rows, int n_cols, int n_groups, int n_groups_stats,
+    bool compute_tie_corr, bool compute_nnz, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
     // ---- Tier dispatch from host offsets ----
@@ -63,9 +62,9 @@ static void ovo_streaming_csc_host_impl(
         if (nnz > max_nnz) max_nnz = nnz;
     }
 
-    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
-
+    // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
     std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
@@ -123,7 +122,6 @@ static void ovo_streaming_csc_host_impl(
         double* d_rank_sums;
         double* d_tie_corr;
         double* d_group_sums;
-        double* d_group_sq_sums;
         double* d_group_nnz;
     };
     std::vector<StreamBuf> bufs(n_streams);
@@ -147,8 +145,6 @@ static void ovo_streaming_csc_host_impl(
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].d_group_sums =
             pool.alloc<double>((size_t)n_groups_stats * sub_batch_cols);
-        bufs[s].d_group_sq_sums = pool.alloc<double>(
-            compute_sq_sums ? (size_t)n_groups_stats * sub_batch_cols : 1);
         bufs[s].d_group_nnz = pool.alloc<double>(
             compute_nnz ? (size_t)n_groups_stats * sub_batch_cols : 1);
         if (run_huge) {
@@ -168,8 +164,8 @@ static void ovo_streaming_csc_host_impl(
     int tpb_rank =
         round_up_to_warp(std::min(max_grp_size, MAX_THREADS_PER_BLOCK));
     bool cast_use_gmem = false;
-    size_t smem_cast = cast_accumulate_smem_config(
-        n_groups_stats, compute_sq_sums, compute_nnz, cast_use_gmem);
+    size_t smem_cast =
+        cast_accumulate_smem_config(n_groups_stats, compute_nnz, cast_use_gmem);
 
     // Pin only the sparse input arrays; outputs live on the device.
     size_t total_nnz = (size_t)h_indptr[n_cols];
@@ -208,9 +204,9 @@ static void ovo_streaming_csc_host_impl(
         // ---- Cast to float32 for sort + accumulate stats in float64 ----
         launch_ovr_cast_and_accumulate_sparse<InT, IndexT>(
             buf.d_sparse_data_orig, buf.d_sparse_data_f32, buf.d_sparse_indices,
-            buf.d_indptr, d_stats_codes, buf.d_group_sums, buf.d_group_sq_sums,
-            buf.d_group_nnz, sb_cols, n_groups_stats, compute_sq_sums,
-            compute_nnz, UTIL_BLOCK_SIZE, smem_cast, cast_use_gmem, stream);
+            buf.d_indptr, d_stats_codes, buf.d_group_sums, buf.d_group_nnz,
+            sb_cols, n_groups_stats, compute_nnz, UTIL_BLOCK_SIZE, smem_cast,
+            cast_use_gmem, stream);
 
         // ---- Extract ref from CSC via row_map, sort ----
         cudaMemsetAsync(buf.ref_dense, 0, sb_ref_actual * sizeof(float),
@@ -262,12 +258,6 @@ static void ovo_streaming_csc_host_impl(
                           buf.d_group_sums, sb_cols * sizeof(double),
                           sb_cols * sizeof(double), n_groups_stats,
                           cudaMemcpyDeviceToDevice, stream);
-        if (compute_sq_sums) {
-            cudaMemcpy2DAsync(d_group_sq_sums + col, n_cols * sizeof(double),
-                              buf.d_group_sq_sums, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups_stats,
-                              cudaMemcpyDeviceToDevice, stream);
-        }
         if (compute_nnz) {
             cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
                               buf.d_group_nnz, sb_cols * sizeof(double),
@@ -316,8 +306,7 @@ static void ovo_streaming_csr_host_impl(
     int n_full_rows, const int* h_ref_row_ids, int n_ref,
     const int* h_grp_row_ids, const int* h_grp_offsets, int n_all_grp,
     int n_test, double* d_rank_sums, double* d_tie_corr, double* d_group_sums,
-    double* d_group_sq_sums, double* d_group_nnz, int n_cols,
-    int n_groups_stats, bool compute_tie_corr, bool compute_sq_sums,
+    double* d_group_nnz, int n_cols, int n_groups_stats, bool compute_tie_corr,
     bool compute_nnz, bool compute_sums, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_test == 0 || n_all_grp == 0) return;
 
@@ -431,10 +420,6 @@ static void ovo_streaming_csr_host_impl(
         cudaMemsetAsync(d_group_sums, 0,
                         (size_t)n_groups_stats * n_cols * sizeof(double));
     }
-    if (compute_sq_sums) {
-        cudaMemsetAsync(d_group_sq_sums, 0,
-                        (size_t)n_groups_stats * n_cols * sizeof(double));
-    }
     if (compute_nnz) {
         cudaMemsetAsync(d_group_nnz, 0,
                         (size_t)n_groups_stats * n_cols * sizeof(double));
@@ -534,8 +519,8 @@ static void ovo_streaming_csr_host_impl(
                     d_data_zc, d_indices_zc, d_indptr_full, d_ref_row_ids,
                     d_ref_indptr, /*d_stats_codes=*/nullptr,
                     /*fixed_slot=*/n_test, d_ref_data_f32, d_ref_indices,
-                    d_group_sums, d_group_sq_sums, d_group_nnz, n_ref, n_cols,
-                    n_groups_stats, compute_sums, compute_sq_sums, compute_nnz);
+                    d_group_sums, d_group_nnz, n_ref, n_cols, n_groups_stats,
+                    compute_sums, compute_nnz);
             CUDA_CHECK_LAST_ERROR(csr_gather_cast_accumulate_mapped_kernel);
         }
 
@@ -707,8 +692,8 @@ static void ovo_streaming_csr_host_impl(
                     d_grp_row_ids + row_start, buf.d_grp_indptr,
                     buf.d_pack_stats_codes, /*fixed_slot=*/-1,
                     buf.d_grp_data_f32, buf.d_grp_indices, d_group_sums,
-                    d_group_sq_sums, d_group_nnz, pack_rows, n_cols,
-                    n_groups_stats, compute_sums, compute_sq_sums, compute_nnz);
+                    d_group_nnz, pack_rows, n_cols, n_groups_stats,
+                    compute_sums, compute_nnz);
             CUDA_CHECK_LAST_ERROR(csr_gather_cast_accumulate_mapped_kernel);
         }
 

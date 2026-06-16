@@ -151,24 +151,20 @@ def _fill_ovo_chunk_stats(
 def _fill_basic_stats_from_accumulators(
     rg: _RankGenes,
     group_sums: cp.ndarray,
-    group_sq_sums: cp.ndarray,
     group_nnz: cp.ndarray,
     group_sizes: np.ndarray,
     *,
     n_cells: int,
-    compute_vars: bool,
     total_sums: cp.ndarray | None = None,
-    total_sq_sums: cp.ndarray | None = None,
     total_nnz: cp.ndarray | None = None,
 ) -> None:
+    # Wilcoxon does not output per-group variance; vars are left zero (real
+    # group means/pts come from group_sums/group_nnz, which drive the lfc/pts
+    # output and the rank test).
     n = cp.asarray(group_sizes, dtype=cp.float64)[:, None]
     means = group_sums / n
     rg.means = cp.asnumpy(means)
-    if compute_vars:
-        group_ss = group_sq_sums - n * means**2
-        rg.vars = cp.asnumpy(cp.maximum(group_ss / cp.maximum(n - 1, 1), 0))
-    else:
-        rg.vars = np.zeros_like(rg.means)
+    rg.vars = np.zeros_like(rg.means)
     rg.pts = cp.asnumpy(group_nnz / n) if rg.comp_pts else None
 
     n_rest = cp.float64(n_cells) - n
@@ -177,13 +173,7 @@ def _fill_basic_stats_from_accumulators(
     rest_sums = total_sums - group_sums
     rest_means = rest_sums / n_rest
     rg.means_rest = cp.asnumpy(rest_means)
-    if compute_vars:
-        if total_sq_sums is None:
-            total_sq_sums = group_sq_sums.sum(axis=0, keepdims=True)
-        rest_ss = (total_sq_sums - group_sq_sums) - n_rest * rest_means**2
-        rg.vars_rest = cp.asnumpy(cp.maximum(rest_ss / cp.maximum(n_rest - 1, 1), 0))
-    else:
-        rg.vars_rest = np.zeros_like(rg.means_rest)
+    rg.vars_rest = np.zeros_like(rg.means_rest)
     if rg.comp_pts:
         if total_nnz is None:
             total_nnz = group_nnz.sum(axis=0, keepdims=True)
@@ -196,13 +186,11 @@ def _fill_basic_stats_from_accumulators(
 def _fill_ovo_stats_from_accumulators(
     rg: _RankGenes,
     group_sums_slots: cp.ndarray,
-    group_sq_sums_slots: cp.ndarray,
     group_nnz_slots: cp.ndarray,
     *,
     group_sizes: NDArray,
     test_group_indices: list[int],
     n_ref: int,
-    compute_vars: bool,
 ) -> None:
     n_test = len(test_group_indices)
     n_genes = int(group_sums_slots.shape[1])
@@ -221,10 +209,7 @@ def _fill_ovo_stats_from_accumulators(
 
     means_slots = group_sums_slots / slot_sizes_dev
     rg.means[slot_group_indices] = cp.asnumpy(means_slots)
-    if compute_vars:
-        group_ss = group_sq_sums_slots - slot_sizes_dev * means_slots**2
-        denom = cp.maximum(slot_sizes_dev - 1.0, 1.0)
-        rg.vars[slot_group_indices] = cp.asnumpy(cp.maximum(group_ss / denom, 0))
+    # vars left zero: wilcoxon does not output per-group variance.
     if rg.comp_pts:
         rg.pts[slot_group_indices] = cp.asnumpy(group_nnz_slots / slot_sizes_dev)
 
@@ -408,8 +393,8 @@ def _device_sparse_fn(module, base_name: str, indptr: cp.ndarray):
 
 
 def _column_totals_for_host_matrix(
-    X, *, compute_sq_sums: bool, compute_nnz: bool
-) -> tuple[cp.ndarray, cp.ndarray | None, cp.ndarray | None]:
+    X, *, compute_nnz: bool
+) -> tuple[cp.ndarray, cp.ndarray | None]:
     n_cols = X.shape[1]
     if isinstance(X, sp.spmatrix | sp.sparray):
         data = np.asarray(X.data)
@@ -422,11 +407,6 @@ def _column_totals_for_host_matrix(
             sums = np.zeros(n_cols, dtype=np.float64)
             if starts.size:
                 sums[nonempty] = np.add.reduceat(values, starts)
-            sq_sums = None
-            if compute_sq_sums:
-                sq_sums = np.zeros(n_cols, dtype=np.float64)
-                if starts.size:
-                    sq_sums[nonempty] = np.add.reduceat(values * values, starts)
             nnz = None
             if compute_nnz:
                 nnz = np.zeros(n_cols, dtype=np.float64)
@@ -438,13 +418,6 @@ def _column_totals_for_host_matrix(
             indices = np.asarray(X.indices, dtype=np.intp)
             sums = np.bincount(indices, weights=values, minlength=n_cols).astype(
                 np.float64, copy=False
-            )
-            sq_sums = (
-                np.bincount(indices, weights=values * values, minlength=n_cols).astype(
-                    np.float64, copy=False
-                )
-                if compute_sq_sums
-                else None
             )
             nnz = (
                 np.bincount(
@@ -464,17 +437,12 @@ def _column_totals_for_host_matrix(
         raise TypeError(f"Unsupported host matrix type: {type(X)}")
 
     total_sums = cp.asarray(sums.reshape(1, n_cols), dtype=cp.float64)
-    total_sq_sums = (
-        cp.asarray(sq_sums.reshape(1, n_cols), dtype=cp.float64)
-        if sq_sums is not None
-        else None
-    )
     total_nnz = (
         cp.asarray(nnz.reshape(1, n_cols), dtype=cp.float64)
         if nnz is not None
         else None
     )
-    return total_sums, total_sq_sums, total_nnz
+    return total_sums, total_nnz
 
 
 def _host_ovr_totals_if_needed(
@@ -482,14 +450,11 @@ def _host_ovr_totals_if_needed(
     group_codes: np.ndarray,
     n_groups: int,
     *,
-    compute_sq_sums: bool,
     compute_nnz: bool,
-) -> tuple[cp.ndarray | None, cp.ndarray | None, cp.ndarray | None]:
+) -> tuple[cp.ndarray | None, cp.ndarray | None]:
     if not np.any(group_codes == n_groups):
-        return None, None, None
-    return _column_totals_for_host_matrix(
-        X, compute_sq_sums=compute_sq_sums, compute_nnz=compute_nnz
-    )
+        return None, None
+    return _column_totals_for_host_matrix(X, compute_nnz=compute_nnz)
 
 
 def wilcoxon(
@@ -574,16 +539,11 @@ def _wilcoxon_vs_rest(
         group_sizes_np = group_sizes.astype(np.float64, copy=False)
         group_sizes_dev = cp.asarray(group_sizes_np, dtype=cp.float64)
         rest_sizes = n_cells - group_sizes_dev
-        compute_vars = False
         compute_nnz = rg.comp_pts
 
         rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
         tie_corr = cp.ones(n_total_genes, dtype=cp.float64)
         group_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
-        group_sq_sums = cp.empty(
-            (n_groups, n_total_genes) if compute_vars else (1, 1),
-            dtype=cp.float64,
-        )
         group_nnz = cp.empty(
             (n_groups, n_total_genes) if compute_nnz else (1, 1),
             dtype=cp.float64,
@@ -606,13 +566,11 @@ def _wilcoxon_vs_rest(
                 rank_sums,
                 tie_corr,
                 group_sums,
-                group_sq_sums,
                 group_nnz,
                 n_rows=n_cells,
                 n_cols=n_total_genes,
                 n_groups=n_groups,
                 compute_tie_corr=tie_correct,
-                compute_sq_sums=compute_vars,
                 compute_nnz=compute_nnz,
                 sub_batch_cols=OVR_HOST_CSC_SUB_BATCH,
             )
@@ -633,35 +591,29 @@ def _wilcoxon_vs_rest(
                 rank_sums,
                 tie_corr,
                 group_sums,
-                group_sq_sums,
                 group_nnz,
                 n_rows=n_cells,
                 n_cols=n_total_genes,
                 n_groups=n_groups,
                 compute_tie_corr=tie_correct,
-                compute_sq_sums=compute_vars,
                 compute_nnz=compute_nnz,
                 sub_batch_cols=OVR_HOST_CSR_SUB_BATCH,
             )
 
         if rg._compute_stats_in_chunks:
-            total_sums, total_sq_sums, total_nnz = _host_ovr_totals_if_needed(
+            total_sums, total_nnz = _host_ovr_totals_if_needed(
                 X,
                 group_codes,
                 n_groups,
-                compute_sq_sums=compute_vars,
                 compute_nnz=compute_nnz,
             )
             _fill_basic_stats_from_accumulators(
                 rg,
                 group_sums,
-                group_sq_sums,
                 group_nnz,
                 group_sizes_np,
                 n_cells=n_cells,
-                compute_vars=compute_vars,
                 total_sums=total_sums,
-                total_sq_sums=total_sq_sums,
                 total_nnz=total_nnz,
             )
 
@@ -887,17 +839,12 @@ def _wilcoxon_with_reference(
         rank_sums = cp.zeros((n_test, n_total_genes), dtype=cp.float64)
         tie_corr_arr = cp.ones((n_test, n_total_genes), dtype=cp.float64)
         n_groups_stats = n_test + 1
-        compute_vars = False
         compute_sums = rg._compute_stats_in_chunks
         compute_nnz = rg.comp_pts
         group_sums = cp.empty(
             (n_groups_stats, n_total_genes)
             if (compute_sums or X.format == "csc")
             else (1,),
-            dtype=cp.float64,
-        )
-        group_sq_sums = cp.empty(
-            (n_groups_stats, n_total_genes) if compute_vars else (1,),
             dtype=cp.float64,
         )
         group_nnz = cp.empty(
@@ -934,7 +881,6 @@ def _wilcoxon_with_reference(
                 rank_sums,
                 tie_corr_arr,
                 group_sums,
-                group_sq_sums,
                 group_nnz,
                 n_ref=n_ref,
                 n_all_grp=n_all_grp,
@@ -943,7 +889,6 @@ def _wilcoxon_with_reference(
                 n_groups=n_test,
                 n_groups_stats=n_groups_stats,
                 compute_tie_corr=tie_correct,
-                compute_sq_sums=compute_vars,
                 compute_nnz=compute_nnz,
                 sub_batch_cols=OVO_HOST_SPARSE_SUB_BATCH,
             )
@@ -964,7 +909,6 @@ def _wilcoxon_with_reference(
                 rank_sums,
                 tie_corr_arr,
                 group_sums,
-                group_sq_sums,
                 group_nnz,
                 n_full_rows=X.shape[0],
                 n_ref=n_ref,
@@ -973,7 +917,6 @@ def _wilcoxon_with_reference(
                 n_test=n_test,
                 n_groups_stats=n_groups_stats,
                 compute_tie_corr=tie_correct,
-                compute_sq_sums=compute_vars,
                 compute_nnz=compute_nnz,
                 compute_sums=compute_sums,
                 sub_batch_cols=OVO_HOST_SPARSE_SUB_BATCH,
@@ -993,12 +936,10 @@ def _wilcoxon_with_reference(
                 _fill_ovo_stats_from_accumulators(
                     rg,
                     group_sums,
-                    group_sq_sums,
                     group_nnz,
                     group_sizes=group_sizes,
                     test_group_indices=test_group_indices,
                     n_ref=n_ref,
-                    compute_vars=compute_vars,
                 )
 
         scores, p_values = _ovo_z_pvals(

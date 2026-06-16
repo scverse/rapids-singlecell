@@ -273,9 +273,9 @@ static inline void launch_ovr_sparse_rank(
 // global memory. Same large-n_groups workloads that drive
 // sparse_ovr_smem_config to gmem also drive this one; both fallbacks are
 // load-bearing, not dead.
-static size_t cast_accumulate_smem_config(int n_groups, bool compute_sq_sums,
-                                          bool compute_nnz, bool& use_gmem) {
-    int n_arrays = 1 + (compute_sq_sums ? 1 : 0) + (compute_nnz ? 1 : 0);
+static size_t cast_accumulate_smem_config(int n_groups, bool compute_nnz,
+                                          bool& use_gmem) {
+    int n_arrays = 1 + (compute_nnz ? 1 : 0);
     size_t need = (size_t)n_arrays * n_groups * sizeof(double);
     if (need <= wilcoxon_max_smem_per_block()) {
         use_gmem = false;
@@ -302,8 +302,7 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
     const InT* __restrict__ data_in, float* __restrict__ data_f32_out,
     const IndexT* __restrict__ indices, const int* __restrict__ col_seg_offsets,
     const int* __restrict__ group_codes, double* __restrict__ group_sums,
-    double* __restrict__ group_sq_sums, double* __restrict__ group_nnz,
-    int sb_cols, int n_groups, bool compute_sq_sums = true,
+    double* __restrict__ group_nnz, int sb_cols, int n_groups,
     bool compute_nnz = true) {
     int col = blockIdx.x;
     if (col >= sb_cols) return;
@@ -312,19 +311,13 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
     int seg_end = col_seg_offsets[col + 1];
 
     // Packed layout matching cast_accumulate_smem_config, which sizes the
-    // dynamic smem as (1 + compute_sq_sums + compute_nnz) * n_groups doubles.
-    // s_nnz must follow only the arrays that are actually present: using a
-    // fixed 2*n_groups offset over-runs the allocation when sq-sums is off but
-    // nnz is on (the host OVR pts path), corrupting/faulting at larger
-    // n_groups.
+    // dynamic smem as (1 + compute_nnz) * n_groups doubles.
     extern __shared__ double smem[];
     double* s_sum = smem;
-    double* s_sq = smem + n_groups;
-    double* s_nnz = smem + (compute_sq_sums ? 2 : 1) * n_groups;
+    double* s_nnz = smem + n_groups;
 
     for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
         s_sum[g] = 0.0;
-        if (compute_sq_sums) s_sq[g] = 0.0;
         if (compute_nnz) s_nnz[g] = 0.0;
     }
     __syncthreads();
@@ -337,7 +330,6 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
         int g = group_codes[row];
         if (g < n_groups) {
             atomicAdd(&s_sum[g], v);
-            if (compute_sq_sums) atomicAdd(&s_sq[g], v * v);
             if (compute_nnz && v != 0.0) atomicAdd(&s_nnz[g], 1.0);
         }
     }
@@ -345,9 +337,6 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
 
     for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
         group_sums[(size_t)g * sb_cols + col] = s_sum[g];
-        if (compute_sq_sums) {
-            group_sq_sums[(size_t)g * sb_cols + col] = s_sq[g];
-        }
         if (compute_nnz) {
             group_nnz[(size_t)g * sb_cols + col] = s_nnz[g];
         }
@@ -364,8 +353,7 @@ __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
     const InT* __restrict__ data_in, float* __restrict__ data_f32_out,
     const IndexT* __restrict__ indices, const int* __restrict__ col_seg_offsets,
     const int* __restrict__ group_codes, double* __restrict__ group_sums,
-    double* __restrict__ group_sq_sums, double* __restrict__ group_nnz,
-    int sb_cols, int n_groups, bool compute_sq_sums = true,
+    double* __restrict__ group_nnz, int sb_cols, int n_groups,
     bool compute_nnz = true) {
     int col = blockIdx.x;
     if (col >= sb_cols) return;
@@ -381,9 +369,6 @@ __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
         int g = group_codes[row];
         if (g < n_groups) {
             atomicAdd(&group_sums[(size_t)g * sb_cols + col], v);
-            if (compute_sq_sums) {
-                atomicAdd(&group_sq_sums[(size_t)g * sb_cols + col], v * v);
-            }
             if (compute_nnz && v != 0.0) {
                 atomicAdd(&group_nnz[(size_t)g * sb_cols + col], 1.0);
             }
@@ -395,32 +380,27 @@ template <typename InT, typename IndexT = int>
 static void launch_ovr_cast_and_accumulate_sparse(
     const InT* d_data_orig, float* d_data_f32, const IndexT* d_indices,
     const int* d_col_offsets, const int* d_group_codes, double* d_group_sums,
-    double* d_group_sq_sums, double* d_group_nnz, int sb_cols, int n_groups,
-    bool compute_sq_sums, bool compute_nnz, int tpb, size_t smem_cast,
-    bool use_gmem, cudaStream_t stream) {
+    double* d_group_nnz, int sb_cols, int n_groups, bool compute_nnz, int tpb,
+    size_t smem_cast, bool use_gmem, cudaStream_t stream) {
     if (use_gmem) {
         size_t stats_items = (size_t)n_groups * sb_cols;
         cudaMemsetAsync(d_group_sums, 0, stats_items * sizeof(double), stream);
-        if (compute_sq_sums) {
-            cudaMemsetAsync(d_group_sq_sums, 0, stats_items * sizeof(double),
-                            stream);
-        }
         if (compute_nnz) {
             cudaMemsetAsync(d_group_nnz, 0, stats_items * sizeof(double),
                             stream);
         }
         ovr_cast_and_accumulate_sparse_global_kernel<InT, IndexT>
-            <<<sb_cols, tpb, 0, stream>>>(
-                d_data_orig, d_data_f32, d_indices, d_col_offsets,
-                d_group_codes, d_group_sums, d_group_sq_sums, d_group_nnz,
-                sb_cols, n_groups, compute_sq_sums, compute_nnz);
+            <<<sb_cols, tpb, 0, stream>>>(d_data_orig, d_data_f32, d_indices,
+                                          d_col_offsets, d_group_codes,
+                                          d_group_sums, d_group_nnz, sb_cols,
+                                          n_groups, compute_nnz);
         CUDA_CHECK_LAST_ERROR(ovr_cast_and_accumulate_sparse_global_kernel);
     } else {
         ovr_cast_and_accumulate_sparse_kernel<InT, IndexT>
             <<<sb_cols, tpb, smem_cast, stream>>>(
                 d_data_orig, d_data_f32, d_indices, d_col_offsets,
-                d_group_codes, d_group_sums, d_group_sq_sums, d_group_nnz,
-                sb_cols, n_groups, compute_sq_sums, compute_nnz);
+                d_group_codes, d_group_sums, d_group_nnz, sb_cols, n_groups,
+                compute_nnz);
         CUDA_CHECK_LAST_ERROR(ovr_cast_and_accumulate_sparse_kernel);
     }
 }

@@ -33,6 +33,8 @@ static void launch_ovr_rank_dense_streaming(
     size_t cub_temp_bytes =
         cub_segmented_sortpairs_temp_bytes(sub_items_i32, sub_batch_cols);
 
+    // pool first: streams drain before it frees their scratch (see guard doc).
+    RmmScratchPool pool;
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
 
     ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
@@ -42,7 +44,6 @@ static void launch_ovr_rank_dense_streaming(
                    "wait on inputs_ready (dense OVR)");
     }
 
-    RmmScratchPool pool;
     struct StreamBuf {
         float* keys_out;
         int* vals_in;
@@ -174,6 +175,8 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
     size_t ref_cub_temp_bytes =
         cub_segmented_sortkeys_temp_bytes(sub_ref_items_i32, sub_batch_cols);
 
+    // pool first: streams drain before it frees their scratch (see guard doc).
+    RmmScratchPool pool;
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
 
     ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
@@ -182,8 +185,6 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         cuda_check(cudaStreamWaitEvent(streams[i], inputs_ready.get(), 0),
                    "wait on inputs_ready (dense OVO)");
     }
-
-    RmmScratchPool pool;
     int* d_sort_group_ids = nullptr;
     if (run_huge) {
         d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());

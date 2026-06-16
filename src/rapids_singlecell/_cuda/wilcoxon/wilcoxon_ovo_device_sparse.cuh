@@ -273,9 +273,9 @@ static void ovo_streaming_csc_impl(
         cub_temp_bytes = std::max(cub_ref_bytes, cub_grp_bytes);
     }
 
-    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
-
+    // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
     int* d_sort_group_ids = nullptr;
     if (run_huge) {
         d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());

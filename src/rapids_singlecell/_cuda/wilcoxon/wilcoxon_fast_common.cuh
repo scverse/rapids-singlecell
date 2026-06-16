@@ -180,12 +180,10 @@ struct HostRegisterGuard {
 
 // RAII for CUDA streams/events: reclaim on every path (incl. exception unwind),
 // fixing the leak when a throwing call skips a trailing manual destroy. The
-// stream dtor SYNCHRONIZES before destroying. Teardown is safe in either
-// pool-vs-streams declaration order: on the normal path the launcher syncs all
-// streams before any dtor runs, and on exception unwind nothing re-allocates
-// the freed (pool-retained) scratch before the streams dtor's sync drains the
-// in-flight kernels. Invariant: do not place an allocating RAII member between
-// an RmmScratchPool and these guards.
+// stream dtor SYNCHRONIZES before destroying. Convention: declare the
+// RmmScratchPool BEFORE these guards so the streams (destroyed first) drain
+// their in-flight kernels before the pool (destroyed last) frees the scratch
+// those kernels read -- safe on the normal and exception-unwind paths alike.
 struct ScopedCudaStream {
     cudaStream_t stream = nullptr;
 
@@ -342,9 +340,8 @@ __global__ void csr_gather_cast_accumulate_mapped_kernel(
     const int* __restrict__ d_row_ids, const int* __restrict__ d_out_indptr,
     const int* __restrict__ d_stats_codes, int fixed_slot,
     float* __restrict__ d_out_data_f32, int* __restrict__ d_out_indices,
-    double* __restrict__ group_sums, double* __restrict__ group_sq_sums,
-    double* __restrict__ group_nnz, int n_target_rows, int n_cols,
-    int n_groups_stats, bool compute_sums, bool compute_sq_sums,
+    double* __restrict__ group_sums, double* __restrict__ group_nnz,
+    int n_target_rows, int n_cols, int n_groups_stats, bool compute_sums,
     bool compute_nnz) {
     int r = blockIdx.x;
     if (r >= n_target_rows) return;
@@ -364,9 +361,6 @@ __global__ void csr_gather_cast_accumulate_mapped_kernel(
         if (accumulate) {
             if (compute_sums) {
                 atomicAdd(&group_sums[(size_t)slot * n_cols + c], v);
-            }
-            if (compute_sq_sums) {
-                atomicAdd(&group_sq_sums[(size_t)slot * n_cols + c], v * v);
             }
             if (compute_nnz && v != 0.0) {
                 atomicAdd(&group_nnz[(size_t)slot * n_cols + c], 1.0);

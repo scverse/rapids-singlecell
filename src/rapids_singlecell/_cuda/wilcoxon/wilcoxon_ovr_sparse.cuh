@@ -11,9 +11,8 @@ template <typename InT, typename IndexT, typename IndptrT>
 static void ovr_sparse_csc_host_streaming_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
     const int* h_group_codes, const double* h_group_sizes, double* d_rank_sums,
-    double* d_tie_corr, double* d_group_sums, double* d_group_sq_sums,
-    double* d_group_nnz, int n_rows, int n_cols, int n_groups,
-    bool compute_tie_corr, bool compute_sq_sums, bool compute_nnz,
+    double* d_tie_corr, double* d_group_sums, double* d_group_nnz, int n_rows,
+    int n_cols, int n_groups, bool compute_tie_corr, bool compute_nnz,
     int sub_batch_cols) {
     if (n_rows == 0 || n_cols == 0) return;
 
@@ -38,9 +37,9 @@ static void ovr_sparse_csc_host_streaming_impl(
             max_nnz_i32, sub_batch_cols);
     }
 
-    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
-
+    // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
     int* d_group_codes = pool.alloc<int>(n_rows);
     double* d_group_sizes = pool.alloc<double>(n_groups);
     struct StreamBuf {
@@ -54,7 +53,6 @@ static void ovr_sparse_csc_host_streaming_impl(
         double* d_rank_sums;
         double* d_tie_corr;
         double* d_group_sums;
-        double* d_group_sq_sums;
         double* d_group_nnz;
         double* d_nz_scratch;  // gmem-only; non-null when rank_use_gmem
     };
@@ -72,10 +70,6 @@ static void ovr_sparse_csc_host_streaming_impl(
         bufs[s].d_tie_corr = pool.alloc<double>(sub_batch_cols);
         bufs[s].d_group_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
-        bufs[s].d_group_sq_sums =
-            compute_sq_sums
-                ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
-                : nullptr;
         bufs[s].d_group_nnz =
             compute_nnz ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
                         : nullptr;
@@ -111,8 +105,8 @@ static void ovr_sparse_csc_host_streaming_impl(
     bool rank_use_gmem = false;
     size_t smem_bytes = sparse_ovr_smem_config(n_groups, rank_use_gmem);
     bool cast_use_gmem = false;
-    size_t smem_cast = cast_accumulate_smem_config(n_groups, compute_sq_sums,
-                                                   compute_nnz, cast_use_gmem);
+    size_t smem_cast =
+        cast_accumulate_smem_config(n_groups, compute_nnz, cast_use_gmem);
 
     // In gmem mode the sparse rank kernel accumulates into rank_sums directly
     // and needs a per-stream nz_count scratch buffer sized (n_groups, sb_cols).
@@ -165,9 +159,8 @@ static void ovr_sparse_csc_host_streaming_impl(
         // Cast to float32 for sort + accumulate stats in float64
         launch_ovr_cast_and_accumulate_sparse<InT, IndexT>(
             buf.d_sparse_data_orig, buf.d_sparse_data_f32, buf.d_sparse_indices,
-            buf.d_seg_offsets, d_group_codes, buf.d_group_sums,
-            buf.d_group_sq_sums, buf.d_group_nnz, sb_cols, n_groups,
-            compute_sq_sums, compute_nnz, tpb, smem_cast, cast_use_gmem,
+            buf.d_seg_offsets, d_group_codes, buf.d_group_sums, buf.d_group_nnz,
+            sb_cols, n_groups, compute_nnz, tpb, smem_cast, cast_use_gmem,
             stream);
 
         // CUB sort only stored nonzeros (float32 keys)
@@ -202,12 +195,6 @@ static void ovr_sparse_csc_host_streaming_impl(
                           buf.d_group_sums, sb_cols * sizeof(double),
                           sb_cols * sizeof(double), n_groups,
                           cudaMemcpyDeviceToDevice, stream);
-        if (compute_sq_sums) {
-            cudaMemcpy2DAsync(d_group_sq_sums + col, n_cols * sizeof(double),
-                              buf.d_group_sq_sums, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups,
-                              cudaMemcpyDeviceToDevice, stream);
-        }
         if (compute_nnz) {
             cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
                               buf.d_group_nnz, sb_cols * sizeof(double),
@@ -244,9 +231,8 @@ template <typename InT, typename IndexT, typename IndptrT>
 static void ovr_sparse_csr_host_streaming_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
     const int* h_group_codes, const double* h_group_sizes, double* d_rank_sums,
-    double* d_tie_corr, double* d_group_sums, double* d_group_sq_sums,
-    double* d_group_nnz, int n_rows, int n_cols, int n_groups,
-    bool compute_tie_corr, bool compute_sq_sums, bool compute_nnz,
+    double* d_tie_corr, double* d_group_sums, double* d_group_nnz, int n_rows,
+    int n_cols, int n_groups, bool compute_tie_corr, bool compute_nnz,
     int sub_batch_cols) {
     if (n_rows == 0 || n_cols == 0) return;
 
@@ -298,8 +284,8 @@ static void ovr_sparse_csr_host_streaming_impl(
     bool rank_use_gmem = false;
     size_t smem_bytes = sparse_ovr_smem_config(n_groups, rank_use_gmem);
     bool cast_use_gmem = false;
-    size_t smem_cast = cast_accumulate_smem_config(n_groups, compute_sq_sums,
-                                                   compute_nnz, cast_use_gmem);
+    size_t smem_cast =
+        cast_accumulate_smem_config(n_groups, compute_nnz, cast_use_gmem);
 
     int n_streams = N_STREAMS;
     if (n_batches < n_streams) n_streams = n_batches;
@@ -309,9 +295,6 @@ static void ovr_sparse_csr_host_streaming_impl(
         (sub_batch_cols + 1 + sub_batch_cols) * sizeof(int) + cub_temp_bytes +
         2 * (size_t)n_groups * sub_batch_cols * sizeof(double) +
         sub_batch_cols * sizeof(double);
-    if (compute_sq_sums) {
-        per_stream_bytes += (size_t)n_groups * sub_batch_cols * sizeof(double);
-    }
     if (compute_nnz) {
         per_stream_bytes += (size_t)n_groups * sub_batch_cols * sizeof(double);
     }
@@ -377,7 +360,6 @@ static void ovr_sparse_csr_host_streaming_impl(
         double* sub_rank_sums;
         double* sub_tie_corr;
         double* sub_group_sums;
-        double* sub_group_sq_sums;
         double* sub_group_nnz;
         double* d_nz_scratch;
     };
@@ -396,10 +378,6 @@ static void ovr_sparse_csr_host_streaming_impl(
         bufs[s].sub_tie_corr = pool.alloc<double>(sub_batch_cols);
         bufs[s].sub_group_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
-        bufs[s].sub_group_sq_sums =
-            compute_sq_sums
-                ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
-                : nullptr;
         bufs[s].sub_group_nnz =
             compute_nnz ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
                         : nullptr;
@@ -439,9 +417,8 @@ static void ovr_sparse_csr_host_streaming_impl(
         launch_ovr_cast_and_accumulate_sparse<InT>(
             buf.csc_vals_orig, buf.csc_vals_f32, buf.csc_row_idx,
             buf.col_offsets, d_group_codes, buf.sub_group_sums,
-            buf.sub_group_sq_sums, buf.sub_group_nnz, sb_cols, n_groups,
-            compute_sq_sums, compute_nnz, tpb, smem_cast, cast_use_gmem,
-            stream);
+            buf.sub_group_nnz, sb_cols, n_groups, compute_nnz, tpb, smem_cast,
+            cast_use_gmem, stream);
 
         if (batch_nnz > 0) {
             size_t temp = cub_temp_bytes;
@@ -472,12 +449,6 @@ static void ovr_sparse_csr_host_streaming_impl(
                           buf.sub_group_sums, sb_cols * sizeof(double),
                           sb_cols * sizeof(double), n_groups,
                           cudaMemcpyDeviceToDevice, stream);
-        if (compute_sq_sums) {
-            cudaMemcpy2DAsync(d_group_sq_sums + col, n_cols * sizeof(double),
-                              buf.sub_group_sq_sums, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups,
-                              cudaMemcpyDeviceToDevice, stream);
-        }
         if (compute_nnz) {
             cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
                               buf.sub_group_nnz, sb_cols * sizeof(double),
@@ -535,13 +506,14 @@ static void ovr_sparse_csc_streaming_impl(
             cub_segmented_sortpairs_temp_bytes(max_nnz_i32, sub_batch_cols);
     }
 
+    // pool first: streams drain before it frees their scratch (see guard doc).
+    RmmScratchPool pool;
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     int tpb = UTIL_BLOCK_SIZE;
     bool rank_use_gmem = false;
     size_t smem_bytes = sparse_ovr_smem_config(n_groups, rank_use_gmem);
 
-    RmmScratchPool pool;
     struct StreamBuf {
         float* keys_out;
         int* vals_out;
