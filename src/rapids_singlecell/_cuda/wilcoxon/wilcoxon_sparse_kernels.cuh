@@ -114,15 +114,16 @@ __global__ void rank_sums_sparse_ovr_kernel(
     for (int i = pos_start + threadIdx.x; i < nnz_stored; i += blockDim.x) {
         int grp = group_codes[si[i]];
         if (grp < n_groups) {
-            atomicAdd(&grp_nz_count[grp * acc_stride], 1.0);
+            atomicAdd(&grp_nz_count[(size_t)grp * acc_stride], 1.0);
         }
     }
     __syncthreads();
 
     // --- Zero-rank contribution per group ---
     for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
-        double n_zero_in_g = group_sizes[g] - grp_nz_count[g * acc_stride];
-        grp_sums[g * acc_stride] = n_zero_in_g * zero_avg_rank;
+        double n_zero_in_g =
+            group_sizes[g] - grp_nz_count[(size_t)g * acc_stride];
+        grp_sums[(size_t)g * acc_stride] = n_zero_in_g * zero_avg_rank;
     }
     __syncthreads();
 
@@ -179,7 +180,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
         for (int j = i; j < tie_local_end; ++j) {
             int grp = group_codes[si[j]];
             if (grp < n_groups) {
-                atomicAdd(&grp_sums[grp * acc_stride], avg_rank);
+                atomicAdd(&grp_sums[(size_t)grp * acc_stride], avg_rank);
             }
         }
 

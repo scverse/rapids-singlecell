@@ -178,6 +178,98 @@ struct HostRegisterGuard {
     }
 };
 
+// RAII for CUDA streams/events: reclaim on every path (incl. exception unwind),
+// fixing the leak when a throwing call skips a trailing manual destroy. The
+// stream dtor SYNCHRONIZES before destroying. Teardown is safe in either
+// pool-vs-streams declaration order: on the normal path the launcher syncs all
+// streams before any dtor runs, and on exception unwind nothing re-allocates
+// the freed (pool-retained) scratch before the streams dtor's sync drains the
+// in-flight kernels. Invariant: do not place an allocating RAII member between
+// an RmmScratchPool and these guards.
+struct ScopedCudaStream {
+    cudaStream_t stream = nullptr;
+
+    ScopedCudaStream() = default;
+    explicit ScopedCudaStream(unsigned int flags) {
+        cuda_check(cudaStreamCreateWithFlags(&stream, flags),
+                   "cudaStreamCreateWithFlags");
+    }
+    ~ScopedCudaStream() {
+        if (stream) {
+            cudaStreamSynchronize(stream);  // drain before teardown
+            cudaStreamDestroy(stream);
+        }
+    }
+    operator cudaStream_t() const {
+        return stream;
+    }
+    cudaStream_t get() const {
+        return stream;
+    }
+    ScopedCudaStream(const ScopedCudaStream&) = delete;
+    ScopedCudaStream& operator=(const ScopedCudaStream&) = delete;
+};
+
+struct ScopedCudaStreams {
+    std::vector<cudaStream_t> streams;
+
+    // `flags` is explicit so call sites keep their original stream semantics.
+    ScopedCudaStreams(int n, unsigned int flags) {
+        streams.reserve(n > 0 ? (size_t)n : 0);
+        for (int i = 0; i < n; ++i) {
+            cudaStream_t s = nullptr;
+            cudaError_t err = cudaStreamCreateWithFlags(&s, flags);
+            if (err != cudaSuccess) {
+                // dtor won't run on ctor throw; reclaim what we made.
+                for (cudaStream_t prev : streams) {
+                    cudaStreamSynchronize(prev);
+                    cudaStreamDestroy(prev);
+                }
+                throw std::runtime_error(
+                    std::string("cudaStreamCreateWithFlags failed: ") +
+                    cudaGetErrorString(err));
+            }
+            streams.push_back(s);
+        }
+    }
+    ~ScopedCudaStreams() {
+        for (cudaStream_t s : streams) {
+            if (!s) continue;
+            cudaStreamSynchronize(s);  // drain before teardown
+            cudaStreamDestroy(s);
+        }
+    }
+    cudaStream_t operator[](int i) const {
+        return streams[i];
+    }
+    int size() const {
+        return (int)streams.size();
+    }
+    ScopedCudaStreams(const ScopedCudaStreams&) = delete;
+    ScopedCudaStreams& operator=(const ScopedCudaStreams&) = delete;
+};
+
+struct ScopedCudaEvent {
+    cudaEvent_t event = nullptr;
+
+    ScopedCudaEvent() = default;
+    explicit ScopedCudaEvent(unsigned int flags) {
+        cuda_check(cudaEventCreateWithFlags(&event, flags),
+                   "cudaEventCreateWithFlags");
+    }
+    ~ScopedCudaEvent() {
+        if (event) cudaEventDestroy(event);
+    }
+    void record(cudaStream_t stream) {
+        cuda_check(cudaEventRecord(event, stream), "cudaEventRecord");
+    }
+    cudaEvent_t get() const {
+        return event;
+    }
+    ScopedCudaEvent(const ScopedCudaEvent&) = delete;
+    ScopedCudaEvent& operator=(const ScopedCudaEvent&) = delete;
+};
+
 static inline int round_up_to_warp(int n) {
     int rounded = ((n + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     return (rounded < MAX_THREADS_PER_BLOCK) ? rounded : MAX_THREADS_PER_BLOCK;

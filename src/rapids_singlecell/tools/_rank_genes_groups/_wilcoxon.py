@@ -1033,7 +1033,7 @@ def _wilcoxon_with_reference(
             sparse_X = sparse_X.copy()
             sparse_X.sort_indices()
         data, indices, indptr = _device_sparse_arrays_f32(sparse_X)
-        offsets_gpu = cp.asarray(offsets_np, dtype=cp.int32)
+        # offsets_gpu (built once above as int32) is reused here.
         # zeros, not empty: an all-empty test batch (n_all_grp == 0)
         # short-circuits the kernel without writing rank_sums.
         rank_sums = cp.zeros((n_test, n_total_genes), dtype=cp.float64)

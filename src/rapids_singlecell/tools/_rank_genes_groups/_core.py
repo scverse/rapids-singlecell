@@ -130,7 +130,6 @@ class _RankGenes:
             tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None] | None
         ) = None
         self._compute_stats_in_chunks: bool = False
-        self._ref_chunk_computed: set[int] = set()
         self._score_dtype = np.dtype(np.float32)
 
     def _init_stats_arrays(self, n_genes: int) -> None:
@@ -313,49 +312,6 @@ class _RankGenes:
                 self.pts_rest[:, start:stop] = cp.asnumpy(
                     rest_nnz / rest_sizes[:, None]
                 )
-
-    def _accumulate_chunk_stats_with_ref(
-        self,
-        block: cp.ndarray,
-        start: int,
-        stop: int,
-        *,
-        group_index: int,
-        group_mask_gpu: cp.ndarray,
-        n_group: int,
-        n_ref: int,
-    ) -> None:
-        """Compute and store stats for one gene chunk (with reference mode)."""
-        if not self._compute_stats_in_chunks:
-            return  # Stats already computed via Aggregate
-
-        # Group stats
-        group_data = block[group_mask_gpu]
-        group_mean = group_data.mean(axis=0)
-        self.means[group_index, start:stop] = cp.asnumpy(group_mean)
-
-        if n_group > 1:
-            group_var = group_data.var(axis=0, ddof=1)
-            self.vars[group_index, start:stop] = cp.asnumpy(group_var)
-
-        if self.comp_pts:
-            group_nnz = (group_data != 0).sum(axis=0)
-            self.pts[group_index, start:stop] = cp.asnumpy(group_nnz / n_group)
-
-        # Reference stats (only compute once, on first non-reference group)
-        if start not in self._ref_chunk_computed:
-            self._ref_chunk_computed.add(start)
-            ref_data = block[~group_mask_gpu]
-            ref_mean = ref_data.mean(axis=0)
-            self.means[self.ireference, start:stop] = cp.asnumpy(ref_mean)
-
-            if n_ref > 1:
-                ref_var = ref_data.var(axis=0, ddof=1)
-                self.vars[self.ireference, start:stop] = cp.asnumpy(ref_var)
-
-            if self.comp_pts:
-                ref_nnz = (ref_data != 0).sum(axis=0)
-                self.pts[self.ireference, start:stop] = cp.asnumpy(ref_nnz / n_ref)
 
     def t_test(
         self, method: Literal["t-test", "t-test_overestim_var"]

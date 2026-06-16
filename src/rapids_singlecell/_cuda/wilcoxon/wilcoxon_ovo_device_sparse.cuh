@@ -72,10 +72,8 @@ static void ovo_streaming_csr_impl(
         cub_temp_bytes = cub_grp_bytes;
     }
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
-    cudaStream_t ref_stream;
-    cudaStreamCreateWithFlags(&ref_stream, cudaStreamNonBlocking);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+    ScopedCudaStream ref_stream(cudaStreamNonBlocking);
 
     int* d_sort_group_ids = nullptr;
     if (run_huge) {
@@ -220,8 +218,6 @@ static void ovo_streaming_csr_impl(
                     cudaGetErrorString(err));
         }
     }
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
-    cudaStreamDestroy(ref_stream);
 }
 
 /**
@@ -277,8 +273,7 @@ static void ovo_streaming_csc_impl(
         cub_temp_bytes = std::max(cub_ref_bytes, cub_grp_bytes);
     }
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     RmmScratchPool pool;
     int* d_sort_group_ids = nullptr;
@@ -402,5 +397,4 @@ static void ovo_streaming_csc_impl(
                 std::string("CUDA error in OVO device CSC streaming: ") +
                 cudaGetErrorString(err));
     }
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }

@@ -12,7 +12,7 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
     IndptrT re = indptr[row + 1];
     for (IndptrT p = rs; p < re; ++p) {
         int c = (int)indices[p];
-        if (c < n_cols) atomicAdd(&col_counts[c], 1u);
+        if (c >= 0 && c < n_cols) atomicAdd(&col_counts[c], 1u);
     }
 }
 

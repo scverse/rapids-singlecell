@@ -5,8 +5,10 @@ These modules provide GPU-accelerated kernels for various single-cell analysis
 operations. Each module is compiled from CUDA source files and exposed through
 nanobind bindings.
 
-On systems without compiled extensions (e.g., docs builds), imports resolve
-to None so that module-level imports don't raise ImportError.
+On systems without compiled extensions (e.g., docs builds), a genuinely absent
+module resolves to None so that module-level imports don't raise ImportError. A
+module that is present but fails to load (ABI/toolkit mismatch, missing shared
+library) is re-raised with context rather than silently swallowed.
 """
 
 from __future__ import annotations
@@ -53,10 +55,38 @@ __all__ = [
 ]
 
 
+def _preload_rapids_runtime_libs() -> None:
+    """Pre-load ``librmm`` / ``rapids_logger`` so the extensions' ``DT_NEEDED``
+    soname deps resolve regardless of import order (the editable-install
+    ``RUNPATH`` is unreliable). Best-effort: absent wheels (docs builds) skip.
+    """
+    for mod in ("librmm", "rapids_logger"):
+        try:
+            importlib.import_module(mod).load_library()
+        except (ImportError, OSError, AttributeError, RuntimeError):
+            pass
+
+
+_preload_rapids_runtime_libs()
+
+
 def __getattr__(name: str):
     if name in __all__:
         try:
             return importlib.import_module(f".{name}", __name__)
-        except ImportError:
+        except ModuleNotFoundError:
+            # Extension genuinely absent (e.g. docs builds, no-GPU installs):
+            # degrade to None so module-level imports don't raise.
             return None
+        except ImportError as exc:
+            # Extension present but failed to load (ABI/toolkit mismatch, a
+            # missing shared library, the rmm symbol-ordering issue, ...).
+            # Surface it with context instead of silently returning None and
+            # crashing later with a cryptic ``'NoneType' has no attribute ...``.
+            msg = (
+                f"Failed to load compiled CUDA extension {name!r}: {exc}. "
+                "Ensure a matching rapids-singlecell-cuXX wheel (and librmm) is "
+                "installed for your CUDA version."
+            )
+            raise ImportError(msg) from exc
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

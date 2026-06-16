@@ -76,14 +76,15 @@ def rank_genes_groups(
     """
     Rank genes for characterizing groups using GPU acceleration.
 
-    Expects nonnegative expression data. Log1p/log-normalized data is expected
-    for biologically meaningful log fold changes; negative values are rejected
-    for eager in-memory inputs.
+    Log1p/log-normalized data is expected for biologically meaningful log fold
+    changes. Complex values are rejected. Sparse inputs with explicit negative
+    values fall back to the dense full-sort ranking path; dense inputs are
+    ranked directly and support any sign.
 
     .. note::
-        **Dask support:** `'t-test'`, `'t-test_overestim_var'`, and
-        `'wilcoxon_binned'` support Dask arrays. The `'wilcoxon'` and
-        `'logreg'` methods do not support Dask arrays.
+        **Dask support:** `'t-test'`, `'t-test_overestim_var'`,
+        `'wilcoxon_binned'`, and `'logreg'` support Dask arrays. The
+        `'wilcoxon'` method does not support Dask arrays.
 
     Parameters
     ----------
@@ -140,7 +141,7 @@ def rank_genes_groups(
         Key from `adata.layers` whose value will be used to perform tests on.
     chunk_size
         Number of genes to process at once for `'wilcoxon'` and
-        `'wilcoxon_binned'`. Default is 128 for `'wilcoxon'`. For
+        `'wilcoxon_binned'`. Default is 512 for `'wilcoxon'`. For
         `'wilcoxon_binned'` the default is sized dynamically based on
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
     pre_load

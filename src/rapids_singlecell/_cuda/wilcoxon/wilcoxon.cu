@@ -33,16 +33,13 @@ static void launch_ovr_rank_dense_streaming(
     size_t cub_temp_bytes =
         cub_segmented_sortpairs_temp_bytes(sub_items_i32, sub_batch_cols);
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; ++i) {
-        cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking);
-    }
+    ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
 
-    cudaEvent_t inputs_ready;
-    cudaEventCreateWithFlags(&inputs_ready, cudaEventDisableTiming);
-    cudaEventRecord(inputs_ready, upstream_stream);
+    ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
+    inputs_ready.record(upstream_stream);
     for (int i = 0; i < n_streams; ++i) {
-        cudaStreamWaitEvent(streams[i], inputs_ready, 0);
+        cuda_check(cudaStreamWaitEvent(streams[i], inputs_ready.get(), 0),
+                   "wait on inputs_ready (dense OVR)");
     }
 
     RmmScratchPool pool;
@@ -127,8 +124,6 @@ static void launch_ovr_rank_dense_streaming(
                 cudaGetErrorString(err));
         }
     }
-    cudaEventDestroy(inputs_ready);
-    for (int s = 0; s < n_streams; ++s) cudaStreamDestroy(streams[s]);
 }
 
 static void launch_ovo_rank_dense_tiered_unsorted_ref(
@@ -179,16 +174,13 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
     size_t ref_cub_temp_bytes =
         cub_segmented_sortkeys_temp_bytes(sub_ref_items_i32, sub_batch_cols);
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; ++i) {
-        cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking);
-    }
+    ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
 
-    cudaEvent_t inputs_ready;
-    cudaEventCreateWithFlags(&inputs_ready, cudaEventDisableTiming);
-    cudaEventRecord(inputs_ready, upstream_stream);
+    ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
+    inputs_ready.record(upstream_stream);
     for (int i = 0; i < n_streams; ++i) {
-        cudaStreamWaitEvent(streams[i], inputs_ready, 0);
+        cuda_check(cudaStreamWaitEvent(streams[i], inputs_ready.get(), 0),
+                   "wait on inputs_ready (dense OVO)");
     }
 
     RmmScratchPool pool;
@@ -300,8 +292,6 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
                 cudaGetErrorString(err));
         }
     }
-    cudaEventDestroy(inputs_ready);
-    for (int s = 0; s < n_streams; ++s) cudaStreamDestroy(streams[s]);
 }
 
 template <typename Device>

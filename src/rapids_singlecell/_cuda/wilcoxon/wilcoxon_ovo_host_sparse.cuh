@@ -63,8 +63,7 @@ static void ovo_streaming_csc_host_impl(
         if (nnz > max_nnz) max_nnz = nnz;
     }
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     RmmScratchPool pool;
 
@@ -287,8 +286,6 @@ static void ovo_streaming_csc_host_impl(
                 std::string("CUDA error in wilcoxon streaming: ") +
                 cudaGetErrorString(err));
     }
-
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }
 
 /**
@@ -511,8 +508,7 @@ static void ovo_streaming_csr_host_impl(
     int ref_items_i32 =
         checked_cub_items(ref_items, "OVO host CSR dense reference cache");
     float* d_ref_sorted = pool.alloc<float>(ref_items);
-    cudaStream_t ref_stream;
-    cudaStreamCreateWithFlags(&ref_stream, cudaStreamNonBlocking);
+    ScopedCudaStream ref_stream(cudaStreamNonBlocking);
     {
         ScopedCudaBuffer ref_data_f32_buf(ref_nnz * sizeof(float));
         ScopedCudaBuffer ref_indices_buf(ref_nnz * sizeof(int));
@@ -568,7 +564,6 @@ static void ovo_streaming_csr_host_impl(
         cuda_check(cudaStreamSynchronize(ref_stream),
                    "host CSR OVO ref sort sync");
     }  // ref scratch drops here
-    cudaStreamDestroy(ref_stream);
 
     // ---- Phase 2: Per-pack streaming ----
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_test);
@@ -592,8 +587,7 @@ static void ovo_streaming_csr_host_impl(
             cub_segmented_sortkeys_temp_bytes(max_sub_items_i32, max_segments);
     }
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     struct StreamBuf {
         float* d_grp_data_f32;
@@ -771,5 +765,4 @@ static void ovo_streaming_csr_host_impl(
                 std::string("CUDA error in ovo csr host streaming: ") +
                 cudaGetErrorString(err));
     }
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }

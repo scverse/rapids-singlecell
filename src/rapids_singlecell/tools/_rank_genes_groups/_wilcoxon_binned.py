@@ -183,6 +183,19 @@ def wilcoxon_binned(
     if bin_range is None:
         bin_range = "log1p" if isinstance(X, DaskArray) else "auto"
 
+    # The fixed log1p [0, 15] range assumes nonnegative data. For signed sparse
+    # input the dense fallback would clamp negatives into the lowest bin and
+    # silently produce wrong rank sums, so switch to the data-driven 'auto'
+    # range (which spans the true [min, max], including negatives).
+    if rg._sparse_negative_fallback and bin_range == "log1p":
+        warnings.warn(
+            "bin_range='log1p' is invalid for sparse input with negative values "
+            "(the fixed [0, 15] range would clamp them); using bin_range='auto'.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+        bin_range = "auto"
+
     # Prepare GPU arrays and bin arithmetic
     if bin_range == "auto":
         bin_low, bin_high = _data_range(X)

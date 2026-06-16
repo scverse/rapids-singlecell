@@ -7,10 +7,9 @@
 // (column-major) double buffer. This skips the CSR -> CSC tile rebuild that a
 // `X[:, lb:ub].tocsc()` densify would do.
 //
-// `out` must be pre-zeroed; the atomicAdd accumulation also makes the result
-// correct for uncanonicalized / duplicate column indices (matching scipy's
-// sum_duplicates semantics). Output is always double to match the rank_genes
-// basic-stats path; the input data dtype is templated.
+// `out` must be pre-zeroed; the atomicAdd also sums duplicate column indices
+// (like scipy's sum_duplicates) -- bit-identical to a dense materialization for
+// canonical CSR. Output is always double; input dtype is templated.
 
 template <typename TData, typename IndptrT, typename IndexT>
 __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
@@ -18,7 +17,8 @@ __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
                                          const TData* __restrict__ data,
                                          double* __restrict__ out, int col_lb,
                                          int col_ub, int n_cells) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long row =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= n_cells) {
         return;
     }

@@ -14,8 +14,6 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 EPS = 1e-9
-WARP_SIZE = 32
-MAX_THREADS_PER_BLOCK = 512
 MIN_GROUP_SIZE_WARNING = 25
 
 
@@ -136,11 +134,6 @@ def _select_groups(
         raise ValueError(msg)
 
     return groups_order, group_codes, group_sizes
-
-
-def _round_up_to_warp(n: int) -> int:
-    """Round up to nearest multiple of WARP_SIZE, capped at MAX_THREADS_PER_BLOCK."""
-    return min(MAX_THREADS_PER_BLOCK, ((n + WARP_SIZE - 1) // WARP_SIZE) * WARP_SIZE)
 
 
 def _choose_chunk_size(requested: int | None) -> int:

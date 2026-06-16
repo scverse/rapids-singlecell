@@ -38,8 +38,7 @@ static void ovr_sparse_csc_host_streaming_impl(
             max_nnz_i32, sub_batch_cols);
     }
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     RmmScratchPool pool;
     int* d_group_codes = pool.alloc<int>(n_rows);
@@ -227,8 +226,6 @@ static void ovr_sparse_csc_host_streaming_impl(
                 std::string("CUDA error in sparse host CSC streaming: ") +
                 cudaGetErrorString(err));
     }
-
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }
 
 // ============================================================================
@@ -329,8 +326,7 @@ static void ovr_sparse_csr_host_streaming_impl(
     while (n_streams > 1 && (size_t)n_streams * per_stream_bytes > budget)
         n_streams--;
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     // Pin the source CSR arrays as mapped memory.  The scatter kernel reads
     // only the requested column window from each row.
@@ -499,8 +495,6 @@ static void ovr_sparse_csr_host_streaming_impl(
                 std::string("CUDA error in sparse host CSR streaming: ") +
                 cudaGetErrorString(err));
     }
-
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }
 
 // ============================================================================
@@ -541,8 +535,7 @@ static void ovr_sparse_csc_streaming_impl(
             cub_segmented_sortpairs_temp_bytes(max_nnz_i32, sub_batch_cols);
     }
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     int tpb = UTIL_BLOCK_SIZE;
     bool rank_use_gmem = false;
@@ -638,8 +631,6 @@ static void ovr_sparse_csc_streaming_impl(
                 std::string("CUDA error in sparse ovr streaming: ") +
                 cudaGetErrorString(err));
     }
-
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }
 
 // ============================================================================
@@ -740,8 +731,7 @@ static void ovr_sparse_csr_streaming_impl(
     while (n_streams > 1 && (size_t)n_streams * per_stream_bytes > budget)
         n_streams--;
 
-    std::vector<cudaStream_t> streams(n_streams);
-    for (int i = 0; i < n_streams; i++) cudaStreamCreate(&streams[i]);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     int tpb = UTIL_BLOCK_SIZE;
     int scatter_blocks = (n_rows + tpb - 1) / tpb;
@@ -842,6 +832,4 @@ static void ovr_sparse_csr_streaming_impl(
                 std::string("CUDA error in sparse CSR ovr streaming: ") +
                 cudaGetErrorString(err));
     }
-
-    for (int s = 0; s < n_streams; s++) cudaStreamDestroy(streams[s]);
 }
