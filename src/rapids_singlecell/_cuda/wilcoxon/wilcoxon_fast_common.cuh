@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -12,6 +14,46 @@
 
 #include "../nb_types.h"     // for CUDA_CHECK_LAST_ERROR
 #include "../rmm_scratch.h"  // rmm_allocate, RmmScratchPool, ScopedCudaBuffer
+
+// Host thread count for CPU-side CSR passes: hardware concurrency, capped.
+static inline int host_worker_count() {
+    unsigned hw = std::thread::hardware_concurrency();
+    return (int)std::min<unsigned>(hw ? hw : 4u, 32u);
+}
+
+// Run fn(chunk, r0, r1) over a contiguous partition of [0, n); `chunk` is the
+// 0-based worker index (for per-thread scratch). fn runs concurrently, so it
+// must only read shared state and write disjoint output ranges (keyed by chunk
+// or by [r0,r1)). Returns the number of chunks used. Serial for small n.
+template <typename F>
+static inline int host_parallel_chunks(int n, F fn) {
+    if (n <= 0) return 0;
+    int n_threads = host_worker_count();
+    if (n_threads <= 1 || n < 4096) {
+        fn(0, 0, n);
+        return 1;
+    }
+    int chunk = (n + n_threads - 1) / n_threads;
+    std::vector<std::thread> pool;
+    pool.reserve(n_threads);
+    for (int t = 0; t < n_threads; t++) {
+        int r0 = t * chunk;
+        if (r0 >= n) break;
+        int r1 = std::min(n, r0 + chunk);
+        pool.emplace_back([&fn, t, r0, r1]() { fn(t, r0, r1); });
+    }
+    int used = (int)pool.size();
+    for (std::thread& th : pool) th.join();
+    return used;
+}
+
+// Run fn(r0, r1) over a contiguous partition of [0, n) across hardware threads
+// (serial for small n). fn is invoked concurrently, so it must only read shared
+// state and write disjoint output ranges. Used for host-side CSR gathers.
+template <typename F>
+static inline void host_parallel_ranges(int n, F fn) {
+    host_parallel_chunks(n, [&fn](int, int r0, int r1) { fn(r0, r1); });
+}
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_THREADS_PER_BLOCK = 512;
@@ -129,6 +171,35 @@ static inline int checked_int_product(size_t a, size_t b, const char* context) {
                                  " exceeds int32 item limit");
     }
     return (int)(a * b);
+}
+
+// Largest per-batch nonzero count we let a column batch reach. A batch is
+// sorted in a single CUB segmented call (int32 item count) and addressed with
+// int offsets, so it must stay below INT_MAX with margin.
+constexpr size_t SAFE_BATCH_NNZ = 2000000000;  // < INT_MAX
+
+// Shrink a column sub-batch (halving) until the densest contiguous window of
+// `sub_batch_cols` columns holds <= cap nonzeros, keeping every batch's nnz
+// within int32 for CUB and bounding the per-stream transpose/sort scratch.
+// `col_nnz(i)` returns the nonzero count of column i. Worst case returns 1
+// (a single column, whose nnz is <= n_rows).
+template <typename ColNnz>
+static inline int cap_sub_batch_by_nnz(int n_cols, int sub_batch_cols,
+                                       size_t cap, ColNnz col_nnz) {
+    if (cap < 1) cap = 1;
+    auto max_window = [&](int s) {
+        size_t mx = 0;
+        for (int c = 0; c < n_cols; c += s) {
+            int e = std::min(c + s, n_cols);
+            size_t sum = 0;
+            for (int i = c; i < e; i++) sum += col_nnz(i);
+            if (sum > mx) mx = sum;
+        }
+        return mx;
+    };
+    while (sub_batch_cols > 1 && max_window(sub_batch_cols) > cap)
+        sub_batch_cols = (sub_batch_cols + 1) / 2;
+    return sub_batch_cols;
 }
 
 // ---------------------------------------------------------------------------

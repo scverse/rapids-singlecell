@@ -16,6 +16,16 @@ static void ovo_streaming_csr_impl(
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
+    // Cap sub_batch_cols so the dense group slab (n_all_grp × sub_batch_cols,
+    // sorted in one CUB call) stays within int32. n_all_grp is a cell count, so
+    // it drives the cap; the reference side is chunked separately below.
+    {
+        size_t cap = n_all_grp > 0 ? SAFE_BATCH_NNZ / (size_t)n_all_grp
+                                   : (size_t)sub_batch_cols;
+        if (cap < 1) cap = 1;
+        if ((size_t)sub_batch_cols > cap) sub_batch_cols = (int)cap;
+    }
+
     std::vector<int> h_offsets(n_groups + 1);
     cudaMemcpy(h_offsets.data(), grp_offsets, (n_groups + 1) * sizeof(int),
                cudaMemcpyDeviceToHost);
@@ -43,11 +53,11 @@ static void ovo_streaming_csr_impl(
             "OVO device CSR reference group exceeds CUB int item limit");
     }
     int ref_cache_cols = std::min(n_cols, (int)max_ref_cols);
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+    {
+        // Reference cache holds 2 floats/col/ref-row; size it to ~a third of
+        // what the joint allocator can serve (leaving room for group buffers).
         size_t bytes_per_col = (size_t)n_ref * sizeof(float) * 2;
-        size_t target_bytes = free_bytes / 3;
+        size_t target_bytes = rmm_available_device_bytes(1.0 / 3.0);
         if (bytes_per_col > 0 && target_bytes >= bytes_per_col) {
             size_t mem_cols = target_bytes / bytes_per_col;
             if (mem_cols > 0 && mem_cols < (size_t)ref_cache_cols) {
@@ -233,6 +243,17 @@ static void ovo_streaming_csc_impl(
     double* rank_sums, double* tie_corr, int n_ref, int n_all_grp, int n_cols,
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
+
+    // Cap sub_batch_cols so both dense slabs (n_ref × sub_batch_cols and
+    // n_all_grp × sub_batch_cols, each sorted in one CUB call) stay within
+    // int32. These row counts are cell counts, so they drive the cap.
+    {
+        size_t max_rows = (size_t)std::max(n_ref, n_all_grp);
+        size_t cap =
+            max_rows > 0 ? SAFE_BATCH_NNZ / max_rows : (size_t)sub_batch_cols;
+        if (cap < 1) cap = 1;
+        if ((size_t)sub_batch_cols > cap) sub_batch_cols = (int)cap;
+    }
 
     std::vector<int> h_offsets(n_groups + 1);
     cudaMemcpy(h_offsets.data(), grp_offsets, (n_groups + 1) * sizeof(int),

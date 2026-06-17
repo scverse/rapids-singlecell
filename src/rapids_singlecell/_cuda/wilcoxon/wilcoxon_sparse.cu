@@ -121,6 +121,12 @@ void register_sparse_bindings(nb::module_& m) {
                                     int);
     RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_f64_i64", double, int,
                                     int64_t);
+    // int64 column indices (int64 indptr): pass indices natively to avoid a
+    // full int32 copy of every nonzero (~nnz*4 bytes) on large matrices.
+    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_i64_idx64", float,
+                                    int64_t, int64_t);
+    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_f64_i64_idx64", double,
+                                    int64_t, int64_t);
 #undef RSC_OVR_SPARSE_CSR_HOST_BINDING
 
 #define RSC_OVO_DEVICE_BINDING(NAME, IMPL, IndptrCType)                       \
@@ -232,6 +238,12 @@ void register_sparse_bindings(nb::module_& m) {
     RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_f64", double, int, int);
     RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_f64_i64", double, int,
                              int64_t);
+    // int64 column indices (int64 indptr): pass indices natively to avoid a
+    // full int32 copy of every nonzero (~nnz*4 bytes) on large matrices.
+    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_i64_idx64", float, int64_t,
+                             int64_t);
+    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_f64_i64_idx64", double,
+                             int64_t, int64_t);
 #undef RSC_OVO_CSR_HOST_BINDING
 }
 

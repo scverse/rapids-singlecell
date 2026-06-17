@@ -26,13 +26,19 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
  * rows would silently drop or misplace nonzeros. Every caller enforces this --
  * the Python dispatch calls `sort_indices()` on the CSR/CSC input before
  * invoking the streaming impls that launch this kernel.
+ *
+ * `row_offset` is added to the local row index when writing csc_row_idx, so a
+ * row-block whose indptr/data are rebased to a local [0, n_rows) range still
+ * records the correct global row id (used by the out-of-core row-streaming OVR
+ * path that feeds bulk-transferred row-blocks). Defaults to 0 for callers that
+ * pass the full matrix.
  */
 template <typename InT, typename IndexT, typename IndptrT>
 __global__ void csr_scatter_to_csc_kernel(
     const InT* __restrict__ data, const IndexT* __restrict__ indices,
     const IndptrT* __restrict__ indptr, int* __restrict__ write_pos,
     InT* __restrict__ csc_vals, int* __restrict__ csc_row_idx, int n_rows,
-    int col_start, int col_stop) {
+    int col_start, int col_stop, int row_offset = 0) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
     IndptrT rs = indptr[row];
@@ -51,7 +57,7 @@ __global__ void csr_scatter_to_csc_kernel(
         if (c >= col_stop) break;
         int dest = atomicAdd(&write_pos[c - col_start], 1);
         csc_vals[dest] = data[p];
-        csc_row_idx[dest] = row;
+        csc_row_idx[dest] = row_offset + row;
     }
 }
 

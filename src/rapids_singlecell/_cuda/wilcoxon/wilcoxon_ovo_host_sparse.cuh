@@ -17,6 +17,20 @@ static void ovo_streaming_csc_host_impl(
     bool compute_tie_corr, bool compute_nnz, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
+    // Cap sub_batch_cols so neither the dense ref/group slabs (rows ×
+    // sub_batch_cols, sorted in one CUB call) nor the per-column-batch nnz
+    // exceed int32. rows here are cell counts, so they dominate the dense cap.
+    {
+        size_t max_rows = (size_t)std::max(n_ref, n_all_grp);
+        size_t dense_cap =
+            max_rows > 0 ? SAFE_BATCH_NNZ / max_rows : (size_t)sub_batch_cols;
+        if (dense_cap < 1) dense_cap = 1;
+        if ((size_t)sub_batch_cols > dense_cap) sub_batch_cols = (int)dense_cap;
+        sub_batch_cols = cap_sub_batch_by_nnz(
+            n_cols, sub_batch_cols, SAFE_BATCH_NNZ,
+            [&](int c) { return (size_t)(h_indptr[c + 1] - h_indptr[c]); });
+    }
+
     // ---- Tier dispatch from host offsets ----
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = t1.max_grp_size;
@@ -60,6 +74,23 @@ static void ovo_streaming_csc_host_impl(
         int sb = std::min(sub_batch_cols, n_cols - c);
         size_t nnz = (size_t)(h_indptr[c + sb] - h_indptr[c]);
         if (nnz > max_nnz) max_nnz = nnz;
+    }
+
+    // Reduce the stream count so the per-stream scratch fits the memory budget.
+    // The dense ref/group slabs scale with n_ref/n_all_grp (cell counts), so at
+    // scale a fixed N_STREAMS would exceed GPU memory and thrash/OOM.
+    {
+        size_t per_stream =
+            max_nnz * (sizeof(InT) + sizeof(float) + sizeof(IndexT)) +
+            2 * sub_ref_items * sizeof(float) +
+            (run_huge ? 2 : 1) * sub_grp_items * sizeof(float) +
+            2 * (size_t)n_groups * sub_batch_cols * sizeof(double) +
+            (compute_nnz ? 2 : 1) * (size_t)n_groups_stats * sub_batch_cols *
+                sizeof(double) +
+            cub_temp_bytes;
+        size_t budget = rmm_available_device_bytes(0.8);
+        while (n_streams > 1 && (size_t)n_streams * per_stream > budget)
+            n_streams--;
     }
 
     // pool first: streams drain before it frees their scratch (see guard doc).
@@ -365,6 +396,10 @@ static void ovo_streaming_csr_host_impl(
             GROUP_DENSE_BUDGET_ITEMS / (size_t)sub_batch_cols;
         if ((size_t)target_rows > budget_cap_rows)
             target_rows = (int)budget_cap_rows;
+        // Also bound each pack's compacted nnz: it feeds int32 CUB item counts
+        // and int offsets, so a dense pack must stay under INT_MAX. This splits
+        // dense perturbation groups across more packs.
+        constexpr size_t SAFE_PACK_NNZ = 1500000000;  // < INT_MAX, CUB-safe
 
         int cur_first = 0;
         int cur_rows = 0;
@@ -374,7 +409,9 @@ static void ovo_streaming_csr_host_impl(
             size_t nnz_g = (size_t)(h_grp_indptr_compact[h_grp_offsets[g + 1]] -
                                     h_grp_indptr_compact[h_grp_offsets[g]]);
             int new_rows = cur_rows + n_g;
-            bool can_add = (cur_rows == 0) || (new_rows <= target_rows);
+            bool can_add =
+                (cur_rows == 0) ||
+                (new_rows <= target_rows && cur_nnz + nnz_g <= SAFE_PACK_NNZ);
             if (!can_add) {
                 size_t sb_size =
                     std::min((size_t)n_cols,
@@ -469,37 +506,39 @@ static void ovo_streaming_csr_host_impl(
                cudaMemcpyHostToDevice);
 
     // ---- Phase 1: Ref setup (scoped scratch, ref_sorted persists) ----
+    // The full-width sorted reference cache d_ref_sorted is [n_ref × n_cols],
+    // but it is built one COLUMN CHUNK at a time so each CUB segmented sort
+    // stays within int32 (n_ref × ref_chunk_cols items) and the dense extract
+    // scratch is bounded to a chunk instead of the whole [n_ref × n_cols] slab.
+    // This is what lets large references (n_ref × n_cols > INT_MAX) work.
     size_t ref_items = (size_t)n_ref * (size_t)n_cols;
-    if (n_ref > 0 && (size_t)n_cols > (size_t)std::numeric_limits<int>::max() /
-                                          (size_t)n_ref) {
-        throw std::runtime_error(
-            "OVO host CSR dense reference cache exceeds CUB int item limit; "
-            "use native CSC/device sparse input or reduce genes/reference "
-            "size");
-    }
     if (ref_items > std::numeric_limits<size_t>::max() / (2 * sizeof(float))) {
         throw std::runtime_error(
             "OVO host CSR dense reference cache size overflows size_t");
     }
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess &&
-        total_bytes > 0 && ref_items * 2 * sizeof(float) > total_bytes) {
+    size_t ref_avail = rmm_available_device_bytes(0.9);
+    if (ref_avail > 0 && ref_items * sizeof(float) > ref_avail) {
         throw std::runtime_error(
-            "OVO host CSR dense reference cache requires more GPU memory than "
-            "the device provides; use native CSC/device sparse input or reduce "
+            "OVO host CSR sorted reference cache requires more GPU memory than "
+            "is available; use native CSC/device sparse input or reduce "
             "genes/reference size");
     }
-    int ref_items_i32 =
-        checked_cub_items(ref_items, "OVO host CSR dense reference cache");
+    int ref_chunk_cols =
+        n_ref > 0
+            ? (int)std::min((size_t)n_cols, SAFE_BATCH_NNZ / (size_t)n_ref)
+            : n_cols;
+    if (ref_chunk_cols < 1) ref_chunk_cols = 1;
+    size_t ref_chunk_items = (size_t)n_ref * (size_t)ref_chunk_cols;
+    int ref_chunk_items_i32 =
+        checked_cub_items(ref_chunk_items, "OVO host CSR ref column chunk");
     float* d_ref_sorted = pool.alloc<float>(ref_items);
     ScopedCudaStream ref_stream(cudaStreamNonBlocking);
     {
         ScopedCudaBuffer ref_data_f32_buf(ref_nnz * sizeof(float));
         ScopedCudaBuffer ref_indices_buf(ref_nnz * sizeof(int));
         ScopedCudaBuffer ref_indptr_buf((n_ref + 1) * sizeof(int));
-        ScopedCudaBuffer ref_dense_buf(ref_items * sizeof(float));
-        ScopedCudaBuffer ref_seg_buf((n_cols + 1) * sizeof(int));
+        ScopedCudaBuffer ref_dense_buf(ref_chunk_items * sizeof(float));
+        ScopedCudaBuffer ref_seg_buf((ref_chunk_cols + 1) * sizeof(int));
 
         float* d_ref_data_f32 = (float*)ref_data_f32_buf.data();
         int* d_ref_indices = (int*)ref_indices_buf.data();
@@ -512,7 +551,8 @@ static void ovo_streaming_csr_host_impl(
                    (n_ref + 1) * sizeof(int), cudaMemcpyHostToDevice);
 
         // Fused gather + cast + stats for ref (fixed slot = n_test).  One
-        // pass over PCIe, no intermediate native-dtype GPU buffer.
+        // pass over PCIe, no intermediate native-dtype GPU buffer. Stats for
+        // all columns are accumulated here, once.
         if (n_ref > 0 && ref_nnz > 0) {
             csr_gather_cast_accumulate_mapped_kernel<InT, IndexT, IndptrT>
                 <<<n_ref, UTIL_BLOCK_SIZE, 0, ref_stream>>>(
@@ -524,28 +564,33 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(csr_gather_cast_accumulate_mapped_kernel);
         }
 
-        // Extract ref dense (F-order) from compacted CSR.
-        cudaMemsetAsync(d_ref_dense, 0, ref_items * sizeof(float), ref_stream);
-        {
+        size_t ref_cub_bytes = cub_segmented_sortkeys_temp_bytes(
+            ref_chunk_items_i32, ref_chunk_cols);
+        ScopedCudaBuffer cub_temp_buf(ref_cub_bytes);
+
+        // Extract + segment-sort the reference one column chunk at a time,
+        // writing each chunk into its slice of the full-width sorted cache.
+        for (int cs = 0; cs < n_cols; cs += ref_chunk_cols) {
+            int ce = std::min(cs + ref_chunk_cols, n_cols);
+            int cc = ce - cs;
+            size_t chunk_items = (size_t)n_ref * (size_t)cc;
+            cudaMemsetAsync(d_ref_dense, 0, chunk_items * sizeof(float),
+                            ref_stream);
             csr_extract_dense_identity_rows_unsorted_kernel<float>
                 <<<n_ref, UTIL_BLOCK_SIZE, 0, ref_stream>>>(
                     d_ref_data_f32, d_ref_indices, d_ref_indptr, d_ref_dense,
-                    n_ref, 0, n_cols);
+                    n_ref, cs, ce);
             CUDA_CHECK_LAST_ERROR(
                 csr_extract_dense_identity_rows_unsorted_kernel);
+            upload_linear_offsets(d_ref_seg, cc, n_ref, ref_stream);
+            size_t temp = ref_cub_bytes;
+            cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
+                           cub_temp_buf.data(), temp, d_ref_dense,
+                           d_ref_sorted + (size_t)cs * (size_t)n_ref,
+                           (int)chunk_items, cc, d_ref_seg, d_ref_seg + 1,
+                           BEGIN_BIT, END_BIT, ref_stream),
+                       "host CSR OVO ref segmented sort");
         }
-
-        // Segmented sort ref_dense by column → ref_sorted
-        size_t ref_cub_bytes =
-            cub_segmented_sortkeys_temp_bytes(ref_items_i32, n_cols);
-        ScopedCudaBuffer cub_temp_buf(ref_cub_bytes);
-        upload_linear_offsets(d_ref_seg, n_cols, n_ref, ref_stream);
-        size_t temp = ref_cub_bytes;
-        cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
-                       cub_temp_buf.data(), temp, d_ref_dense, d_ref_sorted,
-                       ref_items_i32, n_cols, d_ref_seg, d_ref_seg + 1,
-                       BEGIN_BIT, END_BIT, ref_stream),
-                   "host CSR OVO ref segmented sort");
         cuda_check(cudaStreamSynchronize(ref_stream),
                    "host CSR OVO ref sort sync");
     }  // ref scratch drops here

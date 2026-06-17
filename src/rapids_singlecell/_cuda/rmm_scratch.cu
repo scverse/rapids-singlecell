@@ -2,6 +2,7 @@
 #include <stdexcept>
 #include <string>
 
+#include <cuda_runtime.h>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include "rmm_scratch.h"
@@ -24,4 +25,26 @@ void* rmm_allocate(size_t bytes) {
 
 void rmm_deallocate(void* ptr, size_t bytes) {
     rmm::mr::get_current_device_resource_ref().deallocate_sync(ptr, bytes);
+}
+
+// `fraction` * the free device memory reported by cudaMemGetInfo.
+//
+// Deliberately a plain query, NOT a trial-allocation probe. Probing a pool's
+// internal free by allocating until it grows permanently RATCHETS the pool
+// (RMM pools never shrink): repeated wilcoxon calls would grow it toward the
+// whole device and then starve non-pool allocations like cudaStreamCreate
+// ("out of memory" on stream creation). cudaMemGetInfo free is correct and
+// safe everywhere:
+//   * Plain cuda: exact.
+//   * Pool: the memory OUTSIDE the pool's reservation; the pool also serves
+//     from its internal free, so this is conservative but never over-budgets
+//     and never grows the pool. The host-streaming paths transfer each nonzero
+//     once regardless of batch size (per-row cursor gather), so a smaller
+//     budget only adds a few more passes -- it does not re-stream.
+//   * Managed/UVM: device-resident free, so sizing to it avoids host spill.
+size_t rmm_available_device_bytes(double fraction) {
+    if (fraction <= 0.0) return 0;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    return (size_t)(free_b * fraction);
 }

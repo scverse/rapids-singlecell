@@ -348,6 +348,14 @@ def _host_sparse_fn_and_arrays(module, base_name: str, X):
         suffix += "_f64"
     if is_i64:
         suffix += "_i64"
+    # int64 column indices: if a native-int64 binding exists for this path, use
+    # it and pass the indices as-is. astype(int32) on int64 indices materializes
+    # a full copy of every nonzero (~nnz * 4 bytes, e.g. tens of GB on large
+    # matrices), so avoid it when the kernel can read int64 directly.
+    if X.indices.dtype == np.int64:
+        idx_fn = getattr(module, base_name + suffix + "_idx64", None)
+        if idx_fn is not None:
+            return idx_fn, data_arr, X.indices
     fn = getattr(module, base_name + suffix)
     indices_arr = X.indices.astype(np.int32, copy=False)
     return fn, data_arr, indices_arr

@@ -13,6 +13,14 @@
 void* rmm_allocate(size_t bytes);
 void rmm_deallocate(void* ptr, size_t bytes);
 
+// fraction * cudaMemGetInfo free. A plain query, never a trial-allocation probe
+// (probing a pool's internal free ratchets the pool to the whole device and
+// starves non-pool allocations like cudaStreamCreate). Conservative under a
+// pool but safe across the default cuda resource, a pool, and managed/UVM; the
+// host-streaming paths transfer each nonzero once regardless of batch size, so
+// a smaller budget only adds passes. Use for every GPU-memory-budget decision.
+size_t rmm_available_device_bytes(double fraction);
+
 // ---------------------------------------------------------------------------
 // Small allocation pool for temporary CUDA buffers. Frees everything on scope
 // exit; reuse a single pool across a kernel pipeline.
