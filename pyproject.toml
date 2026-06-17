@@ -123,6 +123,7 @@ addopts = [
 ]
 markers = [
     "gpu: tests that use a GPU (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
+    "array_api: array-API tests (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
 ]
 
 [tool.setuptools_scm]

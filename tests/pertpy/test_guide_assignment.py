@@ -190,11 +190,6 @@ def test_mixture_model_stores_params(guide_adata: AnnData) -> None:
         "mix_probs_0",
         "mix_probs_1",
         "threshold",
-        "weight_Poisson",
-        "weight_Normal",
-        "lambda",
-        "mu",
-        "scale",
     ]:
         assert col in guide_adata.var.columns, f"Missing column: {col}"
 
@@ -209,41 +204,20 @@ def test_mixture_model_stores_params(guide_adata: AnnData) -> None:
     means = guide_adata.var["gaussian_mean"].dropna()
     assert (rates < means).all(), "Poisson rate should be < Gaussian mean"
 
-    # Crispat-compatible aliases should mirror the pertpy-style parameter names.
-    np.testing.assert_allclose(
-        guide_adata.var["weight_Poisson"].dropna(),
-        guide_adata.var["mix_probs_0"].dropna(),
-    )
-    np.testing.assert_allclose(
-        guide_adata.var["weight_Normal"].dropna(),
-        guide_adata.var["mix_probs_1"].dropna(),
-    )
-    np.testing.assert_allclose(
-        guide_adata.var["lambda"].dropna(),
-        guide_adata.var["poisson_rate"].dropna(),
-    )
-    np.testing.assert_allclose(
-        guide_adata.var["mu"].dropna(),
-        guide_adata.var["gaussian_mean"].dropna(),
-    )
-    np.testing.assert_allclose(
-        guide_adata.var["scale"].dropna(),
-        guide_adata.var["gaussian_std"].dropna(),
-    )
     assert guide_adata.var["threshold"].dropna().ge(1).all()
 
 
 def test_mixture_model_overwrites_existing_var_columns(guide_adata: AnnData) -> None:
     guide_adata.var["threshold"] = pd.Categorical(["old"] * guide_adata.n_vars)
-    guide_adata.var["lambda"] = "old"
+    guide_adata.var["poisson_rate"] = "old"
 
     ga = rsc.ptg.GuideAssignment()
     ga.assign_mixture_model(guide_adata)
 
     assert pd.api.types.is_float_dtype(guide_adata.var["threshold"])
-    assert pd.api.types.is_float_dtype(guide_adata.var["lambda"])
+    assert pd.api.types.is_float_dtype(guide_adata.var["poisson_rate"])
     assert guide_adata.var["threshold"].dropna().ge(1).all()
-    assert np.isfinite(guide_adata.var["lambda"].dropna()).all()
+    assert np.isfinite(guide_adata.var["poisson_rate"].dropna()).all()
 
 
 def test_mixture_model_sparse_input(guide_adata_sparse: AnnData) -> None:
@@ -375,7 +349,7 @@ def test_mixture_model_skip_low_count() -> None:
 
 
 def test_mixture_model_skip_max_count_below_two() -> None:
-    """Crispat skips guides whose non-zero counts never reach 2 UMIs."""
+    """Guides whose non-zero counts never reach 2 UMIs are skipped."""
     X = np.zeros((50, 2), dtype=np.float32)
     X[:25, :] = 1.0
 
