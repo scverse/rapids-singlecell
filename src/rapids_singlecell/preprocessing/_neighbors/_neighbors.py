@@ -144,7 +144,8 @@ def _get_connectivities_umap(
     """UMAP fuzzy simplicial set connectivities."""
     set_op_mix_ratio = 1.0
     local_connectivity = 1.0
-    X_conn = cp.empty((n_obs, 1), dtype=np.float32)
+
+    X_conn = cp.zeros((n_obs, 1), dtype=np.float32)
     logger_level = _get_logger_level(logger)
     connectivities = fuzzy_simplicial_set(
         X_conn,
