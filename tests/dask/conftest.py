@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dask
 import pytest
 from dask.distributed import Client
 from dask_cuda import LocalCUDACluster
@@ -29,8 +30,12 @@ def dist_client(cluster):
     gets an isolated client (connecting to the shared cluster is cheap).
     """
     client = Client(cluster)
-    yield client
-    client.close()
+    try:
+        yield client
+    finally:
+        # Always deregister the global-default client, even if the test fails,
+        # so it can't leak into later `client`-fixture (synchronous) tests.
+        client.close()
 
 
 @pytest.fixture(scope="function")
@@ -42,5 +47,11 @@ def client():
     never touch the client object. Handing them ``None`` avoids spinning up a
     LocalCUDACluster and skips the distributed serialization round-trips of
     cupy chunks, which are pure overhead on the tiny test arrays.
+
+    Forces the synchronous scheduler so these tests can never be hijacked by a
+    distributed client left as the global default by an earlier ``dist_client``
+    test (which would route ``.compute()`` through the shared cluster and stall
+    on a GIL-holding cupy op -> the random 60s pytest-timeout hangs).
     """
-    yield None
+    with dask.config.set(scheduler="synchronous"):
+        yield None
