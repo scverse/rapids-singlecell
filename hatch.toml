@@ -38,6 +38,13 @@ overrides.matrix.deps.extra-dependencies = [
     { if = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
+    # numpy 2.5 removed `np.row_stack`, which numba-cuda still calls -> the whole
+    # suite fails at collection. Pin <2.5 for the prerelease-allowing envs until
+    # numba-cuda drops the call; remove this once that lands.
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numpy<2.5" },
 ]
 overrides.matrix.cuda.extra-dependencies = [
     { if = [ "13" ], value = "cuml-cu13<26.10" },
