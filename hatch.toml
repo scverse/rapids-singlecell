@@ -45,6 +45,13 @@ overrides.matrix.deps.extra-dependencies = [
         "dev",
         "rapids_prerelease",
     ], value = "numpy<2.5" },
+    # The prerelease numba-cuda caps numba <0.64, so UV_PRERELEASE pulls the
+    # broken numba 0.63.0b1 (references the removed np.trapz). Force the known-
+    # good stable numba (>=0.64 also pulls a compatible stable numba-cuda).
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numba>=0.64" },
 ]
 overrides.matrix.cuda.extra-dependencies = [
     { if = [ "13" ], value = "cuml-cu13<26.10" },
