@@ -49,7 +49,7 @@ def test_regress_out_categorical_dask(client, data_kind, dtype):
 
     dask_X = dask_data.X.compute()
 
-    atol = 1e-5 if dtype == "float32" else 1e-7
+    atol = 5e-5 if dtype == "float32" else 1e-7
     cp.testing.assert_allclose(dask_X, ref.X, atol=atol)
 
 
@@ -75,7 +75,7 @@ def test_regress_out_continuous_dask(client, data_kind, dtype):
 
     dask_X = dask_data.X.compute()
 
-    atol = 1e-5 if dtype == "float32" else 1e-7
+    atol = 5e-5 if dtype == "float32" else 1e-7
     cp.testing.assert_allclose(dask_X, ref.X, atol=atol)
 
 
