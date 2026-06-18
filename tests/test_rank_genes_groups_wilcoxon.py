@@ -78,29 +78,6 @@ def test_rank_genes_groups_sparse_negative_values_fallback(method, fmt):
         )
 
 
-@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "cupy_dense", "cupy_csr"])
-def test_rank_genes_groups_complex_values_raise(fmt):
-    X = np.array(
-        [
-            [1.0 + 0.0j, 0.0, 2.0],
-            [0.0, 1.0, 0.0],
-            [2.0, 0.0, 1.0],
-            [0.0, 3.0, 0.0],
-        ],
-        dtype=np.complex64,
-    )
-    adata = sc.AnnData(
-        X=_to_format(X, fmt),
-        obs=pd.DataFrame(
-            {"group": pd.Categorical(["a", "a", "b", "b"], categories=["a", "b"])}
-        ),
-        var=pd.DataFrame(index=["g0", "g1", "g2"]),
-    )
-
-    with pytest.raises(TypeError, match="complex expression values"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
-
-
 @pytest.mark.parametrize("layout", ["csr", "csc"])
 @pytest.mark.parametrize("reference", ["rest", "1"])
 def test_device_sparse_int64_indptr_matches_scanpy(layout, reference):

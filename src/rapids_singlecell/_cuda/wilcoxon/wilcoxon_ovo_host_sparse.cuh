@@ -31,7 +31,6 @@ static void ovo_streaming_csc_host_impl(
             [&](int c) { return (size_t)(h_indptr[c + 1] - h_indptr[c]); });
     }
 
-    // ---- Tier dispatch from host offsets ----
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = t1.max_grp_size;
     bool run_large = t1.above_medium && t1.run_large;
@@ -95,6 +94,13 @@ static void ovo_streaming_csc_host_impl(
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    // Pin host inputs before the streams so on an exception unwind the streams
+    // drain before the buffers are unregistered (mirrors the safe CSR order).
+    size_t total_nnz = (size_t)h_indptr[n_cols];
+    HostRegisterGuard _pin_data(const_cast<InT*>(h_data),
+                                total_nnz * sizeof(InT));
+    HostRegisterGuard _pin_indices(const_cast<IndexT*>(h_indices),
+                                   total_nnz * sizeof(IndexT));
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
@@ -115,7 +121,7 @@ static void ovo_streaming_csc_host_impl(
     cudaMemcpy(d_all_offsets, h_all_offsets.data(),
                h_all_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
 
-    // GPU copies of row maps + group offsets + stats codes (uploaded once)
+    // Row maps + group offsets + stats codes (uploaded once)
     int* d_ref_row_map = pool.alloc<int>(n_rows);
     int* d_grp_row_map = pool.alloc<int>(n_rows);
     int* d_grp_offsets = pool.alloc<int>(n_groups + 1);
@@ -198,13 +204,6 @@ static void ovo_streaming_csc_host_impl(
     size_t smem_cast =
         cast_accumulate_smem_config(n_groups_stats, compute_nnz, cast_use_gmem);
 
-    // Pin only the sparse input arrays; outputs live on the device.
-    size_t total_nnz = (size_t)h_indptr[n_cols];
-    HostRegisterGuard _pin_data(const_cast<InT*>(h_data),
-                                total_nnz * sizeof(InT));
-    HostRegisterGuard _pin_indices(const_cast<IndexT*>(h_indices),
-                                   total_nnz * sizeof(IndexT));
-
     int col = 0;
     int batch_idx = 0;
     while (col < n_cols) {
@@ -219,7 +218,7 @@ static void ovo_streaming_csc_host_impl(
         auto stream = streams[s];
         auto& buf = bufs[s];
 
-        // ---- H2D: sparse data for this column range (native dtype) ----
+        // H2D: sparse data for this column range (native dtype)
         IndptrT ptr_start = h_indptr[col];
         IndptrT ptr_end = h_indptr[col + sb_cols];
         size_t nnz = (size_t)(ptr_end - ptr_start);
@@ -232,14 +231,14 @@ static void ovo_streaming_csc_host_impl(
         cudaMemcpyAsync(buf.d_indptr, src, (sb_cols + 1) * sizeof(int),
                         cudaMemcpyDeviceToDevice, stream);
 
-        // ---- Cast to float32 for sort + accumulate stats in float64 ----
+        // Cast to float32 for sort + accumulate stats in float64
         launch_ovr_cast_and_accumulate_sparse<InT, IndexT>(
             buf.d_sparse_data_orig, buf.d_sparse_data_f32, buf.d_sparse_indices,
             buf.d_indptr, d_stats_codes, buf.d_group_sums, buf.d_group_nnz,
             sb_cols, n_groups_stats, compute_nnz, UTIL_BLOCK_SIZE, smem_cast,
             cast_use_gmem, stream);
 
-        // ---- Extract ref from CSC via row_map, sort ----
+        // Extract ref from CSC via row_map, sort
         cudaMemsetAsync(buf.ref_dense, 0, sb_ref_actual * sizeof(float),
                         stream);
         csc_extract_mapped_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
@@ -256,7 +255,7 @@ static void ovo_streaming_csc_host_impl(
                        "host CSC OVO ref segmented sort");
         }
 
-        // ---- Extract grp from CSC via row_map ----
+        // Extract grp from CSC via row_map
         cudaMemsetAsync(buf.grp_dense, 0, sb_grp_actual * sizeof(float),
                         stream);
         csc_extract_mapped_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
@@ -264,7 +263,7 @@ static void ovo_streaming_csc_host_impl(
             d_grp_row_map, buf.grp_dense, n_all_grp, 0);
         CUDA_CHECK_LAST_ERROR(csc_extract_mapped_kernel);
 
-        // ---- Tier dispatch: sort grp + rank ----
+        // Tier dispatch: sort grp + rank
         OvoTierScratch sc{buf.ref_tie_sums,    buf.d_rank_sums,
                           buf.d_tie_corr,      buf.grp_sorted,
                           buf.grp_seg_offsets, buf.grp_seg_ends,
@@ -274,7 +273,7 @@ static void ovo_streaming_csc_host_impl(
                            sb_grp_actual, tpb_rank, n_ref, n_all_grp, sb_cols,
                            n_groups, compute_tie_corr, stream);
 
-        // ---- D2D: scatter sub-batch results into caller's GPU buffers ----
+        // D2D: scatter sub-batch results into caller's GPU buffers
         cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
                           buf.d_rank_sums, sb_cols * sizeof(double),
                           sb_cols * sizeof(double), n_groups,
@@ -341,7 +340,7 @@ static void ovo_streaming_csr_host_impl(
     bool compute_nnz, bool compute_sums, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_test == 0 || n_all_grp == 0) return;
 
-    // ---- Pre-compute compacted indptrs on host (O(n_ref + n_all_grp)) ----
+    // Pre-compute compacted indptrs on host (O(n_ref + n_all_grp)).
     // Use IndptrT for the global compacted indptr because the grp side can
     // exceed 2^31 nnz on very large / dense matrices.  Ref always fits in
     // int32 since n_ref × n_cols ≪ 2B; keeping int32 there matches the
@@ -374,7 +373,7 @@ static void ovo_streaming_csr_host_impl(
         h_grp_indptr_compact[i + 1] = h_grp_indptr_compact[i] + nnz_i;
     }
 
-    // ---- Build packs (same rule as grp_impl, but uses compacted indptr) ----
+    // Build packs (same rule as grp_impl, but uses compacted indptr)
     struct Pack {
         int first;
         int end;
@@ -452,7 +451,6 @@ static void ovo_streaming_csr_host_impl(
 
     RmmScratchPool pool;
 
-    // Zero stats outputs.
     if (compute_sums) {
         cudaMemsetAsync(d_group_sums, 0,
                         (size_t)n_groups_stats * n_cols * sizeof(double));
@@ -462,7 +460,7 @@ static void ovo_streaming_csr_host_impl(
                         (size_t)n_groups_stats * n_cols * sizeof(double));
     }
 
-    // ---- Pin full host data + indices as MAPPED (zero-copy accessible) ----
+    // Pin full host data + indices as MAPPED (zero-copy accessible)
     size_t full_nnz = (size_t)h_indptr[n_full_rows];
     HostRegisterGuard _pin_data(const_cast<InT*>(h_data),
                                 full_nnz * sizeof(InT), cudaHostRegisterMapped);
@@ -486,12 +484,12 @@ static void ovo_streaming_csr_host_impl(
         }
     }
 
-    // ---- Upload full indptr (keep native IndptrT — can exceed int32) ----
+    // Upload full indptr (keep native IndptrT — can exceed int32)
     IndptrT* d_indptr_full = pool.alloc<IndptrT>(n_full_rows + 1);
     cudaMemcpy(d_indptr_full, h_indptr, (n_full_rows + 1) * sizeof(IndptrT),
                cudaMemcpyHostToDevice);
 
-    // ---- Upload row_ids + compacted indptrs + group boundaries ----
+    // Upload row_ids + compacted indptrs + group boundaries
     int* d_ref_row_ids = pool.alloc<int>(n_ref);
     int* d_grp_row_ids = pool.alloc<int>(n_all_grp);
     IndptrT* d_grp_indptr_compact = pool.alloc<IndptrT>(n_all_grp + 1);
@@ -505,7 +503,7 @@ static void ovo_streaming_csr_host_impl(
     cudaMemcpy(d_grp_offsets_full, h_grp_offsets, (n_test + 1) * sizeof(int),
                cudaMemcpyHostToDevice);
 
-    // ---- Phase 1: Ref setup (scoped scratch, ref_sorted persists) ----
+    // Phase 1: Ref setup (scoped scratch, ref_sorted persists).
     // The full-width sorted reference cache d_ref_sorted is [n_ref × n_cols],
     // but it is built one COLUMN CHUNK at a time so each CUB segmented sort
     // stays within int32 (n_ref × ref_chunk_cols items) and the dense extract
@@ -546,13 +544,11 @@ static void ovo_streaming_csr_host_impl(
         float* d_ref_dense = (float*)ref_dense_buf.data();
         int* d_ref_seg = (int*)ref_seg_buf.data();
 
-        // Upload ref compacted indptr
         cudaMemcpy(d_ref_indptr, h_ref_indptr_compact.data(),
                    (n_ref + 1) * sizeof(int), cudaMemcpyHostToDevice);
 
-        // Fused gather + cast + stats for ref (fixed slot = n_test).  One
-        // pass over PCIe, no intermediate native-dtype GPU buffer. Stats for
-        // all columns are accumulated here, once.
+        // Fused gather + cast + stats for ref (fixed slot = n_test): one PCIe
+        // pass, no intermediate native-dtype buffer, all-column stats once.
         if (n_ref > 0 && ref_nnz > 0) {
             csr_gather_cast_accumulate_mapped_kernel<InT, IndexT, IndptrT>
                 <<<n_ref, UTIL_BLOCK_SIZE, 0, ref_stream>>>(
@@ -568,8 +564,7 @@ static void ovo_streaming_csr_host_impl(
             ref_chunk_items_i32, ref_chunk_cols);
         ScopedCudaBuffer cub_temp_buf(ref_cub_bytes);
 
-        // Extract + segment-sort the reference one column chunk at a time,
-        // writing each chunk into its slice of the full-width sorted cache.
+        // Extract + segment-sort the reference one column chunk at a time.
         for (int cs = 0; cs < n_cols; cs += ref_chunk_cols) {
             int ce = std::min(cs + ref_chunk_cols, n_cols);
             int cc = ce - cs;
@@ -595,7 +590,7 @@ static void ovo_streaming_csr_host_impl(
                    "host CSR OVO ref sort sync");
     }  // ref scratch drops here
 
-    // ---- Phase 2: Per-pack streaming ----
+    // Phase 2: Per-pack streaming
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_test);
     bool may_need_cub = (t1.max_grp_size > OVO_LARGE_MAX);
 
@@ -709,8 +704,8 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
         }
 
-        // Build per-pack group offsets on GPU (on this stream) — needed to
-        // compute stats codes before the fused gather kernel can run.
+        // Build per-pack group offsets on GPU — needed for stats codes before
+        // the fused gather kernel can run.
         {
             int count = K + 1;
             int blk = (count + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
@@ -719,7 +714,6 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
         }
 
-        // Fill per-row stats codes for this pack
         {
             int blk = (pack_rows + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
             fill_pack_stats_codes_kernel<<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(
@@ -727,9 +721,8 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(fill_pack_stats_codes_kernel);
         }
 
-        // Fused gather + cast + stats for the pack.  One pass over PCIe
-        // (reads mapped host via UVA), no intermediate native-dtype GPU
-        // buffer, writes f32 + indices + atomics.
+        // Fused gather + cast + stats for the pack: one PCIe pass (reads mapped
+        // host via UVA), no intermediate native-dtype buffer.
         if (pack.nnz > 0) {
             csr_gather_cast_accumulate_mapped_kernel<InT, IndexT, IndptrT>
                 <<<pack_rows, UTIL_BLOCK_SIZE, 0, stream>>>(
@@ -742,7 +735,6 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(csr_gather_cast_accumulate_mapped_kernel);
         }
 
-        // Per col sub-batch
         int col = 0;
         while (col < n_cols) {
             int sb_cols = std::min(pack_sb, n_cols - col);

@@ -13,7 +13,12 @@ from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.get._aggregated import Aggregate
 from rapids_singlecell.preprocessing._utils import _check_gpu_X
 
-from ._utils import EPS, _reject_complex, _select_groups, _sparse_has_negative
+from ._utils import (
+    EPS,
+    _canonicalize_sparse,
+    _select_groups,
+    _sparse_has_negative,
+)
 
 _RANK_SORT_MIN_ELEMENTS = 1_000_000
 _RANK_SORT_MAX_WORKERS = 64
@@ -44,7 +49,6 @@ class _RankGenes:
         pre_load: bool = False,
         skip_empty_groups: bool = False,
     ) -> None:
-        # Handle groups parameter
         if groups == "all" or groups is None:
             selected: list | None = None
         elif isinstance(groups, str | int):
@@ -74,7 +78,6 @@ class _RankGenes:
             skip_empty_groups=skip_empty_groups,
         )
 
-        # Get data matrix
         if layer is not None:
             if use_raw is True:
                 msg = "Cannot specify `layer` and have `use_raw=True`."
@@ -94,7 +97,6 @@ class _RankGenes:
             self.X = adata.X
             self.var_names = adata.var_names
 
-        # Apply mask_var to select subset of genes
         if mask_var is not None:
             self.X = self.X[:, mask_var]
             self.var_names = self.var_names[mask_var]
@@ -105,7 +107,7 @@ class _RankGenes:
         if reference != "rest":
             self.ireference = int(np.where(self.groups_order == str(reference))[0][0])
 
-        # Set up expm1 function based on log base
+        # expm1 function depends on the log base used by log1p
         self.is_log1p = "log1p" in adata.uns
         base = adata.uns.get("log1p", {}).get("base")
         self._log1p_base = base
@@ -114,7 +116,6 @@ class _RankGenes:
         else:
             self.expm1_func = np.expm1
 
-        # For basic stats
         self.comp_pts = comp_pts
         self.means: np.ndarray | None = None
         self.vars: np.ndarray | None = None
@@ -163,7 +164,6 @@ class _RankGenes:
         """
         n_genes = self.X.shape[1]
 
-        # Check if data is already on GPU
         try:
             _check_gpu_X(self.X, allow_dask=True)
         except TypeError:
@@ -172,12 +172,11 @@ class _RankGenes:
             is_on_gpu = True
 
         if not is_on_gpu:
-            # Data not on GPU - defer to chunk-based computation
+            # Not on GPU: defer to chunk-based computation in the wilcoxon loop
             self._compute_stats_in_chunks = True
             self._init_stats_arrays(n_genes)
             return
 
-        # Data is on GPU - use Aggregate for fast computation
         self._compute_stats_in_chunks = False
 
         agg = Aggregate(groupby=self.labels.cat, data=self.X)
@@ -204,7 +203,6 @@ class _RankGenes:
         sums = sums_all[order]
         sq_sums = sq_sums_all[order]
 
-        # Compute means and variances from raw sums (all on GPU)
         means = sums / n
         group_ss = sq_sums - n * means**2
         vars_ = cp.maximum(group_ss / cp.maximum(n - 1, 1), 0)
@@ -239,7 +237,6 @@ class _RankGenes:
             self.vars_rest = None
             self.pts_rest = None
 
-        # Transfer to CPU
         self.means = cp.asnumpy(means)
         self.vars = cp.asnumpy(vars_)
         self.pts = cp.asnumpy(pts) if pts is not None else None
@@ -279,20 +276,17 @@ class _RankGenes:
             stream=cp.cuda.get_current_stream().ptr,
         )
 
-        # Means
         chunk_means = group_sums / group_sizes_dev[:, None]
         self.means[:, start:stop] = cp.asnumpy(chunk_means)
 
-        # Variances (with Bessel correction)
+        # variance with Bessel correction
         chunk_vars = group_sum_sq / group_sizes_dev[:, None] - chunk_means**2
         chunk_vars *= group_sizes_dev[:, None] / (group_sizes_dev[:, None] - 1)
         self.vars[:, start:stop] = cp.asnumpy(chunk_vars)
 
-        # Pts (fraction expressing)
         if self.comp_pts:
             self.pts[:, start:stop] = cp.asnumpy(group_nnz / group_sizes_dev[:, None])
 
-        # Rest statistics
         if self.ireference is None:
             total_sum = block.sum(axis=0)
             total_sum_sq = (block**2).sum(axis=0)
@@ -386,13 +380,16 @@ class _RankGenes:
         # The optimized sparse Wilcoxon paths inject implicit zeros analytically
         # as a tie at the column minimum (valid only for nonnegative data).
         # t-test/logreg are mean/variance/model-based and sign-agnostic. For the
-        # Wilcoxon methods we reject complex input and, when sparse data holds
+        # Wilcoxon methods we canonicalize and, when sparse data holds
         # negatives, fall back to the dense full-sort ranking (correct for any
         # sign) rather than erroring -- so e.g. signed sparse data still ranks
         # correctly, just via the dense path.
         self._sparse_negative_fallback = False
         if method in {"wilcoxon", "wilcoxon_binned"}:
-            _reject_complex(self.X)
+            # Canonicalize before the negative check: summing duplicates can
+            # change stored values (e.g. +a and -a -> 0), and the fast paths
+            # rank each stored nnz once, so they must see scanpy's summed view.
+            self.X = _canonicalize_sparse(self.X)
             self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if self.pre_load or method in {
             "t-test",

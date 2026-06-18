@@ -77,14 +77,29 @@ def rank_genes_groups(
     Rank genes for characterizing groups using GPU acceleration.
 
     Log1p/log-normalized data is expected for biologically meaningful log fold
-    changes. Complex values are rejected. Sparse inputs with explicit negative
-    values fall back to the dense full-sort ranking path; dense inputs are
-    ranked directly and support any sign.
+    changes. Sparse inputs with explicit negative values fall back to the dense
+    full-sort ranking path; dense inputs are ranked directly and support any
+    sign.
 
     .. note::
         **Dask support:** `'t-test'`, `'t-test_overestim_var'`,
         `'wilcoxon_binned'`, and `'logreg'` support Dask arrays. The
         `'wilcoxon'` method does not support Dask arrays.
+
+    .. note::
+        **Wilcoxon ranking precision:** `'wilcoxon'` and `'wilcoxon_binned'`
+        rank values in float32 on every code path, while means and log fold
+        changes are computed in float64. This only diverges from Scanpy when the
+        **preprocessing itself ran in float64** — i.e. normalization/log1p
+        produced values carrying sub-float32 precision. If preprocessing was
+        done in float32 (the common case), the values are float32-exact and
+        ranking is bit-identical to Scanpy (~1e-13), even if they are afterward
+        stored as float64. For a fully float64 pipeline the rank-derived scores
+        and p-values still match Scanpy-on-float64 to ~1e-4 on log-normalized
+        data — below any significance threshold and changing no DE calls —
+        because the rank-sum normal approximation is insensitive to sub-float32
+        tie jitter. If exact float64 ranking matters for your workflow, please
+        open an issue at https://github.com/scverse/rapids_singlecell/issues.
 
     Parameters
     ----------
@@ -226,7 +241,6 @@ def rank_genes_groups(
     if key_added is None:
         key_added = "rank_genes_groups"
 
-    # Process mask_var: convert string to boolean array
     mask_var_array: NDArray[np.bool_] | None = None
     if mask_var is not None:
         if isinstance(mask_var, str):
@@ -253,7 +267,6 @@ def rank_genes_groups(
         skip_empty_groups=skip_empty_groups,
     )
 
-    # Determine n_genes_user
     n_genes_user = n_genes
     if n_genes_user is None or n_genes_user > test_obj.X.shape[1]:
         n_genes_user = test_obj.X.shape[1]

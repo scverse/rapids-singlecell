@@ -17,18 +17,6 @@ EPS = 1e-9
 MIN_GROUP_SIZE_WARNING = 25
 
 
-def _reject_complex(X) -> None:
-    """Reject complex expression values (unsupported by every rank method)."""
-    dtype = None
-    if sp.issparse(X) or cpsp.issparse(X):
-        dtype = np.dtype(X.data.dtype)
-    elif isinstance(X, np.ndarray | cp.ndarray):
-        dtype = np.dtype(X.dtype)
-    if dtype is not None and dtype.kind == "c":
-        msg = "rank_genes_groups does not support complex expression values."
-        raise TypeError(msg)
-
-
 def _sparse_has_negative(X) -> bool:
     """Whether X is a sparse matrix holding an explicit negative value.
 
@@ -43,6 +31,23 @@ def _sparse_has_negative(X) -> bool:
     if sp.issparse(X) or cpsp.issparse(X):
         return X.nnz > 0 and float(X.data.min()) < 0
     return False
+
+
+def _canonicalize_sparse(X):
+    """Sum duplicate entries and sort indices of sparse ``X`` in place.
+
+    The fast Wilcoxon paths rank each stored nonzero once, so non-canonical
+    input with duplicate ``(row, col)`` entries would diverge from scanpy,
+    which sums duplicates when it densifies. Canonicalizing keeps them in
+    agreement. A no-op for already-canonical or dense input.
+    """
+    if (
+        (sp.issparse(X) or cpsp.issparse(X))
+        and getattr(X, "format", None) in {"csr", "csc"}
+        and not X.has_canonical_format
+    ):
+        X.sum_duplicates()  # also sorts indices and sets the canonical flag
+    return X
 
 
 def _select_groups(
@@ -124,7 +129,6 @@ def _select_groups(
         np.int64
     )
 
-    # Validate singlet groups
     invalid_groups = {str(selected[i]) for i in range(n_groups) if group_sizes[i] < 2}
     if invalid_groups:
         msg = (

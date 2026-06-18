@@ -93,9 +93,10 @@ static void launch_ovr_rank_dense_streaming(
                    "dense OVR segmented sort");
 
         if (use_gmem) {
-            cudaMemsetAsync(buf.sub_rank_sums, 0,
-                            (size_t)n_groups * sb_cols * sizeof(double),
-                            stream);
+            cuda_check(cudaMemsetAsync(
+                           buf.sub_rank_sums, 0,
+                           (size_t)n_groups * sb_cols * sizeof(double), stream),
+                       "dense OVR gmem rank_sums memset");
         }
         rank_sums_from_sorted_kernel<<<sb_cols, tpb_rank, smem_rank, stream>>>(
             buf.keys_out, buf.vals_out, group_codes, buf.sub_rank_sums,
@@ -103,14 +104,17 @@ static void launch_ovr_rank_dense_streaming(
             use_gmem);
         CUDA_CHECK_LAST_ERROR(rank_sums_from_sorted_kernel);
 
-        cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
-                          buf.sub_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        cuda_check(
+            cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
+                              buf.sub_rank_sums, sb_cols * sizeof(double),
+                              sb_cols * sizeof(double), n_groups,
+                              cudaMemcpyDeviceToDevice, stream),
+            "dense OVR rank_sums D2D copy");
         if (compute_tie_corr) {
-            cudaMemcpyAsync(tie_corr + col, buf.sub_tie_corr,
-                            sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
-                            stream);
+            cuda_check(cudaMemcpyAsync(tie_corr + col, buf.sub_tie_corr,
+                                       sb_cols * sizeof(double),
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "dense OVR tie_corr D2D copy");
         }
 
         col += sb_cols;
@@ -136,9 +140,11 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
 
     std::vector<int> h_offsets(n_groups + 1);
-    cudaStreamSynchronize(upstream_stream);
-    cudaMemcpy(h_offsets.data(), grp_offsets, (n_groups + 1) * sizeof(int),
-               cudaMemcpyDeviceToHost);
+    cuda_check(cudaStreamSynchronize(upstream_stream),
+               "dense OVO sync before offsets D2H");
+    cuda_check(cudaMemcpy(h_offsets.data(), grp_offsets,
+                          (n_groups + 1) * sizeof(int), cudaMemcpyDeviceToHost),
+               "dense OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
     bool run_large = t1.above_medium && t1.run_large;
@@ -188,9 +194,10 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
     int* d_sort_group_ids = nullptr;
     if (run_huge) {
         d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());
-        cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
-                   h_sort_group_ids.size() * sizeof(int),
-                   cudaMemcpyHostToDevice);
+        cuda_check(cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
+                              h_sort_group_ids.size() * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "dense OVO sort group ids H2D");
     }
 
     struct StreamBuf {
@@ -270,15 +277,19 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
                            sb_grp_items_actual, tpb_rank, n_ref, n_all_grp,
                            sb_cols, n_groups, compute_tie_corr, stream);
 
-        cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
-                          buf.sub_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
-        if (compute_tie_corr) {
-            cudaMemcpy2DAsync(tie_corr + col, n_cols * sizeof(double),
-                              buf.sub_tie_corr, sb_cols * sizeof(double),
+        cuda_check(
+            cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
+                              buf.sub_rank_sums, sb_cols * sizeof(double),
                               sb_cols * sizeof(double), n_groups,
-                              cudaMemcpyDeviceToDevice, stream);
+                              cudaMemcpyDeviceToDevice, stream),
+            "dense OVO rank_sums D2D copy");
+        if (compute_tie_corr) {
+            cuda_check(
+                cudaMemcpy2DAsync(tie_corr + col, n_cols * sizeof(double),
+                                  buf.sub_tie_corr, sb_cols * sizeof(double),
+                                  sb_cols * sizeof(double), n_groups,
+                                  cudaMemcpyDeviceToDevice, stream),
+                "dense OVO tie_corr D2D copy");
         }
 
         col += sb_cols;
@@ -308,6 +319,24 @@ void register_bindings(nb::module_& m) {
            gpu_array_c<double, Device> tie_corr, int n_ref, int n_all_grp,
            int n_cols, int n_groups, bool compute_tie_corr, int sub_batch_cols,
            std::uintptr_t stream) {
+            nb_require(ref_data.ndim() == 2 && grp_data.ndim() == 2 &&
+                           rank_sums.ndim() == 2 && tie_corr.ndim() == 2 &&
+                           grp_offsets.ndim() == 1,
+                       "ovo_rank: data/outputs must be 2D, grp_offsets 1D");
+            nb_require((int)ref_data.shape(0) == n_ref &&
+                           (int)ref_data.shape(1) == n_cols,
+                       "ovo_rank: ref_data shape must be (n_ref, n_cols)");
+            nb_require((int)grp_data.shape(0) == n_all_grp &&
+                           (int)grp_data.shape(1) == n_cols,
+                       "ovo_rank: grp_data shape must be (n_all_grp, n_cols)");
+            nb_require((int)grp_offsets.shape(0) >= n_groups + 1,
+                       "ovo_rank: grp_offsets length must be >= n_groups + 1");
+            nb_require((int)rank_sums.shape(0) == n_groups &&
+                           (int)rank_sums.shape(1) == n_cols,
+                       "ovo_rank: rank_sums shape must be (n_groups, n_cols)");
+            nb_require((int)tie_corr.shape(0) == n_groups &&
+                           (int)tie_corr.shape(1) == n_cols,
+                       "ovo_rank: tie_corr shape must be (n_groups, n_cols)");
             launch_ovo_rank_dense_tiered_unsorted_ref(
                 ref_data.data(), grp_data.data(), grp_offsets.data(),
                 rank_sums.data(), tie_corr.data(), n_ref, n_all_grp, n_cols,
@@ -327,6 +356,19 @@ void register_bindings(nb::module_& m) {
            gpu_array_c<double, Device> tie_corr, int n_rows, int n_cols,
            int n_groups, bool compute_tie_corr, int sub_batch_cols,
            std::uintptr_t stream) {
+            nb_require(block.ndim() == 2 && rank_sums.ndim() == 2 &&
+                           group_codes.ndim() == 1 && tie_corr.ndim() == 1,
+                       "ovr_rank: block/rank_sums 2D, group_codes/tie_corr 1D");
+            nb_require(
+                (int)block.shape(0) == n_rows && (int)block.shape(1) == n_cols,
+                "ovr_rank: block shape must be (n_rows, n_cols)");
+            nb_require((int)group_codes.shape(0) == n_rows,
+                       "ovr_rank: group_codes length must be n_rows");
+            nb_require((int)rank_sums.shape(0) == n_groups &&
+                           (int)rank_sums.shape(1) == n_cols,
+                       "ovr_rank: rank_sums shape must be (n_groups, n_cols)");
+            nb_require((int)tie_corr.shape(0) == n_cols,
+                       "ovr_rank: tie_corr length must be n_cols");
             launch_ovr_rank_dense_streaming(
                 block.data(), group_codes.data(), rank_sums.data(),
                 tie_corr.data(), n_rows, n_cols, n_groups, compute_tie_corr,

@@ -2,13 +2,12 @@
 
 #include <cuda_runtime.h>
 
-// CSR-slice + densify in a single pass: scatter the nonzeros of column window
-// [col_lb, col_ub) straight into a dense (n_cells, col_ub-col_lb) F-order
-// (column-major) double buffer. This skips the CSR -> CSC tile rebuild that a
-// `X[:, lb:ub].tocsc()` densify would do.
+// Single-pass CSR-slice + densify: scatter column window [col_lb, col_ub) into
+// a dense (n_cells, col_ub-col_lb) F-order double buffer, skipping the CSR ->
+// CSC rebuild a `X[:, lb:ub].tocsc()` densify would do.
 //
 // `out` must be pre-zeroed; the atomicAdd also sums duplicate column indices
-// (like scipy's sum_duplicates) -- bit-identical to a dense materialization for
+// (like scipy's sum_duplicates) -- bit-identical to dense materialization for
 // canonical CSR. Output is always double; input dtype is templated.
 
 template <typename TData, typename IndptrT, typename IndexT>

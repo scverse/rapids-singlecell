@@ -23,14 +23,8 @@ __device__ __forceinline__ double wilcoxon_block_sum(double val,
     return 0.0;
 }
 
-/**
- * OVR dense rank-sum kernel for data sorted by column.
- *
- * sorted_vals and sorted_row_idx are F-order arrays from a segmented
- * SortPairs. One block owns one column, walks tie runs, and accumulates the
- * average ranks per group without materializing a full rank matrix.
- */
-// Dense OVR rank kernel. One block per column; walks sorted tie runs and
+// Dense OVR rank kernel. sorted_vals/sorted_row_idx are F-order arrays from a
+// segmented SortPairs. One block per column; walks sorted tie runs and
 // accumulates average ranks per group without materializing a rank matrix.
 // The `use_gmem` flag (set by ovr_smem_config) selects shared- vs
 // global-memory group accumulators -- CRITICAL: the use_gmem path is REQUIRED
@@ -110,7 +104,7 @@ __global__ void rank_sums_from_sorted_kernel(
 
         for (int j = i; j < tie_local_end; ++j) {
             int grp = group_codes[si[j]];
-            if (grp < n_groups) {
+            if (grp >= 0 && grp < n_groups) {
                 atomicAdd(&grp_sums[grp * acc_stride], avg_rank);
             }
         }

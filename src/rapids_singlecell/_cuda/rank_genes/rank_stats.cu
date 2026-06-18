@@ -9,9 +9,9 @@ namespace {
 
 constexpr int GROUP_STATS_BLOCK = 256;
 
-// Benjamini-Hochberg step-up tail: in-place reverse cumulative minimum along
-// each row (group) of an already BH-scaled, p-value-sorted matrix. NaNs are
-// treated as 1.0. One block per row, single thread per row (serial scan).
+// Benjamini-Hochberg step-up tail: in-place reverse cumulative minimum per row
+// of an already BH-scaled, p-value-sorted matrix. NaNs treated as 1.0. One
+// block per row, single thread (serial scan).
 __global__ void fdr_bh_reverse_cummin_kernel(double* values, const int n_cols) {
     const int row = blockIdx.x;
     double running = 1.0;
@@ -28,11 +28,10 @@ __global__ void fdr_bh_reverse_cummin_kernel(double* values, const int n_cols) {
     }
 }
 
-// Per-group sum / sum-of-squares / nnz over a dense F-order (column-major)
-// block of shape (n_rows x n_cols). group_codes maps each row to a group; rows
-// with an out-of-range code are skipped. Outputs are (n_groups x n_cols),
-// C-order, accumulated with atomics. Grid-strided so a chunk larger than the
-// gridDim.x cap is still fully covered.
+// Per-group sum / sum-of-squares / nnz over a dense F-order block. group_codes
+// maps each row to a group; out-of-range codes are skipped. C-order
+// (n_groups x n_cols) outputs accumulated with atomics. Grid-strided so chunks
+// larger than the gridDim.x cap are still fully covered.
 __global__ void group_chunk_stats_kernel(
     const double* block, const int* group_codes, double* group_sums,
     double* group_sum_sq, double* group_nnz, const int n_rows, const int n_cols,

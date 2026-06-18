@@ -75,14 +75,12 @@ def __getattr__(name: str):
         try:
             return importlib.import_module(f".{name}", __name__)
         except ModuleNotFoundError:
-            # Extension genuinely absent (e.g. docs builds, no-GPU installs):
-            # degrade to None so module-level imports don't raise.
+            # Extension genuinely absent (docs/no-GPU): degrade to None.
             return None
         except ImportError as exc:
-            # Extension present but failed to load (ABI/toolkit mismatch, a
-            # missing shared library, the rmm symbol-ordering issue, ...).
-            # Surface it with context instead of silently returning None and
-            # crashing later with a cryptic ``'NoneType' has no attribute ...``.
+            # Present but failed to load (ABI/toolkit mismatch, missing .so, rmm
+            # symbol-ordering): surface with context, don't return None and crash
+            # later with a cryptic ``'NoneType' has no attribute ...``.
             msg = (
                 f"Failed to load compiled CUDA extension {name!r}: {exc}. "
                 "Ensure a matching rapids-singlecell-cuXX wheel (and librmm) is "

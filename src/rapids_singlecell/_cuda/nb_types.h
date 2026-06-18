@@ -8,9 +8,8 @@
 
 namespace nb = nanobind;
 
-/// Check the last CUDA error after a kernel launch.
-/// Call immediately after every <<<...>>> launch to catch configuration errors
-/// (invalid grid/block, shared memory overflow, etc.) before they propagate.
+/// Check cudaGetLastError after a <<<...>>> launch (invalid grid/block,
+/// shared memory overflow, etc.).
 inline void cuda_check_last_error(const char* kernel_name) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -21,16 +20,23 @@ inline void cuda_check_last_error(const char* kernel_name) {
 
 #define CUDA_CHECK_LAST_ERROR(kernel_name) cuda_check_last_error(#kernel_name)
 
-/// Check a cudaError_t returned directly by a CUDA/CUB API call.
-/// Unlike CUDA_CHECK_LAST_ERROR (which inspects cudaGetLastError after a
-/// <<<...>>> launch), this validates the status a function call returns -- e.g.
-/// cub::DeviceSegmentedRadixSort::SortKeys or cudaStreamSynchronize -- so a
-/// failed call surfaces here with a clear label instead of as corrupted output
-/// at a later synchronization point.
+/// Check a cudaError_t returned directly by a CUDA/CUB API call (vs.
+/// CUDA_CHECK_LAST_ERROR which inspects state after a launch), so a failed
+/// call surfaces with a clear label instead of as corrupted output later.
 inline void cuda_check(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string(what) +
                                  " failed: " + cudaGetErrorString(err));
+    }
+}
+
+/// Validate a binding-argument precondition (array dims vs. scalar shapes).
+/// Throws std::invalid_argument so a mismatch is a clean Python error instead
+/// of an out-of-bounds kernel launch.
+inline void nb_require(bool cond, const char* what) {
+    if (!cond) {
+        throw std::invalid_argument(
+            std::string("rank_genes_groups CUDA binding: ") + what);
     }
 }
 
@@ -83,8 +89,7 @@ inline unsigned int strided_grid(long long nwork, int block_size) {
     return (unsigned int)(capped < 1 ? 1 : capped);
 }
 
-/// Like `strided_grid` but for the y-axis of a 2D/3D grid (much lower cap,
-/// typically 65535). Use when the y dimension is the one being strided over.
+/// Like `strided_grid` but for the y-axis (much lower cap, typically 65535).
 inline unsigned int strided_grid_y(long long nwork, int block_size) {
     const long long max_grid = max_grid_dim_y();
     long long ideal = (nwork + block_size - 1) / block_size;
@@ -105,11 +110,11 @@ using gpu_array_c = nb::ndarray<T, Device, nb::c_contig>;
 template <typename T, typename Device>
 using gpu_array_f = nb::ndarray<T, Device, nb::f_contig>;
 
-// No contiguity constraint (accepts any order)
+// No contiguity constraint
 template <typename T, typename Device>
 using gpu_array = nb::ndarray<T, Device>;
 
-// Parameterized contiguity (for kernels that handle both C and F order)
+// Parameterized contiguity (kernels handling both C and F order)
 template <typename T, typename Device, typename Contig>
 using gpu_array_contig = nb::ndarray<T, Device, Contig>;
 

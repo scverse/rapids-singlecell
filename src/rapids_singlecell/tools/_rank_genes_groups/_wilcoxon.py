@@ -158,9 +158,7 @@ def _fill_basic_stats_from_accumulators(
     total_sums: cp.ndarray | None = None,
     total_nnz: cp.ndarray | None = None,
 ) -> None:
-    # Wilcoxon does not output per-group variance; vars are left zero (real
-    # group means/pts come from group_sums/group_nnz, which drive the lfc/pts
-    # output and the rank test).
+    # vars left zero: wilcoxon does not output per-group variance.
     n = cp.asarray(group_sizes, dtype=cp.float64)[:, None]
     means = group_sums / n
     rg.means = cp.asnumpy(means)
@@ -336,13 +334,11 @@ def _host_sparse_fn_and_arrays(module, base_name: str, X):
         )
         raise TypeError(msg)
 
-    # Row/column indices always fit int32 (cells and genes are < 2^31); only the
-    # indptr (cumulative nnz) can need int64. Mirrors the rest of the sparse code.
+    # Indices fit int32 (cells/genes < 2^31); only indptr (cumulative nnz) needs int64.
     is_i64 = X.indptr.dtype == np.int64
-    # The *_f64 binding only changes the host pointer dtype so float64 data can
-    # be passed without a host-side copy; it still ranks in float32 on-device
-    # (the kernels cast InT -> float before the segmented sort). See
-    # _device_sparse_arrays_f32 for why float32 ranking is the uniform design.
+    # The *_f64 binding only changes the host pointer dtype to accept float64 data
+    # without a host copy; it still ranks in float32 on-device (kernels cast InT ->
+    # float before the segmented sort). See _device_sparse_arrays_f32.
     suffix = ""
     if is_f64:
         suffix += "_f64"
@@ -367,9 +363,15 @@ def _device_sparse_arrays_f32(X):
     Wilcoxon ranking sorts float32 keys on every path -- the sparse fast paths
     AND the dense fallback (``_get_dense_column_block_f32``); the CUB segmented
     sort is float-keyed throughout. Casting ``X.data`` to float32 here therefore
-    does not diverge from any float64 ranking path, because there is none. For
-    count data float32 is exact (integer values < 2**24) and scanpy parity holds
-    at 1e-13. float64 input is accepted only to spare the caller a pre-cast.
+    does not diverge from any float64 ranking path, because there is none. This
+    only loses precision when preprocessing ran in float64; float32-preprocessed
+    values (even if later stored as float64) are float32-exact, so ranking
+    matches scanpy bit-for-bit (~1e-13). For a fully float64 pipeline the
+    rank-derived scores/p-values match scanpy-on-float64 to ~1e-4 on
+    log-normalized data (below any significance threshold, no DE calls change),
+    while means and log fold changes are still computed in float64. See the
+    ``rank_genes_groups`` note on ranking precision. float64 input is accepted
+    to spare the caller a pre-cast.
     """
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype == np.float32 or data_dtype == np.float64:
@@ -475,14 +477,13 @@ def wilcoxon(
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Compute Wilcoxon rank-sum test statistics."""
     _maybe_preload_host_dense(rg)
-    # Compute basic stats - uses Aggregate if on GPU, else defers to chunks
+    # Aggregate if on GPU, else defer to chunks.
     rg._basic_stats()
     X = rg.X
     n_cells, n_total_genes = rg.X.shape
     group_sizes = rg.group_sizes
 
     if rg.ireference is not None:
-        # Compare each group against a specific reference group
         return _wilcoxon_with_reference(
             rg,
             X,
@@ -493,7 +494,6 @@ def wilcoxon(
             chunk_size=chunk_size,
             return_u_values=return_u_values,
         )
-    # Compare each group against "rest" (all other cells)
     return _wilcoxon_vs_rest(
         rg,
         X,
@@ -522,7 +522,6 @@ def _wilcoxon_vs_rest(
     """Wilcoxon test: each group vs rest of cells."""
     n_groups = len(rg.groups_order)
 
-    # Warn for small groups
     for name, size in zip(rg.groups_order, group_sizes, strict=True):
         rest = n_cells - size
         if size <= MIN_GROUP_SIZE_WARNING or rest <= MIN_GROUP_SIZE_WARNING:
@@ -703,7 +702,6 @@ def _wilcoxon_vs_rest(
 
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
 
-    # Accumulate results per group
     all_scores: dict[int, list] = {i: [] for i in range(n_groups)}
     all_pvals: dict[int, list] = {i: [] for i in range(n_groups)}
 
@@ -760,7 +758,6 @@ def _wilcoxon_vs_rest(
             all_scores[idx].append(scores_host[idx])
             all_pvals[idx].append(p_host[idx])
 
-    # Collect results per group
     return [
         (gi, np.concatenate(all_scores[gi]), np.concatenate(all_pvals[gi]))
         for gi in range(n_groups)

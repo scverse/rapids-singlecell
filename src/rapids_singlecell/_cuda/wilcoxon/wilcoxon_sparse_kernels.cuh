@@ -67,7 +67,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
     int acc_stride;
 
     if (use_gmem) {
-        // Output rank_sums doubles as accumulator (pre-zeroed by caller).
+        // rank_sums doubles as accumulator (pre-zeroed by caller).
         grp_sums = rank_sums + (size_t)col;
         grp_nz_count = nz_count_scratch + (size_t)col;
         acc_stride = sb_cols;
@@ -82,10 +82,9 @@ __global__ void rank_sums_sparse_ovr_kernel(
         __syncthreads();
     }
 
-    // --- Find stored zero range: pos_start = first val > 0 ---
+    // pos_start = first index where sv[i] > 0 (stored zeros precede positives).
     __shared__ int sh_pos_start;
     if (threadIdx.x == 0) {
-        // Binary search: first index where sv[i] > 0.0
         int lo = 0, hi = nnz_stored;
         while (lo < hi) {
             int mid = lo + ((hi - lo) >> 1);
@@ -110,16 +109,16 @@ __global__ void rank_sums_sparse_ovr_kernel(
     //   = n_implicit_zero + (a + b + 1) / 2
     int offset_pos = n_implicit_zero;
 
-    // --- Count stored positive values per group ---
+    // Count stored positives per group.
     for (int i = pos_start + threadIdx.x; i < nnz_stored; i += blockDim.x) {
         int grp = group_codes[si[i]];
-        if (grp < n_groups) {
+        if (grp >= 0 && grp < n_groups) {
             atomicAdd(&grp_nz_count[(size_t)grp * acc_stride], 1.0);
         }
     }
     __syncthreads();
 
-    // --- Zero-rank contribution per group ---
+    // Analytic zero contribution: each group's zeros all get zero_avg_rank.
     for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
         double n_zero_in_g =
             group_sizes[g] - grp_nz_count[(size_t)g * acc_stride];
@@ -127,7 +126,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
     }
     __syncthreads();
 
-    // --- Walk stored positives only and compute ranks ---
+    // Walk stored positives and compute tie-averaged ranks.
     int n_pos = nnz_stored - pos_start;
     int chunk = (n_pos + blockDim.x - 1) / blockDim.x;
     int my_start = pos_start + threadIdx.x * chunk;
@@ -146,7 +145,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
 
         int tie_global_start = i;
         if (i == my_start && i > 0 && sv[i - 1] == val) {
-            // Binary search for first occurrence
+            // tie spans into a prior chunk: find global tie start.
             int lo = pos_start, hi = i;
             while (lo < hi) {
                 int mid = lo + ((hi - lo) >> 1);
@@ -179,7 +178,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
 
         for (int j = i; j < tie_local_end; ++j) {
             int grp = group_codes[si[j]];
-            if (grp < n_groups) {
+            if (grp >= 0 && grp < n_groups) {
                 atomicAdd(&grp_sums[(size_t)grp * acc_stride], avg_rank);
             }
         }
@@ -203,7 +202,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
 
     // Tie correction: warp + block reduction
     if (compute_tie_corr) {
-        // Zero tie group contribution (one thread only)
+        // Single zero tie block contributes once.
         if (threadIdx.x == 0 && total_zero > 1) {
             double tz = (double)total_zero;
             local_tie_sum += tz * tz * tz - tz;
@@ -328,7 +327,7 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
         data_f32_out[i] = (float)v_in;
         int row = (int)indices[i];
         int g = group_codes[row];
-        if (g < n_groups) {
+        if (g >= 0 && g < n_groups) {
             atomicAdd(&s_sum[g], v);
             if (compute_nnz && v != 0.0) atomicAdd(&s_nnz[g], 1.0);
         }
@@ -367,7 +366,7 @@ __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
         data_f32_out[i] = (float)v_in;
         int row = (int)indices[i];
         int g = group_codes[row];
-        if (g < n_groups) {
+        if (g >= 0 && g < n_groups) {
             atomicAdd(&group_sums[(size_t)g * sb_cols + col], v);
             if (compute_nnz && v != 0.0) {
                 atomicAdd(&group_nnz[(size_t)g * sb_cols + col], 1.0);

@@ -61,34 +61,27 @@ constexpr int N_STREAMS = 4;
 constexpr int SUB_BATCH_COLS = 64;
 constexpr int BEGIN_BIT = 0;
 constexpr int END_BIT = 32;
-// Default thread-per-block for utility kernels (extract, gather, offsets,
-// etc.).
+// Default thread-per-block for utility kernels.
 constexpr int UTIL_BLOCK_SIZE = 256;
 // Scratch slots for warp-level reduction (one slot per warp, 32 warps max).
 constexpr int WARP_REDUCE_BUF = 32;
-// Max group size for the super-fast "warp-per-(col,group)" fused kernel (the
-// WARP band).  Each warp sorts and ranks one (col, group) pair entirely in
-// registers via warp-shuffle bitonic sort — no smem sort buffer, no
-// __syncthreads().  Blocks pack 8 warps so block launch overhead is
-// amortised 8× across (col, group) work items.  This path is the fast
-// route for per-celltype perturbation-style workloads where most test
-// groups have only a few dozen cells.
+// WARP band: warp-per-(col,group) fused kernel. Each warp sorts+ranks one
+// pair entirely in registers (warp-shuffle bitonic, no smem, no __syncthreads).
+// Blocks pack 8 warps to amortise launch overhead. Fast route for
+// perturbation-style workloads where most groups have a few dozen cells.
 constexpr int OVO_WARP_MAX = 32;
-// SMALL band for perturbation workloads where most groups are slightly larger
-// than one warp.  Uses one compact shared-memory sort block per (column,
-// group), avoiding the heavier MEDIUM-band in-group scan.
+// SMALL band: groups slightly larger than one warp. One compact smem sort
+// block per (col, group), avoiding the heavier MEDIUM-band in-group scan.
 constexpr int OVO_SMALL_MAX = 64;
-// Medium-group cutoff for the unsorted direct-rank kernel.  For perturbation
-// workloads most groups sit below this range, where avoiding a full smem
-// bitonic sort wins despite the O(n^2) in-group count.
+// MEDIUM band: unsorted direct-rank kernel. Avoiding a full smem bitonic sort
+// wins here despite the O(n^2) in-group count.
 constexpr int OVO_MEDIUM_MAX = 512;
 // Max group size for the fused smem-sort rank kernel (the LARGE band).
 // Beyond this, fall back to the HUGE band: CUB segmented sort + rank kernel.
 constexpr int OVO_LARGE_MAX = 2500;
-// Per-stream dense slab budget (float32 items).  Dynamic sub-batching sizes
-// each group's column batch so that (n_g × eff_sb_cols) ≤ this.  Bigger =
-// fewer kernel launches; smaller = less per-stream memory.  128M items × 4B =
-// 512 MB per stream dense slab + same for sorted copy ≈ 1 GB / stream.
+// Per-stream dense slab budget (float32 items). Sub-batching keeps
+// (n_g × eff_sb_cols) ≤ this. 128M × 4B = 512 MB slab + same for sorted copy
+// ≈ 1 GB / stream. Bigger = fewer launches; smaller = less per-stream memory.
 constexpr size_t GROUP_DENSE_BUDGET_ITEMS = 128 * 1024 * 1024;
 
 // Query CUB device-segmented-radix-sort scratch size with a dummy launch.

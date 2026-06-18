@@ -3,10 +3,9 @@
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 /**
- * Build CUB segmented-sort ranges only for groups in the HUGE band.
- * Group ids are relative to grp_offsets, and ranges still point into the
- * original dense group layout so the presorted rank kernel can read from the
- * normal per-group positions.
+ * Build CUB segmented-sort ranges for HUGE-band groups. Ranges point into the
+ * original dense group layout so the presorted rank kernel reads normal
+ * per-group positions.
  */
 __global__ void build_huge_seg_offsets_kernel(
     const int* __restrict__ grp_offsets, const int* __restrict__ group_ids,
@@ -25,10 +24,9 @@ __global__ void build_huge_seg_offsets_kernel(
 }
 
 /**
- * Extract specific rows from CSC into dense F-order, using a row lookup map.
+ * Extract rows from CSC into dense F-order via a row lookup map.
  * row_map[original_row] = output_row_index (or -1 to skip).
- * One block per column, threads scatter matching nonzeros.
- * Output must be pre-zeroed.
+ * One block per column. Output must be pre-zeroed.
  */
 template <typename IndexT = int, typename IndptrT = int>
 __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
@@ -52,12 +50,10 @@ __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
 }
 
 /**
- * LARGE-band dispatch: when the largest group fits in shared memory, a fused
- * bitonic-sort + binary-search kernel handles the whole group per block.
- * Otherwise we fall back to the HUGE band (CUB segmented sort plus the
- * pre-sorted rank kernel).  This struct bundles the sizing knobs derived from
- * the host-side group offsets so each streaming impl can drop a 15-line prep
- * block.
+ * Sizing knobs for LARGE-band dispatch: when the largest group fits in shared
+ * memory, a fused bitonic-sort + binary-search kernel handles the group per
+ * block; otherwise fall back to the HUGE band (CUB segmented sort + pre-sorted
+ * rank kernel).
  */
 struct OvoTierPlan {
     int max_grp_size = 0;
@@ -102,10 +98,7 @@ static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
     }
     if (n_groups == 0) c.min_grp_size = 0;
 
-    // run_warp: WARP kernel is worth running (at least one group small
-    // enough to benefit from the warp path).
     c.run_warp = (c.min_grp_size <= OVO_WARP_MAX);
-    // above_warp: at least one group needs a non-WARP kernel.
     c.above_warp = (c.max_grp_size > OVO_WARP_MAX);
     // run_large: the fused smem-sort fast path (groups > WARP but ≤ LARGE).
     c.run_large = c.above_warp && (c.max_grp_size <= OVO_LARGE_MAX);
@@ -115,11 +108,10 @@ static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
         c.large_tpb = std::min(c.large_padded, MAX_THREADS_PER_BLOCK);
         c.large_smem = (size_t)c.large_padded * sizeof(float) +
                        WARP_REDUCE_BUF * sizeof(double);
-        // Adapt to the device: if the fused-sort buffer would exceed the
-        // per-block shared-memory limit, fall back to the HUGE-band CUB
-        // segmented sort (no smem cap) rather than launching a kernel that
-        // would fail. Never triggers at the current threshold (~16.6KB), but
-        // keeps the dispatch correct if the threshold or device limit changes.
+        // Device-adapt: if the fused-sort buffer exceeds the per-block smem
+        // limit, fall back to HUGE (no smem cap) instead of launching a kernel
+        // that would fail. Inert at the current ~16.6KB threshold; guards
+        // against threshold/device-limit changes.
         if (c.large_smem > wilcoxon_max_smem_per_block()) {
             c.run_large = false;
         }
@@ -206,13 +198,11 @@ struct OvoTierScratch {
 };
 
 // SINGLE OVO ranking engine, shared by the dense path and all four sparse OVO
-// impls (host/device CSC/CSR). Given an already-sorted reference slice and a
-// dense group slice for one column sub-batch, it runs the size-banded dispatch
-// from `plan` (see make_ovo_tier_plan): co-launch WARP/SMALL/MEDIUM for small
-// groups, then LARGE (fused smem sort) OR HUGE (CUB segmented sort) for the
-// rest. Pure host-side code motion: the kernel launches are identical to the
-// previous inline copies, so results and performance are unchanged. The five
-// callers differ only in how they produce ref_sorted / grp_dense.
+// impls (host/device CSC/CSR). Given a sorted reference slice and a dense group
+// slice for one column sub-batch, runs the size-banded dispatch from `plan`
+// (see make_ovo_tier_plan): co-launch WARP/SMALL/MEDIUM for small groups, then
+// LARGE (fused smem sort) OR HUGE (CUB segmented sort) for the rest. Callers
+// differ only in how they produce ref_sorted / grp_dense.
 static inline void ovo_dispatch_tiers(
     const float* ref_sorted, const float* grp_dense, const int* grp_offsets,
     const OvoTierPlan& plan, const OvoTierScratch& sc,

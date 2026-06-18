@@ -6,10 +6,8 @@
 #include <string>
 #include <vector>
 
-// Shared RMM-backed device scratch, usable by any CUDA module that links
-// rmm::rmm (see add_rmm_cuda_module in CMakeLists.txt). Allocations come from
-// the current RMM device resource, so scratch participates in the same pool as
-// CuPy/RAPIDS allocations.
+// Shared RMM-backed device scratch (link rmm::rmm via add_rmm_cuda_module).
+// Allocates from the current RMM resource, sharing CuPy/RAPIDS's pool.
 void* rmm_allocate(size_t bytes);
 void rmm_deallocate(void* ptr, size_t bytes);
 
@@ -21,10 +19,7 @@ void rmm_deallocate(void* ptr, size_t bytes);
 // a smaller budget only adds passes. Use for every GPU-memory-budget decision.
 size_t rmm_available_device_bytes(double fraction);
 
-// ---------------------------------------------------------------------------
-// Small allocation pool for temporary CUDA buffers. Frees everything on scope
-// exit; reuse a single pool across a kernel pipeline.
-// ---------------------------------------------------------------------------
+// Allocation pool for temporary CUDA buffers; frees everything on scope exit.
 struct RmmScratchPool {
     struct Allocation {
         void* ptr = nullptr;

@@ -66,11 +66,14 @@ This installs the precompiled CUDA kernels but **not** the RAPIDS stack (cupy, c
 This is the recommended approach for **conda/mamba users** who already have RAPIDS installed in their environment.
 
 ```{note}
-The compiled kernels (Wilcoxon, GMM, …) link `librmm` / `rapids_logger` at
-runtime. These are **required**: they are provided by an existing RAPIDS
-conda/mamba environment or by the `[rapids]`/`[rapids-cuXX]` extra below.
-Installing the bare `rapids-singlecell-cuXX` wheel into an environment without
-RAPIDS raises an `ImportError` when those kernels are first used.
+The RAPIDS stack is **required**, not optional: `rapids_singlecell` imports
+`cuml`/`cupy` at the top of its package `__init__`, and the compiled kernels
+(Wilcoxon, GMM, …) link `librmm` / `rapids_logger` at runtime. These are
+provided by an existing RAPIDS conda/mamba environment or by the
+`[rapids]`/`[rapids-cuXX]` extra below. Installing the bare
+`rapids-singlecell-cuXX` wheel into an environment without RAPIDS raises an
+`ImportError` on `import rapids_singlecell` itself — not merely when a kernel is
+first used.
 ```
 
 ### Prebuilt wheels with RAPIDS dependencies

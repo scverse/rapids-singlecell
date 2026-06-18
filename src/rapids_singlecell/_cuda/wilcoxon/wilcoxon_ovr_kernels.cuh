@@ -18,20 +18,17 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
 
 /**
  * Scatter CSR nonzeros into CSC layout for columns [col_start, col_stop).
- * write_pos[c - col_start] must be initialized to the prefix-sum offset
- * for column c.  Each thread atomically claims a unique destination slot.
+ * write_pos[c - col_start] is the prefix-sum offset for column c; each thread
+ * atomically claims a unique destination slot.
  *
- * PRECONDITION: each row's `indices` must be sorted ascending. The binary
- * search for col_start and the `break` at col_stop both depend on it; unsorted
- * rows would silently drop or misplace nonzeros. Every caller enforces this --
- * the Python dispatch calls `sort_indices()` on the CSR/CSC input before
- * invoking the streaming impls that launch this kernel.
+ * PRECONDITION: each row's `indices` must be sorted ascending -- the binary
+ * search for col_start and the `break` at col_stop depend on it; unsorted rows
+ * would silently drop or misplace nonzeros. Python dispatch calls
+ * `sort_indices()` before launching this kernel.
  *
- * `row_offset` is added to the local row index when writing csc_row_idx, so a
- * row-block whose indptr/data are rebased to a local [0, n_rows) range still
- * records the correct global row id (used by the out-of-core row-streaming OVR
- * path that feeds bulk-transferred row-blocks). Defaults to 0 for callers that
- * pass the full matrix.
+ * `row_offset` is added to the local row index so a row-block rebased to a
+ * local [0, n_rows) range still records the correct global row id (out-of-core
+ * row-streaming OVR path). Defaults to 0 for full-matrix callers.
  */
 template <typename InT, typename IndexT, typename IndptrT>
 __global__ void csr_scatter_to_csc_kernel(
@@ -63,14 +60,12 @@ __global__ void csr_scatter_to_csc_kernel(
 
 // CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
 //
-// Decide smem-vs-gmem for the DENSE OVR rank kernel
-// (rank_sums_from_sorted_kernel). Per-block accumulator is one double per group
-// plus a 32-slot warp buffer, i.e. (n_groups + 32) doubles. When that exceeds
-// the per-block smem limit (~48 KB) the kernel must fall back to a
-// global-memory accumulator (use_gmem=true). With a 48 KB limit this flips at
-// roughly n_groups > 6112. Not dead: a kernel launched in smem mode with an
-// oversized request simply fails to launch. Limit is device-queried via
-// wilcoxon_max_smem_per_block(), so it auto-scales.
+// Decide smem-vs-gmem for the DENSE OVR rank kernel. Per-block accumulator is
+// (n_groups + 32) doubles; when that exceeds the per-block smem limit (~48 KB)
+// it must fall back to a global-memory accumulator (use_gmem=true), flipping at
+// roughly n_groups > 6112. Not dead: smem mode with an oversized request fails
+// to launch. Limit is device-queried via wilcoxon_max_smem_per_block(), so it
+// auto-scales.
 static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(n_groups + 32) * sizeof(double);
     if (need <= wilcoxon_max_smem_per_block()) {
@@ -86,16 +81,14 @@ static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
  * CRITICAL — DO NOT REMOVE the gmem branch. This is the load-bearing path for
  * Perturb-seq / pooled-CRISPR DE, where n_groups is in the thousands.
  *
- * Decide smem-vs-gmem for the sparse OVR rank kernel. The per-block accumulator
- * is two double arrays of size n_groups (grp_sums + grp_nz_count) plus a
- * 32-slot warp buffer, i.e. (2*n_groups + 32) doubles. When that exceeds the
- * per-block shared-memory limit (~48 KB) the kernel CANNOT launch in smem mode,
- * so we set use_gmem=true and rank_sums_sparse_ovr_kernel accumulates in a
- * caller-provided global-memory buffer instead. With a 48 KB limit this flips
- * at roughly n_groups > 3056. Reviewers/static analysis have twice mistaken
- * this fallback for dead code; it is the ONLY path that works at large
- * n_groups. The limit is queried per device via wilcoxon_max_smem_per_block(),
- * so the threshold auto-scales with the GPU.
+ * Decide smem-vs-gmem for the sparse OVR rank kernel. Per-block accumulator is
+ * (2*n_groups + 32) doubles (grp_sums + grp_nz_count + warp buf); when that
+ * exceeds the per-block smem limit (~48 KB) the kernel CANNOT launch in smem
+ * mode, so use_gmem=true routes accumulation to a caller-provided gmem buffer.
+ * Flips at roughly n_groups > 3056. Reviewers/static analysis have twice
+ * mistaken this fallback for dead code; it is the ONLY path that works at large
+ * n_groups. Limit is device-queried via wilcoxon_max_smem_per_block(), so the
+ * threshold auto-scales.
  */
 static size_t sparse_ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(2 * n_groups + 32) * sizeof(double);

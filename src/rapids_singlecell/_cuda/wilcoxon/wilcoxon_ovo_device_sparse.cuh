@@ -27,8 +27,9 @@ static void ovo_streaming_csr_impl(
     }
 
     std::vector<int> h_offsets(n_groups + 1);
-    cudaMemcpy(h_offsets.data(), grp_offsets, (n_groups + 1) * sizeof(int),
-               cudaMemcpyDeviceToHost);
+    cuda_check(cudaMemcpy(h_offsets.data(), grp_offsets,
+                          (n_groups + 1) * sizeof(int), cudaMemcpyDeviceToHost),
+               "device OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
     bool run_large = t1.above_medium && t1.run_large;
@@ -88,9 +89,10 @@ static void ovo_streaming_csr_impl(
     int* d_sort_group_ids = nullptr;
     if (run_huge) {
         d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());
-        cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
-                   h_sort_group_ids.size() * sizeof(int),
-                   cudaMemcpyHostToDevice);
+        cuda_check(cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
+                              h_sort_group_ids.size() * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "device OVO sort group ids H2D");
     }
 
     struct StreamBuf {
@@ -256,8 +258,9 @@ static void ovo_streaming_csc_impl(
     }
 
     std::vector<int> h_offsets(n_groups + 1);
-    cudaMemcpy(h_offsets.data(), grp_offsets, (n_groups + 1) * sizeof(int),
-               cudaMemcpyDeviceToHost);
+    cuda_check(cudaMemcpy(h_offsets.data(), grp_offsets,
+                          (n_groups + 1) * sizeof(int), cudaMemcpyDeviceToHost),
+               "device OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
     bool run_large = t1.above_medium && t1.run_large;
@@ -300,9 +303,10 @@ static void ovo_streaming_csc_impl(
     int* d_sort_group_ids = nullptr;
     if (run_huge) {
         d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());
-        cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
-                   h_sort_group_ids.size() * sizeof(int),
-                   cudaMemcpyHostToDevice);
+        cuda_check(cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
+                              h_sort_group_ids.size() * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "device OVO sort group ids H2D");
     }
 
     struct StreamBuf {
