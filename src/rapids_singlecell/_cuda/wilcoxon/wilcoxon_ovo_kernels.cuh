@@ -255,12 +255,10 @@ static inline void ovo_dispatch_tiers(
             n_all_grp, n_sort_groups, sb_cols);
         CUDA_CHECK_LAST_ERROR(build_huge_seg_offsets_kernel);
 
-        size_t temp = grp_cub_temp_bytes;
-        cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
-                       sc.grp_cub_temp, temp, grp_dense, sc.grp_sorted,
-                       sb_grp_items_actual, sb_grp_seg, sc.grp_seg_offsets,
-                       sc.grp_seg_ends, BEGIN_BIT, END_BIT, stream),
-                   "OVO huge-tier group segmented sort");
+        cub_segmented_sortkeys(sc.grp_cub_temp, grp_cub_temp_bytes, grp_dense,
+                               sc.grp_sorted, sb_grp_items_actual, sb_grp_seg,
+                               sc.grp_seg_offsets, sc.grp_seg_ends, stream,
+                               "OVO huge-tier group segmented sort");
 
         dim3 grid(sb_cols, n_groups);
         ovo_rank_huge_kernel<<<grid, tpb_rank, 0, stream>>>(

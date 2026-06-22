@@ -112,6 +112,32 @@ static inline size_t cub_segmented_sortpairs_temp_bytes(int num_items,
     return bytes;
 }
 
+// Launch wrappers for the queries above. begin/end offset arrays may be
+// contiguous (off, off + 1) or distinct (starts, ends).
+static inline void cub_segmented_sortkeys(
+    void* d_temp, size_t temp_bytes, const float* keys_in, float* keys_out,
+    int num_items, int num_segments, const int* begin_offsets,
+    const int* end_offsets, cudaStream_t stream, const char* what) {
+    cuda_check(
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            d_temp, temp_bytes, keys_in, keys_out, num_items, num_segments,
+            begin_offsets, end_offsets, BEGIN_BIT, END_BIT, stream),
+        what);
+}
+
+template <typename ValT = int>
+static inline void cub_segmented_sortpairs(
+    void* d_temp, size_t temp_bytes, const float* keys_in, float* keys_out,
+    const ValT* vals_in, ValT* vals_out, int num_items, int num_segments,
+    const int* begin_offsets, const int* end_offsets, cudaStream_t stream,
+    const char* what) {
+    cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
+                   d_temp, temp_bytes, keys_in, keys_out, vals_in, vals_out,
+                   num_items, num_segments, begin_offsets, end_offsets,
+                   BEGIN_BIT, END_BIT, stream),
+               what);
+}
+
 // Universal CUDA static per-block shared-memory floor; safe fallback if the
 // device query fails.
 constexpr size_t WILCOXON_FALLBACK_SMEM_PER_BLOCK = 48 * 1024;

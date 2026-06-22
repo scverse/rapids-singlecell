@@ -2,6 +2,9 @@
 
 #include <cuda_runtime.h>
 
+#include "wilcoxon_block_reduce.cuh"
+#include "wilcoxon_ovr_tie_walk.cuh"
+
 /**
  * Sparse-aware OVR rank-sum kernel for nonnegative sorted stored values.
  *
@@ -133,63 +136,10 @@ __global__ void rank_sums_sparse_ovr_kernel(
     int my_end = my_start + chunk;
     if (my_end > nnz_stored) my_end = nnz_stored;
 
-    double local_tie_sum = 0.0;
-
-    int i = my_start;
-    while (i < my_end) {
-        float val = sv[i];
-
-        int tie_local_end = i + 1;
-        while (tie_local_end < my_end && sv[tie_local_end] == val)
-            ++tie_local_end;
-
-        int tie_global_start = i;
-        if (i == my_start && i > 0 && sv[i - 1] == val) {
-            // tie spans into a prior chunk: find global tie start.
-            int lo = pos_start, hi = i;
-            while (lo < hi) {
-                int mid = lo + ((hi - lo) >> 1);
-                if (sv[mid] < val)
-                    lo = mid + 1;
-                else
-                    hi = mid;
-            }
-            tie_global_start = lo;
-        }
-
-        int tie_global_end = tie_local_end;
-        if (tie_local_end == my_end && tie_local_end < nnz_stored &&
-            sv[tie_local_end] == val) {
-            int lo = tie_local_end, hi = nnz_stored - 1;
-            while (lo < hi) {
-                int mid = hi - ((hi - lo) >> 1);
-                if (sv[mid] > val)
-                    hi = mid - 1;
-                else
-                    lo = mid;
-            }
-            tie_global_end = lo + 1;
-        }
-
-        int total_tie = tie_global_end - tie_global_start;
-
-        double avg_rank = (double)offset_pos +
-                          (double)(tie_global_start + tie_global_end + 1) / 2.0;
-
-        for (int j = i; j < tie_local_end; ++j) {
-            int grp = group_codes[si[j]];
-            if (grp >= 0 && grp < n_groups) {
-                atomicAdd(&grp_sums[(size_t)grp * acc_stride], avg_rank);
-            }
-        }
-
-        if (compute_tie_corr && tie_global_start >= my_start && total_tie > 1) {
-            double t = (double)total_tie;
-            local_tie_sum += t * t * t - t;
-        }
-
-        i = tie_local_end;
-    }
+    double local_tie_sum = ovr_walk_tie_runs<IndexT>(
+        sv, si, group_codes, grp_sums, acc_stride, n_groups, my_start, my_end,
+        /*seg_floor=*/pos_start, /*seg_ceil=*/nnz_stored,
+        /*rank_offset=*/(double)offset_pos, compute_tie_corr);
 
     __syncthreads();
 
@@ -213,25 +163,11 @@ __global__ void rank_sums_sparse_ovr_kernel(
         int warp_buf_off = use_gmem ? 0 : 2 * n_groups;
         double* warp_buf = smem + warp_buf_off;
 
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            local_tie_sum += __shfl_down_sync(0xffffffff, local_tie_sum, off);
-        int lane = threadIdx.x & 31;
-        int wid = threadIdx.x >> 5;
-        if (lane == 0) warp_buf[wid] = local_tie_sum;
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            double v = (threadIdx.x < ((blockDim.x + 31) >> 5))
-                           ? warp_buf[threadIdx.x]
-                           : 0.0;
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                v += __shfl_down_sync(0xffffffff, v, off);
-            if (threadIdx.x == 0) {
-                double n = (double)n_rows;
-                double denom = n * n * n - n;
-                tie_corr[col] = (denom > 0.0) ? (1.0 - v / denom) : 1.0;
-            }
+        double v = wilcoxon_block_sum(local_tie_sum, warp_buf);
+        if (threadIdx.x == 0) {
+            double n = (double)n_rows;
+            double denom = n * n * n - n;
+            tie_corr[col] = (denom > 0.0) ? (1.0 - v / denom) : 1.0;
         }
     }
 }
@@ -284,6 +220,29 @@ static size_t cast_accumulate_smem_config(int n_groups, bool compute_nnz,
     return 0;
 }
 
+// Shared cast+accumulate loop for the two sparse-OVR stats kernels. Casts each
+// stored value to f32 (data_f32_out) and atomically accumulates per-group sums
+// (and nonzero counts) into sums/nnz, strided by acc_stride (1 for a per-block
+// smem buffer, sb_cols for the global row-major layout).
+template <typename InT, typename IndexT>
+__device__ __forceinline__ void accumulate_group_stats(
+    const InT* data_in, float* data_f32_out, const IndexT* indices,
+    int seg_start, int seg_end, const int* group_codes, double* sums,
+    double* nnz, int acc_stride, int n_groups, bool compute_nnz) {
+    for (int i = seg_start + threadIdx.x; i < seg_end; i += blockDim.x) {
+        InT v_in = data_in[i];
+        double v = (double)v_in;
+        data_f32_out[i] = (float)v_in;
+        int row = (int)indices[i];
+        int g = group_codes[row];
+        if (g >= 0 && g < n_groups) {
+            atomicAdd(&sums[(size_t)g * acc_stride], v);
+            if (compute_nnz && v != 0.0)
+                atomicAdd(&nnz[(size_t)g * acc_stride], 1.0);
+        }
+    }
+}
+
 /**
  * Pre-sort cast-and-accumulate kernel for sparse OVR host streaming.
  *
@@ -321,17 +280,9 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
     }
     __syncthreads();
 
-    for (int i = seg_start + threadIdx.x; i < seg_end; i += blockDim.x) {
-        InT v_in = data_in[i];
-        double v = (double)v_in;
-        data_f32_out[i] = (float)v_in;
-        int row = (int)indices[i];
-        int g = group_codes[row];
-        if (g >= 0 && g < n_groups) {
-            atomicAdd(&s_sum[g], v);
-            if (compute_nnz && v != 0.0) atomicAdd(&s_nnz[g], 1.0);
-        }
-    }
+    accumulate_group_stats<InT, IndexT>(
+        data_in, data_f32_out, indices, seg_start, seg_end, group_codes, s_sum,
+        s_nnz, /*acc_stride=*/1, n_groups, compute_nnz);
     __syncthreads();
 
     for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
@@ -360,19 +311,10 @@ __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
     int seg_start = col_seg_offsets[col];
     int seg_end = col_seg_offsets[col + 1];
 
-    for (int i = seg_start + threadIdx.x; i < seg_end; i += blockDim.x) {
-        InT v_in = data_in[i];
-        double v = (double)v_in;
-        data_f32_out[i] = (float)v_in;
-        int row = (int)indices[i];
-        int g = group_codes[row];
-        if (g >= 0 && g < n_groups) {
-            atomicAdd(&group_sums[(size_t)g * sb_cols + col], v);
-            if (compute_nnz && v != 0.0) {
-                atomicAdd(&group_nnz[(size_t)g * sb_cols + col], 1.0);
-            }
-        }
-    }
+    accumulate_group_stats<InT, IndexT>(
+        data_in, data_f32_out, indices, seg_start, seg_end, group_codes,
+        group_sums + col, group_nnz + col,
+        /*acc_stride=*/sb_cols, n_groups, compute_nnz);
 }
 
 template <typename InT, typename IndexT = int>

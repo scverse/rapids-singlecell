@@ -164,13 +164,11 @@ static void ovo_streaming_csr_impl(
         size_t ref_cub_bytes =
             cub_segmented_sortkeys_temp_bytes(cache_ref_items_i32, cache_cols);
         ScopedCudaBuffer ref_cub_temp_buf(ref_cub_bytes);
-        size_t ref_temp = ref_cub_bytes;
-        cuda_check(
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                ref_cub_temp_buf.data(), ref_temp, d_ref_dense, d_ref_sorted,
-                cache_ref_items_i32, cache_cols, d_ref_seg_offsets,
-                d_ref_seg_offsets + 1, BEGIN_BIT, END_BIT, ref_stream),
-            "device CSR OVO ref segmented sort");
+        cub_segmented_sortkeys(ref_cub_temp_buf.data(), ref_cub_bytes,
+                               d_ref_dense, d_ref_sorted, cache_ref_items_i32,
+                               cache_cols, d_ref_seg_offsets,
+                               d_ref_seg_offsets + 1, ref_stream,
+                               "device CSR OVO ref segmented sort");
         cuda_check(cudaStreamSynchronize(ref_stream),
                    "device CSR OVO ref sort sync");
 
@@ -375,14 +373,10 @@ static void ovo_streaming_csc_impl(
             n_ref, col);
         CUDA_CHECK_LAST_ERROR(csc_extract_mapped_kernel);
         upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
-        {
-            size_t temp = cub_temp_bytes;
-            cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
-                           buf.cub_temp, temp, buf.ref_dense, buf.ref_sorted,
-                           sb_ref_items_actual, sb_cols, buf.ref_seg_offsets,
-                           buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
-                       "device CSC OVO ref segmented sort");
-        }
+        cub_segmented_sortkeys(buf.cub_temp, cub_temp_bytes, buf.ref_dense,
+                               buf.ref_sorted, sb_ref_items_actual, sb_cols,
+                               buf.ref_seg_offsets, buf.ref_seg_offsets + 1,
+                               stream, "device CSC OVO ref segmented sort");
 
         cudaMemsetAsync(buf.grp_dense, 0, sb_grp_items_actual * sizeof(float),
                         stream);

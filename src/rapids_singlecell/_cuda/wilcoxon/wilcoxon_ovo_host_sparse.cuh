@@ -246,14 +246,10 @@ static void ovo_streaming_csc_host_impl(
             d_ref_row_map, buf.ref_dense, n_ref, 0);
         CUDA_CHECK_LAST_ERROR(csc_extract_mapped_kernel);
         upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
-        {
-            size_t temp = cub_temp_bytes;
-            cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
-                           buf.cub_temp, temp, buf.ref_dense, buf.ref_sorted,
-                           sb_ref_actual, sb_cols, buf.ref_seg_offsets,
-                           buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
-                       "host CSC OVO ref segmented sort");
-        }
+        cub_segmented_sortkeys(buf.cub_temp, cub_temp_bytes, buf.ref_dense,
+                               buf.ref_sorted, sb_ref_actual, sb_cols,
+                               buf.ref_seg_offsets, buf.ref_seg_offsets + 1,
+                               stream, "host CSC OVO ref segmented sort");
 
         // Extract grp from CSC via row_map
         cudaMemsetAsync(buf.grp_dense, 0, sb_grp_actual * sizeof(float),
@@ -578,13 +574,11 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(
                 csr_extract_dense_identity_rows_unsorted_kernel);
             upload_linear_offsets(d_ref_seg, cc, n_ref, ref_stream);
-            size_t temp = ref_cub_bytes;
-            cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
-                           cub_temp_buf.data(), temp, d_ref_dense,
-                           d_ref_sorted + (size_t)cs * (size_t)n_ref,
-                           (int)chunk_items, cc, d_ref_seg, d_ref_seg + 1,
-                           BEGIN_BIT, END_BIT, ref_stream),
-                       "host CSR OVO ref segmented sort");
+            cub_segmented_sortkeys(
+                cub_temp_buf.data(), ref_cub_bytes, d_ref_dense,
+                d_ref_sorted + (size_t)cs * (size_t)n_ref, (int)chunk_items, cc,
+                d_ref_seg, d_ref_seg + 1, ref_stream,
+                "host CSR OVO ref segmented sort");
         }
         cuda_check(cudaStreamSynchronize(ref_stream),
                    "host CSR OVO ref sort sync");

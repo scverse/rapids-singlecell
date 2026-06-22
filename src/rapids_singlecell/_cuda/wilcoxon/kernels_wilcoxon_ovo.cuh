@@ -2,31 +2,97 @@
 
 #include <cuda_runtime.h>
 
+#include "wilcoxon_block_reduce.cuh"
 #include "wilcoxon_fast_common.cuh"
 
 // ============================================================================
-// Warp reduction helper (sum doubles across block via warp_buf)
+// Bitonic sort of `n` floats in shared memory, ascending. `n` must be a power
+// of two; pad the tail with +INF before calling. Grid-stride, so any blockDim
+// works (covers both the LARGE runtime-sized and SMALL fixed-size paths).
 // ============================================================================
 
-__device__ __forceinline__ double block_reduce_sum(double val,
-                                                   double* warp_buf) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        val += __shfl_down_sync(0xffffffff, val, off);
-    int lane = threadIdx.x & 31;
-    int wid = threadIdx.x >> 5;
-    if (lane == 0) warp_buf[wid] = val;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        double v2 = (threadIdx.x < ((blockDim.x + 31) >> 5))
-                        ? warp_buf[threadIdx.x]
-                        : 0.0;
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            v2 += __shfl_down_sync(0xffffffff, v2, off);
-        return v2;  // only lane 0 of warp 0 has the final result
+__device__ __forceinline__ void bitonic_sort_smem(float* s, int n) {
+    for (int k = 2; k <= n; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                int ixj = i ^ j;
+                if (ixj > i) {
+                    bool asc = ((i & k) == 0);
+                    float a = s[i], b = s[ixj];
+                    if (asc ? (a > b) : (a < b)) {
+                        s[i] = b;
+                        s[ixj] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
     }
-    return 0.0;
+}
+
+// ============================================================================
+// Sorted-array bounds over [lo, hi). lower: first index with arr[idx] >= v
+// (count of elements < v). upper: first index with arr[idx] > v (count <= v).
+// Pass an advanced `lo` to exploit per-thread-stride monotonicity. Work for
+// both global and shared `arr`.
+// ============================================================================
+
+__device__ __forceinline__ int sorted_lower_bound(const float* arr, int lo,
+                                                  int hi, float v) {
+    while (lo < hi) {
+        int m = lo + ((hi - lo) >> 1);
+        if (arr[m] < v)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    return lo;
+}
+
+__device__ __forceinline__ int sorted_upper_bound(const float* arr, int lo,
+                                                  int hi, float v) {
+    while (lo < hi) {
+        int m = lo + ((hi - lo) >> 1);
+        if (arr[m] <= v)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    return lo;
+}
+
+// Mid-rank of `v` in the merged (ref, grp) arrays. Advances the four
+// incremental bounds (pass 0,0,0,0 for a fresh per-element search) and reports
+// the per-array equal counts for tie correction.
+struct OvoRank {
+    double mid_rank;
+    int n_eq_ref;
+    int n_eq_grp;
+};
+
+__device__ __forceinline__ OvoRank ovo_mid_rank(const float* ref, int n_ref,
+                                                const float* grp, int n_grp,
+                                                float v, int& ref_lb,
+                                                int& ref_ub, int& grp_lb,
+                                                int& grp_ub) {
+    int n_lt_ref = sorted_lower_bound(ref, ref_lb, n_ref, v);
+    ref_lb = n_lt_ref;
+    ref_ub = sorted_upper_bound(ref, ref_ub > n_lt_ref ? ref_ub : n_lt_ref,
+                                n_ref, v);
+    int n_eq_ref = ref_ub - n_lt_ref;
+
+    int n_lt_grp = sorted_lower_bound(grp, grp_lb, n_grp, v);
+    grp_lb = n_lt_grp;
+    grp_ub = sorted_upper_bound(grp, grp_ub > n_lt_grp ? grp_ub : n_lt_grp,
+                                n_grp, v);
+    int n_eq_grp = grp_ub - n_lt_grp;
+
+    OvoRank r;
+    r.mid_rank = (double)(n_lt_ref + n_lt_grp) +
+                 ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
+    r.n_eq_ref = n_eq_ref;
+    r.n_eq_grp = n_eq_grp;
+    return r;
 }
 
 // ============================================================================
@@ -50,39 +116,13 @@ __device__ __forceinline__ void compute_tie_correction_parallel(
         if (i == 0 || ref_col[i] != ref_col[i - 1]) {
             float v = ref_col[i];
 
-            int lo = i + 1, hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] <= v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            int cnt_ref = lo - i;
+            int cnt_ref = sorted_upper_bound(ref_col, i + 1, n_ref, v) - i;
 
-            lo = grp_lb;
-            hi = n_grp;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (grp_col[m] < v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            int lb = lo;
+            int lb = sorted_lower_bound(grp_col, grp_lb, n_grp, v);
             grp_lb = lb;
-
-            lo = (grp_ub > lb) ? grp_ub : lb;
-            hi = n_grp;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (grp_col[m] <= v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            int cnt_grp = lo - lb;
-            grp_ub = lo;
+            grp_ub = sorted_upper_bound(grp_col, grp_ub > lb ? grp_ub : lb,
+                                        n_grp, v);
+            int cnt_grp = grp_ub - lb;
 
             int cnt = cnt_ref + cnt_grp;
             if (cnt > 1) {
@@ -98,28 +138,12 @@ __device__ __forceinline__ void compute_tie_correction_parallel(
         if (i == 0 || grp_col[i] != grp_col[i - 1]) {
             float v = grp_col[i];
 
-            int lo = ref_lb, hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] < v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
+            int lo = sorted_lower_bound(ref_col, ref_lb, n_ref, v);
             ref_lb = lo;
 
             if (lo >= n_ref || ref_col[lo] != v) {
                 // Value absent from ref — count in grp only
-                lo = i + 1;
-                hi = n_grp;
-                while (lo < hi) {
-                    int m = lo + ((hi - lo) >> 1);
-                    if (grp_col[m] <= v)
-                        lo = m + 1;
-                    else
-                        hi = m;
-                }
-                int cnt = lo - i;
+                int cnt = sorted_upper_bound(grp_col, i + 1, n_grp, v) - i;
                 if (cnt > 1) {
                     double t = (double)cnt;
                     local_tie += t * t * t - t;
@@ -128,7 +152,7 @@ __device__ __forceinline__ void compute_tie_correction_parallel(
         }
     }
 
-    double tie_sum = block_reduce_sum(local_tie, warp_buf);
+    double tie_sum = wilcoxon_block_sum(local_tie, warp_buf);
     if (threadIdx.x == 0) {
         int n = n_ref + n_grp;
         double dn = (double)n;
@@ -177,63 +201,13 @@ __global__ void ovo_rank_huge_kernel(
     double local_sum = 0.0;
 
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
-        float v = grp_col[i];
-        int lo, hi;
-
-        lo = ref_lb;
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_ref = lo;
-        ref_lb = n_lt_ref;
-
-        lo = (ref_ub > n_lt_ref) ? ref_ub : n_lt_ref;
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_ref = lo - n_lt_ref;
-        ref_ub = lo;
-
-        lo = grp_lb;
-        hi = n_grp;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (grp_col[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_grp = lo;
-        grp_lb = n_lt_grp;
-
-        lo = (grp_ub > n_lt_grp) ? grp_ub : n_lt_grp;
-        hi = n_grp;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (grp_col[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_grp = lo - n_lt_grp;
-        grp_ub = lo;
-
-        local_sum += (double)(n_lt_ref + n_lt_grp) +
-                     ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
+        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_col, n_grp, grp_col[i],
+                                 ref_lb, ref_ub, grp_lb, grp_ub);
+        local_sum += r.mid_rank;
     }
 
     __shared__ double warp_buf[32];
-    double total = block_reduce_sum(local_sum, warp_buf);
+    double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
     if (!compute_tie_corr) return;
@@ -294,22 +268,7 @@ __global__ void ovo_rank_large_kernel(
     __syncthreads();
 
     // Bitonic sort in shared memory
-    for (int k = 2; k <= large_padded; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = threadIdx.x; i < large_padded; i += blockDim.x) {
-                int ixj = i ^ j;
-                if (ixj > i) {
-                    bool asc = ((i & k) == 0);
-                    float a = grp_smem[i], b = grp_smem[ixj];
-                    if (asc ? (a > b) : (a < b)) {
-                        grp_smem[i] = b;
-                        grp_smem[ixj] = a;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
+    bitonic_sort_smem(grp_smem, large_padded);
 
     // Binary search each sorted grp element against sorted ref;
     // incremental bounds (monotonic within each thread's stride)
@@ -319,62 +278,12 @@ __global__ void ovo_rank_large_kernel(
     double local_sum = 0.0;
 
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
-        float v = grp_smem[i];
-        int lo, hi;
-
-        lo = ref_lb;
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_ref = lo;
-        ref_lb = n_lt_ref;
-
-        lo = (ref_ub > n_lt_ref) ? ref_ub : n_lt_ref;
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_ref = lo - n_lt_ref;
-        ref_ub = lo;
-
-        lo = grp_lb;
-        hi = n_grp;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (grp_smem[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_grp = lo;
-        grp_lb = n_lt_grp;
-
-        lo = (grp_ub > n_lt_grp) ? grp_ub : n_lt_grp;
-        hi = n_grp;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (grp_smem[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_grp = lo - n_lt_grp;
-        grp_ub = lo;
-
-        local_sum += (double)(n_lt_ref + n_lt_grp) +
-                     ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
+        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_smem, n_grp, grp_smem[i],
+                                 ref_lb, ref_ub, grp_lb, grp_ub);
+        local_sum += r.mid_rank;
     }
 
-    double total = block_reduce_sum(local_sum, warp_buf);
+    double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
     if (!compute_tie_corr) return;
@@ -402,15 +311,7 @@ __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
     for (int i = threadIdx.x; i < n_ref; i += blockDim.x) {
         if (i == 0 || ref_col[i] != ref_col[i - 1]) {
             float v = ref_col[i];
-            int lo = i + 1, hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] <= v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            int cnt = lo - i;
+            int cnt = sorted_upper_bound(ref_col, i + 1, n_ref, v) - i;
             if (cnt > 1) {
                 double t = (double)cnt;
                 local_tie += t * t * t - t;
@@ -419,7 +320,7 @@ __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
     }
 
     __shared__ double warp_buf[32];
-    double total = block_reduce_sum(local_tie, warp_buf);
+    double total = wilcoxon_block_sum(local_tie, warp_buf);
     if (threadIdx.x == 0) ref_tie_sums[col] = total;
 }
 
@@ -449,21 +350,7 @@ __global__ void ovo_rank_small_kernel(
     }
     __syncthreads();
 
-    for (int k = 2; k <= OVO_SMALL_MAX; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            int i = threadIdx.x;
-            int ixj = i ^ j;
-            if (i < OVO_SMALL_MAX && ixj > i) {
-                bool asc = ((i & k) == 0);
-                float a = grp_smem[i], b = grp_smem[ixj];
-                if (asc ? (a > b) : (a < b)) {
-                    grp_smem[i] = b;
-                    grp_smem[ixj] = a;
-                }
-            }
-            __syncthreads();
-        }
-    }
+    bitonic_sort_smem(grp_smem, OVO_SMALL_MAX);
 
     const float* ref_col = ref_sorted + (long long)col * n_ref;
     double local_sum = 0.0;
@@ -471,69 +358,31 @@ __global__ void ovo_rank_small_kernel(
 
     if (threadIdx.x < n_grp) {
         float v = grp_smem[threadIdx.x];
-
-        int lo = 0, hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_ref = lo;
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_ref = lo - n_lt_ref;
-
-        lo = 0;
-        hi = n_grp;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (grp_smem[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_grp = lo;
-        hi = n_grp;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (grp_smem[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_grp = lo - n_lt_grp;
-
-        local_sum += (double)(n_lt_ref + n_lt_grp) +
-                     ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
+        int ref_lb = 0, ref_ub = 0, grp_lb = 0, grp_ub = 0;
+        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_smem, n_grp, v, ref_lb,
+                                 ref_ub, grp_lb, grp_ub);
+        local_sum += r.mid_rank;
 
         if (compute_tie_corr &&
             (threadIdx.x == 0 || v != grp_smem[threadIdx.x - 1])) {
-            double combined = (double)(n_eq_ref + n_eq_grp);
+            double combined = (double)(r.n_eq_ref + r.n_eq_grp);
             if (combined > 1.0) {
                 local_tie_delta += combined * combined * combined - combined;
             }
-            if (n_eq_ref > 1) {
-                double cr = (double)n_eq_ref;
+            if (r.n_eq_ref > 1) {
+                double cr = (double)r.n_eq_ref;
                 local_tie_delta -= cr * cr * cr - cr;
             }
         }
     }
 
-    double total = block_reduce_sum(local_sum, warp_buf);
+    double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
     if (!compute_tie_corr) return;
     __syncthreads();
 
-    double tie_delta = block_reduce_sum(local_tie_delta, warp_buf);
+    double tie_delta = wilcoxon_block_sum(local_tie_delta, warp_buf);
     if (threadIdx.x == 0) {
         int n = n_ref + n_grp;
         double dn = (double)n;
@@ -584,25 +433,9 @@ __global__ void ovo_rank_medium_kernel(
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
         float v = grp_smem[i];
 
-        int lo = 0, hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_ref = lo;
-
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_ref = lo - n_lt_ref;
+        int n_lt_ref = sorted_lower_bound(ref_col, 0, n_ref, v);
+        int n_eq_ref =
+            sorted_upper_bound(ref_col, n_lt_ref, n_ref, v) - n_lt_ref;
 
         int n_lt_grp = 0;
         int n_eq_grp = 0;
@@ -633,13 +466,13 @@ __global__ void ovo_rank_medium_kernel(
         }
     }
 
-    double total = block_reduce_sum(local_sum, warp_buf);
+    double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
     if (!compute_tie_corr) return;
     __syncthreads();
 
-    double tie_delta = block_reduce_sum(local_tie_delta, warp_buf);
+    double tie_delta = wilcoxon_block_sum(local_tie_delta, warp_buf);
     if (threadIdx.x == 0) {
         int n = n_ref + n_grp;
         double dn = (double)n;
@@ -674,15 +507,7 @@ __device__ __forceinline__ double warp_tie_sum(const float* ref_col, int n_ref,
         bool is_first = in_ref_lane && ((i == 0) || (v != ref_col[i - 1]));
         int cnt_ref = 0;
         if (is_first) {
-            int lo = i + 1, hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] <= v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            cnt_ref = lo - i;
+            cnt_ref = sorted_upper_bound(ref_col, i + 1, n_ref, v) - i;
         }
 
         // Count in grp: look up how many lanes hold v_lane == v.  All lanes
@@ -717,14 +542,7 @@ __device__ __forceinline__ double warp_tie_sum(const float* ref_col, int n_ref,
         bool first_in_grp = (lane == 0) || (v != v_prev);
         bool in_ref = false;
         if (first_in_grp) {
-            int lo = 0, hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] < v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
+            int lo = sorted_lower_bound(ref_col, 0, n_ref, v);
             in_ref = (lo < n_ref) && (ref_col[lo] == v);
         }
 
@@ -777,24 +595,9 @@ __device__ __forceinline__ double warp_tie_delta(const float* ref_col,
         }
 
         if (first_in_grp) {
-            int lo = 0, hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] < v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            int ref_lb = lo;
-            hi = n_ref;
-            while (lo < hi) {
-                int m = lo + ((hi - lo) >> 1);
-                if (ref_col[m] <= v)
-                    lo = m + 1;
-                else
-                    hi = m;
-            }
-            int cnt_ref = lo - ref_lb;
+            int ref_lb = sorted_lower_bound(ref_col, 0, n_ref, v);
+            int cnt_ref =
+                sorted_upper_bound(ref_col, ref_lb, n_ref, v) - ref_lb;
 
             double combined = (double)(cnt_ref + cnt_grp);
             if (combined > 1.0) {
@@ -882,24 +685,9 @@ __global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
 
     if (lane < n_grp) {
         float v = x;
-        int lo = 0, hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] < v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_lt_ref = lo;
-        hi = n_ref;
-        while (lo < hi) {
-            int m = lo + ((hi - lo) >> 1);
-            if (ref_col[m] <= v)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        int n_eq_ref = lo - n_lt_ref;
+        int n_lt_ref = sorted_lower_bound(ref_col, 0, n_ref, v);
+        int n_eq_ref =
+            sorted_upper_bound(ref_col, n_lt_ref, n_ref, v) - n_lt_ref;
 
         // In-group counts: in the sorted warp-register x, count lanes < this
         // one that hold strictly less, and lanes with equal value.

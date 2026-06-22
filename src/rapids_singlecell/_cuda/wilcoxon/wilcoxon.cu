@@ -85,12 +85,10 @@ static void launch_ovr_rank_dense_streaming(
         CUDA_CHECK_LAST_ERROR(fill_row_indices_kernel);
 
         const float* keys_in = block + (size_t)col * n_rows;
-        size_t temp = cub_temp_bytes;
-        cuda_check(cub::DeviceSegmentedRadixSort::SortPairs(
-                       buf.cub_temp, temp, keys_in, buf.keys_out, buf.vals_in,
-                       buf.vals_out, sb_items, sb_cols, buf.seg_offsets,
-                       buf.seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
-                   "dense OVR segmented sort");
+        cub_segmented_sortpairs(
+            buf.cub_temp, cub_temp_bytes, keys_in, buf.keys_out, buf.vals_in,
+            buf.vals_out, sb_items, sb_cols, buf.seg_offsets,
+            buf.seg_offsets + 1, stream, "dense OVR segmented sort");
 
         if (use_gmem) {
             cuda_check(cudaMemsetAsync(
@@ -260,12 +258,10 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         const float* ref_sub = ref_data + (size_t)col * n_ref;
         const float* grp_sub = grp_data + (size_t)col * n_all_grp;
         upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
-        size_t ref_temp = ref_cub_temp_bytes;
-        cuda_check(cub::DeviceSegmentedRadixSort::SortKeys(
-                       buf.ref_cub_temp, ref_temp, ref_sub, buf.ref_sorted,
-                       sb_ref_items_actual, sb_cols, buf.ref_seg_offsets,
-                       buf.ref_seg_offsets + 1, BEGIN_BIT, END_BIT, stream),
-                   "dense OVO ref segmented sort");
+        cub_segmented_sortkeys(buf.ref_cub_temp, ref_cub_temp_bytes, ref_sub,
+                               buf.ref_sorted, sb_ref_items_actual, sb_cols,
+                               buf.ref_seg_offsets, buf.ref_seg_offsets + 1,
+                               stream, "dense OVO ref segmented sort");
         ref_sub = buf.ref_sorted;
 
         OvoTierScratch sc{buf.ref_tie_sums,    buf.sub_rank_sums,
