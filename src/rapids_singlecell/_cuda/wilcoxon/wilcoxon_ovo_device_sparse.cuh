@@ -81,6 +81,28 @@ static void ovo_streaming_csr_impl(
         cub_temp_bytes = cub_grp_bytes;
     }
 
+    // Clamp streams to the per-stream scratch budget (mirrors host OVO): the
+    // group dense slab scales with the cell count, so a fixed stream count
+    // would OOM at scale. The reference cache is allocated separately, so
+    // reserve its footprint first.
+    {
+        size_t per_stream =
+            sub_grp_items * sizeof(float) +
+            (run_huge ? sub_grp_items * sizeof(float) : 0) +
+            (run_huge ? 2 * (size_t)n_sort_groups * sub_batch_cols * sizeof(int)
+                      : 0) +
+            (run_huge ? cub_temp_bytes : 0) +
+            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium)
+                 ? (size_t)sub_batch_cols * sizeof(double)
+                 : 0) +
+            2 * (size_t)n_groups * sub_batch_cols * sizeof(double);
+        size_t budget = rmm_available_device_bytes(0.8);
+        size_t ref_reserve =
+            2 * (size_t)n_ref * (size_t)ref_cache_cols * sizeof(float);
+        budget = budget > ref_reserve ? budget - ref_reserve : 0;
+        n_streams = clamp_streams_by_budget(n_streams, per_stream, budget);
+    }
+
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
     ScopedCudaStream ref_stream(cudaStreamNonBlocking);
 
@@ -283,6 +305,24 @@ static void ovo_streaming_csc_impl(
         cub_grp_bytes =
             cub_segmented_sortkeys_temp_bytes(sub_grp_items_i32, max_grp_seg);
         cub_temp_bytes = std::max(cub_ref_bytes, cub_grp_bytes);
+    }
+
+    // Clamp streams to the per-stream scratch budget (mirrors host OVO): the
+    // ref/group dense slabs scale with cell counts, so a fixed stream count
+    // would OOM at scale.
+    {
+        size_t per_stream =
+            2 * sub_ref_items * sizeof(float) +
+            (run_huge ? 2 : 1) * sub_grp_items * sizeof(float) +
+            (size_t)(sub_batch_cols + 1) * sizeof(int) + cub_temp_bytes +
+            (run_huge ? 2 * (size_t)n_sort_groups * sub_batch_cols * sizeof(int)
+                      : 0) +
+            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium)
+                 ? (size_t)sub_batch_cols * sizeof(double)
+                 : 0) +
+            2 * (size_t)n_groups * sub_batch_cols * sizeof(double);
+        size_t budget = rmm_available_device_bytes(0.8);
+        n_streams = clamp_streams_by_budget(n_streams, per_stream, budget);
     }
 
     // pool first: streams drain before it frees their scratch (see guard doc).

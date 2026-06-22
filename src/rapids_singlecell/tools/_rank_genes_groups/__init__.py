@@ -77,9 +77,10 @@ def rank_genes_groups(
     Rank genes for characterizing groups using GPU acceleration.
 
     Log1p/log-normalized data is expected for biologically meaningful log fold
-    changes. Sparse inputs with explicit negative values fall back to the dense
-    full-sort ranking path; dense inputs are ranked directly and support any
-    sign.
+    changes. In-memory sparse inputs with explicit negative values fall back to
+    the dense full-sort ranking path; dense inputs are ranked directly and
+    support any sign. (``wilcoxon_binned`` rejects negative Dask sparse input,
+    which it cannot bin correctly.)
 
     .. note::
         **Dask support:** `'t-test'`, `'t-test_overestim_var'`,
@@ -236,6 +237,10 @@ def rank_genes_groups(
 
     if return_u_values and method != "wilcoxon":
         msg = "return_u_values is only supported for method='wilcoxon'."
+        raise ValueError(msg)
+
+    if chunk_size is not None and chunk_size <= 0:
+        msg = "chunk_size must be a positive integer."
         raise ValueError(msg)
 
     if key_added is None:

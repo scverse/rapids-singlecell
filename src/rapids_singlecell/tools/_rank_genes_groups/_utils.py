@@ -18,15 +18,14 @@ MIN_GROUP_SIZE_WARNING = 25
 
 
 def _sparse_has_negative(X) -> bool:
-    """Whether X is a sparse matrix holding an explicit negative value.
+    """Whether an in-memory sparse ``X`` stores an explicit negative value.
 
-    The optimized sparse Wilcoxon paths rank explicit nonzeros and add the
-    implicit (structural) zeros analytically as a tie at the column minimum,
-    which is correct only when every stored value is nonnegative (counts /
-    log1p-normalized data). With a negative stored value the implicit zeros are
-    no longer the minimum, so that analytic ranking is wrong and the caller
-    must fall back to the dense full-sort path (valid for any sign). Dense
-    inputs and the t-test/logreg methods never need this.
+    The fast sparse Wilcoxon paths add implicit (structural) zeros as a tie at
+    the column minimum, which is correct only for nonnegative stored values. A
+    negative breaks that, so the in-memory Wilcoxon paths fall back to the dense
+    full-sort path (valid for any sign). Dask arrays are not inspected here
+    (they are neither ``scipy`` nor ``cupy`` sparse); ``wilcoxon_binned`` guards
+    Dask sparse separately. Dense and t-test/logreg never need this.
     """
     if sp.issparse(X) or cpsp.issparse(X):
         return X.nnz > 0 and float(X.data.min()) < 0
@@ -81,10 +80,8 @@ def _select_groups(
 
     if selected is None:
         selected = list(all_categories)
-    elif len(selected) > 1:
-        # Sort to match original category order (scanpy convention)
-        cat_order = {str(c): i for i, c in enumerate(all_categories)}
-        selected.sort(key=lambda x: cat_order.get(str(x), len(all_categories)))
+    # else: preserve the user-provided order. scanpy's select_groups does NOT
+    # re-sort to category order, so the output column order echoes `groups=`.
 
     if skip_empty_groups:
         counts = {

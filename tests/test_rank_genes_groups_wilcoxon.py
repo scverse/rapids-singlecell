@@ -1023,7 +1023,8 @@ def test_rank_genes_groups_wilcoxon_with_renamed_categories(
 
 @pytest.mark.parametrize("reference", ["rest", "1"])
 def test_rank_genes_groups_wilcoxon_with_unsorted_groups(reference):
-    """Test that group order doesn't affect results."""
+    """Group order sets the output column order (matching scanpy); the per-group
+    statistics themselves are order-independent."""
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=6, n_centers=4, n_observations=180)
     _make_nonnegative(adata)
@@ -1040,9 +1041,13 @@ def test_rank_genes_groups_wilcoxon_with_unsorted_groups(reference):
         bdata, "blobs", method="wilcoxon", groups=groups_reversed, reference=reference
     )
 
-    expected_groups = {g for g in groups if g != reference}
-    assert set(adata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
-    assert set(bdata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
+    # Column order echoes the user-provided group order (reference excluded).
+    assert adata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
+        g for g in groups if g != reference
+    )
+    assert bdata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
+        g for g in groups_reversed if g != reference
+    )
 
     # Pick a group that's not the reference for comparison
     test_group = "3" if reference != "3" else "0"
@@ -1475,3 +1480,419 @@ def test_rank_genes_groups_sparse_negative_values_fallback_ovo(fmt):
             rtol=1e-13,
             atol=1e-13,
         )
+
+
+@pytest.mark.parametrize("reference", ["rest", "2"])
+def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
+    """Output column order must echo the user's ``groups=`` list (scanpy parity),
+    not be re-sorted to category order."""
+    np.random.seed(0)
+    adata = sc.datasets.blobs(n_variables=6, n_centers=4, n_observations=180)
+    adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
+    bdata = adata.copy()
+
+    # Deliberately out-of-category-order subset.
+    groups = ["3", "1"] if reference != "rest" else ["3", "1", "0"]
+    rsc.tl.rank_genes_groups(
+        adata,
+        "blobs",
+        method="wilcoxon",
+        use_raw=False,
+        groups=groups,
+        reference=reference,
+    )
+    sc.tl.rank_genes_groups(
+        bdata,
+        "blobs",
+        method="wilcoxon",
+        use_raw=False,
+        groups=groups,
+        reference=reference,
+    )
+    assert (
+        adata.uns["rank_genes_groups"]["names"].dtype.names
+        == bdata.uns["rank_genes_groups"]["names"].dtype.names
+    )
+
+
+def test_wilcoxon_host_sparse_negative_chunked_stats_match_scanpy():
+    """Host scipy-sparse with negatives takes the dense fallback, whose group
+    means/vars/pts run through the group_chunk_stats kernel (multi-chunk). Those
+    means (-> logfoldchanges) and pts must match scanpy.
+    """
+    rng = np.random.default_rng(0)
+    n_obs, n_vars = 200, 24
+    X = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
+    X[X < 1.5] = 0.0  # structural zeros so pts < 1
+    X[rng.random((n_obs, n_vars)) < 0.01] = -0.5  # a few negatives -> fallback
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+
+    gpu = sc.AnnData(X=sp.csr_matrix(X), obs=obs.copy(), var=var.copy())
+    cpu = sc.AnnData(X=X.copy(), obs=obs.copy(), var=var.copy())
+
+    rsc.tl.rank_genes_groups(
+        gpu,
+        "group",
+        method="wilcoxon",
+        use_raw=False,
+        reference="rest",
+        pts=True,
+        n_genes=n_vars,
+        chunk_size=8,  # < n_vars -> multiple chunks
+    )
+    sc.tl.rank_genes_groups(
+        cpu, "group", method="wilcoxon", use_raw=False, reference="rest", pts=True
+    )
+    g = gpu.uns["rank_genes_groups"]
+    c = cpu.uns["rank_genes_groups"]
+    for group in g["names"].dtype.names:
+        g_lfc = dict(
+            zip(g["names"][group], np.asarray(g["logfoldchanges"][group], float))
+        )
+        c_lfc = dict(
+            zip(c["names"][group], np.asarray(c["logfoldchanges"][group], float))
+        )
+        for gene, val in g_lfc.items():
+            np.testing.assert_allclose(
+                val, c_lfc[gene], rtol=1e-12, atol=1e-13, equal_nan=True
+            )
+    for frame in ("pts", "pts_rest"):
+        for col in c[frame].columns:
+            np.testing.assert_allclose(
+                g[frame].loc[c[frame].index, col].values,
+                c[frame][col].values,
+                rtol=1e-12,
+                atol=1e-13,
+            )
+
+
+def test_wilcoxon_fdr_ties_nan_match_scanpy():
+    """BH FDR must match scanpy on heavily-tied / constant / all-zero genes,
+    locking in that the GPU argsort tie-break is inert for adjusted p-values.
+    Integer data is float32-exact, so ranking is bit-identical to scanpy and the
+    comparison isolates the FDR step.
+    """
+    rng = np.random.default_rng(1)
+    n_obs, n_vars = 240, 30
+    X = rng.integers(0, 3, size=(n_obs, n_vars)).astype(np.float64)  # heavy ties
+    X[:, 0] = 1.0  # constant gene -> identical p across groups
+    X[:, 1] = 0.0  # all-zero gene
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+
+    gpu = sc.AnnData(X=cp.asarray(X), obs=obs.copy(), var=var.copy())  # GPU FDR path
+    cpu = sc.AnnData(X=X.copy(), obs=obs.copy(), var=var.copy())
+
+    rsc.tl.rank_genes_groups(
+        gpu, "group", method="wilcoxon", use_raw=False, tie_correct=True
+    )
+    sc.tl.rank_genes_groups(
+        cpu, "group", method="wilcoxon", use_raw=False, tie_correct=True
+    )
+    g = gpu.uns["rank_genes_groups"]
+    c = cpu.uns["rank_genes_groups"]
+    for group in g["names"].dtype.names:
+        g_adj = dict(zip(g["names"][group], np.asarray(g["pvals_adj"][group], float)))
+        c_adj = dict(zip(c["names"][group], np.asarray(c["pvals_adj"][group], float)))
+        for gene, val in g_adj.items():
+            np.testing.assert_allclose(
+                val, c_adj[gene], rtol=1e-12, atol=1e-13, equal_nan=True
+            )
+
+
+def _promote_host_index_dtypes(X, *, indptr64, indices64):
+    """Copy a host scipy CSR/CSC matrix with promoted index-array dtypes.
+
+    scipy couples indptr/indices to one dtype via get_index_dtype, so the
+    decoupled (i64 indptr / i32 indices) combination only arises by explicit
+    promotion -- which is exactly what drives the templated host kernels.
+    """
+    X = X.copy()
+    if indptr64:
+        X.indptr = X.indptr.astype(np.int64)
+    if indices64:
+        X.indices = X.indices.astype(np.int64)
+    return X
+
+
+@pytest.mark.parametrize("reference", ["rest", "1"])  # OVR vs OVO host paths
+@pytest.mark.parametrize(
+    ("layout", "data_dtype", "indices64"),
+    [
+        ("csr", np.float32, False),  # *_i64
+        ("csr", np.float32, True),  # *_i64_idx64
+        ("csr", np.float64, False),  # *_f64_i64
+        ("csr", np.float64, True),  # *_f64_i64_idx64
+        ("csc", np.float32, False),  # *_i64        (CSC has no idx64 template)
+        ("csc", np.float64, False),  # *_f64_i64
+    ],
+)
+def test_host_sparse_int64_templates_match_int32(
+    reference, layout, data_dtype, indices64
+):
+    """Exercise the host-sparse int64-indptr / int64-indices kernel templates
+    (the 12 ``*_i64`` / ``*_idx64`` / ``*_f64_i64`` host bindings the suite
+    otherwise never reaches). These differ from the validated int32 host path
+    only in index dtype, so they must be bit-identical to it. Real int64 indices
+    only occur at nnz > 2^31 (unallocatable in CI), so we promote a small
+    matrix's index arrays explicitly and keep it host-resident (scipy sparse +
+    method='wilcoxon' is not moved to GPU)."""
+    rng = np.random.default_rng(0)
+    dense = (rng.random((150, 8)) * 4.0).astype(np.float64)
+    dense[dense < 1.5] = 0.0  # nonnegative + structural zeros -> sparse fast path
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(8)])
+
+    maker = sp.csr_matrix if layout == "csr" else sp.csc_matrix
+    base = maker(dense.astype(data_dtype))
+
+    a32 = sc.AnnData(X=base.copy(), obs=obs.copy(), var=var.copy())
+    a64 = sc.AnnData(
+        X=_promote_host_index_dtypes(base, indptr64=True, indices64=indices64),
+        obs=obs.copy(),
+        var=var.copy(),
+    )
+    kw = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "tie_correct": True,
+    }
+    rsc.tl.rank_genes_groups(a32, "group", **kw)
+    rsc.tl.rank_genes_groups(a64, "group", **kw)
+
+    r32, r64 = a32.uns["rank_genes_groups"], a64.uns["rank_genes_groups"]
+    assert r64["names"].dtype.names == r32["names"].dtype.names
+    for fld in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
+        for grp in r32[fld].dtype.names:
+            np.testing.assert_array_equal(
+                np.asarray(r64[fld][grp]), np.asarray(r32[fld][grp])
+            )
+
+
+def _anndata_with_group_sizes(sizes, *, n_genes=6, seed=0):
+    """Dense AnnData whose per-group cell counts are exactly ``sizes``.
+
+    The OVO tier dispatch picks the rank kernel by *test-group* size
+    (WARP<=32, SMALL 33-64, MEDIUM 65-512, LARGE 513-2500, HUGE>2500), so
+    engineered group sizes drive specific bands. Integer data is float32-exact,
+    so ranking is bit-identical to scanpy.
+    """
+    rng = np.random.default_rng(seed)
+    labels = []
+    for name, n in sizes.items():
+        labels += [name] * n
+    X = rng.integers(0, 6, size=(len(labels), n_genes)).astype(np.float64)
+    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    return sc.AnnData(X=X, obs=obs, var=var)
+
+
+def _assert_ovo_matches_scanpy(adata, reference):
+    bdata = adata.copy()
+    kw = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "tie_correct": True,
+    }
+    rsc.tl.rank_genes_groups(adata, "group", **kw)
+    sc.tl.rank_genes_groups(bdata, "group", **kw)
+    g, c = adata.uns["rank_genes_groups"], bdata.uns["rank_genes_groups"]
+    for fld in ("scores", "pvals", "pvals_adj"):
+        for grp in g[fld].dtype.names:
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            for gene, val in gm.items():
+                np.testing.assert_allclose(
+                    val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True
+                )
+
+
+def test_ovo_tier_bands_warp_small_medium_large_match_scanpy():
+    """OVO dense-tiered path must hit the WARP/SMALL/MEDIUM/LARGE rank kernels
+    (test-group sizes 20/50/300/1000, all <= 2500) and match scanpy."""
+    adata = _anndata_with_group_sizes(
+        {"ref": 40, "warp": 20, "small": 50, "medium": 300, "large": 1000}, seed=1
+    )
+    _assert_ovo_matches_scanpy(adata, reference="ref")
+
+
+def test_ovo_tier_band_huge_match_scanpy():
+    """OVO dense-tiered path must hit the HUGE band (CUB segmented sort, a
+    test-group > 2500 cells) and match scanpy."""
+    adata = _anndata_with_group_sizes({"ref": 40, "huge": 3000}, seed=2)
+    _assert_ovo_matches_scanpy(adata, reference="ref")
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 6200 tiny groups warn
+def test_ovr_dense_gmem_branch_matches_scipy():
+    """The DENSE OVR global-memory accumulator (use_gmem) engages only when the
+    per-block group accumulators exceed the 48 KB MaxSharedMemoryPerBlock limit
+    -- n_groups > 6112 (= 49152 / 8 - 32). No other test reaches it (the
+    >3056-group gmem tests only flip the *sparse* accumulator). n_groups=6200
+    deterministically routes through dense gmem; a scanpy oracle here costs ~30s
+    (its per-group Python loop), so we validate a sample of groups against scipy
+    mannwhitneyu with rsc's exact settings (tie-corrected asymptotic, no
+    continuity)."""
+    from scipy.stats import mannwhitneyu
+
+    n_groups, n_genes = 6200, 4  # > 6112 -> dense gmem accumulator
+    rng = np.random.default_rng(3)
+    labels = np.repeat(np.arange(n_groups), 2)  # 2 cells per group
+    X = rng.integers(0, 6, size=(labels.size, n_genes)).astype(np.float64)
+    obs = pd.DataFrame({"group": pd.Categorical([str(x) for x in labels])})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+    adata = sc.AnnData(X=X, obs=obs, var=var)
+
+    rsc.tl.rank_genes_groups(
+        adata, "group", method="wilcoxon", use_raw=False, tie_correct=True
+    )
+    res = adata.uns["rank_genes_groups"]
+    for grp in ("0", "1", "250", "1000", "3057", "6112", "6199"):
+        gp = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float)))
+        mask = labels == int(grp)
+        for gi, gene in enumerate(var.index):
+            _, p = mannwhitneyu(
+                X[mask, gi],
+                X[~mask, gi],
+                use_continuity=False,
+                alternative="two-sided",
+                method="asymptotic",
+            )
+            np.testing.assert_allclose(
+                gp[gene],
+                p,
+                rtol=1e-10,
+                atol=1e-12,
+                equal_nan=True,
+                err_msg=f"group {grp} gene {gene}",
+            )
+
+
+def test_skip_empty_groups_vs_rest_drops_singleton():
+    """skip_empty_groups=True with reference='rest' silently drops <2-cell
+    groups (covers the reference=='rest' branch of _select_groups, which the
+    existing reference='ref' skip tests miss)."""
+    adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=4)
+    rsc.tl.rank_genes_groups(
+        adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True
+    )
+    names = set(adata.uns["rank_genes_groups"]["names"].dtype.names)
+    assert names == {"a", "b"}  # singleton "c" dropped, no error
+
+
+def test_skip_empty_groups_reference_too_small_raises():
+    """skip_empty_groups=True with a <2-cell reference raises a clear error."""
+    adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=4)
+    with pytest.raises(ValueError, match="reference = c has fewer than two samples"):
+        rsc.tl.rank_genes_groups(
+            adata,
+            "group",
+            method="wilcoxon",
+            use_raw=False,
+            reference="c",
+            skip_empty_groups=True,
+        )
+
+
+def test_skip_empty_groups_none_remain_raises():
+    """skip_empty_groups=True raises when no group has >=2 cells (vs-rest)."""
+    adata = _anndata_with_group_sizes({"a": 1, "b": 1, "c": 1}, seed=4)
+    with pytest.raises(ValueError, match="No groups with at least two samples remain"):
+        rsc.tl.rank_genes_groups(
+            adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True
+        )
+
+
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
+)
+def test_ovr_tie_correct_false_tie_heavy_matches_scanpy(fmt):
+    """OVR (reference='rest') tie_correct=False on TIE-HEAVY data must match
+    scanpy across every storage format. The pre-existing tie_correct=False oracle
+    uses tie-free blobs (tie_corr ~= 1), so a wrong uncorrected variance would
+    pass; integer data with many ties stresses the omitted tie term on each path
+    (dense, host-sparse CSR/CSC, device-sparse CSR/CSC)."""
+    rng = np.random.default_rng(7)
+    n_obs, n_genes = 180, 8
+    dense = rng.integers(0, 5, size=(n_obs, n_genes)).astype(np.float64)  # ties
+    dense[dense < 1.0] = 0.0  # nonnegative + structural zeros -> sparse fast path
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+
+    gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
+    cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
+    kw = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": "rest",
+        "tie_correct": False,
+    }
+    rsc.tl.rank_genes_groups(gpu, "group", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
+    for fld in ("scores", "pvals"):
+        for grp in g[fld].dtype.names:
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            for gene, val in gm.items():
+                np.testing.assert_allclose(
+                    val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True
+                )
+
+
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
+)
+@pytest.mark.parametrize("reference", ["rest", "1"])  # OVR and OVO epilogues
+def test_use_continuity_matches_scipy(fmt, reference):
+    """use_continuity=True is validated only on dense-OVO elsewhere. Check the
+    continuity epilogue composes correctly with each path's rank_sums (OVR + OVO,
+    every format) vs scipy.mannwhitneyu(use_continuity=True, asymptotic).
+
+    Groups OVERLAP (no separation) on purpose: that keeps |R-E[R]| moderate so
+    the 0.5 continuity term MATERIALLY changes p -- a missing continuity
+    correction would then fail the scipy oracle (non-vacuous). Because U and E[U]
+    are multiples of 0.5, rsc's clamp (max(|d|-0.5,0)) and scipy's shift agree
+    exactly. tie_correct=True matches scipy's always-on asymptotic tie term."""
+    from scipy.stats import mannwhitneyu
+
+    rng = np.random.default_rng(8)
+    n_obs, n_genes = 150, 6
+    # Overlapping groups (same distribution) -> moderate |R-E[R]| -> continuity
+    # is material. Integer values give ties (exercises the tie term too).
+    dense = rng.integers(0, 4, size=(n_obs, n_genes)).astype(np.float64)
+    labels = np.array([str(i % 3) for i in range(n_obs)])
+    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+
+    gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
+    rsc.tl.rank_genes_groups(
+        gpu,
+        "group",
+        method="wilcoxon",
+        use_raw=False,
+        reference=reference,
+        tie_correct=True,
+        use_continuity=True,
+        n_genes=n_genes,
+    )
+    res = gpu.uns["rank_genes_groups"]
+    for grp in res["names"].dtype.names:
+        gm = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float)))
+        mask_g = labels == grp
+        mask_r = (labels != grp) if reference == "rest" else (labels == reference)
+        for gi, gene in enumerate(var.index):
+            _, p = mannwhitneyu(
+                dense[mask_g, gi],
+                dense[mask_r, gi],
+                use_continuity=True,
+                alternative="two-sided",
+                method="asymptotic",
+            )
+            np.testing.assert_allclose(
+                gm[gene], p, rtol=1e-10, atol=1e-12, equal_nan=True
+            )

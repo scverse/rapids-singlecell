@@ -429,21 +429,35 @@ class TestWilcoxonBinnedEdgeCases:
             assert np.all(pvals <= 1)
 
     def test_sparse_negative_values_fallback(self, adata_blobs):
-        """Sparse input with negatives must not use the sparse histogram (which
-        assigns implicit zeros to bin 0, valid only for nonnegative data); it
-        falls back to the dense histogram, so the result matches the dense run.
+        """Sparse input with negatives must densify: the sparse histogram puts
+        implicit zeros in bin 0 (valid only for nonnegative data). A *correct*
+        fallback (densify) matches the dense run; a removed fallback would bin
+        the implicit zeros below stored negatives and diverge -- so this
+        assertion fails without the fallback.
+
+        Sensitivity hinges on columns holding BOTH structural zeros AND a value
+        below them (a negative). Where the zeros are the column minimum, moving
+        them to bin 0 leaves their rank order unchanged and the binned z is
+        invariant (which is why a naive sparse-vs-dense check is vacuous).
         """
         import cupy as cp
         import cupyx.scipy.sparse as cpsp
 
-        adata = adata_blobs.copy()
-        rsc.get.anndata_to_GPU(adata)
-        dense = cp.asarray(adata.X, dtype=cp.float64)
-        dense[:, 0] = -1.0
+        rng = np.random.default_rng(0)
+        n_obs, n_vars = adata_blobs.shape
+        base = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
+        base[base < 2.0] = 0.0  # real structural zeros (~40%)
+        # Negatives in zero-bearing cells: columns then hold structural zeros
+        # AND values below them, the case the fallback must rank correctly.
+        neg = (base == 0.0) & (rng.random(base.shape) < 0.05)
+        base[neg] = -0.5
+        base[0, 1] = 10.0  # keep a positive max so sparse/dense ranges agree
+        assert (base == 0).any() and (base < 0).any() and (base > 0).any()
 
-        sparse_adata = adata.copy()
+        dense = cp.asarray(base)
+        sparse_adata = adata_blobs.copy()
         sparse_adata.X = cpsp.csr_matrix(dense)
-        dense_adata = adata.copy()
+        dense_adata = adata_blobs.copy()
         dense_adata.X = dense
 
         rsc.tl.rank_genes_groups(

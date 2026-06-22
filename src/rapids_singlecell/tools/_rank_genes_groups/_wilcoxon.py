@@ -38,11 +38,13 @@ def _maybe_preload_host_dense(rg: _RankGenes) -> None:
         return
 
     try:
-        _, total = cp.cuda.runtime.memGetInfo()
+        free, _ = cp.cuda.runtime.memGetInfo()
     except cp.cuda.runtime.CUDARuntimeError:
         return
 
-    if X.nbytes > total * DENSE_HOST_PRELOAD_MAX_GPU_FRACTION:
+    # Gate on *free* (the rmm_available_device_bytes convention), not total:
+    # under an RMM pool an array below a fraction of total can still exceed free.
+    if X.nbytes > free * DENSE_HOST_PRELOAD_MAX_GPU_FRACTION:
         return
 
     registered = False
@@ -56,10 +58,10 @@ def _maybe_preload_host_dense(rg: _RankGenes) -> None:
     try:
         X_gpu = cp.asarray(X)
         cp.cuda.get_current_stream().synchronize()
-    except cp.cuda.memory.OutOfMemoryError:
+    # Under RMM an OOM surfaces as a bare MemoryError (std::bad_alloc), which
+    # also subsumes cupy's OutOfMemoryError subclass.
+    except (MemoryError, cp.cuda.runtime.CUDARuntimeError):
         cp.get_default_memory_pool().free_all_blocks()
-        return
-    except cp.cuda.runtime.CUDARuntimeError:
         return
     finally:
         if registered:

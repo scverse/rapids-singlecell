@@ -103,8 +103,8 @@ def wilcoxon_binned(
         ``'log1p'`` for Dask arrays (to avoid a costly data scan).
         ``'log1p'`` uses a fixed [0, 15] range suitable for
         log1p-normalized data.
-        ``'auto'`` computes the actual (min, max) of the data. Use this
-        for nonnegative expression data outside the fixed log1p range.
+        ``'auto'`` computes the actual (min, max) of the data, spanning
+        negatives when present. Use it for data outside the fixed log1p range.
     """
     if not rg.is_log1p:
         warnings.warn(
@@ -124,6 +124,35 @@ def wilcoxon_binned(
     n_groups = len(rg.groups_order)
     n_cells, n_genes = X.shape
     group_sizes = rg.group_sizes
+
+    # Dask sparse cannot bin negatives correctly: the sparse histogram puts
+    # implicit zeros in the lowest bin and _data_range floors the range at 0
+    # for Dask sparse, so negatives would be silently mis-ranked. Refuse rather
+    # than return wrong numbers (in-memory sparse negatives use the dense
+    # fallback; see _sparse_has_negative).
+    if isinstance(X, DaskArray) and cpsp.issparse(X._meta):
+
+        def _block_data_min(block):
+            if block.nnz > 0:
+                return block.data.min().reshape(1)
+            return cp.zeros(1, dtype=block.dtype)
+
+        data_min = float(
+            X.map_blocks(
+                _block_data_min,
+                dtype=X.dtype,
+                drop_axis=1,
+                chunks=((1,) * len(X.chunks[0]),),
+            )
+            .min()
+            .compute()
+        )
+        if data_min < 0:
+            raise ValueError(
+                "wilcoxon_binned does not support negative values in Dask "
+                "sparse input; the binned approximation mis-ranks implicit "
+                "zeros. Densify the data or use a nonnegative representation."
+            )
 
     # group_codes: 0..n_groups-1 for selected cells, n_groups (sentinel)
     # for unselected. For vs-rest, unselected cells are binned into a

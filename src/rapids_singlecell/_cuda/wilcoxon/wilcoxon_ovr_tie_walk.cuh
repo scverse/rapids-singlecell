@@ -52,7 +52,8 @@ __device__ __forceinline__ double ovr_walk_tie_runs(
 
         int total_tie = tie_global_end - tie_global_start;
         double avg_rank =
-            rank_offset + (double)(tie_global_start + tie_global_end + 1) / 2.0;
+            rank_offset +
+            ((double)tie_global_start + (double)tie_global_end + 1.0) / 2.0;
 
         for (int j = i; j < tie_local_end; ++j) {
             int grp = group_codes[si[j]];

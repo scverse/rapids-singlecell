@@ -254,7 +254,8 @@ def test_rank_genes_groups_ttest_with_renamed_categories(
 @pytest.mark.parametrize("reference", ["rest", "1"])
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
 def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
-    """Test that group order doesn't affect results."""
+    """Group order sets the output column order (matching scanpy); the per-group
+    statistics themselves are order-independent."""
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=6, n_centers=4, n_observations=180)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
@@ -271,9 +272,13 @@ def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
         bdata, "blobs", method=method, groups=groups_reversed, reference=reference
     )
 
-    expected_groups = {g for g in groups if g != reference}
-    assert set(adata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
-    assert set(bdata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
+    # Column order echoes the user-provided group order (reference excluded).
+    assert adata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
+        g for g in groups if g != reference
+    )
+    assert bdata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
+        g for g in groups_reversed if g != reference
+    )
 
     # Pick a group that's not the reference for comparison
     test_group = "3" if reference != "3" else "0"
