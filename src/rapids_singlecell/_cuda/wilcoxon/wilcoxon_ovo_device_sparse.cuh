@@ -220,13 +220,7 @@ static void ovo_streaming_csr_impl(
             batch_idx++;
         }
 
-        for (int s = 0; s < n_streams; s++) {
-            cudaError_t err = cudaStreamSynchronize(streams[s]);
-            if (err != cudaSuccess)
-                throw std::runtime_error(
-                    std::string("CUDA error in OVO device CSR streaming: ") +
-                    cudaGetErrorString(err));
-        }
+        sync_streams(streams, "OVO device CSR streaming");
     }
 }
 
@@ -409,11 +403,5 @@ static void ovo_streaming_csc_impl(
         batch_idx++;
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in OVO device CSC streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "OVO device CSC streaming");
 }

@@ -119,14 +119,7 @@ static void launch_ovr_rank_dense_streaming(
         ++batch_idx;
     }
 
-    for (int s = 0; s < n_streams; ++s) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("CUDA error in dense OVR streaming rank: ") +
-                cudaGetErrorString(err));
-        }
-    }
+    sync_streams(streams, "dense OVR streaming rank");
 }
 
 static void launch_ovo_rank_dense_tiered_unsorted_ref(
@@ -292,14 +285,7 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         ++batch_idx;
     }
 
-    for (int s = 0; s < n_streams; ++s) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("CUDA error in dense OVO tiered rank: ") +
-                cudaGetErrorString(err));
-        }
-    }
+    sync_streams(streams, "dense OVO tiered rank");
 }
 
 template <typename Device>

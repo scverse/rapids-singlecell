@@ -337,6 +337,17 @@ struct ScopedCudaStreams {
     ScopedCudaStreams& operator=(const ScopedCudaStreams&) = delete;
 };
 
+// Drain every stream, surfacing the first async error with a context label.
+static inline void sync_streams(const ScopedCudaStreams& streams,
+                                const char* what) {
+    for (int i = 0; i < streams.size(); ++i) {
+        cudaError_t err = cudaStreamSynchronize(streams[i]);
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA error in ") + what +
+                                     ": " + cudaGetErrorString(err));
+    }
+}
+
 struct ScopedCudaEvent {
     cudaEvent_t event = nullptr;
 

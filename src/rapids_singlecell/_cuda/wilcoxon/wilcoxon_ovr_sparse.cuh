@@ -213,13 +213,7 @@ static void ovr_sparse_csc_host_streaming_impl(
         batch_idx++;
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in sparse host CSC streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "sparse host CSC streaming");
 }
 
 // ============================================================================
@@ -759,13 +753,7 @@ static void ovr_sparse_csr_host_streaming_impl(
         col += sb_cols;
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in sparse host CSR streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "sparse host CSR streaming");
 }
 
 // ============================================================================
@@ -905,13 +893,7 @@ static void ovr_sparse_csc_streaming_impl(
         batch_idx++;
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in sparse ovr streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "sparse ovr streaming");
 }
 
 // ============================================================================
@@ -1113,11 +1095,5 @@ static void ovr_sparse_csr_streaming_impl(
         col += sb_cols;
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in sparse CSR ovr streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "sparse CSR ovr streaming");
 }

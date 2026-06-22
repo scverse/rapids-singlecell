@@ -295,13 +295,7 @@ static void ovo_streaming_csc_host_impl(
         batch_idx++;
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in wilcoxon streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "wilcoxon streaming");
 }
 
 /**
@@ -774,11 +768,5 @@ static void ovo_streaming_csr_host_impl(
         }
     }
 
-    for (int s = 0; s < n_streams; s++) {
-        cudaError_t err = cudaStreamSynchronize(streams[s]);
-        if (err != cudaSuccess)
-            throw std::runtime_error(
-                std::string("CUDA error in ovo csr host streaming: ") +
-                cudaGetErrorString(err));
-    }
+    sync_streams(streams, "ovo csr host streaming");
 }
