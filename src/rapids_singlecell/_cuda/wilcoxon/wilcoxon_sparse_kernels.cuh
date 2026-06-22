@@ -164,11 +164,7 @@ __global__ void rank_sums_sparse_ovr_kernel(
         double* warp_buf = smem + warp_buf_off;
 
         double v = wilcoxon_block_sum(local_tie_sum, warp_buf);
-        if (threadIdx.x == 0) {
-            double n = (double)n_rows;
-            double denom = n * n * n - n;
-            tie_corr[col] = (denom > 0.0) ? (1.0 - v / denom) : 1.0;
-        }
+        if (threadIdx.x == 0) tie_corr[col] = finalize_tie_corr(n_rows, v);
     }
 }
 

@@ -65,6 +65,35 @@ constexpr int END_BIT = 32;
 constexpr int UTIL_BLOCK_SIZE = 256;
 // Scratch slots for warp-level reduction (one slot per warp, 32 warps max).
 constexpr int WARP_REDUCE_BUF = 32;
+
+// Stream-count clamps shared by the streaming impls: never use more streams
+// than there are column batches, nor more than the per-stream memory budget
+// allows.
+static inline int clamp_streams_by_cols(int n_cols, int sub_batch_cols) {
+    int n = N_STREAMS;
+    if (n_cols < n * sub_batch_cols)
+        n = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    return n;
+}
+
+static inline int clamp_streams_by_budget(int n_streams,
+                                          size_t per_stream_bytes,
+                                          size_t budget) {
+    while (n_streams > 1 && (size_t)n_streams * per_stream_bytes > budget)
+        n_streams--;
+    return n_streams;
+}
+
+// Scatter a [rows, sb_cols] device sub-batch block (row-major doubles, source
+// row stride sb_cols) into `dst` whose row stride is n_cols. `dst` must already
+// point at the destination column offset (e.g. out + col).
+static inline void scatter_cols_2d(double* dst, const double* src, int rows,
+                                   int n_cols, int sb_cols,
+                                   cudaStream_t stream) {
+    cudaMemcpy2DAsync(dst, n_cols * sizeof(double), src,
+                      sb_cols * sizeof(double), sb_cols * sizeof(double), rows,
+                      cudaMemcpyDeviceToDevice, stream);
+}
 // WARP band: warp-per-(col,group) fused kernel. Each warp sorts+ranks one
 // pair entirely in registers (warp-shuffle bitonic, no smem, no __syncthreads).
 // Blocks pack 8 warps to amortise launch overhead. Fast route for
@@ -190,6 +219,34 @@ static inline int checked_int_product(size_t a, size_t b, const char* context) {
                                  " exceeds int32 item limit");
     }
     return (int)(a * b);
+}
+
+// Precompute per-batch CSC column offsets rebased to each batch's ptr_start,
+// laid out [n_batches][sub_batch_cols+1], and upload once. Returns the device
+// buffer (allocated from `pool`). Avoids a per-batch H2D from a transient host
+// buffer in the CSC host streaming impls.
+template <typename IndptrT>
+static inline int* precompute_csc_batch_offsets(const IndptrT* h_indptr,
+                                                int n_cols, int sub_batch_cols,
+                                                int n_batches,
+                                                RmmScratchPool& pool,
+                                                const char* what) {
+    std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
+    for (int b = 0; b < n_batches; b++) {
+        int col_start = b * sub_batch_cols;
+        int rem = n_cols - col_start;
+        int sb = (sub_batch_cols < rem) ? sub_batch_cols : rem;
+        IndptrT ptr_start = h_indptr[col_start];
+        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
+        for (int i = 0; i <= sb; i++)
+            off[i] = checked_int_span(
+                (size_t)(h_indptr[col_start + i] - ptr_start), what);
+    }
+    int* d_all_offsets =
+        pool.alloc<int>((size_t)n_batches * (sub_batch_cols + 1));
+    cudaMemcpy(d_all_offsets, h_all_offsets.data(),
+               h_all_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    return d_all_offsets;
 }
 
 // Largest per-batch nonzero count we let a column batch reach. A batch is

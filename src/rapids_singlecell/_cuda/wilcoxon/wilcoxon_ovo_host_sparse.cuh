@@ -43,9 +43,7 @@ static void ovo_streaming_csc_host_impl(
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
-    int n_streams = N_STREAMS;
-    if (n_cols < n_streams * sub_batch_cols)
-        n_streams = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
 
     size_t sub_ref_items = (size_t)n_ref * sub_batch_cols;
     size_t sub_grp_items = (size_t)n_all_grp * sub_batch_cols;
@@ -88,8 +86,7 @@ static void ovo_streaming_csc_host_impl(
                 sizeof(double) +
             cub_temp_bytes;
         size_t budget = rmm_available_device_bytes(0.8);
-        while (n_streams > 1 && (size_t)n_streams * per_stream > budget)
-            n_streams--;
+        n_streams = clamp_streams_by_budget(n_streams, per_stream, budget);
     }
 
     // pool first: streams drain before it frees their scratch (see guard doc).
@@ -104,22 +101,9 @@ static void ovo_streaming_csc_host_impl(
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
-    std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
-    for (int b = 0; b < n_batches; b++) {
-        int col_start = b * sub_batch_cols;
-        int sb = std::min(sub_batch_cols, n_cols - col_start);
-        IndptrT ptr_start = h_indptr[col_start];
-        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
-        for (int i = 0; i <= sb; i++) {
-            off[i] =
-                checked_int_span((size_t)(h_indptr[col_start + i] - ptr_start),
-                                 "OVO host CSC rebased column offsets");
-        }
-    }
-    int* d_all_offsets =
-        pool.alloc<int>((size_t)n_batches * (sub_batch_cols + 1));
-    cudaMemcpy(d_all_offsets, h_all_offsets.data(),
-               h_all_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    int* d_all_offsets = precompute_csc_batch_offsets(
+        h_indptr, n_cols, sub_batch_cols, n_batches, pool,
+        "OVO host CSC rebased column offsets");
 
     // Row maps + group offsets + stats codes (uploaded once)
     int* d_ref_row_map = pool.alloc<int>(n_rows);
@@ -270,25 +254,17 @@ static void ovo_streaming_csc_host_impl(
                            n_groups, compute_tie_corr, stream);
 
         // D2D: scatter sub-batch results into caller's GPU buffers
-        cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
-                          buf.d_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(d_rank_sums + col, buf.d_rank_sums, n_groups, n_cols,
+                        sb_cols, stream);
         if (compute_tie_corr) {
-            cudaMemcpy2DAsync(d_tie_corr + col, n_cols * sizeof(double),
-                              buf.d_tie_corr, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups,
-                              cudaMemcpyDeviceToDevice, stream);
+            scatter_cols_2d(d_tie_corr + col, buf.d_tie_corr, n_groups, n_cols,
+                            sb_cols, stream);
         }
-        cudaMemcpy2DAsync(d_group_sums + col, n_cols * sizeof(double),
-                          buf.d_group_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups_stats,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(d_group_sums + col, buf.d_group_sums, n_groups_stats,
+                        n_cols, sb_cols, stream);
         if (compute_nnz) {
-            cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
-                              buf.d_group_nnz, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups_stats,
-                              cudaMemcpyDeviceToDevice, stream);
+            scatter_cols_2d(d_group_nnz + col, buf.d_group_nnz, n_groups_stats,
+                            n_cols, sb_cols, stream);
         }
 
         col += sb_cols;
@@ -751,17 +727,11 @@ static void ovo_streaming_csr_host_impl(
                                pack_tpb_rank, n_ref, pack_rows, sb_cols, K,
                                compute_tie_corr, stream);
 
-            cudaMemcpy2DAsync(d_rank_sums + (size_t)pack.first * n_cols + col,
-                              n_cols * sizeof(double), buf.d_rank_sums,
-                              sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), K,
-                              cudaMemcpyDeviceToDevice, stream);
+            scatter_cols_2d(d_rank_sums + (size_t)pack.first * n_cols + col,
+                            buf.d_rank_sums, K, n_cols, sb_cols, stream);
             if (compute_tie_corr) {
-                cudaMemcpy2DAsync(
-                    d_tie_corr + (size_t)pack.first * n_cols + col,
-                    n_cols * sizeof(double), buf.d_tie_corr,
-                    sb_cols * sizeof(double), sb_cols * sizeof(double), K,
-                    cudaMemcpyDeviceToDevice, stream);
+                scatter_cols_2d(d_tie_corr + (size_t)pack.first * n_cols + col,
+                                buf.d_tie_corr, K, n_cols, sb_cols, stream);
             }
 
             col += sb_cols;

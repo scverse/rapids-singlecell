@@ -153,12 +153,7 @@ __device__ __forceinline__ void compute_tie_correction_parallel(
     }
 
     double tie_sum = wilcoxon_block_sum(local_tie, warp_buf);
-    if (threadIdx.x == 0) {
-        int n = n_ref + n_grp;
-        double dn = (double)n;
-        double denom = dn * dn * dn - dn;
-        *out = (denom > 0.0) ? (1.0 - tie_sum / denom) : 1.0;
-    }
+    if (threadIdx.x == 0) *out = finalize_tie_corr(n_ref + n_grp, tie_sum);
 }
 
 // ============================================================================
@@ -383,14 +378,9 @@ __global__ void ovo_rank_small_kernel(
     __syncthreads();
 
     double tie_delta = wilcoxon_block_sum(local_tie_delta, warp_buf);
-    if (threadIdx.x == 0) {
-        int n = n_ref + n_grp;
-        double dn = (double)n;
-        double denom = dn * dn * dn - dn;
-        double tie_sum = ref_tie_sums[col] + tie_delta;
+    if (threadIdx.x == 0)
         tie_corr[grp * n_cols + col] =
-            (denom > 0.0) ? (1.0 - tie_sum / denom) : 1.0;
-    }
+            finalize_tie_corr(n_ref + n_grp, ref_tie_sums[col] + tie_delta);
 }
 
 // ============================================================================
@@ -473,14 +463,9 @@ __global__ void ovo_rank_medium_kernel(
     __syncthreads();
 
     double tie_delta = wilcoxon_block_sum(local_tie_delta, warp_buf);
-    if (threadIdx.x == 0) {
-        int n = n_ref + n_grp;
-        double dn = (double)n;
-        double denom = dn * dn * dn - dn;
-        double tie_sum = ref_tie_sums[col] + tie_delta;
+    if (threadIdx.x == 0)
         tie_corr[grp * n_cols + col] =
-            (denom > 0.0) ? (1.0 - tie_sum / denom) : 1.0;
-    }
+            finalize_tie_corr(n_ref + n_grp, ref_tie_sums[col] + tie_delta);
 }
 
 // ============================================================================
@@ -565,9 +550,7 @@ __device__ __forceinline__ double warp_tie_sum(const float* ref_col, int n_ref,
         }
     }
 
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        local_tie += __shfl_down_sync(0xffffffff, local_tie, off);
+    local_tie = warp_reduce_sum(local_tie);
     return local_tie;  // meaningful on lane 0.
 }
 
@@ -610,9 +593,7 @@ __device__ __forceinline__ double warp_tie_delta(const float* ref_col,
         }
     }
 
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        local_delta += __shfl_down_sync(0xffffffff, local_delta, off);
+    local_delta = warp_reduce_sum(local_delta);
     return local_delta;  // meaningful on lane 0.
 }
 
@@ -715,9 +696,7 @@ __global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
     }
 
     // Warp reduce.
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+    local_sum = warp_reduce_sum(local_sum);
     if (lane == 0) rank_sums[grp * n_cols + col] = local_sum;
 
     if (!compute_tie_corr) return;
@@ -729,11 +708,7 @@ __global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
     } else {
         tie_sum = warp_tie_sum(ref_col, n_ref, x, n_grp, active_mask);
     }
-    if (lane == 0) {
-        int n = n_ref + n_grp;
-        double dn = (double)n;
-        double denom = dn * dn * dn - dn;
+    if (lane == 0)
         tie_corr[grp * n_cols + col] =
-            (denom > 0.0) ? (1.0 - tie_sum / denom) : 1.0;
-    }
+            finalize_tie_corr(n_ref + n_grp, tie_sum);
 }

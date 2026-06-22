@@ -42,9 +42,7 @@ static void ovo_streaming_csr_impl(
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
-    int n_streams = N_STREAMS;
-    if (n_cols < n_streams * sub_batch_cols)
-        n_streams = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
 
     size_t sub_grp_items = (size_t)n_all_grp * sub_batch_cols;
 
@@ -265,9 +263,7 @@ static void ovo_streaming_csc_impl(
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
-    int n_streams = N_STREAMS;
-    if (n_cols < n_streams * sub_batch_cols)
-        n_streams = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
 
     size_t sub_ref_items = (size_t)n_ref * sub_batch_cols;
     size_t sub_grp_items = (size_t)n_all_grp * sub_batch_cols;

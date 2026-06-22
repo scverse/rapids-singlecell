@@ -31,9 +31,7 @@ static void ovr_sparse_csc_host_streaming_impl(
             [&](int c) { return (size_t)(h_indptr[c + 1] - h_indptr[c]); });
     }
 
-    int n_streams = N_STREAMS;
-    if (n_cols < n_streams * sub_batch_cols)
-        n_streams = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
 
     size_t max_nnz = 0;
     for (int col = 0; col < n_cols; col += sub_batch_cols) {
@@ -103,22 +101,9 @@ static void ovr_sparse_csc_host_streaming_impl(
     // Pre-compute rebased per-batch offsets and upload once (avoids per-batch
     // H2D copy from a transient host buffer).
     int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
-    std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
-    for (int b = 0; b < n_batches; b++) {
-        int col_start = b * sub_batch_cols;
-        int sb = std::min(sub_batch_cols, n_cols - col_start);
-        IndptrT ptr_start = h_indptr[col_start];
-        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
-        for (int i = 0; i <= sb; i++) {
-            off[i] =
-                checked_int_span((size_t)(h_indptr[col_start + i] - ptr_start),
-                                 "OVR host CSC rebased column offsets");
-        }
-    }
-    int* d_all_offsets =
-        pool.alloc<int>((size_t)n_batches * (sub_batch_cols + 1));
-    cudaMemcpy(d_all_offsets, h_all_offsets.data(),
-               h_all_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    int* d_all_offsets = precompute_csc_batch_offsets(
+        h_indptr, n_cols, sub_batch_cols, n_batches, pool,
+        "OVR host CSC rebased column offsets");
 
     int tpb = UTIL_BLOCK_SIZE;
     bool rank_use_gmem = false;
@@ -189,24 +174,18 @@ static void ovr_sparse_csc_host_streaming_impl(
             n_rows, sb_cols, n_groups, tpb, smem_bytes, compute_tie_corr,
             rank_use_gmem, stream);
 
-        cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
-                          buf.d_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(d_rank_sums + col, buf.d_rank_sums, n_groups, n_cols,
+                        sb_cols, stream);
         if (compute_tie_corr) {
             cudaMemcpyAsync(d_tie_corr + col, buf.d_tie_corr,
                             sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
                             stream);
         }
-        cudaMemcpy2DAsync(d_group_sums + col, n_cols * sizeof(double),
-                          buf.d_group_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(d_group_sums + col, buf.d_group_sums, n_groups, n_cols,
+                        sb_cols, stream);
         if (compute_nnz) {
-            cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
-                              buf.d_group_nnz, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups,
-                              cudaMemcpyDeviceToDevice, stream);
+            scatter_cols_2d(d_group_nnz + col, buf.d_group_nnz, n_groups,
+                            n_cols, sb_cols, stream);
         }
 
         col += sb_cols;
@@ -613,9 +592,8 @@ static void ovr_sparse_csr_host_streaming_impl(
     int n_streams = N_STREAMS;
     if (n_batches < n_streams) n_streams = n_batches;
     size_t stream_budget = budget - resident - (data_staged ? data_bytes : 0);
-    while (n_streams > 1 &&
-           (size_t)n_streams * per_stream_bytes > stream_budget)
-        n_streams--;
+    n_streams =
+        clamp_streams_by_budget(n_streams, per_stream_bytes, stream_budget);
 
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
@@ -730,24 +708,18 @@ static void ovr_sparse_csr_host_streaming_impl(
             buf.d_nz_scratch, n_rows, sb_cols, n_groups, tpb, smem_bytes,
             compute_tie_corr, rank_use_gmem, stream);
 
-        cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
-                          buf.sub_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(d_rank_sums + col, buf.sub_rank_sums, n_groups, n_cols,
+                        sb_cols, stream);
         if (compute_tie_corr) {
             cudaMemcpyAsync(d_tie_corr + col, buf.sub_tie_corr,
                             sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
                             stream);
         }
-        cudaMemcpy2DAsync(d_group_sums + col, n_cols * sizeof(double),
-                          buf.sub_group_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(d_group_sums + col, buf.sub_group_sums, n_groups,
+                        n_cols, sb_cols, stream);
         if (compute_nnz) {
-            cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
-                              buf.sub_group_nnz, sb_cols * sizeof(double),
-                              sb_cols * sizeof(double), n_groups,
-                              cudaMemcpyDeviceToDevice, stream);
+            scatter_cols_2d(d_group_nnz + col, buf.sub_group_nnz, n_groups,
+                            n_cols, sb_cols, stream);
         }
 
         col += sb_cols;
@@ -787,9 +759,7 @@ static void ovr_sparse_csc_streaming_impl(
             [&](int c) { return (size_t)(h_indptr[c + 1] - h_indptr[c]); });
     }
 
-    int n_streams = N_STREAMS;
-    if (n_cols < n_streams * sub_batch_cols)
-        n_streams = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
 
     size_t max_nnz = 0;
     for (int col = 0; col < n_cols; col += sub_batch_cols) {
@@ -879,10 +849,8 @@ static void ovr_sparse_csc_streaming_impl(
                                     sb_cols, n_groups, tpb, smem_bytes,
                                     compute_tie_corr, rank_use_gmem, stream);
 
-        cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
-                          buf.sub_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(rank_sums + col, buf.sub_rank_sums, n_groups, n_cols,
+                        sb_cols, stream);
         if (compute_tie_corr) {
             cudaMemcpyAsync(tie_corr + col, buf.sub_tie_corr,
                             sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
@@ -1002,8 +970,7 @@ static void ovr_sparse_csr_streaming_impl(
     }
 
     size_t budget = rmm_available_device_bytes(0.8);
-    while (n_streams > 1 && (size_t)n_streams * per_stream_bytes > budget)
-        n_streams--;
+    n_streams = clamp_streams_by_budget(n_streams, per_stream_bytes, budget);
 
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
@@ -1082,10 +1049,8 @@ static void ovr_sparse_csr_streaming_impl(
                                     sb_cols, n_groups, tpb, smem_bytes,
                                     compute_tie_corr, rank_use_gmem, stream);
 
-        cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
-                          buf.sub_rank_sums, sb_cols * sizeof(double),
-                          sb_cols * sizeof(double), n_groups,
-                          cudaMemcpyDeviceToDevice, stream);
+        scatter_cols_2d(rank_sums + col, buf.sub_rank_sums, n_groups, n_cols,
+                        sb_cols, stream);
         if (compute_tie_corr) {
             cudaMemcpyAsync(tie_corr + col, buf.sub_tie_corr,
                             sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,

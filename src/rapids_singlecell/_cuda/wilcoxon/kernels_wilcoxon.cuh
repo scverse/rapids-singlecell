@@ -58,10 +58,7 @@ __global__ void rank_sums_from_sorted_kernel(
         int warp_buf_off = use_gmem ? 0 : n_groups;
         double* warp_buf = smem + warp_buf_off;
         double tie_sum = wilcoxon_block_sum(local_tie_sum, warp_buf);
-        if (threadIdx.x == 0) {
-            double n = (double)n_rows;
-            double denom = n * n * n - n;
-            tie_corr[col] = (denom > 0.0) ? (1.0 - tie_sum / denom) : 1.0;
-        }
+        if (threadIdx.x == 0)
+            tie_corr[col] = finalize_tie_corr(n_rows, tie_sum);
     }
 }
