@@ -137,3 +137,72 @@ def test_wilcoxon_binned_dask_reference(client, data_kind):
     )
 
     _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
+
+
+@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+def test_wilcoxon_binned_dask_auto_range(client, data_kind):
+    """bin_range='auto' exercises the Dask _data_range branches (per-block
+    min/max via map_blocks), which the bin_range='log1p' tests never reach."""
+    adata, dask_data, groupby = _setup_data(data_kind)
+
+    for ad_ in (adata, dask_data):
+        rsc.tl.rank_genes_groups(
+            ad_,
+            groupby=groupby,
+            method="wilcoxon_binned",
+            n_bins=200,
+            bin_range="auto",
+            use_raw=False,
+        )
+
+    _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
+
+
+@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+def test_wilcoxon_binned_dask_reference_subset(client, data_kind):
+    """Dask + reference + groups-subset together (the has_unselected Dask
+    branch where unselected cells coexist with a reference group)."""
+    adata, dask_data, groupby = _setup_data(data_kind)
+    cats = [str(c) for c in adata.obs[groupby].cat.categories]
+    groups = cats[1:4]  # subset that excludes the reference -> unselected cells exist
+    reference = cats[0]
+
+    for ad_ in (adata, dask_data):
+        rsc.tl.rank_genes_groups(
+            ad_,
+            groupby=groupby,
+            method="wilcoxon_binned",
+            groups=groups,
+            reference=reference,
+            n_bins=1000,
+            bin_range="log1p",
+            use_raw=False,
+        )
+
+    _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
+
+
+def test_wilcoxon_binned_dask_negative_sparse_raises(client):
+    """Dask sparse input with a stored negative is refused (the binned histogram
+    cannot place implicit zeros correctly for signed data)."""
+    import anndata as ad_mod
+    import pandas as pd
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(0)
+    X = np.abs(rng.standard_normal((60, 8))).astype(np.float32)
+    X[X < 0.5] = 0.0
+    X[0, 0] = -1.0  # one stored negative
+    obs = pd.DataFrame({"g": pd.Categorical([f"{i % 3}" for i in range(60)])})
+    var = pd.DataFrame(index=[f"v{i}" for i in range(8)])
+    adata = ad_mod.AnnData(X=sp.csr_matrix(X), obs=obs, var=var)
+    adata.X = as_sparse_cupy_dask_array(adata.X).persist()
+
+    with pytest.raises(ValueError, match="negative values in Dask sparse"):
+        rsc.tl.rank_genes_groups(
+            adata,
+            groupby="g",
+            method="wilcoxon_binned",
+            bin_range="auto",
+            use_raw=False,
+        )
