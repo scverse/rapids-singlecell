@@ -12,7 +12,14 @@ import scipy.sparse as sp
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
 
-from ._utils import EPS, MIN_GROUP_SIZE_WARNING, _choose_chunk_size, _get_column_block
+from ._utils import (
+    EPS,
+    MIN_GROUP_SIZE_WARNING,
+    _choose_chunk_size,
+    _get_column_block,
+    _ovo_dense_block,
+    _ovr_dense_block_f32,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -32,7 +39,13 @@ DENSE_HOST_PRELOAD_MAX_GPU_FRACTION = 0.55  # leave headroom for rank buffers
 
 
 def _maybe_preload_host_dense(rg: _RankGenes) -> None:
-    """Preload moderate host-dense matrices to avoid repeated chunk transfers."""
+    """Preload a moderate host-dense matrix to the GPU (OVO only).
+
+    OVO caches the sorted reference group on the device and ranks every other
+    group against it, so staging the matrix on the GPU once is intended -- it
+    avoids re-streaming the shared reference per group. The OVR path instead
+    streams column chunks from host (see ``ovr_rank_dense_host_streaming``).
+    """
     X = rg.X
     if not isinstance(X, np.ndarray) or X.size == 0:
         return
@@ -70,38 +83,6 @@ def _maybe_preload_host_dense(rg: _RankGenes) -> None:
             except cp.cuda.runtime.CUDARuntimeError:
                 pass
     rg.X = X_gpu
-
-
-def _get_dense_column_block_f32(X, start: int, stop: int) -> cp.ndarray:
-    """Extract a dense column block as F-order float32 CuPy memory.
-
-    For sparse X (the negative-values dense fallback) the column window is
-    densified on the fly via the shared CSR/CSC densify path, so no full-matrix
-    dense materialization happens.
-    """
-    if isinstance(X, np.ndarray | cp.ndarray):
-        return cp.asarray(X[:, start:stop], dtype=cp.float32, order="F")
-    if sp.issparse(X) or cpsp.issparse(X):
-        block = _get_column_block(X, start, stop)  # float64 F-order chunk
-        return cp.asfortranarray(block.astype(cp.float32, copy=False))
-    raise TypeError(f"Expected dense matrix, got {type(X)}")
-
-
-def _extract_dense_rows_cols(
-    X, row_ids: np.ndarray, start: int, stop: int
-) -> cp.ndarray:
-    """Extract a bounded row/column block as F-order CuPy dense memory."""
-    if isinstance(X, np.ndarray):
-        return cp.asarray(X[row_ids, start:stop], order="F")
-    if isinstance(X, cp.ndarray):
-        rows = cp.asarray(row_ids, dtype=cp.int32)
-        return cp.asfortranarray(X[rows, start:stop])
-    if isinstance(X, sp.spmatrix | sp.sparray):
-        return cp.asarray(X[row_ids][:, start:stop].toarray(), order="F")
-    if cpsp.issparse(X):
-        rows = cp.asarray(row_ids, dtype=cp.int32)
-        return cp.asfortranarray(X[rows][:, start:stop].toarray())
-    raise TypeError(f"Unsupported matrix type: {type(X)}")
 
 
 def _choose_wilcoxon_chunk_size(requested: int | None, n_genes: int) -> int:
@@ -363,7 +344,7 @@ def _device_sparse_arrays_f32(X):
     """Cast device-sparse arrays for the Wilcoxon kernels.
 
     Wilcoxon ranking sorts float32 keys on every path -- the sparse fast paths
-    AND the dense fallback (``_get_dense_column_block_f32``); the CUB segmented
+    AND the dense fallback (``_ovr_dense_block_f32``); the CUB segmented
     sort is float-keyed throughout. Casting ``X.data`` to float32 here therefore
     does not diverge from any float64 ranking path, because there is none. This
     only loses precision when preprocessing ran in float64; float32-preprocessed
@@ -445,6 +426,9 @@ def _column_totals_for_host_matrix(
                 "Wilcoxon sparse input must be CSR or CSC; refusing hidden "
                 f"full-matrix conversion from {X.format!r}."
             )
+    elif isinstance(X, np.ndarray):
+        sums = X.sum(axis=0, dtype=np.float64)
+        nnz = (X != 0).sum(axis=0).astype(np.float64) if compute_nnz else None
     else:
         raise TypeError(f"Unsupported host matrix type: {type(X)}")
 
@@ -478,7 +462,10 @@ def wilcoxon(
     return_u_values: bool = False,
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Compute Wilcoxon rank-sum test statistics."""
-    _maybe_preload_host_dense(rg)
+    # OVO caches the reference on the GPU and ranks each group against it, so
+    # preloading host-dense input is intended. OVR streams chunks from host.
+    if rg.ireference is not None:
+        _maybe_preload_host_dense(rg)
     # Aggregate if on GPU, else defer to chunks.
     rg._basic_stats()
     X = rg.X
@@ -702,6 +689,76 @@ def _wilcoxon_vs_rest(
     group_sizes_dev = cp.asarray(group_sizes, dtype=cp.float64)
     rest_sizes = n_cells - group_sizes_dev
 
+    # Host dense: stream column chunks from host with the CSC-style pipeline
+    # (per-batch H2D overlapping the rank), instead of moving the whole array to
+    # the GPU. Ranking + group sums/nnz come back in one streamed pass.
+    if isinstance(X, np.ndarray):
+        # Only float32/float64 host bindings exist; cast int/bool/uint/float16
+        # to float32 (mirrors the sparse paths) rather than raising a TypeError.
+        if X.dtype.kind != "f" or X.dtype.itemsize < 4:
+            X = X.astype(np.float32)
+        if X.flags.f_contiguous:
+            buf, f_order = X.ravel(order="K"), True
+        elif X.flags.c_contiguous:
+            buf, f_order = X.ravel(order="K"), False
+        else:
+            buf, f_order = np.ascontiguousarray(X).ravel(order="K"), False
+        compute_nnz = rg.comp_pts
+        compute_stats = rg._compute_stats_in_chunks
+        rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
+        tie_corr = (
+            cp.empty(n_total_genes, dtype=cp.float64)
+            if tie_correct
+            else cp.ones(n_total_genes, dtype=cp.float64)
+        )
+        stats_shape = (n_groups, n_total_genes) if compute_stats else (1, 1)
+        group_sums = cp.empty(stats_shape, dtype=cp.float64)
+        group_nnz = cp.empty(
+            (n_groups, n_total_genes) if (compute_stats and compute_nnz) else (1, 1),
+            dtype=cp.float64,
+        )
+        _wc.ovr_rank_dense_host_streaming(
+            buf,
+            group_codes_gpu,
+            rank_sums,
+            tie_corr,
+            group_sums,
+            group_nnz,
+            n_rows=n_cells,
+            n_cols=n_total_genes,
+            n_groups=n_groups,
+            f_order=f_order,
+            compute_tie_corr=tie_correct,
+            compute_nnz=compute_stats and compute_nnz,
+            compute_stats=compute_stats,
+            sub_batch_cols=OVR_DENSE_SUB_BATCH,
+        )
+        if compute_stats:
+            total_sums, total_nnz = _host_ovr_totals_if_needed(
+                X, rg.group_codes, n_groups, compute_nnz=compute_nnz
+            )
+            _fill_basic_stats_from_accumulators(
+                rg,
+                group_sums,
+                group_nnz,
+                group_sizes,
+                n_cells=n_cells,
+                total_sums=total_sums,
+                total_nnz=total_nnz,
+            )
+        scores, p_values = _ovr_z_pvals(
+            rank_sums,
+            group_sizes_dev,
+            rest_sizes,
+            n_cells,
+            tie_corr,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
+        )
+        scores_host = scores.get()
+        p_host = p_values.get()
+        return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
+
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
 
     all_scores: dict[int, list] = {i: [] for i in range(n_groups)}
@@ -722,7 +779,7 @@ def _wilcoxon_vs_rest(
             )
             block_f32 = cp.asfortranarray(block.astype(cp.float32, copy=False))
         else:
-            block_f32 = _get_dense_column_block_f32(X, start, stop)
+            block_f32 = _ovr_dense_block_f32(X, start, stop)
 
         n_cols = stop - start
         rank_sums = cp.empty((n_groups, n_cols), dtype=cp.float64)
@@ -1059,8 +1116,8 @@ def _wilcoxon_with_reference(
         stop = min(start + chunk_width, n_total_genes)
         n_cols = stop - start
 
-        ref_block = _extract_dense_rows_cols(X, ref_row_ids, start, stop)
-        grp_block = _extract_dense_rows_cols(X, all_grp_row_ids, start, stop)
+        ref_block = _ovo_dense_block(X, ref_row_ids, start, stop)
+        grp_block = _ovo_dense_block(X, all_grp_row_ids, start, stop)
 
         _fill_ovo_chunk_stats(
             rg,

@@ -14,6 +14,7 @@
 
 #include "../nb_types.h"     // for CUDA_CHECK_LAST_ERROR
 #include "../rmm_scratch.h"  // rmm_allocate, RmmScratchPool, ScopedCudaBuffer
+#include "../sparse_extract/sparse_extract.cuh"  // csr_extract_dense* kernels
 
 // Host thread count for CPU-side CSR passes: hardware concurrency, capped.
 static inline int host_worker_count() {
@@ -286,14 +287,18 @@ struct HostRegisterGuard {
     void* ptr = nullptr;
 
     HostRegisterGuard() = default;
-    HostRegisterGuard(void* p, size_t bytes, unsigned int flags = 0) {
+    HostRegisterGuard(void* p, size_t bytes, unsigned int flags = 0,
+                      bool best_effort = false) {
         if (p && bytes > 0) {
             cudaError_t err = cudaHostRegister(p, bytes, flags);
             if (err != cudaSuccess) {
                 // Already-registered memory belongs to another owner; use it
                 // without unregistering here. Other failures mean mapped reads
-                // would be unsafe, so surface them immediately.
-                if (err == cudaErrorHostMemoryAlreadyRegistered) {
+                // would be unsafe, so surface them immediately -- unless the
+                // caller opts into best-effort pinning (the pin is only a
+                // transfer speedup; plain H2D still works unpinned).
+                if (err == cudaErrorHostMemoryAlreadyRegistered ||
+                    best_effort) {
                     cudaGetLastError();  // clear sticky error flag
                 } else {
                     throw std::runtime_error(
@@ -537,57 +542,4 @@ static inline void upload_linear_offsets(int* d_offsets, int n_segments,
     fill_linear_offsets_kernel<<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(
         d_offsets, n_segments, stride);
     CUDA_CHECK_LAST_ERROR(fill_linear_offsets_kernel);
-}
-
-// ============================================================================
-// CSR → dense F-order extraction (templated on data type)
-// ============================================================================
-
-template <typename T, typename IndptrT = int>
-__global__ void csr_extract_dense_kernel(const T* __restrict__ data,
-                                         const int* __restrict__ indices,
-                                         const IndptrT* __restrict__ indptr,
-                                         const int* __restrict__ row_ids,
-                                         T* __restrict__ out, int n_target,
-                                         int col_start, int col_stop) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_target) return;
-
-    int row = row_ids[tid];
-    IndptrT rs = indptr[row];
-    IndptrT re = indptr[row + 1];
-
-    IndptrT lo = rs, hi = re;
-    while (lo < hi) {
-        IndptrT m = lo + ((hi - lo) >> 1);
-        if (indices[m] < col_start)
-            lo = m + 1;
-        else
-            hi = m;
-    }
-
-    for (IndptrT p = lo; p < re; ++p) {
-        int c = indices[p];
-        if (c >= col_stop) break;
-        out[(long long)(c - col_start) * n_target + tid] = data[p];
-    }
-}
-
-template <typename T>
-__global__ void csr_extract_dense_identity_rows_unsorted_kernel(
-    const T* __restrict__ data, const int* __restrict__ indices,
-    const int* __restrict__ indptr, T* __restrict__ out, int n_target,
-    int col_start, int col_stop) {
-    int row = blockIdx.x;
-    if (row >= n_target) return;
-
-    int rs = indptr[row];
-    int re = indptr[row + 1];
-
-    for (int p = rs + threadIdx.x; p < re; p += blockDim.x) {
-        int c = indices[p];
-        if (c >= col_start && c < col_stop) {
-            out[(long long)(c - col_start) * n_target + row] = data[p];
-        }
-    }
 }

@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 
 #include "../nb_types.h"
-#include "csr_tile_to_dense.cuh"
+#include "../sparse_extract/sparse_extract.cuh"
 
 using namespace nb::literals;
 
@@ -103,6 +103,48 @@ static void def_csr_tile_to_dense(nb::module_& m) {
         "col_ub"_a, "stream"_a = 0);
 }
 
+// CSC -> dense F-order (double) window densify, fused pass (column-major).
+template <typename TData, typename IndptrT, typename IndexT, typename Device>
+static void def_csc_tile_to_dense(nb::module_& m) {
+    m.def(
+        "csc_tile_to_dense",
+        [](gpu_array_c<const IndptrT, Device> indptr,
+           gpu_array_c<const IndexT, Device> indices,
+           gpu_array_c<const TData, Device> data,
+           gpu_array_f<double, Device> out, int col_lb, int col_ub,
+           std::uintptr_t stream) {
+            const int n_cells = static_cast<int>(out.shape(0));
+            const int n_win = col_ub - col_lb;
+            if (n_cells <= 0 || n_win <= 0) {
+                return;
+            }
+            if (col_lb < 0) {
+                throw std::invalid_argument(
+                    "csc_tile_to_dense: col_lb must be non-negative");
+            }
+            if (indices.shape(0) != data.shape(0)) {
+                throw std::invalid_argument(
+                    "csc_tile_to_dense: indices and data must have equal "
+                    "length");
+            }
+            if (out.ndim() != 2 ||
+                static_cast<long long>(out.shape(1)) < n_win) {
+                throw std::invalid_argument(
+                    "csc_tile_to_dense: out must be a (n_cells, >= col_ub - "
+                    "col_lb) array");
+            }
+            constexpr int CSC_TILE_BLOCK = 128;
+            csc_tile_to_dense_kernel<TData, IndptrT, IndexT>
+                <<<static_cast<unsigned int>(n_win), CSC_TILE_BLOCK, 0,
+                   (cudaStream_t)stream>>>(indptr.data(), indices.data(),
+                                           data.data(), out.data(), col_lb,
+                                           col_ub, n_cells);
+            CUDA_CHECK_LAST_ERROR(csc_tile_to_dense_kernel);
+        },
+        "indptr"_a, "indices"_a, "data"_a, "out"_a, nb::kw_only(), "col_lb"_a,
+        "col_ub"_a, "stream"_a = 0);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
     def_csr_tile_to_dense<float, int, int, Device>(m);
@@ -113,6 +155,15 @@ void register_bindings(nb::module_& m) {
     def_csr_tile_to_dense<double, long long, int, Device>(m);
     def_csr_tile_to_dense<double, int, long long, Device>(m);
     def_csr_tile_to_dense<double, long long, long long, Device>(m);
+
+    def_csc_tile_to_dense<float, int, int, Device>(m);
+    def_csc_tile_to_dense<float, long long, int, Device>(m);
+    def_csc_tile_to_dense<float, int, long long, Device>(m);
+    def_csc_tile_to_dense<float, long long, long long, Device>(m);
+    def_csc_tile_to_dense<double, int, int, Device>(m);
+    def_csc_tile_to_dense<double, long long, int, Device>(m);
+    def_csc_tile_to_dense<double, int, long long, Device>(m);
+    def_csc_tile_to_dense<double, long long, long long, Device>(m);
 
     m.def(
         "fdr_bh_reverse_cummin",

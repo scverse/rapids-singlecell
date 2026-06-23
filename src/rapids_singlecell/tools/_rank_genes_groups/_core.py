@@ -46,7 +46,6 @@ class _RankGenes:
         use_raw: bool | None = None,
         layer: str | None = None,
         comp_pts: bool = False,
-        pre_load: bool = False,
         skip_empty_groups: bool = False,
     ) -> None:
         if groups == "all" or groups is None:
@@ -100,8 +99,6 @@ class _RankGenes:
         if mask_var is not None:
             self.X = self.X[:, mask_var]
             self.var_names = self.var_names[mask_var]
-
-        self.pre_load = pre_load
 
         self.ireference = None
         if reference != "rest":
@@ -391,7 +388,7 @@ class _RankGenes:
             # rank each stored nnz once, so they must see scanpy's summed view.
             self.X = _canonicalize_sparse(self.X)
             self._sparse_negative_fallback = _sparse_has_negative(self.X)
-        if self.pre_load or method in {
+        if method in {
             "t-test",
             "t-test_overestim_var",
             "wilcoxon_binned",

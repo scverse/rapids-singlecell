@@ -2,6 +2,8 @@
 
 #include <cub/device/device_segmented_radix_sort.cuh>
 
+#include "../sparse_extract/sparse_extract.cuh"
+
 /**
  * Build CUB segmented-sort ranges for HUGE-band groups. Ranges point into the
  * original dense group layout so the presorted rank kernel reads normal
@@ -21,32 +23,6 @@ __global__ void build_huge_seg_offsets_kernel(
     int base = c * n_all_grp;
     begins[idx] = base + grp_offsets[g];
     ends[idx] = base + grp_offsets[g + 1];
-}
-
-/**
- * Extract rows from CSC into dense F-order via a row lookup map.
- * row_map[original_row] = output_row_index (or -1 to skip).
- * One block per column. Output must be pre-zeroed.
- */
-template <typename IndexT = int, typename IndptrT = int>
-__global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
-                                          const IndexT* __restrict__ indices,
-                                          const IndptrT* __restrict__ indptr,
-                                          const int* __restrict__ row_map,
-                                          float* __restrict__ out, int n_target,
-                                          int col_start) {
-    int col_local = blockIdx.x;
-    int col = col_start + col_local;
-
-    IndptrT start = indptr[col];
-    IndptrT end = indptr[col + 1];
-
-    for (IndptrT p = start + threadIdx.x; p < end; p += blockDim.x) {
-        int out_row = row_map[(int)indices[p]];
-        if (out_row >= 0) {
-            out[(long long)col_local * n_target + out_row] = data[p];
-        }
-    }
 }
 
 /**

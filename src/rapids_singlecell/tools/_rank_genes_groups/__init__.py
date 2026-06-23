@@ -67,7 +67,6 @@ def rank_genes_groups(
     return_u_values: bool = False,
     layer: str | None = None,
     chunk_size: int | None = None,
-    pre_load: bool = False,
     n_bins: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
     skip_empty_groups: bool = False,
@@ -160,8 +159,6 @@ def rank_genes_groups(
         `'wilcoxon_binned'`. Default is 512 for `'wilcoxon'`. For
         `'wilcoxon_binned'` the default is sized dynamically based on
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
-    pre_load
-        Pre-load the data into GPU memory. Used only for `'wilcoxon'`.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000
@@ -268,7 +265,6 @@ def rank_genes_groups(
         use_raw=use_raw,
         layer=layer,
         comp_pts=pts,
-        pre_load=pre_load,
         skip_empty_groups=skip_empty_groups,
     )
 

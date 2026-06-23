@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "../nb_types.h"
@@ -120,6 +121,210 @@ static void launch_ovr_rank_dense_streaming(
     }
 
     sync_streams(streams, "dense OVR streaming rank");
+}
+
+// Host-streaming dense OVR: same multi-stream pipeline as the host-CSC path
+// (pinned host, round-robin streams, per-batch async H2D overlapping the rank)
+// feeding the dense sort+rank above. Both layouts read into an F-order device
+// block PER SUB-BATCH (the full array is never transposed): F-order is a
+// contiguous memcpy; C-order is a strided cudaMemcpy2DAsync of the sub-batch
+// tile then read into F-order. Input dtype is cast to float32 keys; group sums
+// (+ nnz) are accumulated in f64 from the native-dtype staging for means/pts.
+template <typename T>
+static void launch_ovr_rank_dense_host_streaming(
+    const T* h_X, bool f_order, const int* group_codes, double* rank_sums,
+    double* tie_corr, double* group_sums, double* group_nnz, int n_rows,
+    int n_cols, int n_groups, bool compute_tie_corr, bool compute_nnz,
+    int sub_batch_cols) {
+    if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
+    if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
+    const bool compute_stats = group_sums != nullptr;
+    compute_nnz = compute_nnz && (group_nnz != nullptr);
+    // F-order float32 input feeds the sort directly (no cast/transpose buffer).
+    const bool fast_keys = f_order && std::is_same<T, float>::value;
+
+    int n_streams = N_STREAMS;
+    if (n_cols < n_streams * sub_batch_cols) {
+        n_streams = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
+    }
+
+    size_t sub_items = (size_t)n_rows * sub_batch_cols;
+    int sub_items_i32 =
+        checked_cub_items(sub_items, "Dense host OVR sub-batch");
+    size_t cub_temp_bytes =
+        cub_segmented_sortpairs_temp_bytes(sub_items_i32, sub_batch_cols);
+
+    // Clamp the stream count to the device memory budget (like the sparse
+    // launchers) so a tall/wide host-dense matrix shrinks the pipeline rather
+    // than OOMing on unbounded per-stream sort scratch.
+    size_t per_stream_bytes =
+        sub_items * (sizeof(T) + (fast_keys ? 0 : sizeof(float)) +
+                     sizeof(float) + 2 * sizeof(int)) +
+        cub_temp_bytes + (size_t)(sub_batch_cols + 1) * sizeof(int) +
+        (size_t)n_groups * sub_batch_cols * sizeof(double) +
+        (size_t)sub_batch_cols * sizeof(double) +
+        (compute_stats ? (size_t)n_groups * sub_batch_cols * sizeof(double)
+                       : 0) +
+        (compute_nnz ? (size_t)n_groups * sub_batch_cols * sizeof(double) : 0);
+    n_streams = clamp_streams_by_budget(n_streams, per_stream_bytes,
+                                        rmm_available_device_bytes(0.8));
+
+    // pool first: streams drain before it frees their scratch (see guard doc).
+    RmmScratchPool pool;
+    // Best-effort pin of the host array for faster async H2D; on failure (pin
+    // caps / non-pinnable memory) proceed unpinned rather than raising.
+    HostRegisterGuard _pin(const_cast<T*>(h_X),
+                           (size_t)n_rows * n_cols * sizeof(T), 0,
+                           /*best_effort=*/true);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+
+    struct StreamBuf {
+        T* d_stg;
+        float* block_f32;
+        float* keys_out;
+        int* vals_in;
+        int* vals_out;
+        int* seg_offsets;
+        uint8_t* cub_temp;
+        double* sub_rank_sums;
+        double* sub_tie_corr;
+        double* sub_group_sums;
+        double* sub_group_nnz;
+    };
+    std::vector<StreamBuf> bufs(n_streams);
+    for (int s = 0; s < n_streams; ++s) {
+        bufs[s].d_stg = pool.alloc<T>(sub_items);
+        bufs[s].block_f32 = fast_keys ? nullptr : pool.alloc<float>(sub_items);
+        bufs[s].keys_out = pool.alloc<float>(sub_items);
+        bufs[s].vals_in = pool.alloc<int>(sub_items);
+        bufs[s].vals_out = pool.alloc<int>(sub_items);
+        bufs[s].seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
+        bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
+        bufs[s].sub_rank_sums =
+            pool.alloc<double>((size_t)n_groups * sub_batch_cols);
+        bufs[s].sub_tie_corr = pool.alloc<double>(sub_batch_cols);
+        bufs[s].sub_group_sums =
+            compute_stats
+                ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
+                : nullptr;
+        bufs[s].sub_group_nnz =
+            compute_nnz ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
+                        : nullptr;
+    }
+
+    int tpb_rank = round_up_to_warp(n_rows);
+    bool use_gmem = false;
+    size_t smem_rank = ovr_smem_config(n_groups, use_gmem);
+
+    cudaDeviceSynchronize();
+
+    int col = 0;
+    int batch_idx = 0;
+    while (col < n_cols) {
+        int sb_cols = std::min(sub_batch_cols, n_cols - col);
+        int sb_items = checked_int_product((size_t)n_rows, (size_t)sb_cols,
+                                           "Dense host OVR active sub-batch");
+        int s = batch_idx % n_streams;
+        cudaStream_t stream = streams[s];
+        auto& buf = bufs[s];
+
+        // H2D the column window on this stream (overlaps the prior batch rank).
+        if (f_order) {
+            cudaMemcpyAsync(buf.d_stg, h_X + (size_t)col * n_rows,
+                            (size_t)sb_items * sizeof(T),
+                            cudaMemcpyHostToDevice, stream);
+        } else {
+            cudaMemcpy2DAsync(buf.d_stg, (size_t)sb_cols * sizeof(T), h_X + col,
+                              (size_t)n_cols * sizeof(T),
+                              (size_t)sb_cols * sizeof(T), n_rows,
+                              cudaMemcpyHostToDevice, stream);
+        }
+
+        const float* keys_in;
+        if (fast_keys) {
+            keys_in = reinterpret_cast<const float*>(buf.d_stg);
+        } else {
+            // dense_block_to_f32_kernel is grid-stride, so a bounded grid
+            // covers any sb_items (up to INT_MAX) with no overflow in the
+            // launch math and enough blocks to saturate the device.
+            const unsigned int grid = (unsigned int)std::min<size_t>(
+                ((size_t)sb_items + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE,
+                65535u);
+            dense_block_to_f32_kernel<T><<<grid, UTIL_BLOCK_SIZE, 0, stream>>>(
+                buf.d_stg, buf.block_f32, n_rows, sb_cols, f_order);
+            CUDA_CHECK_LAST_ERROR(dense_block_to_f32_kernel);
+            keys_in = buf.block_f32;
+        }
+
+        upload_linear_offsets(buf.seg_offsets, sb_cols, n_rows, stream);
+        fill_row_indices_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+            buf.vals_in, n_rows, sb_cols);
+        CUDA_CHECK_LAST_ERROR(fill_row_indices_kernel);
+
+        cub_segmented_sortpairs(
+            buf.cub_temp, cub_temp_bytes, keys_in, buf.keys_out, buf.vals_in,
+            buf.vals_out, sb_items, sb_cols, buf.seg_offsets,
+            buf.seg_offsets + 1, stream, "dense host OVR segmented sort");
+
+        // gmem rank mode atomicAdds onto sub_rank_sums without self-zeroing,
+        // and the per-stream buffer is reused round-robin, so zero it first
+        // (the device-resident launcher does the same).
+        if (use_gmem) {
+            cuda_check(cudaMemsetAsync(
+                           buf.sub_rank_sums, 0,
+                           (size_t)n_groups * sb_cols * sizeof(double), stream),
+                       "dense host OVR gmem rank_sums memset");
+        }
+        rank_sums_from_sorted_kernel<<<sb_cols, tpb_rank, smem_rank, stream>>>(
+            buf.keys_out, buf.vals_out, group_codes, buf.sub_rank_sums,
+            buf.sub_tie_corr, n_rows, sb_cols, n_groups, compute_tie_corr,
+            use_gmem);
+        CUDA_CHECK_LAST_ERROR(rank_sums_from_sorted_kernel);
+
+        cuda_check(
+            cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
+                              buf.sub_rank_sums, sb_cols * sizeof(double),
+                              sb_cols * sizeof(double), n_groups,
+                              cudaMemcpyDeviceToDevice, stream),
+            "dense host OVR rank_sums D2D copy");
+        if (compute_tie_corr) {
+            cuda_check(cudaMemcpyAsync(tie_corr + col, buf.sub_tie_corr,
+                                       sb_cols * sizeof(double),
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "dense host OVR tie_corr D2D copy");
+        }
+
+        // Group sums (+ nnz) for means/pts, in f64 from the native-dtype
+        // staging (matches the Aggregate path); fed to
+        // _fill_basic_stats_from_accumulators like the host-CSC path.
+        if (compute_stats) {
+            cudaMemsetAsync(buf.sub_group_sums, 0,
+                            (size_t)n_groups * sb_cols * sizeof(double),
+                            stream);
+            if (compute_nnz) {
+                cudaMemsetAsync(buf.sub_group_nnz, 0,
+                                (size_t)n_groups * sb_cols * sizeof(double),
+                                stream);
+            }
+            dense_group_accumulate_kernel<T>
+                <<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+                    buf.d_stg, group_codes, buf.sub_group_sums,
+                    compute_nnz ? buf.sub_group_nnz : buf.sub_group_sums,
+                    n_rows, sb_cols, n_groups, f_order, compute_nnz);
+            CUDA_CHECK_LAST_ERROR(dense_group_accumulate_kernel);
+            scatter_cols_2d(group_sums + col, buf.sub_group_sums, n_groups,
+                            n_cols, sb_cols, stream);
+            if (compute_nnz) {
+                scatter_cols_2d(group_nnz + col, buf.sub_group_nnz, n_groups,
+                                n_cols, sb_cols, stream);
+            }
+        }
+
+        col += sb_cols;
+        ++batch_idx;
+    }
+
+    sync_streams(streams, "dense host OVR streaming");
 }
 
 static void launch_ovo_rank_dense_tiered_unsorted_ref(
@@ -288,9 +493,45 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
     sync_streams(streams, "dense OVO tiered rank");
 }
 
+template <typename T, typename Device>
+static void def_ovr_rank_dense_host_streaming(nb::module_& m) {
+    m.def(
+        "ovr_rank_dense_host_streaming",
+        [](host_array<const T> buf, gpu_array_c<const int, Device> group_codes,
+           gpu_array_c<double, Device> rank_sums,
+           gpu_array_c<double, Device> tie_corr,
+           gpu_array_c<double, Device> group_sums,
+           gpu_array_c<double, Device> group_nnz, int n_rows, int n_cols,
+           int n_groups, bool f_order, bool compute_tie_corr, bool compute_nnz,
+           bool compute_stats, int sub_batch_cols) {
+            nb_require(buf.shape(0) == (size_t)n_rows * (size_t)n_cols,
+                       "ovr_rank_host: buf length must be n_rows*n_cols");
+            nb_require((int)group_codes.shape(0) == n_rows,
+                       "ovr_rank_host: group_codes length must be n_rows");
+            nb_require(
+                (int)rank_sums.shape(0) == n_groups &&
+                    (int)rank_sums.shape(1) == n_cols,
+                "ovr_rank_host: rank_sums shape must be (n_groups, n_cols)");
+            nb_require((int)tie_corr.shape(0) == n_cols,
+                       "ovr_rank_host: tie_corr length must be n_cols");
+            launch_ovr_rank_dense_host_streaming<T>(
+                buf.data(), f_order, group_codes.data(), rank_sums.data(),
+                tie_corr.data(), compute_stats ? group_sums.data() : nullptr,
+                compute_nnz ? group_nnz.data() : nullptr, n_rows, n_cols,
+                n_groups, compute_tie_corr, compute_nnz, sub_batch_cols);
+        },
+        "buf"_a, "group_codes"_a, "rank_sums"_a, "tie_corr"_a, "group_sums"_a,
+        "group_nnz"_a, nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_groups"_a,
+        "f_order"_a, "compute_tie_corr"_a, "compute_nnz"_a, "compute_stats"_a,
+        "sub_batch_cols"_a = SUB_BATCH_COLS);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
     m.doc() = "CUDA kernels for Wilcoxon rank-sum test";
+
+    def_ovr_rank_dense_host_streaming<float, Device>(m);
+    def_ovr_rank_dense_host_streaming<double, Device>(m);
 
     m.def(
         "ovo_rank_dense_tiered_unsorted_ref",

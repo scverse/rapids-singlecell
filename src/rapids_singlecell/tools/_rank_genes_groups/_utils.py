@@ -7,8 +7,6 @@ import cupyx.scipy.sparse as cpsp
 import numpy as np
 import scipy.sparse as sp
 
-from rapids_singlecell.preprocessing._utils import _sparse_to_dense
-
 if TYPE_CHECKING:
     import pandas as pd
     from numpy.typing import NDArray
@@ -146,20 +144,31 @@ def _choose_chunk_size(requested: int | None) -> int:
 
 def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray:
     """
-    Extract columns from a CSC matrix via direct indptr pointer slicing.
+    Densify a CSC column window [start, stop) into an F-order float64 block via
+    the fused ``csc_tile_to_dense`` kernel (column-major, coalesced, no atomics).
 
-    Works for both scipy and CuPy CSC matrices. Much faster than
-    ``X[:, start:stop]`` which rebuilds index arrays internally.
+    Slices the window by indptr pointers so only that window's nonzeros are
+    touched (and, for host CSC, transferred). Works for scipy and CuPy CSC.
     """
+    from rapids_singlecell._cuda import _rank_stats_cuda as _rs
+
     s_ptr = int(X_csc.indptr[start])
     e_ptr = int(X_csc.indptr[stop])
-    chunk_data = cp.asarray(X_csc.data[s_ptr:e_ptr])
-    chunk_indices = cp.asarray(X_csc.indices[s_ptr:e_ptr])
-    chunk_indptr = cp.asarray(X_csc.indptr[start : stop + 1] - s_ptr)
-    csc_chunk = cpsp.csc_matrix(
-        (chunk_data, chunk_indices, chunk_indptr), shape=(n_rows, stop - start)
-    )
-    return _sparse_to_dense(csc_chunk, order="F").astype(cp.float64)
+    out = cp.zeros((n_rows, stop - start), dtype=cp.float64, order="F")
+    if e_ptr > s_ptr:
+        chunk_data = cp.asarray(X_csc.data[s_ptr:e_ptr])
+        chunk_indices = cp.asarray(X_csc.indices[s_ptr:e_ptr])
+        chunk_indptr = cp.asarray(X_csc.indptr[start : stop + 1] - s_ptr)
+        _rs.csc_tile_to_dense(
+            chunk_indptr,
+            chunk_indices,
+            chunk_data,
+            out,
+            col_lb=0,
+            col_ub=stop - start,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    return out
 
 
 def _csr_tile_to_dense_block(X, start: int, stop: int) -> cp.ndarray:
@@ -203,12 +212,48 @@ def _get_column_block(X, start: int, stop: int) -> cp.ndarray:
             return _csc_columns_to_gpu(X, start, stop, X.shape[0])
         case sp.spmatrix() | sp.sparray():
             chunk = cpsp.csc_matrix(X[:, start:stop].tocsc())
-            return _sparse_to_dense(chunk, order="F").astype(cp.float64)
+            return _csc_columns_to_gpu(chunk, 0, chunk.shape[1], X.shape[0])
         case cpsp.csc_matrix():
             return _csc_columns_to_gpu(X, start, stop, X.shape[0])
         case cpsp.spmatrix():
-            return _sparse_to_dense(X[:, start:stop], order="F").astype(cp.float64)
+            chunk = cpsp.csc_matrix(X[:, start:stop].tocsc())
+            return _csc_columns_to_gpu(chunk, 0, chunk.shape[1], X.shape[0])
         case np.ndarray() | cp.ndarray():
             return cp.asarray(X[:, start:stop], dtype=cp.float64, order="F")
         case _:
             raise ValueError(f"Unsupported matrix type: {type(X)}")
+
+
+def _ovr_dense_block_f32(X, start: int, stop: int) -> cp.ndarray:
+    """OVR (vs-rest): ALL cells x gene-window, F-order float32.
+
+    For sparse X (the negative-values dense fallback) the window is densified on
+    the fly via the shared CSR/CSC densify path (`_get_column_block`), so no
+    full-matrix dense materialization happens.
+    """
+    if isinstance(X, np.ndarray | cp.ndarray):
+        return cp.asarray(X[:, start:stop], dtype=cp.float32, order="F")
+    if sp.issparse(X) or cpsp.issparse(X):
+        block = _get_column_block(X, start, stop)  # float64 F-order chunk
+        return cp.asfortranarray(block.astype(cp.float32, copy=False))
+    raise TypeError(f"Expected dense matrix, got {type(X)}")
+
+
+def _ovo_dense_block(X, row_ids: np.ndarray, start: int, stop: int) -> cp.ndarray:
+    """OVO (with-reference): a ROW SUBSET (`row_ids`) x gene-window, F-order.
+
+    OVO ranks the reference group against each other group, so it materializes
+    only the selected rows -- unlike `_ovr_dense_block_f32`, which takes all
+    cells.
+    """
+    if isinstance(X, np.ndarray):
+        return cp.asarray(X[row_ids, start:stop], order="F")
+    if isinstance(X, cp.ndarray):
+        rows = cp.asarray(row_ids, dtype=cp.int32)
+        return cp.asfortranarray(X[rows, start:stop])
+    if isinstance(X, sp.spmatrix | sp.sparray):
+        return cp.asarray(X[row_ids][:, start:stop].toarray(), order="F")
+    if cpsp.issparse(X):
+        rows = cp.asarray(row_ids, dtype=cp.int32)
+        return cp.asfortranarray(X[rows][:, start:stop].toarray())
+    raise TypeError(f"Unsupported matrix type: {type(X)}")

@@ -670,8 +670,7 @@ def test_wilcoxon_ovo_host_csr_unsorted_indices_match_sorted():
         "cupy_csc",
     ],
 )
-@pytest.mark.parametrize("pre_load", [False, True])
-def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt, pre_load):
+def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=5, n_centers=3, n_observations=120)
     _make_nonnegative(adata_gpu)
@@ -687,7 +686,7 @@ def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt, pre_load):
         "tie_correct": True,
         "n_genes": 5,
     }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw, pre_load=pre_load)
+    rsc.tl.rank_genes_groups(adata_gpu, **kw)
     sc.tl.rank_genes_groups(adata_cpu, **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
@@ -834,6 +833,127 @@ def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
             )
 
 
+# Regression guard for the host-dense OVR streaming launcher: in gmem rank mode
+# the rank kernel atomicAdds onto its per-stream rank-sum buffer without
+# self-zeroing, and those buffers are reused round-robin -- so the launcher must
+# zero them per sub-batch. This only bites past the DENSE gmem flip
+# (n_groups > ~6112) AND with enough genes (> N_STREAMS*sub_batch_cols = 256)
+# that the per-stream buffers actually wrap; the formats-agree gmem test above
+# uses n_genes=6 (one batch, fresh buffer) and cannot see it. Compares the host
+# (numpy) dense path against the device (cupy) dense + sparse paths, which zero
+# the gmem buffer correctly.
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 6200 tiny groups warn
+def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
+    adata = _make_sized_groups_adata([2] * 6200, n_genes=400, seed=7)
+    ref = None
+    for fmt in ("cupy_dense", "numpy_dense", "cupy_csr"):
+        a = adata.copy()
+        a.X = _to_format(adata.X, fmt)
+        rsc.tl.rank_genes_groups(
+            a,
+            "group",
+            method="wilcoxon",
+            use_raw=False,
+            reference="rest",
+            tie_correct=True,
+        )
+        r = a.uns["rank_genes_groups"]
+        cur = {
+            field: np.vstack(
+                [np.asarray(r[field][n], dtype=float) for n in r[field].dtype.names]
+            )
+            for field in ("scores", "pvals")
+        }
+        if ref is None:
+            ref = cur
+            continue
+        for field in ("scores", "pvals"):
+            np.testing.assert_allclose(
+                cur[field], ref[field], rtol=1e-13, atol=1e-15, equal_nan=True
+            )
+
+
+# Host-dense OVR has only float32/float64 nanobind overloads; integer/bool/uint/
+# float16 numpy must be cast to float32 (mirrors the sparse path) rather than
+# raising a TypeError.
+@pytest.mark.parametrize(
+    "data_dtype", [np.int32, np.int64, np.uint16, np.float16, bool]
+)
+def test_wilcoxon_dense_nonfloat_data_matches_float32(data_dtype):
+    rng = np.random.default_rng(5)
+    n_obs, n_genes = 120, 8
+    counts = rng.integers(0, 5, size=(n_obs, n_genes))
+    if data_dtype is bool:
+        counts = counts > 2
+    typed = np.ascontiguousarray(counts.astype(data_dtype))
+    f32 = np.ascontiguousarray(counts.astype(np.float32))
+    labels = np.array([f"{i % 3}" for i in range(n_obs)])
+    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    var = pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])
+
+    def run(arr):
+        adata = sc.AnnData(X=arr, obs=obs.copy(), var=var.copy())
+        adata.uns["log1p"] = {"base": None}
+        rsc.tl.rank_genes_groups(
+            adata,
+            "group",
+            method="wilcoxon",
+            use_raw=False,
+            reference="rest",
+            tie_correct=True,
+            n_genes=n_genes,
+        )
+        return adata.uns["rank_genes_groups"]
+
+    r_typed = run(typed)
+    r_f32 = run(f32)
+    for grp in r_typed["scores"].dtype.names:
+        np.testing.assert_array_equal(
+            np.asarray(r_typed["scores"][grp], dtype=float),
+            np.asarray(r_f32["scores"][grp], dtype=float),
+        )
+
+
+# F-contiguous host-dense numpy hits the f_order=True branch of the host-
+# streaming launcher: float32 -> the reinterpret-cast fast path (no cast kernel),
+# float64 -> dense_block_to_f32_kernel's identity branch. Every numpy_dense
+# fixture elsewhere is C-order, so this is the only coverage of that branch.
+# AnnData preserves F-order, so an F-contiguous X reaches the path; result must
+# match the C-order run on identical data.
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
+    rng = np.random.default_rng(11)
+    X = np.abs(rng.standard_normal((300, 40))).astype(dtype)
+    X[X < 0.3] = 0.0
+    labels = rng.integers(0, 5, 300)
+    obs = pd.DataFrame({"group": pd.Categorical([f"g{c}" for c in labels])})
+    var = pd.DataFrame(index=[f"g{j}" for j in range(40)])
+
+    def run(arr):
+        adata = sc.AnnData(X=arr, obs=obs.copy(), var=var.copy())
+        adata.uns["log1p"] = {"base": None}
+        rsc.tl.rank_genes_groups(
+            adata,
+            "group",
+            method="wilcoxon",
+            use_raw=False,
+            reference="rest",
+            tie_correct=True,
+        )
+        return adata.uns["rank_genes_groups"]
+
+    xf = np.asfortranarray(X)
+    assert xf.flags.f_contiguous
+    r_f = run(xf)
+    r_c = run(np.ascontiguousarray(X))
+    for field in ("scores", "pvals", "logfoldchanges"):
+        for grp in r_f[field].dtype.names:
+            np.testing.assert_array_equal(
+                np.asarray(r_f[field][grp], dtype=float),
+                np.asarray(r_c[field][grp], dtype=float),
+            )
+
+
 # Regression guard for a shared-memory OOB write in the host sparse OVR
 # cast-and-accumulate kernel: it placed the per-group nnz accumulator at a fixed
 # 2*n_groups smem offset, but cast_accumulate_smem_config packs only the enabled
@@ -931,9 +1051,8 @@ def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
     ],
 )
 @pytest.mark.parametrize("tie_correct", [False, True])
-@pytest.mark.parametrize("pre_load", [False, True])
 def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(
-    groups, reference, tie_correct, pre_load
+    groups, reference, tie_correct
 ):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
@@ -948,7 +1067,6 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(
         reference=reference,
         use_raw=False,
         tie_correct=tie_correct,
-        pre_load=pre_load,
     )
     sc.tl.rank_genes_groups(
         adata_cpu,
@@ -1066,8 +1184,7 @@ def test_rank_genes_groups_wilcoxon_with_unsorted_groups(reference):
 
 
 @pytest.mark.parametrize("reference", ["rest", "1"])
-@pytest.mark.parametrize("pre_load", [True, False])
-def test_rank_genes_groups_wilcoxon_pts(reference, pre_load):
+def test_rank_genes_groups_wilcoxon_pts(reference):
     """Test that pts (fraction of cells expressing) is computed correctly."""
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
@@ -1084,7 +1201,6 @@ def test_rank_genes_groups_wilcoxon_pts(reference, pre_load):
         pts=True,
         tie_correct=False,
         reference=reference,
-        pre_load=pre_load,
     )
     sc.tl.rank_genes_groups(
         adata_cpu,

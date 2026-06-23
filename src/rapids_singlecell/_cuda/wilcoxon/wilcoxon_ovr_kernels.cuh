@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../sparse_extract/sparse_extract.cuh"
+
 /** Count nonzeros per column from CSR. One thread per row. */
 template <typename IndexT, typename IndptrT>
 __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
@@ -13,48 +15,6 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
     for (IndptrT p = rs; p < re; ++p) {
         int c = (int)indices[p];
         if (c >= 0 && c < n_cols) atomicAdd(&col_counts[c], 1u);
-    }
-}
-
-/**
- * Scatter CSR nonzeros into CSC layout for columns [col_start, col_stop).
- * write_pos[c - col_start] is the prefix-sum offset for column c; each thread
- * atomically claims a unique destination slot.
- *
- * PRECONDITION: each row's `indices` must be sorted ascending -- the binary
- * search for col_start and the `break` at col_stop depend on it; unsorted rows
- * would silently drop or misplace nonzeros. Python dispatch calls
- * `sort_indices()` before launching this kernel.
- *
- * `row_offset` is added to the local row index so a row-block rebased to a
- * local [0, n_rows) range still records the correct global row id (out-of-core
- * row-streaming OVR path). Defaults to 0 for full-matrix callers.
- */
-template <typename InT, typename IndexT, typename IndptrT>
-__global__ void csr_scatter_to_csc_kernel(
-    const InT* __restrict__ data, const IndexT* __restrict__ indices,
-    const IndptrT* __restrict__ indptr, int* __restrict__ write_pos,
-    InT* __restrict__ csc_vals, int* __restrict__ csc_row_idx, int n_rows,
-    int col_start, int col_stop, int row_offset = 0) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_rows) return;
-    IndptrT rs = indptr[row];
-    IndptrT re = indptr[row + 1];
-    // Binary search for col_start (overflow-safe midpoint)
-    IndptrT lo = rs, hi = re;
-    while (lo < hi) {
-        IndptrT m = lo + ((hi - lo) >> 1);
-        if (indices[m] < col_start)
-            lo = m + 1;
-        else
-            hi = m;
-    }
-    for (IndptrT p = lo; p < re; ++p) {
-        int c = (int)indices[p];
-        if (c >= col_stop) break;
-        int dest = atomicAdd(&write_pos[c - col_start], 1);
-        csc_vals[dest] = data[p];
-        csc_row_idx[dest] = row_offset + row;
     }
 }
 
@@ -111,5 +71,60 @@ __global__ void fill_row_indices_kernel(int* __restrict__ vals, int n_rows,
     int* out = vals + (long long)col * n_rows;
     for (int i = threadIdx.x; i < n_rows; i += blockDim.x) {
         out[i] = i;
+    }
+}
+
+/**
+ * Read one transferred dense column-batch (native dtype `T`) into float32 in
+ * F-order (column-major), the layout the segmented sort expects. Operates on a
+ * single sub-batch (n_rows x sb_cols) only -- the full array is never
+ * reordered/transposed.
+ *   f_order=true : staging is already F-order -> identity cast.
+ *   f_order=false: staging is C-order (n_rows x sb_cols, row-major); each
+ *                  element is read into its F-order slot while casting.
+ * Grid-stride over n_rows*sb_cols elements.
+ */
+template <typename T>
+__global__ void dense_block_to_f32_kernel(const T* __restrict__ stg,
+                                          float* __restrict__ out, int n_rows,
+                                          int sb_cols, bool f_order) {
+    const long long total = (long long)n_rows * sb_cols;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += stride) {
+        if (f_order) {
+            out[idx] = (float)stg[idx];
+        } else {
+            int col = (int)(idx / n_rows);
+            int row = (int)(idx % n_rows);
+            out[idx] = (float)stg[(long long)row * sb_cols + col];
+        }
+    }
+}
+
+/**
+ * Accumulate per-(group, column) sums (+ optional nnz) from a transferred dense
+ * column-batch, reading the NATIVE dtype staging in f64 so means match the
+ * Aggregate path (the f32 cast is only for ranking). One block per column.
+ * `group_sums`/`group_nnz` are this batch's (n_groups x sb_cols) buffers and
+ * must be pre-zeroed. Mirrors the sparse cast+accumulate the CSC host path
+ * runs.
+ */
+template <typename T>
+__global__ void dense_group_accumulate_kernel(
+    const T* __restrict__ stg, const int* __restrict__ group_codes,
+    double* __restrict__ group_sums, double* __restrict__ group_nnz, int n_rows,
+    int sb_cols, int n_groups, bool f_order, bool compute_nnz) {
+    int col = blockIdx.x;
+    if (col >= sb_cols) return;
+    for (int row = threadIdx.x; row < n_rows; row += blockDim.x) {
+        int g = group_codes[row];
+        if (g < 0 || g >= n_groups) continue;
+        double v = f_order ? (double)stg[(long long)col * n_rows + row]
+                           : (double)stg[(long long)row * sb_cols + col];
+        atomicAdd(&group_sums[(long long)g * sb_cols + col], v);
+        if (compute_nnz && v != 0.0) {
+            atomicAdd(&group_nnz[(long long)g * sb_cols + col], 1.0);
+        }
     }
 }
