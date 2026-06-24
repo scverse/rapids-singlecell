@@ -115,9 +115,9 @@ __global__ void csc_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
 // CSR selected rows -> dense F-order. row_ids[tid] = source row; output column
 // is (col - col_start), output row is tid. Requires sorted indices (binary
 // search + break). Output must be pre-zeroed.
-template <typename T, typename IndptrT = int>
+template <typename T, typename IndexT = int, typename IndptrT = int>
 __global__ void csr_extract_dense_kernel(const T* __restrict__ data,
-                                         const int* __restrict__ indices,
+                                         const IndexT* __restrict__ indices,
                                          const IndptrT* __restrict__ indptr,
                                          const int* __restrict__ row_ids,
                                          T* __restrict__ out, int n_target,
@@ -190,4 +190,14 @@ __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
             out[(long long)col_local * n_target + out_row] = data[p];
         }
     }
+}
+
+// Narrowing element-wise cast (e.g. int64 row indices -> int32 sort values).
+// Used only when the input index width exceeds int32; the caller guarantees the
+// values fit the destination type (row/col positions < 2^31).
+template <typename SrcT, typename DstT>
+__global__ void cast_array_kernel(const SrcT* __restrict__ src,
+                                  DstT* __restrict__ dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (DstT)src[i];
 }

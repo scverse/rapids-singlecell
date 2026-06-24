@@ -369,19 +369,34 @@ def _device_sparse_arrays_f32(X):
         raise TypeError(msg)
 
     data = X.data.astype(cp.float32, copy=False)
-    # Row/column indices fit int32 (cells and genes are < 2^31); indptr
-    # (cumulative nnz) may need int64, which the *_i64 device kernels handle.
-    indices = X.indices.astype(cp.int32, copy=False)
-    if X.indptr.dtype == cp.int64:
-        indptr = X.indptr
+    # Pass int64 indices natively to the *_idx64 kernels rather than a full nnz
+    # int32 copy (indices are only int64 when nnz > 2^31). int64 indices imply
+    # an int64 indptr, which those kernels require -- promote the (tiny) indptr
+    # if a hand-built matrix left it int32. Index values always fit int32; the
+    # CSC kernels downcast per-batch on-device where it's the sort value.
+    if X.indices.dtype == cp.int64:
+        indices = X.indices
+        indptr = (
+            X.indptr
+            if X.indptr.dtype == cp.int64
+            else X.indptr.astype(cp.int64, copy=False)
+        )
     else:
-        indptr = X.indptr.astype(cp.int32, copy=False)
+        indices = X.indices.astype(cp.int32, copy=False)
+        indptr = (
+            X.indptr
+            if X.indptr.dtype == cp.int64
+            else X.indptr.astype(cp.int32, copy=False)
+        )
     return data, indices, indptr
 
 
-def _device_sparse_fn(module, base_name: str, indptr: cp.ndarray):
-    """Select the device kernel binding, using the int64-indptr variant if needed."""
-    suffix = "_i64" if indptr.dtype == cp.int64 else ""
+def _device_sparse_fn(module, base_name: str, indptr: cp.ndarray, indices: cp.ndarray):
+    """Select the device kernel binding (int64 indptr / int64 indices variants)."""
+    if indptr.dtype == cp.int64:
+        suffix = "_i64_idx64" if indices.dtype == cp.int64 else "_i64"
+    else:
+        suffix = ""
     return getattr(module, base_name + suffix)
 
 
@@ -636,7 +651,7 @@ def _wilcoxon_vs_rest(
         rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
         tie_corr = cp.ones(n_total_genes, dtype=cp.float64)
         if cpsp.isspmatrix_csc(X):
-            _device_sparse_fn(_wcs, "ovr_sparse_csc_device", indptr)(
+            _device_sparse_fn(_wcs, "ovr_sparse_csc_device", indptr, indices)(
                 data,
                 indices,
                 indptr,
@@ -656,7 +671,7 @@ def _wilcoxon_vs_rest(
                 sparse_X = sparse_X.copy()
                 sparse_X.sort_indices()
                 data, indices, indptr = _device_sparse_arrays_f32(sparse_X)
-            _device_sparse_fn(_wcs, "ovr_sparse_csr_device", indptr)(
+            _device_sparse_fn(_wcs, "ovr_sparse_csr_device", indptr, indices)(
                 data,
                 indices,
                 indptr,
@@ -1049,7 +1064,7 @@ def _wilcoxon_with_reference(
             ref_row_map[ref_row_ids] = np.arange(n_ref, dtype=np.int32)
             grp_row_map = np.full(X.shape[0], -1, dtype=np.int32)
             grp_row_map[all_grp_row_ids] = np.arange(n_all_grp, dtype=np.int32)
-            _device_sparse_fn(_wcs, "ovo_streaming_csc_device", indptr)(
+            _device_sparse_fn(_wcs, "ovo_streaming_csc_device", indptr, indices)(
                 data,
                 indices,
                 indptr,
@@ -1066,7 +1081,7 @@ def _wilcoxon_with_reference(
                 sub_batch_cols=OVO_DEVICE_SPARSE_SUB_BATCH,
             )
         else:
-            _device_sparse_fn(_wcs, "ovo_streaming_csr_device", indptr)(
+            _device_sparse_fn(_wcs, "ovo_streaming_csr_device", indptr, indices)(
                 data,
                 indices,
                 indptr,

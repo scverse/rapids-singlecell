@@ -44,8 +44,8 @@ static void ovr_sparse_csc_host_streaming_impl(
     if (max_nnz > 0) {
         int max_nnz_i32 =
             checked_cub_items(max_nnz, "OVR host CSC sparse sub-batch nnz");
-        cub_temp_bytes = cub_segmented_sortpairs_temp_bytes<IndexT>(
-            max_nnz_i32, sub_batch_cols);
+        cub_temp_bytes =
+            cub_segmented_sortpairs_temp_bytes(max_nnz_i32, sub_batch_cols);
     }
 
     // pool first: streams drain before it frees their scratch (see guard doc).
@@ -64,9 +64,10 @@ static void ovr_sparse_csc_host_streaming_impl(
         InT* d_sparse_data_orig;
         float* d_sparse_data_f32;
         IndexT* d_sparse_indices;
+        int* idx_i32;  // int32 sort-val scratch; only used when IndexT != int
         int* d_seg_offsets;
         float* keys_out;
-        IndexT* vals_out;
+        int* vals_out;
         uint8_t* cub_temp;
         double* d_rank_sums;
         double* d_tie_corr;
@@ -79,9 +80,11 @@ static void ovr_sparse_csc_host_streaming_impl(
         bufs[s].d_sparse_data_orig = pool.alloc<InT>(max_nnz);
         bufs[s].d_sparse_data_f32 = pool.alloc<float>(max_nnz);
         bufs[s].d_sparse_indices = pool.alloc<IndexT>(max_nnz);
+        bufs[s].idx_i32 =
+            (sizeof(IndexT) > sizeof(int)) ? pool.alloc<int>(max_nnz) : nullptr;
         bufs[s].d_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
         bufs[s].keys_out = pool.alloc<float>(max_nnz);
-        bufs[s].vals_out = pool.alloc<IndexT>(max_nnz);
+        bufs[s].vals_out = pool.alloc<int>(max_nnz);
         bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
         bufs[s].d_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
@@ -148,27 +151,42 @@ static void ovr_sparse_csc_host_streaming_impl(
                             cudaMemcpyHostToDevice, stream);
         }
 
+        // Row indices are the sort values; downcast int64 -> int32 at the
+        // device boundary (values < n_rows < 2^31) so sort + rank stay int32.
+        int* idx32;
+        if constexpr (sizeof(IndexT) > sizeof(int)) {
+            if (batch_nnz > 0) {
+                int cblk = (batch_nnz + tpb - 1) / tpb;
+                cast_array_kernel<IndexT, int><<<cblk, tpb, 0, stream>>>(
+                    buf.d_sparse_indices, buf.idx_i32, (size_t)batch_nnz);
+                CUDA_CHECK_LAST_ERROR(cast_array_kernel);
+            }
+            idx32 = buf.idx_i32;
+        } else {
+            idx32 = buf.d_sparse_indices;
+        }
+
         int* src = d_all_offsets + (size_t)batch_idx * (sub_batch_cols + 1);
         cudaMemcpyAsync(buf.d_seg_offsets, src, (sb_cols + 1) * sizeof(int),
                         cudaMemcpyDeviceToDevice, stream);
 
         // Cast to float32 for sort + accumulate stats in float64
-        launch_ovr_cast_and_accumulate_sparse<InT, IndexT>(
-            buf.d_sparse_data_orig, buf.d_sparse_data_f32, buf.d_sparse_indices,
+        launch_ovr_cast_and_accumulate_sparse<InT>(
+            buf.d_sparse_data_orig, buf.d_sparse_data_f32, idx32,
             buf.d_seg_offsets, d_group_codes, buf.d_group_sums, buf.d_group_nnz,
             sb_cols, n_groups, compute_nnz, tpb, smem_cast, cast_use_gmem,
             stream);
 
         // Sort only stored nonzeros (float32 keys)
         if (batch_nnz > 0) {
-            cub_segmented_sortpairs(
-                buf.cub_temp, cub_temp_bytes, buf.d_sparse_data_f32,
-                buf.keys_out, buf.d_sparse_indices, buf.vals_out, batch_nnz,
-                sb_cols, buf.d_seg_offsets, buf.d_seg_offsets + 1, stream,
-                "host CSC OVR segmented sort");
+            cub_segmented_sortpairs(buf.cub_temp, cub_temp_bytes,
+                                    buf.d_sparse_data_f32, buf.keys_out, idx32,
+                                    buf.vals_out, batch_nnz, sb_cols,
+                                    buf.d_seg_offsets, buf.d_seg_offsets + 1,
+                                    stream, "host CSC OVR segmented sort");
         }
 
-        launch_ovr_sparse_rank<IndexT>(
+        launch_ovr_sparse_rank<int>(
             buf.keys_out, buf.vals_out, buf.d_seg_offsets, d_group_codes,
             d_group_sizes, buf.d_rank_sums, buf.d_tie_corr, buf.d_nz_scratch,
             n_rows, sb_cols, n_groups, tpb, smem_bytes, compute_tie_corr,
@@ -732,9 +750,9 @@ static void ovr_sparse_csr_host_streaming_impl(
 // Sparse-aware CSC OVR streaming (sort only stored nonzeros)
 // ============================================================================
 
-template <typename IndptrT = int>
+template <typename IndexT = int, typename IndptrT = int>
 static void ovr_sparse_csc_streaming_impl(
-    const float* csc_data, const int* csc_indices, const IndptrT* csc_indptr,
+    const float* csc_data, const IndexT* csc_indices, const IndptrT* csc_indptr,
     const int* group_codes, const double* group_sizes, double* rank_sums,
     double* tie_corr, int n_rows, int n_cols, int n_groups,
     bool compute_tie_corr, int sub_batch_cols) {
@@ -787,6 +805,7 @@ static void ovr_sparse_csc_streaming_impl(
     struct StreamBuf {
         float* keys_out;
         int* vals_out;
+        int* idx_i32;  // int32 sort-val scratch; only used when IndexT != int
         int* seg_offsets;
         uint8_t* cub_temp;
         double* sub_rank_sums;
@@ -797,6 +816,8 @@ static void ovr_sparse_csc_streaming_impl(
     for (int s = 0; s < n_streams; s++) {
         bufs[s].keys_out = pool.alloc<float>(max_nnz);
         bufs[s].vals_out = pool.alloc<int>(max_nnz);
+        bufs[s].idx_i32 =
+            (sizeof(IndexT) > sizeof(int)) ? pool.alloc<int>(max_nnz) : nullptr;
         bufs[s].seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
         bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
         bufs[s].sub_rank_sums =
@@ -833,13 +854,27 @@ static void ovr_sparse_csc_streaming_impl(
             CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
         }
 
-        // Sort only stored values (keys=data, vals=row_indices)
+        // Sort only stored values (keys=data, vals=row_indices). Row indices
+        // always fit int32 (n_rows < 2^31); downcast int64 input here so the
+        // sort + rank stay int32 (half the val buffer) -- the device boundary.
         if (batch_nnz > 0) {
-            cub_segmented_sortpairs(
-                buf.cub_temp, cub_temp_bytes, csc_data + ptr_start,
-                buf.keys_out, csc_indices + ptr_start, buf.vals_out, batch_nnz,
-                sb_cols, buf.seg_offsets, buf.seg_offsets + 1, stream,
-                "device CSC OVR segmented sort");
+            const int* idx_src;
+            if constexpr (sizeof(IndexT) > sizeof(int)) {
+                int cblk = (batch_nnz + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
+                cast_array_kernel<IndexT, int>
+                    <<<cblk, UTIL_BLOCK_SIZE, 0, stream>>>(
+                        csc_indices + ptr_start, buf.idx_i32,
+                        (size_t)batch_nnz);
+                CUDA_CHECK_LAST_ERROR(cast_array_kernel);
+                idx_src = buf.idx_i32;
+            } else {
+                idx_src = csc_indices + ptr_start;
+            }
+            cub_segmented_sortpairs(buf.cub_temp, cub_temp_bytes,
+                                    csc_data + ptr_start, buf.keys_out, idx_src,
+                                    buf.vals_out, batch_nnz, sb_cols,
+                                    buf.seg_offsets, buf.seg_offsets + 1,
+                                    stream, "device CSC OVR segmented sort");
         }
 
         // Sparse rank kernel (handles implicit zeros analytically)
@@ -879,9 +914,9 @@ static void ovr_sparse_csc_streaming_impl(
  *
  * Compared to the dense CSR path, sort work drops by ~1/sparsity.
  */
-template <typename IndptrT = int>
+template <typename IndexT = int, typename IndptrT = int>
 static void ovr_sparse_csr_streaming_impl(
-    const float* csr_data, const int* csr_indices, const IndptrT* csr_indptr,
+    const float* csr_data, const IndexT* csr_indices, const IndptrT* csr_indptr,
     const int* group_codes, const double* group_sizes, double* rank_sums,
     double* tie_corr, int n_rows, int n_cols, int n_groups,
     bool compute_tie_corr, int sub_batch_cols) {

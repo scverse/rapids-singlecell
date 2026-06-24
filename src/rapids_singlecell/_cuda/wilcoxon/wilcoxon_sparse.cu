@@ -19,11 +19,11 @@ template <typename Device>
 void register_sparse_bindings(nb::module_& m) {
     m.doc() = "Sparse-native host Wilcoxon CUDA kernels";
 
-#define RSC_OVR_SPARSE_DEVICE_BINDING(NAME, IMPL, IndptrCType)                \
+#define RSC_OVR_SPARSE_DEVICE_BINDING(NAME, IMPL, IndexCType, IndptrCType)    \
     m.def(                                                                    \
         NAME,                                                                 \
         [](gpu_array_c<const float, Device> data,                             \
-           gpu_array_c<const int, Device> indices,                            \
+           gpu_array_c<const IndexCType, Device> indices,                     \
            gpu_array_c<const IndptrCType, Device> indptr,                     \
            gpu_array_c<const int, Device> group_codes,                        \
            gpu_array_c<const double, Device> group_sizes,                     \
@@ -42,13 +42,19 @@ void register_sparse_bindings(nb::module_& m) {
         "sub_batch_cols"_a = SUB_BATCH_COLS)
 
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device",
-                                  ovr_sparse_csc_streaming_impl, int);
+                                  ovr_sparse_csc_streaming_impl, int, int);
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device_i64",
-                                  ovr_sparse_csc_streaming_impl, int64_t);
+                                  ovr_sparse_csc_streaming_impl, int, int64_t);
+    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device_i64_idx64",
+                                  ovr_sparse_csc_streaming_impl, int64_t,
+                                  int64_t);
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device",
-                                  ovr_sparse_csr_streaming_impl, int);
+                                  ovr_sparse_csr_streaming_impl, int, int);
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device_i64",
-                                  ovr_sparse_csr_streaming_impl, int64_t);
+                                  ovr_sparse_csr_streaming_impl, int, int64_t);
+    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device_i64_idx64",
+                                  ovr_sparse_csr_streaming_impl, int64_t,
+                                  int64_t);
 #undef RSC_OVR_SPARSE_DEVICE_BINDING
 
 #define RSC_OVR_SPARSE_CSC_HOST_BINDING(NAME, InT, IndexT, IndptrT)           \
@@ -85,6 +91,12 @@ void register_sparse_bindings(nb::module_& m) {
                                     int);
     RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_f64_i64", double, int,
                                     int64_t);
+    // int64 row indices (int64 indptr): pass indices natively, downcast to
+    // int32 per-batch on-device rather than a full host int32 copy.
+    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_i64_idx64", float,
+                                    int64_t, int64_t);
+    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_f64_i64_idx64", double,
+                                    int64_t, int64_t);
 #undef RSC_OVR_SPARSE_CSC_HOST_BINDING
 
 #define RSC_OVR_SPARSE_CSR_HOST_BINDING(NAME, InT, IndexT, IndptrT)           \
@@ -129,11 +141,11 @@ void register_sparse_bindings(nb::module_& m) {
                                     int64_t, int64_t);
 #undef RSC_OVR_SPARSE_CSR_HOST_BINDING
 
-#define RSC_OVO_DEVICE_BINDING(NAME, IMPL, IndptrCType)                       \
+#define RSC_OVO_DEVICE_BINDING(NAME, IMPL, IndexCType, IndptrCType)           \
     m.def(                                                                    \
         NAME,                                                                 \
         [](gpu_array_c<const float, Device> data,                             \
-           gpu_array_c<const int, Device> indices,                            \
+           gpu_array_c<const IndexCType, Device> indices,                     \
            gpu_array_c<const IndptrCType, Device> indptr,                     \
            gpu_array_c<const int, Device> ref_rows,                           \
            gpu_array_c<const int, Device> grp_rows,                           \
@@ -154,13 +166,17 @@ void register_sparse_bindings(nb::module_& m) {
         "compute_tie_corr"_a, "sub_batch_cols"_a = SUB_BATCH_COLS)
 
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device", ovo_streaming_csc_impl,
-                           int);
+                           int, int);
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device_i64",
-                           ovo_streaming_csc_impl, int64_t);
+                           ovo_streaming_csc_impl, int, int64_t);
+    RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device_i64_idx64",
+                           ovo_streaming_csc_impl, int64_t, int64_t);
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device", ovo_streaming_csr_impl,
-                           int);
+                           int, int);
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device_i64",
-                           ovo_streaming_csr_impl, int64_t);
+                           ovo_streaming_csr_impl, int, int64_t);
+    RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device_i64_idx64",
+                           ovo_streaming_csr_impl, int64_t, int64_t);
 #undef RSC_OVO_DEVICE_BINDING
 
 #define RSC_OVO_CSC_HOST_BINDING(NAME, InT, IndexT, IndptrT)                  \
@@ -200,6 +216,12 @@ void register_sparse_bindings(nb::module_& m) {
     RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_f64", double, int, int);
     RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_f64_i64", double, int,
                              int64_t);
+    // int64 row indices: read natively (extraction only, never sorted) to skip
+    // the full host int32 copy.
+    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_i64_idx64", float, int64_t,
+                             int64_t);
+    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_f64_i64_idx64", double,
+                             int64_t, int64_t);
 #undef RSC_OVO_CSC_HOST_BINDING
 
 #define RSC_OVO_CSR_HOST_BINDING(NAME, InT, IndexT, IndptrT)                   \
