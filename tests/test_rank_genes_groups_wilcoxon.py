@@ -720,15 +720,15 @@ def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
     return adata
 
 
-# Tier thresholds (wilcoxon_fast_common.cuh): tier0<=32, tier0_64<=64,
-# tier2<=512, tier1(fused smem sort)<=2500, tier3(CUB segmented sort)>2500.
-# Group sizes in the standard blobs datasets are <=~70, so tier1/tier3 are
-# otherwise never exercised. These force a single large test group.
+# OVO tiers (wilcoxon_fast_common.cuh): MEDIUM<=512, LARGE(fused smem sort)<=2500,
+# HUGE(CUB segmented sort)>2500. Group sizes in the standard blobs datasets are
+# <=~70 (all MEDIUM), so LARGE/HUGE are otherwise never exercised. These force a
+# single large test group.
 @pytest.mark.parametrize(
     "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
 )
 @pytest.mark.parametrize("tie_correct", [False, True])
-@pytest.mark.parametrize("big", [700, 3000], ids=["tier1_fused", "tier3_cub"])
+@pytest.mark.parametrize("big", [700, 3000], ids=["large_fused", "huge_cub"])
 def test_wilcoxon_ovo_large_group_tiers_match_scanpy(fmt, tie_correct, big):
     # g0 = reference, g1 = the large test group that drives tier selection.
     adata_gpu = _make_sized_groups_adata([60, big, 45], n_genes=6, seed=1)
@@ -741,40 +741,6 @@ def test_wilcoxon_ovo_large_group_tiers_match_scanpy(fmt, tie_correct, big):
         "use_raw": False,
         "reference": "g0",
         "tie_correct": tie_correct,
-        "n_genes": 6,
-    }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
-
-    gpu = adata_gpu.uns["rank_genes_groups"]
-    cpu = adata_cpu.uns["rank_genes_groups"]
-    for field in ("scores", "pvals"):
-        for group in gpu[field].dtype.names:
-            np.testing.assert_allclose(
-                np.asarray(gpu[field][group], dtype=float),
-                np.asarray(cpu[field][group], dtype=float),
-                rtol=1e-13,
-                atol=1e-15,
-                equal_nan=True,
-            )
-
-
-@pytest.mark.parametrize(
-    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
-)
-def test_wilcoxon_ovo_mixed_tier_sizes_match_scanpy(fmt):
-    # Groups spanning tier0 (20), tier0_64 (50) and tier2 (300) co-launched with
-    # tie_correct=True, pinning the skip_le boundaries and the ref_tie_sums gate.
-    adata_gpu = _make_sized_groups_adata([80, 20, 50, 300], n_genes=6, seed=2)
-    adata_cpu = adata_gpu.copy()
-    adata_gpu.X = _to_format(adata_gpu.X, fmt)
-
-    kw = {
-        "groupby": "group",
-        "method": "wilcoxon",
-        "use_raw": False,
-        "reference": "g0",
-        "tie_correct": True,
         "n_genes": 6,
     }
     rsc.tl.rank_genes_groups(adata_gpu, **kw)
@@ -1792,9 +1758,9 @@ def _anndata_with_group_sizes(sizes, *, n_genes=6, seed=0):
     """Dense AnnData whose per-group cell counts are exactly ``sizes``.
 
     The OVO tier dispatch picks the rank kernel by *test-group* size
-    (WARP<=32, SMALL 33-64, MEDIUM 65-512, LARGE 513-2500, HUGE>2500), so
-    engineered group sizes drive specific bands. Integer data is float32-exact,
-    so ranking is bit-identical to scanpy.
+    (MEDIUM<=512, LARGE 513-2500, HUGE>2500), so engineered group sizes drive
+    specific bands. Integer data is float32-exact, so ranking is bit-identical
+    to scanpy.
     """
     rng = np.random.default_rng(seed)
     labels = []
@@ -1827,11 +1793,11 @@ def _assert_ovo_matches_scanpy(adata, reference):
                 )
 
 
-def test_ovo_tier_bands_warp_small_medium_large_match_scanpy():
-    """OVO dense-tiered path must hit the WARP/SMALL/MEDIUM/LARGE rank kernels
-    (test-group sizes 20/50/300/1000, all <= 2500) and match scanpy."""
+def test_ovo_tier_bands_medium_large_match_scanpy():
+    """OVO dense-tiered path: small groups (20/50/300, all <= 512) run through
+    MEDIUM and a 1000-cell group through LARGE; must match scanpy."""
     adata = _anndata_with_group_sizes(
-        {"ref": 40, "warp": 20, "small": 50, "medium": 300, "large": 1000}, seed=1
+        {"ref": 40, "g20": 20, "g50": 50, "g300": 300, "g1000": 1000}, seed=1
     )
     _assert_ovo_matches_scanpy(adata, reference="ref")
 

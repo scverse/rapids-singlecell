@@ -96,64 +96,86 @@ __device__ __forceinline__ OvoRank ovo_mid_rank(const float* ref, int n_ref,
 }
 
 // ============================================================================
-// Parallel tie correction — all threads collaborate.
+// Amortized tie correction for the LARGE/HUGE bands (group is SORTED).
 //
-// Accumulates t^3 - t per unique value of the combined (ref, grp) arrays via
-// two passes: ref uniques (counted in both), then grp uniques absent from ref.
-// Incremental binary search bounds exploit per-thread-stride monotonicity.
-// Caller must __syncthreads() first.  warp_buf (32 doubles) reused for
-// reduction.
+// Adds only the group-only / ref-overlap delta on top of the precomputed
+// reference base ref_tie_sums[col] (= ref_tie_sum_kernel), exactly like the
+// MEDIUM band. Iterates the sorted group's UNIQUE values only -- one binary
+// search into the ref per unique value -- so the reference is NOT rescanned per
+// group (the cost a naive full-combined-rescan would pay). This makes tie
+// correction O(n_grp_unique * log n_ref) instead of O(n_ref) per group, which
+// dominates whenever the reference is large (e.g. a perturbation control or a
+// big cluster). Bit-identical: same per-value (t^3 - t) terms, just
+// reassociated against the shared ref base.
 // ============================================================================
-
-__device__ __forceinline__ void compute_tie_correction_parallel(
+__device__ __forceinline__ void compute_tie_delta_sorted_grp(
     const float* ref_col, int n_ref, const float* grp_col, int n_grp,
-    double* warp_buf, double* out) {
-    double local_tie = 0.0;
-
-    // Pass 1: unique values in ref_col, counted in both arrays
-    int grp_lb = 0, grp_ub = 0;
-    for (int i = threadIdx.x; i < n_ref; i += blockDim.x) {
-        if (i == 0 || ref_col[i] != ref_col[i - 1]) {
-            float v = ref_col[i];
-
-            int cnt_ref = sorted_upper_bound(ref_col, i + 1, n_ref, v) - i;
-
-            int lb = sorted_lower_bound(grp_col, grp_lb, n_grp, v);
-            grp_lb = lb;
-            grp_ub = sorted_upper_bound(grp_col, grp_ub > lb ? grp_ub : lb,
-                                        n_grp, v);
-            int cnt_grp = grp_ub - lb;
-
-            int cnt = cnt_ref + cnt_grp;
-            if (cnt > 1) {
-                double t = (double)cnt;
-                local_tie += t * t * t - t;
-            }
-        }
-    }
-
-    // Pass 2: unique values in grp_col that are absent from ref_col
-    int ref_lb = 0;
+    double ref_base, double* warp_buf, double* out) {
+    double local = 0.0;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
+        // run-start of a unique value in the sorted group
         if (i == 0 || grp_col[i] != grp_col[i - 1]) {
             float v = grp_col[i];
-
-            int lo = sorted_lower_bound(ref_col, ref_lb, n_ref, v);
-            ref_lb = lo;
-
-            if (lo >= n_ref || ref_col[lo] != v) {
-                // Value absent from ref — count in grp only
-                int cnt = sorted_upper_bound(grp_col, i + 1, n_grp, v) - i;
-                if (cnt > 1) {
-                    double t = (double)cnt;
-                    local_tie += t * t * t - t;
-                }
+            int gub = sorted_upper_bound(grp_col, i + 1, n_grp, v);
+            double cg = (double)(gub - i);
+            int rlo = sorted_lower_bound(ref_col, 0, n_ref, v);
+            int rub = sorted_upper_bound(ref_col, rlo, n_ref, v);
+            double cr = (double)(rub - rlo);
+            double group_tie = (cg > 1.0) ? (cg * cg * cg - cg) : 0.0;
+            local += group_tie;
+            if (cr > 0.0) {
+                double combined = cr + cg;
+                double ref_tie = (cr > 1.0) ? (cr * cr * cr - cr) : 0.0;
+                local += combined * combined * combined - combined - ref_tie -
+                         group_tie;
             }
         }
     }
+    double tie = wilcoxon_block_sum(local, warp_buf);
+    if (threadIdx.x == 0)
+        *out = finalize_tie_corr(n_ref + n_grp, ref_base + tie);
+}
 
-    double tie_sum = wilcoxon_block_sum(local_tie, warp_buf);
-    if (threadIdx.x == 0) *out = finalize_tie_corr(n_ref + n_grp, tie_sum);
+// ============================================================================
+// No-tie fast path (tie_correct=False, the default). Ranks each group value
+// against the sorted REFERENCE only, via the Mann-Whitney U identity:
+//   R_g = n_grp(n_grp+1)/2 + Σ_{g values}(#ref_below + 0.5·#ref_equal)
+// The group-internal ranks collapse to the closed form, so the group block
+// needs NO sort — each value does a full binary search into sorted ref. This
+// eliminates the group segmented sort, ~half of dense-OVO time (see profiling).
+// rank_sums are exact half-integers, so this matches the tiered path
+// bit-for-bit. Grid: (n_cols, n_groups), Block: (tpb,). grp_dense is UNSORTED.
+// ============================================================================
+__global__ void ovo_rank_dense_vs_ref_kernel(
+    const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
+    const int* __restrict__ grp_offsets, double* __restrict__ rank_sums,
+    int n_ref, int n_all_grp, int n_cols, int n_groups) {
+    int col = blockIdx.x;
+    int grp = blockIdx.y;
+    if (col >= n_cols || grp >= n_groups) return;
+
+    int g_start = grp_offsets[grp];
+    int n_grp = grp_offsets[grp + 1] - g_start;
+    if (n_grp == 0) {
+        if (threadIdx.x == 0) rank_sums[(size_t)grp * n_cols + col] = 0.0;
+        return;
+    }
+    const float* ref_col = ref_sorted + (long long)col * n_ref;
+    const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
+
+    double local_sum = 0.0;
+    for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
+        float v = grp_col[i];
+        int n_lt = sorted_lower_bound(ref_col, 0, n_ref, v);
+        int n_eq = sorted_upper_bound(ref_col, n_lt, n_ref, v) - n_lt;
+        local_sum += (double)n_lt + 0.5 * (double)n_eq;
+    }
+    __shared__ double warp_buf[32];
+    double total = wilcoxon_block_sum(local_sum, warp_buf);
+    if (threadIdx.x == 0) {
+        rank_sums[(size_t)grp * n_cols + col] =
+            total + (double)n_grp * ((double)n_grp + 1.0) / 2.0;
+    }
 }
 
 // ============================================================================
@@ -165,7 +187,8 @@ __device__ __forceinline__ void compute_tie_correction_parallel(
 
 __global__ void ovo_rank_huge_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_sorted,
-    const int* __restrict__ grp_offsets, double* __restrict__ rank_sums,
+    const int* __restrict__ grp_offsets,
+    const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
     double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
     int n_groups, bool compute_tie_corr, int skip_n_grp_le /*= 0*/) {
     int col = blockIdx.x;
@@ -208,8 +231,11 @@ __global__ void ovo_rank_huge_kernel(
     if (!compute_tie_corr) return;
     __syncthreads();
 
-    compute_tie_correction_parallel(ref_col, n_ref, grp_col, n_grp, warp_buf,
-                                    &tie_corr[grp * n_cols + col]);
+    // grp_col is sorted (CUB segmented sort upstream): amortize the ref tie
+    // contribution via the precomputed base instead of rescanning the ref.
+    compute_tie_delta_sorted_grp(ref_col, n_ref, grp_col, n_grp,
+                                 ref_tie_sums[col], warp_buf,
+                                 &tie_corr[grp * n_cols + col]);
 }
 
 // ============================================================================
@@ -220,12 +246,13 @@ __global__ void ovo_rank_huge_kernel(
 // ============================================================================
 
 __global__ void ovo_rank_large_kernel(
-    const float* __restrict__ ref_sorted,  // F-order (n_ref, n_cols) sorted
-    const float* __restrict__ grp_dense,   // F-order (n_all_grp, n_cols)
-                                           // unsorted
-    const int* __restrict__ grp_offsets,   // (n_groups + 1,)
-    double* __restrict__ rank_sums,        // (n_groups, n_cols) row-major
-    double* __restrict__ tie_corr,         // (n_groups, n_cols) row-major
+    const float* __restrict__ ref_sorted,     // F-order (n_ref, n_cols) sorted
+    const float* __restrict__ grp_dense,      // F-order (n_all_grp, n_cols)
+                                              // unsorted
+    const int* __restrict__ grp_offsets,      // (n_groups + 1,)
+    const double* __restrict__ ref_tie_sums,  // (n_cols,) ref tie base
+    double* __restrict__ rank_sums,           // (n_groups, n_cols) row-major
+    double* __restrict__ tie_corr,            // (n_groups, n_cols) row-major
     int n_ref, int n_all_grp, int n_cols, int n_groups, bool compute_tie_corr,
     int large_padded, int skip_n_grp_le /*= 0*/) {
     int col = blockIdx.x;
@@ -284,9 +311,11 @@ __global__ void ovo_rank_large_kernel(
     if (!compute_tie_corr) return;
     __syncthreads();
 
-    // grp_smem is sorted here
-    compute_tie_correction_parallel(ref_col, n_ref, grp_smem, n_grp, warp_buf,
-                                    &tie_corr[grp * n_cols + col]);
+    // grp_smem is sorted here: amortize the ref tie contribution via the
+    // precomputed base instead of rescanning the ref per group.
+    compute_tie_delta_sorted_grp(ref_col, n_ref, grp_smem, n_grp,
+                                 ref_tie_sums[col], warp_buf,
+                                 &tie_corr[grp * n_cols + col]);
 }
 
 // ============================================================================
@@ -317,70 +346,6 @@ __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
     __shared__ double warp_buf[32];
     double total = wilcoxon_block_sum(local_tie, warp_buf);
     if (threadIdx.x == 0) ref_tie_sums[col] = total;
-}
-
-__global__ void ovo_rank_small_kernel(
-    const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
-    const int* __restrict__ grp_offsets,
-    const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
-    double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int skip_n_grp_le) {
-    int col = blockIdx.x;
-    int grp = blockIdx.y;
-    if (col >= n_cols || grp >= n_groups) return;
-
-    int g_start = grp_offsets[grp];
-    int g_end = grp_offsets[grp + 1];
-    int n_grp = g_end - g_start;
-    if (n_grp <= skip_n_grp_le || n_grp > OVO_SMALL_MAX) return;
-
-    __shared__ float grp_smem[OVO_SMALL_MAX];
-    __shared__ double warp_buf[WARP_REDUCE_BUF];
-
-    const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
-    const float POS_INF = __int_as_float(0x7f800000);
-    if (threadIdx.x < OVO_SMALL_MAX) {
-        grp_smem[threadIdx.x] =
-            (threadIdx.x < n_grp) ? grp_col[threadIdx.x] : POS_INF;
-    }
-    __syncthreads();
-
-    bitonic_sort_smem(grp_smem, OVO_SMALL_MAX);
-
-    const float* ref_col = ref_sorted + (long long)col * n_ref;
-    double local_sum = 0.0;
-    double local_tie_delta = 0.0;
-
-    if (threadIdx.x < n_grp) {
-        float v = grp_smem[threadIdx.x];
-        int ref_lb = 0, ref_ub = 0, grp_lb = 0, grp_ub = 0;
-        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_smem, n_grp, v, ref_lb,
-                                 ref_ub, grp_lb, grp_ub);
-        local_sum += r.mid_rank;
-
-        if (compute_tie_corr &&
-            (threadIdx.x == 0 || v != grp_smem[threadIdx.x - 1])) {
-            double combined = (double)(r.n_eq_ref + r.n_eq_grp);
-            if (combined > 1.0) {
-                local_tie_delta += combined * combined * combined - combined;
-            }
-            if (r.n_eq_ref > 1) {
-                double cr = (double)r.n_eq_ref;
-                local_tie_delta -= cr * cr * cr - cr;
-            }
-        }
-    }
-
-    double total = wilcoxon_block_sum(local_sum, warp_buf);
-    if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
-
-    if (!compute_tie_corr) return;
-    __syncthreads();
-
-    double tie_delta = wilcoxon_block_sum(local_tie_delta, warp_buf);
-    if (threadIdx.x == 0)
-        tie_corr[grp * n_cols + col] =
-            finalize_tie_corr(n_ref + n_grp, ref_tie_sums[col] + tie_delta);
 }
 
 // ============================================================================
@@ -468,247 +433,7 @@ __global__ void ovo_rank_medium_kernel(
             finalize_tie_corr(n_ref + n_grp, ref_tie_sums[col] + tie_delta);
 }
 
-// ============================================================================
-// Warp-scoped tie correction for the WARP band.
-//
-// Sorted values live in a 32-lane register (one per lane, with unused lanes
-// carrying +INF).  Walks unique values via lane-step differentials and
-// counts ties across the sorted ref column via binary search.  All the
-// sync is __syncwarp — no smem, no __syncthreads.
-// ============================================================================
-
-__device__ __forceinline__ double warp_tie_sum(const float* ref_col, int n_ref,
-                                               float v_lane, int n_grp,
-                                               unsigned int active_mask) {
-    int lane = threadIdx.x & 31;
-    double local_tie = 0.0;
-
-    // Pass 1: per unique ref value, count occurrences in ref and in the
-    // sorted group (held in register v_lane across 32 lanes).
-    for (int base = 0; base < n_ref; base += 32) {
-        int i = base + lane;
-        bool in_ref_lane = (i < n_ref);
-        float v = in_ref_lane ? ref_col[i] : 0.0f;
-        bool is_first = in_ref_lane && ((i == 0) || (v != ref_col[i - 1]));
-        int cnt_ref = 0;
-        if (is_first) {
-            cnt_ref = sorted_upper_bound(ref_col, i + 1, n_ref, v) - i;
-        }
-
-        // Count in grp: look up how many lanes hold v_lane == v.  All lanes
-        // execute the shuffle loop; only lanes owning a unique ref value use
-        // the result.
-        int cnt_grp = 0;
-#pragma unroll
-        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
-            float vi = __shfl_sync(0xffffffff, v_lane, lane_i);
-            if (is_first && lane_i < n_grp && vi == v) ++cnt_grp;
-        }
-
-        if (is_first) {
-            int cnt = cnt_ref + cnt_grp;
-            if (cnt > 1) {
-                double t = (double)cnt;
-                local_tie += t * t * t - t;
-            }
-        }
-    }
-
-    // Pass 2: unique values in grp that are absent from ref.
-    // Walk lanes 0..n_grp-1; for each lane whose v differs from prev lane's,
-    // binary-search ref for v.  If not present, count consecutive matching
-    // lanes (tie block).
-    if (lane < n_grp) {
-        float v = v_lane;
-        float prev_lane_v =
-            __shfl_sync(active_mask, v_lane, (lane > 0) ? lane - 1 : 0);
-        float v_prev =
-            (lane > 0) ? prev_lane_v : __int_as_float(0xff800000);  // -INF
-        bool first_in_grp = (lane == 0) || (v != v_prev);
-        bool in_ref = false;
-        if (first_in_grp) {
-            int lo = sorted_lower_bound(ref_col, 0, n_ref, v);
-            in_ref = (lo < n_ref) && (ref_col[lo] == v);
-        }
-
-        // Count how many lanes ≥ this lane hold the same v.  Keep the shuffle
-        // uniform across active lanes even though only unique, ref-absent
-        // group values consume the count.
-        int cnt = 0;
-#pragma unroll
-        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
-            int src_lane = (lane_i < n_grp) ? lane_i : 0;
-            float vi = __shfl_sync(active_mask, v_lane, src_lane);
-            if (first_in_grp && !in_ref && lane_i >= lane && lane_i < n_grp &&
-                vi == v) {
-                ++cnt;
-            }
-        }
-        if (first_in_grp && !in_ref && cnt > 1) {
-            double t = (double)cnt;
-            local_tie += t * t * t - t;
-        }
-    }
-
-    local_tie = warp_reduce_sum(local_tie);
-    return local_tie;  // meaningful on lane 0.
-}
-
-__device__ __forceinline__ double warp_tie_delta(const float* ref_col,
-                                                 int n_ref, float v_lane,
-                                                 int n_grp,
-                                                 unsigned int active_mask) {
-    int lane = threadIdx.x & 31;
-    double local_delta = 0.0;
-
-    if (lane < n_grp) {
-        float v = v_lane;
-        float prev_lane_v =
-            __shfl_sync(active_mask, v_lane, (lane > 0) ? lane - 1 : 0);
-        float v_prev =
-            (lane > 0) ? prev_lane_v : __int_as_float(0xff800000);  // -INF
-        bool first_in_grp = (lane == 0) || (v != v_prev);
-
-        int cnt_grp = 0;
-#pragma unroll
-        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
-            int src_lane = (lane_i < n_grp) ? lane_i : 0;
-            float vi = __shfl_sync(active_mask, v_lane, src_lane);
-            if (lane_i < n_grp && vi == v) ++cnt_grp;
-        }
-
-        if (first_in_grp) {
-            int ref_lb = sorted_lower_bound(ref_col, 0, n_ref, v);
-            int cnt_ref =
-                sorted_upper_bound(ref_col, ref_lb, n_ref, v) - ref_lb;
-
-            double combined = (double)(cnt_ref + cnt_grp);
-            if (combined > 1.0) {
-                local_delta += combined * combined * combined - combined;
-            }
-            if (cnt_ref > 1) {
-                double cr = (double)cnt_ref;
-                local_delta -= cr * cr * cr - cr;
-            }
-        }
-    }
-
-    local_delta = warp_reduce_sum(local_delta);
-    return local_delta;  // meaningful on lane 0.
-}
-
-// ============================================================================
-// WARP-band kernel: warp-per-(col, group) pair, 8 warps packed per block.
-//
-// Each warp independently loads ≤32 group values into registers (one per
-// lane), bitonic-sorts via __shfl_xor_sync, binary-searches into sorted ref,
-// and warp-reduces to lane 0.  8 pairs/block cuts block count 8× vs the
-// block-per-pair LARGE band; no smem/__syncthreads lets warps run at full
-// throughput independently.
-//
-// Grid: (n_cols, ceil(n_groups / 8)), Block: 256.
-// ============================================================================
-
-__global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
-                                     const float* __restrict__ grp_dense,
-                                     const int* __restrict__ grp_offsets,
-                                     const double* __restrict__ ref_tie_sums,
-                                     double* __restrict__ rank_sums,
-                                     double* __restrict__ tie_corr, int n_ref,
-                                     int n_all_grp, int n_cols, int n_groups,
-                                     bool compute_tie_corr) {
-    constexpr int WARPS_PER_BLOCK = 8;
-    int warp_id = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-
-    int col = blockIdx.x;
-    int grp = blockIdx.y * WARPS_PER_BLOCK + warp_id;
-    if (col >= n_cols || grp >= n_groups) return;
-
-    int g_start = grp_offsets[grp];
-    int g_end = grp_offsets[grp + 1];
-    int n_grp = g_end - g_start;
-
-    // This kernel only handles groups that fit in a single warp (one value
-    // per lane).  Larger groups are delegated to LARGE/HUGE in a co-launched
-    // kernel; since each group owns its own row in rank_sums/tie_corr, the
-    // two kernels interlace into the output without conflict.
-    if (n_grp > OVO_WARP_MAX) return;
-
-    if (n_grp == 0) {
-        if (lane == 0) {
-            rank_sums[grp * n_cols + col] = 0.0;
-            if (compute_tie_corr) tie_corr[grp * n_cols + col] = 1.0;
-        }
-        return;
-    }
-
-    // One value per lane, pad with +INF so sort pushes them to the end.
-    const float POS_INF = __int_as_float(0x7f800000);
-    const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
-    float x = (lane < n_grp) ? grp_col[lane] : POS_INF;
-    unsigned int active_mask = __ballot_sync(0xffffffff, lane < n_grp);
-
-    // Warp-shuffle bitonic sort (ascending) — 32 elements in registers.
-    for (int k = 1; k <= 16; k <<= 1) {
-        for (int j = k; j > 0; j >>= 1) {
-            float y = __shfl_xor_sync(0xffffffff, x, j);
-            bool asc = (((lane & (k << 1)) == 0));
-            bool take_min = (((lane & j) == 0) == asc);
-            x = take_min ? fminf(x, y) : fmaxf(x, y);
-        }
-    }
-
-    // After sort, x[lane] holds the lane-th smallest group value (lanes
-    // ≥ n_grp hold +INF).  Binary-search each value into the sorted ref.
-    const float* ref_col = ref_sorted + (long long)col * n_ref;
-    double local_sum = 0.0;
-
-    if (lane < n_grp) {
-        float v = x;
-        int n_lt_ref = sorted_lower_bound(ref_col, 0, n_ref, v);
-        int n_eq_ref =
-            sorted_upper_bound(ref_col, n_lt_ref, n_ref, v) - n_lt_ref;
-
-        // In-group counts: in the sorted warp-register x, count lanes < this
-        // one that hold strictly less, and lanes with equal value.
-        int n_lt_grp = 0;
-        int n_eq_grp_offset = 0;  // tied lanes strictly before this one
-        int n_eq_grp_after = 1;   // count self
-#pragma unroll
-        for (int lane_i = 0; lane_i < OVO_WARP_MAX; ++lane_i) {
-            if (lane_i >= n_grp) continue;
-            float vi = __shfl_sync(active_mask, v, lane_i);
-            if (lane_i < lane) {
-                if (vi < v)
-                    ++n_lt_grp;
-                else if (vi == v)
-                    ++n_eq_grp_offset;
-            } else if (lane_i > lane) {
-                if (vi == v) ++n_eq_grp_after;
-            }
-        }
-        int n_eq_grp_total = n_eq_grp_offset + n_eq_grp_after;
-        // Per-lane mid-rank; each tie lane gets the same value (matches LARGE
-        // band).
-        local_sum = (double)(n_lt_ref + n_lt_grp) +
-                    ((double)(n_eq_ref + n_eq_grp_total) + 1.0) / 2.0;
-    }
-
-    // Warp reduce.
-    local_sum = warp_reduce_sum(local_sum);
-    if (lane == 0) rank_sums[grp * n_cols + col] = local_sum;
-
-    if (!compute_tie_corr) return;
-
-    double tie_sum;
-    if (ref_tie_sums != nullptr) {
-        tie_sum = ref_tie_sums[col] +
-                  warp_tie_delta(ref_col, n_ref, x, n_grp, active_mask);
-    } else {
-        tie_sum = warp_tie_sum(ref_col, n_ref, x, n_grp, active_mask);
-    }
-    if (lane == 0)
-        tie_corr[grp * n_cols + col] =
-            finalize_tie_corr(n_ref + n_grp, tie_sum);
-}
+// WARP (≤32) and SMALL (33–64) tiers were removed -- MEDIUM is now the smallest
+// tier and covers all groups ≤ OVO_MEDIUM_MAX. The removed kernels (warp/small
+// rank + warp tie helpers) are archived with restore steps in
+// .claude/wilcoxon-warp-small-tiers-removed.md.

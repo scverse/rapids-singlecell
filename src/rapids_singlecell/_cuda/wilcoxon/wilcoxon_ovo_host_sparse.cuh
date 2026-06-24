@@ -156,10 +156,10 @@ static void ovo_streaming_csc_host_impl(
         bufs[s].grp_dense = pool.alloc<float>(sub_grp_items);
         bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
         bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
+        // LARGE/HUGE now share the ref tie base too: allocate whenever
+        // correcting.
         bufs[s].ref_tie_sums =
-            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium))
-                ? pool.alloc<double>(sub_batch_cols)
-                : nullptr;
+            compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].d_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].d_tie_corr =
@@ -632,12 +632,11 @@ static void ovo_streaming_csr_host_impl(
         OvoTierPlan pack_t1 = make_ovo_tier_plan(h_grp_offsets + pack.first, K);
         int pack_tpb_rank = round_up_to_warp(
             std::min(pack_t1.max_grp_size, MAX_THREADS_PER_BLOCK));
-        bool pack_has_above_t2 = pack_t1.max_grp_size > OVO_MEDIUM_MAX;
-        int pack_huge_skip_le =
-            pack_has_above_t2 ? OVO_MEDIUM_MAX : OVO_WARP_MAX;
+        // HUGE skips groups MEDIUM already handled (≤ OVO_MEDIUM_MAX).
+        int pack_huge_skip_le = OVO_MEDIUM_MAX;
         std::vector<int> h_sort_group_ids;
         int pack_n_sort_groups = K;
-        if (pack_t1.above_warp && !pack_t1.run_large) {
+        if (pack_t1.above_medium && !pack_t1.run_large) {
             h_sort_group_ids = make_sort_group_ids(h_grp_offsets + pack.first,
                                                    K, pack_huge_skip_le);
             pack_n_sort_groups = (int)h_sort_group_ids.size();
@@ -647,7 +646,7 @@ static void ovo_streaming_csr_host_impl(
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
 
-        if (pack_t1.above_warp && !pack_t1.run_large) {
+        if (pack_t1.above_medium && !pack_t1.run_large) {
             cudaMemcpyAsync(buf.d_sort_group_ids, h_sort_group_ids.data(),
                             h_sort_group_ids.size() * sizeof(int),
                             cudaMemcpyHostToDevice, stream);

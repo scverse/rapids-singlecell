@@ -415,10 +415,10 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         bufs[s].ref_cub_temp = pool.alloc<uint8_t>(ref_cub_temp_bytes);
         bufs[s].grp_cub_temp =
             run_huge ? pool.alloc<uint8_t>(grp_cub_temp_bytes) : nullptr;
+        // All tiers share the ref tie base now (LARGE/HUGE included), so
+        // allocate whenever correcting, not only for the small-group tiers.
         bufs[s].ref_tie_sums =
-            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium))
-                ? pool.alloc<double>(sub_batch_cols)
-                : nullptr;
+            compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].sub_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_tie_corr =

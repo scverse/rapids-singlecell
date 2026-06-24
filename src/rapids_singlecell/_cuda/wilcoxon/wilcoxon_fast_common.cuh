@@ -95,16 +95,11 @@ static inline void scatter_cols_2d(double* dst, const double* src, int rows,
                       sb_cols * sizeof(double), sb_cols * sizeof(double), rows,
                       cudaMemcpyDeviceToDevice, stream);
 }
-// WARP band: warp-per-(col,group) fused kernel. Each warp sorts+ranks one
-// pair entirely in registers (warp-shuffle bitonic, no smem, no __syncthreads).
-// Blocks pack 8 warps to amortise launch overhead. Fast route for
-// perturbation-style workloads where most groups have a few dozen cells.
-constexpr int OVO_WARP_MAX = 32;
-// SMALL band: groups slightly larger than one warp. One compact smem sort
-// block per (col, group), avoiding the heavier MEDIUM-band in-group scan.
-constexpr int OVO_SMALL_MAX = 64;
-// MEDIUM band: unsorted direct-rank kernel. Avoiding a full smem bitonic sort
-// wins here despite the O(n^2) in-group count.
+// MEDIUM band: unsorted direct-rank kernel and the SMALLEST OVO tier. Handles
+// every group up to this size (the former WARP/SMALL sub-tiers were removed --
+// they added no measurable speedup on real tier-spanning data; see
+// .claude/wilcoxon-warp-small-tiers-removed.md). Avoids a smem bitonic sort
+// via an O(n^2) in-group count, cheap at these sizes.
 constexpr int OVO_MEDIUM_MAX = 512;
 // Max group size for the fused smem-sort rank kernel (the LARGE band).
 // Beyond this, fall back to the HUGE band: CUB segmented sort + rank kernel.

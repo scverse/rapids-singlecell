@@ -92,9 +92,7 @@ static void ovo_streaming_csr_impl(
             (run_huge ? 2 * (size_t)n_sort_groups * sub_batch_cols * sizeof(int)
                       : 0) +
             (run_huge ? cub_temp_bytes : 0) +
-            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium)
-                 ? (size_t)sub_batch_cols * sizeof(double)
-                 : 0) +
+            (compute_tie_corr ? (size_t)sub_batch_cols * sizeof(double) : 0) +
             2 * (size_t)n_groups * sub_batch_cols * sizeof(double);
         size_t budget = rmm_available_device_bytes(0.8);
         size_t ref_reserve =
@@ -130,10 +128,10 @@ static void ovo_streaming_csr_impl(
         bufs[s].grp_dense = pool.alloc<float>(sub_grp_items);
         bufs[s].cub_temp =
             run_huge ? pool.alloc<uint8_t>(cub_temp_bytes) : nullptr;
+        // LARGE/HUGE now share the ref tie base too: allocate whenever
+        // correcting.
         bufs[s].ref_tie_sums =
-            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium))
-                ? pool.alloc<double>(sub_batch_cols)
-                : nullptr;
+            compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].sub_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_tie_corr =
@@ -317,9 +315,7 @@ static void ovo_streaming_csc_impl(
             (size_t)(sub_batch_cols + 1) * sizeof(int) + cub_temp_bytes +
             (run_huge ? 2 * (size_t)n_sort_groups * sub_batch_cols * sizeof(int)
                       : 0) +
-            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium)
-                 ? (size_t)sub_batch_cols * sizeof(double)
-                 : 0) +
+            (compute_tie_corr ? (size_t)sub_batch_cols * sizeof(double) : 0) +
             2 * (size_t)n_groups * sub_batch_cols * sizeof(double);
         size_t budget = rmm_available_device_bytes(0.8);
         n_streams = clamp_streams_by_budget(n_streams, per_stream, budget);
@@ -357,10 +353,10 @@ static void ovo_streaming_csc_impl(
         bufs[s].grp_dense = pool.alloc<float>(sub_grp_items);
         bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
         bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
+        // LARGE/HUGE now share the ref tie base too: allocate whenever
+        // correcting.
         bufs[s].ref_tie_sums =
-            (compute_tie_corr && (t1.run_warp || t1.run_small || t1.run_medium))
-                ? pool.alloc<double>(sub_batch_cols)
-                : nullptr;
+            compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].sub_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_tie_corr =
