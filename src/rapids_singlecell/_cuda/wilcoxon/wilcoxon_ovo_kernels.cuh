@@ -24,6 +24,40 @@ __global__ void build_huge_seg_offsets_kernel(
     ends[idx] = base + grp_offsets[g + 1];
 }
 
+template <typename T>
+__global__ void dense_ovo_group_stats_kernel(
+    const T* __restrict__ ref_dense, const T* __restrict__ grp_dense,
+    const int* __restrict__ grp_codes, double* __restrict__ group_sums,
+    double* __restrict__ group_sum_sq, double* __restrict__ group_nnz,
+    int n_ref, int n_all_grp, int sb_cols, int n_groups, bool compute_nnz) {
+    int col = blockIdx.x;
+    if (col >= sb_cols) return;
+
+    int ref_slot = n_groups;
+    const T* ref_col = ref_dense + (size_t)col * n_ref;
+    const T* grp_col = grp_dense + (size_t)col * n_all_grp;
+
+    for (int row = threadIdx.x; row < n_ref; row += blockDim.x) {
+        double v = (double)ref_col[row];
+        atomicAdd(&group_sums[(size_t)ref_slot * sb_cols + col], v);
+        atomicAdd(&group_sum_sq[(size_t)ref_slot * sb_cols + col], v * v);
+        if (compute_nnz && v != 0.0) {
+            atomicAdd(&group_nnz[(size_t)ref_slot * sb_cols + col], 1.0);
+        }
+    }
+
+    for (int row = threadIdx.x; row < n_all_grp; row += blockDim.x) {
+        int g = grp_codes[row];
+        if (g < 0 || g >= n_groups) continue;
+        double v = (double)grp_col[row];
+        atomicAdd(&group_sums[(size_t)g * sb_cols + col], v);
+        atomicAdd(&group_sum_sq[(size_t)g * sb_cols + col], v * v);
+        if (compute_nnz && v != 0.0) {
+            atomicAdd(&group_nnz[(size_t)g * sb_cols + col], 1.0);
+        }
+    }
+}
+
 /**
  * Sizing knobs for LARGE-band dispatch: largest group fits in smem -> fused
  * bitonic-sort + binary-search kernel per block; else fall back to HUGE band

@@ -13,14 +13,10 @@ static void ovo_streaming_csr_impl(
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
-    // Cap sub_batch_cols so the group slab (n_all_grp × sub_batch_cols, one CUB
-    // sort) stays within int32; n_all_grp (cell count) drives the cap.
-    {
-        size_t cap = n_all_grp > 0 ? SAFE_BATCH_NNZ / (size_t)n_all_grp
-                                   : (size_t)sub_batch_cols;
-        if (cap < 1) cap = 1;
-        if ((size_t)sub_batch_cols > cap) sub_batch_cols = (int)cap;
-    }
+    DenseColumnBatchPlan group_batches = plan_dense_column_batches(
+        n_all_grp, n_cols, sub_batch_cols, SAFE_BATCH_NNZ,
+        "OVO device CSR group sub-batch");
+    sub_batch_cols = group_batches.sub_batch_cols;
 
     std::vector<int> h_offsets(n_groups + 1);
     cuda_check(cudaMemcpy(h_offsets.data(), grp_offsets,
@@ -248,15 +244,10 @@ static void ovo_streaming_csc_impl(
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
-    // Cap sub_batch_cols so both slabs (n_ref× and n_all_grp× sub_batch_cols,
-    // each one CUB sort) stay within int32; these cell counts drive the cap.
-    {
-        size_t max_rows = (size_t)std::max(n_ref, n_all_grp);
-        size_t cap =
-            max_rows > 0 ? SAFE_BATCH_NNZ / max_rows : (size_t)sub_batch_cols;
-        if (cap < 1) cap = 1;
-        if ((size_t)sub_batch_cols > cap) sub_batch_cols = (int)cap;
-    }
+    DenseColumnBatchPlan batches = plan_dense_column_batches(
+        std::max(n_ref, n_all_grp), n_cols, sub_batch_cols, SAFE_BATCH_NNZ,
+        "OVO device CSC sub-batch");
+    sub_batch_cols = batches.sub_batch_cols;
 
     std::vector<int> h_offsets(n_groups + 1);
     cuda_check(cudaMemcpy(h_offsets.data(), grp_offsets,

@@ -16,26 +16,21 @@ static void ovr_sparse_csc_host_streaming_impl(
 
     // Bound each batch's nnz: CUB item counts stay within int32 + per-stream
     // sort buffers fit the budget (column counts free from CSC indptr).
+    size_t cap = SAFE_BATCH_NNZ;
     {
         constexpr size_t BYTES_PER_NNZ =
             sizeof(InT) + 2 * sizeof(float) + 2 * sizeof(IndexT) + 8;
-        size_t cap = SAFE_BATCH_NNZ;
         size_t mem_cap =
             rmm_available_device_bytes(0.8) / (size_t)N_STREAMS / BYTES_PER_NNZ;
         if (mem_cap > 0 && mem_cap < cap) cap = mem_cap;
-        sub_batch_cols = cap_sub_batch_by_nnz(
-            n_cols, sub_batch_cols, cap,
-            [&](int c) { return (size_t)(h_indptr[c + 1] - h_indptr[c]); });
     }
 
+    ColumnBatchPlan batches =
+        plan_csc_column_batches(h_indptr, n_cols, sub_batch_cols, cap,
+                                "OVR host CSC rebased column offsets");
+    sub_batch_cols = batches.sub_batch_cols;
     int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
-
-    size_t max_nnz = 0;
-    for (int col = 0; col < n_cols; col += sub_batch_cols) {
-        int sb_cols = std::min(sub_batch_cols, n_cols - col);
-        size_t nnz = (size_t)(h_indptr[col + sb_cols] - h_indptr[col]);
-        if (nnz > max_nnz) max_nnz = nnz;
-    }
+    size_t max_nnz = batches.max_nnz;
 
     size_t cub_temp_bytes = 0;
     if (max_nnz > 0) {
@@ -47,13 +42,21 @@ static void ovr_sparse_csc_host_streaming_impl(
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
-    // Pin host inputs before streams: on exception unwind streams drain before
-    // buffers are unregistered (mirrors safe CSR order).
     size_t total_nnz = (size_t)h_indptr[n_cols];
-    HostRegisterGuard _pin_data(const_cast<InT*>(h_data),
-                                total_nnz * sizeof(InT));
-    HostRegisterGuard _pin_indices(const_cast<IndexT*>(h_indices),
-                                   total_nnz * sizeof(IndexT));
+    size_t direct_pin_bytes = total_nnz * (sizeof(InT) + sizeof(IndexT));
+    bool use_bounded_stage =
+        direct_pin_bytes > HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES;
+    HostRegisterGuard pin_data;
+    HostRegisterGuard pin_indices;
+    std::unique_ptr<PinnedRing<InT, IndexT>> stage;
+    if (use_bounded_stage) {
+        stage.reset(new PinnedRing<InT, IndexT>(n_streams, max_nnz));
+    } else {
+        pin_data = HostRegisterGuard(const_cast<InT*>(h_data),
+                                     total_nnz * sizeof(InT));
+        pin_indices = HostRegisterGuard(const_cast<IndexT*>(h_indices),
+                                        total_nnz * sizeof(IndexT));
+    }
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
     int* d_group_codes = pool.alloc<int>(n_rows);
     double* d_group_sizes = pool.alloc<double>(n_groups);
@@ -99,10 +102,7 @@ static void ovr_sparse_csc_host_streaming_impl(
                cudaMemcpyHostToDevice);
 
     // Pre-compute rebased per-batch offsets, upload once (no per-batch H2D).
-    int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
-    int* d_all_offsets = precompute_csc_batch_offsets(
-        h_indptr, n_cols, sub_batch_cols, n_batches, pool,
-        "OVR host CSC rebased column offsets");
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
 
     int tpb = UTIL_BLOCK_SIZE;
     bool rank_use_gmem = false;
@@ -137,8 +137,24 @@ static void ovr_sparse_csc_host_streaming_impl(
         int batch_nnz = checked_int_span((size_t)(ptr_end - ptr_start),
                                          "OVR host CSC active batch nnz");
 
-        // H2D: this column range's sparse data (native dtype).
-        if (batch_nnz > 0) {
+        if (use_bounded_stage) {
+            // Bounded staging: copy native values/indices into a small pinned
+            // slot instead of page-locking the whole host CSC.
+            stage->wait(s);
+            if (batch_nnz > 0) {
+                host_copy_slice(h_data, h_indices, (size_t)ptr_start, batch_nnz,
+                                stage->template get<0>(s),
+                                stage->template get<1>(s));
+                cudaMemcpyAsync(buf.d_sparse_data_orig,
+                                stage->template get<0>(s),
+                                (size_t)batch_nnz * sizeof(InT),
+                                cudaMemcpyHostToDevice, stream);
+                cudaMemcpyAsync(buf.d_sparse_indices, stage->template get<1>(s),
+                                (size_t)batch_nnz * sizeof(IndexT),
+                                cudaMemcpyHostToDevice, stream);
+            }
+            stage->record(s, stream);
+        } else if (batch_nnz > 0) {
             cudaMemcpyAsync(buf.d_sparse_data_orig, h_data + ptr_start,
                             (size_t)batch_nnz * sizeof(InT),
                             cudaMemcpyHostToDevice, stream);
@@ -263,24 +279,12 @@ static void ovr_sparse_csr_host_rowstream_impl(
     size_t cap = SAFE_BATCH_NNZ;
     size_t mem_cap = budget / BYTES_PER_NNZ;
     if (mem_cap > 0 && mem_cap < cap) cap = mem_cap;
-    sub_batch_cols = cap_sub_batch_by_nnz(
-        n_cols, sub_batch_cols, cap, [&](int c) { return h_col_counts[c]; });
-
-    int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
-    size_t max_batch_nnz = 0;
-    std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
-    std::vector<size_t> h_batch_nnz(n_batches);
-    for (int b = 0; b < n_batches; b++) {
-        int col_start = b * sub_batch_cols;
-        int sb = std::min(sub_batch_cols, n_cols - col_start);
-        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
-        for (int i = 0; i < sb; i++)
-            off[i + 1] =
-                checked_int_span((size_t)off[i] + h_col_counts[col_start + i],
-                                 "rowstream rebased column offsets");
-        h_batch_nnz[b] = (size_t)off[sb];
-        if (h_batch_nnz[b] > max_batch_nnz) max_batch_nnz = h_batch_nnz[b];
-    }
+    ColumnBatchPlan batches = plan_column_batches_from_counts(
+        n_cols, sub_batch_cols, cap, [&](int c) { return h_col_counts[c]; },
+        "rowstream rebased column offsets");
+    sub_batch_cols = batches.sub_batch_cols;
+    int n_batches = batches.n_batches;
+    size_t max_batch_nnz = batches.max_nnz;
 
     size_t cub_temp_bytes = 0;
     if (max_batch_nnz > 0) {
@@ -299,11 +303,8 @@ static void ovr_sparse_csr_host_rowstream_impl(
     // NOT page-locked: gather reads it on CPU, only compacted slice crosses
     // bus.
     size_t stage_nnz = max_batch_nnz ? max_batch_nnz : 1;
-    std::vector<InT> h_gather_vals(stage_nnz);
-    std::vector<int> h_gather_cols(stage_nnz);
-    std::vector<int> h_gather_indptr(n_rows + 1);
-    HostRegisterGuard pin_gvals(h_gather_vals.data(), stage_nnz * sizeof(InT));
-    HostRegisterGuard pin_gcols(h_gather_cols.data(), stage_nnz * sizeof(int));
+    PinnedRing<InT, int> gather_stage(1, stage_nnz);
+    PinnedRing<int> indptr_stage(1, (size_t)n_rows + 1);
     std::vector<IndptrT> cursor(n_rows, 0);  // offset within each (sorted) row
 
     int* d_group_codes = pool.alloc<int>(n_rows);
@@ -318,6 +319,7 @@ static void ovr_sparse_csr_host_rowstream_impl(
     int* d_gather_indptr = pool.alloc<int>(n_rows + 1);
     int* col_offsets = pool.alloc<int>(sub_batch_cols + 1);
     int* write_pos = pool.alloc<int>(sub_batch_cols);
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
     InT* csc_vals_orig = pool.alloc<InT>(max_batch_nnz);
     float* csc_vals_f32 = pool.alloc<float>(max_batch_nnz);
     int* csc_row_idx = pool.alloc<int>(max_batch_nnz);
@@ -335,6 +337,8 @@ static void ovr_sparse_csr_host_rowstream_impl(
     double* d_nz_scratch =
         rank_use_gmem ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
                       : nullptr;
+    ScopedCudaStream row_stream(cudaStreamDefault);
+    cudaStream_t stream = row_stream.get();
 
     // ---- One linear column-batched pass. Cursor advances monotonically
     // (sorted indices + ascending batches): each nonzero read/transferred once,
@@ -346,62 +350,43 @@ static void ovr_sparse_csr_host_rowstream_impl(
     for (int b = 0; b < n_batches; b++) {
         int sb_cols = std::min(sub_batch_cols, n_cols - col);
         int col_end = col + sb_cols;
+        gather_stage.wait(0);
+        indptr_stage.wait(0);
+        InT* h_gather_vals = gather_stage.template get<0>(0);
+        int* h_gather_cols = gather_stage.template get<1>(0);
+        int* h_gather_indptr = indptr_stage.template get<0>(0);
 
-        // Per-row run for this batch: binary-search sorted indices from cursor
-        // for first column >= col_end.
-        host_parallel_ranges(n_rows, [&](int r0, int r1) {
-            for (int r = r0; r < r1; r++) {
-                const IndexT* lo = h_indices + h_indptr[r] + cursor[r];
-                const IndexT* hi = h_indices + h_indptr[r + 1];
-                g_count[r] =
-                    (int)(std::lower_bound(lo, hi, (IndexT)col_end) - lo);
-            }
-        });
-        // Prefix sum -> per-row output offsets (gather mini-CSR row pointer).
-        h_gather_indptr[0] = 0;
-        for (int r = 0; r < n_rows; r++)
-            h_gather_indptr[r + 1] = checked_int_span(
-                (size_t)h_gather_indptr[r] + (size_t)g_count[r],
-                "rowstream gather nnz");
-        int batch_nnz = h_gather_indptr[n_rows];
-        // Copy each row's run into its slot, advance cursor (disjoint outputs
-        // -> race-free).
-        host_parallel_ranges(n_rows, [&](int r0, int r1) {
-            for (int r = r0; r < r1; r++) {
-                IndptrT base = h_indptr[r] + cursor[r];
-                size_t gpos = (size_t)h_gather_indptr[r];
-                int cnt = g_count[r];
-                for (int k = 0; k < cnt; k++) {
-                    h_gather_vals[gpos + k] = h_data[base + k];
-                    h_gather_cols[gpos + k] = (int)h_indices[base + k];
-                }
-                cursor[r] += cnt;
-            }
-        });
+        int batch_nnz = host_materialize_csr_column_interval_cursor(
+            h_data, h_indices, h_indptr, n_rows, col, col_end, cursor.data(),
+            g_count.data(), h_gather_indptr, h_gather_vals, h_gather_cols,
+            "rowstream gather nnz");
 
-        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
-        cudaMemcpy(col_offsets, off, (sb_cols + 1) * sizeof(int),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(write_pos, off, sb_cols * sizeof(int),
-                   cudaMemcpyHostToDevice);
+        int* off = d_all_offsets + (size_t)b * (sub_batch_cols + 1);
+        cudaMemcpyAsync(col_offsets, off, (sb_cols + 1) * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(write_pos, off, sb_cols * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream);
 
         // Bulk H2D of this batch's compacted nonzeros (1x transfer).
         if (batch_nnz > 0) {
-            cuda_check(cudaMemcpy(d_gather_vals, h_gather_vals.data(),
-                                  (size_t)batch_nnz * sizeof(InT),
-                                  cudaMemcpyHostToDevice),
+            cuda_check(cudaMemcpyAsync(d_gather_vals, h_gather_vals,
+                                       (size_t)batch_nnz * sizeof(InT),
+                                       cudaMemcpyHostToDevice, stream),
                        "rowstream gathered vals H2D");
-            cuda_check(cudaMemcpy(d_gather_cols, h_gather_cols.data(),
-                                  (size_t)batch_nnz * sizeof(int),
-                                  cudaMemcpyHostToDevice),
+            cuda_check(cudaMemcpyAsync(d_gather_cols, h_gather_cols,
+                                       (size_t)batch_nnz * sizeof(int),
+                                       cudaMemcpyHostToDevice, stream),
                        "rowstream gathered cols H2D");
         }
-        cudaMemcpy(d_gather_indptr, h_gather_indptr.data(),
-                   (n_rows + 1) * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(d_gather_indptr, h_gather_indptr,
+                        (n_rows + 1) * sizeof(int), cudaMemcpyHostToDevice,
+                        stream);
+        gather_stage.record(0, stream);
+        indptr_stage.record(0, stream);
 
         // Scatter mini-CSR into the column-batch CSC accumulator.
         csr_scatter_to_csc_kernel<InT, int, int>
-            <<<(n_rows + tpb - 1) / tpb, tpb>>>(
+            <<<(n_rows + tpb - 1) / tpb, tpb, 0, stream>>>(
                 d_gather_vals, d_gather_cols, d_gather_indptr, write_pos,
                 csc_vals_orig, csc_row_idx, n_rows, col, col_end, 0);
         CUDA_CHECK_LAST_ERROR(csr_scatter_to_csc_kernel);
@@ -409,36 +394,38 @@ static void ovr_sparse_csr_host_rowstream_impl(
         launch_ovr_cast_and_accumulate_sparse<InT>(
             csc_vals_orig, csc_vals_f32, csc_row_idx, col_offsets,
             d_group_codes, sub_group_sums, sub_group_nnz, sb_cols, n_groups,
-            compute_nnz, tpb, smem_cast, cast_use_gmem, 0);
+            compute_nnz, tpb, smem_cast, cast_use_gmem, stream);
         if (batch_nnz > 0) {
             cub_segmented_sortpairs(cub_temp, cub_temp_bytes, csc_vals_f32,
                                     keys_out, csc_row_idx, vals_out, batch_nnz,
-                                    sb_cols, col_offsets, col_offsets + 1, 0,
-                                    "rowstream segmented sort");
+                                    sb_cols, col_offsets, col_offsets + 1,
+                                    stream, "rowstream segmented sort");
         }
         launch_ovr_sparse_rank<int>(
             keys_out, vals_out, col_offsets, d_group_codes, d_group_sizes,
             sub_rank_sums, sub_tie_corr, d_nz_scratch, n_rows, sb_cols,
-            n_groups, tpb, smem_bytes, compute_tie_corr, rank_use_gmem, 0);
+            n_groups, tpb, smem_bytes, compute_tie_corr, rank_use_gmem, stream);
 
-        cudaMemcpy2D(d_rank_sums + col, n_cols * sizeof(double), sub_rank_sums,
-                     sb_cols * sizeof(double), sb_cols * sizeof(double),
-                     n_groups, cudaMemcpyDeviceToDevice);
+        cudaMemcpy2DAsync(d_rank_sums + col, n_cols * sizeof(double),
+                          sub_rank_sums, sb_cols * sizeof(double),
+                          sb_cols * sizeof(double), n_groups,
+                          cudaMemcpyDeviceToDevice, stream);
         if (compute_tie_corr)
-            cudaMemcpy(d_tie_corr + col, sub_tie_corr, sb_cols * sizeof(double),
-                       cudaMemcpyDeviceToDevice);
-        cudaMemcpy2D(d_group_sums + col, n_cols * sizeof(double),
-                     sub_group_sums, sb_cols * sizeof(double),
-                     sb_cols * sizeof(double), n_groups,
-                     cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(d_tie_corr + col, sub_tie_corr,
+                            sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
+                            stream);
+        cudaMemcpy2DAsync(d_group_sums + col, n_cols * sizeof(double),
+                          sub_group_sums, sb_cols * sizeof(double),
+                          sb_cols * sizeof(double), n_groups,
+                          cudaMemcpyDeviceToDevice, stream);
         if (compute_nnz)
-            cudaMemcpy2D(d_group_nnz + col, n_cols * sizeof(double),
-                         sub_group_nnz, sb_cols * sizeof(double),
-                         sb_cols * sizeof(double), n_groups,
-                         cudaMemcpyDeviceToDevice);
+            cudaMemcpy2DAsync(d_group_nnz + col, n_cols * sizeof(double),
+                              sub_group_nnz, sb_cols * sizeof(double),
+                              sb_cols * sizeof(double), n_groups,
+                              cudaMemcpyDeviceToDevice, stream);
         col += sb_cols;
     }
-    cuda_check(cudaDeviceSynchronize(), "rowstream sync");
+    cuda_check(cudaStreamSynchronize(stream), "rowstream sync");
 }
 
 /**
@@ -532,30 +519,14 @@ static void ovr_sparse_csr_host_streaming_impl(
     size_t batch_nnz_cap = SAFE_BATCH_NNZ;
     size_t mem_cap = budget / (size_t)N_STREAMS / BYTES_PER_NNZ;
     if (mem_cap > 0 && mem_cap < batch_nnz_cap) batch_nnz_cap = mem_cap;
-    sub_batch_cols =
-        cap_sub_batch_by_nnz(n_cols, sub_batch_cols, batch_nnz_cap,
-                             [&](int c) { return (size_t)h_col_counts[c]; });
-
-    int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
-    size_t max_batch_nnz = 0;
-    std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
-    std::vector<size_t> h_batch_nnz(n_batches);
-    for (int b = 0; b < n_batches; b++) {
-        int col_start = b * sub_batch_cols;
-        int sb_cols = std::min(sub_batch_cols, n_cols - col_start);
-        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
-        for (int i = 0; i < sb_cols; i++)
-            off[i + 1] = checked_int_span(
-                (size_t)off[i] + (size_t)h_col_counts[col_start + i],
-                "OVR host CSR rebased column offsets");
-        h_batch_nnz[b] = (size_t)off[sb_cols];
-        if (h_batch_nnz[b] > max_batch_nnz) max_batch_nnz = h_batch_nnz[b];
-    }
-
-    int* d_all_offsets =
-        pool.alloc<int>((size_t)n_batches * (sub_batch_cols + 1));
-    cudaMemcpy(d_all_offsets, h_all_offsets.data(),
-               h_all_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    ColumnBatchPlan batches = plan_column_batches_from_counts(
+        n_cols, sub_batch_cols, batch_nnz_cap,
+        [&](int c) { return (size_t)h_col_counts[c]; },
+        "OVR host CSR rebased column offsets");
+    sub_batch_cols = batches.sub_batch_cols;
+    int n_batches = batches.n_batches;
+    size_t max_batch_nnz = batches.max_nnz;
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
 
     // ---- Phase 1: per-stream bounded work buffer size + stream count ----
     size_t cub_temp_bytes = 0;
@@ -673,7 +644,7 @@ static void ovr_sparse_csr_host_streaming_impl(
         auto stream = streams[s];
         auto& buf = bufs[s];
         int batch_nnz =
-            checked_int_span(h_batch_nnz[b], "OVR host CSR active batch nnz");
+            checked_int_span(batches.nnz[b], "OVR host CSR active batch nnz");
 
         int* src = d_all_offsets + (size_t)b * (sub_batch_cols + 1);
         cudaMemcpyAsync(buf.col_offsets, src, (sb_cols + 1) * sizeof(int),
@@ -748,26 +719,17 @@ static void ovr_sparse_csc_streaming_impl(
                cudaMemcpyDeviceToHost);
 
     // Bound each batch's nnz: CUB item counts within int32 + sort buffers fit.
-    {
-        constexpr size_t BYTES_PER_NNZ =
-            2 * sizeof(float) + 2 * sizeof(int) + 8;
-        size_t cap = SAFE_BATCH_NNZ;
-        size_t mem_cap =
-            rmm_available_device_bytes(0.8) / (size_t)N_STREAMS / BYTES_PER_NNZ;
-        if (mem_cap > 0 && mem_cap < cap) cap = mem_cap;
-        sub_batch_cols = cap_sub_batch_by_nnz(
-            n_cols, sub_batch_cols, cap,
-            [&](int c) { return (size_t)(h_indptr[c + 1] - h_indptr[c]); });
-    }
-
+    constexpr size_t BYTES_PER_NNZ = 2 * sizeof(float) + 2 * sizeof(int) + 8;
+    size_t cap = SAFE_BATCH_NNZ;
+    size_t mem_cap =
+        rmm_available_device_bytes(0.8) / (size_t)N_STREAMS / BYTES_PER_NNZ;
+    if (mem_cap > 0 && mem_cap < cap) cap = mem_cap;
+    ColumnBatchPlan batches =
+        plan_csc_column_batches(h_indptr.data(), n_cols, sub_batch_cols, cap,
+                                "OVR device CSC rebased column offsets");
+    sub_batch_cols = batches.sub_batch_cols;
     int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
-
-    size_t max_nnz = 0;
-    for (int col = 0; col < n_cols; col += sub_batch_cols) {
-        int sb_cols = std::min(sub_batch_cols, n_cols - col);
-        size_t nnz = (size_t)(h_indptr[col + sb_cols] - h_indptr[col]);
-        if (nnz > max_nnz) max_nnz = nnz;
-    }
+    size_t max_nnz = batches.max_nnz;
 
     size_t cub_temp_bytes = 0;
     if (max_nnz > 0) {
@@ -916,42 +878,21 @@ static void ovr_sparse_csr_streaming_impl(
 
     // Bound each batch's nnz: CUB item counts within int32 + transpose/sort
     // buffers fit.
-    {
-        constexpr size_t BYTES_PER_NNZ =
-            2 * sizeof(float) + 2 * sizeof(int) + 8;
-        size_t cap = SAFE_BATCH_NNZ;
-        size_t mem_cap =
-            rmm_available_device_bytes(0.8) / (size_t)N_STREAMS / BYTES_PER_NNZ;
-        if (mem_cap > 0 && mem_cap < cap) cap = mem_cap;
-        sub_batch_cols = cap_sub_batch_by_nnz(
-            n_cols, sub_batch_cols, cap,
-            [&](int c) { return (size_t)h_col_counts[c]; });
-    }
-
-    // Per-batch prefix sums on host; flat n_batches x (sub_batch_cols+1).
-    int n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
-    size_t max_batch_nnz = 0;
-    std::vector<int> h_all_offsets((size_t)n_batches * (sub_batch_cols + 1), 0);
-    std::vector<size_t> h_batch_nnz(n_batches);
-
-    for (int b = 0; b < n_batches; b++) {
-        int col_start = b * sub_batch_cols;
-        int sb_cols = std::min(sub_batch_cols, n_cols - col_start);
-        int* off = &h_all_offsets[(size_t)b * (sub_batch_cols + 1)];
-        off[0] = 0;
-        for (int i = 0; i < sb_cols; i++)
-            off[i + 1] = checked_int_span(
-                (size_t)off[i] + (size_t)h_col_counts[col_start + i],
-                "OVR device CSR rebased column offsets");
-        h_batch_nnz[b] = (size_t)off[sb_cols];
-        if (h_batch_nnz[b] > max_batch_nnz) max_batch_nnz = h_batch_nnz[b];
-    }
+    constexpr size_t BYTES_PER_NNZ = 2 * sizeof(float) + 2 * sizeof(int) + 8;
+    size_t cap = SAFE_BATCH_NNZ;
+    size_t mem_cap =
+        rmm_available_device_bytes(0.8) / (size_t)N_STREAMS / BYTES_PER_NNZ;
+    if (mem_cap > 0 && mem_cap < cap) cap = mem_cap;
+    ColumnBatchPlan batches = plan_column_batches_from_counts(
+        n_cols, sub_batch_cols, cap,
+        [&](int c) { return (size_t)h_col_counts[c]; },
+        "OVR device CSR rebased column offsets");
+    sub_batch_cols = batches.sub_batch_cols;
+    int n_batches = batches.n_batches;
+    size_t max_batch_nnz = batches.max_nnz;
 
     // Upload all batch offsets in one H2D.
-    int* d_all_offsets =
-        pool.alloc<int>((size_t)n_batches * (sub_batch_cols + 1));
-    cudaMemcpy(d_all_offsets, h_all_offsets.data(),
-               h_all_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
 
     // ---- Phase 1: per-stream buffers ----
     size_t cub_temp_bytes = 0;
@@ -1028,7 +969,7 @@ static void ovr_sparse_csr_streaming_impl(
         auto stream = streams[s];
         auto& buf = bufs[s];
         int batch_nnz =
-            checked_int_span(h_batch_nnz[b], "OVR device CSR active batch nnz");
+            checked_int_span(batches.nnz[b], "OVR device CSR active batch nnz");
 
         int* src = d_all_offsets + (size_t)b * (sub_batch_cols + 1);
         cudaMemcpyAsync(buf.col_offsets, src, (sb_cols + 1) * sizeof(int),

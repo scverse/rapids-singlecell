@@ -35,54 +35,6 @@ OVO_HOST_SPARSE_SUB_BATCH = 256
 OVO_DEVICE_SPARSE_SUB_BATCH = 128
 OVR_DENSE_SUB_BATCH = 64
 OVO_DENSE_TIERED_SUB_BATCH = 256
-DENSE_HOST_PRELOAD_MAX_GPU_FRACTION = 0.55  # leave headroom for rank buffers
-
-
-def _maybe_preload_host_dense(rg: _RankGenes) -> None:
-    """Preload a moderate host-dense matrix to the GPU (OVO only).
-
-    OVO caches the sorted reference group on the device and ranks every other
-    group against it, so staging the matrix on the GPU once is intended -- it
-    avoids re-streaming the shared reference per group. The OVR path instead
-    streams column chunks from host (see ``ovr_rank_dense_host_streaming``).
-    """
-    X = rg.X
-    if not isinstance(X, np.ndarray) or X.size == 0:
-        return
-
-    try:
-        free, _ = cp.cuda.runtime.memGetInfo()
-    except cp.cuda.runtime.CUDARuntimeError:
-        return
-
-    # Gate on *free* (the rmm_available_device_bytes convention), not total:
-    # under an RMM pool an array below a fraction of total can still exceed free.
-    if X.nbytes > free * DENSE_HOST_PRELOAD_MAX_GPU_FRACTION:
-        return
-
-    registered = False
-    if X.flags.c_contiguous or X.flags.f_contiguous:
-        try:
-            cp.cuda.runtime.hostRegister(X.ctypes.data, X.nbytes, 0)
-            registered = True
-        except cp.cuda.runtime.CUDARuntimeError:
-            registered = False
-
-    try:
-        X_gpu = cp.asarray(X)
-        cp.cuda.get_current_stream().synchronize()
-    # Under RMM an OOM surfaces as a bare MemoryError (std::bad_alloc), which
-    # also subsumes cupy's OutOfMemoryError subclass.
-    except (MemoryError, cp.cuda.runtime.CUDARuntimeError):
-        cp.get_default_memory_pool().free_all_blocks()
-        return
-    finally:
-        if registered:
-            try:
-                cp.cuda.runtime.hostUnregister(X.ctypes.data)
-            except cp.cuda.runtime.CUDARuntimeError:
-                pass
-    rg.X = X_gpu
 
 
 def _choose_wilcoxon_chunk_size(requested: int | None, n_genes: int) -> int:
@@ -191,6 +143,49 @@ def _fill_ovo_stats_from_accumulators(
     means_slots = group_sums_slots / slot_sizes_dev
     rg.means[slot_group_indices] = cp.asnumpy(means_slots)
     # vars left zero: wilcoxon does not output per-group variance.
+    if rg.comp_pts:
+        rg.pts[slot_group_indices] = cp.asnumpy(group_nnz_slots / slot_sizes_dev)
+
+    rg.means_rest = None
+    rg.vars_rest = None
+    rg.pts_rest = None
+    rg._compute_stats_in_chunks = False
+
+
+def _fill_ovo_dense_stats_from_accumulators(
+    rg: _RankGenes,
+    group_sums_slots: cp.ndarray,
+    group_sum_sq_slots: cp.ndarray,
+    group_nnz_slots: cp.ndarray,
+    *,
+    group_sizes: NDArray,
+    test_group_indices: list[int],
+    n_ref: int,
+) -> None:
+    n_test = len(test_group_indices)
+    n_genes = int(group_sums_slots.shape[1])
+    n_groups = len(rg.groups_order)
+    slot_group_indices = np.empty(n_test + 1, dtype=np.intp)
+    slot_group_indices[:n_test] = np.asarray(test_group_indices, dtype=np.intp)
+    slot_group_indices[n_test] = rg.ireference
+    slot_sizes = np.empty(n_test + 1, dtype=np.float64)
+    slot_sizes[:n_test] = group_sizes[slot_group_indices[:n_test]]
+    slot_sizes[n_test] = n_ref
+    slot_sizes_dev = cp.asarray(slot_sizes, dtype=cp.float64)[:, None]
+
+    rg.means = np.zeros((n_groups, n_genes), dtype=np.float64)
+    rg.vars = np.zeros((n_groups, n_genes), dtype=np.float64)
+    rg.pts = np.zeros((n_groups, n_genes), dtype=np.float64) if rg.comp_pts else None
+
+    means_slots = group_sums_slots / slot_sizes_dev
+    vars_slots = group_sum_sq_slots / slot_sizes_dev - means_slots**2
+    vars_slots = cp.where(
+        slot_sizes_dev > 1.0,
+        vars_slots * slot_sizes_dev / (slot_sizes_dev - 1.0),
+        0.0,
+    )
+    rg.means[slot_group_indices] = cp.asnumpy(means_slots)
+    rg.vars[slot_group_indices] = cp.asnumpy(vars_slots)
     if rg.comp_pts:
         rg.pts[slot_group_indices] = cp.asnumpy(group_nnz_slots / slot_sizes_dev)
 
@@ -542,10 +537,8 @@ def wilcoxon(
     return_u_values: bool = False,
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Compute Wilcoxon rank-sum test statistics."""
-    # OVO caches the reference on the GPU and ranks each group against it, so
-    # preloading host-dense input is intended. OVR streams chunks from host.
-    if rg.ireference is not None:
-        _maybe_preload_host_dense(rg)
+    # Host dense OVR and OVO stream column windows from host. Already-device
+    # dense OVO still uses the device-resident tiered planner.
     # Aggregate if on GPU, else defer to chunks.
     rg._basic_stats()
     X = rg.X
@@ -1157,6 +1150,88 @@ def _wilcoxon_with_reference(
             rg=rg,
             test_group_indices=test_group_indices,
             logfoldchanges_gpu=None,
+        )
+
+    if isinstance(X, np.ndarray):
+        if X.dtype.kind != "f" or X.dtype.itemsize < 4:
+            X = X.astype(np.float32)
+        if X.flags.f_contiguous:
+            buf, f_order = X.ravel(order="K"), True
+        elif X.flags.c_contiguous:
+            buf, f_order = X.ravel(order="K"), False
+        else:
+            buf, f_order = np.ascontiguousarray(X).ravel(order="K"), False
+        dense_sub_batch_cols = (
+            _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
+            if chunk_size is not None
+            else OVO_DENSE_TIERED_SUB_BATCH
+        )
+
+        rank_sums = cp.zeros((n_test, n_total_genes), dtype=cp.float64)
+        tie_corr_arr = cp.ones((n_test, n_total_genes), dtype=cp.float64)
+        compute_stats = rg._compute_stats_in_chunks
+        compute_nnz = compute_stats and rg.comp_pts
+        n_groups_stats = n_test + 1
+        stats_shape = (n_groups_stats, n_total_genes) if compute_stats else (1, 1)
+        group_sums = cp.empty(stats_shape, dtype=cp.float64)
+        group_sum_sq = cp.empty(stats_shape, dtype=cp.float64)
+        group_nnz = cp.empty(
+            stats_shape if compute_nnz else (1, 1),
+            dtype=cp.float64,
+        )
+
+        _wc.ovo_rank_dense_host_streaming(
+            buf,
+            ref_row_ids,
+            all_grp_row_ids,
+            offsets_np,
+            rank_sums,
+            tie_corr_arr,
+            group_sums,
+            group_sum_sq,
+            group_nnz,
+            n_full_rows=X.shape[0],
+            n_cols=n_total_genes,
+            n_groups=n_test,
+            f_order=f_order,
+            compute_tie_corr=tie_correct,
+            compute_nnz=compute_nnz,
+            compute_stats=compute_stats,
+            sub_batch_cols=dense_sub_batch_cols,
+        )
+
+        logfoldchanges_gpu = None
+        if compute_stats:
+            if rg._store_wilcoxon_gpu_result and not rg.comp_pts:
+                logfoldchanges_gpu = _ovo_logfoldchanges_from_sums(
+                    rg,
+                    group_sums,
+                    test_sizes,
+                    n_ref,
+                )
+                rg._compute_stats_in_chunks = False
+            else:
+                _fill_ovo_dense_stats_from_accumulators(
+                    rg,
+                    group_sums,
+                    group_sum_sq,
+                    group_nnz,
+                    group_sizes=group_sizes,
+                    test_group_indices=test_group_indices,
+                    n_ref=n_ref,
+                )
+
+        return _finish_ovo(
+            rank_sums,
+            test_sizes,
+            n_ref,
+            tie_corr_arr,
+            tie_correct=tie_correct,
+            use_continuity=use_continuity,
+            return_u_values=return_u_values,
+            rg=rg,
+            test_group_indices=test_group_indices,
+            logfoldchanges_gpu=logfoldchanges_gpu,
         )
 
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
