@@ -103,6 +103,16 @@ constexpr int OVO_LARGE_MAX = 2500;
 // copy ≈ 1GB/stream. Sub-batching keeps (n_g * eff_sb_cols) <= this.
 constexpr size_t GROUP_DENSE_BUDGET_ITEMS = 128 * 1024 * 1024;
 
+// Budget-aware OVO-host pack sizing. Per-stream device scratch that does NOT
+// scale with pack nnz: dense + sorted slabs (each <= GROUP_DENSE_BUDGET) plus
+// rank/tie/seg/cub headroom. Reserved per target stream when bounding pack nnz
+// so the resident packs + sorted ref cache fit device free.
+constexpr size_t OVO_PACK_FIXED_PER_STREAM =
+    4 * GROUP_DENSE_BUDGET_ITEMS * sizeof(float);  // ~2 GB
+// Floor for the budget-derived pack-nnz cap: avoid pathological over-splitting
+// into thousands of tiny packs when device memory is very tight.
+constexpr size_t OVO_MIN_PACK_NNZ = 64 * 1024 * 1024;  // 64M nnz
+
 // Host->device staging-ring slot cap (nnz). Bounds the page-locked footprint:
 // a pack's device buffer is filled in row-blocks of <= this many nonzeros, so
 // the cold pin stays small instead of seconds when pack nnz is large. 32M nnz

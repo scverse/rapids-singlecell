@@ -345,6 +345,29 @@ static void ovo_streaming_csr_host_impl(
         // counts + offsets); splits dense groups across more packs.
         constexpr size_t SAFE_PACK_NNZ = 1500000000;  // < INT_MAX, CUB-safe
 
+        // Budget-aware pack-nnz cap: shrink packs so ~N_STREAMS of them plus
+        // the sorted ref cache and per-stream fixed scratch fit in 90% of free
+        // device memory. On a tight GPU this yields more, smaller packs (the
+        // per-stream device buffers then fit; the Phase-2 stream clamp sets the
+        // final stream count); on a big GPU it stays at the int32-safe cap, so
+        // large-GPU pack layout (and timing) is unchanged. Only the per-stream
+        // pack buffers scale with this; the ref cache is bounded separately.
+        size_t pack_nnz_cap = SAFE_PACK_NNZ;
+        {
+            int target_streams = std::min(N_STREAMS, n_test);
+            if (target_streams < 1) target_streams = 1;
+            size_t dev_budget = rmm_available_device_bytes(0.9);
+            size_t ref_bytes = (size_t)n_ref * (size_t)n_cols * sizeof(float);
+            size_t reserve = (size_t)target_streams * OVO_PACK_FIXED_PER_STREAM;
+            size_t grp_avail =
+                dev_budget > ref_bytes ? dev_budget - ref_bytes : 0;
+            size_t data_avail = grp_avail > reserve ? grp_avail - reserve : 0;
+            size_t cap =
+                data_avail / ((size_t)target_streams * 2 * sizeof(float));
+            if (cap < OVO_MIN_PACK_NNZ) cap = OVO_MIN_PACK_NNZ;
+            if (cap < pack_nnz_cap) pack_nnz_cap = cap;
+        }
+
         int cur_first = 0;
         int cur_rows = 0;
         size_t cur_nnz = 0;
@@ -353,9 +376,8 @@ static void ovo_streaming_csr_host_impl(
             size_t nnz_g = (size_t)(h_grp_indptr_compact[h_grp_offsets[g + 1]] -
                                     h_grp_indptr_compact[h_grp_offsets[g]]);
             int new_rows = cur_rows + n_g;
-            bool can_add =
-                (cur_rows == 0) ||
-                (new_rows <= target_rows && cur_nnz + nnz_g <= SAFE_PACK_NNZ);
+            bool can_add = (cur_rows == 0) || (new_rows <= target_rows &&
+                                               cur_nnz + nnz_g <= pack_nnz_cap);
             if (!can_add) {
                 size_t sb_size =
                     std::min((size_t)n_cols,
