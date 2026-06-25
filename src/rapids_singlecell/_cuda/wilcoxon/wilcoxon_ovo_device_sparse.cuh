@@ -1,12 +1,9 @@
 #pragma once
 
 /**
- * CSR-direct OVO streaming pipeline.
- *
- * One C++ call does everything.  Reference rows are extracted and sorted once
- * across all columns, then each group sub-batch ranks against that cached
- * reference slice.  This mirrors the fast host-CSR path and avoids redoing the
- * reference dense extraction + segmented sort for every column sub-batch.
+ * CSR-direct OVO streaming pipeline. Reference rows are extracted and sorted
+ * once across all columns; each group sub-batch ranks against that cached slice
+ * (mirrors the host-CSR path, avoids per-column reference re-extraction+sort).
  */
 template <typename IndexT = int, typename IndptrT = int>
 static void ovo_streaming_csr_impl(
@@ -16,9 +13,8 @@ static void ovo_streaming_csr_impl(
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
-    // Cap sub_batch_cols so the dense group slab (n_all_grp × sub_batch_cols,
-    // sorted in one CUB call) stays within int32. n_all_grp is a cell count, so
-    // it drives the cap; the reference side is chunked separately below.
+    // Cap sub_batch_cols so the group slab (n_all_grp × sub_batch_cols, one CUB
+    // sort) stays within int32; n_all_grp (cell count) drives the cap.
     {
         size_t cap = n_all_grp > 0 ? SAFE_BATCH_NNZ / (size_t)n_all_grp
                                    : (size_t)sub_batch_cols;
@@ -53,8 +49,8 @@ static void ovo_streaming_csr_impl(
     }
     int ref_cache_cols = std::min(n_cols, (int)max_ref_cols);
     {
-        // Reference cache holds 2 floats/col/ref-row; size it to ~a third of
-        // what the joint allocator can serve (leaving room for group buffers).
+        // Ref cache = 2 floats/col/ref-row; size to ~1/3 of the allocator
+        // budget, leaving room for group buffers.
         size_t bytes_per_col = (size_t)n_ref * sizeof(float) * 2;
         size_t target_bytes = rmm_available_device_bytes(1.0 / 3.0);
         if (bytes_per_col > 0 && target_bytes >= bytes_per_col) {
@@ -82,9 +78,8 @@ static void ovo_streaming_csr_impl(
     }
 
     // Clamp streams to the per-stream scratch budget (mirrors host OVO): the
-    // group dense slab scales with the cell count, so a fixed stream count
-    // would OOM at scale. The reference cache is allocated separately, so
-    // reserve its footprint first.
+    // group slab scales with cell count, so a fixed stream count would OOM at
+    // scale. Ref cache is allocated separately, so reserve its footprint first.
     {
         size_t per_stream =
             sub_grp_items * sizeof(float) +
@@ -128,8 +123,7 @@ static void ovo_streaming_csr_impl(
         bufs[s].grp_dense = pool.alloc<float>(sub_grp_items);
         bufs[s].cub_temp =
             run_huge ? pool.alloc<uint8_t>(cub_temp_bytes) : nullptr;
-        // LARGE/HUGE now share the ref tie base too: allocate whenever
-        // correcting.
+        // LARGE/HUGE share the ref tie base: allocate whenever correcting.
         bufs[s].ref_tie_sums =
             compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].sub_rank_sums =
@@ -243,10 +237,8 @@ static void ovo_streaming_csr_impl(
 }
 
 /**
- * CSC-direct OVO streaming pipeline.
- *
- * Like the CSR variant, but extracts rows via lookup maps so it can operate on
- * native CSC input without converting the whole matrix.
+ * CSC-direct OVO streaming pipeline. Like the CSR variant, but extracts rows
+ * via lookup maps to operate on native CSC input without converting the matrix.
  */
 template <typename IndexT = int, typename IndptrT = int>
 static void ovo_streaming_csc_impl(
@@ -256,9 +248,8 @@ static void ovo_streaming_csc_impl(
     int n_groups, bool compute_tie_corr, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
-    // Cap sub_batch_cols so both dense slabs (n_ref × sub_batch_cols and
-    // n_all_grp × sub_batch_cols, each sorted in one CUB call) stay within
-    // int32. These row counts are cell counts, so they drive the cap.
+    // Cap sub_batch_cols so both slabs (n_ref× and n_all_grp× sub_batch_cols,
+    // each one CUB sort) stay within int32; these cell counts drive the cap.
     {
         size_t max_rows = (size_t)std::max(n_ref, n_all_grp);
         size_t cap =
@@ -306,8 +297,8 @@ static void ovo_streaming_csc_impl(
     }
 
     // Clamp streams to the per-stream scratch budget (mirrors host OVO): the
-    // ref/group dense slabs scale with cell counts, so a fixed stream count
-    // would OOM at scale.
+    // ref/group slabs scale with cell counts, so a fixed count would OOM at
+    // scale.
     {
         size_t per_stream =
             2 * sub_ref_items * sizeof(float) +
@@ -353,8 +344,7 @@ static void ovo_streaming_csc_impl(
         bufs[s].grp_dense = pool.alloc<float>(sub_grp_items);
         bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
         bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
-        // LARGE/HUGE now share the ref tie base too: allocate whenever
-        // correcting.
+        // LARGE/HUGE share the ref tie base: allocate whenever correcting.
         bufs[s].ref_tie_sums =
             compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].sub_rank_sums =

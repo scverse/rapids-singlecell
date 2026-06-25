@@ -19,13 +19,11 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
 }
 
 // CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
-//
-// Decide smem-vs-gmem for the DENSE OVR rank kernel. Per-block accumulator is
-// (n_groups + 32) doubles; when that exceeds the per-block smem limit (~48 KB)
-// it must fall back to a global-memory accumulator (use_gmem=true), flipping at
-// roughly n_groups > 6112. Not dead: smem mode with an oversized request fails
-// to launch. Limit is device-queried via wilcoxon_max_smem_per_block(), so it
-// auto-scales.
+// smem-vs-gmem for the DENSE OVR rank kernel. Per-block accumulator is
+// (n_groups+32) doubles; over the per-block smem limit (~48 KB) it falls back
+// to gmem (use_gmem=true), flipping at roughly n_groups > 6112. Not dead: smem
+// mode with an oversized request fails to launch. Limit device-queried via
+// wilcoxon_max_smem_per_block(), so it auto-scales.
 static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(n_groups + 32) * sizeof(double);
     if (need <= wilcoxon_max_smem_per_block()) {
@@ -38,17 +36,14 @@ static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
 }
 
 /**
- * CRITICAL — DO NOT REMOVE the gmem branch. This is the load-bearing path for
- * Perturb-seq / pooled-CRISPR DE, where n_groups is in the thousands.
- *
- * Decide smem-vs-gmem for the sparse OVR rank kernel. Per-block accumulator is
- * (2*n_groups + 32) doubles (grp_sums + grp_nz_count + warp buf); when that
- * exceeds the per-block smem limit (~48 KB) the kernel CANNOT launch in smem
- * mode, so use_gmem=true routes accumulation to a caller-provided gmem buffer.
- * Flips at roughly n_groups > 3056. Reviewers/static analysis have twice
- * mistaken this fallback for dead code; it is the ONLY path that works at large
- * n_groups. Limit is device-queried via wilcoxon_max_smem_per_block(), so the
- * threshold auto-scales.
+ * CRITICAL — DO NOT REMOVE the gmem branch. Load-bearing path for Perturb-seq /
+ * pooled-CRISPR DE (n_groups in the thousands). smem-vs-gmem for the sparse OVR
+ * rank kernel. Per-block accumulator is (2*n_groups+32) doubles (grp_sums +
+ * grp_nz_count + warp buf); over the per-block smem limit (~48 KB) the kernel
+ * CANNOT launch in smem mode, so use_gmem=true routes to a caller gmem buffer.
+ * Flips at roughly n_groups > 3056. Twice mistaken for dead code; it is the
+ * ONLY path that works at large n_groups. Limit device-queried via
+ * wilcoxon_max_smem_per_block(), so the threshold auto-scales.
  */
 static size_t sparse_ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(2 * n_groups + 32) * sizeof(double);
@@ -75,14 +70,11 @@ __global__ void fill_row_indices_kernel(int* __restrict__ vals, int n_rows,
 }
 
 /**
- * Read one transferred dense column-batch (native dtype `T`) into float32 in
- * F-order (column-major), the layout the segmented sort expects. Operates on a
- * single sub-batch (n_rows x sb_cols) only -- the full array is never
- * reordered/transposed.
- *   f_order=true : staging is already F-order -> identity cast.
- *   f_order=false: staging is C-order (n_rows x sb_cols, row-major); each
- *                  element is read into its F-order slot while casting.
- * Grid-stride over n_rows*sb_cols elements.
+ * Read one dense column-batch (native `T`) into f32 F-order (the layout the
+ * segmented sort expects); single sub-batch only, full array never transposed.
+ *   f_order=true : staging already F-order -> identity cast.
+ *   f_order=false: staging C-order; read into the F-order slot while casting.
+ * Grid-stride over n_rows*sb_cols.
  */
 template <typename T>
 __global__ void dense_block_to_f32_kernel(const T* __restrict__ stg,
@@ -103,12 +95,11 @@ __global__ void dense_block_to_f32_kernel(const T* __restrict__ stg,
 }
 
 /**
- * Accumulate per-(group, column) sums (+ optional nnz) from a transferred dense
- * column-batch, reading the NATIVE dtype staging in f64 so means match the
- * Aggregate path (the f32 cast is only for ranking). One block per column.
- * `group_sums`/`group_nnz` are this batch's (n_groups x sb_cols) buffers and
- * must be pre-zeroed. Mirrors the sparse cast+accumulate the CSC host path
- * runs.
+ * Accumulate per-(group, column) sums (+optional nnz) from a dense
+ * column-batch, reading NATIVE staging in f64 so means match the Aggregate path
+ * (the f32 cast is only for ranking). One block per column;
+ * group_sums/group_nnz are this batch's (n_groups x sb_cols) buffers and must
+ * be pre-zeroed.
  */
 template <typename T>
 __global__ void dense_group_accumulate_kernel(

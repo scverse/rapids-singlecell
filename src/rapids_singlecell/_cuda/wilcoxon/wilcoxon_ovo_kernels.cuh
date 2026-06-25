@@ -6,8 +6,7 @@
 
 /**
  * Build CUB segmented-sort ranges for HUGE-band groups. Ranges point into the
- * original dense group layout so the presorted rank kernel reads normal
- * per-group positions.
+ * original dense group layout (normal per-group positions).
  */
 __global__ void build_huge_seg_offsets_kernel(
     const int* __restrict__ grp_offsets, const int* __restrict__ group_ids,
@@ -26,10 +25,9 @@ __global__ void build_huge_seg_offsets_kernel(
 }
 
 /**
- * Sizing knobs for LARGE-band dispatch: when the largest group fits in shared
- * memory, a fused bitonic-sort + binary-search kernel handles the group per
- * block; otherwise fall back to the HUGE band (CUB segmented sort + pre-sorted
- * rank kernel).
+ * Sizing knobs for LARGE-band dispatch: largest group fits in smem -> fused
+ * bitonic-sort + binary-search kernel per block; else fall back to HUGE band
+ * (CUB segmented sort + pre-sorted rank kernel).
  */
 struct OvoTierPlan {
     int max_grp_size = 0;
@@ -41,18 +39,15 @@ struct OvoTierPlan {
     size_t large_smem = 0;
 };
 
-// Single source of truth for OVO tier dispatch (used by the dense path AND all
-// four sparse OVO impls, which extract ref+group rows to dense then call this).
-// Scans group sizes once; returns which size bands to co-launch (by max group):
+// Single source of truth for OVO tier dispatch (dense + all four sparse OVO
+// impls). Scans group sizes once; co-launches by max group size:
 //   MEDIUM (<=512):  ovo_rank_medium_kernel (no sort; O(n^2) in-group count)
-//   LARGE  (<=2500): ovo_rank_large_kernel  (fused smem bitonic sort)
-//   HUGE   (>2500):  CUB segmented sort + ovo_rank_huge_kernel (presorted rank)
-// MEDIUM is the smallest tier (the WARP/SMALL sub-tiers were removed -- no
-// measurable speedup on real data; archived in
-// .claude/wilcoxon-warp-small-tiers-removed.md). MEDIUM co-launches with LARGE
-// or HUGE; the upper tier skips groups ≤ OVO_MEDIUM_MAX (skip_n_grp_le). LARGE
-// is device-adapted: if its smem would exceed the per-block limit it falls back
-// to HUGE.
+//   LARGE  (<=2500): ovo_rank_sorted_kernel<true>  (fused smem bitonic sort)
+//   HUGE   (>2500):  CUB segmented sort + ovo_rank_sorted_kernel<false>
+// MEDIUM co-launches with the upper tier, which skips groups <= OVO_MEDIUM_MAX
+// (skip_n_grp_le). LARGE falls back to HUGE if smem exceeds the per-block
+// limit. (WARP/SMALL sub-tiers removed --
+// .claude/wilcoxon-warp-small-tiers-removed.md.)
 static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
     OvoTierPlan c;
     for (int g = 0; g < n_groups; g++) {
@@ -62,18 +57,17 @@ static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
         if (sz > OVO_MEDIUM_MAX) c.above_medium = true;
     }
 
-    // run_large: the fused smem-sort fast path for groups > MEDIUM but ≤ LARGE.
+    // run_large: fused smem-sort fast path for groups > MEDIUM but <= LARGE.
     c.run_large = c.above_medium && (c.max_grp_size <= OVO_LARGE_MAX);
     if (c.run_large) {
         c.large_padded = 1;
         while (c.large_padded < c.max_grp_size) c.large_padded <<= 1;
         c.large_tpb = std::min(c.large_padded, MAX_THREADS_PER_BLOCK);
-        c.large_smem = (size_t)c.large_padded * sizeof(float) +
-                       WARP_REDUCE_BUF * sizeof(double);
-        // Device-adapt: if the fused-sort buffer exceeds the per-block smem
-        // limit, fall back to HUGE (no smem cap) instead of launching a kernel
-        // that would fail. Inert at the current ~16.6KB threshold; guards
-        // against threshold/device-limit changes.
+        // dynamic smem = grp_smem only; warp_buf is static in the kernel.
+        c.large_smem = (size_t)c.large_padded * sizeof(float);
+        // Device-adapt: if fused-sort buffer exceeds the per-block smem limit,
+        // fall back to HUGE (no smem cap). Inert at the ~16.6KB threshold;
+        // guards against threshold/device-limit changes.
         if (c.large_smem > wilcoxon_max_smem_per_block()) {
             c.run_large = false;
         }
@@ -117,9 +111,8 @@ static inline void launch_ovo_medium(
     CUDA_CHECK_LAST_ERROR(ovo_rank_medium_kernel);
 }
 
-// Per-stream scratch consumed by ovo_dispatch_tiers (one set per CUDA stream).
-// grp_sorted/grp_seg_*/grp_cub_temp are only needed for the HUGE band and may
-// be null otherwise.
+// Per-stream scratch for ovo_dispatch_tiers (one set per CUDA stream).
+// grp_sorted/grp_seg_*/grp_cub_temp are HUGE-band only; may be null otherwise.
 struct OvoTierScratch {
     double* ref_tie_sums;  // [sb_cols] pre-computed reference tie sums, or null
     double* sub_rank_sums;  // [n_groups * sb_cols] rank-sum output accumulator
@@ -130,12 +123,11 @@ struct OvoTierScratch {
     uint8_t* grp_cub_temp;  // HUGE: CUB scratch
 };
 
-// SINGLE OVO ranking engine, shared by the dense path and all four sparse OVO
-// impls (host/device CSC/CSR). Given a sorted reference slice and a dense group
-// slice for one column sub-batch, runs the size-banded dispatch from `plan`
-// (see make_ovo_tier_plan): co-launch MEDIUM for groups ≤512, then LARGE (fused
-// smem sort) OR HUGE (CUB segmented sort) for the rest. Callers differ only in
-// how they produce ref_sorted / grp_dense.
+// SINGLE OVO ranking engine, shared by dense + all four sparse OVO impls
+// (host/device CSC/CSR). Given a sorted reference slice and a dense group slice
+// for one column sub-batch, runs the size-banded dispatch from `plan` (see
+// make_ovo_tier_plan). Callers differ only in how they produce ref_sorted /
+// grp_dense.
 static inline void ovo_dispatch_tiers(
     const float* ref_sorted, const float* grp_dense, const int* grp_offsets,
     const OvoTierPlan& plan, const OvoTierScratch& sc,
@@ -143,9 +135,8 @@ static inline void ovo_dispatch_tiers(
     int sb_grp_items_actual, int tpb_rank, int n_ref, int n_all_grp,
     int sb_cols, int n_groups, bool compute_tie_corr, cudaStream_t stream) {
     // No-tie fast path (tie_correct=False, the default): rank each group value
-    // vs the sorted reference only (U-identity), skipping the group sort and
-    // all tiers. grp_dense is unsorted here, which is exactly what this kernel
-    // wants.
+    // vs the sorted reference only (U-identity), skipping group sort + all
+    // tiers. grp_dense is unsorted here, which this kernel wants.
     if (!compute_tie_corr) {
         constexpr int VS_REF_BLOCK = 256;
         dim3 grid(sb_cols, n_groups);
@@ -158,14 +149,13 @@ static inline void ovo_dispatch_tiers(
     bool run_large = plan.above_medium && plan.run_large;
     bool run_huge = plan.above_medium && !run_large;
 
-    // All tiers (MEDIUM/LARGE/HUGE) share the precomputed reference tie base,
-    // so compute it once per column whenever correcting.
+    // All tiers share the precomputed reference tie base; compute once/column.
     if (compute_tie_corr) {
         launch_ref_tie_sums(ref_sorted, sc.ref_tie_sums, n_ref, sb_cols,
                             stream);
     }
-    // MEDIUM is the smallest tier: it handles every group ≤ OVO_MEDIUM_MAX
-    // (skip_n_grp_le = 0). LARGE/HUGE then take the groups above MEDIUM.
+    // MEDIUM handles every group <= OVO_MEDIUM_MAX (skip_n_grp_le = 0);
+    // LARGE/HUGE take the groups above MEDIUM.
     if (plan.run_medium) {
         launch_ovo_medium(ref_sorted, grp_dense, grp_offsets, sc.ref_tie_sums,
                           sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp,
@@ -176,12 +166,12 @@ static inline void ovo_dispatch_tiers(
     int upper_skip_le = plan.above_medium ? OVO_MEDIUM_MAX : 0;
     if (plan.above_medium && run_large) {
         dim3 grid(sb_cols, n_groups);
-        ovo_rank_large_kernel<<<grid, plan.large_tpb, plan.large_smem,
-                                stream>>>(
-            ref_sorted, grp_dense, grp_offsets, sc.ref_tie_sums,
-            sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp, sb_cols,
-            n_groups, compute_tie_corr, plan.large_padded, upper_skip_le);
-        CUDA_CHECK_LAST_ERROR(ovo_rank_large_kernel);
+        ovo_rank_sorted_kernel<true>
+            <<<grid, plan.large_tpb, plan.large_smem, stream>>>(
+                ref_sorted, grp_dense, grp_offsets, sc.ref_tie_sums,
+                sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp, sb_cols,
+                n_groups, compute_tie_corr, plan.large_padded, upper_skip_le);
+        CUDA_CHECK_LAST_ERROR(ovo_rank_sorted_kernel);
     } else if (run_huge) {
         int sb_grp_seg =
             checked_int_product((size_t)n_sort_groups, (size_t)sb_cols,
@@ -198,10 +188,10 @@ static inline void ovo_dispatch_tiers(
                                "OVO huge-tier group segmented sort");
 
         dim3 grid(sb_cols, n_groups);
-        ovo_rank_huge_kernel<<<grid, tpb_rank, 0, stream>>>(
+        ovo_rank_sorted_kernel<false><<<grid, tpb_rank, 0, stream>>>(
             ref_sorted, sc.grp_sorted, grp_offsets, sc.ref_tie_sums,
             sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp, sb_cols,
-            n_groups, compute_tie_corr, upper_skip_le);
-        CUDA_CHECK_LAST_ERROR(ovo_rank_huge_kernel);
+            n_groups, compute_tie_corr, /*large_padded=*/0, upper_skip_le);
+        CUDA_CHECK_LAST_ERROR(ovo_rank_sorted_kernel);
     }
 }

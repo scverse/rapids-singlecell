@@ -5,11 +5,9 @@
 #include "wilcoxon_block_reduce.cuh"
 #include "wilcoxon_fast_common.cuh"
 
-// ============================================================================
-// Bitonic sort of `n` floats in shared memory, ascending. `n` must be a power
-// of two; pad the tail with +INF before calling. Grid-stride, so any blockDim
-// works (covers both the LARGE runtime-sized and SMALL fixed-size paths).
-// ============================================================================
+// Bitonic sort of `n` floats in shared memory, ascending. `n` MUST be a power
+// of two; pad the tail with +INF before calling. Grid-stride: any blockDim
+// works.
 
 __device__ __forceinline__ void bitonic_sort_smem(float* s, int n) {
     for (int k = 2; k <= n; k <<= 1) {
@@ -30,12 +28,9 @@ __device__ __forceinline__ void bitonic_sort_smem(float* s, int n) {
     }
 }
 
-// ============================================================================
-// Sorted-array bounds over [lo, hi). lower: first index with arr[idx] >= v
-// (count of elements < v). upper: first index with arr[idx] > v (count <= v).
-// Pass an advanced `lo` to exploit per-thread-stride monotonicity. Work for
-// both global and shared `arr`.
-// ============================================================================
+// Sorted-array bounds over [lo, hi). lower: first idx with arr[idx] >= v (count
+// of elements < v). upper: first idx with arr[idx] > v (count <= v). Advanced
+// `lo` exploits per-thread-stride monotonicity; works on global or shared arr.
 
 __device__ __forceinline__ int sorted_lower_bound(const float* arr, int lo,
                                                   int hi, float v) {
@@ -62,8 +57,8 @@ __device__ __forceinline__ int sorted_upper_bound(const float* arr, int lo,
 }
 
 // Mid-rank of `v` in the merged (ref, grp) arrays. Advances the four
-// incremental bounds (pass 0,0,0,0 for a fresh per-element search) and reports
-// the per-array equal counts for tie correction.
+// incremental bounds (pass 0,0,0,0 for a fresh search); reports per-array equal
+// counts for tie correction.
 struct OvoRank {
     double mid_rank;
     int n_eq_ref;
@@ -95,19 +90,12 @@ __device__ __forceinline__ OvoRank ovo_mid_rank(const float* ref, int n_ref,
     return r;
 }
 
-// ============================================================================
-// Amortized tie correction for the LARGE/HUGE bands (group is SORTED).
-//
-// Adds only the group-only / ref-overlap delta on top of the precomputed
-// reference base ref_tie_sums[col] (= ref_tie_sum_kernel), exactly like the
-// MEDIUM band. Iterates the sorted group's UNIQUE values only -- one binary
-// search into the ref per unique value -- so the reference is NOT rescanned per
-// group (the cost a naive full-combined-rescan would pay). This makes tie
-// correction O(n_grp_unique * log n_ref) instead of O(n_ref) per group, which
-// dominates whenever the reference is large (e.g. a perturbation control or a
-// big cluster). Bit-identical: same per-value (t^3 - t) terms, just
-// reassociated against the shared ref base.
-// ============================================================================
+// Amortized tie correction for LARGE/HUGE bands (group is SORTED). Adds only
+// the group-only / ref-overlap delta on the precomputed ref base
+// ref_tie_sums[col], like MEDIUM. Iterates the group's UNIQUE values only (one
+// ref binary search each) so the ref is NOT rescanned per group: O(n_grp_unique
+// * log n_ref) vs O(n_ref)/group. Bit-identical: same per-value (t^3 - t)
+// terms, reassociated against the shared ref base.
 __device__ __forceinline__ void compute_tie_delta_sorted_grp(
     const float* ref_col, int n_ref, const float* grp_col, int n_grp,
     double ref_base, double* warp_buf, double* out) {
@@ -136,16 +124,13 @@ __device__ __forceinline__ void compute_tie_delta_sorted_grp(
         *out = finalize_tie_corr(n_ref + n_grp, ref_base + tie);
 }
 
-// ============================================================================
-// No-tie fast path (tie_correct=False, the default). Ranks each group value
-// against the sorted REFERENCE only, via the Mann-Whitney U identity:
+// No-tie fast path (tie_correct=False, default). Ranks each group value against
+// the sorted REFERENCE only, via the Mann-Whitney U identity:
 //   R_g = n_grp(n_grp+1)/2 + Σ_{g values}(#ref_below + 0.5·#ref_equal)
-// The group-internal ranks collapse to the closed form, so the group block
-// needs NO sort — each value does a full binary search into sorted ref. This
-// eliminates the group segmented sort, ~half of dense-OVO time (see profiling).
-// rank_sums are exact half-integers, so this matches the tiered path
-// bit-for-bit. Grid: (n_cols, n_groups), Block: (tpb,). grp_dense is UNSORTED.
-// ============================================================================
+// Group-internal ranks collapse to the closed form, so the group needs NO sort
+// (each value binary-searches the sorted ref) -- skips the group segmented
+// sort, ~half of dense-OVO time. rank_sums are exact half-integers => matches
+// the tiered path bit-for-bit. Grid (n_cols, n_groups). grp_dense is UNSORTED.
 __global__ void ovo_rank_dense_vs_ref_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets, double* __restrict__ rank_sums,
@@ -178,30 +163,27 @@ __global__ void ovo_rank_dense_vs_ref_kernel(
     }
 }
 
-// ============================================================================
-// Batched rank sums — pre-sorted (binary search, no shared memory sort).
-// Used by the OVO streaming pipeline in wilcoxon_streaming.cu.
-// Each thread carries lower/upper bounds across iterations, exploiting
-// sorted-grp_col monotonicity within its stride.
-// ============================================================================
-
-__global__ void ovo_rank_huge_kernel(
-    const float* __restrict__ ref_sorted, const float* __restrict__ grp_sorted,
+// LARGE/HUGE pre-sorted rank kernel. Grid (n_cols, n_groups); each thread
+// carries lower/upper bounds across its stride (sorted-grp_col monotonicity).
+// SMEM_SORT=true (LARGE, groups <= OVO_LARGE_MAX): load unsorted group into
+// dynamic smem (large_padded floats) + bitonic-sort. =false (HUGE): read a
+// CUB-segmented-sorted group from global. Post-sort body (incremental mid-ranks
+// + amortized ref-tie delta) is shared. Each group owns its rank_sums/tie_corr
+// row, so size-gated co-launch (skip_n_grp_le) never aliases.
+template <bool SMEM_SORT>
+__global__ void ovo_rank_sorted_kernel(
+    const float* __restrict__ ref_sorted, const float* __restrict__ grp_in,
     const int* __restrict__ grp_offsets,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
     double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int skip_n_grp_le /*= 0*/) {
+    int n_groups, bool compute_tie_corr, int large_padded, int skip_n_grp_le) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
 
     int g_start = grp_offsets[grp];
-    int g_end = grp_offsets[grp + 1];
-    int n_grp = g_end - g_start;
-
-    // Size-gated dispatch (see ovo_rank_large_kernel for the contract).
+    int n_grp = grp_offsets[grp + 1] - g_start;
     if (n_grp <= skip_n_grp_le) return;
-
     if (n_grp == 0) {
         if (threadIdx.x == 0) {
             rank_sums[grp * n_cols + col] = 0.0;
@@ -211,119 +193,46 @@ __global__ void ovo_rank_huge_kernel(
     }
 
     const float* ref_col = ref_sorted + (long long)col * n_ref;
-    const float* grp_col = grp_sorted + (long long)col * n_all_grp + g_start;
+    __shared__ double warp_buf[32];
+    const float* grp_col;
+    if constexpr (SMEM_SORT) {
+        extern __shared__ float grp_smem[];
+        const float* src = grp_in + (long long)col * n_all_grp + g_start;
+        for (int i = threadIdx.x; i < n_grp; i += blockDim.x)
+            grp_smem[i] = src[i];
+        for (int i = n_grp + threadIdx.x; i < large_padded; i += blockDim.x)
+            grp_smem[i] = __int_as_float(0x7f800000);  // +INF pad
+        __syncthreads();
+        bitonic_sort_smem(grp_smem, large_padded);
+        grp_col = grp_smem;
+    } else {
+        (void)large_padded;
+        grp_col =
+            grp_in + (long long)col * n_all_grp + g_start;  // CUB-presorted
+    }
 
-    // Incremental binary search bounds (advance monotonically per thread)
-    int ref_lb = 0, ref_ub = 0;
-    int grp_lb = 0, grp_ub = 0;
+    int ref_lb = 0, ref_ub = 0, grp_lb = 0, grp_ub = 0;
     double local_sum = 0.0;
-
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
         OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_col, n_grp, grp_col[i],
                                  ref_lb, ref_ub, grp_lb, grp_ub);
         local_sum += r.mid_rank;
     }
-
-    __shared__ double warp_buf[32];
     double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
     if (!compute_tie_corr) return;
     __syncthreads();
-
-    // grp_col is sorted (CUB segmented sort upstream): amortize the ref tie
-    // contribution via the precomputed base instead of rescanning the ref.
+    // grp_col is sorted: amortize the ref tie contribution via the precomputed
+    // base instead of rescanning the ref per group.
     compute_tie_delta_sorted_grp(ref_col, n_ref, grp_col, n_grp,
                                  ref_tie_sums[col], warp_buf,
                                  &tie_corr[grp * n_cols + col]);
 }
 
-// ============================================================================
-// LARGE-band fused kernel: smem bitonic sort + binary search rank sums
-// For groups up to OVO_LARGE_MAX cells.  No CUB, no global memory sort buffers.
-// Grid: (n_cols, n_groups), Block: min(large_padded, 512)
-// Shared memory: large_padded floats + 32 doubles (warp reduction)
-// ============================================================================
-
-__global__ void ovo_rank_large_kernel(
-    const float* __restrict__ ref_sorted,     // F-order (n_ref, n_cols) sorted
-    const float* __restrict__ grp_dense,      // F-order (n_all_grp, n_cols)
-                                              // unsorted
-    const int* __restrict__ grp_offsets,      // (n_groups + 1,)
-    const double* __restrict__ ref_tie_sums,  // (n_cols,) ref tie base
-    double* __restrict__ rank_sums,           // (n_groups, n_cols) row-major
-    double* __restrict__ tie_corr,            // (n_groups, n_cols) row-major
-    int n_ref, int n_all_grp, int n_cols, int n_groups, bool compute_tie_corr,
-    int large_padded, int skip_n_grp_le /*= 0*/) {
-    int col = blockIdx.x;
-    int grp = blockIdx.y;
-    if (col >= n_cols || grp >= n_groups) return;
-
-    int g_start = grp_offsets[grp];
-    int g_end = grp_offsets[grp + 1];
-    int n_grp = g_end - g_start;
-
-    // Size-gated dispatch: when co-launched with the WARP kernel we
-    // skip groups it's already handling.  Each group owns its own
-    // rank_sums row, so the two kernels' writes never alias.
-    if (n_grp <= skip_n_grp_le) return;
-
-    if (n_grp == 0) {
-        if (threadIdx.x == 0) {
-            rank_sums[grp * n_cols + col] = 0.0;
-            if (compute_tie_corr) tie_corr[grp * n_cols + col] = 1.0;
-        }
-        return;
-    }
-
-    // Shared memory: [large_padded floats | 32 doubles for warp reduction]
-    extern __shared__ char smem_raw[];
-    float* grp_smem = (float*)smem_raw;
-    double* warp_buf = (double*)(smem_raw + large_padded * sizeof(float));
-
-    // Load group into smem, pad with +INF
-    const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
-    for (int i = threadIdx.x; i < n_grp; i += blockDim.x)
-        grp_smem[i] = grp_col[i];
-    for (int i = n_grp + threadIdx.x; i < large_padded; i += blockDim.x)
-        grp_smem[i] = __int_as_float(0x7f800000);  // +INF
-    __syncthreads();
-
-    // Bitonic sort in shared memory
-    bitonic_sort_smem(grp_smem, large_padded);
-
-    // Binary search each sorted grp element against sorted ref;
-    // incremental bounds (monotonic within each thread's stride)
-    const float* ref_col = ref_sorted + (long long)col * n_ref;
-    int ref_lb = 0, ref_ub = 0;
-    int grp_lb = 0, grp_ub = 0;
-    double local_sum = 0.0;
-
-    for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
-        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_smem, n_grp, grp_smem[i],
-                                 ref_lb, ref_ub, grp_lb, grp_ub);
-        local_sum += r.mid_rank;
-    }
-
-    double total = wilcoxon_block_sum(local_sum, warp_buf);
-    if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
-
-    if (!compute_tie_corr) return;
-    __syncthreads();
-
-    // grp_smem is sorted here: amortize the ref tie contribution via the
-    // precomputed base instead of rescanning the ref per group.
-    compute_tie_delta_sorted_grp(ref_col, n_ref, grp_smem, n_grp,
-                                 ref_tie_sums[col], warp_buf,
-                                 &tie_corr[grp * n_cols + col]);
-}
-
-// ============================================================================
-// MEDIUM-band helper: tie contribution of the sorted reference alone.
-// One block per column.  The medium unsorted-rank kernel uses this as a base
-// and only adds group-only/overlap deltas from the unsorted group values.
-// ============================================================================
-
+// MEDIUM-band helper: tie contribution of the sorted reference alone (one block
+// per column). The rank kernels use this base and add only group-only/overlap
+// deltas from the group values.
 __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
                                    double* __restrict__ ref_tie_sums, int n_ref,
                                    int n_cols) {
@@ -348,15 +257,10 @@ __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
     if (threadIdx.x == 0) ref_tie_sums[col] = total;
 }
 
-// ============================================================================
-// MEDIUM-band fused kernel: no-sort direct rank for medium groups.
-//
-// Avoids the smem bitonic sort for groups in (skip_n_grp_le,
-// max_n_grp_le].  Ranks are computed from ref binary searches plus an
-// in-group scan over unsorted shared values.  Tie correction starts from
-// ref_tie_sums[col] and adds only group-only / ref-overlap deltas.
-// ============================================================================
-
+// MEDIUM-band fused kernel: no-sort direct rank for groups in (skip_n_grp_le,
+// max_n_grp_le]. Ranks = ref binary searches + an in-group scan over unsorted
+// shared values. Tie correction starts from ref_tie_sums[col] and adds only
+// group-only / ref-overlap deltas.
 __global__ void ovo_rank_medium_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets,
@@ -433,7 +337,6 @@ __global__ void ovo_rank_medium_kernel(
             finalize_tie_corr(n_ref + n_grp, ref_tie_sums[col] + tie_delta);
 }
 
-// WARP (≤32) and SMALL (33–64) tiers were removed -- MEDIUM is now the smallest
-// tier and covers all groups ≤ OVO_MEDIUM_MAX. The removed kernels (warp/small
-// rank + warp tie helpers) are archived with restore steps in
-// .claude/wilcoxon-warp-small-tiers-removed.md.
+// WARP (≤32) and SMALL (33–64) tiers were removed; MEDIUM is now the smallest
+// tier, covering all groups ≤ OVO_MEDIUM_MAX. Removed kernels archived with
+// restore steps in .claude/wilcoxon-warp-small-tiers-removed.md.

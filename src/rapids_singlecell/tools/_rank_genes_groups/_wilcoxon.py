@@ -276,6 +276,32 @@ def _ovr_z_pvals(
     )
 
 
+def _finish_ovr(
+    rank_sums,
+    group_sizes_dev,
+    rest_sizes,
+    n_cells,
+    tie_corr,
+    *,
+    use_continuity,
+    return_u_values,
+    n_groups,
+):
+    """OVR epilogue: z/p-values -> host -> per-group (idx, scores, pvals)."""
+    scores, p_values = _ovr_z_pvals(
+        rank_sums,
+        group_sizes_dev,
+        rest_sizes,
+        n_cells,
+        tie_corr,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+    )
+    scores_host = scores.get()
+    p_host = p_values.get()
+    return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
+
+
 def _ovo_z_pvals(
     rank_sums: cp.ndarray,
     test_sizes: cp.ndarray,
@@ -300,6 +326,45 @@ def _ovo_z_pvals(
         use_continuity=use_continuity,
         return_u_values=return_u_values,
     )
+
+
+def _finish_ovo(
+    rank_sums,
+    test_sizes,
+    n_ref,
+    tie_corr_arr,
+    *,
+    tie_correct,
+    use_continuity,
+    return_u_values,
+    rg,
+    test_group_indices,
+    logfoldchanges_gpu,
+):
+    """OVO epilogue: z/p-values; stash GPU result if requested, else host tuples."""
+    scores, p_values = _ovo_z_pvals(
+        rank_sums,
+        test_sizes,
+        n_ref,
+        tie_corr_arr,
+        tie_correct=tie_correct,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+    )
+    if rg._store_wilcoxon_gpu_result:
+        rg._wilcoxon_gpu_result = (
+            np.asarray(test_group_indices, dtype=np.intp),
+            scores,
+            p_values,
+            logfoldchanges_gpu,
+        )
+        return []
+    scores_host = scores.get()
+    p_host = p_values.get()
+    return [
+        (group_index, scores_host[slot], p_host[slot])
+        for slot, group_index in enumerate(test_group_indices)
+    ]
 
 
 def _host_sparse_fn_and_arrays(module, base_name: str, X):
@@ -628,7 +693,7 @@ def _wilcoxon_vs_rest(
                 total_nnz=total_nnz,
             )
 
-        scores, p_values = _ovr_z_pvals(
+        return _finish_ovr(
             rank_sums,
             group_sizes_dev,
             rest_sizes,
@@ -636,10 +701,8 @@ def _wilcoxon_vs_rest(
             tie_corr,
             use_continuity=use_continuity,
             return_u_values=return_u_values,
+            n_groups=n_groups,
         )
-        scores_host = scores.get()
-        p_host = p_values.get()
-        return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
 
     if (
         cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X)
@@ -686,7 +749,7 @@ def _wilcoxon_vs_rest(
                 sub_batch_cols=OVR_DEVICE_CSR_SUB_BATCH,
             )
 
-        scores, p_values = _ovr_z_pvals(
+        return _finish_ovr(
             rank_sums,
             group_sizes_dev,
             rest_sizes,
@@ -694,10 +757,8 @@ def _wilcoxon_vs_rest(
             tie_corr,
             use_continuity=use_continuity,
             return_u_values=return_u_values,
+            n_groups=n_groups,
         )
-        scores_host = scores.get()
-        p_host = p_values.get()
-        return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
 
     group_codes_gpu = cp.asarray(rg.group_codes, dtype=cp.int32)
 
@@ -761,7 +822,7 @@ def _wilcoxon_vs_rest(
                 total_sums=total_sums,
                 total_nnz=total_nnz,
             )
-        scores, p_values = _ovr_z_pvals(
+        return _finish_ovr(
             rank_sums,
             group_sizes_dev,
             rest_sizes,
@@ -769,10 +830,8 @@ def _wilcoxon_vs_rest(
             tie_corr,
             use_continuity=use_continuity,
             return_u_values=return_u_values,
+            n_groups=n_groups,
         )
-        scores_host = scores.get()
-        p_host = p_values.get()
-        return [(gi, scores_host[gi], p_host[gi]) for gi in range(n_groups)]
 
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
 
@@ -1021,7 +1080,7 @@ def _wilcoxon_with_reference(
                     n_ref=n_ref,
                 )
 
-        scores, p_values = _ovo_z_pvals(
+        return _finish_ovo(
             rank_sums,
             test_sizes,
             n_ref,
@@ -1029,21 +1088,10 @@ def _wilcoxon_with_reference(
             tie_correct=tie_correct,
             use_continuity=use_continuity,
             return_u_values=return_u_values,
+            rg=rg,
+            test_group_indices=test_group_indices,
+            logfoldchanges_gpu=logfoldchanges_gpu,
         )
-        if rg._store_wilcoxon_gpu_result:
-            rg._wilcoxon_gpu_result = (
-                np.asarray(test_group_indices, dtype=np.intp),
-                scores,
-                p_values,
-                logfoldchanges_gpu,
-            )
-            return []
-        scores_host = scores.get()
-        p_host = p_values.get()
-        return [
-            (group_index, scores_host[slot], p_host[slot])
-            for slot, group_index in enumerate(test_group_indices)
-        ]
 
     if (
         cpsp.isspmatrix_csc(X) or cpsp.isspmatrix_csr(X)
@@ -1098,7 +1146,7 @@ def _wilcoxon_with_reference(
                 sub_batch_cols=OVO_DEVICE_SPARSE_SUB_BATCH,
             )
 
-        scores, p_values = _ovo_z_pvals(
+        return _finish_ovo(
             rank_sums,
             test_sizes,
             n_ref,
@@ -1106,21 +1154,10 @@ def _wilcoxon_with_reference(
             tie_correct=tie_correct,
             use_continuity=use_continuity,
             return_u_values=return_u_values,
+            rg=rg,
+            test_group_indices=test_group_indices,
+            logfoldchanges_gpu=None,
         )
-        if rg._store_wilcoxon_gpu_result:
-            rg._wilcoxon_gpu_result = (
-                np.asarray(test_group_indices, dtype=np.intp),
-                scores,
-                p_values,
-                None,
-            )
-            return []
-        scores_host = scores.get()
-        p_host = p_values.get()
-        return [
-            (group_index, scores_host[slot], p_host[slot])
-            for slot, group_index in enumerate(test_group_indices)
-        ]
 
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
 

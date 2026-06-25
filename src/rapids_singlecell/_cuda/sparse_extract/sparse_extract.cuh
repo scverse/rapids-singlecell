@@ -3,27 +3,22 @@
 #include <cuda_runtime.h>
 
 // ============================================================================
-// Shared CSR/CSC -> {compact CSC, dense} extraction kernels.
-//
-// Header-only templates used by the wilcoxon and rank_genes CUDA modules to
-// land a gene-column window on the GPU in a column-usable layout. Two families:
+// Shared CSR/CSC -> {compact CSC, dense} extraction kernels (header-only).
 //   * compact CSC   (csr_scatter_to_csc)        -> sparse ranker (nnz only)
 //   * dense F-order (csr_tile_to_dense, extract) -> dense ranker (all values)
 // ============================================================================
 
 /**
  * Scatter CSR nonzeros into compact CSC for columns [col_start, col_stop).
- * write_pos[c - col_start] is the prefix-sum offset for column c; each thread
- * atomically claims a unique destination slot.
+ * write_pos[c - col_start] is column c's prefix-sum offset; threads atomically
+ * claim destination slots.
  *
- * PRECONDITION: each row's `indices` must be sorted ascending -- the binary
- * search for col_start and the `break` at col_stop depend on it; unsorted rows
- * would silently drop or misplace nonzeros. Python dispatch calls
- * `sort_indices()` before launching this kernel.
+ * PRECONDITION: each row's `indices` sorted ascending -- the binary search for
+ * col_start and the `break` at col_stop depend on it; unsorted rows would
+ * silently drop/misplace nonzeros. Python dispatch calls sort_indices() first.
  *
- * `row_offset` is added to the local row index so a row-block rebased to a
- * local [0, n_rows) range still records the correct global row id (out-of-core
- * row-streaming OVR path). Defaults to 0 for full-matrix callers.
+ * `row_offset` rebases a local-row block to its global row id (out-of-core
+ * row-streaming OVR path). 0 for full-matrix callers.
  */
 template <typename InT, typename IndexT, typename IndptrT>
 __global__ void csr_scatter_to_csc_kernel(
@@ -54,12 +49,11 @@ __global__ void csr_scatter_to_csc_kernel(
 }
 
 // Single-pass CSR-slice + densify: scatter column window [col_lb, col_ub) into
-// a dense (n_cells, col_ub-col_lb) F-order double buffer, skipping the CSR ->
-// CSC rebuild a `X[:, lb:ub].tocsc()` densify would do.
+// a dense (n_cells, col_ub-col_lb) F-order double buffer.
 //
-// `out` must be pre-zeroed; the atomicAdd also sums duplicate column indices
-// (like scipy's sum_duplicates) -- bit-identical to dense materialization for
-// canonical CSR. Output is always double; input dtype is templated.
+// `out` must be pre-zeroed; atomicAdd sums duplicate column indices (like
+// scipy's sum_duplicates) -- bit-identical to dense materialization for
+// canonical CSR. Output always double; input dtype templated.
 template <typename TData, typename IndptrT, typename IndexT>
 __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
                                          const IndexT* __restrict__ indices,
@@ -86,15 +80,13 @@ __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
     }
 }
 
-// CSC column-window [col_lb, col_ub) -> dense F-order (double), single fused
-// pass. One block per column; threads stride that column's nonzeros. Writes are
-// column-major coalesced and need NO atomicAdd -- canonical CSC has a unique
-// (col,row) per nonzero (the wilcoxon dispatch canonicalizes/sums first). This
-// is the densify-from-CSC counterpart to csr_tile_to_dense_kernel.
+// CSC column-window [col_lb, col_ub) -> dense F-order (double), one block per
+// column. NO atomicAdd -- canonical CSC has a unique (col,row) per nonzero (the
+// wilcoxon dispatch canonicalizes/sums first). CSC counterpart to
+// csr_tile_to_dense_kernel.
 //
-// `out` must be pre-zeroed. `indptr` indexes columns; pass either full-matrix
-// column pointers (with col_lb/col_ub) or a window rebased to [0,
-// col_ub-col_lb).
+// `out` must be pre-zeroed. `indptr` indexes columns; pass full-matrix column
+// pointers (with col_lb/col_ub) or a window rebased to [0, col_ub-col_lb).
 template <typename TData, typename IndptrT, typename IndexT>
 __global__ void csc_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
                                          const IndexT* __restrict__ indices,

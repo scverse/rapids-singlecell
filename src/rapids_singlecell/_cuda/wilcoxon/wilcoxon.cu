@@ -123,13 +123,11 @@ static void launch_ovr_rank_dense_streaming(
     sync_streams(streams, "dense OVR streaming rank");
 }
 
-// Host-streaming dense OVR: same multi-stream pipeline as the host-CSC path
-// (pinned host, round-robin streams, per-batch async H2D overlapping the rank)
-// feeding the dense sort+rank above. Both layouts read into an F-order device
-// block PER SUB-BATCH (the full array is never transposed): F-order is a
-// contiguous memcpy; C-order is a strided cudaMemcpy2DAsync of the sub-batch
-// tile then read into F-order. Input dtype is cast to float32 keys; group sums
-// (+ nnz) are accumulated in f64 from the native-dtype staging for means/pts.
+// Host-streaming dense OVR: pinned-host multi-stream pipeline feeding the dense
+// sort+rank above. Reads each sub-batch into an F-order device block (full
+// array never transposed): F-order = contiguous memcpy, C-order = strided 2D
+// copy. Keys cast to f32; group sums (+nnz) accumulated in f64 from native
+// staging.
 template <typename T>
 static void launch_ovr_rank_dense_host_streaming(
     const T* h_X, bool f_order, const int* group_codes, double* rank_sums,
@@ -154,9 +152,8 @@ static void launch_ovr_rank_dense_host_streaming(
     size_t cub_temp_bytes =
         cub_segmented_sortpairs_temp_bytes(sub_items_i32, sub_batch_cols);
 
-    // Clamp the stream count to the device memory budget (like the sparse
-    // launchers) so a tall/wide host-dense matrix shrinks the pipeline rather
-    // than OOMing on unbounded per-stream sort scratch.
+    // Clamp stream count to device memory budget so a large matrix shrinks the
+    // pipeline rather than OOMing on per-stream sort scratch.
     size_t per_stream_bytes =
         sub_items * (sizeof(T) + (fast_keys ? 0 : sizeof(float)) +
                      sizeof(float) + 2 * sizeof(int)) +
@@ -171,8 +168,7 @@ static void launch_ovr_rank_dense_host_streaming(
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
-    // Best-effort pin of the host array for faster async H2D; on failure (pin
-    // caps / non-pinnable memory) proceed unpinned rather than raising.
+    // Best-effort pin for faster async H2D; on failure proceed unpinned.
     HostRegisterGuard _pin(const_cast<T*>(h_X),
                            (size_t)n_rows * n_cols * sizeof(T), 0,
                            /*best_effort=*/true);
@@ -228,7 +224,7 @@ static void launch_ovr_rank_dense_host_streaming(
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
 
-        // H2D the column window on this stream (overlaps the prior batch rank).
+        // H2D the column window (overlaps the prior batch rank).
         if (f_order) {
             cudaMemcpyAsync(buf.d_stg, h_X + (size_t)col * n_rows,
                             (size_t)sb_items * sizeof(T),
@@ -244,9 +240,8 @@ static void launch_ovr_rank_dense_host_streaming(
         if (fast_keys) {
             keys_in = reinterpret_cast<const float*>(buf.d_stg);
         } else {
-            // dense_block_to_f32_kernel is grid-stride, so a bounded grid
-            // covers any sb_items (up to INT_MAX) with no overflow in the
-            // launch math and enough blocks to saturate the device.
+            // grid-stride kernel: bounded grid covers any sb_items (<=INT_MAX)
+            // with no launch-math overflow.
             const unsigned int grid = (unsigned int)std::min<size_t>(
                 ((size_t)sb_items + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE,
                 65535u);
@@ -266,9 +261,8 @@ static void launch_ovr_rank_dense_host_streaming(
             buf.vals_out, sb_items, sb_cols, buf.seg_offsets,
             buf.seg_offsets + 1, stream, "dense host OVR segmented sort");
 
-        // gmem rank mode atomicAdds onto sub_rank_sums without self-zeroing,
-        // and the per-stream buffer is reused round-robin, so zero it first
-        // (the device-resident launcher does the same).
+        // gmem rank mode atomicAdds without self-zeroing and the buffer is
+        // reused round-robin, so zero it first.
         if (use_gmem) {
             cuda_check(cudaMemsetAsync(
                            buf.sub_rank_sums, 0,
@@ -294,9 +288,8 @@ static void launch_ovr_rank_dense_host_streaming(
                        "dense host OVR tie_corr D2D copy");
         }
 
-        // Group sums (+ nnz) for means/pts, in f64 from the native-dtype
-        // staging (matches the Aggregate path); fed to
-        // _fill_basic_stats_from_accumulators like the host-CSC path.
+        // Group sums (+nnz) for means/pts, f64 from native staging (matches
+        // the Aggregate path).
         if (compute_stats) {
             cudaMemsetAsync(buf.sub_group_sums, 0,
                             (size_t)n_groups * sb_cols * sizeof(double),
@@ -415,8 +408,7 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         bufs[s].ref_cub_temp = pool.alloc<uint8_t>(ref_cub_temp_bytes);
         bufs[s].grp_cub_temp =
             run_huge ? pool.alloc<uint8_t>(grp_cub_temp_bytes) : nullptr;
-        // All tiers share the ref tie base now (LARGE/HUGE included), so
-        // allocate whenever correcting, not only for the small-group tiers.
+        // All tiers share the ref tie base, so allocate whenever correcting.
         bufs[s].ref_tie_sums =
             compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
         bufs[s].sub_rank_sums =

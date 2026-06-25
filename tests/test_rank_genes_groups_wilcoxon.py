@@ -39,12 +39,14 @@ def _make_nonnegative(adata):
 # full-sort path (correct for any sign), so the result matches running the same
 # method on the dense matrix. (t-test/t-test_overestim_var/logreg never need this
 # and accept signed sparse data directly -- e.g. mixscape's LDA t-test.)
+# (method, reference) combos: vs-rest for wilcoxon + binned, plus the OVO
+# (with-reference) wilcoxon path. binned has no with-reference mode.
 @pytest.mark.parametrize(
-    "method",
-    ["wilcoxon", "wilcoxon_binned"],
+    ("method", "reference"),
+    [("wilcoxon", "rest"), ("wilcoxon_binned", "rest"), ("wilcoxon", "b")],
 )
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
-def test_rank_genes_groups_sparse_negative_values_fallback(method, fmt):
+def test_rank_genes_groups_sparse_negative_values_fallback(method, reference, fmt):
     X = np.array(
         [
             [-1.0, 0.0, 2.0],
@@ -63,8 +65,9 @@ def test_rank_genes_groups_sparse_negative_values_fallback(method, fmt):
     dense_fmt = "cupy_dense" if fmt.startswith("cupy") else "numpy_dense"
     dense_adata = sc.AnnData(X=_to_format(X, dense_fmt), obs=obs.copy(), var=var.copy())
 
-    rsc.tl.rank_genes_groups(sparse_adata, "group", method=method, use_raw=False)
-    rsc.tl.rank_genes_groups(dense_adata, "group", method=method, use_raw=False)
+    kw = {"method": method, "reference": reference, "use_raw": False}
+    rsc.tl.rank_genes_groups(sparse_adata, "group", **kw)
+    rsc.tl.rank_genes_groups(dense_adata, "group", **kw)
 
     # Sparse-with-negatives falls back to the dense ranking -> identical result.
     sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
@@ -176,7 +179,10 @@ def test_rank_genes_groups_return_format_removed():
 
 
 @pytest.mark.parametrize("reference", ["rest", "b"])
-@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "cupy_csr"])
+@pytest.mark.parametrize(
+    "fmt",
+    ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_dense", "cupy_csr", "cupy_csc"],
+)
 def test_rank_genes_groups_wilcoxon_return_u_values(reference, fmt):
     X = np.array(
         [
@@ -1453,14 +1459,14 @@ def test_wilcoxon_sparse_integer_bool_data_matches_float32(fmt, data_dtype):
         )
 
 
-@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc"])
+@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr"])
 def test_wilcoxon_sparse_float16_data_raises(fmt):
-    # Unsupported float16 sparse data is rejected with a TypeError.
+    # Unsupported float16 sparse data (host + device) is rejected with TypeError.
     rng = np.random.default_rng(0)
     dense = np.abs(rng.standard_normal((40, 4))).astype(np.float32)
-    mat = sp.csr_matrix(dense) if fmt == "scipy_csr" else sp.csc_matrix(dense)
-    mat.data = mat.data.astype(np.float16)
-    assert mat.data.dtype == np.float16
+    mat = _to_format(dense, fmt)
+    xp = cp if fmt.startswith("cupy") else np
+    mat.data = mat.data.astype(xp.float16)
     adata = sc.AnnData(
         X=mat,
         obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(40)])}),
@@ -1468,100 +1474,6 @@ def test_wilcoxon_sparse_float16_data_raises(fmt):
     )
     with pytest.raises(TypeError, match="float32"):
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
-
-
-@pytest.mark.parametrize("reference", ["rest", "b"])
-@pytest.mark.parametrize("fmt", ["scipy_csc", "cupy_csc", "cupy_dense"])
-def test_rank_genes_groups_wilcoxon_return_u_values_more_formats(reference, fmt):
-    # U-value + continuity epilogue on CSC (host/device) and device-dense.
-    X = np.array(
-        [
-            [5.0, 0.0, 1.0, 2.0],
-            [4.0, 0.0, 1.0, 2.0],
-            [1.0, 3.0, 2.0, 2.0],
-            [0.0, 2.0, 2.0, 2.0],
-            [2.0, 1.0, 0.0, 3.0],
-            [3.0, 1.0, 0.0, 3.0],
-        ],
-        dtype=np.float32,
-    )
-    labels = np.array(["a", "a", "b", "b", "c", "c"])
-    adata = sc.AnnData(
-        X=_to_format(X, fmt),
-        obs=pd.DataFrame({"group": pd.Categorical(labels)}),
-        var=pd.DataFrame(index=[f"g{i}" for i in range(X.shape[1])]),
-    )
-
-    rsc.tl.rank_genes_groups(
-        adata,
-        "group",
-        groups=["a"],
-        reference=reference,
-        method="wilcoxon",
-        use_raw=False,
-        tie_correct=True,
-        use_continuity=True,
-        return_u_values=True,
-        n_genes=adata.n_vars,
-    )
-
-    result = adata.uns["rank_genes_groups"]
-    assert result["params"]["return_u_values"] is True
-    assert result["scores"].dtype["a"] == np.dtype("float64")
-
-    df = sc.get.rank_genes_groups_df(adata, group="a").sort_values("names")
-    mask_group = labels == "a"
-    mask_ref = labels != "a" if reference == "rest" else labels == reference
-    expected = np.array(
-        [
-            mannwhitneyu(
-                X[mask_group, gene],
-                X[mask_ref, gene],
-                alternative="two-sided",
-            ).statistic
-            for gene in range(X.shape[1])
-        ],
-        dtype=np.float64,
-    )
-    gene_to_idx = {name: idx for idx, name in enumerate(adata.var_names)}
-    expected_sorted = np.array([expected[gene_to_idx[name]] for name in df["names"]])
-    np.testing.assert_allclose(df["scores"].to_numpy(), expected_sorted)
-
-
-@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
-def test_rank_genes_groups_sparse_negative_values_fallback_ovo(fmt):
-    # Sparse-negative dense fallback on the OVO (with-reference) path.
-    X = np.array(
-        [
-            [-1.0, 0.0, 2.0],
-            [0.0, 1.0, 0.0],
-            [2.0, 0.0, 1.0],
-            [0.0, 3.0, 0.0],
-            [-2.0, 1.0, 0.0],
-            [1.0, 0.0, 3.0],
-        ],
-        dtype=np.float64,
-    )
-    obs = pd.DataFrame({"group": pd.Categorical(list("aaabbb"), categories=["a", "b"])})
-    var = pd.DataFrame(index=["g0", "g1", "g2"])
-
-    sparse_adata = sc.AnnData(X=_to_format(X, fmt), obs=obs.copy(), var=var.copy())
-    dense_fmt = "cupy_dense" if fmt.startswith("cupy") else "numpy_dense"
-    dense_adata = sc.AnnData(X=_to_format(X, dense_fmt), obs=obs.copy(), var=var.copy())
-
-    kw = {"groupby": "group", "method": "wilcoxon", "use_raw": False, "reference": "b"}
-    rsc.tl.rank_genes_groups(sparse_adata, **kw)
-    rsc.tl.rank_genes_groups(dense_adata, **kw)
-
-    sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
-    dn_scores = dense_adata.uns["rank_genes_groups"]["scores"]
-    for group in sp_scores.dtype.names:
-        np.testing.assert_allclose(
-            np.asarray(sp_scores[group], dtype=float),
-            np.asarray(dn_scores[group], dtype=float),
-            rtol=1e-13,
-            atol=1e-13,
-        )
 
 
 @pytest.mark.parametrize("reference", ["rest", "2"])
@@ -1793,19 +1705,17 @@ def _assert_ovo_matches_scanpy(adata, reference):
                 )
 
 
-def test_ovo_tier_bands_medium_large_match_scanpy():
-    """OVO dense-tiered path: small groups (20/50/300, all <= 512) run through
-    MEDIUM and a 1000-cell group through LARGE; must match scanpy."""
-    adata = _anndata_with_group_sizes(
-        {"ref": 40, "g20": 20, "g50": 50, "g300": 300, "g1000": 1000}, seed=1
-    )
-    _assert_ovo_matches_scanpy(adata, reference="ref")
-
-
-def test_ovo_tier_band_huge_match_scanpy():
-    """OVO dense-tiered path must hit the HUGE band (CUB segmented sort, a
-    test-group > 2500 cells) and match scanpy."""
-    adata = _anndata_with_group_sizes({"ref": 40, "huge": 3000}, seed=2)
+@pytest.mark.parametrize(
+    ("sizes", "seed"),
+    [
+        ({"ref": 40, "g20": 20, "g50": 50, "g300": 300, "g1000": 1000}, 1),
+        ({"ref": 40, "huge": 3000}, 2),
+    ],
+)
+def test_ovo_tier_bands_match_scanpy(sizes, seed):
+    """OVO dense-tiered path across MEDIUM/LARGE (groups <= 512 plus a 1000-cell
+    LARGE) and HUGE (a > 2500-cell group, CUB segmented sort); match scanpy."""
+    adata = _anndata_with_group_sizes(sizes, seed=seed)
     _assert_ovo_matches_scanpy(adata, reference="ref")
 
 
@@ -2289,20 +2199,3 @@ def test_host_csc_int64_indices_cast_matches_int32(reference):
             np.testing.assert_array_equal(
                 np.asarray(r64[fld][grp]), np.asarray(r32[fld][grp])
             )
-
-
-def test_device_sparse_float16_raises():
-    """A cupy sparse matrix with float16 data raises a clear TypeError (the
-    device counterpart of the host float16 guard)."""
-    rng = np.random.default_rng(16)
-    dense = np.abs(rng.standard_normal((60, 4))).astype(np.float32)
-    dense[dense < 0.5] = 0.0
-    mat = cpsp.csr_matrix(cp.asarray(dense))
-    mat.data = mat.data.astype(cp.float16)
-    adata = sc.AnnData(
-        X=mat,
-        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(60)])}),
-        var=pd.DataFrame(index=[f"g{i}" for i in range(4)]),
-    )
-    with pytest.raises(TypeError, match="float32"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
