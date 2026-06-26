@@ -1,8 +1,8 @@
 runners:
-  # Primary: T4. Cheapest, usually has capacity.
-  - name: aws-gpu-runner-g4dn
+  # Primary: A10G. ~3-4x faster than the T4 (Ampere, tensor cores, ~600 GB/s).
+  - name: aws-gpu-runner-g5
     cloud: aws
-    instance_type: g4dn.xlarge
+    instance_type: g5.xlarge
     machine_image: ami-067a4ba2816407ee9
     region: eu-north-1
     preemptible:
@@ -10,10 +10,10 @@ runners:
       - false
     labels:
       - cirun-aws-gpu
-  # Fallback: A10G. cirun picks this when g4dn spot is dry.
-  - name: aws-gpu-runner-g5
+  # Fallback: T4. Cheapest; cirun picks this when g5 spot is dry.
+  - name: aws-gpu-runner-g4dn
     cloud: aws
-    instance_type: g5.xlarge
+    instance_type: g4dn.xlarge
     machine_image: ami-067a4ba2816407ee9
     region: eu-north-1
     preemptible:

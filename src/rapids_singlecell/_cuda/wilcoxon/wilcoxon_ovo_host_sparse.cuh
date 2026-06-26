@@ -1,0 +1,797 @@
+#pragma once
+
+struct OvoHostCsrPack {
+    int first;
+    int end;
+    int n_rows;
+    size_t nnz;
+    int sb_cols;
+};
+
+struct OvoHostCsrPackPlan {
+    std::vector<OvoHostCsrPack> packs;
+    int max_pack_rows = 0;
+    size_t max_pack_nnz = 0;
+    int max_pack_K = 0;
+    int max_pack_items = 0;
+    int max_pack_sb_cols = 0;
+    size_t max_sub_items = 0;
+};
+
+template <typename IndptrT>
+static OvoHostCsrPackPlan plan_ovo_host_csr_packs(
+    const int* h_grp_offsets, const IndptrT* h_grp_indptr_compact,
+    int n_all_grp, int n_test, int n_cols, int n_ref, int sub_batch_cols) {
+    OvoHostCsrPackPlan plan;
+    plan.max_pack_sb_cols = sub_batch_cols;
+
+    int target_packs = N_STREAMS;
+    int target_rows = (n_all_grp + target_packs - 1) / target_packs;
+    if (target_rows < 1) target_rows = 1;
+    size_t budget_cap_rows = GROUP_DENSE_BUDGET_ITEMS / (size_t)sub_batch_cols;
+    if ((size_t)target_rows > budget_cap_rows)
+        target_rows = (int)budget_cap_rows;
+
+    constexpr size_t SAFE_PACK_NNZ = 1500000000;  // < INT_MAX, CUB-safe
+    size_t pack_nnz_cap = SAFE_PACK_NNZ;
+    {
+        int target_streams = std::min(N_STREAMS, n_test);
+        if (target_streams < 1) target_streams = 1;
+        size_t dev_budget = rmm_available_device_bytes(0.9);
+        size_t ref_bytes = (size_t)n_ref * (size_t)n_cols * sizeof(float);
+        size_t reserve = (size_t)target_streams * OVO_PACK_FIXED_PER_STREAM;
+        size_t grp_avail = dev_budget > ref_bytes ? dev_budget - ref_bytes : 0;
+        size_t data_avail = grp_avail > reserve ? grp_avail - reserve : 0;
+        size_t cap = data_avail / ((size_t)target_streams * 2 * sizeof(float));
+        if (cap < OVO_MIN_PACK_NNZ) cap = OVO_MIN_PACK_NNZ;
+        if (cap < pack_nnz_cap) pack_nnz_cap = cap;
+    }
+
+    int cur_first = 0;
+    int cur_rows = 0;
+    size_t cur_nnz = 0;
+    for (int g = 0; g < n_test; g++) {
+        int n_g = h_grp_offsets[g + 1] - h_grp_offsets[g];
+        size_t nnz_g = (size_t)(h_grp_indptr_compact[h_grp_offsets[g + 1]] -
+                                h_grp_indptr_compact[h_grp_offsets[g]]);
+        int new_rows = cur_rows + n_g;
+        bool can_add = (cur_rows == 0) || (new_rows <= target_rows &&
+                                           cur_nnz + nnz_g <= pack_nnz_cap);
+        if (!can_add) {
+            size_t sb_size = std::min(
+                (size_t)n_cols, GROUP_DENSE_BUDGET_ITEMS / (size_t)cur_rows);
+            if (sb_size < (size_t)sub_batch_cols) sb_size = sub_batch_cols;
+            plan.packs.push_back(
+                {cur_first, g, cur_rows, cur_nnz, (int)sb_size});
+            cur_first = g;
+            cur_rows = n_g;
+            cur_nnz = nnz_g;
+        } else {
+            cur_rows = new_rows;
+            cur_nnz += nnz_g;
+        }
+    }
+    if (cur_rows > 0) {
+        size_t sb_size = std::min((size_t)n_cols,
+                                  GROUP_DENSE_BUDGET_ITEMS / (size_t)cur_rows);
+        if (sb_size < (size_t)sub_batch_cols) sb_size = sub_batch_cols;
+        plan.packs.push_back(
+            {cur_first, n_test, cur_rows, cur_nnz, (int)sb_size});
+    }
+
+    for (const OvoHostCsrPack& pk : plan.packs) {
+        int K = pk.end - pk.first;
+        if (pk.n_rows > plan.max_pack_rows) plan.max_pack_rows = pk.n_rows;
+        if (pk.nnz > plan.max_pack_nnz) plan.max_pack_nnz = pk.nnz;
+        if (K > plan.max_pack_K) plan.max_pack_K = K;
+        int pack_items =
+            checked_int_product((size_t)pk.n_rows, (size_t)pk.sb_cols,
+                                "OVO host CSR pack dense slab");
+        if (pack_items > plan.max_pack_items) plan.max_pack_items = pack_items;
+        checked_int_span(pk.nnz, "OVO host CSR pack compacted nnz");
+        if (pk.sb_cols > plan.max_pack_sb_cols)
+            plan.max_pack_sb_cols = pk.sb_cols;
+    }
+    plan.max_sub_items = (size_t)plan.max_pack_items;
+    return plan;
+}
+
+/** Host-streaming CSC OVO: send only each column sub-batch to GPU.
+ *  Row maps/group offsets upload once; results scatter per sub-batch. */
+template <typename InT, typename IndexT, typename IndptrT>
+static void ovo_streaming_csc_host_impl(
+    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
+    const int* h_ref_row_map, const int* h_grp_row_map,
+    const int* h_grp_offsets, const int* h_stats_codes, double* d_rank_sums,
+    double* d_tie_corr, double* d_group_sums, double* d_group_nnz, int n_ref,
+    int n_all_grp, int n_rows, int n_cols, int n_groups, int n_groups_stats,
+    bool compute_tie_corr, bool compute_nnz, int sub_batch_cols) {
+    if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
+
+    // Cap sub_batch_cols so neither the dense ref/group slabs (rows ×
+    // sub_batch_cols, one CUB call) nor per-batch nnz exceed int32.
+    DenseColumnBatchPlan dense_batches = plan_dense_column_batches(
+        std::max(n_ref, n_all_grp), n_cols, sub_batch_cols, SAFE_BATCH_NNZ,
+        "OVO host CSC dense sub-batch");
+    sub_batch_cols = dense_batches.sub_batch_cols;
+    size_t sparse_cap = SAFE_BATCH_NNZ;
+    ColumnBatchPlan batches =
+        plan_csc_column_batches(h_indptr, n_cols, sub_batch_cols, sparse_cap,
+                                "OVO host CSC rebased column offsets");
+    sub_batch_cols = batches.sub_batch_cols;
+
+    auto t1 = make_ovo_tier_plan(h_grp_offsets, n_groups);
+    int max_grp_size = t1.max_grp_size;
+    bool run_large = t1.above_medium && t1.run_large;
+    bool run_huge = t1.above_medium && !run_large;
+    std::vector<int> h_sort_group_ids;
+    int n_sort_groups = n_groups;
+    if (run_huge) {
+        h_sort_group_ids =
+            make_sort_group_ids(h_grp_offsets, n_groups, OVO_MEDIUM_MAX);
+        n_sort_groups = (int)h_sort_group_ids.size();
+    }
+
+    int n_streams = clamp_streams_by_cols(n_cols, sub_batch_cols);
+
+    size_t sub_ref_items = (size_t)n_ref * sub_batch_cols;
+    size_t sub_grp_items = (size_t)n_all_grp * sub_batch_cols;
+    int sub_ref_items_i32 =
+        checked_cub_items(sub_ref_items, "OVO host CSC reference sub-batch");
+    int sub_grp_items_i32 =
+        checked_cub_items(sub_grp_items, "OVO host CSC group sub-batch");
+
+    // CUB temp
+    size_t cub_ref_bytes =
+        cub_segmented_sortkeys_temp_bytes(sub_ref_items_i32, sub_batch_cols);
+    size_t cub_temp_bytes = cub_ref_bytes;
+    if (run_huge) {
+        int max_grp_seg =
+            checked_int_product((size_t)n_sort_groups, (size_t)sub_batch_cols,
+                                "OVO host CSC group segment count");
+        size_t cub_grp_bytes =
+            cub_segmented_sortkeys_temp_bytes(sub_grp_items_i32, max_grp_seg);
+        cub_temp_bytes = std::max(cub_ref_bytes, cub_grp_bytes);
+    }
+
+    size_t max_nnz = batches.max_nnz;
+    constexpr size_t window_value_bytes =
+        sizeof(WilcoxonSparseWindowDTypes::value_type);
+
+    // Clamp streams so per-stream scratch fits the budget: dense slabs scale
+    // with cell counts, so a fixed N_STREAMS would OOM at scale.
+    {
+        size_t per_stream =
+            sparse_window_nnz_bytes<WilcoxonSparseWindowDTypes>(max_nnz) +
+            2 * sub_ref_items * window_value_bytes +
+            (run_huge ? 2 : 1) * sub_grp_items * window_value_bytes +
+            sparse_window_accum_bytes<WilcoxonSparseWindowDTypes>(
+                2 * (size_t)n_groups * sub_batch_cols) +
+            (compute_nnz ? 2 : 1) *
+                sparse_window_accum_bytes<WilcoxonSparseWindowDTypes>(
+                    (size_t)n_groups_stats * sub_batch_cols) +
+            cub_temp_bytes;
+        size_t budget = rmm_available_device_bytes(0.8);
+        n_streams = clamp_streams_by_budget(n_streams, per_stream, budget);
+    }
+
+    // pool first: streams drain before it frees their scratch (RAII order).
+    RmmScratchPool pool;
+    // Bounded staging avoids page-locking huge host CSC arrays and gives every
+    // dtype/index combination the same device footprint.
+    HostStagingRing stage(n_streams, max_nnz);
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
+
+    // Row maps + group offsets + stats codes (uploaded once)
+    int* d_ref_row_map = pool.alloc<int>(n_rows);
+    int* d_grp_row_map = pool.alloc<int>(n_rows);
+    int* d_grp_offsets = pool.alloc<int>(n_groups + 1);
+    int* d_stats_codes = pool.alloc<int>(n_rows);
+    int* d_sort_group_ids = nullptr;
+    cudaMemcpy(d_ref_row_map, h_ref_row_map, n_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grp_row_map, h_grp_row_map, n_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grp_offsets, h_grp_offsets, (n_groups + 1) * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_stats_codes, h_stats_codes, n_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+    if (run_huge) {
+        d_sort_group_ids = pool.alloc<int>(h_sort_group_ids.size());
+        cudaMemcpy(d_sort_group_ids, h_sort_group_ids.data(),
+                   h_sort_group_ids.size() * sizeof(int),
+                   cudaMemcpyHostToDevice);
+    }
+
+    struct StreamBuf {
+        float* d_sparse_data_f32;
+        int* d_sparse_indices;
+        int* d_indptr;
+        float* ref_dense;
+        float* ref_sorted;
+        float* grp_dense;
+        float* grp_sorted;
+        int* ref_seg_offsets;
+        int* grp_seg_offsets;
+        int* grp_seg_ends;
+        uint8_t* cub_temp;
+        double* ref_tie_sums;
+        double* d_rank_sums;
+        double* d_tie_corr;
+        double* d_group_sums;
+        double* d_group_nnz;
+    };
+    std::vector<StreamBuf> bufs(n_streams);
+    for (int s = 0; s < n_streams; s++) {
+        bufs[s].d_sparse_data_f32 = pool.alloc<float>(max_nnz);
+        bufs[s].d_sparse_indices = pool.alloc<int>(max_nnz);
+        bufs[s].d_indptr = pool.alloc<int>(sub_batch_cols + 1);
+        bufs[s].ref_dense = pool.alloc<float>(sub_ref_items);
+        bufs[s].ref_sorted = pool.alloc<float>(sub_ref_items);
+        bufs[s].grp_dense = pool.alloc<float>(sub_grp_items);
+        bufs[s].ref_seg_offsets = pool.alloc<int>(sub_batch_cols + 1);
+        bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
+        // LARGE/HUGE share the ref tie base: allocate whenever correcting.
+        bufs[s].ref_tie_sums =
+            compute_tie_corr ? pool.alloc<double>(sub_batch_cols) : nullptr;
+        bufs[s].d_rank_sums =
+            pool.alloc<double>((size_t)n_groups * sub_batch_cols);
+        bufs[s].d_tie_corr =
+            pool.alloc<double>((size_t)n_groups * sub_batch_cols);
+        bufs[s].d_group_sums =
+            pool.alloc<double>((size_t)n_groups_stats * sub_batch_cols);
+        bufs[s].d_group_nnz = pool.alloc<double>(
+            compute_nnz ? (size_t)n_groups_stats * sub_batch_cols : 1);
+        if (run_huge) {
+            bufs[s].grp_sorted = pool.alloc<float>(sub_grp_items);
+            int max_grp_seg = checked_int_product(
+                (size_t)n_sort_groups, (size_t)sub_batch_cols,
+                "OVO host CSC stream group segment count");
+            bufs[s].grp_seg_offsets = pool.alloc<int>(max_grp_seg);
+            bufs[s].grp_seg_ends = pool.alloc<int>(max_grp_seg);
+        } else {
+            bufs[s].grp_sorted = nullptr;
+            bufs[s].grp_seg_offsets = nullptr;
+            bufs[s].grp_seg_ends = nullptr;
+        }
+    }
+
+    int tpb_rank =
+        round_up_to_warp(std::min(max_grp_size, MAX_THREADS_PER_BLOCK));
+    bool cast_use_gmem = false;
+    size_t smem_cast = cast_accumulate_smem_config(
+        n_groups_stats, compute_nnz, /*compute_totals=*/false, cast_use_gmem);
+
+    int col = 0;
+    int batch_idx = 0;
+    while (col < n_cols) {
+        int sb_cols = std::min(sub_batch_cols, n_cols - col);
+        int sb_ref_actual =
+            checked_int_product((size_t)n_ref, (size_t)sb_cols,
+                                "OVO host CSC active reference sub-batch");
+        int sb_grp_actual =
+            checked_int_product((size_t)n_all_grp, (size_t)sb_cols,
+                                "OVO host CSC active group sub-batch");
+        int s = batch_idx % n_streams;
+        auto stream = streams[s];
+        auto& buf = bufs[s];
+
+        IndptrT ptr_start = h_indptr[col];
+        IndptrT ptr_end = h_indptr[col + sb_cols];
+        size_t nnz = (size_t)(ptr_end - ptr_start);
+        int nnz_i = checked_int_span(nnz, "OVO host CSC active batch nnz");
+
+        // Cast-copy column batch into pinned staging, bulk H2D; the event lets
+        // the next copy overlap compute.
+        stage.wait(s);
+        host_cast_copy_slice(h_data, h_indices, (size_t)ptr_start, nnz_i,
+                             stage.get<0>(s), stage.get<1>(s));
+        cudaMemcpyAsync(buf.d_sparse_data_f32, stage.get<0>(s),
+                        nnz * sizeof(float), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(buf.d_sparse_indices, stage.get<1>(s),
+                        nnz * sizeof(int), cudaMemcpyHostToDevice, stream);
+        stage.record(s, stream);
+        int* src = d_all_offsets + (size_t)batch_idx * (sub_batch_cols + 1);
+        cudaMemcpyAsync(buf.d_indptr, src, (sb_cols + 1) * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream);
+
+        // Data already f32 on device: accumulate stats (cast is f32->f32
+        // no-op).
+        launch_ovr_cast_and_accumulate_sparse<float, int>(
+            buf.d_sparse_data_f32, buf.d_sparse_data_f32, buf.d_sparse_indices,
+            buf.d_indptr, d_stats_codes, buf.d_group_sums, buf.d_group_nnz,
+            nullptr, nullptr, sb_cols, n_groups_stats, compute_nnz,
+            /*compute_totals=*/false, UTIL_BLOCK_SIZE, smem_cast, cast_use_gmem,
+            stream);
+
+        // Extract ref from CSC via row_map, sort
+        cudaMemsetAsync(buf.ref_dense, 0, sb_ref_actual * sizeof(float),
+                        stream);
+        csc_extract_mapped_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+            buf.d_sparse_data_f32, buf.d_sparse_indices, buf.d_indptr,
+            d_ref_row_map, buf.ref_dense, n_ref, 0);
+        CUDA_CHECK_LAST_ERROR(csc_extract_mapped_kernel);
+        upload_linear_offsets(buf.ref_seg_offsets, sb_cols, n_ref, stream);
+        cub_segmented_sortkeys(buf.cub_temp, cub_temp_bytes, buf.ref_dense,
+                               buf.ref_sorted, sb_ref_actual, sb_cols,
+                               buf.ref_seg_offsets, buf.ref_seg_offsets + 1,
+                               stream, "host CSC OVO ref segmented sort");
+
+        // Extract grp from CSC via row_map
+        cudaMemsetAsync(buf.grp_dense, 0, sb_grp_actual * sizeof(float),
+                        stream);
+        csc_extract_mapped_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+            buf.d_sparse_data_f32, buf.d_sparse_indices, buf.d_indptr,
+            d_grp_row_map, buf.grp_dense, n_all_grp, 0);
+        CUDA_CHECK_LAST_ERROR(csc_extract_mapped_kernel);
+
+        // Tier dispatch: sort grp + rank
+        OvoTierScratch sc{buf.ref_tie_sums,    buf.d_rank_sums,
+                          buf.d_tie_corr,      buf.grp_sorted,
+                          buf.grp_seg_offsets, buf.grp_seg_ends,
+                          buf.cub_temp};
+        ovo_dispatch_tiers(buf.ref_sorted, buf.grp_dense, d_grp_offsets, t1, sc,
+                           d_sort_group_ids, n_sort_groups, cub_temp_bytes,
+                           sb_grp_actual, tpb_rank, n_ref, n_all_grp, sb_cols,
+                           n_groups, compute_tie_corr, stream);
+
+        // D2D: scatter sub-batch results into caller's GPU buffers
+        scatter_cols_2d(d_rank_sums + col, buf.d_rank_sums, n_groups, n_cols,
+                        sb_cols, stream);
+        if (compute_tie_corr) {
+            scatter_cols_2d(d_tie_corr + col, buf.d_tie_corr, n_groups, n_cols,
+                            sb_cols, stream);
+        }
+        scatter_cols_2d(d_group_sums + col, buf.d_group_sums, n_groups_stats,
+                        n_cols, sb_cols, stream);
+        if (compute_nnz) {
+            scatter_cols_2d(d_group_nnz + col, buf.d_group_nnz, n_groups_stats,
+                            n_cols, sb_cols, stream);
+        }
+
+        col += sb_cols;
+        batch_idx++;
+    }
+
+    sync_streams(streams, "wilcoxon streaming");
+}
+
+/** Host CSR OVO pipeline with no full-matrix page-lock.
+ *  Pinned pack staging feeds dense extract, sort, rank vs cached ref, scatter.
+ */
+template <typename InT, typename IndexT, typename IndptrT>
+static void ovo_streaming_csr_host_impl(
+    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
+    int n_full_rows, const int* h_ref_row_ids, int n_ref,
+    const int* h_grp_row_ids, const int* h_grp_offsets, int n_all_grp,
+    int n_test, double* d_rank_sums, double* d_tie_corr, double* d_group_sums,
+    double* d_group_nnz, int n_cols, int n_groups_stats, bool compute_tie_corr,
+    bool compute_nnz, bool compute_sums, int sub_batch_cols) {
+    if (n_cols == 0 || n_ref == 0 || n_test == 0 || n_all_grp == 0) return;
+
+    // Compacted indptrs on host. IndptrT for grp (can exceed 2^31 nnz when
+    // large/dense); ref stays int32 (n_ref × n_cols ≪ 2B, matches CUB temp).
+    std::vector<int> h_ref_indptr_compact(n_ref + 1);
+    h_ref_indptr_compact[0] = 0;
+    for (int i = 0; i < n_ref; i++) {
+        int r = h_ref_row_ids[i];
+        IndptrT row_nnz = h_indptr[r + 1] - h_indptr[r];
+        if ((size_t)row_nnz > (size_t)std::numeric_limits<int>::max()) {
+            throw std::runtime_error(
+                "OVO host CSR reference row exceeds int32 compacted nnz limit");
+        }
+        int nnz_i = (int)row_nnz;
+        if ((size_t)h_ref_indptr_compact[i] + (size_t)nnz_i >
+            (size_t)std::numeric_limits<int>::max()) {
+            throw std::runtime_error(
+                "OVO host CSR reference compacted nnz exceeds int32 limit");
+        }
+        h_ref_indptr_compact[i + 1] = h_ref_indptr_compact[i] + nnz_i;
+    }
+    int ref_nnz = h_ref_indptr_compact[n_ref];
+
+    // grp: compacted indptr over concatenated test-group rows.
+    std::vector<IndptrT> h_grp_indptr_compact(n_all_grp + 1);
+    h_grp_indptr_compact[0] = 0;
+    for (int i = 0; i < n_all_grp; i++) {
+        int r = h_grp_row_ids[i];
+        IndptrT nnz_i = h_indptr[r + 1] - h_indptr[r];
+        h_grp_indptr_compact[i + 1] = h_grp_indptr_compact[i] + nnz_i;
+    }
+
+    OvoHostCsrPackPlan pack_plan = plan_ovo_host_csr_packs(
+        h_grp_offsets, h_grp_indptr_compact.data(), n_all_grp, n_test, n_cols,
+        n_ref, sub_batch_cols);
+    const std::vector<OvoHostCsrPack>& packs = pack_plan.packs;
+    int max_pack_rows = pack_plan.max_pack_rows;
+    size_t max_pack_nnz = pack_plan.max_pack_nnz;
+    int max_pack_K = pack_plan.max_pack_K;
+    int max_pack_sb_cols = pack_plan.max_pack_sb_cols;
+    size_t max_sub_items = pack_plan.max_sub_items;
+    if (max_pack_rows == 0) return;
+
+    RmmScratchPool pool;
+    ScopedCudaStream ref_stream(cudaStreamNonBlocking);
+
+    if (compute_sums) {
+        cudaMemsetAsync(d_group_sums, 0,
+                        (size_t)n_groups_stats * n_cols * sizeof(double),
+                        ref_stream);
+    }
+    if (compute_nnz) {
+        cudaMemsetAsync(d_group_nnz, 0,
+                        (size_t)n_groups_stats * n_cols * sizeof(double),
+                        ref_stream);
+    }
+
+    // No full-matrix page-lock: large cudaHostRegister was seconds per call.
+    // Gather reads pageable CSR and pins only small staging buffers.
+    (void)n_full_rows;
+
+    // Pinned staging for the reference gather (compacted f32 vals + int32
+    // cols). Uninitialized: the gather overwrites it, so skip a multi-GB zero.
+    size_t ref_stage_n = ref_nnz ? (size_t)ref_nnz : 1;
+    PinnedRing<float, int> ref_stage(1, ref_stage_n);
+
+    // Upload row_ids + compacted indptrs + group boundaries
+    int* d_ref_row_ids = pool.alloc<int>(n_ref);
+    int* d_grp_row_ids = pool.alloc<int>(n_all_grp);
+    IndptrT* d_grp_indptr_compact = pool.alloc<IndptrT>(n_all_grp + 1);
+    int* d_grp_offsets_full = pool.alloc<int>(n_test + 1);
+    cudaMemcpy(d_ref_row_ids, h_ref_row_ids, n_ref * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grp_row_ids, h_grp_row_ids, n_all_grp * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grp_indptr_compact, h_grp_indptr_compact.data(),
+               (n_all_grp + 1) * sizeof(IndptrT), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grp_offsets_full, h_grp_offsets, (n_test + 1) * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    // Phase 1: ref setup with scoped scratch; sorted cache persists.
+    // Build by column chunk so CUB item counts and extract scratch stay
+    // bounded.
+    size_t ref_items = (size_t)n_ref * (size_t)n_cols;
+    if (ref_items > std::numeric_limits<size_t>::max() / (2 * sizeof(float))) {
+        throw std::runtime_error(
+            "OVO host CSR dense reference cache size overflows size_t");
+    }
+    size_t ref_avail = rmm_available_device_bytes(0.9);
+    if (ref_avail > 0 && ref_items * sizeof(float) > ref_avail) {
+        throw std::runtime_error(
+            "OVO host CSR sorted reference cache requires more GPU memory than "
+            "is available; use native CSC/device sparse input or reduce "
+            "genes/reference size");
+    }
+    int ref_chunk_cols =
+        n_ref > 0
+            ? (int)std::min((size_t)n_cols, SAFE_BATCH_NNZ / (size_t)n_ref)
+            : n_cols;
+    if (ref_chunk_cols < 1) ref_chunk_cols = 1;
+    size_t ref_chunk_items = (size_t)n_ref * (size_t)ref_chunk_cols;
+    int ref_chunk_items_i32 =
+        checked_cub_items(ref_chunk_items, "OVO host CSR ref column chunk");
+    float* d_ref_sorted = pool.alloc<float>(ref_items);
+    {
+        ScopedCudaBuffer ref_data_f32_buf(ref_nnz * sizeof(float));
+        ScopedCudaBuffer ref_indices_buf(ref_nnz * sizeof(int));
+        ScopedCudaBuffer ref_indptr_buf((n_ref + 1) * sizeof(int));
+        ScopedCudaBuffer ref_dense_buf(ref_chunk_items * sizeof(float));
+        ScopedCudaBuffer ref_seg_buf((ref_chunk_cols + 1) * sizeof(int));
+
+        float* d_ref_data_f32 = (float*)ref_data_f32_buf.data();
+        int* d_ref_indices = (int*)ref_indices_buf.data();
+        int* d_ref_indptr = (int*)ref_indptr_buf.data();
+        float* d_ref_dense = (float*)ref_dense_buf.data();
+        int* d_ref_seg = (int*)ref_seg_buf.data();
+
+        cudaMemcpy(d_ref_indptr, h_ref_indptr_compact.data(),
+                   (n_ref + 1) * sizeof(int), cudaMemcpyHostToDevice);
+
+        // Host-gather ref rows into pinned staging, bulk H2D, accumulate stats.
+        if (n_ref > 0 && ref_nnz > 0) {
+            host_gather_rows_compact(h_data, h_indices, h_indptr, h_ref_row_ids,
+                                     h_ref_indptr_compact.data(), 0, n_ref,
+                                     ref_stage.get<0>(0), ref_stage.get<1>(0));
+            cuda_check(cudaMemcpyAsync(d_ref_data_f32, ref_stage.get<0>(0),
+                                       (size_t)ref_nnz * sizeof(float),
+                                       cudaMemcpyHostToDevice, ref_stream),
+                       "OVO host CSR ref staged vals H2D");
+            cuda_check(cudaMemcpyAsync(d_ref_indices, ref_stage.get<1>(0),
+                                       (size_t)ref_nnz * sizeof(int),
+                                       cudaMemcpyHostToDevice, ref_stream),
+                       "OVO host CSR ref staged cols H2D");
+            ref_stage.record(0, ref_stream);
+            if (compute_sums || compute_nnz) {
+                csr_compact_accumulate_kernel<<<n_ref, UTIL_BLOCK_SIZE, 0,
+                                                ref_stream>>>(
+                    d_ref_data_f32, d_ref_indices, d_ref_indptr,
+                    /*d_stats_codes=*/nullptr, /*fixed_slot=*/n_test,
+                    d_group_sums, d_group_nnz, n_ref, n_cols, n_groups_stats,
+                    compute_sums, compute_nnz);
+                CUDA_CHECK_LAST_ERROR(csr_compact_accumulate_kernel);
+            }
+        }
+
+        size_t ref_cub_bytes = cub_segmented_sortkeys_temp_bytes(
+            ref_chunk_items_i32, ref_chunk_cols);
+        ScopedCudaBuffer cub_temp_buf(ref_cub_bytes);
+
+        // Extract + segment-sort the reference per column chunk.
+        for (int cs = 0; cs < n_cols; cs += ref_chunk_cols) {
+            int ce = std::min(cs + ref_chunk_cols, n_cols);
+            int cc = ce - cs;
+            size_t chunk_items = (size_t)n_ref * (size_t)cc;
+            cudaMemsetAsync(d_ref_dense, 0, chunk_items * sizeof(float),
+                            ref_stream);
+            csr_extract_dense_identity_rows_unsorted_kernel<float>
+                <<<n_ref, UTIL_BLOCK_SIZE, 0, ref_stream>>>(
+                    d_ref_data_f32, d_ref_indices, d_ref_indptr, d_ref_dense,
+                    n_ref, cs, ce);
+            CUDA_CHECK_LAST_ERROR(
+                csr_extract_dense_identity_rows_unsorted_kernel);
+            upload_linear_offsets(d_ref_seg, cc, n_ref, ref_stream);
+            cub_segmented_sortkeys(
+                cub_temp_buf.data(), ref_cub_bytes, d_ref_dense,
+                d_ref_sorted + (size_t)cs * (size_t)n_ref, (int)chunk_items, cc,
+                d_ref_seg, d_ref_seg + 1, ref_stream,
+                "host CSR OVO ref segmented sort");
+        }
+        cuda_check(cudaStreamSynchronize(ref_stream),
+                   "host CSR OVO ref sort sync");
+    }  // ref scratch drops here
+
+    // Phase 2: Per-pack streaming
+    auto t1 = make_ovo_tier_plan(h_grp_offsets, n_test);
+    bool may_need_cub = (t1.max_grp_size > OVO_LARGE_MAX);
+
+    constexpr int MAX_GROUP_STREAMS = 4;
+    int n_streams = MAX_GROUP_STREAMS;
+    if (n_test < n_streams) n_streams = n_test;
+    if (n_streams < 1) n_streams = 1;
+    if ((int)packs.size() < n_streams) n_streams = (int)packs.size();
+    if (n_streams < 1) n_streams = 1;
+
+    size_t cub_grp_bytes = 0;
+    if (may_need_cub && max_sub_items > 0) {
+        int max_sub_items_i32 =
+            checked_cub_items(max_sub_items, "OVO host CSR group pack");
+        int max_segments =
+            checked_int_product((size_t)max_pack_K, (size_t)max_pack_sb_cols,
+                                "OVO host CSR max group segment count");
+        cub_grp_bytes =
+            cub_segmented_sortkeys_temp_bytes(max_sub_items_i32, max_segments);
+    }
+    int max_pack_kernel_seg =
+        checked_int_product((size_t)max_pack_K, (size_t)max_pack_sb_cols,
+                            "OVO host CSR pack segment buffer");
+    constexpr size_t window_value_bytes =
+        sizeof(WilcoxonSparseWindowDTypes::value_type);
+
+    // Clamp streams to the post-ref free-memory budget.
+    // Per-stream pack buffers dominate; fewer streams reduce overlap only.
+    {
+        size_t per_stream =
+            sparse_window_nnz_bytes<WilcoxonSparseWindowDTypes>(max_pack_nnz) +
+            (size_t)(max_pack_rows + 1) * sizeof(int)  // grp indptr
+            + (size_t)max_pack_rows * sizeof(int)      // stats codes
+            + (size_t)(max_pack_K + 1) * sizeof(int)   // pack grp offsets
+            + max_sub_items * window_value_bytes       // grp dense
+            + sparse_window_accum_bytes<WilcoxonSparseWindowDTypes>(
+                  2 * (size_t)max_pack_K * max_pack_sb_cols)  // rank+tie
+            + sparse_window_accum_bytes<WilcoxonSparseWindowDTypes>(
+                  (size_t)max_pack_sb_cols)  // ref tie
+            +
+            (may_need_cub
+                 ? max_sub_items * window_value_bytes      // grp sorted
+                       + (size_t)max_pack_K * sizeof(int)  // sort ids
+                       + 2 * (size_t)max_pack_kernel_seg * sizeof(int)  // segs
+                       + cub_grp_bytes  // cub temp
+                 : 0);
+        size_t budget = rmm_available_device_bytes(0.9);
+        n_streams = clamp_streams_by_budget(n_streams, per_stream, budget);
+    }
+
+    ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+
+    struct StreamBuf {
+        float* d_grp_data_f32;
+        int* d_grp_indices;
+        int* d_grp_indptr;
+        int* d_pack_grp_offsets;
+        int* d_pack_stats_codes;
+        float* d_grp_dense;
+        float* d_grp_sorted;
+        double* d_ref_tie_sums;
+        int* d_sort_group_ids;
+        int* d_grp_seg_offsets;
+        int* d_grp_seg_ends;
+        uint8_t* cub_temp;
+        double* d_rank_sums;
+        double* d_tie_corr;
+    };
+    std::vector<StreamBuf> bufs(n_streams);
+    for (int s = 0; s < n_streams; s++) {
+        bufs[s].d_grp_data_f32 = pool.alloc<float>(max_pack_nnz);
+        bufs[s].d_grp_indices = pool.alloc<int>(max_pack_nnz);
+        bufs[s].d_grp_indptr = pool.alloc<int>(max_pack_rows + 1);
+        bufs[s].d_pack_grp_offsets = pool.alloc<int>(max_pack_K + 1);
+        bufs[s].d_pack_stats_codes = pool.alloc<int>(max_pack_rows);
+        bufs[s].d_grp_dense = pool.alloc<float>(max_sub_items);
+        bufs[s].d_ref_tie_sums = pool.alloc<double>(max_pack_sb_cols);
+        bufs[s].d_rank_sums =
+            pool.alloc<double>((size_t)max_pack_K * max_pack_sb_cols);
+        bufs[s].d_tie_corr =
+            pool.alloc<double>((size_t)max_pack_K * max_pack_sb_cols);
+        if (may_need_cub) {
+            bufs[s].d_grp_sorted = pool.alloc<float>(max_sub_items);
+            bufs[s].d_sort_group_ids = pool.alloc<int>(max_pack_K);
+            bufs[s].d_grp_seg_offsets = pool.alloc<int>(max_pack_kernel_seg);
+            bufs[s].d_grp_seg_ends = pool.alloc<int>(max_pack_kernel_seg);
+            bufs[s].cub_temp = pool.alloc<uint8_t>(cub_grp_bytes);
+        } else {
+            bufs[s].d_grp_sorted = nullptr;
+            bufs[s].d_sort_group_ids = nullptr;
+            bufs[s].d_grp_seg_offsets = nullptr;
+            bufs[s].d_grp_seg_ends = nullptr;
+            bufs[s].cub_temp = nullptr;
+        }
+    }
+
+    // Rolling pinned staging fills pack device buffers in <= stage_cap nnz
+    // blocks. This keeps page-locked footprint small while extra slots overlap
+    // H2D.
+    size_t stage_cap = std::min(max_pack_nnz, STAGE_RING_NNZ_CAP);
+    int ring_slots = n_streams + 2;
+    HostStagingRing stage(ring_slots, stage_cap);
+    int stage_slot = 0;
+
+    for (int p = 0; p < (int)packs.size(); p++) {
+        const OvoHostCsrPack& pack = packs[p];
+        int K = pack.end - pack.first;
+        if (K == 0 || pack.n_rows == 0) continue;
+        OvoTierPlan pack_t1 = make_ovo_tier_plan(h_grp_offsets + pack.first, K);
+        int pack_tpb_rank = round_up_to_warp(
+            std::min(pack_t1.max_grp_size, MAX_THREADS_PER_BLOCK));
+        // HUGE skips groups MEDIUM already handled (≤ OVO_MEDIUM_MAX).
+        int pack_huge_skip_le = OVO_MEDIUM_MAX;
+        std::vector<int> h_sort_group_ids;
+        int pack_n_sort_groups = K;
+        if (pack_t1.above_medium && !pack_t1.run_large) {
+            h_sort_group_ids = make_sort_group_ids(h_grp_offsets + pack.first,
+                                                   K, pack_huge_skip_le);
+            pack_n_sort_groups = (int)h_sort_group_ids.size();
+        }
+
+        int s = p % n_streams;
+        cudaStream_t stream = streams[s];
+        auto& buf = bufs[s];
+
+        if (pack_t1.above_medium && !pack_t1.run_large) {
+            cudaMemcpyAsync(buf.d_sort_group_ids, h_sort_group_ids.data(),
+                            h_sort_group_ids.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, stream);
+        }
+
+        int row_start = h_grp_offsets[pack.first];
+        int pack_rows = pack.n_rows;
+        int pack_sb = pack.sb_cols;
+
+        // Rebase pack's output indptr (IndptrT → int32: pack nnz is bounded by
+        // GROUP_DENSE_BUDGET so fits).
+        {
+            int count = pack_rows + 1;
+            int blk = (count + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
+            rebase_indptr_kernel<IndptrT, int>
+                <<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(
+                    d_grp_indptr_compact, buf.d_grp_indptr, row_start, count);
+            CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
+        }
+
+        // Per-pack group offsets on GPU — needed for stats codes.
+        {
+            int count = K + 1;
+            int blk = (count + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
+            rebase_indptr_kernel<int, int><<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(
+                d_grp_offsets_full, buf.d_pack_grp_offsets, pack.first, count);
+            CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
+        }
+
+        {
+            int blk = (pack_rows + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
+            fill_pack_stats_codes_kernel<<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(
+                buf.d_pack_grp_offsets, buf.d_pack_stats_codes, K, pack.first);
+            CUDA_CHECK_LAST_ERROR(fill_pack_stats_codes_kernel);
+        }
+
+        // Host-gather pack rows into rolling staging blocks, then H2D by
+        // offset. Stats accumulate once over the full device-resident pack.
+        if (pack.nnz > 0) {
+            IndptrT pack_base = h_grp_indptr_compact[row_start];
+            int rb0 = 0;
+            while (rb0 < pack_rows) {
+                IndptrT blk_base = h_grp_indptr_compact[row_start + rb0];
+                int rb1 = rb0 + 1;
+                while (rb1 < pack_rows &&
+                       (size_t)(h_grp_indptr_compact[row_start + rb1 + 1] -
+                                blk_base) <= stage_cap)
+                    rb1++;
+                size_t blk_nnz =
+                    (size_t)(h_grp_indptr_compact[row_start + rb1] - blk_base);
+                size_t dev_off = (size_t)(blk_base - pack_base);
+                int slot = stage_slot % ring_slots;
+                stage_slot++;
+                // wait drains a prior H2D out of this slot before we overwrite
+                // it; the event lets the next gather overlap the in-flight H2D.
+                stage.wait(slot);
+                host_gather_rows_compact(
+                    h_data, h_indices, h_indptr,
+                    h_grp_row_ids + row_start + rb0,
+                    h_grp_indptr_compact.data() + row_start + rb0, blk_base,
+                    rb1 - rb0, stage.get<0>(slot), stage.get<1>(slot));
+                cuda_check(
+                    cudaMemcpyAsync(buf.d_grp_data_f32 + dev_off,
+                                    stage.get<0>(slot), blk_nnz * sizeof(float),
+                                    cudaMemcpyHostToDevice, stream),
+                    "OVO host CSR pack staged vals H2D");
+                cuda_check(
+                    cudaMemcpyAsync(buf.d_grp_indices + dev_off,
+                                    stage.get<1>(slot), blk_nnz * sizeof(int),
+                                    cudaMemcpyHostToDevice, stream),
+                    "OVO host CSR pack staged cols H2D");
+                stage.record(slot, stream);
+                rb0 = rb1;
+            }
+            if (compute_sums || compute_nnz) {
+                csr_compact_accumulate_kernel<<<pack_rows, UTIL_BLOCK_SIZE, 0,
+                                                stream>>>(
+                    buf.d_grp_data_f32, buf.d_grp_indices, buf.d_grp_indptr,
+                    buf.d_pack_stats_codes, /*fixed_slot=*/-1, d_group_sums,
+                    d_group_nnz, pack_rows, n_cols, n_groups_stats,
+                    compute_sums, compute_nnz);
+                CUDA_CHECK_LAST_ERROR(csr_compact_accumulate_kernel);
+            }
+        }
+
+        int col = 0;
+        while (col < n_cols) {
+            int sb_cols = std::min(pack_sb, n_cols - col);
+            int sb_items =
+                checked_int_product((size_t)pack_rows, (size_t)sb_cols,
+                                    "OVO host CSR active group sub-batch");
+
+            cudaMemsetAsync(buf.d_grp_dense, 0, sb_items * sizeof(float),
+                            stream);
+            csr_extract_dense_identity_rows_unsorted_kernel<float>
+                <<<pack_rows, UTIL_BLOCK_SIZE, 0, stream>>>(
+                    buf.d_grp_data_f32, buf.d_grp_indices, buf.d_grp_indptr,
+                    buf.d_grp_dense, pack_rows, col, col + sb_cols);
+            CUDA_CHECK_LAST_ERROR(
+                csr_extract_dense_identity_rows_unsorted_kernel);
+
+            const float* ref_sub = d_ref_sorted + (size_t)col * n_ref;
+
+            OvoTierScratch sc{buf.d_ref_tie_sums,    buf.d_rank_sums,
+                              buf.d_tie_corr,        buf.d_grp_sorted,
+                              buf.d_grp_seg_offsets, buf.d_grp_seg_ends,
+                              buf.cub_temp};
+            ovo_dispatch_tiers(ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
+                               pack_t1, sc, buf.d_sort_group_ids,
+                               pack_n_sort_groups, cub_grp_bytes, sb_items,
+                               pack_tpb_rank, n_ref, pack_rows, sb_cols, K,
+                               compute_tie_corr, stream);
+
+            scatter_cols_2d(d_rank_sums + (size_t)pack.first * n_cols + col,
+                            buf.d_rank_sums, K, n_cols, sb_cols, stream);
+            if (compute_tie_corr) {
+                scatter_cols_2d(d_tie_corr + (size_t)pack.first * n_cols + col,
+                                buf.d_tie_corr, K, n_cols, sb_cols, stream);
+            }
+
+            col += sb_cols;
+        }
+    }
+
+    sync_streams(streams, "ovo csr host streaming");
+}

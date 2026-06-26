@@ -65,6 +65,17 @@ pip install rapids-singlecell-cu12
 This installs the precompiled CUDA kernels but **not** the RAPIDS stack (cupy, cuml, cudf, etc.).
 This is the recommended approach for **conda/mamba users** who already have RAPIDS installed in their environment.
 
+```{note}
+The RAPIDS stack is **required**, not optional: `rapids_singlecell` imports
+`cuml`/`cupy` at the top of its package `__init__`, and the compiled kernels
+(Wilcoxon, GMM, …) link `librmm` / `rapids_logger` at runtime. These are
+provided by an existing RAPIDS conda/mamba environment or by the
+`[rapids]`/`[rapids-cuXX]` extra below. Installing the bare
+`rapids-singlecell-cuXX` wheel into an environment without RAPIDS raises an
+`ImportError` on `import rapids_singlecell` itself — not merely when a kernel is
+first used.
+```
+
 ### Prebuilt wheels with RAPIDS dependencies
 
 To also install the RAPIDS stack via pip, use the `rapids` extra.
@@ -102,6 +113,13 @@ pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvid
 ```{note}
 Building from source requires the CUDA toolkit (nvcc) and CMake >= 3.24 to be available in your environment.
 The nvcc/CUDAToolkit found during the build should match the RAPIDS/CuPy CUDA major runtime version in or linked to the environment.
+
+Isolated source builds (the default for `pip install rapids-singlecell` and the
+`git+` installs below) pull `librmm-cu12` into the build environment regardless
+of your local CUDA major. On a **CUDA 13** system this mismatches the toolkit, so
+build inside an environment that already provides a matching `librmm` and pass
+`--no-build-isolation` (e.g. `pip install --no-build-isolation "rapids-singlecell @ git+…"`)
+so the build uses the environment's `librmm` instead of the cu12 wheel.
 ```
 
 ### Install from GitHub
