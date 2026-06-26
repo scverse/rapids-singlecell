@@ -264,8 +264,8 @@ static void ovo_streaming_csc_host_impl(
     int tpb_rank =
         round_up_to_warp(std::min(max_grp_size, MAX_THREADS_PER_BLOCK));
     bool cast_use_gmem = false;
-    size_t smem_cast =
-        cast_accumulate_smem_config(n_groups_stats, compute_nnz, cast_use_gmem);
+    size_t smem_cast = cast_accumulate_smem_config(
+        n_groups_stats, compute_nnz, /*compute_totals=*/false, cast_use_gmem);
 
     int col = 0;
     int batch_idx = 0;
@@ -305,8 +305,9 @@ static void ovo_streaming_csc_host_impl(
         launch_ovr_cast_and_accumulate_sparse<float, int>(
             buf.d_sparse_data_f32, buf.d_sparse_data_f32, buf.d_sparse_indices,
             buf.d_indptr, d_stats_codes, buf.d_group_sums, buf.d_group_nnz,
-            sb_cols, n_groups_stats, compute_nnz, UTIL_BLOCK_SIZE, smem_cast,
-            cast_use_gmem, stream);
+            nullptr, nullptr, sb_cols, n_groups_stats, compute_nnz,
+            /*compute_totals=*/false, UTIL_BLOCK_SIZE, smem_cast, cast_use_gmem,
+            stream);
 
         // Extract ref from CSC via row_map, sort
         cudaMemsetAsync(buf.ref_dense, 0, sb_ref_actual * sizeof(float),
@@ -419,14 +420,17 @@ static void ovo_streaming_csr_host_impl(
     if (max_pack_rows == 0) return;
 
     RmmScratchPool pool;
+    ScopedCudaStream ref_stream(cudaStreamNonBlocking);
 
     if (compute_sums) {
         cudaMemsetAsync(d_group_sums, 0,
-                        (size_t)n_groups_stats * n_cols * sizeof(double));
+                        (size_t)n_groups_stats * n_cols * sizeof(double),
+                        ref_stream);
     }
     if (compute_nnz) {
         cudaMemsetAsync(d_group_nnz, 0,
-                        (size_t)n_groups_stats * n_cols * sizeof(double));
+                        (size_t)n_groups_stats * n_cols * sizeof(double),
+                        ref_stream);
     }
 
     // No full-matrix page-lock (the 280GB cudaHostRegister was ~7s/call). The
@@ -478,7 +482,6 @@ static void ovo_streaming_csr_host_impl(
     int ref_chunk_items_i32 =
         checked_cub_items(ref_chunk_items, "OVO host CSR ref column chunk");
     float* d_ref_sorted = pool.alloc<float>(ref_items);
-    ScopedCudaStream ref_stream(cudaStreamNonBlocking);
     {
         ScopedCudaBuffer ref_data_f32_buf(ref_nnz * sizeof(float));
         ScopedCudaBuffer ref_indices_buf(ref_nnz * sizeof(int));

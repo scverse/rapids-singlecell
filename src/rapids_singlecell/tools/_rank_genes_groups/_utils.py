@@ -26,6 +26,8 @@ def _sparse_has_negative(X) -> bool:
     Dask sparse separately. Dense and t-test/logreg never need this.
     """
     if sp.issparse(X) or cpsp.issparse(X):
+        if np.dtype(X.data.dtype).kind == "c":
+            return False
         return X.nnz > 0 and float(X.data.min()) < 0
     return False
 

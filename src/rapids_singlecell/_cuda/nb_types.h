@@ -121,6 +121,10 @@ using gpu_array_contig = nb::ndarray<T, Device, Contig>;
 // Host (NumPy) array aliases
 template <typename T>
 using host_array = nb::ndarray<T, nb::numpy, nb::ndim<1>>;
+template <typename T>
+using host_array_c2 = nb::ndarray<T, nb::numpy, nb::ndim<2>, nb::c_contig>;
+template <typename T>
+using host_array_f2 = nb::ndarray<T, nb::numpy, nb::ndim<2>, nb::f_contig>;
 
 // Register bindings for both regular CUDA and managed-memory arrays.
 // Usage:

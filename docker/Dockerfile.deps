@@ -1,4 +1,4 @@
-ARG CUDA_VER=13.0.2
+ARG CUDA_VER=13.1.0
 ARG LINUX_VER=ubuntu24.04
 
 FROM nvidia/cuda:${CUDA_VER}-devel-${LINUX_VER}
@@ -7,7 +7,7 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ARG PYTHON_VER=3.13
 # Re-declare after FROM so it is available to RUN steps (passed by docker.yml build-args)
-ARG CUDA_VER=13.0.2
+ARG CUDA_VER=13.1.0
 
 ENV PATH=/opt/conda/bin:$PATH
 ENV PYTHON_VERSION=${PYTHON_VER}

@@ -48,7 +48,9 @@ if (RSC_BUILD_EXTENSIONS)
     ERROR_QUIET
   )
   if (RSC_PYTHON_RMM_DIR AND EXISTS "${RSC_PYTHON_RMM_DIR}/rmm-config.cmake")
-    list(APPEND RSC_RMM_HINTS "${RSC_PYTHON_RMM_DIR}")
+    set(_rsc_python_rmm_hint "${RSC_PYTHON_RMM_DIR}")
+  else()
+    set(_rsc_python_rmm_hint "")
   endif()
   # Wheel builds install librmm/rapids_logger into the isolated build env and
   # write build/.librmm_dir from CIBW_BEFORE_BUILD.  publish.yml also symlinks
@@ -91,6 +93,10 @@ if (RSC_BUILD_EXTENSIONS)
     get_filename_component(_rsc_path_prefix "${_rsc_path_entry}/.." ABSOLUTE)
     _rsc_collect_rapids_python_prefix("${_rsc_path_prefix}")
   endforeach()
+  if (NOT RSC_RMM_HINTS
+      AND NOT "${_rsc_python_rmm_hint}" STREQUAL "")
+    list(APPEND RSC_RMM_HINTS "${_rsc_python_rmm_hint}")
+  endif()
   if (RSC_RAPIDS_CMAKE_PREFIXES)
     list(APPEND CMAKE_PREFIX_PATH ${RSC_RAPIDS_CMAKE_PREFIXES})
     if (RSC_CCCL_HINTS)
@@ -107,7 +113,9 @@ if (RSC_BUILD_EXTENSIONS)
     endif()
   endif()
   if (RSC_RMM_HINTS)
-    find_package(rmm CONFIG REQUIRED HINTS ${RSC_RMM_HINTS})
+    list(GET RSC_RMM_HINTS 0 _rsc_rmm_dir)
+    set(rmm_DIR "${_rsc_rmm_dir}" CACHE PATH "Path to rmm package config" FORCE)
+    find_package(rmm CONFIG REQUIRED)
   else()
     find_package(rmm CONFIG REQUIRED)
   endif()
@@ -189,16 +197,55 @@ function(add_nb_cuda_module target src)
 endfunction()
 
 # An RMM-backed nanobind CUDA module: add_nb_cuda_module plus the shared RMM
-# scratch allocator (rmm_scratch.cu) and the rmm::rmm link. librmm.so is resolved
-# at runtime via the cuML preload (rapids_singlecell/__init__.py imports cuML
-# before these extensions, loading librmm into the process), so no INSTALL_RPATH
-# is needed. Reusable by any module that needs RMM device scratch.
+# scratch allocator (rmm_scratch.cu) and the rmm::rmm link. Installed wheels
+# resolve RAPIDS runtime libs from sibling Python packages; editable source-tree
+# imports still have the _cuda/__init__.py preload fallback.
 function(add_rmm_cuda_module target src)
   add_nb_cuda_module(${target} ${src})
   if (RSC_BUILD_EXTENSIONS)
     target_sources(${target} PRIVATE
         src/rapids_singlecell/_cuda/rmm_scratch.cu)
     target_link_libraries(${target} PRIVATE rmm::rmm)
+    set(_rsc_rmm_build_rpath)
+    set(_rsc_rmm_have_build_librmm FALSE)
+    set(_rsc_rmm_have_build_rapids_logger FALSE)
+    if (DEFINED ENV{CONDA_PREFIX})
+      set(_rsc_rmm_env_site
+          "$ENV{CONDA_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
+      if (EXISTS "${_rsc_rmm_env_site}/librmm/lib64")
+        list(APPEND _rsc_rmm_build_rpath
+            "${_rsc_rmm_env_site}/librmm/lib64")
+        set(_rsc_rmm_have_build_librmm TRUE)
+      endif()
+      if (EXISTS "${_rsc_rmm_env_site}/rapids_logger/lib64")
+        list(APPEND _rsc_rmm_build_rpath
+            "${_rsc_rmm_env_site}/rapids_logger/lib64")
+        set(_rsc_rmm_have_build_rapids_logger TRUE)
+      endif()
+    endif()
+    if (NOT _rsc_rmm_have_build_librmm AND rmm_DIR)
+      get_filename_component(_rsc_rmm_build_librmm_dir
+          "${rmm_DIR}/../.." REALPATH)
+      list(APPEND _rsc_rmm_build_rpath "${_rsc_rmm_build_librmm_dir}")
+    endif()
+    if (NOT _rsc_rmm_have_build_rapids_logger AND rapids_logger_DIR)
+      get_filename_component(_rsc_rmm_build_rapids_logger_dir
+          "${rapids_logger_DIR}/../.." REALPATH)
+      list(APPEND _rsc_rmm_build_rpath
+          "${_rsc_rmm_build_rapids_logger_dir}")
+    endif()
+    set(_rsc_rmm_install_rpath
+        "\$ORIGIN/../../librmm/lib64"
+        "\$ORIGIN/../../rapids_logger/lib64"
+    )
+    if (CUDAToolkit_LIBRARY_DIR)
+      list(APPEND _rsc_rmm_build_rpath "${CUDAToolkit_LIBRARY_DIR}")
+      list(APPEND _rsc_rmm_install_rpath "${CUDAToolkit_LIBRARY_DIR}")
+    endif()
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH "${_rsc_rmm_build_rpath}"
+        INSTALL_RPATH "${_rsc_rmm_install_rpath}"
+    )
   endif()
 endfunction()
 

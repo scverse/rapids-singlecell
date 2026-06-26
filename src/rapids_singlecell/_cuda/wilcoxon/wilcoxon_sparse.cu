@@ -43,16 +43,12 @@ void register_sparse_bindings(nb::module_& m) {
 
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device",
                                   ovr_sparse_csc_streaming_impl, int, int);
-    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device_i64",
-                                  ovr_sparse_csc_streaming_impl, int, int64_t);
-    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device_i64_idx64",
+    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device",
                                   ovr_sparse_csc_streaming_impl, int64_t,
                                   int64_t);
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device",
                                   ovr_sparse_csr_streaming_impl, int, int);
-    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device_i64",
-                                  ovr_sparse_csr_streaming_impl, int, int64_t);
-    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device_i64_idx64",
+    RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csr_device",
                                   ovr_sparse_csr_streaming_impl, int64_t,
                                   int64_t);
 #undef RSC_OVR_SPARSE_DEVICE_BINDING
@@ -67,36 +63,33 @@ void register_sparse_bindings(nb::module_& m) {
            gpu_array_c<double, Device> d_rank_sums,                           \
            gpu_array_c<double, Device> d_tie_corr,                            \
            gpu_array_c<double, Device> d_group_sums,                          \
-           gpu_array_c<double, Device> d_group_nnz, int n_rows, int n_cols,   \
+           gpu_array_c<double, Device> d_group_nnz,                           \
+           gpu_array_c<double, Device> d_total_sums,                          \
+           gpu_array_c<double, Device> d_total_nnz, int n_rows, int n_cols,   \
            int n_groups, bool compute_tie_corr, bool compute_nnz,             \
-           int sub_batch_cols) {                                              \
+           bool compute_totals, int sub_batch_cols) {                         \
             if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             ovr_sparse_csc_host_streaming_impl<InT, IndexT, IndptrT>(         \
                 h_data.data(), h_indices.data(), h_indptr.data(),             \
                 h_group_codes.data(), h_group_sizes.data(),                   \
                 d_rank_sums.data(), d_tie_corr.data(), d_group_sums.data(),   \
-                d_group_nnz.data(), n_rows, n_cols, n_groups,                 \
-                compute_tie_corr, compute_nnz, sub_batch_cols);               \
+                d_group_nnz.data(), d_total_sums.data(), d_total_nnz.data(),  \
+                n_rows, n_cols, n_groups, compute_tie_corr, compute_nnz,      \
+                compute_totals, sub_batch_cols);                              \
         },                                                                    \
         "h_data"_a, "h_indices"_a, "h_indptr"_a, "h_group_codes"_a,           \
         "h_group_sizes"_a, "d_rank_sums"_a, "d_tie_corr"_a, "d_group_sums"_a, \
-        "d_group_nnz"_a, nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_groups"_a, \
-        "compute_tie_corr"_a, "compute_nnz"_a = true,                         \
+        "d_group_nnz"_a, "d_total_sums"_a, "d_total_nnz"_a, nb::kw_only(),    \
+        "n_rows"_a, "n_cols"_a, "n_groups"_a, "compute_tie_corr"_a,           \
+        "compute_nnz"_a = true, "compute_totals"_a = false,                   \
         "sub_batch_cols"_a = SUB_BATCH_COLS)
 
     RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host", float, int, int);
-    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_i64", float, int,
+    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host", double, int, int);
+    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host", float, int64_t,
                                     int64_t);
-    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_f64", double, int,
-                                    int);
-    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_f64_i64", double, int,
+    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host", double, int64_t,
                                     int64_t);
-    // int64 row indices: pass natively, downcast to int32 per-batch on-device
-    // (avoids a full host int32 copy).
-    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_i64_idx64", float,
-                                    int64_t, int64_t);
-    RSC_OVR_SPARSE_CSC_HOST_BINDING("ovr_sparse_csc_host_f64_i64_idx64", double,
-                                    int64_t, int64_t);
 #undef RSC_OVR_SPARSE_CSC_HOST_BINDING
 
 #define RSC_OVR_SPARSE_CSR_HOST_BINDING(NAME, InT, IndexT, IndptrT)           \
@@ -109,36 +102,33 @@ void register_sparse_bindings(nb::module_& m) {
            gpu_array_c<double, Device> d_rank_sums,                           \
            gpu_array_c<double, Device> d_tie_corr,                            \
            gpu_array_c<double, Device> d_group_sums,                          \
-           gpu_array_c<double, Device> d_group_nnz, int n_rows, int n_cols,   \
+           gpu_array_c<double, Device> d_group_nnz,                           \
+           gpu_array_c<double, Device> d_total_sums,                          \
+           gpu_array_c<double, Device> d_total_nnz, int n_rows, int n_cols,   \
            int n_groups, bool compute_tie_corr, bool compute_nnz,             \
-           int sub_batch_cols) {                                              \
+           bool compute_totals, int sub_batch_cols) {                         \
             if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;         \
             ovr_sparse_csr_host_streaming_impl<InT, IndexT, IndptrT>(         \
                 h_data.data(), h_indices.data(), h_indptr.data(),             \
                 h_group_codes.data(), h_group_sizes.data(),                   \
                 d_rank_sums.data(), d_tie_corr.data(), d_group_sums.data(),   \
-                d_group_nnz.data(), n_rows, n_cols, n_groups,                 \
-                compute_tie_corr, compute_nnz, sub_batch_cols);               \
+                d_group_nnz.data(), d_total_sums.data(), d_total_nnz.data(),  \
+                n_rows, n_cols, n_groups, compute_tie_corr, compute_nnz,      \
+                compute_totals, sub_batch_cols);                              \
         },                                                                    \
         "h_data"_a, "h_indices"_a, "h_indptr"_a, "h_group_codes"_a,           \
         "h_group_sizes"_a, "d_rank_sums"_a, "d_tie_corr"_a, "d_group_sums"_a, \
-        "d_group_nnz"_a, nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_groups"_a, \
-        "compute_tie_corr"_a, "compute_nnz"_a = true,                         \
+        "d_group_nnz"_a, "d_total_sums"_a, "d_total_nnz"_a, nb::kw_only(),    \
+        "n_rows"_a, "n_cols"_a, "n_groups"_a, "compute_tie_corr"_a,           \
+        "compute_nnz"_a = true, "compute_totals"_a = false,                   \
         "sub_batch_cols"_a = SUB_BATCH_COLS)
 
     RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host", float, int, int);
-    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_i64", float, int,
+    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host", double, int, int);
+    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host", float, int64_t,
                                     int64_t);
-    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_f64", double, int,
-                                    int);
-    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_f64_i64", double, int,
+    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host", double, int64_t,
                                     int64_t);
-    // int64 column indices: pass natively to avoid a full int32 copy of every
-    // nonzero (~nnz*4 bytes) on large matrices.
-    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_i64_idx64", float,
-                                    int64_t, int64_t);
-    RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host_f64_i64_idx64", double,
-                                    int64_t, int64_t);
 #undef RSC_OVR_SPARSE_CSR_HOST_BINDING
 
 #define RSC_OVO_DEVICE_BINDING(NAME, IMPL, IndexCType, IndptrCType)           \
@@ -167,16 +157,12 @@ void register_sparse_bindings(nb::module_& m) {
 
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device", ovo_streaming_csc_impl,
                            int, int);
-    RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device_i64",
-                           ovo_streaming_csc_impl, int, int64_t);
-    RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device_i64_idx64",
-                           ovo_streaming_csc_impl, int64_t, int64_t);
+    RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device", ovo_streaming_csc_impl,
+                           int64_t, int64_t);
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device", ovo_streaming_csr_impl,
                            int, int);
-    RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device_i64",
-                           ovo_streaming_csr_impl, int, int64_t);
-    RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device_i64_idx64",
-                           ovo_streaming_csr_impl, int64_t, int64_t);
+    RSC_OVO_DEVICE_BINDING("ovo_streaming_csr_device", ovo_streaming_csr_impl,
+                           int64_t, int64_t);
 #undef RSC_OVO_DEVICE_BINDING
 
 #define RSC_OVO_CSC_HOST_BINDING(NAME, InT, IndexT, IndptrT)                  \
@@ -212,16 +198,10 @@ void register_sparse_bindings(nb::module_& m) {
         "compute_nnz"_a = true, "sub_batch_cols"_a = SUB_BATCH_COLS)
 
     RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host", float, int, int);
-    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_i64", float, int, int64_t);
-    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_f64", double, int, int);
-    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_f64_i64", double, int,
+    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host", double, int, int);
+    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host", float, int64_t, int64_t);
+    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host", double, int64_t,
                              int64_t);
-    // int64 row indices: read natively (extraction only, never sorted),
-    // skipping the full host int32 copy.
-    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_i64_idx64", float, int64_t,
-                             int64_t);
-    RSC_OVO_CSC_HOST_BINDING("ovo_streaming_csc_host_f64_i64_idx64", double,
-                             int64_t, int64_t);
 #undef RSC_OVO_CSC_HOST_BINDING
 
 #define RSC_OVO_CSR_HOST_BINDING(NAME, InT, IndexT, IndptrT)                   \
@@ -256,16 +236,10 @@ void register_sparse_bindings(nb::module_& m) {
         "sub_batch_cols"_a = SUB_BATCH_COLS)
 
     RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host", float, int, int);
-    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_i64", float, int, int64_t);
-    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_f64", double, int, int);
-    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_f64_i64", double, int,
+    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host", double, int, int);
+    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host", float, int64_t, int64_t);
+    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host", double, int64_t,
                              int64_t);
-    // int64 column indices: pass natively to avoid a full int32 copy of every
-    // nonzero (~nnz*4 bytes) on large matrices.
-    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_i64_idx64", float, int64_t,
-                             int64_t);
-    RSC_OVO_CSR_HOST_BINDING("ovo_streaming_csr_host_f64_i64_idx64", double,
-                             int64_t, int64_t);
 #undef RSC_OVO_CSR_HOST_BINDING
 }
 

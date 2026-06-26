@@ -85,8 +85,8 @@ def test_rank_genes_groups_sparse_negative_values_fallback(method, reference, fm
 @pytest.mark.parametrize("reference", ["rest", "1"])
 def test_device_sparse_int64_indptr_matches_scanpy(layout, reference):
     # Real int64 indptr only occurs at nnz > 2^31 (unallocatable in CI). cupy
-    # >= 14.1 preserves an explicitly promoted int64 indptr, so a small matrix
-    # promoted to int64 drives the *_i64 device kernels through the public API.
+    # >= 14.1 preserves explicitly promoted int64 indices/indptr, so a small
+    # matrix promoted to int64 drives the int64 device overloads.
     rng = np.random.default_rng(0)
     dense = np.abs(rng.standard_normal((150, 8))).astype(np.float32)
     dense[dense < 0.5] = 0.0
@@ -731,7 +731,8 @@ def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
 # <=~70 (all MEDIUM), so LARGE/HUGE are otherwise never exercised. These force a
 # single large test group.
 @pytest.mark.parametrize(
-    "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
+    "fmt",
+    ["numpy_dense", "cupy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"],
 )
 @pytest.mark.parametrize("tie_correct", [False, True])
 @pytest.mark.parametrize("big", [700, 3000], ids=["large_fused", "huge_cub"])
@@ -886,10 +887,10 @@ def test_wilcoxon_dense_nonfloat_data_matches_float32(data_dtype):
         )
 
 
-# F-contiguous host-dense numpy hits the f_order=True branch of the host-
+# F-contiguous host-dense numpy hits the F-order nanobind overload of the host
 # streaming launcher: float32 -> the reinterpret-cast fast path (no cast kernel),
 # float64 -> dense_block_to_f32_kernel's identity branch. Every numpy_dense
-# fixture elsewhere is C-order, so this is the only coverage of that branch.
+# fixture elsewhere is C-order, so this is the only coverage of that overload.
 # AnnData preserves F-order, so an F-contiguous X reaches the path; result must
 # match the C-order run on identical data.
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -1459,7 +1460,19 @@ def test_wilcoxon_sparse_integer_bool_data_matches_float32(fmt, data_dtype):
         )
 
 
-@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr"])
+def test_wilcoxon_device_sparse_bool_data_raises():
+    counts = np.arange(400).reshape(100, 4) % 3 == 0
+    mat = cpsp.csr_matrix(cp.asarray(counts))
+    adata = sc.AnnData(
+        X=mat,
+        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(100)])}),
+        var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
+    )
+    with pytest.raises(TypeError, match="float32 or float64"):
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+
+
+@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
 def test_wilcoxon_sparse_float16_data_raises(fmt):
     # Unsupported float16 sparse data (host + device) is rejected with TypeError.
     rng = np.random.default_rng(0)
@@ -1473,6 +1486,21 @@ def test_wilcoxon_sparse_float16_data_raises(fmt):
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="float32"):
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+
+
+@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
+def test_wilcoxon_sparse_complex_data_raises(fmt):
+    rng = np.random.default_rng(4)
+    dense = np.abs(rng.standard_normal((40, 4))).astype(np.float32)
+    dense[dense < 0.4] = 0.0
+    mat = _to_format(dense.astype(np.complex64), fmt)
+    adata = sc.AnnData(
+        X=mat,
+        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(40)])}),
+        var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
+    )
+    with pytest.raises(TypeError, match="complex sparse data is not supported"):
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
 
 
@@ -1596,39 +1624,33 @@ def test_wilcoxon_fdr_ties_nan_match_scanpy():
             )
 
 
-def _promote_host_index_dtypes(X, *, indptr64, indices64):
+def _promote_host_index_dtype(X):
     """Copy a host scipy CSR/CSC matrix with promoted index-array dtypes.
 
-    scipy couples indptr/indices to one dtype via get_index_dtype, so the
-    decoupled (i64 indptr / i32 indices) combination only arises by explicit
-    promotion -- which is exactly what drives the templated host kernels.
+    scipy couples indptr/indices to one dtype via get_index_dtype. Real int64
+    index buffers only occur at nnz > 2^31 in practice, so tests promote a small
+    matrix explicitly to drive the int64 templates.
     """
     X = X.copy()
-    if indptr64:
-        X.indptr = X.indptr.astype(np.int64)
-    if indices64:
-        X.indices = X.indices.astype(np.int64)
+    X.indptr = X.indptr.astype(np.int64)
+    X.indices = X.indices.astype(np.int64)
     return X
 
 
 @pytest.mark.parametrize("reference", ["rest", "1"])  # OVR vs OVO host paths
 @pytest.mark.parametrize(
-    ("layout", "data_dtype", "indices64"),
+    ("layout", "data_dtype"),
     [
-        ("csr", np.float32, False),  # *_i64
-        ("csr", np.float32, True),  # *_i64_idx64
-        ("csr", np.float64, False),  # *_f64_i64
-        ("csr", np.float64, True),  # *_f64_i64_idx64
-        ("csc", np.float32, False),  # *_i64        (CSC has no idx64 template)
-        ("csc", np.float64, False),  # *_f64_i64
+        ("csr", np.float32),
+        ("csr", np.float64),
+        ("csc", np.float32),
+        ("csc", np.float64),
     ],
 )
-def test_host_sparse_int64_templates_match_int32(
-    reference, layout, data_dtype, indices64
-):
+def test_host_sparse_int64_templates_match_int32(reference, layout, data_dtype):
     """Exercise the host-sparse int64-indptr / int64-indices kernel templates
-    (the 12 ``*_i64`` / ``*_idx64`` / ``*_f64_i64`` host bindings the suite
-    otherwise never reaches). These differ from the validated int32 host path
+    (the int64-index/indptr overloads the suite otherwise never reaches).
+    These differ from the validated int32 host path
     only in index dtype, so they must be bit-identical to it. Real int64 indices
     only occur at nnz > 2^31 (unallocatable in CI), so we promote a small
     matrix's index arrays explicitly and keep it host-resident (scipy sparse +
@@ -1644,7 +1666,7 @@ def test_host_sparse_int64_templates_match_int32(
 
     a32 = sc.AnnData(X=base.copy(), obs=obs.copy(), var=var.copy())
     a64 = sc.AnnData(
-        X=_promote_host_index_dtypes(base, indptr64=True, indices64=indices64),
+        X=_promote_host_index_dtype(base),
         obs=obs.copy(),
         var=var.copy(),
     )
@@ -2172,30 +2194,25 @@ def test_ovr_device_sparse_subset_match_scanpy(fmt):
 
 
 @pytest.mark.parametrize("reference", ["rest", "1"])
-def test_host_csc_int64_indices_cast_matches_int32(reference):
-    """Host CSC has no *_idx64 template, so int64 indices are cast to int32
-    (_wilcoxon.py:355->357). Result must be bit-identical to the int32 input."""
+@pytest.mark.parametrize("layout", ["csr", "csc"])
+def test_host_sparse_mismatched_index_dtype_raises(reference, layout):
+    """Host sparse indices/indptr must keep scipy's same-dtype invariant."""
     rng = np.random.default_rng(15)
     dense = rng.integers(0, 5, size=(120, 6)).astype(np.float64)
     dense[dense < 1.0] = 0.0
     obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(120)])})
     var = pd.DataFrame(index=[f"g{i}" for i in range(6)])
-    base = sp.csc_matrix(dense)
-    a32 = sc.AnnData(X=base.copy(), obs=obs.copy(), var=var.copy())
-    m64 = base.copy()
+    maker = sp.csr_matrix if layout == "csr" else sp.csc_matrix
+    m64 = maker(dense)
     m64.indices = m64.indices.astype(np.int64)  # keep indptr int32
-    a64 = sc.AnnData(X=m64, obs=obs.copy(), var=var.copy())
+    assert m64.indptr.dtype == np.int32
+    assert m64.indices.dtype == np.int64
+    adata = sc.AnnData(X=m64, obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
         "use_raw": False,
         "reference": reference,
         "tie_correct": True,
     }
-    rsc.tl.rank_genes_groups(a32, "group", **kw)
-    rsc.tl.rank_genes_groups(a64, "group", **kw)
-    r32, r64 = a32.uns["rank_genes_groups"], a64.uns["rank_genes_groups"]
-    for fld in ("scores", "pvals"):
-        for grp in r32[fld].dtype.names:
-            np.testing.assert_array_equal(
-                np.asarray(r64[fld][grp]), np.asarray(r32[fld][grp])
-            )
+    with pytest.raises(TypeError, match="indices and indptr must have the same dtype"):
+        rsc.tl.rank_genes_groups(adata, "group", **kw)

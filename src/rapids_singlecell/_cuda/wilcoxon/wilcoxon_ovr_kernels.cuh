@@ -104,15 +104,23 @@ __global__ void dense_block_to_f32_kernel(const T* __restrict__ stg,
 template <typename T>
 __global__ void dense_group_accumulate_kernel(
     const T* __restrict__ stg, const int* __restrict__ group_codes,
-    double* __restrict__ group_sums, double* __restrict__ group_nnz, int n_rows,
-    int sb_cols, int n_groups, bool f_order, bool compute_nnz) {
+    double* __restrict__ group_sums, double* __restrict__ group_nnz,
+    double* __restrict__ total_sums, double* __restrict__ total_nnz, int n_rows,
+    int sb_cols, int n_groups, bool f_order, bool compute_nnz,
+    bool compute_totals) {
     int col = blockIdx.x;
     if (col >= sb_cols) return;
     for (int row = threadIdx.x; row < n_rows; row += blockDim.x) {
-        int g = group_codes[row];
-        if (g < 0 || g >= n_groups) continue;
         double v = f_order ? (double)stg[(long long)col * n_rows + row]
                            : (double)stg[(long long)row * sb_cols + col];
+        if (compute_totals) {
+            atomicAdd(&total_sums[col], v);
+            if (compute_nnz && v != 0.0) {
+                atomicAdd(&total_nnz[col], 1.0);
+            }
+        }
+        int g = group_codes[row];
+        if (g < 0 || g >= n_groups) continue;
         atomicAdd(&group_sums[(long long)g * sb_cols + col], v);
         if (compute_nnz && v != 0.0) {
             atomicAdd(&group_nnz[(long long)g * sb_cols + col], 1.0);
