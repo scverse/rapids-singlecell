@@ -5,6 +5,7 @@
 
 #include "../nb_types.h"
 #include "wilcoxon_fast_common.cuh"
+#include "kernels_wilcoxon.cuh"
 #include "wilcoxon_sparse_kernels.cuh"
 #include "wilcoxon_ovr_kernels.cuh"
 #include "wilcoxon_ovr_sparse.cuh"
@@ -130,6 +131,99 @@ void register_sparse_bindings(nb::module_& m) {
     RSC_OVR_SPARSE_CSR_HOST_BINDING("ovr_sparse_csr_host", double, int64_t,
                                     int64_t);
 #undef RSC_OVR_SPARSE_CSR_HOST_BINDING
+
+#define RSC_OVR_DENSE_DEVICE_BINDING(NAME, IMPL, IndexCType, IndptrCType)   \
+    m.def(                                                                  \
+        NAME,                                                               \
+        [](gpu_array_c<const float, Device> data,                           \
+           gpu_array_c<const IndexCType, Device> indices,                   \
+           gpu_array_c<const IndptrCType, Device> indptr,                   \
+           gpu_array_c<const int, Device> group_codes,                      \
+           gpu_array_c<double, Device> rank_sums,                           \
+           gpu_array_c<double, Device> tie_corr, int n_rows, int n_cols,    \
+           int n_groups, bool compute_tie_corr, int chunk_cols,             \
+           int rank_sub_batch_cols) {                                       \
+            if (chunk_cols <= 0) chunk_cols = SPARSE_DENSE_OVR_CHUNK_COLS;  \
+            if (rank_sub_batch_cols <= 0)                                   \
+                rank_sub_batch_cols = SUB_BATCH_COLS;                       \
+            IMPL(data.data(), indices.data(), indptr.data(),                \
+                 group_codes.data(), rank_sums.data(), tie_corr.data(),     \
+                 n_rows, n_cols, n_groups, compute_tie_corr, chunk_cols,    \
+                 rank_sub_batch_cols);                                      \
+        },                                                                  \
+        "data"_a, "indices"_a, "indptr"_a, "group_codes"_a, "rank_sums"_a,  \
+        "tie_corr"_a, nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_groups"_a,  \
+        "compute_tie_corr"_a, "chunk_cols"_a = SPARSE_DENSE_OVR_CHUNK_COLS, \
+        "rank_sub_batch_cols"_a = SUB_BATCH_COLS)
+
+    RSC_OVR_DENSE_DEVICE_BINDING("ovr_dense_csc_device",
+                                 ovr_dense_csc_streaming_impl, int, int);
+    RSC_OVR_DENSE_DEVICE_BINDING(
+        "ovr_dense_csc_device", ovr_dense_csc_streaming_impl, int64_t, int64_t);
+    RSC_OVR_DENSE_DEVICE_BINDING("ovr_dense_csr_device",
+                                 ovr_dense_csr_streaming_impl, int, int);
+    RSC_OVR_DENSE_DEVICE_BINDING(
+        "ovr_dense_csr_device", ovr_dense_csr_streaming_impl, int64_t, int64_t);
+#undef RSC_OVR_DENSE_DEVICE_BINDING
+
+#define RSC_OVR_DENSE_HOST_BINDING(NAME, IMPL, InT, IndexT, IndptrT)           \
+    m.def(                                                                     \
+        NAME,                                                                  \
+        [](host_array<const InT> h_data, host_array<const IndexT> h_indices,   \
+           host_array<const IndptrT> h_indptr,                                 \
+           host_array<const int> h_group_codes,                                \
+           gpu_array_c<double, Device> d_rank_sums,                            \
+           gpu_array_c<double, Device> d_tie_corr,                             \
+           gpu_array_c<double, Device> d_group_sums,                           \
+           gpu_array_c<double, Device> d_group_nnz,                            \
+           gpu_array_c<double, Device> d_total_sums,                           \
+           gpu_array_c<double, Device> d_total_nnz, int n_rows, int n_cols,    \
+           int n_groups, bool compute_tie_corr, bool compute_stats,            \
+           bool compute_nnz, bool compute_totals, int chunk_cols,              \
+           int rank_sub_batch_cols) {                                          \
+            if (chunk_cols <= 0) chunk_cols = SPARSE_DENSE_OVR_CHUNK_COLS;     \
+            if (rank_sub_batch_cols <= 0)                                      \
+                rank_sub_batch_cols = SUB_BATCH_COLS;                          \
+            IMPL(h_data.data(), h_indices.data(), h_indptr.data(),             \
+                 h_group_codes.data(), d_rank_sums.data(), d_tie_corr.data(),  \
+                 d_group_sums.data(), d_group_nnz.data(), d_total_sums.data(), \
+                 d_total_nnz.data(), n_rows, n_cols, n_groups,                 \
+                 compute_tie_corr, compute_stats, compute_nnz, compute_totals, \
+                 chunk_cols, rank_sub_batch_cols);                             \
+        },                                                                     \
+        "h_data"_a, "h_indices"_a, "h_indptr"_a, "h_group_codes"_a,            \
+        "d_rank_sums"_a, "d_tie_corr"_a, "d_group_sums"_a, "d_group_nnz"_a,    \
+        "d_total_sums"_a, "d_total_nnz"_a, nb::kw_only(), "n_rows"_a,          \
+        "n_cols"_a, "n_groups"_a, "compute_tie_corr"_a, "compute_stats"_a,     \
+        "compute_nnz"_a = true, "compute_totals"_a = false,                    \
+        "chunk_cols"_a = SPARSE_DENSE_OVR_CHUNK_COLS,                          \
+        "rank_sub_batch_cols"_a = SUB_BATCH_COLS)
+
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csc_host",
+                               ovr_dense_csc_host_streaming_impl, float, int,
+                               int);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csc_host",
+                               ovr_dense_csc_host_streaming_impl, double, int,
+                               int);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csc_host",
+                               ovr_dense_csc_host_streaming_impl, float,
+                               int64_t, int64_t);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csc_host",
+                               ovr_dense_csc_host_streaming_impl, double,
+                               int64_t, int64_t);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csr_host",
+                               ovr_dense_csr_host_streaming_impl, float, int,
+                               int);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csr_host",
+                               ovr_dense_csr_host_streaming_impl, double, int,
+                               int);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csr_host",
+                               ovr_dense_csr_host_streaming_impl, float,
+                               int64_t, int64_t);
+    RSC_OVR_DENSE_HOST_BINDING("ovr_dense_csr_host",
+                               ovr_dense_csr_host_streaming_impl, double,
+                               int64_t, int64_t);
+#undef RSC_OVR_DENSE_HOST_BINDING
 
 #define RSC_OVO_DEVICE_BINDING(NAME, IMPL, IndexCType, IndptrCType)           \
     m.def(                                                                    \

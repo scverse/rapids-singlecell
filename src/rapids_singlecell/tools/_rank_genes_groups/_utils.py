@@ -20,8 +20,8 @@ def _sparse_has_negative(X) -> bool:
 
     The fast sparse Wilcoxon paths add implicit (structural) zeros as a tie at
     the column minimum, which is correct only for nonnegative stored values. A
-    negative breaks that, so the in-memory Wilcoxon paths fall back to the dense
-    full-sort path (valid for any sign). Dask arrays are not inspected here
+    negative breaks that, so in-memory Wilcoxon routes signed sparse data to
+    the sign-safe sparse-dense ranker. Dask arrays are not inspected here
     (they are neither ``scipy`` nor ``cupy`` sparse); ``wilcoxon_binned`` guards
     Dask sparse separately. Dense and t-test/logreg never need this.
     """
@@ -224,38 +224,3 @@ def _get_column_block(X, start: int, stop: int) -> cp.ndarray:
             return cp.asarray(X[:, start:stop], dtype=cp.float64, order="F")
         case _:
             raise ValueError(f"Unsupported matrix type: {type(X)}")
-
-
-def _ovr_dense_block_f32(X, start: int, stop: int) -> cp.ndarray:
-    """OVR (vs-rest): ALL cells x gene-window, F-order float32.
-
-    For sparse X (the negative-values dense fallback) the window is densified on
-    the fly via the shared CSR/CSC densify path (`_get_column_block`), so no
-    full-matrix dense materialization happens.
-    """
-    if isinstance(X, np.ndarray | cp.ndarray):
-        return cp.asarray(X[:, start:stop], dtype=cp.float32, order="F")
-    if sp.issparse(X) or cpsp.issparse(X):
-        block = _get_column_block(X, start, stop)  # float64 F-order chunk
-        return cp.asfortranarray(block.astype(cp.float32, copy=False))
-    raise TypeError(f"Expected dense matrix, got {type(X)}")
-
-
-def _ovo_dense_block(X, row_ids: np.ndarray, start: int, stop: int) -> cp.ndarray:
-    """OVO (with-reference): a ROW SUBSET (`row_ids`) x gene-window, F-order.
-
-    OVO ranks the reference group against each other group, so it materializes
-    only the selected rows -- unlike `_ovr_dense_block_f32`, which takes all
-    cells.
-    """
-    if isinstance(X, np.ndarray):
-        return cp.asarray(X[row_ids, start:stop], order="F")
-    if isinstance(X, cp.ndarray):
-        rows = cp.asarray(row_ids, dtype=cp.int32)
-        return cp.asfortranarray(X[rows, start:stop])
-    if isinstance(X, sp.spmatrix | sp.sparray):
-        return cp.asarray(X[row_ids][:, start:stop].toarray(), order="F")
-    if cpsp.issparse(X):
-        rows = cp.asarray(row_ids, dtype=cp.int32)
-        return cp.asfortranarray(X[rows][:, start:stop].toarray())
-    raise TypeError(f"Unsupported matrix type: {type(X)}")

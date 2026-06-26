@@ -763,6 +763,483 @@ static void ovr_sparse_csr_host_streaming_impl(
 }
 
 // ============================================================================
+// Sign-safe sparse OVR path: sparse window -> dense f32 tile -> dense rank.
+// ============================================================================
+
+constexpr int SPARSE_DENSE_OVR_CHUNK_COLS = 512;
+
+static void launch_ovr_dense_rank_window(
+    const float* dense, const int* group_codes, double* rank_sums,
+    double* tie_corr, int out_col, int n_rows, int n_cols_total,
+    int window_cols, int n_groups, bool compute_tie_corr,
+    int rank_sub_batch_cols, cudaStream_t upstream_stream) {
+    if (n_rows == 0 || window_cols == 0 || n_groups == 0) return;
+    if (rank_sub_batch_cols <= 0) rank_sub_batch_cols = SUB_BATCH_COLS;
+
+    DenseColumnBatchPlan batches = plan_dense_column_batches(
+        n_rows, window_cols, rank_sub_batch_cols, SAFE_BATCH_NNZ,
+        "Sparse-dense OVR rank sub-batch");
+    rank_sub_batch_cols = batches.sub_batch_cols;
+    int n_streams = clamp_streams_by_cols(window_cols, rank_sub_batch_cols);
+    size_t sub_items = batches.max_items;
+    int sub_items_i32 =
+        checked_cub_items(sub_items, "Sparse-dense OVR rank sub-batch");
+    size_t cub_temp_bytes =
+        cub_segmented_sortpairs_temp_bytes(sub_items_i32, rank_sub_batch_cols);
+
+    RmmScratchPool pool;
+    ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
+    ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
+    inputs_ready.record(upstream_stream);
+    for (int s = 0; s < n_streams; s++) {
+        cuda_check(cudaStreamWaitEvent(streams[s], inputs_ready.get(), 0),
+                   "wait on sparse-dense OVR tile");
+    }
+
+    struct StreamBuf {
+        float* keys_out;
+        int* vals_in;
+        int* vals_out;
+        int* seg_offsets;
+        uint8_t* cub_temp;
+        double* sub_rank_sums;
+        double* sub_tie_corr;
+    };
+    std::vector<StreamBuf> bufs(n_streams);
+    for (int s = 0; s < n_streams; s++) {
+        bufs[s].keys_out = pool.alloc<float>(sub_items);
+        bufs[s].vals_in = pool.alloc<int>(sub_items);
+        bufs[s].vals_out = pool.alloc<int>(sub_items);
+        bufs[s].seg_offsets = pool.alloc<int>(rank_sub_batch_cols + 1);
+        bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
+        bufs[s].sub_rank_sums =
+            pool.alloc<double>((size_t)n_groups * rank_sub_batch_cols);
+        bufs[s].sub_tie_corr = pool.alloc<double>(rank_sub_batch_cols);
+    }
+
+    int tpb_rank = round_up_to_warp(n_rows);
+    bool use_gmem = false;
+    size_t smem_rank = ovr_smem_config(n_groups, use_gmem);
+
+    int col = 0;
+    int batch_idx = 0;
+    while (col < window_cols) {
+        int sb_cols = std::min(rank_sub_batch_cols, window_cols - col);
+        int sb_items =
+            checked_int_product((size_t)n_rows, (size_t)sb_cols,
+                                "Sparse-dense OVR active rank sub-batch");
+        int s = batch_idx % n_streams;
+        cudaStream_t stream = streams[s];
+        auto& buf = bufs[s];
+
+        upload_linear_offsets(buf.seg_offsets, sb_cols, n_rows, stream);
+        fill_row_indices_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+            buf.vals_in, n_rows, sb_cols);
+        CUDA_CHECK_LAST_ERROR(fill_row_indices_kernel);
+
+        const float* keys_in = dense + (size_t)col * n_rows;
+        cub_segmented_sortpairs(
+            buf.cub_temp, cub_temp_bytes, keys_in, buf.keys_out, buf.vals_in,
+            buf.vals_out, sb_items, sb_cols, buf.seg_offsets,
+            buf.seg_offsets + 1, stream, "sparse-dense OVR segmented sort");
+
+        if (use_gmem) {
+            cuda_check(cudaMemsetAsync(
+                           buf.sub_rank_sums, 0,
+                           (size_t)n_groups * sb_cols * sizeof(double), stream),
+                       "sparse-dense OVR gmem rank_sums memset");
+        }
+        rank_sums_from_sorted_kernel<<<sb_cols, tpb_rank, smem_rank, stream>>>(
+            buf.keys_out, buf.vals_out, group_codes, buf.sub_rank_sums,
+            buf.sub_tie_corr, n_rows, sb_cols, n_groups, compute_tie_corr,
+            use_gmem);
+        CUDA_CHECK_LAST_ERROR(rank_sums_from_sorted_kernel);
+
+        scatter_cols_2d(rank_sums + out_col + col, buf.sub_rank_sums, n_groups,
+                        n_cols_total, sb_cols, stream);
+        if (compute_tie_corr) {
+            cudaMemcpyAsync(tie_corr + out_col + col, buf.sub_tie_corr,
+                            sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
+                            stream);
+        }
+
+        col += sb_cols;
+        batch_idx++;
+    }
+
+    sync_streams(streams, "sparse-dense OVR rank");
+}
+
+template <typename IndexT = int, typename IndptrT = int>
+static void ovr_dense_csr_streaming_impl(
+    const float* csr_data, const IndexT* csr_indices, const IndptrT* csr_indptr,
+    const int* group_codes, double* rank_sums, double* tie_corr, int n_rows,
+    int n_cols, int n_groups, bool compute_tie_corr, int chunk_cols,
+    int rank_sub_batch_cols) {
+    if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
+    if (chunk_cols <= 0) chunk_cols = SPARSE_DENSE_OVR_CHUNK_COLS;
+
+    DenseColumnBatchPlan chunks =
+        plan_dense_column_batches(n_rows, n_cols, chunk_cols, SAFE_BATCH_NNZ,
+                                  "Device CSR sparse-dense OVR column chunk");
+    chunk_cols = chunks.sub_batch_cols;
+    size_t max_dense_items = (size_t)n_rows * (size_t)chunk_cols;
+
+    RmmScratchPool pool;
+    ScopedCudaStream extract_stream(cudaStreamDefault);
+    cudaStream_t stream = extract_stream.get();
+    float* dense = pool.alloc<float>(max_dense_items);
+
+    for (int col = 0; col < n_cols; col += chunk_cols) {
+        int sb_cols = std::min(chunk_cols, n_cols - col);
+        size_t dense_items = (size_t)n_rows * (size_t)sb_cols;
+        cudaMemsetAsync(dense, 0, dense_items * sizeof(float), stream);
+        int blocks = (n_rows + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
+        csr_tile_to_dense_kernel<float, IndptrT, IndexT, float>
+            <<<blocks, UTIL_BLOCK_SIZE, 0, stream>>>(csr_indptr, csr_indices,
+                                                     csr_data, dense, col,
+                                                     col + sb_cols, n_rows);
+        CUDA_CHECK_LAST_ERROR(csr_tile_to_dense_kernel);
+        launch_ovr_dense_rank_window(
+            dense, group_codes, rank_sums, tie_corr, col, n_rows, n_cols,
+            sb_cols, n_groups, compute_tie_corr, rank_sub_batch_cols, stream);
+    }
+}
+
+template <typename IndexT = int, typename IndptrT = int>
+static void ovr_dense_csc_streaming_impl(
+    const float* csc_data, const IndexT* csc_indices, const IndptrT* csc_indptr,
+    const int* group_codes, double* rank_sums, double* tie_corr, int n_rows,
+    int n_cols, int n_groups, bool compute_tie_corr, int chunk_cols,
+    int rank_sub_batch_cols) {
+    if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
+    if (chunk_cols <= 0) chunk_cols = SPARSE_DENSE_OVR_CHUNK_COLS;
+
+    DenseColumnBatchPlan chunks =
+        plan_dense_column_batches(n_rows, n_cols, chunk_cols, SAFE_BATCH_NNZ,
+                                  "Device CSC sparse-dense OVR column chunk");
+    chunk_cols = chunks.sub_batch_cols;
+    size_t max_dense_items = (size_t)n_rows * (size_t)chunk_cols;
+
+    RmmScratchPool pool;
+    ScopedCudaStream extract_stream(cudaStreamDefault);
+    cudaStream_t stream = extract_stream.get();
+    float* dense = pool.alloc<float>(max_dense_items);
+
+    for (int col = 0; col < n_cols; col += chunk_cols) {
+        int sb_cols = std::min(chunk_cols, n_cols - col);
+        size_t dense_items = (size_t)n_rows * (size_t)sb_cols;
+        cudaMemsetAsync(dense, 0, dense_items * sizeof(float), stream);
+        csc_tile_to_dense_kernel<float, IndptrT, IndexT, float>
+            <<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(csc_indptr, csc_indices,
+                                                      csc_data, dense, col,
+                                                      col + sb_cols, n_rows);
+        CUDA_CHECK_LAST_ERROR(csc_tile_to_dense_kernel);
+        launch_ovr_dense_rank_window(
+            dense, group_codes, rank_sums, tie_corr, col, n_rows, n_cols,
+            sb_cols, n_groups, compute_tie_corr, rank_sub_batch_cols, stream);
+    }
+}
+
+template <typename InT, typename IndexT, typename IndptrT>
+static void ovr_dense_csc_host_streaming_impl(
+    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
+    const int* h_group_codes, double* d_rank_sums, double* d_tie_corr,
+    double* d_group_sums, double* d_group_nnz, double* d_total_sums,
+    double* d_total_nnz, int n_rows, int n_cols, int n_groups,
+    bool compute_tie_corr, bool compute_stats, bool compute_nnz,
+    bool compute_totals, int chunk_cols, int rank_sub_batch_cols) {
+    if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
+    if (chunk_cols <= 0) chunk_cols = SPARSE_DENSE_OVR_CHUNK_COLS;
+    compute_nnz = compute_stats && compute_nnz && d_group_nnz != nullptr;
+    compute_totals = compute_stats && compute_totals && d_total_sums != nullptr;
+
+    DenseColumnBatchPlan dense_chunks =
+        plan_dense_column_batches(n_rows, n_cols, chunk_cols, SAFE_BATCH_NNZ,
+                                  "Host CSC sparse-dense OVR column chunk");
+    chunk_cols = dense_chunks.sub_batch_cols;
+    ColumnBatchPlan batches =
+        plan_csc_column_batches(h_indptr, n_cols, chunk_cols, SAFE_BATCH_NNZ,
+                                "Host CSC sparse-dense OVR offsets");
+    chunk_cols = batches.sub_batch_cols;
+    size_t max_nnz = batches.max_nnz;
+    size_t max_dense_items = (size_t)n_rows * (size_t)chunk_cols;
+
+    RmmScratchPool pool;
+    PinnedRing<InT, IndexT> stage(1, max_nnz ? max_nnz : 1);
+    ScopedCudaStream extract_stream(cudaStreamDefault);
+    cudaStream_t stream = extract_stream.get();
+
+    int* d_group_codes = pool.alloc<int>(n_rows);
+    cudaMemcpy(d_group_codes, h_group_codes, n_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
+
+    InT* d_sparse_data_orig = pool.alloc<InT>(max_nnz ? max_nnz : 1);
+    float* d_sparse_data_f32 = pool.alloc<float>(max_nnz ? max_nnz : 1);
+    IndexT* d_sparse_indices = pool.alloc<IndexT>(max_nnz ? max_nnz : 1);
+    int* idx_i32 = (sizeof(IndexT) > sizeof(int))
+                       ? pool.alloc<int>(max_nnz ? max_nnz : 1)
+                       : nullptr;
+    int* d_indptr = pool.alloc<int>(chunk_cols + 1);
+    float* dense = pool.alloc<float>(max_dense_items);
+    double* sub_group_sums =
+        compute_stats ? pool.alloc<double>((size_t)n_groups * chunk_cols)
+                      : nullptr;
+    double* sub_group_nnz =
+        compute_nnz ? pool.alloc<double>((size_t)n_groups * chunk_cols)
+                    : nullptr;
+    double* sub_total_sums =
+        compute_totals ? pool.alloc<double>(chunk_cols) : nullptr;
+    double* sub_total_nnz = (compute_totals && compute_nnz)
+                                ? pool.alloc<double>(chunk_cols)
+                                : nullptr;
+
+    bool cast_use_gmem = false;
+    size_t smem_cast = cast_accumulate_smem_config(
+        n_groups, compute_nnz, compute_totals, cast_use_gmem);
+
+    int col = 0;
+    for (int b = 0; b < batches.n_batches; b++) {
+        int sb_cols = std::min(chunk_cols, n_cols - col);
+        IndptrT ptr_start = h_indptr[col];
+        IndptrT ptr_end = h_indptr[col + sb_cols];
+        int batch_nnz = checked_int_span((size_t)(ptr_end - ptr_start),
+                                         "Host CSC sparse-dense active nnz");
+
+        stage.wait(0);
+        if (batch_nnz > 0) {
+            host_copy_slice(h_data, h_indices, (size_t)ptr_start, batch_nnz,
+                            stage.template get<0>(0), stage.template get<1>(0));
+            cudaMemcpyAsync(d_sparse_data_orig, stage.template get<0>(0),
+                            (size_t)batch_nnz * sizeof(InT),
+                            cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(d_sparse_indices, stage.template get<1>(0),
+                            (size_t)batch_nnz * sizeof(IndexT),
+                            cudaMemcpyHostToDevice, stream);
+        }
+        stage.record(0, stream);
+
+        int* idx32;
+        if constexpr (sizeof(IndexT) > sizeof(int)) {
+            if (batch_nnz > 0) {
+                int cblk = (batch_nnz + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
+                cast_array_kernel<IndexT, int>
+                    <<<cblk, UTIL_BLOCK_SIZE, 0, stream>>>(
+                        d_sparse_indices, idx_i32, (size_t)batch_nnz);
+                CUDA_CHECK_LAST_ERROR(cast_array_kernel);
+            }
+            idx32 = idx_i32;
+        } else {
+            idx32 = reinterpret_cast<int*>(d_sparse_indices);
+        }
+
+        int* src = d_all_offsets + (size_t)b * (chunk_cols + 1);
+        cudaMemcpyAsync(d_indptr, src, (sb_cols + 1) * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream);
+
+        launch_ovr_cast_and_accumulate_sparse<InT>(
+            d_sparse_data_orig, d_sparse_data_f32, idx32, d_indptr,
+            d_group_codes, sub_group_sums, sub_group_nnz, sub_total_sums,
+            sub_total_nnz, sb_cols, n_groups, compute_nnz, compute_totals,
+            UTIL_BLOCK_SIZE, smem_cast, cast_use_gmem, stream);
+
+        size_t dense_items = (size_t)n_rows * (size_t)sb_cols;
+        cudaMemsetAsync(dense, 0, dense_items * sizeof(float), stream);
+        csc_tile_to_dense_kernel<float, int, int, float>
+            <<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+                d_indptr, idx32, d_sparse_data_f32, dense, 0, sb_cols, n_rows);
+        CUDA_CHECK_LAST_ERROR(csc_tile_to_dense_kernel);
+
+        if (compute_stats) {
+            scatter_cols_2d(d_group_sums + col, sub_group_sums, n_groups,
+                            n_cols, sb_cols, stream);
+            if (compute_nnz) {
+                scatter_cols_2d(d_group_nnz + col, sub_group_nnz, n_groups,
+                                n_cols, sb_cols, stream);
+            }
+            if (compute_totals) {
+                cudaMemcpyAsync(d_total_sums + col, sub_total_sums,
+                                sb_cols * sizeof(double),
+                                cudaMemcpyDeviceToDevice, stream);
+                if (compute_nnz) {
+                    cudaMemcpyAsync(d_total_nnz + col, sub_total_nnz,
+                                    sb_cols * sizeof(double),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+            }
+        }
+
+        launch_ovr_dense_rank_window(
+            dense, d_group_codes, d_rank_sums, d_tie_corr, col, n_rows, n_cols,
+            sb_cols, n_groups, compute_tie_corr, rank_sub_batch_cols, stream);
+        col += sb_cols;
+    }
+}
+
+template <typename InT, typename IndexT, typename IndptrT>
+static void ovr_dense_csr_host_streaming_impl(
+    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
+    const int* h_group_codes, double* d_rank_sums, double* d_tie_corr,
+    double* d_group_sums, double* d_group_nnz, double* d_total_sums,
+    double* d_total_nnz, int n_rows, int n_cols, int n_groups,
+    bool compute_tie_corr, bool compute_stats, bool compute_nnz,
+    bool compute_totals, int chunk_cols, int rank_sub_batch_cols) {
+    if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
+    if (chunk_cols <= 0) chunk_cols = SPARSE_DENSE_OVR_CHUNK_COLS;
+    compute_nnz = compute_stats && compute_nnz && d_group_nnz != nullptr;
+    compute_totals = compute_stats && compute_totals && d_total_sums != nullptr;
+
+    DenseColumnBatchPlan dense_chunks =
+        plan_dense_column_batches(n_rows, n_cols, chunk_cols, SAFE_BATCH_NNZ,
+                                  "Host CSR sparse-dense OVR column chunk");
+    chunk_cols = dense_chunks.sub_batch_cols;
+
+    std::vector<size_t> h_col_counts(n_cols, 0);
+    {
+        int n_workers = host_worker_count();
+        std::vector<std::vector<size_t>> local(n_workers,
+                                               std::vector<size_t>(n_cols, 0));
+        int used = host_parallel_chunks(n_rows, [&](int w, int r0, int r1) {
+            std::vector<size_t>& lc = local[w];
+            for (IndptrT p = h_indptr[r0]; p < h_indptr[r1]; p++)
+                lc[(size_t)h_indices[p]]++;
+        });
+        for (int w = 0; w < used; w++)
+            for (int c = 0; c < n_cols; c++) h_col_counts[c] += local[w][c];
+    }
+
+    size_t cap = SAFE_BATCH_NNZ;
+    ColumnBatchPlan batches = plan_column_batches_from_counts(
+        n_cols, chunk_cols, cap, [&](int c) { return h_col_counts[c]; },
+        "Host CSR sparse-dense OVR offsets");
+    chunk_cols = batches.sub_batch_cols;
+    size_t max_batch_nnz = batches.max_nnz;
+    size_t max_dense_items = (size_t)n_rows * (size_t)chunk_cols;
+
+    RmmScratchPool pool;
+    ScopedCudaStream extract_stream(cudaStreamDefault);
+    cudaStream_t stream = extract_stream.get();
+    PinnedRing<InT, int> gather_stage(1, max_batch_nnz ? max_batch_nnz : 1);
+    PinnedRing<int> indptr_stage(1, (size_t)n_rows + 1);
+    std::vector<IndptrT> cursor(n_rows, 0);
+    std::vector<int> row_counts(n_rows);
+
+    int* d_group_codes = pool.alloc<int>(n_rows);
+    cudaMemcpy(d_group_codes, h_group_codes, n_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+    int* d_all_offsets = upload_batch_offsets(batches, pool);
+
+    InT* d_gather_vals = pool.alloc<InT>(max_batch_nnz ? max_batch_nnz : 1);
+    int* d_gather_cols = pool.alloc<int>(max_batch_nnz ? max_batch_nnz : 1);
+    int* d_gather_indptr = pool.alloc<int>(n_rows + 1);
+    int* col_offsets = pool.alloc<int>(chunk_cols + 1);
+    int* write_pos = pool.alloc<int>(chunk_cols);
+    InT* csc_vals_orig = pool.alloc<InT>(max_batch_nnz ? max_batch_nnz : 1);
+    float* csc_vals_f32 = pool.alloc<float>(max_batch_nnz ? max_batch_nnz : 1);
+    int* csc_row_idx = pool.alloc<int>(max_batch_nnz ? max_batch_nnz : 1);
+    float* dense = pool.alloc<float>(max_dense_items);
+    double* sub_group_sums =
+        compute_stats ? pool.alloc<double>((size_t)n_groups * chunk_cols)
+                      : nullptr;
+    double* sub_group_nnz =
+        compute_nnz ? pool.alloc<double>((size_t)n_groups * chunk_cols)
+                    : nullptr;
+    double* sub_total_sums =
+        compute_totals ? pool.alloc<double>(chunk_cols) : nullptr;
+    double* sub_total_nnz = (compute_totals && compute_nnz)
+                                ? pool.alloc<double>(chunk_cols)
+                                : nullptr;
+
+    bool cast_use_gmem = false;
+    size_t smem_cast = cast_accumulate_smem_config(
+        n_groups, compute_nnz, compute_totals, cast_use_gmem);
+
+    int col = 0;
+    for (int b = 0; b < batches.n_batches; b++) {
+        int sb_cols = std::min(chunk_cols, n_cols - col);
+        int col_end = col + sb_cols;
+        gather_stage.wait(0);
+        indptr_stage.wait(0);
+        InT* h_gather_vals = gather_stage.template get<0>(0);
+        int* h_gather_cols = gather_stage.template get<1>(0);
+        int* h_gather_indptr = indptr_stage.template get<0>(0);
+
+        int batch_nnz = host_materialize_csr_column_interval_cursor(
+            h_data, h_indices, h_indptr, n_rows, col, col_end, cursor.data(),
+            row_counts.data(), h_gather_indptr, h_gather_vals, h_gather_cols,
+            "Host CSR sparse-dense gather nnz");
+
+        int* src = d_all_offsets + (size_t)b * (chunk_cols + 1);
+        cudaMemcpyAsync(col_offsets, src, (sb_cols + 1) * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(write_pos, src, sb_cols * sizeof(int),
+                        cudaMemcpyDeviceToDevice, stream);
+
+        if (batch_nnz > 0) {
+            cudaMemcpyAsync(d_gather_vals, h_gather_vals,
+                            (size_t)batch_nnz * sizeof(InT),
+                            cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(d_gather_cols, h_gather_cols,
+                            (size_t)batch_nnz * sizeof(int),
+                            cudaMemcpyHostToDevice, stream);
+        }
+        cudaMemcpyAsync(d_gather_indptr, h_gather_indptr,
+                        (n_rows + 1) * sizeof(int), cudaMemcpyHostToDevice,
+                        stream);
+        gather_stage.record(0, stream);
+        indptr_stage.record(0, stream);
+
+        if (batch_nnz > 0) {
+            csr_scatter_to_csc_kernel<InT, int, int>
+                <<<(n_rows + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE,
+                   UTIL_BLOCK_SIZE, 0, stream>>>(
+                    d_gather_vals, d_gather_cols, d_gather_indptr, write_pos,
+                    csc_vals_orig, csc_row_idx, n_rows, col, col_end, 0);
+            CUDA_CHECK_LAST_ERROR(csr_scatter_to_csc_kernel);
+        }
+
+        launch_ovr_cast_and_accumulate_sparse<InT>(
+            csc_vals_orig, csc_vals_f32, csc_row_idx, col_offsets,
+            d_group_codes, sub_group_sums, sub_group_nnz, sub_total_sums,
+            sub_total_nnz, sb_cols, n_groups, compute_nnz, compute_totals,
+            UTIL_BLOCK_SIZE, smem_cast, cast_use_gmem, stream);
+
+        size_t dense_items = (size_t)n_rows * (size_t)sb_cols;
+        cudaMemsetAsync(dense, 0, dense_items * sizeof(float), stream);
+        csc_tile_to_dense_kernel<float, int, int, float>
+            <<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(col_offsets, csc_row_idx,
+                                                      csc_vals_f32, dense, 0,
+                                                      sb_cols, n_rows);
+        CUDA_CHECK_LAST_ERROR(csc_tile_to_dense_kernel);
+
+        if (compute_stats) {
+            scatter_cols_2d(d_group_sums + col, sub_group_sums, n_groups,
+                            n_cols, sb_cols, stream);
+            if (compute_nnz) {
+                scatter_cols_2d(d_group_nnz + col, sub_group_nnz, n_groups,
+                                n_cols, sb_cols, stream);
+            }
+            if (compute_totals) {
+                cudaMemcpyAsync(d_total_sums + col, sub_total_sums,
+                                sb_cols * sizeof(double),
+                                cudaMemcpyDeviceToDevice, stream);
+                if (compute_nnz) {
+                    cudaMemcpyAsync(d_total_nnz + col, sub_total_nnz,
+                                    sb_cols * sizeof(double),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+            }
+        }
+
+        launch_ovr_dense_rank_window(
+            dense, d_group_codes, d_rank_sums, d_tie_corr, col, n_rows, n_cols,
+            sb_cols, n_groups, compute_tie_corr, rank_sub_batch_cols, stream);
+        col += sb_cols;
+    }
+}
+
+// ============================================================================
 // Sparse-aware CSC OVR streaming (sort only stored nonzeros)
 // ============================================================================
 

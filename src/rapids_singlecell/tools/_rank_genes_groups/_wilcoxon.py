@@ -17,9 +17,6 @@ from ._utils import (
     EPS,
     MIN_GROUP_SIZE_WARNING,
     _choose_chunk_size,
-    _get_column_block,
-    _ovo_dense_block,
-    _ovr_dense_block_f32,
 )
 
 if TYPE_CHECKING:
@@ -58,46 +55,6 @@ def _choose_wilcoxon_chunk_size(requested: int | None, n_genes: int) -> int:
     if requested is not None:
         return _choose_chunk_size(requested)
     return min(DEFAULT_WILCOXON_CHUNK_SIZE, max(1, n_genes))
-
-
-def _fill_ovo_chunk_stats(
-    rg: _RankGenes,
-    ref_block: cp.ndarray,
-    grp_block: cp.ndarray,
-    *,
-    offsets: np.ndarray,
-    test_group_indices: list[int],
-    start: int,
-    stop: int,
-    group_sizes: NDArray,
-) -> None:
-    if not rg._compute_stats_in_chunks:
-        return
-
-    ireference = rg.ireference
-    n_ref = int(group_sizes[ireference])
-    ref_mean = ref_block.mean(axis=0)
-    rg.means[ireference, start:stop] = cp.asnumpy(ref_mean)
-    if n_ref > 1:
-        rg.vars[ireference, start:stop] = cp.asnumpy(ref_block.var(axis=0, ddof=1))
-    if rg.comp_pts:
-        ref_nnz = (ref_block != 0).sum(axis=0)
-        rg.pts[ireference, start:stop] = cp.asnumpy(ref_nnz / n_ref)
-
-    for slot, group_index in enumerate(test_group_indices):
-        begin = int(offsets[slot])
-        end = int(offsets[slot + 1])
-        n_group = int(group_sizes[group_index])
-        group_block = grp_block[begin:end]
-        group_mean = group_block.mean(axis=0)
-        rg.means[group_index, start:stop] = cp.asnumpy(group_mean)
-        if n_group > 1:
-            rg.vars[group_index, start:stop] = cp.asnumpy(
-                group_block.var(axis=0, ddof=1)
-            )
-        if rg.comp_pts:
-            group_nnz = (group_block != 0).sum(axis=0)
-            rg.pts[group_index, start:stop] = cp.asnumpy(group_nnz / n_group)
 
 
 def _fill_basic_stats_from_accumulators(
@@ -437,18 +394,17 @@ def _validate_wilcoxon_sparse_dtype(X) -> None:
 def _device_sparse_arrays(X):
     """Prepare device-sparse arrays for the Wilcoxon kernels.
 
-    Wilcoxon ranking sorts float32 keys on every path -- the sparse fast paths
-    AND the dense fallback (``_ovr_dense_block_f32``); the CUB segmented
-    sort is float-keyed throughout. Casting ``X.data`` to float32 here therefore
-    does not diverge from any float64 ranking path, because there is none. This
-    only loses precision when preprocessing ran in float64; float32-preprocessed
-    values (even if later stored as float64) are float32-exact, so ranking
-    matches scanpy bit-for-bit (~1e-13). For a fully float64 pipeline the
-    rank-derived scores/p-values match scanpy-on-float64 to ~1e-4 on
-    log-normalized data (below any significance threshold, no DE calls change),
-    while means and log fold changes are still computed in float64. See the
-    ``rank_genes_groups`` note on ranking precision. float64 input is accepted
-    to spare the caller a pre-cast.
+    Wilcoxon ranking sorts float32 keys on every sparse device path, including
+    the sign-safe sparse-dense OVR path. Casting ``X.data`` to float32 here
+    therefore does not diverge from any float64 ranking path, because there is
+    none. This only loses precision when preprocessing ran in float64;
+    float32-preprocessed values (even if later stored as float64) are
+    float32-exact, so ranking matches scanpy bit-for-bit (~1e-13). For a fully
+    float64 pipeline the rank-derived scores/p-values match scanpy-on-float64
+    to ~1e-4 on log-normalized data (below any significance threshold, no DE
+    calls change), while means and log fold changes are still computed in
+    float64. See the ``rank_genes_groups`` note on ranking precision. float64
+    input is accepted to spare the caller a pre-cast.
     """
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype == np.float32:
@@ -521,8 +477,8 @@ def wilcoxon(
     )
 
 
-def _host_sparse_format(X, *, sparse_negative_fallback: bool) -> str | None:
-    if sparse_negative_fallback or not isinstance(X, sp.spmatrix | sp.sparray):
+def _host_sparse_format(X) -> str | None:
+    if not isinstance(X, sp.spmatrix | sp.sparray):
         return None
     if X.format not in {"csr", "csc"}:
         raise TypeError(
@@ -532,9 +488,7 @@ def _host_sparse_format(X, *, sparse_negative_fallback: bool) -> str | None:
     return X.format
 
 
-def _device_sparse_format(X, *, sparse_negative_fallback: bool) -> str | None:
-    if sparse_negative_fallback:
-        return None
+def _device_sparse_format(X) -> str | None:
     if cpsp.isspmatrix_csc(X):
         return "csc"
     if cpsp.isspmatrix_csr(X):
@@ -705,9 +659,7 @@ def _run_ovr_host_sparse(
     use_continuity: bool,
     return_u_values: bool,
 ) -> list[tuple[int, NDArray, NDArray]] | None:
-    sparse_format = _host_sparse_format(
-        X, sparse_negative_fallback=rg._sparse_negative_fallback
-    )
+    sparse_format = _host_sparse_format(X)
     if sparse_format is None:
         return None
 
@@ -815,9 +767,7 @@ def _run_ovr_device_sparse(
     use_continuity: bool,
     return_u_values: bool,
 ) -> list[tuple[int, NDArray, NDArray]] | None:
-    sparse_format = _device_sparse_format(
-        X, sparse_negative_fallback=rg._sparse_negative_fallback
-    )
+    sparse_format = _device_sparse_format(X)
     if sparse_format is None:
         return None
 
@@ -859,6 +809,124 @@ def _run_ovr_device_sparse(
             n_groups=n_groups,
             compute_tie_corr=tie_correct,
             sub_batch_cols=OVR_DEVICE_CSR_SUB_BATCH,
+        )
+
+    return _finish_ovr(
+        rank_sums,
+        group_sizes_dev,
+        rest_sizes,
+        n_cells,
+        tie_corr,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+        n_groups=n_groups,
+    )
+
+
+def _run_ovr_signed_sparse_dense(
+    rg: _RankGenes,
+    X,
+    n_cells: int,
+    n_total_genes: int,
+    group_sizes: NDArray,
+    *,
+    tie_correct: bool,
+    use_continuity: bool,
+    chunk_size: int | None,
+    return_u_values: bool,
+) -> list[tuple[int, NDArray, NDArray]] | None:
+    host_format = (
+        _host_sparse_format(X) if isinstance(X, sp.spmatrix | sp.sparray) else None
+    )
+    device_format = _device_sparse_format(X)
+    sparse_format = host_format or device_format
+    if sparse_format is None:
+        return None
+
+    n_groups = len(rg.groups_order)
+    group_codes_np = rg.group_codes.astype(np.int32, copy=False)
+    group_codes_gpu = cp.asarray(group_codes_np, dtype=cp.int32)
+    group_sizes_dev = cp.asarray(group_sizes, dtype=cp.float64)
+    rest_sizes = n_cells - group_sizes_dev
+    rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
+    tie_corr = cp.ones(n_total_genes, dtype=cp.float64)
+    chunk_cols = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
+
+    if host_format is not None:
+        X.sort_indices()
+        compute_stats = rg._compute_stats_in_chunks
+        compute_nnz = compute_stats and rg.comp_pts
+        compute_totals = bool(compute_stats and np.any(group_codes_np == n_groups))
+        stats_shape = (n_groups, n_total_genes) if compute_stats else (1, 1)
+        group_sums = cp.empty(stats_shape, dtype=cp.float64)
+        group_nnz = cp.empty(
+            stats_shape if compute_nnz else (1, 1),
+            dtype=cp.float64,
+        )
+        total_sums = cp.empty(
+            (1, n_total_genes) if compute_totals else (1, 1),
+            dtype=cp.float64,
+        )
+        total_nnz = cp.empty(
+            (1, n_total_genes) if (compute_totals and compute_nnz) else (1, 1),
+            dtype=cp.float64,
+        )
+        runner = (
+            _wcs.ovr_dense_csc_host if host_format == "csc" else _wcs.ovr_dense_csr_host
+        )
+        runner(
+            _host_sparse_data_array(X),
+            X.indices,
+            X.indptr,
+            group_codes_np,
+            rank_sums,
+            tie_corr,
+            group_sums,
+            group_nnz,
+            total_sums,
+            total_nnz,
+            n_rows=n_cells,
+            n_cols=n_total_genes,
+            n_groups=n_groups,
+            compute_tie_corr=tie_correct,
+            compute_stats=compute_stats,
+            compute_nnz=compute_nnz,
+            compute_totals=compute_totals,
+            chunk_cols=chunk_cols,
+            rank_sub_batch_cols=OVR_DENSE_SUB_BATCH,
+        )
+        if compute_stats:
+            _fill_basic_stats_from_accumulators(
+                rg,
+                group_sums,
+                group_nnz,
+                group_sizes,
+                n_cells=n_cells,
+                total_sums=total_sums if compute_totals else None,
+                total_nnz=total_nnz if compute_totals and compute_nnz else None,
+            )
+    else:
+        if isinstance(X, cpsp.spmatrix) and X.format == "csr":
+            X.sort_indices()
+        data, indices, indptr = _device_sparse_arrays(X)
+        runner = (
+            _wcs.ovr_dense_csc_device
+            if device_format == "csc"
+            else _wcs.ovr_dense_csr_device
+        )
+        runner(
+            data,
+            indices,
+            indptr,
+            group_codes_gpu,
+            rank_sums,
+            tie_corr,
+            n_rows=n_cells,
+            n_cols=n_total_genes,
+            n_groups=n_groups,
+            compute_tie_corr=tie_correct,
+            chunk_cols=chunk_cols,
+            rank_sub_batch_cols=OVR_DENSE_SUB_BATCH,
         )
 
     return _finish_ovr(
@@ -952,7 +1020,7 @@ def _run_ovr_host_dense(
     )
 
 
-def _run_ovr_dense_chunks(
+def _run_ovr_device_dense(
     rg: _RankGenes,
     X,
     n_cells: int,
@@ -963,34 +1031,28 @@ def _run_ovr_dense_chunks(
     use_continuity: bool,
     chunk_size: int | None,
     return_u_values: bool,
-) -> list[tuple[int, NDArray, NDArray]]:
+) -> list[tuple[int, NDArray, NDArray]] | None:
+    if not isinstance(X, cp.ndarray):
+        return None
+
     n_groups = len(rg.groups_order)
     chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
     group_codes_gpu = cp.asarray(rg.group_codes, dtype=cp.int32)
     group_sizes_dev = cp.asarray(group_sizes, dtype=cp.float64)
     rest_sizes = n_cells - group_sizes_dev
-    all_scores: dict[int, list] = {i: [] for i in range(n_groups)}
-    all_pvals: dict[int, list] = {i: [] for i in range(n_groups)}
+    rank_sums = cp.empty((n_groups, n_total_genes), dtype=cp.float64)
+    tie_corr = (
+        cp.empty(n_total_genes, dtype=cp.float64)
+        if tie_correct
+        else cp.ones(n_total_genes, dtype=cp.float64)
+    )
 
     for start in range(0, n_total_genes, chunk_width):
         stop = min(start + chunk_width, n_total_genes)
-        if rg._compute_stats_in_chunks:
-            block = _get_column_block(X, start, stop)
-            rg._accumulate_chunk_stats_vs_rest(
-                block,
-                start,
-                stop,
-                group_codes_dev=group_codes_gpu,
-                group_sizes_dev=group_sizes_dev,
-                n_cells=n_cells,
-            )
-            block_f32 = cp.asfortranarray(block.astype(cp.float32, copy=False))
-        else:
-            block_f32 = _ovr_dense_block_f32(X, start, stop)
-
+        block_f32 = cp.asarray(X[:, start:stop], dtype=cp.float32, order="F")
         n_cols = stop - start
-        rank_sums = cp.empty((n_groups, n_cols), dtype=cp.float64)
-        tie_corr = (
+        sub_rank_sums = cp.empty((n_groups, n_cols), dtype=cp.float64)
+        sub_tie_corr = (
             cp.empty(n_cols, dtype=cp.float64)
             if tie_correct
             else cp.ones(n_cols, dtype=cp.float64)
@@ -998,8 +1060,8 @@ def _run_ovr_dense_chunks(
         _wc.ovr_rank_dense_streaming(
             block_f32,
             group_codes_gpu,
-            rank_sums,
-            tie_corr,
+            sub_rank_sums,
+            sub_tie_corr,
             n_rows=n_cells,
             n_cols=n_cols,
             n_groups=n_groups,
@@ -1007,26 +1069,20 @@ def _run_ovr_dense_chunks(
             sub_batch_cols=OVR_DENSE_SUB_BATCH,
             stream=cp.cuda.get_current_stream().ptr,
         )
-        scores, p_values = _ovr_z_pvals(
-            rank_sums,
-            group_sizes_dev,
-            rest_sizes,
-            n_cells,
-            tie_corr,
-            use_continuity=use_continuity,
-            return_u_values=return_u_values,
-        )
-        scores_host = scores.get()
-        p_host = p_values.get()
+        rank_sums[:, start:stop] = sub_rank_sums
+        if tie_correct:
+            tie_corr[start:stop] = sub_tie_corr
 
-        for idx in range(n_groups):
-            all_scores[idx].append(scores_host[idx])
-            all_pvals[idx].append(p_host[idx])
-
-    return [
-        (gi, np.concatenate(all_scores[gi]), np.concatenate(all_pvals[gi]))
-        for gi in range(n_groups)
-    ]
+    return _finish_ovr(
+        rank_sums,
+        group_sizes_dev,
+        rest_sizes,
+        n_cells,
+        tie_corr,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+        n_groups=n_groups,
+    )
 
 
 def _wilcoxon_vs_rest(
@@ -1043,34 +1099,85 @@ def _wilcoxon_vs_rest(
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Wilcoxon test: each group vs rest of cells."""
     _warn_small_ovr_groups(rg, group_sizes, n_cells)
-    for runner in (
-        _run_ovr_host_sparse,
-        _run_ovr_device_sparse,
-        _run_ovr_host_dense,
-    ):
-        result = runner(
-            rg,
-            X,
-            n_cells,
-            n_total_genes,
-            group_sizes,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-            return_u_values=return_u_values,
-        )
-        if result is not None:
-            return result
-    return _run_ovr_dense_chunks(
-        rg,
-        X,
-        n_cells,
-        n_total_genes,
-        group_sizes,
-        tie_correct=tie_correct,
-        use_continuity=use_continuity,
-        chunk_size=chunk_size,
-        return_u_values=return_u_values,
-    )
+    match X:
+        case sp.spmatrix() | sp.sparray():
+            if rg._sparse_negative_fallback:
+                result = _run_ovr_signed_sparse_dense(
+                    rg,
+                    X,
+                    n_cells,
+                    n_total_genes,
+                    group_sizes,
+                    tie_correct=tie_correct,
+                    use_continuity=use_continuity,
+                    chunk_size=chunk_size,
+                    return_u_values=return_u_values,
+                )
+            else:
+                result = _run_ovr_host_sparse(
+                    rg,
+                    X,
+                    n_cells,
+                    n_total_genes,
+                    group_sizes,
+                    tie_correct=tie_correct,
+                    use_continuity=use_continuity,
+                    return_u_values=return_u_values,
+                )
+        case _ if _device_sparse_format(X) is not None:
+            if rg._sparse_negative_fallback:
+                result = _run_ovr_signed_sparse_dense(
+                    rg,
+                    X,
+                    n_cells,
+                    n_total_genes,
+                    group_sizes,
+                    tie_correct=tie_correct,
+                    use_continuity=use_continuity,
+                    chunk_size=chunk_size,
+                    return_u_values=return_u_values,
+                )
+            else:
+                result = _run_ovr_device_sparse(
+                    rg,
+                    X,
+                    n_cells,
+                    n_total_genes,
+                    group_sizes,
+                    tie_correct=tie_correct,
+                    use_continuity=use_continuity,
+                    return_u_values=return_u_values,
+                )
+        case np.ndarray():
+            result = _run_ovr_host_dense(
+                rg,
+                X,
+                n_cells,
+                n_total_genes,
+                group_sizes,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                return_u_values=return_u_values,
+            )
+        case cp.ndarray():
+            result = _run_ovr_device_dense(
+                rg,
+                X,
+                n_cells,
+                n_total_genes,
+                group_sizes,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                chunk_size=chunk_size,
+                return_u_values=return_u_values,
+            )
+        case _:
+            msg = f"Unsupported Wilcoxon OVR input type: {type(X)}"
+            raise TypeError(msg)
+    if result is not None:
+        return result
+    msg = f"Unsupported Wilcoxon OVR input type: {type(X)}"
+    raise TypeError(msg)
 
 
 def _run_ovo_host_sparse(
@@ -1084,9 +1191,7 @@ def _run_ovo_host_sparse(
     use_continuity: bool,
     return_u_values: bool,
 ) -> list[tuple[int, NDArray, NDArray]] | None:
-    sparse_format = _host_sparse_format(
-        X, sparse_negative_fallback=rg._sparse_negative_fallback
-    )
+    sparse_format = _host_sparse_format(X)
     if sparse_format is None:
         return None
 
@@ -1192,9 +1297,7 @@ def _run_ovo_device_sparse(
     use_continuity: bool,
     return_u_values: bool,
 ) -> list[tuple[int, NDArray, NDArray]] | None:
-    sparse_format = _device_sparse_format(
-        X, sparse_negative_fallback=rg._sparse_negative_fallback
-    )
+    sparse_format = _device_sparse_format(X)
     if sparse_format is None:
         return None
 
@@ -1327,49 +1430,39 @@ def _run_ovo_host_dense(
     )
 
 
-def _run_ovo_dense_chunks(
+def _run_ovo_device_dense(
     rg: _RankGenes,
     X,
     ctx: _OvoContext,
     n_total_genes: int,
-    group_sizes: NDArray,
+    _group_sizes: NDArray,
     *,
     tie_correct: bool,
     use_continuity: bool,
     chunk_size: int | None,
     return_u_values: bool,
-) -> list[tuple[int, NDArray, NDArray]]:
-    chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
-    scores_host = np.empty((ctx.n_test, n_total_genes), dtype=np.float64)
-    pvals_host = np.empty((ctx.n_test, n_total_genes), dtype=np.float64)
+) -> list[tuple[int, NDArray, NDArray]] | None:
+    if not isinstance(X, cp.ndarray):
+        return None
 
+    chunk_width = _choose_wilcoxon_chunk_size(chunk_size, n_total_genes)
+    ref_rows = cp.asarray(ctx.ref_row_ids, dtype=cp.int32)
+    grp_rows = cp.asarray(ctx.all_grp_row_ids, dtype=cp.int32)
+    rank_sums = cp.empty((ctx.n_test, n_total_genes), dtype=cp.float64)
+    tie_corr_arr = cp.ones((ctx.n_test, n_total_genes), dtype=cp.float64)
     for start in range(0, n_total_genes, chunk_width):
         stop = min(start + chunk_width, n_total_genes)
         n_cols = stop - start
-        ref_block = _ovo_dense_block(X, ctx.ref_row_ids, start, stop)
-        grp_block = _ovo_dense_block(X, ctx.all_grp_row_ids, start, stop)
-
-        _fill_ovo_chunk_stats(
-            rg,
-            ref_block,
-            grp_block,
-            offsets=ctx.offsets_np,
-            test_group_indices=ctx.test_group_indices,
-            start=start,
-            stop=stop,
-            group_sizes=group_sizes,
-        )
-
-        ref_f32 = cp.asarray(ref_block, dtype=cp.float32, order="F")
-        grp_f32 = cp.asarray(grp_block, dtype=cp.float32, order="F")
-        rank_sums = cp.zeros((ctx.n_test, n_cols), dtype=cp.float64)
-        tie_corr = cp.ones((ctx.n_test, n_cols), dtype=cp.float64)
+        ref_f32 = cp.asarray(X[ref_rows, start:stop], dtype=cp.float32, order="F")
+        grp_f32 = cp.asarray(X[grp_rows, start:stop], dtype=cp.float32, order="F")
+        sub_rank_sums = cp.empty((ctx.n_test, n_cols), dtype=cp.float64)
+        sub_tie_corr = cp.ones((ctx.n_test, n_cols), dtype=cp.float64)
         _wc.ovo_rank_dense_tiered_unsorted_ref(
             ref_f32,
             grp_f32,
             ctx.offsets_gpu,
-            rank_sums,
-            tie_corr,
+            sub_rank_sums,
+            sub_tie_corr,
             n_ref=ctx.n_ref,
             n_all_grp=ctx.n_all_grp,
             n_cols=n_cols,
@@ -1378,22 +1471,22 @@ def _run_ovo_dense_chunks(
             sub_batch_cols=OVO_DENSE_TIERED_SUB_BATCH,
             stream=cp.cuda.get_current_stream().ptr,
         )
-        scores, p_values = _ovo_z_pvals(
-            rank_sums,
-            ctx.test_sizes,
-            ctx.n_ref,
-            tie_corr,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-            return_u_values=return_u_values,
-        )
-        scores_host[:, start:stop] = scores.get()
-        pvals_host[:, start:stop] = p_values.get()
+        rank_sums[:, start:stop] = sub_rank_sums
+        if tie_correct:
+            tie_corr_arr[:, start:stop] = sub_tie_corr
 
-    return [
-        (group_index, scores_host[slot], pvals_host[slot])
-        for slot, group_index in enumerate(ctx.test_group_indices)
-    ]
+    return _finish_ovo(
+        rank_sums,
+        ctx.test_sizes,
+        ctx.n_ref,
+        tie_corr_arr,
+        tie_correct=tie_correct,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+        rg=rg,
+        test_group_indices=ctx.test_group_indices,
+        logfoldchanges_gpu=None,
+    )
 
 
 def _wilcoxon_with_reference(
@@ -1412,32 +1505,57 @@ def _wilcoxon_with_reference(
     if ctx.n_test == 0:
         return []
     _warn_small_ovo_groups(rg, ctx, group_sizes)
-    for runner, extra in (
-        (_run_ovo_host_sparse, {}),
-        (_run_ovo_device_sparse, {}),
-        (_run_ovo_host_dense, {"chunk_size": chunk_size}),
-    ):
-        result = runner(
-            rg,
-            X,
-            ctx,
-            n_total_genes,
-            group_sizes,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-            return_u_values=return_u_values,
-            **extra,
-        )
-        if result is not None:
-            return result
-    return _run_ovo_dense_chunks(
-        rg,
-        X,
-        ctx,
-        n_total_genes,
-        group_sizes,
-        tie_correct=tie_correct,
-        use_continuity=use_continuity,
-        chunk_size=chunk_size,
-        return_u_values=return_u_values,
-    )
+    match X:
+        case sp.spmatrix() | sp.sparray():
+            result = _run_ovo_host_sparse(
+                rg,
+                X,
+                ctx,
+                n_total_genes,
+                group_sizes,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                return_u_values=return_u_values,
+            )
+        case _ if _device_sparse_format(X) is not None:
+            result = _run_ovo_device_sparse(
+                rg,
+                X,
+                ctx,
+                n_total_genes,
+                group_sizes,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                return_u_values=return_u_values,
+            )
+        case np.ndarray():
+            result = _run_ovo_host_dense(
+                rg,
+                X,
+                ctx,
+                n_total_genes,
+                group_sizes,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                chunk_size=chunk_size,
+                return_u_values=return_u_values,
+            )
+        case cp.ndarray():
+            result = _run_ovo_device_dense(
+                rg,
+                X,
+                ctx,
+                n_total_genes,
+                group_sizes,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                chunk_size=chunk_size,
+                return_u_values=return_u_values,
+            )
+        case _:
+            msg = f"Unsupported Wilcoxon OVO input type: {type(X)}"
+            raise TypeError(msg)
+    if result is not None:
+        return result
+    msg = f"Unsupported Wilcoxon OVO input type: {type(X)}"
+    raise TypeError(msg)

@@ -54,11 +54,12 @@ __global__ void csr_scatter_to_csc_kernel(
 // `out` must be pre-zeroed; atomicAdd sums duplicate column indices (like
 // scipy's sum_duplicates) -- bit-identical to dense materialization for
 // canonical CSR. Output always double; input dtype templated.
-template <typename TData, typename IndptrT, typename IndexT>
+template <typename TData, typename IndptrT, typename IndexT,
+          typename OutT = double>
 __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
                                          const IndexT* __restrict__ indices,
                                          const TData* __restrict__ data,
-                                         double* __restrict__ out, int col_lb,
+                                         OutT* __restrict__ out, int col_lb,
                                          int col_ub, int n_cells) {
     const long long row =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -75,7 +76,7 @@ __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
         const IndexT col = indices[k];
         if (col >= lb && col < ub) {
             atomicAdd(&out[static_cast<long long>(col - lb) * n_cells + row],
-                      static_cast<double>(data[k]));
+                      static_cast<OutT>(data[k]));
         }
     }
 }
@@ -87,11 +88,12 @@ __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
 //
 // `out` must be pre-zeroed. `indptr` indexes columns; pass full-matrix column
 // pointers (with col_lb/col_ub) or a window rebased to [0, col_ub-col_lb).
-template <typename TData, typename IndptrT, typename IndexT>
+template <typename TData, typename IndptrT, typename IndexT,
+          typename OutT = double>
 __global__ void csc_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
                                          const IndexT* __restrict__ indices,
                                          const TData* __restrict__ data,
-                                         double* __restrict__ out, int col_lb,
+                                         OutT* __restrict__ out, int col_lb,
                                          int col_ub, int n_cells) {
     const int col = col_lb + static_cast<int>(blockIdx.x);
     if (col >= col_ub) return;
@@ -100,7 +102,7 @@ __global__ void csc_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
     const IndptrT e = indptr[col + 1];
     for (IndptrT p = s + threadIdx.x; p < e; p += blockDim.x) {
         const long long row = static_cast<long long>(indices[p]);
-        out[col_local * n_cells + row] = static_cast<double>(data[p]);
+        out[col_local * n_cells + row] = static_cast<OutT>(data[p]);
     }
 }
 

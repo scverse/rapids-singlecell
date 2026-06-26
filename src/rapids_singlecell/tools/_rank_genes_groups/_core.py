@@ -378,9 +378,8 @@ class _RankGenes:
         # as a tie at the column minimum (valid only for nonnegative data).
         # t-test/logreg are mean/variance/model-based and sign-agnostic. For the
         # Wilcoxon methods we canonicalize and, when sparse data holds
-        # negatives, fall back to the dense full-sort ranking (correct for any
-        # sign) rather than erroring -- so e.g. signed sparse data still ranks
-        # correctly, just via the dense path.
+        # negatives, route to sign-safe dense ranking inside the sparse
+        # streamers rather than erroring.
         self._sparse_negative_fallback = False
         if method in {"wilcoxon", "wilcoxon_binned"}:
             # Canonicalize before the negative check: summing duplicates can
