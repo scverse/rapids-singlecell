@@ -24,12 +24,8 @@ def logreg(rg: _RankGenes, **kwds) -> list[tuple[int, NDArray, None]]:
     X = rg.X[selected, :]
     codes = rg.group_codes[selected]
 
-    # Encode the multinomial class labels in canonical (original category) order
-    # rather than in `groups_order` order. groups_order echoes the user's
-    # `groups=` argument (see _select_groups), but cuML's softmax solver is not
-    # invariant to a class-index permutation, so without this the fitted scores
-    # would depend on the order groups are listed in. canon_label[i] is the
-    # class index used for groups_order[i]; coef_ rows are mapped back below.
+    # Encode multinomial classes in original category order for cuML softmax.
+    # groups_order follows the user; coef_ rows are mapped back below.
     cat_order = {str(c): i for i, c in enumerate(rg.labels.cat.categories)}
     canon_key = np.array([cat_order[str(g)] for g in rg.groups_order])
     canon_label = np.empty(n_groups, dtype=np.int64)

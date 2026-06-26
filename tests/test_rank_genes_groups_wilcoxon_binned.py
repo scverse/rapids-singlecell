@@ -429,17 +429,7 @@ class TestWilcoxonBinnedEdgeCases:
             assert np.all(pvals <= 1)
 
     def test_sparse_negative_values_fallback(self, adata_blobs):
-        """Sparse input with negatives must densify: the sparse histogram puts
-        implicit zeros in bin 0 (valid only for nonnegative data). A *correct*
-        fallback (densify) matches the dense run; a removed fallback would bin
-        the implicit zeros below stored negatives and diverge -- so this
-        assertion fails without the fallback.
-
-        Sensitivity hinges on columns holding BOTH structural zeros AND a value
-        below them (a negative). Where the zeros are the column minimum, moving
-        them to bin 0 leaves their rank order unchanged and the binned z is
-        invariant (which is why a naive sparse-vs-dense check is vacuous).
-        """
+        """Sparse negatives must densify so implicit zeros rank correctly."""
         import cupy as cp
         import cupyx.scipy.sparse as cpsp
 
@@ -570,12 +560,7 @@ def test_top_genes_match_scipy(adata_blobs):
 
 @pytest.mark.parametrize("reference", ["rest", "1"])
 def test_binned_bin_exact_matches_scipy(reference):
-    """wilcoxon_binned otherwise has NO external numeric oracle. With integer
-    data and n_bins >> value-range, each value gets its own bin -> binned ranks
-    == exact ranks -> binned pvals must match scipy.mannwhitneyu exactly
-    (tie_correct=True matches scipy's always-on asymptotic tie term). Covers
-    vs-rest and vs-ref, tie_correct and use_continuity, with non-vacuity
-    self-guards (each flag must materially change the result)."""
+    """Bin-exact integer data must match scipy.mannwhitneyu."""
     import pandas as pd
     from scipy.stats import mannwhitneyu
 
@@ -657,9 +642,7 @@ def test_binned_all_zero_sparse_finite(adata_blobs):
 
 
 def test_binned_log1p_invalid_for_negative_sparse_coerces_to_auto(adata_blobs):
-    """Sparse input with negatives + bin_range='log1p' warns and coerces to
-    'auto' (the fixed [0,15] range would clamp negatives). Result must equal the
-    explicit 'auto' run (non-vacuous: no coercion -> mis-binned negatives differ)."""
+    """Negative sparse log1p range must warn, coerce to auto, and match auto."""
     import cupy as cp
     import cupyx.scipy.sparse as cpsp
 

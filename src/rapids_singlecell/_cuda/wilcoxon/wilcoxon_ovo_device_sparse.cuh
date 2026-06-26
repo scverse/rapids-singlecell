@@ -1,10 +1,7 @@
 #pragma once
 
-/**
- * CSR-direct OVO streaming pipeline. Reference rows are extracted and sorted
- * once across all columns; each group sub-batch ranks against that cached slice
- * (mirrors the host-CSR path, avoids per-column reference re-extraction+sort).
- */
+/** CSR-direct OVO pipeline: cache sorted reference columns once.
+ *  Group sub-batches rank against that cache, matching the host-CSR path. */
 template <typename IndexT = int, typename IndptrT = int>
 static void ovo_streaming_csr_impl(
     const float* csr_data, const IndexT* csr_indices, const IndptrT* csr_indptr,
@@ -45,8 +42,8 @@ static void ovo_streaming_csr_impl(
     }
     int ref_cache_cols = std::min(n_cols, (int)max_ref_cols);
     {
-        // Ref cache = 2 floats/col/ref-row; size to ~1/3 of the allocator
-        // budget, leaving room for group buffers.
+        // Ref cache uses dense+sorted floats per column/ref row.
+        // Size to ~1/3 allocator budget, leaving room for group buffers.
         size_t bytes_per_col = (size_t)n_ref * sizeof(float) * 2;
         size_t target_bytes = rmm_available_device_bytes(1.0 / 3.0);
         if (bytes_per_col > 0 && target_bytes >= bytes_per_col) {
@@ -73,9 +70,8 @@ static void ovo_streaming_csr_impl(
         cub_temp_bytes = cub_grp_bytes;
     }
 
-    // Clamp streams to the per-stream scratch budget (mirrors host OVO): the
-    // group slab scales with cell count, so a fixed stream count would OOM at
-    // scale. Ref cache is allocated separately, so reserve its footprint first.
+    // Clamp streams to budget: group slabs scale with cell count.
+    // Ref cache is allocated separately, so reserve its footprint first.
     {
         size_t per_stream =
             sub_grp_items * sizeof(float) +
@@ -232,10 +228,8 @@ static void ovo_streaming_csr_impl(
     }
 }
 
-/**
- * CSC-direct OVO streaming pipeline. Like the CSR variant, but extracts rows
- * via lookup maps to operate on native CSC input without converting the matrix.
- */
+/** CSC-direct OVO pipeline: extracts rows via lookup maps.
+ *  Operates on native CSC input without converting the matrix. */
 template <typename IndexT = int, typename IndptrT = int>
 static void ovo_streaming_csc_impl(
     const float* csc_data, const IndexT* csc_indices, const IndptrT* csc_indptr,
@@ -287,9 +281,8 @@ static void ovo_streaming_csc_impl(
         cub_temp_bytes = std::max(cub_ref_bytes, cub_grp_bytes);
     }
 
-    // Clamp streams to the per-stream scratch budget (mirrors host OVO): the
-    // ref/group slabs scale with cell counts, so a fixed count would OOM at
-    // scale.
+    // Clamp streams to per-stream scratch budget.
+    // Ref/group slabs scale with cell counts, so fixed counts can OOM.
     {
         size_t per_stream =
             2 * sub_ref_items * sizeof(float) +

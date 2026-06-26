@@ -52,10 +52,8 @@ if (RSC_BUILD_EXTENSIONS)
   else()
     set(_rsc_python_rmm_hint "")
   endif()
-  # Wheel builds install librmm/rapids_logger into the isolated build env and
-  # write build/.librmm_dir from CIBW_BEFORE_BUILD.  publish.yml also symlinks
-  # those shared libraries into /usr/local/lib so auditwheel can see and exclude
-  # them instead of bundling RAPIDS runtime libraries into the wheel.
+  # Wheel builds write build/.librmm_dir from CIBW_BEFORE_BUILD.
+  # publish.yml symlinks runtime libs so auditwheel excludes them.
   if(DEFINED ENV{RSC_LIBRMM_DIR} AND EXISTS "$ENV{RSC_LIBRMM_DIR}/lib64/cmake/rmm/rmm-config.cmake")
     set(_rsc_librmm_marker "$ENV{RSC_LIBRMM_DIR}")
   elseif(EXISTS "${CMAKE_SOURCE_DIR}/build/.librmm_dir")
@@ -120,16 +118,8 @@ if (RSC_BUILD_EXTENSIONS)
     find_package(rmm CONFIG REQUIRED)
   endif()
 
-  # CCCL 3.3.0 (shipped by RAPIDS 26.04) declares the
-  # cudaDevAttrHostNumaMemoryPoolsSupported device-attribute specialization under
-  # `_CCCL_CTK_AT_LEAST(12, 6)`, but the CUDA runtime only added that enum in 12.9.
-  # So compiling the RMM/CCCL-including TUs (the Wilcoxon scratch allocator) against
-  # a CUDA 12.6-12.8 toolkit fails with a cryptic
-  # `error: the global scope has no "cudaDevAttrHostNumaMemoryPoolsSupported"`.
-  # CCCL fixed the guard to `_CCCL_CTK_AT_LEAST(12, 9)` after 3.3.0 (cccl PR #7838),
-  # so RAPIDS >= 26.06 (CCCL > 3.3.0) closes the gap -- only flag the buggy CCCL.
-  # Fail fast with an actionable message. Prebuilt wheels are unaffected: they are
-  # built on CUDA 12.2 (below the guard), so the enum is never referenced.
+  # CCCL 3.3.0 gates cudaDevAttrHostNumaMemoryPoolsSupported too loosely.
+  # Fail fast for CUDA 12.6-12.8 source builds with that buggy CCCL.
   set(_rsc_cccl_buggy_numa_guard TRUE)
   if (DEFINED CCCL_VERSION AND CCCL_VERSION VERSION_GREATER 3.3.0)
     set(_rsc_cccl_buggy_numa_guard FALSE)
@@ -196,10 +186,8 @@ function(add_nb_cuda_module target src)
   endif()
 endfunction()
 
-# An RMM-backed nanobind CUDA module: add_nb_cuda_module plus the shared RMM
-# scratch allocator (rmm_scratch.cu) and the rmm::rmm link. Installed wheels
-# resolve RAPIDS runtime libs from sibling Python packages; editable source-tree
-# imports still have the _cuda/__init__.py preload fallback.
+# RMM-backed nanobind CUDA module: normal module plus shared scratch allocator.
+# Wheels use sibling RAPIDS packages; editable imports still preload fallbacks.
 function(add_rmm_cuda_module target src)
   add_nb_cuda_module(${target} ${src})
   if (RSC_BUILD_EXTENSIONS)

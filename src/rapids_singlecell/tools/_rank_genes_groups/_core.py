@@ -155,10 +155,7 @@ class _RankGenes:
 
     def _basic_stats(self) -> None:
         """Compute means, vars, and pts for each group.
-
-        If data is already on GPU, uses Aggregate for fast single-pass computation.
-        Otherwise, sets flag for chunk-based computation during the wilcoxon loop.
-        """
+        Host data defers stats to the Wilcoxon chunk/streaming path."""
         n_genes = self.X.shape[1]
 
         try:
@@ -189,9 +186,8 @@ class _RankGenes:
         cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
         order = [cat_to_idx[str(name)] for name in self.groups_order]
 
-        # Aggregate returns stats per ALL categories. Slice to selected groups
-        # for per-group means/vars; keep the all-category arrays for "rest"
-        # stats so the totals stay correct when ``groups`` is a strict subset.
+        # Aggregate returns all categories; slice selected groups for outputs.
+        # Keep all-category totals so ``groups`` subsets get correct rest stats.
         sums_all = result["sum"]
         sq_sums_all = result["sq_sum"]
         nnz_all = result["count_nonzero"] if self.comp_pts else None
@@ -209,9 +205,8 @@ class _RankGenes:
         else:
             pts = None
 
-        # Compute rest statistics if reference='rest' — "rest" means every
-        # cell in ``groupby`` not in this group, including cells in
-        # categories that weren't selected via ``groups=``.
+        # For reference='rest', rest includes every category not in this group.
+        # That includes categories omitted by a strict ``groups=`` selection.
         if self.ireference is None:
             n_total = agg.n_cells.sum()
             n_rest = n_total - n
@@ -374,17 +369,12 @@ class _RankGenes:
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
-        # The optimized sparse Wilcoxon paths inject implicit zeros analytically
-        # as a tie at the column minimum (valid only for nonnegative data).
-        # t-test/logreg are mean/variance/model-based and sign-agnostic. For the
-        # Wilcoxon methods we canonicalize and, when sparse data holds
-        # negatives, route to sign-safe dense ranking inside the sparse
-        # streamers rather than erroring.
+        # Sparse Wilcoxon handles implicit zeros analytically only for nonnegative data.
+        # Signed sparse Wilcoxon routes to sign-safe dense ranking inside streamers.
         self._sparse_negative_fallback = False
         if method in {"wilcoxon", "wilcoxon_binned"}:
-            # Canonicalize before the negative check: summing duplicates can
-            # change stored values (e.g. +a and -a -> 0), and the fast paths
-            # rank each stored nnz once, so they must see scanpy's summed view.
+            # Canonicalize before the negative check because summing duplicates can change signs.
+            # Fast paths rank stored nnz once, so they must see scanpy's summed view.
             self.X = _canonicalize_sparse(self.X)
             self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if method in {

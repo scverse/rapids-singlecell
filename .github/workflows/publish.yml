@@ -94,9 +94,8 @@ jobs:
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
           text = remove_toml_array(text, f"rapids-cu{other}")
 
-          # librmm is needed at build time because CMake links the CUDA
-          # extension against librmm. Add the matching wheel to the isolated
-          # PEP 517 build requirements after selecting the CUDA package variant.
+          # CMake links CUDA extensions against librmm.
+          # Add the matching wheel to isolated build requirements.
           for dep in (
               f'    "librmm-cu{other}>=25.12",\n',
               f'    "rmm-cu{other}>=25.12",\n',
@@ -164,16 +163,8 @@ jobs:
             echo "[rsc-build] marker=$(cat build/.librmm_dir)"
           CIBW_TEST_SKIP: "*"
           CIBW_TEST_COMMAND: ""
-          # Exclude CUDA libs by SONAME glob (auditwheel >=6.2): the runtime
-          # stack (CuPy / nvidia-* wheels) provides them. Globs are version
-          # agnostic -- cusolver's SONAME is libcusolver.so.11 on CUDA 12 but
-          # .12 on CUDA 13, and nvJitLink is .12 vs .13, so pinning to the CUDA
-          # major would graft the wrong (or no) lib. cusolver's transitive deps
-          # (cublasLt, cusparse ~186MB, nvJitLink) are reached by auditwheel's
-          # tree walk and must each be excluded or they bloat the wheel.
-          # librmm.so / librapids_logger.so are also excluded: they are NOT in
-          # the CuPy/nvidia stack but are provided by the librmm / rapids_logger
-          # wheels at runtime, so we must not bundle them into our wheel.
+          # Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+          # Use SONAME globs so CUDA 12/13 suffix changes do not bundle them.
           CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 

@@ -392,20 +392,8 @@ def _validate_wilcoxon_sparse_dtype(X) -> None:
 
 
 def _device_sparse_arrays(X):
-    """Prepare device-sparse arrays for the Wilcoxon kernels.
-
-    Wilcoxon ranking sorts float32 keys on every sparse device path, including
-    the sign-safe sparse-dense OVR path. Casting ``X.data`` to float32 here
-    therefore does not diverge from any float64 ranking path, because there is
-    none. This only loses precision when preprocessing ran in float64;
-    float32-preprocessed values (even if later stored as float64) are
-    float32-exact, so ranking matches scanpy bit-for-bit (~1e-13). For a fully
-    float64 pipeline the rank-derived scores/p-values match scanpy-on-float64
-    to ~1e-4 on log-normalized data (below any significance threshold, no DE
-    calls change), while means and log fold changes are still computed in
-    float64. See the ``rank_genes_groups`` note on ranking precision. float64
-    input is accepted to spare the caller a pre-cast.
-    """
+    """Prepare device-sparse arrays for float32-key Wilcoxon kernels.
+    float64 data is accepted and cast for ranking; stats stay float64."""
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype == np.float32:
         data = X.data
@@ -444,9 +432,8 @@ def wilcoxon(
     return_u_values: bool = False,
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Compute Wilcoxon rank-sum test statistics."""
-    # Host dense OVR and OVO stream column windows from host. Already-device
-    # dense OVO still uses the device-resident tiered planner.
-    # Aggregate if on GPU, else defer to chunks.
+    # Host dense streams column windows; device dense stays device-resident.
+    # Aggregate stats on GPU, otherwise compute them inside streaming paths.
     X = rg.X
     _validate_wilcoxon_sparse_dtype(X)
     rg._basic_stats()

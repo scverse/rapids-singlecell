@@ -16,15 +16,8 @@ MIN_GROUP_SIZE_WARNING = 25
 
 
 def _sparse_has_negative(X) -> bool:
-    """Whether an in-memory sparse ``X`` stores an explicit negative value.
-
-    The fast sparse Wilcoxon paths add implicit (structural) zeros as a tie at
-    the column minimum, which is correct only for nonnegative stored values. A
-    negative breaks that, so in-memory Wilcoxon routes signed sparse data to
-    the sign-safe sparse-dense ranker. Dask arrays are not inspected here
-    (they are neither ``scipy`` nor ``cupy`` sparse); ``wilcoxon_binned`` guards
-    Dask sparse separately. Dense and t-test/logreg never need this.
-    """
+    """Return whether an in-memory sparse matrix stores a negative value.
+    Signed sparse Wilcoxon needs the sign-safe sparse-dense ranker."""
     if sp.issparse(X) or cpsp.issparse(X):
         if np.dtype(X.data.dtype).kind == "c":
             return False
@@ -33,13 +26,8 @@ def _sparse_has_negative(X) -> bool:
 
 
 def _canonicalize_sparse(X):
-    """Sum duplicate entries and sort indices of sparse ``X`` in place.
-
-    The fast Wilcoxon paths rank each stored nonzero once, so non-canonical
-    input with duplicate ``(row, col)`` entries would diverge from scanpy,
-    which sums duplicates when it densifies. Canonicalizing keeps them in
-    agreement. A no-op for already-canonical or dense input.
-    """
+    """Sum duplicates and sort sparse indices in place when needed.
+    Fast Wilcoxon ranks stored nnz once, so it expects scanpy's summed view."""
     if (
         (sp.issparse(X) or cpsp.issparse(X))
         and getattr(X, "format", None) in {"csr", "csc"}
@@ -56,26 +44,8 @@ def _select_groups(
     reference: str = "rest",
     skip_empty_groups: bool = False,
 ) -> tuple[NDArray, NDArray[np.int32], NDArray[np.int64]]:
-    """Build integer group codes from a categorical Series.
-
-    Parameters
-    ----------
-    labels
-        Categorical Series (from ``adata.obs[groupby]``).
-    selected
-        Group names to keep, or ``None`` for all groups.
-        Must already include the reference group if applicable.
-
-    Returns
-    -------
-    groups_order
-        Selected group names as a numpy array.
-    group_codes
-        Per-cell int32 codes: ``0..n_groups-1`` for selected cells,
-        ``n_groups`` (sentinel) for unselected cells.
-    group_sizes
-        Number of cells per selected group (int64).
-    """
+    """Build selected group names, per-cell int32 codes, and group sizes.
+    Unselected cells receive the sentinel code ``n_groups``."""
     all_categories = labels.cat.categories
 
     if selected is None:
@@ -145,13 +115,8 @@ def _choose_chunk_size(requested: int | None) -> int:
 
 
 def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray:
-    """
-    Densify a CSC column window [start, stop) into an F-order float64 block via
-    the fused ``csc_tile_to_dense`` kernel (column-major, coalesced, no atomics).
-
-    Slices the window by indptr pointers so only that window's nonzeros are
-    touched (and, for host CSC, transferred). Works for scipy and CuPy CSC.
-    """
+    """Densify a CSC column window into an F-order float64 GPU block.
+    Slices by indptr so only window nonzeros are touched/transferred."""
     from rapids_singlecell._cuda import _rank_stats_cuda as _rs
 
     s_ptr = int(X_csc.indptr[start])
@@ -174,12 +139,8 @@ def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray
 
 
 def _csr_tile_to_dense_block(X, start: int, stop: int) -> cp.ndarray:
-    """Densify a CSR column window [start, stop) straight into an F-order
-    float64 block via a single fused CSR->dense kernel, skipping the CSR->CSC
-    tile rebuild that ``X[:, start:stop].tocsc()`` (host) / ``X[:, start:stop]``
-    (device) would do. For device CSR the index arrays are already on the GPU,
-    so there is no transfer.
-    """
+    """Densify a CSR column window into an F-order float64 GPU block.
+    Device CSR avoids rebuilding a CSR/CSC slice before densifying."""
     from rapids_singlecell._cuda import _rank_stats_cuda as _rs
 
     n_rows = X.shape[0]
@@ -201,13 +162,8 @@ def _csr_tile_to_dense_block(X, start: int, stop: int) -> cp.ndarray:
 def _get_column_block(X, start: int, stop: int) -> cp.ndarray:
     """Extract a column block as a dense F-order float64 CuPy array."""
     match X:
-        # Device CSR: the fused csr_tile_to_dense kernel densifies the window in
-        # one pass with no transfer (index arrays are already on the GPU) -- the
-        # big win. Host CSR is intentionally NOT routed here: doing so would
-        # re-transfer the whole CSR every chunk (only ~1.15x and worse with more
-        # chunks); host data should be moved to the device once upstream
-        # (`X_to_GPU`) so it lands in this fast device branch, otherwise it falls
-        # through to the `.tocsc()` path below.
+        # Device CSR can densify in one pass without transfer.
+        # Host CSR intentionally falls through to avoid per-chunk full transfers.
         case cpsp.csr_matrix():
             return _csr_tile_to_dense_block(X, start, stop)
         case sp.csc_matrix() | sp.csc_array():

@@ -122,11 +122,9 @@ static void launch_ovr_rank_dense_streaming(
     sync_streams(streams, "dense OVR streaming rank");
 }
 
-// Host-streaming dense OVR: pinned-host multi-stream pipeline feeding the dense
-// sort+rank above. Reads each sub-batch into an F-order device block (full
-// array never transposed): F-order = contiguous memcpy, C-order = strided 2D
-// copy. Keys cast to f32; group sums (+nnz) accumulated in f64 from native
-// staging.
+// Host-streaming dense OVR: pinned multi-stream batches into F-order device
+// slabs. F-order copies contiguous; C-order uses 2D copy; stats accumulate in
+// f64.
 template <typename T>
 static void launch_ovr_rank_dense_host_streaming(
     const T* h_X, bool f_order, const int* group_codes, double* rank_sums,

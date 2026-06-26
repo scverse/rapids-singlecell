@@ -33,14 +33,8 @@ def _make_nonnegative(adata):
     return adata
 
 
-# The optimized sparse Wilcoxon paths inject implicit zeros analytically as a tie
-# at the column minimum, which is valid only for nonnegative data. With negatives
-# present they must NOT be used; instead the ranking falls back to the dense
-# full-sort path (correct for any sign), so the result matches running the same
-# method on the dense matrix. (t-test/t-test_overestim_var/logreg never need this
-# and accept signed sparse data directly -- e.g. mixscape's LDA t-test.)
-# (method, reference) combos: vs-rest for wilcoxon + binned, plus the OVO
-# (with-reference) wilcoxon path. binned has no with-reference mode.
+# Sparse Wilcoxon negative values must fall back to dense full-sort ranking.
+# Covers Wilcoxon OVR/OVO and binned OVR; other methods accept signed sparse.
 @pytest.mark.parametrize(
     ("method", "reference"),
     [("wilcoxon", "rest"), ("wilcoxon_binned", "rest"), ("wilcoxon", "b")],
@@ -84,9 +78,8 @@ def test_rank_genes_groups_sparse_negative_values_fallback(method, reference, fm
 @pytest.mark.parametrize("layout", ["csr", "csc"])
 @pytest.mark.parametrize("reference", ["rest", "1"])
 def test_device_sparse_int64_indptr_matches_scanpy(layout, reference):
-    # Real int64 indptr only occurs at nnz > 2^31 (unallocatable in CI). cupy
-    # >= 14.1 preserves explicitly promoted int64 indices/indptr, so a small
-    # matrix promoted to int64 drives the int64 device overloads.
+    # Real int64 indptr needs nnz > 2^31, so CI promotes a small matrix.
+    # cupy >= 14.1 preserves the promoted int64 buffers for overload coverage.
     rng = np.random.default_rng(0)
     dense = np.abs(rng.standard_normal((150, 8))).astype(np.float32)
     dense[dense < 0.5] = 0.0
@@ -726,10 +719,8 @@ def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
     return adata
 
 
-# OVO tiers (wilcoxon_fast_common.cuh): MEDIUM<=512, LARGE(fused smem sort)<=2500,
-# HUGE(CUB segmented sort)>2500. Group sizes in the standard blobs datasets are
-# <=~70 (all MEDIUM), so LARGE/HUGE are otherwise never exercised. These force a
-# single large test group.
+# OVO tier coverage: standard blobs hit only MEDIUM.
+# These cases force LARGE fused-smem sort and HUGE CUB segmented sort.
 @pytest.mark.parametrize(
     "fmt",
     ["numpy_dense", "cupy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"],
@@ -766,14 +757,8 @@ def test_wilcoxon_ovo_large_group_tiers_match_scanpy(fmt, tie_correct, big):
             )
 
 
-# n_groups > ~3056 makes the per-block smem for the sparse-OVR accumulator
-# ((2*n_groups+32) doubles) exceed the 48KB static limit, so sparse_ovr_smem_config
-# (and the dense ovr_smem_config) fall back to the global-memory accumulator.
-# This is the perturbation regime (thousands of guides vs rest). scanpy's
-# 3000+-group DataFrame build is O(n_groups^2) and too slow for an in-suite
-# parity check; gmem-vs-scanpy parity is verified out-of-band (<=2e-15). Here we
-# guard that every storage format (incl. the dense reference kernel) agrees at
-# gmem scale, with and without tie correction.
+# Many groups force global-memory accumulators, matching perturbation-scale DE.
+# scanpy is too slow here, so this guards cross-format agreement at gmem scale.
 @pytest.mark.parametrize("tie_correct", [False, True])
 def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
     adata = _make_sized_groups_adata([26] * 3100, n_genes=6, seed=3)
@@ -806,15 +791,8 @@ def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
             )
 
 
-# Regression guard for the host-dense OVR streaming launcher: in gmem rank mode
-# the rank kernel atomicAdds onto its per-stream rank-sum buffer without
-# self-zeroing, and those buffers are reused round-robin -- so the launcher must
-# zero them per sub-batch. This only bites past the DENSE gmem flip
-# (n_groups > ~6112) AND with enough genes (> N_STREAMS*sub_batch_cols = 256)
-# that the per-stream buffers actually wrap; the formats-agree gmem test above
-# uses n_genes=6 (one batch, fresh buffer) and cannot see it. Compares the host
-# (numpy) dense path against the device (cupy) dense + sparse paths, which zero
-# the gmem buffer correctly.
+# Host-dense OVR gmem buffers are reused round-robin and must be zeroed per batch.
+# This forces enough groups and genes to wrap per-stream rank-sum buffers.
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 6200 tiny groups warn
 def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
     adata = _make_sized_groups_adata([2] * 6200, n_genes=400, seed=7)
@@ -846,9 +824,8 @@ def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
             )
 
 
-# Host-dense OVR has only float32/float64 nanobind overloads; integer/bool/uint/
-# float16 numpy must be cast to float32 (mirrors the sparse path) rather than
-# raising a TypeError.
+# Host-dense OVR has only float32/float64 nanobind overloads.
+# Other numpy numeric dtypes must cast to float32 rather than raise.
 @pytest.mark.parametrize(
     "data_dtype", [np.int32, np.int64, np.uint16, np.float16, bool]
 )
@@ -887,12 +864,8 @@ def test_wilcoxon_dense_nonfloat_data_matches_float32(data_dtype):
         )
 
 
-# F-contiguous host-dense numpy hits the F-order nanobind overload of the host
-# streaming launcher: float32 -> the reinterpret-cast fast path (no cast kernel),
-# float64 -> dense_block_to_f32_kernel's identity branch. Every numpy_dense
-# fixture elsewhere is C-order, so this is the only coverage of that overload.
-# AnnData preserves F-order, so an F-contiguous X reaches the path; result must
-# match the C-order run on identical data.
+# F-contiguous host-dense numpy hits the F-order host-streaming overload.
+# It must match the C-order run on identical data.
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
     rng = np.random.default_rng(11)
@@ -927,16 +900,8 @@ def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
             )
 
 
-# Regression guard for a shared-memory OOB write in the host sparse OVR
-# cast-and-accumulate kernel: it placed the per-group nnz accumulator at a fixed
-# 2*n_groups smem offset, but cast_accumulate_smem_config packs only the enabled
-# arrays -- and the host OVR path runs with sq-sums OFF, nnz ON (pts=True). The
-# overrun was benign at tiny n_groups (it landed in rounded smem slack, and the
-# write/read used the same wrong offset so values stayed self-consistent) but
-# caused an illegal memory access once n_groups grew past ~25. n_groups=50 +
-# pts=True is the faulting regime, with the smem (non-gmem) accumulator still
-# selected. Covers both host sparse formats (the ones that crashed) plus the
-# dense/device formats for full parity.
+# Guards host sparse OVR smem packing for pts=True, where nnz offset once overran.
+# n_groups=50 stays on smem but reaches the formerly faulting regime.
 @pytest.mark.parametrize(
     "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
 )
@@ -976,11 +941,8 @@ def test_wilcoxon_ovr_pts_many_groups_match_scanpy(fmt):
         )
 
 
-# Companion to test_wilcoxon_ovr_many_groups_gmem_formats_agree, with pts=True:
-# at gmem scale (n_groups > ~3056) the global cast-accumulate and the
-# analytic-zero rank kernel both drive the per-group nnz path. scanpy's
-# 3000+-group build is too slow for an in-suite parity check, so we assert every
-# storage format agrees, including the pts fraction-expressing matrix.
+# Companion gmem-scale check with pts=True.
+# It exercises global cast-accumulate and analytic-zero nnz paths.
 def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
     adata = _make_sized_groups_adata([26] * 3100, n_genes=6, seed=5)
     ref = None
@@ -1220,9 +1182,7 @@ def test_rank_genes_groups_wilcoxon_pts(reference):
             )
 
 
-# ============================================================================
-# Ground-truth validation against scipy.stats.mannwhitneyu
-# ============================================================================
+# Ground-truth validation against scipy.stats.mannwhitneyu.
 
 
 def _make_perturbation_adata(
@@ -1539,10 +1499,7 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
 
 
 def test_wilcoxon_host_sparse_negative_chunked_stats_match_scanpy():
-    """Host scipy-sparse with negatives takes the dense fallback, whose group
-    means/vars/pts run through the group_chunk_stats kernel (multi-chunk). Those
-    means (-> logfoldchanges) and pts must match scanpy.
-    """
+    """Host sparse negatives fallback must match scanpy stats across chunks."""
     rng = np.random.default_rng(0)
     n_obs, n_vars = 200, 24
     X = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
@@ -1591,11 +1548,7 @@ def test_wilcoxon_host_sparse_negative_chunked_stats_match_scanpy():
 
 
 def test_wilcoxon_fdr_ties_nan_match_scanpy():
-    """BH FDR must match scanpy on heavily-tied / constant / all-zero genes,
-    locking in that the GPU argsort tie-break is inert for adjusted p-values.
-    Integer data is float32-exact, so ranking is bit-identical to scanpy and the
-    comparison isolates the FDR step.
-    """
+    """BH FDR must match scanpy on tied, constant, and all-zero genes."""
     rng = np.random.default_rng(1)
     n_obs, n_vars = 240, 30
     X = rng.integers(0, 3, size=(n_obs, n_vars)).astype(np.float64)  # heavy ties
@@ -1625,12 +1578,7 @@ def test_wilcoxon_fdr_ties_nan_match_scanpy():
 
 
 def _promote_host_index_dtype(X):
-    """Copy a host scipy CSR/CSC matrix with promoted index-array dtypes.
-
-    scipy couples indptr/indices to one dtype via get_index_dtype. Real int64
-    index buffers only occur at nnz > 2^31 in practice, so tests promote a small
-    matrix explicitly to drive the int64 templates.
-    """
+    """Copy a host scipy CSR/CSC matrix with promoted index-array dtypes."""
     X = X.copy()
     X.indptr = X.indptr.astype(np.int64)
     X.indices = X.indices.astype(np.int64)
@@ -1648,13 +1596,7 @@ def _promote_host_index_dtype(X):
     ],
 )
 def test_host_sparse_int64_templates_match_int32(reference, layout, data_dtype):
-    """Exercise the host-sparse int64-indptr / int64-indices kernel templates
-    (the int64-index/indptr overloads the suite otherwise never reaches).
-    These differ from the validated int32 host path
-    only in index dtype, so they must be bit-identical to it. Real int64 indices
-    only occur at nnz > 2^31 (unallocatable in CI), so we promote a small
-    matrix's index arrays explicitly and keep it host-resident (scipy sparse +
-    method='wilcoxon' is not moved to GPU)."""
+    """Host sparse int64 index templates must match the int32 path bit-for-bit."""
     rng = np.random.default_rng(0)
     dense = (rng.random((150, 8)) * 4.0).astype(np.float64)
     dense[dense < 1.5] = 0.0  # nonnegative + structural zeros -> sparse fast path
@@ -1689,13 +1631,7 @@ def test_host_sparse_int64_templates_match_int32(reference, layout, data_dtype):
 
 
 def _anndata_with_group_sizes(sizes, *, n_genes=6, seed=0):
-    """Dense AnnData whose per-group cell counts are exactly ``sizes``.
-
-    The OVO tier dispatch picks the rank kernel by *test-group* size
-    (MEDIUM<=512, LARGE 513-2500, HUGE>2500), so engineered group sizes drive
-    specific bands. Integer data is float32-exact, so ranking is bit-identical
-    to scanpy.
-    """
+    """Dense AnnData with exact per-group sizes for OVO tier tests."""
     rng = np.random.default_rng(seed)
     labels = []
     for name, n in sizes.items():
@@ -1735,22 +1671,14 @@ def _assert_ovo_matches_scanpy(adata, reference):
     ],
 )
 def test_ovo_tier_bands_match_scanpy(sizes, seed):
-    """OVO dense-tiered path across MEDIUM/LARGE (groups <= 512 plus a 1000-cell
-    LARGE) and HUGE (a > 2500-cell group, CUB segmented sort); match scanpy."""
+    """OVO dense-tiered MEDIUM/LARGE/HUGE paths must match scanpy."""
     adata = _anndata_with_group_sizes(sizes, seed=seed)
     _assert_ovo_matches_scanpy(adata, reference="ref")
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 6200 tiny groups warn
 def test_ovr_dense_gmem_branch_matches_scipy():
-    """The DENSE OVR global-memory accumulator (use_gmem) engages only when the
-    per-block group accumulators exceed the 48 KB MaxSharedMemoryPerBlock limit
-    -- n_groups > 6112 (= 49152 / 8 - 32). No other test reaches it (the
-    >3056-group gmem tests only flip the *sparse* accumulator). n_groups=6200
-    deterministically routes through dense gmem; a scanpy oracle here costs ~30s
-    (its per-group Python loop), so we validate a sample of groups against scipy
-    mannwhitneyu with rsc's exact settings (tie-corrected asymptotic, no
-    continuity)."""
+    """Dense OVR gmem branch must match scipy on sampled groups."""
     from scipy.stats import mannwhitneyu
 
     n_groups, n_genes = 6200, 4  # > 6112 -> dense gmem accumulator
@@ -1787,9 +1715,7 @@ def test_ovr_dense_gmem_branch_matches_scipy():
 
 
 def test_skip_empty_groups_vs_rest_drops_singleton():
-    """skip_empty_groups=True with reference='rest' silently drops <2-cell
-    groups (covers the reference=='rest' branch of _select_groups, which the
-    existing reference='ref' skip tests miss)."""
+    """skip_empty_groups=True with reference='rest' drops singleton groups."""
     adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=4)
     rsc.tl.rank_genes_groups(
         adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True
@@ -1825,11 +1751,7 @@ def test_skip_empty_groups_none_remain_raises():
     "fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"]
 )
 def test_ovr_tie_correct_false_tie_heavy_matches_scanpy(fmt):
-    """OVR (reference='rest') tie_correct=False on TIE-HEAVY data must match
-    scanpy across every storage format. The pre-existing tie_correct=False oracle
-    uses tie-free blobs (tie_corr ~= 1), so a wrong uncorrected variance would
-    pass; integer data with many ties stresses the omitted tie term on each path
-    (dense, host-sparse CSR/CSC, device-sparse CSR/CSC)."""
+    """OVR tie_correct=False on tie-heavy data must match scanpy for all formats."""
     rng = np.random.default_rng(7)
     n_obs, n_genes = 180, 8
     dense = rng.integers(0, 5, size=(n_obs, n_genes)).astype(np.float64)  # ties
@@ -1863,15 +1785,7 @@ def test_ovr_tie_correct_false_tie_heavy_matches_scanpy(fmt):
 )
 @pytest.mark.parametrize("reference", ["rest", "1"])  # OVR and OVO epilogues
 def test_use_continuity_matches_scipy(fmt, reference):
-    """use_continuity=True is validated only on dense-OVO elsewhere. Check the
-    continuity epilogue composes correctly with each path's rank_sums (OVR + OVO,
-    every format) vs scipy.mannwhitneyu(use_continuity=True, asymptotic).
-
-    Groups OVERLAP (no separation) on purpose: that keeps |R-E[R]| moderate so
-    the 0.5 continuity term MATERIALLY changes p -- a missing continuity
-    correction would then fail the scipy oracle (non-vacuous). Because U and E[U]
-    are multiples of 0.5, rsc's clamp (max(|d|-0.5,0)) and scipy's shift agree
-    exactly. tie_correct=True matches scipy's always-on asymptotic tie term."""
+    """Continuity epilogues must match scipy across OVR/OVO and formats."""
     from scipy.stats import mannwhitneyu
 
     rng = np.random.default_rng(8)
@@ -1912,9 +1826,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
             )
 
 
-# ---------------------------------------------------------------------------
-# Entry-point / init validation (rank_genes_groups + _RankGenes + _select_groups)
-# ---------------------------------------------------------------------------
+# Entry-point / init validation (rank_genes_groups + _RankGenes + _select_groups).
 
 
 def test_rank_genes_groups_default_method_is_ttest():
@@ -1987,9 +1899,7 @@ def test_singleton_group_without_skip_raises():
 
 @pytest.mark.parametrize("use_raw", [None, True])
 def test_rank_genes_groups_reads_raw_matches_scanpy(use_raw):
-    """use_raw=None (raw present) and use_raw=True both read adata.raw. X is
-    overwritten with rank-scrambling noise so a path that wrongly read .X would
-    diverge from scanpy (non-vacuous)."""
+    """use_raw=None and use_raw=True both read adata.raw, matching scanpy."""
     adata = _anndata_with_group_sizes({"0": 30, "1": 30, "2": 30}, seed=6)
     adata.raw = adata.copy()  # raw holds the real signal
     rng = np.random.default_rng(99)
@@ -2039,14 +1949,11 @@ def test_log1p_base_logfoldchanges_match_scanpy(reference, fmt):
             )
 
 
-# ---------------------------------------------------------------------------
-# OVO / OVR parity & dispatch gaps
-# ---------------------------------------------------------------------------
+# OVO / OVR parity and dispatch gaps.
 
 
 def test_ovo_dense_fallback_pts_match_scanpy():
-    """OVO sparse-negative dense fallback computes pts via _fill_ovo_chunk_stats
-    (ref + group branches). Validate pts vs scanpy on the dense equivalent."""
+    """OVO sparse-negative dense fallback pts must match scanpy."""
     rng = np.random.default_rng(11)
     dense = (rng.random((120, 8)) * 5.0).astype(np.float64)
     dense[dense < 1.5] = 0.0
@@ -2078,9 +1985,7 @@ def test_ovo_dense_fallback_pts_match_scanpy():
 
 @pytest.mark.parametrize("fmt", ["numpy_dense", "cupy_csr"])  # CPU + GPU FDR epilogues
 def test_bonferroni_matches_scanpy(fmt):
-    """Bonferroni correction (CPU _core.py:584 via dense, GPU :630-631 via the
-    cupy OVO result path) must match scanpy, not just be <=1 (the prior tests
-    only asserted the tautological clamp)."""
+    """Bonferroni correction must match scanpy, not just clamp below one."""
     rng = np.random.default_rng(12)
     dense = rng.integers(0, 5, size=(150, 6)).astype(np.float64)
     dense[dense < 1.0] = 0.0

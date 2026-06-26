@@ -18,12 +18,8 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
     }
 }
 
-// CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
-// smem-vs-gmem for the DENSE OVR rank kernel. Per-block accumulator is
-// (n_groups+32) doubles; over the per-block smem limit (~48 KB) it falls back
-// to gmem (use_gmem=true), flipping at roughly n_groups > 6112. Not dead: smem
-// mode with an oversized request fails to launch. Limit device-queried via
-// wilcoxon_max_smem_per_block(), so it auto-scales.
+// CRITICAL: dense OVR gmem fallback is load-bearing for large n_groups.
+// Shared-memory thresholds are device-queried; oversized smem would not launch.
 static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(n_groups + 32) * sizeof(double);
     if (need <= wilcoxon_max_smem_per_block()) {
@@ -35,15 +31,8 @@ static size_t ovr_smem_config(int n_groups, bool& use_gmem) {
     return 32 * sizeof(double);
 }
 
-/**
- * CRITICAL — DO NOT REMOVE the gmem branch. Load-bearing path for Perturb-seq /
- * pooled-CRISPR DE (n_groups in the thousands). smem-vs-gmem for the sparse OVR
- * rank kernel. Per-block accumulator is (2*n_groups+32) doubles (grp_sums +
- * grp_nz_count + warp buf); over the per-block smem limit (~48 KB) the kernel
- * CANNOT launch in smem mode, so use_gmem=true routes to a caller gmem buffer.
- * Flips at roughly n_groups > 3056. Twice mistaken for dead code; it is the
- * ONLY path that works at large n_groups. Limit device-queried via
- * wilcoxon_max_smem_per_block(), so the threshold auto-scales.
+/** CRITICAL: sparse OVR gmem fallback is required for Perturb-seq-scale groups.
+ *  Shared-memory thresholds are device-queried; oversized smem cannot launch.
  */
 static size_t sparse_ovr_smem_config(int n_groups, bool& use_gmem) {
     size_t need = (size_t)(2 * n_groups + 32) * sizeof(double);
@@ -55,10 +44,8 @@ static size_t sparse_ovr_smem_config(int n_groups, bool& use_gmem) {
     return 32 * sizeof(double);
 }
 
-/**
- * Fill sort values with row indices [0,1,...,n_rows-1] per column.
- * Grid: (n_cols,), block: 256 threads.
- */
+/** Fill sort values with row indices [0, 1, ..., n_rows-1] per column.
+ *  Grid: (n_cols,), block: 256 threads. */
 __global__ void fill_row_indices_kernel(int* __restrict__ vals, int n_rows,
                                         int n_cols) {
     int col = blockIdx.x;
@@ -69,13 +56,8 @@ __global__ void fill_row_indices_kernel(int* __restrict__ vals, int n_rows,
     }
 }
 
-/**
- * Read one dense column-batch (native `T`) into f32 F-order (the layout the
- * segmented sort expects); single sub-batch only, full array never transposed.
- *   f_order=true : staging already F-order -> identity cast.
- *   f_order=false: staging C-order; read into the F-order slot while casting.
- * Grid-stride over n_rows*sb_cols.
- */
+/** Read one dense column batch into f32 F-order for segmented sort.
+ *  F-order is identity cast; C-order reads into F-order while casting. */
 template <typename T>
 __global__ void dense_block_to_f32_kernel(const T* __restrict__ stg,
                                           float* __restrict__ out, int n_rows,
@@ -94,13 +76,8 @@ __global__ void dense_block_to_f32_kernel(const T* __restrict__ stg,
     }
 }
 
-/**
- * Accumulate per-(group, column) sums (+optional nnz) from a dense
- * column-batch, reading NATIVE staging in f64 so means match the Aggregate path
- * (the f32 cast is only for ranking). One block per column;
- * group_sums/group_nnz are this batch's (n_groups x sb_cols) buffers and must
- * be pre-zeroed.
- */
+/** Accumulate dense batch per-group sums and optional nnz in f64.
+ *  Reads native staging so means match Aggregate; ranking cast is separate. */
 template <typename T>
 __global__ void dense_group_accumulate_kernel(
     const T* __restrict__ stg, const int* __restrict__ group_codes,

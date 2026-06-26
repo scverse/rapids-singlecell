@@ -31,9 +31,8 @@ static inline int host_worker_count() {
     return (int)std::min<unsigned>(hw ? hw : 4u, 32u);
 }
 
-// Run fn(chunk, r0, r1) over a partition of [0, n); `chunk` = 0-based worker
-// index. fn runs concurrently: read-only shared state, disjoint output ranges
-// (keyed by chunk or [r0,r1)). Returns chunks used; serial for small n.
+// Run fn(chunk, r0, r1) over partitions of [0, n), serial for small n.
+// Concurrent callers must use read-only shared state and disjoint outputs.
 template <typename F>
 static inline int host_parallel_chunks(int n, F fn) {
     if (n <= 0) return 0;
@@ -157,9 +156,8 @@ static inline int clamp_streams_by_budget(int n_streams,
     return n_streams;
 }
 
-// Scatter a [rows, sb_cols] device sub-batch (row-major doubles, src stride
-// sb_cols) into `dst` (stride n_cols). `dst` must point at the dest column
-// offset (e.g. out + col).
+// Scatter row-major [rows, sb_cols] into destination stride n_cols.
+// `dst` must already point at the destination column offset.
 static inline void scatter_cols_2d(double* dst, const double* src, int rows,
                                    int n_cols, int sb_cols,
                                    cudaStream_t stream) {
@@ -168,10 +166,8 @@ static inline void scatter_cols_2d(double* dst, const double* src, int rows,
                       cudaMemcpyDeviceToDevice, stream);
 }
 
-// Halve sub_batch_cols until the densest window holds <= cap nonzeros, keeping
-// every batch's nnz within int32 for CUB and bounding per-stream transpose/sort
-// scratch. col_nnz(i) = nnz of column i. Worst case returns 1 (single column,
-// nnz <= n_rows).
+// Halve sub_batch_cols until the densest window holds <= cap nonzeros.
+// Keeps CUB item counts and per-stream scratch bounded; worst case returns 1.
 template <typename ColNnz>
 static inline int cap_sub_batch_by_nnz(int n_cols, int sub_batch_cols,
                                        size_t cap, ColNnz col_nnz) {
@@ -359,10 +355,8 @@ struct HostRegisterGuard {
         if (p && bytes > 0) {
             cudaError_t err = cudaHostRegister(p, bytes, flags);
             if (err != cudaSuccess) {
-                // Already-registered = owned elsewhere; use it without
-                // unregistering. Other failures make mapped reads unsafe, so
-                // surface them -- unless best_effort (pin is only a speedup;
-                // unpinned H2D still works).
+                // Already-registered memory is owned elsewhere; use as-is.
+                // Other failures are fatal unless pinning is only a speedup.
                 if (err == cudaErrorHostMemoryAlreadyRegistered ||
                     best_effort) {
                     cudaGetLastError();  // clear sticky error flag
@@ -396,11 +390,8 @@ struct HostRegisterGuard {
     }
 };
 
-// RAII for CUDA streams/events: reclaim on every path (incl. exception unwind).
-// Stream dtor SYNCHRONIZES before destroying. CRITICAL ordering: declare the
-// RmmScratchPool BEFORE these guards so streams (destroyed first) drain
-// in-flight kernels before the pool (destroyed last) frees the scratch they
-// read.
+// RAII for CUDA streams/events: stream destruction synchronizes first.
+// Declare RmmScratchPool before guards so streams drain before scratch frees.
 struct ScopedCudaStream {
     cudaStream_t stream = nullptr;
 
@@ -517,9 +508,8 @@ struct PinnedRingArray {
     }
 };
 
-// Per-slot pinned host staging with events, so CPU materialization into one
-// slot can overlap GPU consumption of another. All arrays have the same item
-// capacity; use a second ring for differently-sized metadata such as indptr.
+// Per-slot pinned host staging with events for CPU/GPU overlap.
+// Arrays share item capacity; use another ring for differently-sized metadata.
 template <typename... Ts>
 struct PinnedRing {
     std::tuple<PinnedRingArray<Ts>...> arrays;
@@ -583,9 +573,8 @@ __global__ void fill_linear_offsets_kernel(int* __restrict__ out,
     if (i <= n_segments) out[i] = i * stride;
 }
 
-/** Rebase a slice of indptr: out[i] = indptr[col+i] - indptr[col]. Grid-strided
- *  (arbitrary `count`). Templated so 64-bit global indptrs produce 32-bit
- *  pack-local indptrs (per-pack nnz fits int32 via the memory budget). */
+/** Rebase indptr slice to a local origin, grid-strided for arbitrary count.
+ *  64-bit global indptrs may produce 32-bit pack-local indptrs. */
 template <typename IdxIn, typename IdxOut>
 __global__ void rebase_indptr_kernel(const IdxIn* __restrict__ indptr,
                                      IdxOut* __restrict__ out, int col,
@@ -594,10 +583,8 @@ __global__ void rebase_indptr_kernel(const IdxIn* __restrict__ indptr,
     if (i < count) out[i] = (IdxOut)(indptr[col + i] - indptr[col]);
 }
 
-// Threaded host gather of selected rows into compact staging (f32 vals + int32
-// cols) at disjoint per-row offsets (compact_indptr - base) -> race-free.
-// No-pin alternative to the mapped gather kernel: only the compacted slice
-// crosses the bus.
+// Threaded selected-row gather into compact staging at disjoint offsets.
+// No-pin alternative: only the compacted slice crosses the bus.
 template <typename StageValT, typename StageIndexT, typename InT,
           typename IndexT, typename IndptrT, typename CompactT>
 static void host_gather_rows_compact_as(
@@ -630,9 +617,8 @@ static void host_gather_rows_compact(const InT* h_data, const IndexT* h_indices,
                                             n_target, stage_vals, stage_cols);
 }
 
-// Threaded host cast-copy of a contiguous nnz slice into staging (f32 + int32).
-// CSC analogue of host_gather_rows_compact: contiguous column batch, no gather.
-// nnz fits int32 (batch-bounded).
+// Threaded host cast-copy of a contiguous nnz slice into staging.
+// CSC analogue of row gather: contiguous column batch, bounded int32 nnz.
 template <typename StageValT, typename StageIndexT, typename InT,
           typename IndexT>
 static void host_copy_slice_as(const InT* h_data, const IndexT* h_indices,
@@ -662,9 +648,8 @@ static void host_cast_copy_slice(const InT* h_data, const IndexT* h_indices,
                                    stage_cols);
 }
 
-// Threaded host gather of selected dense rows and a contiguous column window
-// into an F-order staging tile. f_order describes the full source matrix; the
-// staged output is always [n_window_rows, n_window_cols] in column-major order.
+// Threaded host gather of selected dense rows and contiguous columns.
+// Output staging is always F-order [n_window_rows, n_window_cols].
 template <typename StageT, typename InT>
 static void host_materialize_dense_rows_window_as(
     const InT* h_X, bool f_order, int n_full_rows, int n_full_cols,
@@ -764,9 +749,8 @@ static void host_materialize_csr_cols_window(
         [&](int col) { return col_map[col]; }, stage_vals, stage_cols);
 }
 
-// Optimized CSR -> contiguous-column-window materialization for sorted rows and
-// ascending column batches. The per-row cursor means each nonzero is examined
-// once across the full stream.
+// Optimized CSR -> contiguous-column-window materialization for sorted rows.
+// The per-row cursor examines each nonzero once across the full stream.
 template <typename StageValT, typename StageIndexT, typename InT,
           typename IndexT, typename IndptrT>
 static int host_materialize_csr_column_interval_cursor_as(

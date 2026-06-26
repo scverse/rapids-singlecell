@@ -56,10 +56,7 @@ __all__ = [
 
 
 def _preload_rapids_runtime_libs() -> None:
-    """Pre-load ``librmm`` / ``rapids_logger`` so the extensions' ``DT_NEEDED``
-    soname deps resolve regardless of import order (the editable-install
-    ``RUNPATH`` is unreliable). Best-effort: absent wheels (docs builds) skip.
-    """
+    """Pre-load RAPIDS runtime libs so extension ``DT_NEEDED`` deps resolve."""
     for mod in ("librmm", "rapids_logger"):
         try:
             importlib.import_module(mod).load_library()
@@ -78,9 +75,8 @@ def __getattr__(name: str):
             # Extension genuinely absent (docs/no-GPU): degrade to None.
             return None
         except ImportError as exc:
-            # Present but failed to load (ABI/toolkit mismatch, missing .so, rmm
-            # symbol-ordering): surface with context, don't return None and crash
-            # later with a cryptic ``'NoneType' has no attribute ...``.
+            # Present but failed to load: surface ABI/toolkit/lib errors now.
+            # Returning None would cause a later cryptic attribute error.
             msg = (
                 f"Failed to load compiled CUDA extension {name!r}: {exc}. "
                 "Ensure a matching rapids-singlecell-cuXX wheel (and librmm) is "

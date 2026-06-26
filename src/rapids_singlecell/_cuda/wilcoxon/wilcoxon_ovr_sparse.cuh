@@ -1,10 +1,7 @@
 #pragma once
 
-/**
- * Sparse-aware host-streaming CSC OVR pipeline.
- * Sorts only stored nonzeros per column: GPU mem O(max_batch_nnz), sort work
- * O(nnz) not O(n_rows).
- */
+// Host-streaming CSC OVR: sort only stored nonzeros per column.
+// GPU memory is O(max_batch_nnz), not O(n_rows * n_cols).
 template <typename InT, typename IndexT, typename IndptrT>
 static void ovr_sparse_csc_host_streaming_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
@@ -243,20 +240,9 @@ static void ovr_sparse_csc_host_streaming_impl(
     sync_streams(streams, "sparse host CSC streaming");
 }
 
-// ============================================================================
-// Sparse-aware host-streaming CSR OVR pipeline.
-// ============================================================================
-
-/**
- * Out-of-core OVR for a host CSR too large to stage on the GPU.
- *
- * PRECONDITION: column indices sorted within each row. A per-row cursor (init
- * 0) walks the matrix ONCE: for each ascending column batch [col, col_end)
- * every row resumes where the prior batch stopped. Cursor advances
- * monotonically, so each nonzero is read + bulk-transferred exactly once (true
- * 1x transfer, not per-batch whole-CSR re-streaming). Histogram counted on
- * host; full CSR never page-locked (gather reads it on CPU). Single stream.
- */
+// Host CSR rowstream OVR for matrices too large to stage on the GPU.
+// Sorted rows let cursors advance once, so each nnz is gathered/transferred
+// once.
 template <typename InT, typename IndexT, typename IndptrT>
 static void ovr_sparse_csr_host_rowstream_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
@@ -272,8 +258,7 @@ static void ovr_sparse_csr_host_rowstream_impl(
     int tpb = UTIL_BLOCK_SIZE;
     size_t budget = rmm_available_device_bytes(0.8);
 
-    // ---- Phase 0: host column histogram, threaded by row range; each worker
-    // counts into a private array (no false sharing), merged after. ----
+    // Host column histogram; each worker counts privately, then merges.
     std::vector<size_t> h_col_counts(n_cols, 0);
     {
         int n_workers = host_worker_count();
@@ -288,9 +273,8 @@ static void ovr_sparse_csr_host_rowstream_impl(
             for (int c = 0; c < n_cols; c++) h_col_counts[c] += local[w][c];
     }
 
-    // ---- Column batch size: int32 CUB limit + device buffers fit budget.
-    // Per-nnz: gather mini-CSR (val+col) + CSC accum (val+f32+row) + sort out
-    // (key+row) + CUB temp. ----
+    // Column batches must satisfy int32 CUB limits and device memory budget.
+    // Per-nnz scratch covers mini-CSR gather, CSC accum, sort output, and CUB.
     constexpr size_t BYTES_PER_NNZ = 2 * sizeof(InT)  // gather val + csc val
                                      + 2 * sizeof(float)  // f32 key in + out
                                      + 3 * sizeof(int)    // gather col + 2 rows
@@ -318,9 +302,8 @@ static void ovr_sparse_csr_host_rowstream_impl(
     size_t smem_cast = cast_accumulate_smem_config(
         n_groups, compute_nnz, compute_totals, cast_use_gmem);
 
-    // ---- Host gather staging (pinned for bulk H2D) + per-row cursor. Full CSR
-    // NOT page-locked: gather reads it on CPU, only compacted slice crosses
-    // bus.
+    // Host gather staging is pinned; full CSR stays pageable on CPU.
+    // Only the compacted column interval crosses the bus.
     size_t stage_nnz = max_batch_nnz ? max_batch_nnz : 1;
     PinnedRing<InT, int> gather_stage(1, stage_nnz);
     PinnedRing<int> indptr_stage(1, (size_t)n_rows + 1);
@@ -364,11 +347,9 @@ static void ovr_sparse_csr_host_rowstream_impl(
     ScopedCudaStream row_stream(cudaStreamDefault);
     cudaStream_t stream = row_stream.get();
 
-    // ---- One linear column-batched pass. Cursor advances monotonically
-    // (sorted indices + ascending batches): each nonzero read/transferred once,
-    // no whole-matrix re-streaming. Threaded gather: count each row's run,
-    // prefix-sum to per-row offsets, copy rows into disjoint staging ranges.
-    // ----
+    // One ascending column pass; sorted-row cursors make transfer one-shot.
+    // Threaded gather counts row runs, prefix-sums, then copies disjoint
+    // ranges.
     std::vector<int> g_count(n_rows);
     int col = 0;
     for (int b = 0; b < n_batches; b++) {
@@ -463,12 +444,8 @@ static void ovr_sparse_csr_host_rowstream_impl(
     cuda_check(cudaStreamSynchronize(stream), "rowstream sync");
 }
 
-/**
- * Host CSR variant of the sparse OVR stream.
- * CSR stays in host memory; columns counted once, then mapped pinned arrays
- * feed bounded per-column-batch CSR->CSC scatter on the GPU -- avoids both a
- * full sparse upload and any whole-matrix CSR->CSC conversion.
- */
+// Host CSR sparse OVR stream: keep CSR on host and batch CSR->CSC scatter.
+// Avoids full sparse upload and whole-matrix CSR->CSC conversion.
 template <typename InT, typename IndexT, typename IndptrT>
 static void ovr_sparse_csr_host_streaming_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
@@ -508,10 +485,8 @@ static void ovr_sparse_csr_host_streaming_impl(
     cudaMemcpy(d_indptr_full, h_indptr, (n_rows + 1) * sizeof(IndptrT),
                cudaMemcpyHostToDevice);
 
-    // Stage indices on device when they fit so histogram + scatter read at HBM
-    // speed not over the bus. Both need indices, so staged first; data (equal
-    // size) staged later only if it fits too. Bulk pageable copy is
-    // driver-staged -- no host registration.
+    // Stage indices first when they fit so histogram/scatter read at HBM speed.
+    // Data is staged too only if data plus one stream buffer still fits.
     IndexT* d_indices = nullptr;
     bool indices_staged = total_nnz > 0 && idx_bytes <= budget / 2;
     if (total_nnz > 0) {
@@ -530,9 +505,8 @@ static void ovr_sparse_csr_host_streaming_impl(
         }
     }
 
-    // ---- Phase 0: per-column nnz counts on the GPU ----
-    // CSR has no column structure -> CPU count is a serial pass over every nnz.
-    // Histogram device-accessible indices; only n_cols counts come back.
+    // Count per-column nnz on GPU; CSR has no native column structure.
+    // Only n_cols counts are copied back for batch planning.
     std::vector<unsigned int> h_col_counts(n_cols, 0);
     if (total_nnz > 0) {
         unsigned int* d_col_counts = pool.alloc<unsigned int>(n_cols);
@@ -547,10 +521,8 @@ static void ovr_sparse_csr_host_streaming_impl(
             "OVR host CSR column-count D2H");
     }
 
-    // Each batch sorted in one CUB segmented call (int32 item count); its
-    // CSR->CSC transpose lives in per-stream scratch (~BYTES_PER_NNZ/nnz).
-    // Shrink sub_batch_cols until densest window fits BOTH the int32 limit AND
-    // a per-stream budget slice (tall matrices neither overflow CUB nor OOM).
+    // Each batch uses one CUB segmented sort and per-stream CSR->CSC scratch.
+    // Shrink sub_batch_cols until item counts and memory budget both fit.
     constexpr size_t BYTES_PER_NNZ = sizeof(InT) + sizeof(float) +
                                      2 * sizeof(int) + 8;  // buffers + CUB temp
     size_t batch_nnz_cap = SAFE_BATCH_NNZ;
@@ -598,9 +570,8 @@ static void ovr_sparse_csr_host_streaming_impl(
         per_stream_bytes += (size_t)n_groups * sub_batch_cols * sizeof(double);
     }
 
-    // Stage data too when indices resident and data + one stream's transpose
-    // buffers fit (scatter reads values at HBM speed). Else data stays mapped
-    // zero-copy (bounded for matrices too large to stage).
+    // Stage data when indices are resident and one transpose stream still fits.
+    // Otherwise values stay mapped zero-copy for bounded-memory streaming.
     size_t resident = indices_staged ? idx_bytes : 0;
     bool data_staged = total_nnz > 0 && indices_staged &&
                        resident + data_bytes + per_stream_bytes <= budget;
@@ -762,9 +733,7 @@ static void ovr_sparse_csr_host_streaming_impl(
     sync_streams(streams, "sparse host CSR streaming");
 }
 
-// ============================================================================
 // Sign-safe sparse OVR path: sparse window -> dense f32 tile -> dense rank.
-// ============================================================================
 
 constexpr int SPARSE_DENSE_OVR_CHUNK_COLS = 512;
 
@@ -1239,9 +1208,7 @@ static void ovr_dense_csr_host_streaming_impl(
     }
 }
 
-// ============================================================================
-// Sparse-aware CSC OVR streaming (sort only stored nonzeros)
-// ============================================================================
+// Sparse-aware CSC OVR streaming: sort only stored nonzeros.
 
 template <typename IndexT = int, typename IndptrT = int>
 static void ovr_sparse_csc_streaming_impl(
@@ -1336,9 +1303,8 @@ static void ovr_sparse_csc_streaming_impl(
             CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
         }
 
-        // Sort stored values (keys=data, vals=row_indices). Row indices fit
-        // int32 (n_rows < 2^31); downcast int64 here so sort + rank stay int32
-        // (half the val buffer) -- the device boundary.
+        // Sort stored values; row indices become int32 sort values here.
+        // This keeps sort/rank int32 while preserving int64 sparse buffers.
         if (batch_nnz > 0) {
             const int* idx_src;
             if constexpr (sizeof(IndexT) > sizeof(int)) {
@@ -1381,17 +1347,8 @@ static void ovr_sparse_csc_streaming_impl(
     sync_streams(streams, "sparse ovr streaming");
 }
 
-// ============================================================================
-// Sparse-aware CSR OVR streaming (partial CSR→CSC transpose per sub-batch)
-// ============================================================================
-
-/**
- * Sparse-aware OVR streaming pipeline for GPU CSR data.
- * P0: histogram nnz per column -> per-batch nnz + max_batch_nnz for sizing.
- * P1: alloc per-stream buffers sized to max_batch_nnz.
- * P2: per sub-batch scatter CSR->CSC (partial atomic transpose) -> CUB sort
- *     only nonzeros -> sparse rank. Sort work drops ~1/sparsity vs dense.
- */
+// Sparse-aware CSR OVR streaming with partial CSR->CSC transpose per batch.
+// Histogram plans batches; each batch transposes, sorts nnz only, then ranks.
 template <typename IndexT = int, typename IndptrT = int>
 static void ovr_sparse_csr_streaming_impl(
     const float* csr_data, const IndexT* csr_indices, const IndptrT* csr_indptr,

@@ -3,14 +3,8 @@ requires = [
     "scikit-build-core>=0.10",
     "nanobind>=2.0.0",
     "setuptools-scm>=8",
-    # librmm headers/CMake config are needed at build time for Wilcoxon.
-    # Generic isolated source builds default to CUDA 12. CUDA wheel builds
-    # rewrite this to the matching cu12/cu13 package; CUDA 13 source builds
-    # should build in an existing RAPIDS env with --no-build-isolation.
-    # 25.12 floor: the Wilcoxon scratch allocator uses the resource-ref API
-    # (get_current_device_resource_ref().allocate_sync), and the flat
-    # <rmm/mr/per_device_resource.hpp> header path only exists from 25.12
-    # onward (25.10 kept it under rmm/mr/device/). Builds through RMM 26.06+.
+    # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.
+    # 25.12+ provides the resource-ref API and flat RMM header path we use.
     "librmm-cu12>=25.12",
 ]
 build-backend = "scikit_build_core.build"
@@ -173,13 +167,8 @@ sdist.include = [ "src/rapids_singlecell/_version.py" ]
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]
-# Exclude CUDA libs by SONAME glob (auditwheel >= 6.2): suffixes are version-
-# dependent (cusolver is libcusolver.so.11 on CUDA 12 but .12 on CUDA 13), so a
-# `.*` glob stays correct across CUDA majors where hardcoded `.12`/`.13` would
-# miss variants and bundle ~186MB (cublasLt, cusparse, nvJitLink) that CuPy
-# provides at runtime. librmm.so / librapids_logger.so come from the librmm /
-# rapids_logger wheels. Keep this list in sync with CIBW_REPAIR_WHEEL_COMMAND in
-# .github/workflows/publish.yml (that env var overrides this block in CI).
+# Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+# Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
 repair-wheel-command = [
     "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
     "pipx run abi3audit --strict --report {wheel}",

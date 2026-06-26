@@ -4,10 +4,8 @@
 
 #include "../sparse_extract/sparse_extract.cuh"
 
-/**
- * Build CUB segmented-sort ranges for HUGE-band groups. Ranges point into the
- * original dense group layout (normal per-group positions).
- */
+/** Build CUB segmented-sort ranges for HUGE-band groups.
+ *  Ranges point into the original dense group layout. */
 __global__ void build_huge_seg_offsets_kernel(
     const int* __restrict__ grp_offsets, const int* __restrict__ group_ids,
     int* __restrict__ begins, int* __restrict__ ends, int n_all_grp,
@@ -58,11 +56,8 @@ __global__ void dense_ovo_group_stats_kernel(
     }
 }
 
-/**
- * Sizing knobs for LARGE-band dispatch: largest group fits in smem -> fused
- * bitonic-sort + binary-search kernel per block; else fall back to HUGE band
- * (CUB segmented sort + pre-sorted rank kernel).
- */
+/** Sizing knobs for LARGE/HUGE dispatch.
+ *  LARGE uses fused smem sort; HUGE uses CUB sort plus pre-sorted rank. */
 struct OvoTierPlan {
     int max_grp_size = 0;
     bool run_medium = false;    // MEDIUM band: any group ≤ OVO_MEDIUM_MAX
@@ -73,15 +68,8 @@ struct OvoTierPlan {
     size_t large_smem = 0;
 };
 
-// Single source of truth for OVO tier dispatch (dense + all four sparse OVO
-// impls). Scans group sizes once; co-launches by max group size:
-//   MEDIUM (<=512):  ovo_rank_medium_kernel (no sort; O(n^2) in-group count)
-//   LARGE  (<=2500): ovo_rank_sorted_kernel<true>  (fused smem bitonic sort)
-//   HUGE   (>2500):  CUB segmented sort + ovo_rank_sorted_kernel<false>
-// MEDIUM co-launches with the upper tier, which skips groups <= OVO_MEDIUM_MAX
-// (skip_n_grp_le). LARGE falls back to HUGE if smem exceeds the per-block
-// limit. (WARP/SMALL sub-tiers removed --
-// .claude/wilcoxon-warp-small-tiers-removed.md.)
+// Single OVO tier planner shared by dense and all sparse implementations.
+// MEDIUM co-launches; LARGE falls back to HUGE if smem exceeds device limits.
 static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
     OvoTierPlan c;
     for (int g = 0; g < n_groups; g++) {
@@ -99,9 +87,8 @@ static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
         c.large_tpb = std::min(c.large_padded, MAX_THREADS_PER_BLOCK);
         // dynamic smem = grp_smem only; warp_buf is static in the kernel.
         c.large_smem = (size_t)c.large_padded * sizeof(float);
-        // Device-adapt: if fused-sort buffer exceeds the per-block smem limit,
-        // fall back to HUGE (no smem cap). Inert at the ~16.6KB threshold;
-        // guards against threshold/device-limit changes.
+        // Device-adapt fused-sort smem to the per-block limit.
+        // If it no longer fits, fall back to HUGE with no smem cap.
         if (c.large_smem > wilcoxon_max_smem_per_block()) {
             c.run_large = false;
         }
@@ -157,20 +144,16 @@ struct OvoTierScratch {
     uint8_t* grp_cub_temp;  // HUGE: CUB scratch
 };
 
-// SINGLE OVO ranking engine, shared by dense + all four sparse OVO impls
-// (host/device CSC/CSR). Given a sorted reference slice and a dense group slice
-// for one column sub-batch, runs the size-banded dispatch from `plan` (see
-// make_ovo_tier_plan). Callers differ only in how they produce ref_sorted /
-// grp_dense.
+// Single OVO ranking engine shared by dense and all sparse host/device paths.
+// Callers differ only in how they produce ref_sorted and grp_dense.
 static inline void ovo_dispatch_tiers(
     const float* ref_sorted, const float* grp_dense, const int* grp_offsets,
     const OvoTierPlan& plan, const OvoTierScratch& sc,
     const int* d_sort_group_ids, int n_sort_groups, size_t grp_cub_temp_bytes,
     int sb_grp_items_actual, int tpb_rank, int n_ref, int n_all_grp,
     int sb_cols, int n_groups, bool compute_tie_corr, cudaStream_t stream) {
-    // No-tie fast path (tie_correct=False, the default): rank each group value
-    // vs the sorted reference only (U-identity), skipping group sort + all
-    // tiers. grp_dense is unsorted here, which this kernel wants.
+    // No-tie fast path: rank unsorted group values vs sorted ref (U-identity).
+    // Skips group sort and all tier kernels.
     if (!compute_tie_corr) {
         constexpr int VS_REF_BLOCK = 256;
         dim3 grid(sb_cols, n_groups);

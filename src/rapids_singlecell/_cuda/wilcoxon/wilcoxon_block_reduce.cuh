@@ -10,9 +10,8 @@ __device__ __forceinline__ double warp_reduce_sum(double v) {
     return v;
 }
 
-// Block-wide sum of `val` across all threads. `warp_buf` is shared scratch
-// holding one double per warp (>= ceil(blockDim.x / 32) <= 32). Result is
-// returned on thread 0 (lane 0 of warp 0); other threads get 0.0.
+// Block-wide sum of `val` using one shared double per warp.
+// Result is returned on thread 0; other threads get 0.0.
 __device__ __forceinline__ double wilcoxon_block_sum(double val,
                                                      double* warp_buf) {
     val = warp_reduce_sum(val);

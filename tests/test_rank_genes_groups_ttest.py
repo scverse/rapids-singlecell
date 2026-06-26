@@ -360,11 +360,7 @@ def test_rank_genes_groups_ttest_pts(reference, method):
 
 
 def test_rank_genes_groups_ttest_direct_scipy():
-    """Test t-test scores directly against scipy.stats.ttest_ind on two matrices.
-
-    Creates a simple two-group dataset and compares rapids_singlecell t-test
-    directly against scipy.stats.ttest_ind without intermediate statistics.
-    """
+    """Compare rapids_singlecell t-test scores directly to scipy.stats.ttest_ind."""
     np.random.seed(42)
     n_group1, n_group2, n_genes = 50, 60, 20
 
@@ -410,12 +406,7 @@ def test_rank_genes_groups_ttest_direct_scipy():
 
 
 def test_rank_genes_groups_ttest_matches_scipy():
-    """Test that t-test scores match scipy computation directly.
-
-    This test verifies that our variance clipping fix produces correct results
-    by comparing against scipy.stats.ttest_ind_from_stats with properly computed
-    (non-negative) variances. Uses real pbmc68k_reduced dataset at float64 precision.
-    """
+    """Compare t-test scores to scipy stats with nonnegative variances."""
     adata = pbmc68k_reduced()
     # Convert to float64 for maximum precision in comparison
     adata.X = adata.X.astype(np.float64)

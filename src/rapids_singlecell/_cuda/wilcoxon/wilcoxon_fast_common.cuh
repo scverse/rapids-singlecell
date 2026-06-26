@@ -22,32 +22,26 @@ constexpr int BEGIN_BIT = 0;
 constexpr int END_BIT = 32;
 // Scratch slots for warp-level reduction (one slot per warp, 32 warps max).
 constexpr int WARP_REDUCE_BUF = 32;
-// MEDIUM band cap: groups up to this size use unsorted O(n^2) in-group-count
-// rank (no smem sort). Tier dispatch: make_ovo_tier_plan.
+// MEDIUM band cap: groups up to this size use unsorted O(n^2) in-group rank.
+// Tier dispatch: make_ovo_tier_plan.
 constexpr int OVO_MEDIUM_MAX = 512;
 // LARGE band cap (fused smem-sort kernel); beyond it -> HUGE (CUB segmented
 // sort).
 constexpr int OVO_LARGE_MAX = 2500;
-// Per-stream dense slab budget (f32 items): 128M*4B=512MB slab + 512MB sorted
-// copy ≈ 1GB/stream. Sub-batching keeps (n_g * eff_sb_cols) <= this.
+// Per-stream dense slab budget: 128M f32 items plus sorted copy ~= 1GB/stream.
+// Sub-batching keeps (n_g * eff_sb_cols) within this.
 constexpr size_t GROUP_DENSE_BUDGET_ITEMS = 128 * 1024 * 1024;
 
-// Budget-aware OVO-host pack sizing. Per-stream device scratch that does NOT
-// scale with pack nnz: dense + sorted slabs (each <= GROUP_DENSE_BUDGET) plus
-// rank/tie/seg/cub headroom. Reserved per target stream when bounding pack nnz
-// so the resident packs + sorted ref cache fit device free.
+// Budget-aware OVO-host pack sizing for fixed per-stream scratch.
+// Reserves dense/sorted slabs plus rank/tie/seg/CUB headroom.
 constexpr size_t OVO_PACK_FIXED_PER_STREAM =
     4 * GROUP_DENSE_BUDGET_ITEMS * sizeof(float);  // ~2 GB
 // Floor for the budget-derived pack-nnz cap: avoid pathological over-splitting
 // into thousands of tiny packs when device memory is very tight.
 constexpr size_t OVO_MIN_PACK_NNZ = 64 * 1024 * 1024;  // 64M nnz
 
-// Host->device staging-ring slot cap (nnz). Bounds the page-locked footprint:
-// a pack's device buffer is filled in row-blocks of <= this many nonzeros, so
-// the cold pin stays small instead of seconds when pack nnz is large. 32M nnz
-// (128MB vals + 128MB cols/slot) is the joint sweet spot across scales: it
-// crushes the whole-pack pin at 2M (~2.7x) yet stays well clear of a sharp
-// large-scale slowdown seen with much smaller blocks at multi-billion nnz.
+// H2D staging-ring slot cap: keeps page-locked footprint bounded per row-block.
+// 32M nnz was the best compromise across small and multi-billion-nnz scales.
 constexpr size_t STAGE_RING_NNZ_CAP = 32 * 1024 * 1024;
 
 // Query CUB segmented-radix-sort scratch size. Float keys, int values/offsets.
@@ -103,16 +97,12 @@ static inline void cub_segmented_sortpairs(
                what);
 }
 
-// Universal CUDA static per-block shared-memory floor; safe fallback if the
-// device query fails.
+// Universal CUDA static per-block shared-memory floor.
+// Safe fallback if the device query fails.
 constexpr size_t WILCOXON_FALLBACK_SMEM_PER_BLOCK = 48 * 1024;
 
-// CRITICAL: per-block smem limit (cached per device) powering every smem/gmem
-// and tier decision (ovr_smem_config, sparse_ovr_smem_config,
-// cast_accumulate_smem_config, make_ovo_tier_plan). DO NOT hardcode a smem
-// value in place of this call -- gmem-fallback thresholds (e.g. sparse OVR
-// ~3056 groups) auto-scale with the GPU. Falls back to 48 KB if the query
-// fails.
+// CRITICAL: cached per-device smem limit drives every smem/gmem/tier decision.
+// Do not hardcode thresholds; sparse OVR fallback auto-scales with the GPU.
 static inline size_t wilcoxon_max_smem_per_block() {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {
@@ -140,9 +130,8 @@ static inline int round_up_to_warp(int n) {
     return (rounded < MAX_THREADS_PER_BLOCK) ? rounded : MAX_THREADS_PER_BLOCK;
 }
 
-/** Per-row stats codes for a pack of K groups. From pack_grp_offsets (size K+1,
- *  relative to pack start), write stats_codes[r] = base_slot + group_idx(r) via
- *  binary search over the K+1 offsets. */
+/** Per-row stats codes for a pack of K groups.
+ *  Writes stats_codes[r] = base_slot + group_idx(r) by offset binary search. */
 __global__ void fill_pack_stats_codes_kernel(
     const int* __restrict__ pack_grp_offsets, int* __restrict__ stats_codes,
     int K, int base_slot) {
@@ -160,9 +149,8 @@ __global__ void fill_pack_stats_codes_kernel(
     stats_codes[r] = base_slot + lo;
 }
 
-// Per-group stats over an already-compact CSR (accumulate half of the mapped
-// gather kernel, decoupled for host-staged data). slot = stats_codes[r] or
-// fixed_slot; slot outside [0,n_groups_stats) is skipped.
+// Per-group stats over compact CSR, decoupled for host-staged data.
+// Slot comes from stats_codes[r] or fixed_slot; out-of-range slots are skipped.
 __global__ void csr_compact_accumulate_kernel(
     const float* __restrict__ d_data_f32, const int* __restrict__ d_indices,
     const int* __restrict__ d_indptr, const int* __restrict__ d_stats_codes,

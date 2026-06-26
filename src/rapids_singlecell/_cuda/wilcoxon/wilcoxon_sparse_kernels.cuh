@@ -5,19 +5,9 @@
 #include "wilcoxon_block_reduce.cuh"
 #include "wilcoxon_ovr_tie_walk.cuh"
 
-// Sparse-aware OVR rank-sum kernel for nonnegative sorted stored values. Ranks
-// ONLY stored positives; all zeros (stored + implicit n_rows-nnz) form one
-// leading tie block ranked analytically at (total_zero+1)/2, each group's zero
-// contribution in closed form -> O(nnz log nnz)/col. Sentinel-group (n_groups)
-// rows feed the rest/tie denominator but get no rank-sum accumulation.
-//
-// CRITICAL: validity relies on upstream rejection of negative sparse values
-// (guarantees zeros form the first tie block). use_gmem selects shared- vs
-// global-memory accumulators (sparse_ovr_smem_config), REQUIRED for large
-// n_groups (Perturb-seq) -- do not remove.
-//
-// Grid (sb_cols,), Block (tpb,). Shared (doubles): grp_sums[n_groups] +
-// grp_nz_count[n_groups] + warp_buf[32].
+// Sparse OVR rank for nonnegative stored values; zeros rank analytically.
+// CRITICAL: negative rejection and gmem fallback are required at large
+// n_groups.
 template <typename IndexT = int>
 __global__ void rank_sums_sparse_ovr_kernel(
     const float* __restrict__ sorted_vals,
@@ -141,11 +131,8 @@ __global__ void rank_sums_sparse_ovr_kernel(
     }
 }
 
-// Shared sparse-OVR rank launch (all four sparse OVR impls). Optionally zeroes
-// the gmem accumulators, then launches the analytic-zero rank kernel. use_gmem
-// is the CRITICAL large-n_groups/perturbation fallback (see
-// sparse_ovr_smem_config) — DO NOT drop the gmem branch. ValT is the
-// sorted-row-index type (int everywhere today).
+// Shared sparse-OVR rank launch for all sparse OVR implementations.
+// CRITICAL: keep the gmem fallback for large-n_groups perturbation DE.
 template <typename ValT = int>
 static inline void launch_ovr_sparse_rank(
     const float* sorted_vals, const ValT* sorted_row_idx,
@@ -167,11 +154,8 @@ static inline void launch_ovr_sparse_rank(
     CUDA_CHECK_LAST_ERROR(rank_sums_sparse_ovr_kernel);
 }
 
-// CRITICAL — DO NOT REMOVE the gmem branch (large n_groups / perturbation DE).
-// smem-vs-gmem for the sparse-OVR stats cast+accumulate kernel. Needs
-// n_arrays*n_groups doubles in smem; over the per-block limit, use_gmem=true
-// selects ovr_cast_and_accumulate_sparse_global_kernel (accumulates in gmem).
-// Load-bearing fallback, not dead.
+// CRITICAL: sparse stats gmem fallback is load-bearing for large n_groups.
+// It selects the global accumulator when smem would exceed the per-block limit.
 static size_t cast_accumulate_smem_config(int n_groups, bool compute_nnz,
                                           bool compute_totals, bool& use_gmem) {
     int n_arrays = 1 + (compute_nnz ? 1 : 0);
@@ -185,9 +169,8 @@ static size_t cast_accumulate_smem_config(int n_groups, bool compute_nnz,
     return compute_totals ? WARP_REDUCE_BUF * sizeof(double) : 0;
 }
 
-// Shared cast+accumulate loop for the two sparse-OVR stats kernels. Casts each
-// stored value to f32 and atomically accumulates per-group sums (+nnz), strided
-// by acc_stride (1 for per-block smem, sb_cols for the gmem row-major layout).
+// Shared cast+accumulate loop for sparse-OVR stats kernels.
+// Casts to f32 for sort and atomically accumulates f64 sums/nnz.
 template <typename InT, typename IndexT>
 __device__ __forceinline__ void accumulate_group_stats(
     const InT* data_in, float* data_f32_out, const IndexT* indices,
@@ -212,13 +195,8 @@ __device__ __forceinline__ void accumulate_group_stats(
     }
 }
 
-/**
- * Pre-sort cast-and-accumulate kernel for sparse OVR host streaming. Sub-batch
- * CSC column c lives at [col_seg_offsets[c], col_seg_offsets[c+1]); writes an
- * f32 copy for the CUB sort and accumulates per-group sum/nnz in f64 (implicit
- * zeros contribute nothing). Block-per-column (grid (sb_cols,), block (tpb,)),
- * smem (1+compute_nnz)*n_groups doubles.
- */
+/** Pre-sort cast-and-accumulate kernel for sparse OVR streaming.
+ *  Writes f32 sort keys and accumulates explicit-value sums/nnz in f64. */
 template <typename InT, typename IndexT = int>
 __global__ void ovr_cast_and_accumulate_sparse_kernel(
     const InT* __restrict__ data_in, float* __restrict__ data_f32_out,
@@ -273,10 +251,8 @@ __global__ void ovr_cast_and_accumulate_sparse_kernel(
     }
 }
 
-// CRITICAL — DO NOT REMOVE. Gmem variant of the stats accumulator, selected by
-// cast_accumulate_smem_config when n_groups is too large for the smem kernel
-// (its n_arrays*n_groups double buffer exceeds the per-block limit). Required
-// for Perturb-seq-scale n_groups.
+// CRITICAL: gmem stats accumulator for n_groups too large for smem.
+// Required for Perturb-seq-scale group counts.
 template <typename InT, typename IndexT = int>
 __global__ void ovr_cast_and_accumulate_sparse_global_kernel(
     const InT* __restrict__ data_in, float* __restrict__ data_f32_out,

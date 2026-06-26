@@ -2,12 +2,8 @@
 
 #include <cuda_runtime.h>
 
-// Walk this thread's chunk [my_start, my_end) of a sorted column, accumulating
-// tie-averaged ranks into grp_sums (atomic, strided by acc_stride). Ties that
-// straddle a chunk boundary are expanded to their global extent within
-// [seg_floor, seg_ceil) by binary search. `rank_offset` shifts every rank (the
-// sparse path uses it to account for implicit leading zeros). Returns this
-// thread's tie-correction sum (sum of t^3 - t over tie blocks it owns).
+// Walk one sorted-column chunk and accumulate tie-averaged ranks atomically.
+// Boundary ties are expanded by search; sparse paths pass a rank_offset.
 template <typename IndexT>
 __device__ __forceinline__ double ovr_walk_tie_runs(
     const float* sv, const IndexT* si, const int* group_codes, double* grp_sums,

@@ -96,11 +96,8 @@ static OvoHostCsrPackPlan plan_ovo_host_csr_packs(
     return plan;
 }
 
-/**
- * Host-streaming CSC OVO pipeline: CSC on host, only each column sub-batch is
- * sent to GPU; row maps + group offsets uploaded once; results written back
- * per sub-batch.
- */
+/** Host-streaming CSC OVO: send only each column sub-batch to GPU.
+ *  Row maps/group offsets upload once; results scatter per sub-batch. */
 template <typename InT, typename IndexT, typename IndptrT>
 static void ovo_streaming_csc_host_impl(
     const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
@@ -361,12 +358,8 @@ static void ovo_streaming_csc_host_impl(
     sync_streams(streams, "wilcoxon streaming");
 }
 
-/**
- * Host CSR OVO pipeline (no full-matrix page-lock).
- *
- * Ref + each group pack are host-gathered into pinned staging, bulk-H2D'd,
- * then extract dense -> segmented sort -> rank vs cached sorted ref -> scatter.
- * Packs round-robin across N_STREAMS; per-slot events overlap gather + compute.
+/** Host CSR OVO pipeline with no full-matrix page-lock.
+ *  Pinned pack staging feeds dense extract, sort, rank vs cached ref, scatter.
  */
 template <typename InT, typename IndexT, typename IndptrT>
 static void ovo_streaming_csr_host_impl(
@@ -433,9 +426,8 @@ static void ovo_streaming_csr_host_impl(
                         ref_stream);
     }
 
-    // No full-matrix page-lock (the 280GB cudaHostRegister was ~7s/call). The
-    // gather reads pageable CSR and transfers only the compacted slice; just
-    // the small pinned staging buffers are registered.
+    // No full-matrix page-lock: large cudaHostRegister was seconds per call.
+    // Gather reads pageable CSR and pins only small staging buffers.
     (void)n_full_rows;
 
     // Pinned staging for the reference gather (compacted f32 vals + int32
@@ -457,10 +449,9 @@ static void ovo_streaming_csr_host_impl(
     cudaMemcpy(d_grp_offsets_full, h_grp_offsets, (n_test + 1) * sizeof(int),
                cudaMemcpyHostToDevice);
 
-    // Phase 1: Ref setup (scoped scratch, ref_sorted persists).
-    // The [n_ref × n_cols] sorted cache is built one COLUMN CHUNK at a time so
-    // each CUB segmented sort stays within int32 and the extract scratch is
-    // chunk-bounded; this is what lets n_ref × n_cols > INT_MAX work.
+    // Phase 1: ref setup with scoped scratch; sorted cache persists.
+    // Build by column chunk so CUB item counts and extract scratch stay
+    // bounded.
     size_t ref_items = (size_t)n_ref * (size_t)n_cols;
     if (ref_items > std::numeric_limits<size_t>::max() / (2 * sizeof(float))) {
         throw std::runtime_error(
@@ -578,12 +569,8 @@ static void ovo_streaming_csr_host_impl(
     constexpr size_t window_value_bytes =
         sizeof(WilcoxonSparseWindowDTypes::value_type);
 
-    // Clamp streams to the device-memory budget (90% of free). The per-stream
-    // pack buffers + dense slabs dominate device use, so a fixed stream count
-    // OOMs at scale / on smaller GPUs. The sorted ref cache + small shared
-    // arrays are already allocated, so the measured free already excludes them;
-    // budget is what is left for the per-stream scratch. Fewer streams just
-    // means less gather/compute overlap, not a re-stream.
+    // Clamp streams to the post-ref free-memory budget.
+    // Per-stream pack buffers dominate; fewer streams reduce overlap only.
     {
         size_t per_stream =
             sparse_window_nnz_bytes<WilcoxonSparseWindowDTypes>(max_pack_nnz) +
@@ -652,11 +639,9 @@ static void ovo_streaming_csr_host_impl(
         }
     }
 
-    // Small rolling pinned staging shared across packs: each pack's device
-    // buffer is filled in row-blocks of <= stage_cap nnz, so the page-locked
-    // footprint stays small regardless of pack nnz (the whole-pack pin was the
-    // dominant cost at small/medium scale). Extra slots let the host gather run
-    // ahead of the in-flight H2Ds.
+    // Rolling pinned staging fills pack device buffers in <= stage_cap nnz
+    // blocks. This keeps page-locked footprint small while extra slots overlap
+    // H2D.
     size_t stage_cap = std::min(max_pack_nnz, STAGE_RING_NNZ_CAP);
     int ring_slots = n_streams + 2;
     HostStagingRing stage(ring_slots, stage_cap);
@@ -720,9 +705,8 @@ static void ovo_streaming_csr_host_impl(
             CUDA_CHECK_LAST_ERROR(fill_pack_stats_codes_kernel);
         }
 
-        // Host-gather pack rows into the rolling staging in row-blocks (<=
-        // stage_cap nnz each), H2D each block into the pack's device buffer at
-        // its nnz offset, then accumulate stats over the full pack.
+        // Host-gather pack rows into rolling staging blocks, then H2D by
+        // offset. Stats accumulate once over the full device-resident pack.
         if (pack.nnz > 0) {
             IndptrT pack_base = h_grp_indptr_compact[row_start];
             int rb0 = 0;

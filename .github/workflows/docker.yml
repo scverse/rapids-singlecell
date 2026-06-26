@@ -1,6 +1,5 @@
-# This workflow will build two Docker image and push then to GitHub Packages Container registry:
-# - a base image with the dependencies
-# - a main image with the application code
+# Build/push two GHCR images: dependency base and application image.
+# Release events push; PR/comment runs only validate.
 
 name: Docker
 

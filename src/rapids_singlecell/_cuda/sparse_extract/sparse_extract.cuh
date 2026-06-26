@@ -2,24 +2,11 @@
 
 #include <cuda_runtime.h>
 
-// ============================================================================
-// Shared CSR/CSC -> {compact CSC, dense} extraction kernels (header-only).
-//   * compact CSC   (csr_scatter_to_csc)        -> sparse ranker (nnz only)
-//   * dense F-order (csr_tile_to_dense, extract) -> dense ranker (all values)
-// ============================================================================
+// Shared CSR/CSC extraction kernels for compact CSC and dense F-order tiles.
+// Callers canonicalize/sort before kernels that binary-search row indices.
 
-/**
- * Scatter CSR nonzeros into compact CSC for columns [col_start, col_stop).
- * write_pos[c - col_start] is column c's prefix-sum offset; threads atomically
- * claim destination slots.
- *
- * PRECONDITION: each row's `indices` sorted ascending -- the binary search for
- * col_start and the `break` at col_stop depend on it; unsorted rows would
- * silently drop/misplace nonzeros. Python dispatch calls sort_indices() first.
- *
- * `row_offset` rebases a local-row block to its global row id (out-of-core
- * row-streaming OVR path). 0 for full-matrix callers.
- */
+// Scatter CSR nonzeros into compact CSC for columns [col_start, col_stop).
+// `row_offset` rebases local row blocks; write_pos is atomically claimed.
 template <typename InT, typename IndexT, typename IndptrT>
 __global__ void csr_scatter_to_csc_kernel(
     const InT* __restrict__ data, const IndexT* __restrict__ indices,
@@ -48,12 +35,8 @@ __global__ void csr_scatter_to_csc_kernel(
     }
 }
 
-// Single-pass CSR-slice + densify: scatter column window [col_lb, col_ub) into
-// a dense (n_cells, col_ub-col_lb) F-order double buffer.
-//
-// `out` must be pre-zeroed; atomicAdd sums duplicate column indices (like
-// scipy's sum_duplicates) -- bit-identical to dense materialization for
-// canonical CSR. Output always double; input dtype templated.
+// CSR column window [col_lb, col_ub) -> pre-zeroed dense F-order tile.
+// atomicAdd preserves summed duplicate semantics for canonicalized CSR.
 template <typename TData, typename IndptrT, typename IndexT,
           typename OutT = double>
 __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
@@ -81,13 +64,8 @@ __global__ void csr_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
     }
 }
 
-// CSC column-window [col_lb, col_ub) -> dense F-order (double), one block per
-// column. NO atomicAdd -- canonical CSC has a unique (col,row) per nonzero (the
-// wilcoxon dispatch canonicalizes/sums first). CSC counterpart to
-// csr_tile_to_dense_kernel.
-//
-// `out` must be pre-zeroed. `indptr` indexes columns; pass full-matrix column
-// pointers (with col_lb/col_ub) or a window rebased to [0, col_ub-col_lb).
+// CSC column window [col_lb, col_ub) -> pre-zeroed dense F-order tile.
+// No atomics: canonical CSC has one stored value per (col, row).
 template <typename TData, typename IndptrT, typename IndexT,
           typename OutT = double>
 __global__ void csc_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
@@ -106,9 +84,8 @@ __global__ void csc_tile_to_dense_kernel(const IndptrT* __restrict__ indptr,
     }
 }
 
-// CSR selected rows -> dense F-order. row_ids[tid] = source row; output column
-// is (col - col_start), output row is tid. Requires sorted indices (binary
-// search + break). Output must be pre-zeroed.
+// CSR selected rows -> pre-zeroed dense F-order tile.
+// Requires sorted row indices for binary-search + col_stop break.
 template <typename T, typename IndexT = int, typename IndptrT = int>
 __global__ void csr_extract_dense_kernel(const T* __restrict__ data,
                                          const IndexT* __restrict__ indices,
@@ -160,11 +137,8 @@ __global__ void csr_extract_dense_identity_rows_unsorted_kernel(
     }
 }
 
-/**
- * Extract rows from CSC into dense F-order via a row lookup map.
- * row_map[original_row] = output_row_index (or -1 to skip).
- * One block per column. Output must be pre-zeroed.
- */
+// CSC selected rows -> pre-zeroed dense F-order tile.
+// row_map[original_row] gives output row, or -1 to skip.
 template <typename IndexT = int, typename IndptrT = int>
 __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
                                           const IndexT* __restrict__ indices,
@@ -186,9 +160,8 @@ __global__ void csc_extract_mapped_kernel(const float* __restrict__ data,
     }
 }
 
-// Narrowing element-wise cast (e.g. int64 row indices -> int32 sort values).
-// Used only when the input index width exceeds int32; the caller guarantees the
-// values fit the destination type (row/col positions < 2^31).
+// Narrowing element-wise cast, used only when input index width exceeds int32.
+// Caller guarantees row/column positions fit the destination type.
 template <typename SrcT, typename DstT>
 __global__ void cast_array_kernel(const SrcT* __restrict__ src,
                                   DstT* __restrict__ dst, size_t n) {
