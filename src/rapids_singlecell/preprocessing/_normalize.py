@@ -6,6 +6,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Union
 
 import cupy as cp
+from anndata import AnnData
 from cupyx.scipy import sparse
 from cupyx.scipy.sparse import csr_matrix
 from scanpy.get import _get_obs_rep, _set_obs_rep
@@ -19,7 +20,6 @@ from rapids_singlecell._compat import (
 from ._utils import _check_gpu_X, _check_nonnegative_integers
 
 if TYPE_CHECKING:
-    from anndata import AnnData
     from cupyx.scipy.sparse import spmatrix
 
     from rapids_singlecell._utils import ArrayTypesDask
@@ -357,7 +357,7 @@ def _calc_log1p(X: ArrayTypesDask, base: float | None = None) -> ArrayTypesDask:
 
 
 def log1p(
-    adata: AnnData,
+    data: AnnData | ArrayTypesDask,
     *,
     base: float | None = None,
     layer: str | None = None,
@@ -373,8 +373,10 @@ def log1p(
 
     Parameters
     ----------
-        adata
-            AnnData object
+        data
+            The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
+            to cells and columns to genes. If a matrix is passed instead of an
+            :class:`~anndata.AnnData` object, the transformed matrix is returned.
         base
             Base of the logarithm. Natural logarithm is used by default.
         layer
@@ -382,17 +384,30 @@ def log1p(
         obsm
             Entry of `.obsm` to transform.
         inplace
-            Whether to update `adata` or return the matrix.
+            Whether to update `data` or return the matrix. Only applies to
+            :class:`~anndata.AnnData` input.
         copy
-            Whether to return a copy or update `adata`. Not compatible with `inplace=False`.
+            Whether to return a copy or update `data`. Not compatible with `inplace=False`.
+            Only applies to :class:`~anndata.AnnData` input.
 
     Returns
     -------
     The resulting matrix after applying the logarithm of one plus the input matrix. \
-    If `copy` is set to True, returns the modified AnnData. Otherwise, updates the `adata` object \
-    in-place and returns None.
+    If a matrix is passed, the transformed matrix is returned. If an AnnData object is \
+    passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the \
+    `data` object in-place and returns None.
 
     """
+    if not isinstance(data, AnnData):
+        if layer is not None or obsm is not None:
+            raise ValueError(
+                "`layer` and `obsm` can only be used with an AnnData object."
+            )
+        X = data
+        _check_gpu_X(X, allow_dask=True)
+        return _calc_log1p(X, base=base)
+
+    adata = data
     if copy:
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
@@ -406,6 +421,88 @@ def log1p(
 
     X = _calc_log1p(X, base=base)
     adata.uns["log1p"] = {"base": base}
+    if inplace:
+        _set_obs_rep(adata, X, layer=layer, obsm=obsm)
+
+    if copy:
+        return adata
+    elif not inplace:
+        return X
+
+
+def _calc_sqrt(X: ArrayTypesDask) -> ArrayTypesDask:
+    if isinstance(X, DaskArray):
+        meta = _meta_sparse if isinstance(X._meta, csr_matrix) else _meta_dense
+        X = X.map_blocks(_calc_sqrt, meta=meta(X.dtype))
+    else:
+        X = X.copy()
+        if sparse.issparse(X):
+            X = X.sqrt()
+        else:
+            X = cp.sqrt(X)
+    return X
+
+
+def sqrt(
+    data: AnnData | ArrayTypesDask,
+    *,
+    layer: str | None = None,
+    obsm: str | None = None,
+    inplace: bool = True,
+    copy: bool = False,
+) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
+    """\
+    Take the square root of the data matrix.
+
+    Computes :math:`X = \\sqrt{X}`.
+
+    Parameters
+    ----------
+        data
+            The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
+            to cells and columns to genes. If a matrix is passed instead of an
+            :class:`~anndata.AnnData` object, the transformed matrix is returned.
+        layer
+            Layer to transform instead of `X`. If `None`, `X` is transformed.
+        obsm
+            Entry of `.obsm` to transform.
+        inplace
+            Whether to update `data` or return the matrix. Only applies to
+            :class:`~anndata.AnnData` input.
+        copy
+            Whether to return a copy or update `data`. Not compatible with `inplace=False`.
+            Only applies to :class:`~anndata.AnnData` input.
+
+    Returns
+    -------
+    The resulting matrix after applying the square root to the input matrix. \
+    If a matrix is passed, the transformed matrix is returned. If an AnnData object is \
+    passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the \
+    `data` object in-place and returns None.
+
+    """
+    if not isinstance(data, AnnData):
+        if layer is not None or obsm is not None:
+            raise ValueError(
+                "`layer` and `obsm` can only be used with an AnnData object."
+            )
+        X = data
+        _check_gpu_X(X, allow_dask=True)
+        return _calc_sqrt(X)
+
+    adata = data
+    if copy:
+        if not inplace:
+            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
+        adata = adata.copy()
+    X = _get_obs_rep(adata, layer=layer, obsm=obsm)
+
+    _check_gpu_X(X, allow_dask=True)
+
+    if not inplace:
+        X = X.copy()
+
+    X = _calc_sqrt(X)
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
 

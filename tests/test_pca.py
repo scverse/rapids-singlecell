@@ -62,19 +62,25 @@ def _pbmc3k_normalized() -> AnnData:
 # =============================================================================
 
 
+@pytest.mark.parametrize("use_array", [False, True])
 @pytest.mark.parametrize("use_sparse", [True, False])
-def test_pca_correctness_zero_center(use_sparse):
+def test_pca_correctness_zero_center(use_sparse, use_array):
     """Test PCA correctness against reference values (zero_center=True)."""
     A = np.array(A_list).astype("float64")
     if use_sparse:
         A = sparse.csr_matrix(A)
 
     adata = AnnData(A)
-    rsc.pp.pca(adata, n_comps=4, zero_center=True)
+    if use_array:
+        # feeding the matrix directly should return the embedding
+        X_pca = rsc.pp.pca(adata.X, n_comps=4, zero_center=True)
+    else:
+        rsc.pp.pca(adata, n_comps=4, zero_center=True)
+        X_pca = adata.obsm["X_pca"]
 
     # Compare absolute values (signs can flip)
     np.testing.assert_allclose(
-        np.abs(adata.obsm["X_pca"]),
+        np.abs(cp.asnumpy(X_pca)),
         np.abs(A_pca[:, :4]),
         rtol=1e-5,
         atol=1e-5,

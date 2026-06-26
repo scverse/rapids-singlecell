@@ -130,16 +130,23 @@ def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
     cp.testing.assert_allclose(output, reference, rtol=1e-9, atol=1e-9)
 
 
+@pytest.mark.parametrize("use_array", [False, True])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.parametrize("base", [None, 2, 10])
-def test_log1p_base(dtype, sparse, base):
+def test_log1p_base(use_array, dtype, sparse, base):
     X = cp.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype)
     if sparse:
         X = csr_matrix(X)
     cudata = AnnData(X.copy())
 
-    rsc.pp.log1p(cudata, base=base)
+    if use_array:
+        # feeding the matrix directly should match feeding the AnnData
+        out = rsc.pp.log1p(X.copy(), base=base)
+        result = out.toarray() if hasattr(out, "toarray") else out
+    else:
+        rsc.pp.log1p(cudata, base=base)
+        result = cudata.X.toarray() if sparse else cudata.X
 
     # Compute reference
     X_ref = cp.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype)
@@ -147,13 +154,30 @@ def test_log1p_base(dtype, sparse, base):
     if base is not None:
         X_ref /= cp.log(base)
 
-    if sparse:
-        result = cudata.X.toarray()
-    else:
-        result = cudata.X
-
     cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
-    assert cudata.uns["log1p"]["base"] == base
+    if not use_array:
+        assert cudata.uns["log1p"]["base"] == base
+
+
+@pytest.mark.parametrize("use_array", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("sparse", [True, False])
+def test_sqrt(use_array, dtype, sparse):
+    X = cp.array([[1.0, 4.0], [9.0, 16.0], [0.0, 25.0]], dtype=dtype)
+    if sparse:
+        X = csr_matrix(X)
+    cudata = AnnData(X.copy())
+
+    if use_array:
+        # feeding the matrix directly should match feeding the AnnData
+        out = rsc.pp.sqrt(X.copy())
+        result = out.toarray() if hasattr(out, "toarray") else out
+    else:
+        rsc.pp.sqrt(cudata)
+        result = cudata.X.toarray() if sparse else cudata.X
+
+    X_ref = cp.sqrt(cp.array([[1.0, 4.0], [9.0, 16.0], [0.0, 25.0]], dtype=dtype))
+    cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
