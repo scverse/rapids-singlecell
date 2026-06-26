@@ -148,11 +148,10 @@ def test_log1p_base(use_array, dtype, sparse, base):
         rsc.pp.log1p(cudata, base=base)
         result = cudata.X.toarray() if sparse else cudata.X
 
-    # Compute reference
-    X_ref = cp.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype)
-    X_ref = cp.log1p(X_ref)
+    # Compute reference on the host (CPU) to validate the GPU result
+    X_ref = np.log1p(np.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype))
     if base is not None:
-        X_ref /= cp.log(base)
+        X_ref /= np.log(base)
 
     cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
     if not use_array:
@@ -176,7 +175,7 @@ def test_sqrt(use_array, dtype, sparse):
         rsc.pp.sqrt(cudata)
         result = cudata.X.toarray() if sparse else cudata.X
 
-    X_ref = cp.sqrt(cp.array([[1.0, 4.0], [9.0, 16.0], [0.0, 25.0]], dtype=dtype))
+    X_ref = np.sqrt(np.array([[1.0, 4.0], [9.0, 16.0], [0.0, 25.0]], dtype=dtype))
     cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
 
 

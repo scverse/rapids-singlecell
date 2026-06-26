@@ -87,6 +87,21 @@ def test_pca_correctness_zero_center(use_sparse, use_array):
     )
 
 
+def test_pca_return_info_array():
+    """`return_info=True` returns the 4-tuple for matrix input (Scanpy parity)."""
+    A = np.array(A_list).astype("float64")
+    out = rsc.pp.pca(cp.asarray(A), n_comps=4, return_info=True)
+    assert isinstance(out, tuple) and len(out) == 4
+    X_pca, components, variance_ratio, variance = out
+    assert cp.asnumpy(X_pca).shape == (6, 4)
+    assert cp.asnumpy(components).shape == (4, 5)
+    assert cp.asnumpy(variance_ratio).shape == (4,)
+    assert cp.asnumpy(variance).shape == (4,)
+    np.testing.assert_allclose(
+        np.abs(cp.asnumpy(X_pca)), np.abs(A_pca[:, :4]), rtol=1e-5, atol=1e-5
+    )
+
+
 @pytest.mark.parametrize("use_sparse", [True, False])
 def test_pca_correctness_no_center(use_sparse):
     """Test truncated SVD correctness (zero_center=False)."""

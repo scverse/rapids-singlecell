@@ -85,12 +85,9 @@ def scale(
             raise ValueError(
                 "`layer` and `obsm` can only be used with an AnnData object."
             )
-        if isinstance(mask_obs, str):
-            raise ValueError(
-                "Cannot refer to a mask with a string without providing an AnnData object."
-            )
         X = data
         _check_gpu_X(X, allow_dask=True)
+        mask_obs = _check_mask(X, mask_obs, "obs")
         X, _, _ = _scale_dispatch(
             X,
             mask_obs=mask_obs,

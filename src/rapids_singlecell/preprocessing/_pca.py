@@ -13,7 +13,7 @@ from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.get import _get_obs_rep
+from rapids_singlecell.get import _check_mask, _get_obs_rep
 
 from ._utils import _check_gpu_X
 
@@ -84,9 +84,10 @@ def pca(
     chunked: bool = False,
     chunk_size: int = None,
     key_added: str | None = None,
+    return_info: bool = False,
     copy: bool = False,
     **kwargs,
-) -> None | AnnData:
+) -> None | AnnData | ArrayTypesDask:
     """\
     Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
 
@@ -188,6 +189,10 @@ def pca(
         :attr:`~anndata.AnnData.varm`\\ `[key_added]`, and the parameters in
         :attr:`~anndata.AnnData.uns`\\ `[key_added]`.
 
+    return_info
+        Only relevant when passing a matrix instead of an
+        :class:`~anndata.AnnData`: see "Returns".
+
     copy
         Whether to return a copy or update `data`. Only applies to
         :class:`~anndata.AnnData` input.
@@ -203,7 +208,9 @@ def pca(
 
     Returns
     -------
-        If a matrix is passed, the PCA representation is returned.
+        If a matrix is passed and `return_info=False`, the PCA representation is \
+        returned. If a matrix is passed and `return_info=True`, a tuple of \
+        ``(X_pca, components, variance_ratio, variance)`` is returned.
 
         If an AnnData object is passed, adds fields to `adata`:
 
@@ -225,9 +232,9 @@ def pca(
                 "`use_highly_variable` can only be used with an AnnData object."
             )
         X = data
-        mask_var = _resolve_mask_var_array(mask_var, n_vars=X.shape[1])
+        mask_var = None if mask_var is _empty else _check_mask(X, mask_var, "var")
         X = X[:, mask_var] if mask_var is not None else X
-        _, X_pca, _ = _pca_compute(
+        pca_func, X_pca, _ = _pca_compute(
             X,
             n_comps,
             zero_center=zero_center,
@@ -238,6 +245,13 @@ def pca(
             dtype=dtype,
             kwargs=kwargs,
         )
+        if return_info:
+            return (
+                X_pca,
+                pca_func.components_,
+                pca_func.explained_variance_ratio_,
+                pca_func.explained_variance_,
+            )
         return X_pca
 
     adata = data
@@ -292,25 +306,6 @@ def pca(
 
     if copy:
         return adata
-
-
-def _resolve_mask_var_array(
-    mask_var: NDArray[np.bool] | str | None, *, n_vars: int
-) -> np.ndarray | None:
-    """Resolve `mask_var` for array input (no `adata.var` to look strings up in)."""
-    if mask_var is _empty or mask_var is None:
-        return None
-    if isinstance(mask_var, str):
-        raise ValueError(
-            "Cannot refer to a mask with a string without providing an AnnData object."
-        )
-    mask_var = np.asarray(mask_var)
-    if mask_var.shape != (n_vars,):
-        raise ValueError(
-            f"The shape of the mask ({mask_var.shape}) does not match "
-            f"the number of variables ({n_vars})."
-        )
-    return mask_var
 
 
 def _pca_compute(
