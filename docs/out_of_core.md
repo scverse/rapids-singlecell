@@ -138,8 +138,11 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.pp.log1p`
 - {func}`~.pp.highly_variable_genes` (flavors: `seurat`, `cell_ranger`, `poisson_gene_selection`)
 - {func}`~.pp.scale`
+- {func}`~.pp.regress_out`
 - {func}`~.pp.pca`
 - {func}`~.tl.score_genes`
+- {func}`~.tl.louvain`
+- {func}`~.tl.leiden`
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`; NOT `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`
 

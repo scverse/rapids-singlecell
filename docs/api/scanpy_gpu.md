@@ -1,6 +1,6 @@
 # scanpy-GPU
 
-These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html).
+These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html) {cite}`Wolf2018`.
 
 ## Preprocessing `pp`
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
@@ -28,6 +28,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.flag_gene_family
    pp.filter_highly_variable
 ```
+
 ### Batch effect correction
 
 ```{eval-rst}
@@ -45,7 +46,6 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.scrublet
    pp.scrublet_simulate_doublets
 ```
-
 
 ### Neighbors
 ```{eval-rst}
@@ -77,7 +77,6 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
     tl.tsne
     tl.diffmap
     tl.draw_graph
-    tl.mde
     tl.embedding_density
 ```
 

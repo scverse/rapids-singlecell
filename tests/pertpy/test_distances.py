@@ -44,6 +44,25 @@ def test_distance_class_initialization() -> None:
     assert distance_custom.obsm_key == "X_custom"
 
 
+def test_unused_categories_dropped() -> None:
+    """A zero-cell (unused) category in groupby is dropped, not kept as a NaN
+    group (shared subsetting on BaseMetric handles this for all metrics)."""
+    rng = np.random.default_rng(0)
+    cpg, nf = 15, 5
+    X = np.vstack(
+        [(rng.normal(size=(cpg, nf)) + i).astype(np.float32) for i in range(3)]
+    )
+    labels = [c for c in ["g0", "g1", "g2"] for _ in range(cpg)]
+    obs = pd.DataFrame(
+        {"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}
+    )
+    adata = AnnData(X.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(X, dtype=cp.float32)
+    df = Distance(metric="edistance").pairwise(adata, groupby="group")
+    assert list(df.index) == ["g0", "g1", "g2"]  # unused 'gZ' dropped
+    assert np.all(np.isfinite(df.values))
+
+
 def test_distance_class_invalid_metric() -> None:
     """Test Distance class raises error for unsupported metrics."""
     with pytest.raises(ValueError, match="Unknown metric"):
@@ -95,10 +114,31 @@ def test_distance_class_onesided_matches_pairwise(small_adata: AnnData) -> None:
         )
         # Should match the row from pairwise matrix
         np.testing.assert_allclose(
-            onesided.values, pairwise_df.loc[group].values, atol=1e-5
+            onesided.values, pairwise_df.loc[group].values, atol=1e-6
         )
         # Self-distance should be 0
-        assert onesided[group] == pytest.approx(0.0, abs=1e-6)
+        assert onesided.loc[group] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_distance_class_onesided_multiple_controls(small_adata: AnnData) -> None:
+    """Test onesided_distances with multiple selected groups."""
+    distance = Distance(metric="edistance")
+
+    # Multiple controls in a single call
+    result = distance.onesided_distances(
+        small_adata, groupby="group", selected_group=["g0", "g1"]
+    )
+
+    assert isinstance(result, pd.DataFrame)
+    assert list(result.columns) == ["g0", "g1"]
+    assert len(result) == 3
+
+    # Each column should match the corresponding row from pairwise
+    pairwise_df = distance.pairwise(small_adata, groupby="group")
+    for group in ["g0", "g1"]:
+        np.testing.assert_allclose(
+            result[group].values, pairwise_df.loc[group].values, atol=1e-7
+        )
 
 
 def test_distance_class_onesided_invalid_group(small_adata: AnnData) -> None:
@@ -133,12 +173,12 @@ def test_distance_class_onesided_bootstrap(small_adata: AnnData) -> None:
     assert len(distances_var) == 3
 
     # Self-distance variance should be 0
-    assert distances["g0"] == pytest.approx(0.0, abs=1e-6)
-    assert distances_var["g0"] == pytest.approx(0.0, abs=1e-6)
+    assert distances.loc["g0"] == pytest.approx(0.0, abs=1e-6)
+    assert distances_var.loc["g0"] == pytest.approx(0.0, abs=1e-6)
 
     # Non-self variances should be positive
-    assert distances_var["g1"] > 0
-    assert distances_var["g2"] > 0
+    assert distances_var.loc["g1"] > 0
+    assert distances_var.loc["g2"] > 0
 
 
 def test_distance_class_onesided_bootstrap_matches_pairwise(
@@ -167,9 +207,9 @@ def test_distance_class_onesided_bootstrap_matches_pairwise(
     )
 
     # Should match the corresponding row from pairwise
-    np.testing.assert_allclose(onesided.values, pairwise_df.loc["g0"].values, atol=1e-6)
+    np.testing.assert_allclose(onesided.values, pairwise_df.loc["g0"].values, atol=1e-7)
     np.testing.assert_allclose(
-        onesided_var.values, pairwise_var_df.loc["g0"].values, atol=1e-6
+        onesided_var.values, pairwise_var_df.loc["g0"].values, atol=1e-7
     )
 
 
@@ -239,7 +279,7 @@ def test_edistance_correctness_vs_cpu(small_adata: AnnData) -> None:
                 np.testing.assert_allclose(
                     actual,
                     expected,
-                    rtol=1e-5,
+                    rtol=1e-6,
                     atol=1e-6,
                     err_msg=f"Mismatch for ({g1}, {g2}): GPU={actual}, CPU={expected}",
                 )
@@ -272,7 +312,7 @@ def test_edistance_correctness_larger_dataset() -> None:
         expected = _compute_energy_distance_cpu(X, Y)
         actual = result_df.loc[g1, g2]
         np.testing.assert_allclose(
-            actual, expected, rtol=1e-5, atol=1e-6, err_msg=f"Mismatch for ({g1}, {g2})"
+            actual, expected, rtol=1e-6, atol=1e-6, err_msg=f"Mismatch for ({g1}, {g2})"
         )
 
 
@@ -305,14 +345,345 @@ def test_onesided_distances_correctness_vs_cpu(small_adata: AnnData) -> None:
             else:
                 expected = _compute_energy_distance_cpu(X, Y)
 
-            actual = onesided[target_group]
+            actual = onesided.loc[target_group]
             np.testing.assert_allclose(
                 actual,
                 expected,
-                rtol=1e-5,
+                rtol=1e-6,
                 atol=1e-6,
                 err_msg=f"Onesided mismatch for ({selected_group}, {target_group})",
             )
+
+
+# ============================================================================
+# Contrast distance tests
+# ============================================================================
+
+
+@pytest.fixture
+def contrast_adata() -> AnnData:
+    """AnnData with treatment and celltype columns for contrast tests."""
+    rng = np.random.default_rng(42)
+    n = 10
+    cpu_emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(
+                ["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n
+            ),
+            "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2),
+        }
+    )
+    adata = AnnData(cpu_emb.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
+    return adata
+
+
+def test_contrast_distances_matches_compute_distance(
+    contrast_adata: AnnData,
+) -> None:
+    """Test contrast_distances matches per-pair compute_distance reference."""
+    from rapids_singlecell.pertpy_gpu._metrics._edistance import EDistanceMetric
+
+    d = EDistanceMetric(obsm_key="X_pca")
+
+    contrasts = Distance.create_contrasts(
+        contrast_adata,
+        groupby="treatment",
+        selected_group="ctrl",
+        split_by="celltype",
+    )
+
+    result = d.contrast_distances(contrast_adata, contrasts=contrasts)
+
+    assert isinstance(result, pd.DataFrame)
+    assert "edistance" in result.columns
+    assert len(result) == len(contrasts)
+
+    # Verify each contrast against compute_distance
+    for _, row in result.iterrows():
+        mask_target = (contrast_adata.obs["treatment"].values == row["treatment"]) & (
+            contrast_adata.obs["celltype"].values == row["celltype"]
+        )
+        mask_ref = (contrast_adata.obs["treatment"].values == row["reference"]) & (
+            contrast_adata.obs["celltype"].values == row["celltype"]
+        )
+
+        X = contrast_adata.obsm["X_pca"][mask_target]
+        Y = contrast_adata.obsm["X_pca"][mask_ref]
+        expected = d.compute_distance(X, Y)
+
+        np.testing.assert_allclose(
+            row["edistance"],
+            expected,
+            atol=1e-6,
+            err_msg=f"Contrast {row['treatment']} vs {row['reference']} "
+            f"in {row['celltype']} mismatch",
+        )
+
+
+def test_contrast_distances_shared_condition(contrast_adata: AnnData) -> None:
+    """Test that contrasts sharing a condition (e.g. same control) work."""
+    distance = Distance(metric="edistance")
+
+    contrasts = Distance.create_contrasts(
+        contrast_adata,
+        groupby="treatment",
+        selected_group="ctrl",
+        split_by="celltype",
+    )
+
+    result = distance.contrast_distances(contrast_adata, contrasts=contrasts)
+
+    assert isinstance(result, pd.DataFrame)
+    assert "edistance" in result.columns
+    # All distances should be finite
+    assert np.all(np.isfinite(result["edistance"].values))
+
+
+def test_contrast_distances_self_distance_zero(contrast_adata: AnnData) -> None:
+    """Test that self-distance (same group vs itself) is zero."""
+    distance = Distance(metric="edistance")
+
+    # Manually create a contrast where target == reference
+    contrasts = pd.DataFrame(
+        {
+            "treatment": ["ctrl"],
+            "reference": ["ctrl"],
+            "celltype": ["T"],
+        }
+    )
+
+    result = distance.contrast_distances(contrast_adata, contrasts=contrasts)
+    assert result["edistance"].iloc[0] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_contrast_distances_no_split(contrast_adata: AnnData) -> None:
+    """Test contrast_distances without split_by columns."""
+    distance = Distance(metric="edistance")
+
+    contrasts = Distance.create_contrasts(
+        contrast_adata,
+        groupby="treatment",
+        selected_group="ctrl",
+    )
+
+    result = distance.contrast_distances(contrast_adata, contrasts=contrasts)
+
+    assert isinstance(result, pd.DataFrame)
+    assert "edistance" in result.columns
+    assert len(result) == 1  # only drugA vs ctrl
+    assert np.all(np.isfinite(result["edistance"].values))
+
+
+def test_contrast_distances_multiple_references() -> None:
+    """Test create_contrasts with multiple reference groups."""
+    rng = np.random.default_rng(42)
+    n = 10
+    cpu_emb = rng.normal(size=(n * 6, 5)).astype(np.float32)
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(
+                ["ref1"] * n
+                + ["ref2"] * n
+                + ["drugA"] * n
+                + ["drugB"] * n
+                + ["ref1"] * n
+                + ["drugA"] * n
+            ),
+            "celltype": pd.Categorical(["T"] * n * 4 + ["B"] * n * 2),
+        }
+    )
+    adata = AnnData(cpu_emb.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
+
+    from rapids_singlecell.pertpy_gpu._metrics._edistance import EDistanceMetric
+
+    d = EDistanceMetric(obsm_key="X_pca")
+    distance = Distance(metric="edistance")
+
+    # Two references
+    contrasts = Distance.create_contrasts(
+        adata,
+        groupby="treatment",
+        selected_group=["ref1", "ref2"],
+        split_by="celltype",
+    )
+
+    # References should not appear as targets
+    assert "ref1" not in contrasts["treatment"].values
+    assert "ref2" not in contrasts["treatment"].values
+
+    # Both references should appear in the reference column
+    assert "ref1" in contrasts["reference"].values
+    assert "ref2" in contrasts["reference"].values
+
+    result = distance.contrast_distances(adata, contrasts=contrasts)
+    assert "edistance" in result.columns
+
+    # Verify each row against compute_distance
+    for _, row in result.iterrows():
+        mask_target = (adata.obs["treatment"].values == row["treatment"]) & (
+            adata.obs["celltype"].values == row["celltype"]
+        )
+        mask_ref = (adata.obs["treatment"].values == row["reference"]) & (
+            adata.obs["celltype"].values == row["celltype"]
+        )
+        X = adata.obsm["X_pca"][mask_target]
+        Y = adata.obsm["X_pca"][mask_ref]
+
+        if len(X) == 0 or len(Y) == 0:
+            continue
+        expected = d.compute_distance(X, Y)
+        np.testing.assert_allclose(row["edistance"], expected, rtol=1e-5, atol=1e-5)
+
+
+def test_contrast_distances_multiple_references_no_split() -> None:
+    """Test create_contrasts with multiple references and no split_by."""
+    rng = np.random.default_rng(42)
+    n = 15
+    cpu_emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(
+                ["ref1"] * n + ["ref2"] * n + ["drugA"] * n + ["drugB"] * n
+            ),
+        }
+    )
+    adata = AnnData(cpu_emb.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
+
+    distance = Distance(metric="edistance")
+
+    contrasts = Distance.create_contrasts(
+        adata,
+        groupby="treatment",
+        selected_group=["ref1", "ref2"],
+    )
+
+    # 2 targets x 2 references = 4 rows
+    assert len(contrasts) == 4
+    assert set(contrasts["treatment"].values) == {"drugA", "drugB"}
+    assert set(contrasts["reference"].values) == {"ref1", "ref2"}
+
+    result = distance.contrast_distances(adata, contrasts=contrasts)
+    assert len(result) == 4
+    assert np.all(np.isfinite(result["edistance"].values))
+
+
+def test_contrast_distances_filtered(contrast_adata: AnnData) -> None:
+    """Test that filtering a contrasts DataFrame before computing works."""
+    from rapids_singlecell.pertpy_gpu._metrics._edistance import EDistanceMetric
+
+    d = EDistanceMetric(obsm_key="X_pca")
+    distance = Distance(metric="edistance")
+
+    # Create full contrasts, then drop one celltype
+    contrasts = Distance.create_contrasts(
+        contrast_adata,
+        groupby="treatment",
+        selected_group="ctrl",
+        split_by="celltype",
+    )
+    assert len(contrasts) == 2  # drugA-T, drugA-B
+
+    # Keep only celltype == "T"
+    filtered = contrasts[contrasts["celltype"] == "T"].reset_index(drop=True)
+    assert len(filtered) == 1
+
+    result = distance.contrast_distances(contrast_adata, contrasts=filtered)
+
+    assert isinstance(result, pd.DataFrame)
+    assert len(result) == 1
+    assert result["celltype"].iloc[0] == "T"
+
+    # Verify the distance matches compute_distance
+    mask_target = (contrast_adata.obs["treatment"].values == "drugA") & (
+        contrast_adata.obs["celltype"].values == "T"
+    )
+    mask_ref = (contrast_adata.obs["treatment"].values == "ctrl") & (
+        contrast_adata.obs["celltype"].values == "T"
+    )
+    expected = d.compute_distance(
+        contrast_adata.obsm["X_pca"][mask_target],
+        contrast_adata.obsm["X_pca"][mask_ref],
+    )
+    np.testing.assert_allclose(result["edistance"].iloc[0], expected, atol=1e-6)
+
+    # Also verify it differs from the full (unfiltered) result
+    full_result = distance.contrast_distances(contrast_adata, contrasts=contrasts)
+    assert len(full_result) == 2
+
+    # The T-cell row should match between filtered and full
+    full_t = full_result[full_result["celltype"] == "T"]["edistance"].iloc[0]
+    np.testing.assert_allclose(result["edistance"].iloc[0], full_t, atol=1e-10)
+
+
+def test_contrast_distances_two_split_by() -> None:
+    """Test contrast_distances with two split_by columns."""
+    rng = np.random.default_rng(42)
+    n = 10
+    cpu_emb = rng.normal(size=(n * 6, 5)).astype(np.float32)
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(
+                ["ctrl"] * n
+                + ["drugA"] * n
+                + ["ctrl"] * n
+                + ["drugA"] * n
+                + ["ctrl"] * n
+                + ["drugA"] * n
+            ),
+            "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2 + ["T"] * n * 2),
+            "batch": pd.Categorical(["b1"] * n * 4 + ["b2"] * n * 2),
+        }
+    )
+    adata = AnnData(cpu_emb.copy(), obs=obs)
+    adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
+
+    from rapids_singlecell.pertpy_gpu._metrics._edistance import EDistanceMetric
+
+    d = EDistanceMetric(obsm_key="X_pca")
+    distance = Distance(metric="edistance")
+
+    contrasts = Distance.create_contrasts(
+        adata,
+        groupby="treatment",
+        selected_group="ctrl",
+        split_by=["celltype", "batch"],
+    )
+
+    assert "celltype" in contrasts.columns
+    assert "batch" in contrasts.columns
+
+    result = distance.contrast_distances(adata, contrasts=contrasts)
+
+    assert isinstance(result, pd.DataFrame)
+    assert "edistance" in result.columns
+
+    # Verify each contrast against compute_distance
+    for _, row in result.iterrows():
+        mask_target = (
+            (adata.obs["treatment"].values == row["treatment"])
+            & (adata.obs["celltype"].values == row["celltype"])
+            & (adata.obs["batch"].values == row["batch"])
+        )
+        mask_ref = (
+            (adata.obs["treatment"].values == row["reference"])
+            & (adata.obs["celltype"].values == row["celltype"])
+            & (adata.obs["batch"].values == row["batch"])
+        )
+
+        X = adata.obsm["X_pca"][mask_target]
+        Y = adata.obsm["X_pca"][mask_ref]
+        expected = d.compute_distance(X, Y)
+
+        np.testing.assert_allclose(
+            row["edistance"],
+            expected,
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
 
 # ============================================================================
@@ -466,7 +837,7 @@ def test_distance_call_api_vs_cpu_reference(small_adata: AnnData) -> None:
         np.testing.assert_allclose(
             actual,
             expected,
-            rtol=1e-5,
+            rtol=1e-6,
             atol=1e-6,
             err_msg=f"__call__ mismatch for ({g1}, {g2})",
         )
@@ -500,7 +871,7 @@ def test_distance_call_api_vs_pairwise(small_adata: AnnData) -> None:
             np.testing.assert_allclose(
                 call_result,
                 pairwise_result,
-                atol=1e-5,
+                atol=1e-6,
                 err_msg=f"__call__ vs pairwise mismatch for ({g1}, {g2})",
             )
 
@@ -623,7 +994,7 @@ def test_distance_layer_key_basic() -> None:
         np.testing.assert_allclose(
             actual,
             expected,
-            rtol=1e-5,
+            rtol=1e-6,
             atol=1e-6,
             err_msg=f"layer_key mismatch for ({g1}, {g2})",
         )
@@ -684,7 +1055,7 @@ def test_float64_matches_float32_results() -> None:
     np.testing.assert_allclose(
         result_f32.values,
         result_f64.values,
-        rtol=1e-5,
+        rtol=1e-6,
         atol=1e-6,
         err_msg="Float64 and float32 results should be similar",
     )
@@ -872,7 +1243,7 @@ def test_block_size_consistency() -> None:
 
     # Get result with default block size (1024 for Ampere+)
     distance = Distance(metric="edistance")
-    result_1024 = distance.pairwise(adata, groupby="group")
+    result = distance.pairwise(adata, groupby="group")
 
     # Temporarily override cc_major to force 256 block size
     device_id = cp.cuda.Device().id
@@ -886,13 +1257,20 @@ def test_block_size_consistency() -> None:
     finally:
         _multi_gpu._DEVICE_ATTRS_CACHE[device_id]["cc_major"] = original_cc  # Restore
 
-    # Results should be identical (within floating point tolerance)
+    # Results should be identical between 256 and 1024 block paths
     np.testing.assert_allclose(
-        result_1024.values,
+        result.values,
         result_256.values,
-        rtol=1e-5,
-        atol=1e-6,
-        err_msg="Block size 1024 vs 256 produced different results",
+        rtol=1e-7,
+        atol=1e-7,
+        err_msg="256-block and 1024-block paths should produce identical results",
+    )
+    # Diagonal should be zero (self-distance)
+    np.testing.assert_allclose(
+        np.diag(result.values),
+        0,
+        atol=1e-7,
+        err_msg="Diagonal (self-distance) should be zero",
     )
 
 
@@ -953,7 +1331,7 @@ def test_distance_axioms(
     np.testing.assert_allclose(
         result_df.values,
         result_df.values.T,
-        atol=1e-5,
+        atol=1e-7,
         err_msg="Matrix should be symmetric",
     )
 
@@ -1069,15 +1447,16 @@ def test_pairwise_output_format(small_adata: AnnData) -> None:
 
 
 def test_onesided_output_format(small_adata: AnnData) -> None:
-    """Test onesided_distances output format: Series with proper name."""
+    """Test onesided_distances output format: DataFrame with proper structure."""
     distance = Distance(metric="edistance")
     result = distance.onesided_distances(
         small_adata, groupby="group", selected_group="g0"
     )
 
-    assert isinstance(result, pd.Series), "onesided_distances should return Series"
-    assert "edistance" in result.name, "Series name should contain 'edistance'"
-    assert "g0" in result.name, "Series name should contain selected group"
+    assert isinstance(result, pd.Series), (
+        "onesided_distances with single control should return Series"
+    )
+    assert result.index.name == "group"
 
 
 # ============================================================================
@@ -1241,7 +1620,7 @@ def test_unequal_group_sizes() -> None:
         Y = cpu_embedding[np.array(groups) == g2]
         expected = _compute_energy_distance_cpu(X, Y)
         actual = result_df.loc[g1, g2]
-        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_distance_call_empty_array_error() -> None:
@@ -1380,7 +1759,7 @@ def test_single_cell_mixed_groups() -> None:
     # Test onesided_distances with single-cell selected group
     onesided = distance.onesided_distances(adata, groupby="group", selected_group="g0")
     assert np.all(np.isfinite(onesided.values)), "Onesided distances should be finite"
-    assert onesided["g0"] == 0.0, "Self-distance should be 0"
+    assert onesided.loc["g0"] == 0.0, "Self-distance should be 0"
 
 
 def test_high_dimensional_features() -> None:
@@ -1524,8 +1903,8 @@ def test_multi_gpu_pairwise_matches_single_gpu() -> None:
     np.testing.assert_allclose(
         single_result.values,
         multi_result.values,
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
         err_msg="Multi-GPU pairwise should match single-GPU",
     )
 
@@ -1563,8 +1942,8 @@ def test_multi_gpu_onesided_matches_single_gpu() -> None:
     np.testing.assert_allclose(
         single_result.values,
         multi_result.values,
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
         err_msg="Multi-GPU onesided should match single-GPU",
     )
 
@@ -1616,16 +1995,16 @@ def test_multi_gpu_bootstrap_matches_single_gpu() -> None:
     np.testing.assert_allclose(
         single_df.values,
         multi_df.values,
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
         err_msg="Multi-GPU bootstrap mean should match single-GPU",
     )
 
     np.testing.assert_allclose(
         single_var.values,
         multi_var.values,
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
         err_msg="Multi-GPU bootstrap variance should match single-GPU",
     )
 
@@ -1675,16 +2054,16 @@ def test_multi_gpu_onesided_bootstrap_matches_single_gpu() -> None:
     np.testing.assert_allclose(
         single_dist.values,
         multi_dist.values,
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
         err_msg="Multi-GPU onesided bootstrap mean should match single-GPU",
     )
 
     np.testing.assert_allclose(
         single_var.values,
         multi_var.values,
-        rtol=1e-5,
-        atol=1e-6,
+        rtol=1e-7,
+        atol=1e-7,
         err_msg="Multi-GPU onesided bootstrap variance should match single-GPU",
     )
 
@@ -1708,7 +2087,7 @@ def test_single_gpu_fallback_unchanged(small_adata: AnnData) -> None:
         np.testing.assert_allclose(
             actual,
             expected,
-            rtol=1e-5,
+            rtol=1e-6,
             atol=1e-6,
             err_msg=f"Single-GPU fallback mismatch for ({g1}, {g2})",
         )
@@ -1744,7 +2123,7 @@ def test_small_group_count_works() -> None:
     X = cpu_embedding_np[:cells_per_group]
     Y = cpu_embedding_np[cells_per_group:]
     expected = _compute_energy_distance_cpu(X, Y)
-    np.testing.assert_allclose(result.loc["g0", "g1"], expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(result.loc["g0", "g1"], expected, rtol=1e-6, atol=1e-6)
 
 
 def test_multi_gpu_with_more_gpus_than_pairs() -> None:

@@ -10,11 +10,11 @@ import pandas as pd
 from anndata import AnnData
 from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
-from cupyx.scipy.special import betainc
 from scanpy.get import _get_obs_rep
 from scipy.sparse import csr_matrix, issparse
 from tqdm.auto import tqdm
 
+from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.decoupler_gpu._helper._docs import docs
 from rapids_singlecell.decoupler_gpu._helper._log import _log
 from rapids_singlecell.preprocessing._utils import _check_use_raw
@@ -35,12 +35,6 @@ getnnz_0 = cp.ElementwiseKernel(
 )
 
 
-def __stdtr(df, t):
-    x = df / (t**2 + df)
-    tail = betainc(df / 2, 0.5, x) / 2
-    return cp.where(t < 0, tail, 1 - tail)
-
-
 def _validate_mat(
     mat: DataType_matrix,
     row: np.ndarray,
@@ -50,6 +44,16 @@ def _validate_mat(
     verbose: bool = False,
 ) -> tuple[DataType_matrix, np.ndarray, np.ndarray]:
     assert isinstance(empty, bool), "empty must be bool"
+
+    # Skip validation for Dask arrays - validation is deferred to chunk processing
+    if isinstance(mat, DaskArray):
+        _log(
+            "Dask array detected, skipping validation (will be validated per chunk)",
+            level="info",
+            verbose=verbose,
+        )
+        return mat, row, col
+
     # Accept any sparse format but transform to csr
     if issparse(mat) and not isinstance(mat, csr_matrix):
         mat = csr_matrix(mat)
@@ -78,7 +82,7 @@ def _validate_mat(
     )
 
     # Check for empty samples
-    if type(mat) is csr_matrix:
+    if isinstance(mat, csr_matrix):
         msk_row = mat.getnnz(axis=1) == 0
     elif cp_issparse(mat):
         msk_row = cp.diff(mat.indptr) == 0
@@ -181,7 +185,7 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
         Array of feature names.
     """
 
-    if type(data) is list:
+    if isinstance(data, list):
         m, r, c = data
         m = np.array(m, dtype=float)
         r = np.array(r, dtype="U")
@@ -190,7 +194,7 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
         m = data.values.astype(float)
         r = data.index.to_numpy(dtype="U")
         c = data.columns.to_numpy(dtype="U")
-    elif type(data) is AnnData:
+    elif isinstance(data, AnnData):
         use_raw = _check_use_raw(data, layer, use_raw=raw)
         m = _get_obs_rep(data, layer=layer, use_raw=raw)
         c = (

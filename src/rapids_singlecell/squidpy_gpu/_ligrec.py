@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import product
 from typing import (
@@ -37,8 +36,6 @@ def _get_interactions(
         receiver_params=receiver_params,
     )
 
-    if True:
-        assert isinstance(interactions, pd.DataFrame)
     # we don't really care about these
     if SOURCE in interactions.columns:
         interactions.pop(SOURCE)
@@ -295,10 +292,6 @@ def ligrec(
             raise AttributeError(
                 "No `.raw` attribute found. Try specifying `use_raw=False`."
             )
-        if adata.raw.n_obs != adata.n_obs:
-            raise ValueError(
-                f"Expected `{adata.n_obs}` cells in `.raw` object, found `{adata.raw.n_obs}`."
-            )
         var_names = adata.raw.var_names
         X = adata.raw.X
     else:
@@ -459,103 +452,39 @@ def ligrec(
     # Calculate the total counts per cluster
     total_counts = cp.bincount(clusters)
 
+    from rapids_singlecell._cuda import _ligrec_cuda as _lc
+
     if not cpissparse(data_cp):
         sum_gt0 = cp.zeros((data_cp.shape[1], n_clusters), dtype=cp.float32)
         count_gt0 = cp.zeros((data_cp.shape[1], n_clusters), dtype=cp.int32)
 
-        kernel = cp.RawKernel(
-            r"""
-        extern "C" __global__
-        void calculate_sum_and_count_gt02(const float* data, const int* clusters,
-                                        float* sum_gt0, int* count_gt0,
-                                        const int num_rows, const int num_cols, const int n_cls) {
-            int i = blockIdx.x * blockDim.x + threadIdx.x;
-            int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-            if (i >= num_rows || j >= num_cols) {
-                return;
-            }
-
-            int cluster = clusters[i];
-            float value = data[i * num_cols + j];
-
-            if (value>0.0){
-                atomicAdd(&sum_gt0[j * n_cls + cluster], value);
-                atomicAdd(&count_gt0[j * n_cls + cluster], 1);
-            }
-        }
-        """,
-            "calculate_sum_and_count_gt02",
-        )
-
-        block = (32, 32)
-        grid = (
-            int(math.ceil(data_cp.shape[0] / block[0])),
-            int(math.ceil(data_cp.shape[1] / block[1])),
-        )
-        kernel(
-            grid,
-            block,
-            (
-                data_cp,
-                clusters,
-                sum_gt0,
-                count_gt0,
-                data_cp.shape[0],
-                data_cp.shape[1],
-                n_clusters,
-            ),
+        _lc.sum_count_dense(
+            data_cp,
+            clusters=clusters,
+            sum=sum_gt0,
+            count=count_gt0,
+            rows=data_cp.shape[0],
+            cols=data_cp.shape[1],
+            ncls=n_clusters,
+            stream=cp.cuda.get_current_stream().ptr,
         )
 
         mean_cp = sum_gt0 / total_counts
         mask_cp = count_gt0 / total_counts >= threshold
         del sum_gt0, count_gt0
     else:
-        sparse_kernel = cp.RawKernel(
-            r"""
-        extern "C" __global__
-        void calculate_sum_and_count_sparse(const int *indptr,const int *index,const float *data,
-                                            const int* clusters,float* sum_gt0, int* count_gt0,
-                                            int nrows, int n_cls) {
-            int cell = blockDim.x * blockIdx.x + threadIdx.x;
-            if(cell >= nrows){
-                return;
-            }
-            int start_idx = indptr[cell];
-            int stop_idx = indptr[cell+1];
-            int cluster = clusters[cell];
-            for(int gene = start_idx; gene < stop_idx; gene++){
-                float value = data[gene];
-                int gene_number = index[gene];
-
-                if (value>0.0){
-                    atomicAdd(&sum_gt0[gene_number * n_cls + cluster], value);
-                    atomicAdd(&count_gt0[gene_number * n_cls + cluster], 1);
-
-                }
-            }
-        }
-        """,
-            "calculate_sum_and_count_sparse",
-        )
-
         sum_gt0 = cp.zeros((data_cp.shape[1], n_clusters), dtype=cp.float32, order="C")
         count_gt0 = cp.zeros((data_cp.shape[1], n_clusters), dtype=cp.int32, order="C")
-        block_sparse = (32,)
-        grid_sparse = (int(math.ceil(data_cp.shape[0] / block_sparse[0])),)
-        sparse_kernel(
-            grid_sparse,
-            block_sparse,
-            (
-                data_cp.indptr,
-                data_cp.indices,
-                data_cp.data,
-                clusters,
-                sum_gt0,
-                count_gt0,
-                data_cp.shape[0],
-                n_clusters,
-            ),
+        _lc.sum_count_sparse(
+            data_cp.indptr,
+            data_cp.indices,
+            data_cp.data,
+            clusters=clusters,
+            sum=sum_gt0,
+            count=count_gt0,
+            rows=data_cp.shape[0],
+            ncls=n_clusters,
+            stream=cp.cuda.get_current_stream().ptr,
         )
         mean_cp = sum_gt0 / total_counts
         mask_cp = count_gt0 / total_counts >= threshold
@@ -566,132 +495,9 @@ def ligrec(
     clustering_use = clusters.copy()
     n_cls = mean_cp.shape[1]
 
-    mean_kernel = cp.RawKernel(
-        r"""
-    extern "C" __global__
-    void mean_kernel(const float* data, const int* clusters,
-                                    float* g_cluster,
-                                    const int num_rows, const int num_cols, const int n_cls) {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-        if (i >= num_rows || j >= num_cols) {
-            return;
-        }
-
-        //int cluster = clusters[i];
-        //float value = data[i * num_cols + j];
-
-        atomicAdd(&g_cluster[j * n_cls + clusters[i]], data[i * num_cols + j]);
-    }
-    """,
-        "mean_kernel",
-    )
-
-    mean_kernel_sparse = cp.RawKernel(
-        r"""
-        extern "C" __global__
-        void mean_kernel_sparse(const int *indptr,const int *index,const float *data,
-                                            const int* clusters,float* sum_gt0,
-                                            int nrows, int n_cls) {
-            int cell = blockDim.x * blockIdx.x + threadIdx.x;
-            if(cell >= nrows){
-                return;
-            }
-            int start_idx = indptr[cell];
-            int stop_idx = indptr[cell+1];
-            int cluster = clusters[cell];
-            for(int gene = start_idx; gene < stop_idx; gene++){
-                float value = data[gene];
-                int gene_number = index[gene];
-
-                if (value>0.0){
-                    atomicAdd(&sum_gt0[gene_number * n_cls + cluster], value);
-
-                }
-            }
-        }
-        """,
-        "mean_kernel_sparse",
-    )
-
-    elementwise_diff = cp.RawKernel(
-        r"""
-    extern "C" __global__
-    void elementwise_diff( float* g_cluster,
-                        const float* total_counts,
-                        const int num_genes, const int num_clusters) {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-        if (i >= num_genes || j >= num_clusters) {
-            return;
-        }
-        g_cluster[i * num_clusters + j] = g_cluster[i * num_clusters + j]/total_counts[j];
-    }
-    """,
-        "elementwise_diff",
-    )
-
-    interaction_kernel = cp.RawKernel(
-        r"""
-    extern "C" __global__
-    void interaction_kernel( const int* interactions,
-                            const int* interaction_clusters,
-                            const float* mean,
-                            float* res,
-                            const bool * mask,
-                            const float* g,
-                            const int n_iter, const int n_inter_clust, const int n_cls) {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-        if (i >= n_iter || j >= n_inter_clust) {
-            return;
-        }
-        int rec = interactions[i*2];
-        int lig = interactions[i*2+1];
-
-        int c1 = interaction_clusters[j*2];
-        int c2 = interaction_clusters[j*2+1];
-
-        float m1 = mean[rec* n_cls+ c1];
-        float m2 = mean[lig* n_cls+ c2];
-
-        if (!isnan(res[i*n_inter_clust  + j])) {
-            if (m1 > 0 && m2 > 0) {
-                if (mask[rec*n_cls + c1 ] && mask[lig*n_cls + c2]) {
-                    float g_sum = g[rec*n_cls + c1 ] + g[lig *n_cls+ c2 ];
-                    res[i*n_inter_clust  + j] += (g_sum > (m1 + m2));
-                } else {
-                    res[i*n_inter_clust  + j] = nan("");
-                }
-            } else {
-                res[i*n_inter_clust  + j] = nan("");
-            }
-        }
-    }
-    """,
-        "interaction_kernel",
-    )
-
-    block_shuffle = (32, 32)
-    block = (32, 32)
-    grid_shuffle = (
-        int(math.ceil(data_cp.shape[0] / block_shuffle[0])),
-        int(math.ceil(data_cp.shape[1] / block_shuffle[1])),
-    )
     interactions_ = interactions_.astype(cp.int32, order="C")
     mean_cp = mean_cp.astype(cp.float32, order="C")
     mask_cp = mask_cp.astype(cp.bool_, order="C")
-    grid_inter = (
-        int(math.ceil(len(interactions_) / block[0])),
-        int(math.ceil(len(interaction_clusters) / block[1])),
-    )
-    grid_element = (
-        int(math.ceil(data_cp.shape[1] / block[0])),
-        int(math.ceil(n_cls) / block[1]),
-    )
     total_counts = total_counts.astype(cp.float32)
     res = cp.zeros(
         (len(interactions_), len(interaction_clusters)), dtype=np.float32, order="C"
@@ -700,118 +506,82 @@ def ligrec(
         for _i in range(n_perms):
             cp.random.shuffle(clustering_use)
             g = cp.zeros((data_cp.shape[1], n_cls), dtype=cp.float32, order="C")
-            mean_kernel_sparse(
-                grid_sparse,
-                block_sparse,
-                (
-                    data_cp.indptr,
-                    data_cp.indices,
-                    data_cp.data,
-                    clustering_use,
-                    g,
-                    data_cp.shape[0],
-                    n_clusters,
-                ),
+            _lc.mean_sparse(
+                data_cp.indptr,
+                data_cp.indices,
+                data_cp.data,
+                clusters=clustering_use,
+                g=g,
+                rows=data_cp.shape[0],
+                ncls=n_clusters,
+                stream=cp.cuda.get_current_stream().ptr,
             )
 
-            g = g.astype(cp.float32, order="C")
-            elementwise_diff(
-                grid_element, block, (g, total_counts, data_cp.shape[1], n_cls)
+            _lc.elementwise_diff(
+                g,
+                total_counts=total_counts,
+                n_genes=data_cp.shape[1],
+                n_clusters=n_cls,
+                stream=cp.cuda.get_current_stream().ptr,
             )
-            g = g.astype(cp.float32, order="C")
-            interaction_kernel(
-                grid_inter,
-                block,
-                (
-                    interactions_,
-                    interaction_clusters,
-                    mean_cp,
-                    res,
-                    mask_cp,
-                    g,
-                    len(interactions_),
-                    len(interaction_clusters),
-                    n_cls,
-                ),
+            _lc.interaction(
+                interactions_,
+                interaction_clusters=interaction_clusters,
+                mean=mean_cp,
+                res=res,
+                mask=mask_cp,
+                g=g,
+                n_iter=len(interactions_),
+                n_inter_clust=len(interaction_clusters),
+                ncls=n_cls,
+                stream=cp.cuda.get_current_stream().ptr,
             )
     else:
         for _i in range(n_perms):
             cp.random.shuffle(clustering_use)
             g = cp.zeros((data_cp.shape[1], n_cls), dtype=cp.float32, order="C")
-            mean_kernel(
-                grid_shuffle,
-                block,
-                (data_cp, clustering_use, g, data_cp.shape[0], data_cp.shape[1], n_cls),
+            _lc.mean_dense(
+                data_cp,
+                clusters=clustering_use,
+                g=g,
+                rows=data_cp.shape[0],
+                cols=data_cp.shape[1],
+                ncls=n_cls,
+                stream=cp.cuda.get_current_stream().ptr,
             )
-            g = g.astype(cp.float32, order="C")
-            elementwise_diff(
-                grid_element, block, (g, total_counts, data_cp.shape[1], n_cls)
+            _lc.elementwise_diff(
+                g,
+                total_counts=total_counts,
+                n_genes=data_cp.shape[1],
+                n_clusters=n_cls,
+                stream=cp.cuda.get_current_stream().ptr,
             )
-            g = g.astype(cp.float32, order="C")
-            interaction_kernel(
-                grid_inter,
-                block,
-                (
-                    interactions_,
-                    interaction_clusters,
-                    mean_cp,
-                    res,
-                    mask_cp,
-                    g,
-                    len(interactions_),
-                    len(interaction_clusters),
-                    n_cls,
-                ),
+            _lc.interaction(
+                interactions_,
+                interaction_clusters=interaction_clusters,
+                mean=mean_cp,
+                res=res,
+                mask=mask_cp,
+                g=g,
+                n_iter=len(interactions_),
+                n_inter_clust=len(interaction_clusters),
+                ncls=n_cls,
+                stream=cp.cuda.get_current_stream().ptr,
             )
-
-    res_mean_kernel = cp.RawKernel(
-        r"""
-    extern "C" __global__
-    void res_mean_kernel( const int* interactions,
-                            const int* interaction_clusters,
-                            const float* mean,
-                            float* res_mean,
-                            const int n_inter, const int n_inter_clust, const int n_cls) {
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-        if (i >= n_inter || j >= n_inter_clust) {
-            return;
-        }
-        int rec = interactions[i*2];
-        int lig = interactions[i*2+1];
-
-        int c1 = interaction_clusters[j*2];
-        int c2 = interaction_clusters[j*2+1];
-
-        float m1 = mean[rec* n_cls+ c1];
-        float m2 = mean[lig* n_cls+ c2];
-
-
-        if (m1 > 0 && m2 > 0) {
-            res_mean[i*n_inter_clust  + j] = (m1 + m2) / 2.0;
-        }
-    }
-    """,
-        "res_mean_kernel",
-    )
 
     res_mean = cp.zeros(
         (len(interactions_), len(interaction_clusters)), dtype=np.float32, order="C"
     )
 
-    res_mean_kernel(
-        grid_inter,
-        block,
-        (
-            interactions_,
-            interaction_clusters,
-            mean_cp,
-            res_mean,
-            len(interactions_),
-            len(interaction_clusters),
-            n_cls,
-        ),
+    _lc.res_mean(
+        interactions_,
+        interaction_clusters=interaction_clusters,
+        mean=mean_cp,
+        res_mean=res_mean,
+        n_inter=len(interactions_),
+        n_inter_clust=len(interaction_clusters),
+        ncls=n_cls,
+        stream=cp.cuda.get_current_stream().ptr,
     )
 
     res_mean = res_mean.get()

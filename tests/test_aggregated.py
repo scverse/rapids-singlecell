@@ -338,12 +338,12 @@ def test_factors():
         X=cp.arange(obs.shape[0]).reshape(-1, 1),
         obs=obs,
     )
-
+    adata.X = adata.X.astype(np.float32)
     res = rsc.get.aggregate(adata, by=["a", "b", "c", "d"], func="sum")
     cp.testing.assert_array_equal(res.layers["sum"], adata.X)
 
 
-@pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero"])
+@pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero", "sq_sum"])
 def test_sparse_vs_dense(metric):
     adata = pbmc3k_processed().raw.to_adata()
     rsc.get.anndata_to_GPU(adata)

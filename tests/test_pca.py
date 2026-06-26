@@ -10,6 +10,7 @@ from scanpy.datasets import pbmc3k, pbmc3k_processed
 from scipy import sparse
 
 import rapids_singlecell as rsc
+from rapids_singlecell.preprocessing._pca import _empty, _resolve_mask_var
 from rapids_singlecell.preprocessing._sparse_pca._block_lanczos import randomized_svd
 from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import lanczos_svd
 
@@ -359,9 +360,7 @@ def test_mask_length_error():
     """Check error for mask length mismatch."""
     adata = AnnData(np.array(A_list).astype("float32"))
     mask_var = np.random.choice([True, False], adata.shape[1] + 1)
-    with pytest.raises(
-        ValueError, match=r"The shape of the mask do not match the data\."
-    ):
+    with pytest.raises(ValueError, match=r"The shape of the mask .* does not match"):
         rsc.pp.pca(adata, mask_var=mask_var)
 
 
@@ -464,6 +463,33 @@ def test_mask_defaults(float_dtype):
 
     with_no_mask = rsc.pp.pca(adata, mask_var=None, copy=True, dtype=float_dtype)
     assert np.array_equal(without_var.obsm["X_pca"], with_no_mask.obsm["X_pca"])
+
+
+def test_resolve_mask_var_deprecation_warning():
+    """use_highly_variable triggers FutureWarning."""
+    adata = AnnData(np.zeros((3, 5)))
+    adata.var["highly_variable"] = [True, True, False, False, True]
+
+    with pytest.warns(FutureWarning, match="use_highly_variable.*deprecated"):
+        name, arr = _resolve_mask_var(adata, mask_var=_empty, use_highly_variable=True)
+    assert name == "highly_variable"
+    assert arr is not None
+
+
+def test_resolve_mask_var_conflict():
+    """Passing both mask_var and use_highly_variable raises ValueError."""
+    adata = AnnData(np.zeros((3, 5)))
+    with pytest.raises(ValueError, match="Cannot specify both"):
+        _resolve_mask_var(adata, mask_var="highly_variable", use_highly_variable=True)
+
+
+def test_resolve_mask_var_ndarray():
+    """Passing an ndarray mask_var returns None name and the array."""
+    adata = AnnData(np.zeros((3, 5)))
+    mask = np.array([True, False, True, False, True])
+    name, arr = _resolve_mask_var(adata, mask_var=mask, use_highly_variable=None)
+    assert name is None
+    assert arr is mask
 
 
 # =============================================================================

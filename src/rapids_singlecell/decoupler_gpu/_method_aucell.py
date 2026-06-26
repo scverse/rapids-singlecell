@@ -3,6 +3,7 @@ from __future__ import annotations
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._cuda import _aucell_cuda as _au
 from rapids_singlecell.decoupler_gpu._helper._docs import docs
 from rapids_singlecell.decoupler_gpu._helper._log import _log
 from rapids_singlecell.decoupler_gpu._helper._Method import Method, MethodMeta
@@ -18,46 +19,6 @@ def rank_rows_desc(x: cp.ndarray) -> cp.ndarray:
     return ranks
 
 
-_auc_kernel = cp.RawKernel(
-    r"""
-extern "C" __global__
-void auc_kernel(
-    const int* __restrict__ ranks,
-    const int R, const int C,
-    const int* __restrict__ cnct,
-    const int* __restrict__ starts,
-    const int* __restrict__ lens,
-    const int n_sets,
-    const int n_up,
-    const float*  __restrict__ max_aucs,
-    float*        __restrict__ es)
-{
-    const int set = blockIdx.x;
-    const int row = blockIdx.y * blockDim.x + threadIdx.x;
-    if (set >= n_sets || row >= R) return;
-
-    const int start = starts[set];
-    const int end   = start + lens[set];
-
-    int r = 0;
-    int s = 0;
-
-    for (int i = start; i < end; ++i) {
-        const int g = cnct[i];
-        const int rk = ranks[row * C + g];
-        if (rk <= n_up) {
-            r += 1;
-            s += rk;
-        }
-    }
-    const float val = (float)((r * (long long)n_up) - s) / max_aucs[set];
-    es[row * n_sets + set] = val;
-}
-""",
-    "auc_kernel",
-)
-
-
 def _auc(row, cnct, *, starts, offsets, n_up, n_fsets, max_aucs):
     # Cast dtypes to what the kernel expects
     ranks = rank_rows_desc(row)
@@ -67,12 +28,18 @@ def _auc(row, cnct, *, starts, offsets, n_up, n_fsets, max_aucs):
     R, C = ranks.shape
     es = cp.zeros((R, n_fsets), dtype=cp.float32)
 
-    tpb = 32
-    grid_y = (R + tpb - 1) // tpb
-    _auc_kernel(
-        (n_fsets, grid_y),
-        (tpb,),
-        (ranks, R, C, cnct, starts, offsets, n_fsets, n_up, max_aucs, es),
+    _au.auc(
+        ranks,
+        R=R,
+        C=C,
+        cnct=cnct,
+        starts=starts,
+        lens=offsets,
+        n_sets=n_fsets,
+        n_up=n_up,
+        max_aucs=max_aucs,
+        es=es,
+        stream=cp.cuda.get_current_stream().ptr,
     )
     return es
 

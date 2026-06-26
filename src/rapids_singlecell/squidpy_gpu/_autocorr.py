@@ -133,7 +133,7 @@ def spatial_autocorr(
         genes = list(set(genes) & set(adata.raw.var_names))
         vals = adata.raw[:, genes].X
     else:
-        if layer:
+        if layer is not None:
             vals = adata[:, genes].layers[layer]
         else:
             vals = adata[:, genes].X

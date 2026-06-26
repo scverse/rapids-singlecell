@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import warnings
 from typing import TYPE_CHECKING
 
@@ -10,6 +9,7 @@ import pandas as pd
 from cupyx.scipy.sparse import issparse
 from scanpy.get import _get_obs_rep
 
+from rapids_singlecell._cuda import _pr_cuda
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
     _check_nonnegative_integers,
@@ -60,93 +60,79 @@ def _highly_variable_pearson_residuals(
 
     n_batches = len(np.unique(batch_info))
     residual_gene_vars = []
-    if issparse(X):
-        from rapids_singlecell.preprocessing._kernels._pr_kernels import (
-            _csc_hvg_res,
-            _sparse_sum_csc,
-        )
-
-        sum_csc = _sparse_sum_csc(X.dtype)
-        csc_hvg_res = _csc_hvg_res(X.dtype)
-    else:
-        from rapids_singlecell.preprocessing._kernels._pr_kernels import _dense_hvg_res
-
-        dense_hvg_res = _dense_hvg_res(X.dtype)
+    dtype = X.dtype
 
     for b in np.unique(batch_info):
         if issparse(X):
             X_batch = X[batch_info == b].tocsc()
             nnz_per_gene = cp.diff(X_batch.indptr).ravel()
         else:
-            X_batch = cp.array(X[batch_info == b], dtype=X.dtype)
+            X_batch = cp.array(X[batch_info == b], dtype=dtype)
             nnz_per_gene = cp.sum(X_batch != 0, axis=0).ravel()
         nonzero_genes = cp.array(nnz_per_gene >= 1)
         X_batch = X_batch[:, nonzero_genes]
         if clip is None:
             n = X_batch.shape[0]
-            clip = cp.sqrt(n, dtype=X.dtype)
-        if clip < 0:
+            clip_batch = cp.sqrt(n, dtype=dtype)
+        else:
+            clip_batch = clip
+        if clip_batch < 0:
             raise ValueError("Pearson residuals require `clip>=0` or `clip=None`.")
 
-        clip = cp.array([clip], dtype=X.dtype)
-        theta = cp.array([theta], dtype=X.dtype)
-        residual_gene_var = cp.zeros(X_batch.shape[1], dtype=X.dtype, order="C")
-        if issparse(X_batch):
-            sums_genes = cp.zeros(X_batch.shape[1], dtype=X.dtype)
-            sums_cells = cp.zeros(X_batch.shape[0], dtype=X.dtype)
-            block = (32,)
-            grid = (int(math.ceil(X_batch.shape[1] / block[0])),)
+        n_cells = X_batch.shape[0]
+        n_genes = X_batch.shape[1]
+        clip_val = float(clip_batch)
+        inv_theta = 1.0 / theta
+        residual_gene_var = cp.zeros(n_genes, dtype=dtype, order="C")
+        stream = cp.cuda.get_current_stream().ptr
 
-            sum_csc(
-                grid,
-                block,
-                (
-                    X_batch.indptr,
-                    X_batch.indices,
-                    X_batch.data,
-                    sums_genes,
-                    sums_cells,
-                    X_batch.shape[1],
-                ),
+        if issparse(X_batch):
+            # Compute sums using custom kernel (single pass, no CSC->CSR conversion)
+            sums_genes = cp.zeros(n_genes, dtype=dtype)
+            sums_cells = cp.zeros(n_cells, dtype=dtype)
+            _pr_cuda.sparse_sum_csc(
+                X_batch.indptr,
+                X_batch.indices,
+                X_batch.data,
+                sums_genes=sums_genes,
+                sums_cells=sums_cells,
+                n_genes=n_genes,
+                stream=stream,
             )
-            sum_total = sums_genes.sum().squeeze()
-            csc_hvg_res(
-                grid,
-                block,
-                (
-                    X_batch.indptr,
-                    X_batch.indices,
-                    X_batch.data,
-                    sums_genes,
-                    sums_cells,
-                    residual_gene_var,
-                    sum_total,
-                    clip,
-                    theta,
-                    X_batch.shape[1],
-                    X_batch.shape[0],
-                ),
+            sum_total = float(sums_genes.sum())
+            inv_sum_total = 1.0 / sum_total
+
+            _pr_cuda.csc_hvg_res(
+                X_batch.indptr,
+                X_batch.indices,
+                X_batch.data,
+                sums_genes=sums_genes,
+                sums_cells=sums_cells,
+                residuals=residual_gene_var,
+                inv_sum_total=inv_sum_total,
+                clip=clip_val,
+                inv_theta=inv_theta,
+                n_genes=n_genes,
+                n_cells=n_cells,
+                stream=stream,
             )
         else:
-            sums_genes = cp.sum(X_batch, axis=0, dtype=X.dtype).ravel()
-            sums_cells = cp.sum(X_batch, axis=1, dtype=X.dtype).ravel()
-            sum_total = sums_genes.sum().squeeze()
-            block = (32,)
-            grid = (int(math.ceil(X_batch.shape[1] / block[0])),)
-            dense_hvg_res(
-                grid,
-                block,
-                (
-                    cp.array(X_batch, dtype=X.dtype, order="F"),
-                    sums_genes,
-                    sums_cells,
-                    residual_gene_var,
-                    sum_total,
-                    clip,
-                    theta,
-                    X_batch.shape[1],
-                    X_batch.shape[0],
-                ),
+            sums_genes = cp.sum(X_batch, axis=0, dtype=dtype).ravel()
+            sums_cells = cp.sum(X_batch, axis=1, dtype=dtype).ravel()
+            sum_total = float(sums_genes.sum())
+            inv_sum_total = 1.0 / sum_total
+
+            _pr_cuda.dense_hvg_res(
+                cp.asfortranarray(X_batch),
+                sums_genes=sums_genes,
+                sums_cells=sums_cells,
+                residuals=residual_gene_var,
+                inv_sum_total=inv_sum_total,
+                clip=clip_val,
+                inv_theta=inv_theta,
+                n_genes=n_genes,
+                n_cells=n_cells,
+                stream=stream,
             )
 
         unmasked_residual_gene_var = cp.zeros(len(nonzero_genes))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import anndata as ad
 import numpy as np
 import pytest
 import scanpy as sc
@@ -10,6 +11,10 @@ from scipy import stats
 import rapids_singlecell as rsc
 
 
+def _make_nonnegative(adata):
+    adata.X = np.abs(adata.X)
+
+
 @pytest.mark.parametrize("reference", ["rest", "1"])
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
 @pytest.mark.parametrize("sparse", [True, False])
@@ -18,11 +23,15 @@ def test_rank_genes_groups_ttest_matches_scanpy(reference, method, sparse):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
+    _make_nonnegative(adata_gpu)
 
     if sparse:
+        adata_gpu.X = adata_gpu.X.astype(np.float32)
         adata_gpu.X = sp.csr_matrix(adata_gpu.X)
 
     adata_cpu = adata_gpu.copy()
+    if sparse:
+        adata_cpu.X = adata_cpu.X.astype(np.float64)
 
     rsc.tl.rank_genes_groups(
         adata_gpu,
@@ -57,7 +66,7 @@ def test_rank_genes_groups_ttest_matches_scanpy(reference, method, sparse):
             gpu_values = np.asarray(gpu_field[group], dtype=float)
             cpu_values = np.asarray(cpu_field[group], dtype=float)
             np.testing.assert_allclose(
-                gpu_values, cpu_values, rtol=1e-5, atol=1e-6, equal_nan=True
+                gpu_values, cpu_values, rtol=1e-13, atol=1e-15, equal_nan=True
             )
 
     params = gpu_result["params"]
@@ -75,6 +84,7 @@ def test_rank_genes_groups_ttest_honors_layer_and_use_raw(reference, method):
     np.random.seed(42)
     base = sc.datasets.blobs(n_variables=5, n_centers=3, n_observations=150)
     base.obs["blobs"] = base.obs["blobs"].astype("category")
+    _make_nonnegative(base)
     base.layers["signal"] = base.X.copy()
 
     ref_adata = base.copy()
@@ -123,6 +133,7 @@ def test_rank_genes_groups_ttest_subset_and_bonferroni(reference, method):
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=5, n_centers=4, n_observations=150)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
 
     groups = ["0", "1", "2"] if reference != "rest" else ["0", "2"]
 
@@ -150,6 +161,63 @@ def test_rank_genes_groups_ttest_subset_and_bonferroni(reference, method):
 
 
 @pytest.mark.parametrize(
+    ("groups", "reference"),
+    [
+        (["0"], "rest"),
+        (["0", "2"], "rest"),
+        (["0"], "1"),
+        (["0", "2"], "1"),
+    ],
+)
+@pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
+def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference):
+    np.random.seed(42)
+    adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
+    adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
+    adata_cpu = adata_gpu.copy()
+
+    rsc.tl.rank_genes_groups(
+        adata_gpu,
+        "blobs",
+        method=method,
+        groups=groups,
+        reference=reference,
+        use_raw=False,
+    )
+    sc.tl.rank_genes_groups(
+        adata_cpu,
+        "blobs",
+        method=method,
+        groups=groups,
+        reference=reference,
+        use_raw=False,
+    )
+
+    gpu_result = adata_gpu.uns["rank_genes_groups"]
+    cpu_result = adata_cpu.uns["rank_genes_groups"]
+
+    assert gpu_result["names"].dtype.names == cpu_result["names"].dtype.names
+    for group in gpu_result["names"].dtype.names:
+        gpu_names = list(gpu_result["names"][group])
+        cpu_names = list(cpu_result["names"][group])
+        for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+            gpu_map = dict(
+                zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float))
+            )
+            cpu_map = dict(
+                zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float))
+            )
+            for gene, gpu_val in gpu_map.items():
+                np.testing.assert_allclose(
+                    gpu_val,
+                    cpu_map[gene],
+                    rtol=1e-6,
+                    atol=1e-8,
+                    err_msg=f"{field} mismatch for gene {gene} group {group}",
+                )
+
+
+@pytest.mark.parametrize(
     "reference_before,reference_after",
     [("rest", "rest"), ("1", "One")],
 )
@@ -161,6 +229,7 @@ def test_rank_genes_groups_ttest_with_renamed_categories(
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=4, n_centers=3, n_observations=200)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
 
     # First run with original category names
     rsc.tl.rank_genes_groups(adata, "blobs", method=method, reference=reference_before)
@@ -185,10 +254,12 @@ def test_rank_genes_groups_ttest_with_renamed_categories(
 @pytest.mark.parametrize("reference", ["rest", "1"])
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
 def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
-    """Test that group order doesn't affect results."""
+    """Group order sets the output column order (matching scanpy); the per-group
+    statistics themselves are order-independent."""
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=6, n_centers=4, n_observations=180)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
     bdata = adata.copy()
 
     groups = ["0", "1", "2", "3"] if reference != "rest" else ["0", "2", "3"]
@@ -201,9 +272,13 @@ def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
         bdata, "blobs", method=method, groups=groups_reversed, reference=reference
     )
 
-    expected_groups = {g for g in groups if g != reference}
-    assert set(adata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
-    assert set(bdata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
+    # Column order echoes the user-provided group order (reference excluded).
+    assert adata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
+        g for g in groups if g != reference
+    )
+    assert bdata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
+        g for g in groups_reversed if g != reference
+    )
 
     # Pick a group that's not the reference for comparison
     test_group = "3" if reference != "3" else "0"
@@ -211,8 +286,8 @@ def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
         np.testing.assert_allclose(
             np.asarray(adata.uns["rank_genes_groups"][field][test_group], dtype=float),
             np.asarray(bdata.uns["rank_genes_groups"][field][test_group], dtype=float),
-            rtol=1e-5,
-            atol=1e-6,
+            rtol=1e-13,
+            atol=1e-15,
             equal_nan=True,
         )
 
@@ -228,6 +303,7 @@ def test_rank_genes_groups_ttest_pts(reference, method):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
+    _make_nonnegative(adata_gpu)
     adata_cpu = adata_gpu.copy()
 
     # Run with pts=True
@@ -263,7 +339,7 @@ def test_rank_genes_groups_ttest_pts(reference, method):
 
     for col in gpu_pts.columns:
         np.testing.assert_allclose(
-            gpu_pts[col].values, cpu_pts[col].values, rtol=1e-5, atol=1e-6
+            gpu_pts[col].values, cpu_pts[col].values, rtol=1e-13, atol=1e-15
         )
 
     # pts_rest only exists when reference='rest'
@@ -276,18 +352,15 @@ def test_rank_genes_groups_ttest_pts(reference, method):
 
         for col in gpu_pts_rest.columns:
             np.testing.assert_allclose(
-                gpu_pts_rest[col].values, cpu_pts_rest[col].values, rtol=1e-5, atol=1e-6
+                gpu_pts_rest[col].values,
+                cpu_pts_rest[col].values,
+                rtol=1e-13,
+                atol=1e-15,
             )
 
 
 def test_rank_genes_groups_ttest_direct_scipy():
-    """Test t-test scores directly against scipy.stats.ttest_ind on two matrices.
-
-    Creates a simple two-group dataset and compares rapids_singlecell t-test
-    directly against scipy.stats.ttest_ind without intermediate statistics.
-    """
-    import anndata as ad
-
+    """Compare rapids_singlecell t-test scores directly to scipy.stats.ttest_ind."""
     np.random.seed(42)
     n_group1, n_group2, n_genes = 50, 60, 20
 
@@ -297,6 +370,9 @@ def test_rank_genes_groups_ttest_direct_scipy():
 
     # Combine into AnnData
     X = np.vstack([X_group1, X_group2])
+    X -= X.min()
+    X_group1 = X[:n_group1]
+    X_group2 = X[n_group1:]
     obs = {"group": ["A"] * n_group1 + ["B"] * n_group2}
     adata = ad.AnnData(X=X, obs=obs)
     adata.obs["group"] = adata.obs["group"].astype("category")
@@ -317,27 +393,24 @@ def test_rank_genes_groups_ttest_direct_scipy():
     scipy_scores, _ = stats.ttest_ind(X_group1, X_group2, equal_var=False)
 
     # Compare scores for each gene
+    # Scores are stored as float32 in the structured array, so rtol ~ float32 eps
     for i in range(n_genes):
         gene = adata.var_names[i]
         np.testing.assert_allclose(
             rsc_score_map[gene],
             scipy_scores[i],
-            rtol=1e-5,
-            atol=1e-6,
+            rtol=1e-7,
+            atol=1e-15,
             err_msg=f"Score mismatch for gene {gene}",
         )
 
 
 def test_rank_genes_groups_ttest_matches_scipy():
-    """Test that t-test scores match scipy computation directly.
-
-    This test verifies that our variance clipping fix produces correct results
-    by comparing against scipy.stats.ttest_ind_from_stats with properly computed
-    (non-negative) variances. Uses real pbmc68k_reduced dataset at float64 precision.
-    """
+    """Compare t-test scores to scipy stats with nonnegative variances."""
     adata = pbmc68k_reduced()
     # Convert to float64 for maximum precision in comparison
     adata.X = adata.X.astype(np.float64)
+    _make_nonnegative(adata)
 
     # Run rapids_singlecell t-test
     rsc.tl.rank_genes_groups(adata, "bulk_labels", method="t-test", use_raw=False)
@@ -383,12 +456,13 @@ def test_rank_genes_groups_ttest_matches_scipy():
         rsc_score_map = dict(zip(rsc_names, rsc_scores))
 
         # Compare scores for each gene
+        # Gap is from GPU vs CPU mean/var computation (~float32 intermediates)
         for i, gene in enumerate(var_names):
             np.testing.assert_allclose(
                 rsc_score_map[gene],
                 scipy_scores[i],
-                rtol=1e-5,
-                atol=1e-6,
+                rtol=1e-6,
+                atol=1e-15,
                 err_msg=f"Score mismatch for gene {gene} in group {group}",
             )
 
@@ -399,6 +473,7 @@ def test_rank_genes_groups_ttest_mask_var_array(method):
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=10, n_centers=3, n_observations=150)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
 
     # Create mask to select only first 5 genes
     mask = np.array([True] * 5 + [False] * 5)
@@ -426,6 +501,7 @@ def test_rank_genes_groups_ttest_mask_var_string(method):
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=10, n_centers=3, n_observations=150)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
 
     # Add mask column to adata.var
     adata.var["highly_variable"] = [True] * 6 + [False] * 4
@@ -452,6 +528,7 @@ def test_rank_genes_groups_ttest_mask_var_matches_scanpy(method):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=3, n_observations=150)
     adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
+    _make_nonnegative(adata_gpu)
     adata_cpu = adata_gpu.copy()
 
     mask = np.array([True, False, True, False, True, True, False, True])
@@ -475,7 +552,7 @@ def test_rank_genes_groups_ttest_mask_var_matches_scanpy(method):
     for group in gpu_result["scores"].dtype.names:
         gpu_values = np.asarray(gpu_result["scores"][group], dtype=float)
         cpu_values = np.asarray(cpu_result["scores"][group], dtype=float)
-        np.testing.assert_allclose(gpu_values, cpu_values, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(gpu_values, cpu_values, rtol=1e-13, atol=1e-15)
 
 
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
@@ -484,6 +561,7 @@ def test_rank_genes_groups_ttest_rankby_abs(method):
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
     adata_abs = adata.copy()
 
     # Run without rankby_abs
@@ -511,6 +589,7 @@ def test_rank_genes_groups_ttest_key_added(method):
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    _make_nonnegative(adata)
 
     custom_key = "my_custom_key"
 

@@ -9,6 +9,7 @@ import pandas as pd
 from cupyx.scipy.sparse import issparse, isspmatrix_csc
 from scanpy.get import _get_obs_rep
 
+from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
     _check_nonnegative_integers,
@@ -17,6 +18,77 @@ from rapids_singlecell.preprocessing._utils import (
 
 if TYPE_CHECKING:
     from anndata import AnnData
+
+
+_seurat_v3_elementwise_kernel = cp.ElementwiseKernel(
+    "T data, S idx, raw D clip_val",
+    "raw D sq_sum, raw D sum",
+    """
+    D element = min((double)data, clip_val[idx]);
+    atomicAdd(&sq_sum[idx], element * element);
+    atomicAdd(&sum[idx], element);
+    """,
+    "seurat_v3_elementwise_kernel",
+    no_return=True,
+)
+
+
+def _clip_square_sum_sparse(X, clip_val):
+    """Compute clipped sum and sum-of-squares for a sparse CSR matrix."""
+    if isspmatrix_csc(X):
+        X = X.tocsr()
+    squared_batch_counts_sum = cp.zeros(clip_val.shape, dtype=cp.float64)
+    batch_counts_sum = cp.zeros(clip_val.shape, dtype=cp.float64)
+    _seurat_v3_elementwise_kernel(
+        X.data,
+        X.indices,
+        clip_val,
+        squared_batch_counts_sum,
+        batch_counts_sum,
+    )
+    return squared_batch_counts_sum, batch_counts_sum
+
+
+def _clip_square_sum_dense(X, clip_val):
+    """Compute clipped sum and sum-of-squares for a dense matrix."""
+    batch_counts = X.astype(cp.float64)
+    clip_val_broad = cp.broadcast_to(clip_val, batch_counts.shape)
+    batch_counts = cp.minimum(batch_counts, clip_val_broad)
+    squared_batch_counts_sum = cp.sum(batch_counts**2, axis=0)
+    batch_counts_sum = cp.sum(batch_counts, axis=0)
+    return squared_batch_counts_sum, batch_counts_sum
+
+
+def _clip_square_sum(X, clip_val):
+    """Compute clipped sum and sum-of-squares, dispatching on array type."""
+    if isinstance(X, DaskArray):
+        return _clip_square_sum_dask(X, clip_val)
+    elif issparse(X):
+        return _clip_square_sum_sparse(X, clip_val)
+    else:
+        return _clip_square_sum_dense(X, clip_val)
+
+
+def _clip_square_sum_dask(X, clip_val):
+    """Compute clipped sum and sum-of-squares for a Dask array via map_blocks."""
+    n_blocks = X.blocks.size
+
+    def _block_clip_square_sum(block):
+        sq_sum, b_sum = _clip_square_sum(block, clip_val)
+        return cp.stack([sq_sum, b_sum])[None, ...]
+
+    squared_batch_counts_sum, batch_counts_sum = (
+        X.map_blocks(
+            _block_clip_square_sum,
+            new_axis=(1,),
+            chunks=((1,) * n_blocks, (2,), (X.shape[1],)),
+            meta=cp.array([], dtype=cp.float64),
+            dtype=cp.float64,
+        )
+        .sum(axis=0)
+        .compute()
+    )
+    return squared_batch_counts_sum, batch_counts_sum
 
 
 def _highly_variable_genes_seurat_v3(
@@ -64,7 +136,10 @@ def _highly_variable_genes_seurat_v3(
 
     df = pd.DataFrame(index=adata.var.index)
     X = _get_obs_rep(adata, layer=layer)
-    _check_gpu_X(X)
+    _check_gpu_X(X, allow_dask=True)
+    is_dask = isinstance(X, DaskArray)
+    if is_dask:
+        check_values = False
     if check_values and not _check_nonnegative_integers(X):
         warnings.warn(
             "`flavor='seurat_v3'` expects raw count data, but non-integers were found.",
@@ -72,18 +147,30 @@ def _highly_variable_genes_seurat_v3(
         )
 
     mean, var = _get_mean_var(X, axis=0)
+    if is_dask:
+        import dask
+
+        mean, var = dask.compute(mean, var)
     df["means"], df["variances"] = mean.get(), var.get()
     if batch_key is None:
         batch_info = pd.Categorical(np.zeros(adata.shape[0], dtype=int))
     else:
         batch_info = adata.obs[batch_key].values
-        if isspmatrix_csc(X):
+        if not is_dask and isspmatrix_csc(X):
             X = X.tocsr()
 
+    batches = np.unique(batch_info)
     norm_gene_vars = []
-    for b in np.unique(batch_info):
-        X_batch = X[batch_info == b]
-        mean, var = _get_mean_var(X_batch, axis=0)
+    for b in batches:
+        if len(batches) == 1:
+            X_batch = X
+        else:
+            X_batch = X[batch_info == b]
+            mean, var = _get_mean_var(X_batch, axis=0)
+            if is_dask:
+                import dask
+
+                mean, var = dask.compute(mean, var)
         not_const = var > 0
         estimat_var = cp.zeros(X_batch.shape[1], dtype=np.float64)
 
@@ -93,49 +180,11 @@ def _highly_variable_genes_seurat_v3(
         model.fit()
         estimat_var[not_const] = model.outputs.fitted_values
         reg_std = cp.sqrt(10**estimat_var)
-        batch_counts = X_batch
         N = X_batch.shape[0]
         vmax = cp.sqrt(N)
         clip_val = reg_std * vmax + mean
-        if issparse(batch_counts):
-            seurat_v3_elementwise_kernel = cp.ElementwiseKernel(
-                "T data, S idx, raw D clip_val",
-                "raw D sq_sum, raw D sum",
-                """
-                D element = min((double)data, clip_val[idx]);
-                atomicAdd(&sq_sum[idx], element * element);
-                atomicAdd(&sum[idx], element);
-                """,
-                "seurat_v3_elementwise_kernel",
-                no_return=True,
-            )
-            if isspmatrix_csc(batch_counts):
-                batch_counts = batch_counts.tocsr()
-            squared_batch_counts_sum = cp.zeros(clip_val.shape, dtype=cp.float64)
-            batch_counts_sum = cp.zeros(clip_val.shape, dtype=cp.float64)
-            seurat_v3_elementwise_kernel(
-                batch_counts.data,
-                batch_counts.indices,
-                clip_val,
-                squared_batch_counts_sum,
-                batch_counts_sum,
-            )
-        else:
-            batch_counts = batch_counts.astype(cp.float64)
-            clip_val_broad = cp.repeat(clip_val, batch_counts.shape[0]).reshape(
-                batch_counts.shape
-            )
 
-            cp.putmask(
-                batch_counts,
-                batch_counts > clip_val_broad,
-                clip_val_broad,
-            )
-            # Calculate the sum of squared values for each column
-            squared_batch_counts_sum = cp.sum(batch_counts**2, axis=0)
-
-            # Calculate the sum for each column
-            batch_counts_sum = cp.sum(batch_counts, axis=0)
+        squared_batch_counts_sum, batch_counts_sum = _clip_square_sum(X_batch, clip_val)
 
         norm_gene_var = (1 / ((N - 1) * cp.square(reg_std))) * (
             (N * cp.square(mean))

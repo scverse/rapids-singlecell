@@ -32,6 +32,14 @@ out_of_core.md
 ```
 
 ```{toctree}
+:caption: 'Development'
+:hidden: true
+:maxdepth: 1
+
+contributing.md
+```
+
+```{toctree}
 :caption: 'About'
 :hidden: true
 :maxdepth: 1

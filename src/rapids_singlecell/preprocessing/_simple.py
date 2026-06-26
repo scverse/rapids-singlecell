@@ -44,11 +44,11 @@ def flag_gene_family(
         adds the boolean column in `.var`
 
     """
-    if gene_family_prefix:
+    if gene_family_prefix is not None:
         adata.var[gene_family_name] = cp.asnumpy(
             adata.var.index.str.startswith(gene_family_prefix)
         ).ravel()
-    if gene_list:
+    if gene_list is not None:
         adata.var[gene_family_name] = cp.asnumpy(
             adata.var.index.isin(gene_list)
         ).ravel()

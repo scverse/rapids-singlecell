@@ -69,7 +69,7 @@ def test_score_with_reference(array_type):
         elif array_type == "csc":
             adata.X = csc_matrix(adata.X)
     adata.X = adata.X.astype(np.float64)
-    sc.pp.normalize_per_cell(adata, counts_per_cell_after=10000)
+    sc.pp.normalize_total(adata, target_sum=10000)
 
     sc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_cpu")
     rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_gpu")
@@ -85,7 +85,7 @@ def test_add_score():
     """
     adata = _create_adata(100, 1000, p_zero=0, p_nan=0).copy()
 
-    sc.pp.normalize_per_cell(adata, counts_per_cell_after=1e4)
+    sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
 
     # the actual genes names are all 6letters
@@ -162,10 +162,11 @@ def test_score_genes_deplete():
     # here's an arbitrary gene set
     gene_set = adata_dense.var_names[:10]
 
+    gene_idx = np.where(adata_dense.var_names.isin(gene_set))[0]
     for adata in [adata_sparse, adata_dense]:
         # deplete these genes in 50 cells,
         ix_obs = np.random.choice(adata.shape[0], 50)
-        adata[ix_obs][:, gene_set].X = 0
+        adata.X[np.ix_(ix_obs, gene_idx)] = 0
 
         rsc.tl.score_genes(adata, gene_list=gene_set, score_name="Test")
         scores = adata.obs["Test"].values
@@ -200,7 +201,7 @@ def test_use_raw_None():
 def test_layer():
     adata = _create_adata(100, 1000, p_zero=0, p_nan=0)
 
-    sc.pp.normalize_per_cell(adata, counts_per_cell_after=1e4)
+    sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
 
     # score X

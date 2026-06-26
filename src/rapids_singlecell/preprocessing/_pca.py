@@ -9,8 +9,6 @@ from cuml.internals.input_utils import sparse_scipy_to_cp
 from cupyx.scipy.sparse import issparse as cpissparse
 from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
-from scanpy._utils import Empty, _empty
-from scanpy.preprocessing._pca import _handle_mask_var
 from scipy.sparse import issparse
 
 from rapids_singlecell._compat import DaskArray
@@ -22,6 +20,53 @@ if TYPE_CHECKING:
     from anndata import AnnData
     from numpy.typing import NDArray
 
+_empty = object()
+
+
+def _resolve_mask_var(
+    adata: AnnData,
+    mask_var: NDArray[np.bool] | str | None,
+    *,
+    use_highly_variable: bool | None,
+) -> tuple[str | None, np.ndarray | None]:
+    """Resolve mask_var and use_highly_variable into a mask parameter and array."""
+    import warnings
+
+    if use_highly_variable is not None:
+        warnings.warn(
+            "Argument `use_highly_variable` is deprecated, use `mask_var` instead. "
+            'Use mask_var="highly_variable" instead of use_highly_variable=True, '
+            "and mask_var=None instead of use_highly_variable=False.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        if mask_var is not _empty:
+            raise ValueError(
+                "Cannot specify both `mask_var` and `use_highly_variable`."
+            )
+
+    if use_highly_variable or (
+        use_highly_variable is None
+        and mask_var is _empty
+        and "highly_variable" in adata.var.columns
+    ):
+        mask_var = "highly_variable"
+
+    if mask_var is _empty or mask_var is None:
+        return None, None
+
+    if isinstance(mask_var, str):
+        mask_array = adata.var[mask_var].to_numpy()
+        return mask_var, mask_array
+
+    mask_var = np.asarray(mask_var)
+    if mask_var.shape != (adata.n_vars,):
+        raise ValueError(
+            f"The shape of the mask ({mask_var.shape}) does not match "
+            f"the number of variables ({adata.n_vars})."
+        )
+    return None, mask_var
+
 
 def pca(
     adata: AnnData,
@@ -31,7 +76,7 @@ def pca(
     zero_center: bool = True,
     svd_solver: str | None = None,
     random_state: int | None = 0,
-    mask_var: NDArray[np.bool] | str | None | Empty = _empty,
+    mask_var: NDArray[np.bool] | str | None = _empty,
     use_highly_variable: bool | None = None,
     dtype: str = "float32",
     chunked: bool = False,
@@ -41,7 +86,7 @@ def pca(
     **kwargs,
 ) -> None | AnnData:
     """\
-    Principal component analysis using GPU acceleration.
+    Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
 
     Uses the following implementations based on data type (defaults for `svd_solver` in parentheses):
 
@@ -176,7 +221,7 @@ def pca(
 
     X = _get_obs_rep(adata, layer=layer)
 
-    mask_var_param, mask_var = _handle_mask_var(
+    mask_var_param, mask_var = _resolve_mask_var(
         adata, mask_var, use_highly_variable=use_highly_variable
     )
     del use_highly_variable

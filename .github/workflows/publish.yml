@@ -1,36 +1,220 @@
-# This workflow will upload a Python Package using Twine when a release is created
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#publishing-to-package-registries
+# https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#publishing-to-package-registries
+# https://github.com/pypa/cibuildwheel/blob/main/examples/github-deploy.yml
 
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
-name: Upload Python Package
+name: Build and upload to PyPI
 
 on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
   release:
     types: [published]
 
 jobs:
-  deploy:
-
-    runs-on: ubuntu-latest
-
-    environment: publish
-
-    permissions:
-      id-token: write
+  build_wheels:
+    name: Build wheels for ${{ matrix.os }}-cu${{ matrix.cuda_major }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        include:
+          # CUDA 12 wheels (compiled with 12.2 for runtime 12.2+ compatibility)
+          - os: linux-intel
+            cuda_major: "12"
+            runs-on: ubuntu-latest
+            cibw_image: "ghcr.io/scverse/rapids_singlecell:manylinux_2_28_x86_64_cuda12.2"
+            dockerfile: "docker/manylinux_2_28_x86_64_cuda12.2.Dockerfile"
+            cuda_archs: "75-real;80-real;86-real;89-real;90"
+          - os: linux-arm
+            cuda_major: "12"
+            runs-on: ubuntu-24.04-arm
+            cibw_image: "ghcr.io/scverse/rapids_singlecell:manylinux_2_28_aarch64_cuda12.2"
+            dockerfile: "docker/manylinux_2_28_aarch64_cuda12.2.Dockerfile"
+            cuda_archs: "75-real;80-real;86-real;89-real;90"
+          # CUDA 13 wheels (native Blackwell support)
+          - os: linux-intel
+            cuda_major: "13"
+            runs-on: ubuntu-latest
+            cibw_image: "ghcr.io/scverse/rapids_singlecell:manylinux_2_28_x86_64_cuda13.0"
+            dockerfile: "docker/manylinux_2_28_x86_64_cuda13.0.Dockerfile"
+            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;120"
+          - os: linux-arm
+            cuda_major: "13"
+            runs-on: ubuntu-24.04-arm
+            cibw_image: "ghcr.io/scverse/rapids_singlecell:manylinux_2_28_aarch64_cuda13.0"
+            dockerfile: "docker/manylinux_2_28_aarch64_cuda13.0.Dockerfile"
+            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;120"
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.x'
-    - name: Install CLI tool
-      run: pip install build
-    - name: Build package
-      run: python -m build
-    - name: Publish package
-      uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Get version from setuptools-scm
+        id: version
+        run: |
+          pip install setuptools-scm
+          VERSION=$(python -m setuptools_scm)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Set package name, extras, and CUDA archs for CUDA ${{ matrix.cuda_major }}
+        run: |
+          python3 - ${{ matrix.cuda_major }} "${{ matrix.cuda_archs }}" <<'SCRIPT'
+          import sys, pathlib
+
+          cuda = sys.argv[1]
+          cuda_archs = sys.argv[2]
+          other = "13" if cuda == "12" else "12"
+          path = pathlib.Path("pyproject.toml")
+          text = path.read_text()
+
+          def remove_toml_array(text, key):
+              lines = text.splitlines(keepends=True)
+              out = []
+              i = 0
+              while i < len(lines):
+                  if lines[i].startswith(f"{key} = ["):
+                      depth = lines[i].count("[") - lines[i].count("]")
+                      i += 1
+                      while i < len(lines) and depth > 0:
+                          depth += lines[i].count("[") - lines[i].count("]")
+                          i += 1
+                      continue
+                  out.append(lines[i])
+                  i += 1
+              return "".join(out)
+
+          # Rename package
+          text = text.replace(
+              'name = "rapids-singlecell"',
+              f'name = "rapids-singlecell-cu{cuda}"',
+          )
+          # Rename matching extra to "rapids", remove the other
+          text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
+          text = remove_toml_array(text, f"rapids-cu{other}")
+
+          # CMake links CUDA extensions against librmm.
+          # Add the matching wheel to isolated build requirements.
+          for dep in (
+              f'    "librmm-cu{other}>=25.12",\n',
+              f'    "rmm-cu{other}>=25.12",\n',
+          ):
+              text = text.replace(dep, "")
+          rmm_build_req = f'    "librmm-cu{cuda}>=25.12",\n'
+          build_system_text = text.split("[project]", 1)[0]
+          if f'"librmm-cu{cuda}>=25.12"' not in build_system_text:
+              text = text.replace(
+                  ']\nbuild-backend = "scikit_build_core.build"',
+                  f'{rmm_build_req}]\nbuild-backend = "scikit_build_core.build"',
+                  1,
+              )
+
+          # Set CUDA architectures (replace "native" with CI target archs)
+          text = text.replace(
+              'CMAKE_CUDA_ARCHITECTURES = "native"',
+              f'CMAKE_CUDA_ARCHITECTURES = "{cuda_archs}"',
+          )
+
+          path.write_text(text)
+
+          # Verify
+          for line in path.read_text().splitlines():
+              if "name" in line or "rapids" in line.lower() or "CUDA_ARCH" in line:
+                  print(line)
+          SCRIPT
+
+      - name: Sanity check pyproject.toml
+        run: |
+          python3 -c "import tomllib; tomllib.load(open('pyproject.toml', 'rb'))"
+          grep -E "name|rapids|CUDA_ARCH" pyproject.toml
+
+      - name: Build CUDA manylinux image
+        run: |
+          docker build -t "${{ matrix.cibw_image }}" -f "${{ matrix.dockerfile }}" docker
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.4.1
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
+          CIBW_BUILD: 'cp312-*'
+          CIBW_SKIP: '*-musllinux*'
+          CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.os == 'linux-intel' && matrix.cibw_image || '' }}
+          CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.os == 'linux-arm' && matrix.cibw_image || '' }}
+          CIBW_ENVIRONMENT_PASS_LINUX: SETUPTOOLS_SCM_PRETEND_VERSION
+          CIBW_ENVIRONMENT: >
+            CUDA_PATH=/usr/local/cuda
+            LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+            PATH=/usr/local/cuda/bin:$PATH
+          CIBW_BEFORE_BUILD: >
+            rm -f build/.librmm_dir &&
+            mkdir -p build &&
+            python -m pip install -U pip
+            scikit-build-core cmake ninja nanobind
+            librmm-cu${{ matrix.cuda_major }} &&
+            RMM_ROOT=$(python -c "import librmm; print(librmm.__path__[0])") &&
+            LOG_ROOT=$(python -c "import rapids_logger; print(rapids_logger.__path__[0])") &&
+            echo "[rsc-build] librmm=$RMM_ROOT" &&
+            echo "[rsc-build] rapids_logger=$LOG_ROOT" &&
+            ln -sf "$RMM_ROOT/lib64/librmm.so" /usr/local/lib/librmm.so &&
+            ln -sf "$LOG_ROOT/lib64/librapids_logger.so" /usr/local/lib/librapids_logger.so &&
+            ldconfig &&
+            python -c "import librmm; print(librmm.__path__[0])" > build/.librmm_dir &&
+            echo "[rsc-build] marker=$(cat build/.librmm_dir)"
+          CIBW_TEST_SKIP: "*"
+          CIBW_TEST_COMMAND: ""
+          # Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+          # Use SONAME globs so CUDA 12/13 suffix changes do not bundle them.
+          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
+          CIBW_BUILD_VERBOSITY: "1"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-${{ matrix.os }}-cu${{ matrix.cuda_major }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build sdist
+        run: pipx run build --sdist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cibw-sdist
+          path: dist/*.tar.gz
+
+  upload_wheels:
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    environment: publish-cu${{ matrix.cuda_major }}
+    permissions:
+      id-token: write
+    if: github.event_name == 'release' && github.event.action == 'published'
+    strategy:
+      matrix:
+        cuda_major: ["12", "13"]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cibw-wheels-*-cu${{ matrix.cuda_major }}-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  upload_sdist:
+    needs: [build_sdist]
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      id-token: write
+    if: github.event_name == 'release' && github.event.action == 'published'
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: cibw-sdist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

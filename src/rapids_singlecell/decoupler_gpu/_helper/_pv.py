@@ -4,34 +4,16 @@ import cupy as cp
 import numba as nb
 import numpy as np
 
-# Reverse cumulative min along the last axis, per row (float64)
-_rev_cummin64 = cp.RawKernel(
-    r"""
-extern "C" __global__
-void rev_cummin64(const double* __restrict__ x,
-                  double* __restrict__ y,
-                  const int n_rows,
-                  const int m)
-{
-    int r = blockDim.x * blockIdx.x + threadIdx.x;
-    if (r >= n_rows) return;
+from rapids_singlecell._cuda import _pv_cuda as _pv
 
-    const double* xr = x + (size_t)r * m;
-    double* yr       = y + (size_t)r * m;
 
-    double cur = xr[m - 1];
-    yr[m - 1] = cur;
+def _rev_cummin64(x, n_rows, m):
+    y = cp.empty_like(x)
 
-    // right -> left
-    for (int j = m - 2; j >= 0; --j) {
-        double v = xr[j];
-        cur = (v < cur) ? v : cur;
-        yr[j] = cur;
-    }
-}
-""",
-    "rev_cummin64",
-)
+    _pv.rev_cummin64(
+        x, out=y, n_rows=n_rows, m=m, stream=cp.cuda.get_current_stream().ptr
+    )
+    return y
 
 
 def fdr_bh_axis1_cupy_optimized(ps, *, mem_gb: float = 4.0) -> cp.ndarray:
@@ -78,7 +60,6 @@ def fdr_bh_axis1_cupy_optimized(ps, *, mem_gb: float = 4.0) -> cp.ndarray:
 
     out = cp.empty_like(ps, dtype=cp.float64)
 
-    threads = 256  # for the rev_cummin kernel
     for s in range(0, n_rows, B):
         e = min(n_rows, s + B)
         R = e - s
@@ -97,9 +78,7 @@ def fdr_bh_axis1_cupy_optimized(ps, *, mem_gb: float = 4.0) -> cp.ndarray:
         ps_bh = ps_sorted * scale  # (R, m) float64
 
         # 4) reverse cumulative min via custom kernel
-        ps_mon = cp.empty_like(ps_bh)
-        blocks = (R + threads - 1) // threads
-        _rev_cummin64((blocks,), (threads,), (ps_bh, ps_mon, R, m))
+        ps_mon = _rev_cummin64(ps_bh, R, m)
 
         # 5) build inverse permutation without argsort (scatter)
         inv_order = cp.empty_like(order, dtype=cp.int32)  # (R, m) int32

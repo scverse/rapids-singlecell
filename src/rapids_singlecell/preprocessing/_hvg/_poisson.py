@@ -9,14 +9,11 @@ import pandas as pd
 from scanpy.get import _get_obs_rep
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._cuda import _hvg_cuda as _hvg
 from rapids_singlecell.preprocessing._qc import _basic_qc
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
     _check_nonnegative_integers,
-)
-
-from ._kernels._poisson import (
-    _expected_zeros_kernel,
 )
 
 if TYPE_CHECKING:
@@ -152,14 +149,13 @@ def _compute_expected_zeros_kernel(
     """
     expected = cp.zeros(n_genes, dtype=dtype)
 
-    block_size = 256
-    grid_size = (n_genes + block_size - 1) // block_size
-
-    kernel = _expected_zeros_kernel(dtype)
-    kernel(
-        (grid_size,),
-        (block_size,),
-        (scaled_means, total_counts, expected, n_genes, n_cells),
+    _hvg.expected_zeros(
+        scaled_means,
+        total_counts,
+        expected,
+        n_genes,
+        n_cells,
+        stream=cp.cuda.get_current_stream().ptr,
     )
 
     return expected

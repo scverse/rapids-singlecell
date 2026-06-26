@@ -8,15 +8,15 @@ features = [ "test" ]
 
 # Select CUDA feature per matrix
 overrides.matrix.cuda.features = [
-    { if = [ "12" ], value = "rapids12" },
-    { if = [ "13" ], value = "rapids13" },
+    { if = [ "12" ], value = "rapids-cu12" },
+    { if = [ "13" ], value = "rapids-cu13" },
 ]
 
 # Python per deps
 overrides.matrix.deps.python = [
     { if = [ "stable" ], value = "3.12" },
-    { if = [ "dev" ], value = "3.13" },
-    { if = [ "rapids_prerelease" ], value = "3.13" },
+    { if = [ "dev" ], value = "3.14" },
+    { if = [ "rapids_prerelease" ], value = "3.14" },
 ]
 
 # Allow prereleases and use RAPIDS nightly index only for prerelease
@@ -38,16 +38,35 @@ overrides.matrix.deps.extra-dependencies = [
     { if = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
+    # numpy 2.5 removed `np.row_stack`, which numba-cuda still calls -> the whole
+    # suite fails at collection. Pin <2.5 for the prerelease-allowing envs until
+    # numba-cuda drops the call; remove this once that lands.
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numpy<2.5" },
+    # UV_PRERELEASE=allow otherwise drags in mutually-incompatible numba/numba-cuda
+    # prereleases (numba 0.63.0b1 -> removed np.trapz; numba 0.66.0rc2 + numba-cuda
+    # 0.30.2 -> missing numba.cuda.types.NPDatetime). Pin the known-good stable pair
+    # (numba 0.64.x + numba-cuda 0.28.x) so only RAPIDS uses nightlies.
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numba>=0.64,<0.65" },
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numba-cuda<0.30" },
 ]
 overrides.matrix.cuda.extra-dependencies = [
-    { if = [ "13" ], value = "cuml-cu13<26.4" },
-    { if = [ "13" ], value = "cudf-cu13<26.4" },
-    { if = [ "13" ], value = "cugraph-cu13<26.4" },
-    { if = [ "13" ], value = "cuvs-cu13<26.4" },
-    { if = [ "12" ], value = "cuml-cu12<26.4" },
-    { if = [ "12" ], value = "cudf-cu12<26.4" },
-    { if = [ "12" ], value = "cugraph-cu12<26.4" },
-    { if = [ "12" ], value = "cuvs-cu12<26.4" },
+    { if = [ "13" ], value = "cuml-cu13<26.10" },
+    { if = [ "13" ], value = "cudf-cu13<26.10" },
+    { if = [ "13" ], value = "cugraph-cu13<26.10" },
+    { if = [ "13" ], value = "cuvs-cu13<26.10" },
+    { if = [ "12" ], value = "cuml-cu12<26.10" },
+    { if = [ "12" ], value = "cudf-cu12<26.10" },
+    { if = [ "12" ], value = "cugraph-cu12<26.10" },
+    { if = [ "12" ], value = "cuvs-cu12<26.10" },
 ]
 
 ## For prerelease we rely on UV_PRERELEASE + nightly index; features select cu12/cu13

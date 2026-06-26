@@ -1,39 +1,24 @@
 from __future__ import annotations
 
-import math
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-import cuml.internals.logger as logger
 import cupy as cp
 import numpy as np
-from cupyx.scipy import sparse as cp_sparse
-from scipy import sparse as sc_sparse
 
-from rapids_singlecell.preprocessing._neighbors._algorithms._all_neighbors import (
-    _all_neighbors_knn,
-)
-from rapids_singlecell.preprocessing._neighbors._algorithms._brute import _brute_knn
-from rapids_singlecell.preprocessing._neighbors._algorithms._cagra import _cagra_knn
-from rapids_singlecell.preprocessing._neighbors._algorithms._ivfflat import (
-    _ivf_flat_knn,
-)
-from rapids_singlecell.preprocessing._neighbors._algorithms._ivfpq import _ivf_pq_knn
-from rapids_singlecell.preprocessing._neighbors._algorithms._mg_ivfflat import (
-    _mg_ivf_flat_knn,
-)
-from rapids_singlecell.preprocessing._neighbors._algorithms._mg_ivfpq import (
-    _mg_ivf_pq_knn,
-)
-from rapids_singlecell.preprocessing._neighbors._algorithms._nn_descent import (
-    _nn_descent_knn,
-)
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
     _fix_self_distances,
-    _get_connectivities,
     _trimming,
+)
+from rapids_singlecell.preprocessing._neighbors._neighbors import (
+    KNN_ALGORITHMS,
+    AnyRandom,
+    _Algorithms,
+    _build_sparse_distances,
+    _calc_connectivities,
+    _Metrics,
 )
 from rapids_singlecell.tools._utils import _choose_representation
 
@@ -42,70 +27,9 @@ if TYPE_CHECKING:
 
     from anndata import AnnData
 
-AnyRandom = None | int | np.random.RandomState
-
 _Algorithms_bbknn = Literal[
     "brute", "cagra", "ivfflat", "ivfpq", "mg_ivfflat", "mg_ivfpq"
 ]
-_Algorithms = Literal[
-    "brute",
-    "cagra",
-    "ivfflat",
-    "ivfpq",
-    "nn_descent",
-    "all_neighbors",
-    "mg_ivfflat",
-    "mg_ivfpq",
-]
-_MetricsDense = Literal[
-    "l2",
-    "chebyshev",
-    "manhattan",
-    "taxicab",
-    "correlation",
-    "inner_product",
-    "euclidean",
-    "canberra",
-    "lp",
-    "minkowski",
-    "cosine",
-    "jensenshannon",
-    "linf",
-    "cityblock",
-    "l1",
-    "haversine",
-    "sqeuclidean",
-]
-_MetricsSparse = Literal[
-    "canberra",
-    "chebyshev",
-    "cityblock",
-    "cosine",
-    "euclidean",
-    "hellinger",
-    "inner_product",
-    "jaccard",
-    "l1",
-    "l2",
-    "linf",
-    "lp",
-    "manhattan",
-    "minkowski",
-    "taxicab",
-]
-_Metrics = _MetricsDense | _MetricsSparse
-
-
-KNN_ALGORITHMS = {
-    "brute": _brute_knn,
-    "cagra": _cagra_knn,
-    "ivfflat": _ivf_flat_knn,
-    "ivfpq": _ivf_pq_knn,
-    "nn_descent": _nn_descent_knn,
-    "all_neighbors": _all_neighbors_knn,
-    "mg_ivfflat": _mg_ivf_flat_knn,
-    "mg_ivfpq": _mg_ivf_pq_knn,
-}
 
 
 def neighbors(
@@ -119,13 +43,14 @@ def neighbors(
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
     algorithm_kwds: Mapping[str, Any] = MappingProxyType({}),
+    method: Literal["umap", "gauss", "jaccard"] = "umap",
     key_added: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
     """\
-    Compute a neighborhood graph of observations with cuml.
+    Compute a neighborhood graph of observations :cite:p:`Ootomo2024`.
 
-    The neighbor search efficiency of this heavily relies on cuml,
+    The neighbor search efficiency of this heavily relies on cuVS,
     which also provides a method for estimating connectivities of data points -
     the connectivity of the manifold.
 
@@ -180,6 +105,15 @@ def neighbors(
         A known metric's name or a callable that returns a distance.
     metric_kwds
         Options for the metric.
+    method
+        Method for computing connectivities.
+
+        ``'umap'``
+            UMAP fuzzy simplicial set (default).
+        ``'gauss'``
+            Adaptive Gaussian kernel.
+        ``'jaccard'``
+            PhenoGraph Jaccard index.
     algorithm_kwds
         Options for the algorithm.
         For `ivfflat` and `ivfpq` algorithms, the following parameters can be specified:
@@ -242,20 +176,19 @@ def neighbors(
     """
     adata = adata.copy() if copy else adata
 
+    if adata.is_view:
+        adata._init_as_actual(adata.copy())
+
     if algorithm not in get_args(_Algorithms):
         raise ValueError(
             f"Invalid algorithm '{algorithm}' for KNN. "
             f"Valid options are: {get_args(_Algorithms)}."
         )
 
-    if adata.is_view:
-        adata._init_as_actual(adata.copy())
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-
     X_contiguous = _check_neighbors_X(X, algorithm)
     _check_metrics(algorithm, metric)
 
-    n_obs = adata.shape[0]
     knn_indices, knn_dist = KNN_ALGORITHMS[algorithm](
         X_contiguous,
         X_contiguous,
@@ -265,39 +198,6 @@ def neighbors(
         algorithm_kwds=algorithm_kwds,
     )
     knn_dist = _fix_self_distances(knn_dist, metric)
-
-    n_nonzero = n_obs * n_neighbors
-    rowptr = cp.arange(0, n_nonzero + 1, n_neighbors)
-    if n_nonzero >= np.iinfo(np.int32).max:
-        distances = sc_sparse.csr_matrix(
-            (cp.ravel(knn_dist).get(), cp.ravel(knn_indices).get(), rowptr.get()),
-            shape=(n_obs, n_obs),
-        )
-    else:
-        distances = cp_sparse.csr_matrix(
-            (cp.ravel(knn_dist), cp.ravel(knn_indices), rowptr), shape=(n_obs, n_obs)
-        )
-        distances = distances.get()
-
-    connectivities = _get_connectivities(
-        n_neighbors=n_neighbors,
-        n_obs=n_obs,
-        random_state=random_state,
-        metric=metric,
-        knn_indices=knn_indices,
-        knn_dist=knn_dist,
-    )
-    if connectivities.nnz >= np.iinfo(np.int32).max:
-        connectivities = connectivities.get().tocsr()
-    else:
-        connectivities = connectivities.tocsr().get()
-    if key_added is None:
-        key_added = "neighbors"
-        conns_key = "connectivities"
-        dists_key = "distances"
-    else:
-        conns_key = key_added + "_connectivities"
-        dists_key = key_added + "_distances"
 
     params = dict(
         n_neighbors=n_neighbors,
@@ -309,13 +209,37 @@ def neighbors(
         **({"use_rep": use_rep} if use_rep is not None else {}),
         **({"n_pcs": n_pcs} if n_pcs is not None else {}),
     )
-    neighbors_dict = {
+
+    n_obs = adata.shape[0]
+    distances = _build_sparse_distances(knn_indices, knn_dist, n_obs=n_obs)
+    connectivities = _calc_connectivities(
+        knn_indices,
+        knn_dist,
+        n_obs=n_obs,
+        n_neighbors=n_neighbors,
+        random_state=random_state,
+        metric=metric,
+        method=method,
+    )
+    if connectivities.nnz >= np.iinfo(np.int32).max:
+        connectivities = connectivities.get().tocsr()
+    else:
+        connectivities = connectivities.tocsr().get()
+
+    # Store results
+    neighbors_key = key_added if key_added is not None else "neighbors"
+    if neighbors_key == "neighbors":
+        conns_key = "connectivities"
+        dists_key = "distances"
+    else:
+        conns_key = neighbors_key + "_connectivities"
+        dists_key = neighbors_key + "_distances"
+
+    adata.uns[neighbors_key] = {
         "connectivities_key": conns_key,
         "distances_key": dists_key,
         "params": params,
     }
-    adata.uns[key_added] = neighbors_dict
-
     adata.obsp[dists_key] = distances
     adata.obsp[conns_key] = connectivities
 
@@ -339,7 +263,7 @@ def bbknn(
     copy: bool = False,
 ) -> AnnData | None:
     """\
-    Batch balanced KNN, altering the KNN procedure to identify each cell's top neighbours in
+    Batch balanced KNN :cite:p:`Polanski2019`, altering the KNN procedure to identify each cell's top neighbours in
     each batch separately instead of the entire cell pool with no accounting for batch.
     The nearest neighbours for each batch are then merged to create a final list of
     neighbours for the cell.
@@ -483,42 +407,16 @@ def bbknn(
         knn_indices[:, col_range] = ind_to[sub_ind]
         knn_dist[:, col_range] = sub_dist
 
-    n_nonzero = n_obs * total_neighbors
-    rowptr = cp.arange(0, n_nonzero + 1, total_neighbors)
-    if rowptr.max() >= np.iinfo(np.int32).max:
-        distances = sc_sparse.csr_matrix(
-            (cp.ravel(knn_dist).get(), cp.ravel(knn_indices).get(), rowptr.get()),
-            shape=(n_obs, n_obs),
-        )
-    else:
-        distances = cp_sparse.csr_matrix(
-            (cp.ravel(knn_dist), cp.ravel(knn_indices), rowptr), shape=(n_obs, n_obs)
-        )
-        distances = distances.get()
+    # Sort each row so neighbors are ordered closest-first across all batches.
+    # fuzzy_simplicial_set uses the first non-zero distance per row as the
+    # local-connectivity rho; unsorted input collapses sigma and weights.
+    order = cp.argsort(knn_dist, axis=1)
+    row_idx = cp.arange(n_obs)[:, None]
+    knn_dist = knn_dist[row_idx, order]
+    knn_indices = knn_indices[row_idx, order]
 
-    connectivities = _get_connectivities(
-        total_neighbors,
-        n_obs=n_obs,
-        random_state=random_state,
-        metric=metric,
-        knn_indices=knn_indices,
-        knn_dist=knn_dist,
-    )
-
-    connectivities = connectivities.tocsr()
     if trim is None:
-        trim = 10 * neighbors_within_batch
-    if trim > 0:
-        connectivities = _trimming(connectivities, trim)
-
-    connectivities = connectivities.get()
-    if key_added is None:
-        key_added = "neighbors"
-        conns_key = "connectivities"
-        dists_key = "distances"
-    else:
-        conns_key = key_added + "_connectivities"
-        dists_key = key_added + "_distances"
+        trim = 10 * total_neighbors
 
     params = dict(
         n_neighbors=total_neighbors,
@@ -531,12 +429,38 @@ def bbknn(
         **({"use_rep": use_rep} if use_rep is not None else {}),
         **({"n_pcs": n_pcs} if n_pcs is not None else {}),
     )
-    neighbors_dict = {
+
+    distances = _build_sparse_distances(knn_indices, knn_dist, n_obs=n_obs)
+    connectivities = _calc_connectivities(
+        knn_indices,
+        knn_dist,
+        n_obs=n_obs,
+        n_neighbors=total_neighbors,
+        random_state=random_state,
+        metric=metric,
+    )
+    if connectivities.nnz >= np.iinfo(np.int32).max:
+        connectivities = connectivities.get().tocsr()
+    else:
+        connectivities = connectivities.tocsr()
+        if trim > 0:
+            connectivities = _trimming(connectivities, trim)
+        connectivities = connectivities.get()
+
+    # Store results
+    neighbors_key = key_added if key_added is not None else "neighbors"
+    if neighbors_key == "neighbors":
+        conns_key = "connectivities"
+        dists_key = "distances"
+    else:
+        conns_key = neighbors_key + "_connectivities"
+        dists_key = neighbors_key + "_distances"
+
+    adata.uns[neighbors_key] = {
         "connectivities_key": conns_key,
         "distances_key": dists_key,
         "params": params,
     }
-    adata.uns[key_added] = neighbors_dict
     adata.obsp[dists_key] = distances
     adata.obsp[conns_key] = connectivities
 

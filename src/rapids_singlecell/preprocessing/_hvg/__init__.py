@@ -48,7 +48,8 @@ def highly_variable_genes(
     batch_key: str | None = None,
 ) -> None:
     """\
-    Annotate highly variable genes.
+    Annotate highly variable genes :cite:p:`Satija2015,Zheng2017,Stuart2019,Lause2021,Andrews2019`.
+
     Expects logarithmized data, except when `flavor='seurat_v3','seurat_v3_paper','pearson_residuals','poisson_gene_selection'`, in which count data is expected.
 
     Reimplementation of scanpy's function.

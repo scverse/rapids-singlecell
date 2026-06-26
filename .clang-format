@@ -1,0 +1,22 @@
+BasedOnStyle: Google
+Language: Cpp
+
+# Make braces stay on the same line (like your diffs)
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: None
+
+# Compact/“binpack” parameter lists (what produced your earlier diffs)
+BinPackParameters: true
+BinPackArguments: true
+
+# Typical CUDA/C++ ergonomics
+IndentWidth: 4
+ColumnLimit: 80
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# Don’t reorder #includes if you don’t want surprise churn
+SortIncludes: false
+
+# Optional: make templates break more aggressively
+AlwaysBreakTemplateDeclarations: Yes

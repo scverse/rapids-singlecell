@@ -7,16 +7,16 @@ import cuml.internals.logger as logger
 import cupy as cp
 import numpy as np
 from cuml.manifold.umap import UMAP, find_ab_params, simplicial_set_embedding
-from cuml.thirdparty_adapters import check_array as check_array_cuml
 from cupyx.scipy import sparse
 from packaging.version import parse as parse_version
 from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
 from sklearn.utils import check_random_state
 
+from rapids_singlecell._compat import _random_state_kwargs
 from rapids_singlecell._utils import _get_logger_level
 
-from ._utils import _choose_representation
+from ._utils import _choose_representation, _validate_init_pos
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -42,7 +42,7 @@ def umap(
     copy: bool = False,
 ) -> AnnData | None:
     """\
-    Embed the neighborhood graph using UMAP's cuml implementation.
+    Embed the neighborhood graph using UMAP :cite:p:`McInnes2018` :cite:p:`Nolet2021`.
 
     UMAP (Uniform Manifold Approximation and Projection) is a manifold learning
     technique suitable for visualizing high-dimensional data. Besides tending to
@@ -205,7 +205,9 @@ def umap(
                 init_coords = adata.obsm[init_pos]
             case str() if init_pos == "paga":
                 init_coords = get_init_pos_from_paga(
-                    adata, random_state=random_state, neighbors_key=neighbors_key
+                    adata,
+                    **_random_state_kwargs(get_init_pos_from_paga, random_state),
+                    neighbors_key=neighbors_key,
                 )
             case str() if init_pos == "auto":
                 init_coords = "spectral" if n_obs < 1000000 else "random"
@@ -213,9 +215,12 @@ def umap(
                 init_coords = init_pos
 
         if hasattr(init_coords, "dtype"):
-            init_coords = check_array_cuml(
-                init_coords, dtype=np.float32, accept_sparse=False
-            )
+            init_coords = _validate_init_pos(init_coords)
+            if init_coords.shape[1] != n_components:
+                raise ValueError(
+                    f"Expected {n_components} columns but got "
+                    f"{init_coords.shape[1]} columns."
+                )
 
         random_state = check_random_state(random_state)
 

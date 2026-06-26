@@ -1,20 +1,14 @@
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import cupy as cp
-import numpy as np
 from cupyx.scipy import sparse
 
+from rapids_singlecell._cuda import _autocorr_cuda as _ac
 from rapids_singlecell._utils import parse_device_ids
 
 from ._utils import _check_precision_issues
-from .kernels._autocorr import (
-    get_gearys_C_num_dense_kernel,
-    get_gearys_C_num_sparse_kernel,
-    get_pre_den_sparse_kernel,
-)
 
 if TYPE_CHECKING:
     from cupyx.scipy.sparse import csr_matrix
@@ -31,24 +25,16 @@ def _gearys_C_cupy_dense(
 
     # Calculate the numerator for Geary's C
     num = cp.zeros(n_features, dtype=dtype)
-    num_kernel = get_gearys_C_num_dense_kernel(np.dtype(dtype))
-
-    block_size = 8
-    fg = int(math.ceil(n_features / block_size))
-    sg = int(math.ceil(n_samples / block_size))
-    grid_size = (fg, sg, 1)
-    num_kernel(
-        grid_size,
-        (block_size, block_size, 1),
-        (
-            data,
-            adj_matrix_cupy.indptr,
-            adj_matrix_cupy.indices,
-            adj_matrix_cupy.data,
-            num,
-            n_samples,
-            n_features,
-        ),
+    stream = cp.cuda.get_current_stream().ptr
+    _ac.gearys_dense(
+        data,
+        adj_row_ptr=adj_matrix_cupy.indptr,
+        adj_col_ind=adj_matrix_cupy.indices,
+        adj_data=adj_matrix_cupy.data,
+        num=num,
+        n_samples=n_samples,
+        n_features=n_features,
+        stream=stream,
     )
 
     # Calculate the denominator for Geary's C
@@ -87,7 +73,7 @@ def _run_permutations_dense(
     n_permutations: int,
     n_samples: int,
     n_features: int,
-    dtype: np.dtype,
+    dtype: cp.dtype,
     device_ids: list[int] | None = None,
 ) -> cp.ndarray:
     """Run permutation tests for Geary's C (dense data) with multi-GPU support."""
@@ -138,41 +124,32 @@ def _run_permutations_dense(
                 )
 
     # Phase 2: Dispatch each iteration to all GPUs in parallel
-    block_size = 8
-    fg = int(math.ceil(n_features / block_size))
-    sg = int(math.ceil(n_samples / block_size))
-    grid_size = (fg, sg, 1)
-
     for p in range(perms_per_device):
         for dd in device_data:
             device_id = dd["device_id"]
             with cp.cuda.Device(device_id):
                 streams[device_id].synchronize()
 
-                num_kernel = get_gearys_C_num_dense_kernel(np.dtype(dtype))
                 num_permuted = cp.zeros(n_features, dtype=dtype)
 
                 idx_shuffle = cp.random.permutation(dd["adj"].shape[0])
                 adj_matrix_permuted = dd["adj"][idx_shuffle, :]
-                num_kernel(
-                    grid_size,
-                    (block_size, block_size, 1),
-                    (
-                        dd["data"],
-                        adj_matrix_permuted.indptr,
-                        adj_matrix_permuted.indices,
-                        adj_matrix_permuted.data,
-                        num_permuted,
-                        n_samples,
-                        n_features,
-                    ),
+                _ac.gearys_dense(
+                    dd["data"],
+                    adj_row_ptr=adj_matrix_permuted.indptr,
+                    adj_col_ind=adj_matrix_permuted.indices,
+                    adj_data=adj_matrix_permuted.data,
+                    num=num_permuted,
+                    n_samples=n_samples,
+                    n_features=n_features,
+                    stream=cp.cuda.get_current_stream().ptr,
                 )
                 dd["perms"][p, :] = (n_samples - 1) * num_permuted / dd["den"]
 
         # Sync all devices after each iteration
         for dd in device_data:
             with cp.cuda.Device(dd["device_id"]):
-                cp.cuda.Stream.null.synchronize()
+                streams[dd["device_id"]].synchronize()
 
     # Phase 3: Gather results on first device and cut to exact size
     with cp.cuda.Device(device_ids[0]):
@@ -193,24 +170,18 @@ def _gearys_C_cupy_sparse(
 
     # Calculate the numerator for Geary's C
     num = cp.zeros(n_features, dtype=dtype)
-    num_kernel = get_gearys_C_num_sparse_kernel(np.dtype(dtype))
-
-    sg = n_samples
-    # Launch the kernel
-    num_kernel(
-        (sg,),
-        (1024,),
-        (
-            adj_matrix_cupy.indptr,
-            adj_matrix_cupy.indices,
-            adj_matrix_cupy.data,
-            data.indptr,
-            data.indices,
-            data.data,
-            n_samples,
-            n_features,
-            num,
-        ),
+    stream = cp.cuda.get_current_stream().ptr
+    _ac.gearys_sparse(
+        adj_matrix_cupy.indptr,
+        adj_matrix_cupy.indices,
+        adj_matrix_cupy.data,
+        data_row_ptr=data.indptr,
+        data_col_ind=data.indices,
+        data_values=data.data,
+        n_samples=n_samples,
+        n_features=n_features,
+        num=num,
+        stream=stream,
     )
 
     # Calculate the denominator for Geary's C
@@ -218,11 +189,14 @@ def _gearys_C_cupy_sparse(
     means = means.astype(dtype)
     den = cp.zeros(n_features, dtype=dtype)
     counter = cp.zeros(n_features, dtype=cp.int32)
-    block_den = math.ceil(data.nnz / 32)
-    pre_den_kernel = get_pre_den_sparse_kernel(np.dtype(dtype))
-
-    pre_den_kernel(
-        (block_den,), (32,), (data.indices, data.data, data.nnz, means, den, counter)
+    _ac.pre_den_sparse(
+        data.indices,
+        data.data,
+        nnz=data.nnz,
+        mean_array=means,
+        den=den,
+        counter=counter,
+        stream=stream,
     )
     counter = n_samples - counter
     den += counter * means**2
@@ -259,7 +233,7 @@ def _run_permutations_sparse(
     n_permutations: int,
     n_samples: int,
     n_features: int,
-    dtype: np.dtype,
+    dtype: cp.dtype,
     device_ids: list[int] | None = None,
 ) -> cp.ndarray:
     """Run permutation tests for Geary's C (sparse data) with multi-GPU support."""
@@ -317,40 +291,34 @@ def _run_permutations_sparse(
                 )
 
     # Phase 2: Dispatch each iteration to all GPUs in parallel
-    sg = n_samples
-
     for p in range(perms_per_device):
         for dd in device_data:
             device_id = dd["device_id"]
             with cp.cuda.Device(device_id):
                 streams[device_id].synchronize()
 
-                num_kernel = get_gearys_C_num_sparse_kernel(np.dtype(dtype))
                 num_permuted = cp.zeros(n_features, dtype=dtype)
 
                 idx_shuffle = cp.random.permutation(dd["adj"].shape[0])
                 adj_matrix_permuted = dd["adj"][idx_shuffle, :]
-                num_kernel(
-                    (sg,),
-                    (1024,),
-                    (
-                        adj_matrix_permuted.indptr,
-                        adj_matrix_permuted.indices,
-                        adj_matrix_permuted.data,
-                        dd["data"].indptr,
-                        dd["data"].indices,
-                        dd["data"].data,
-                        n_samples,
-                        n_features,
-                        num_permuted,
-                    ),
+                _ac.gearys_sparse(
+                    adj_matrix_permuted.indptr,
+                    adj_matrix_permuted.indices,
+                    adj_matrix_permuted.data,
+                    data_row_ptr=dd["data"].indptr,
+                    data_col_ind=dd["data"].indices,
+                    data_values=dd["data"].data,
+                    n_samples=n_samples,
+                    n_features=n_features,
+                    num=num_permuted,
+                    stream=cp.cuda.get_current_stream().ptr,
                 )
                 dd["perms"][p, :] = (n_samples - 1) * num_permuted / dd["den"]
 
         # Sync all devices after each iteration
         for dd in device_data:
             with cp.cuda.Device(dd["device_id"]):
-                cp.cuda.Stream.null.synchronize()
+                streams[dd["device_id"]].synchronize()
 
     # Phase 3: Gather results on first device and cut to exact size
     with cp.cuda.Device(device_ids[0]):

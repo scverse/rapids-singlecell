@@ -4,6 +4,8 @@ __pycache__/
 /*cache/
 .ipynb_checkpoints/
 /data/
+/benchmarks/
+test-data/
 .vscode/
 
 # Distribution / packaging
@@ -31,8 +33,10 @@ __pycache__/
 /_skbuild/
 /*.egg-info/
 
-# Compiled CUDA extension copied for editable installs
+# Compiled CUDA extensions and stubs copied for editable installs
 *.so
+*.pyi
+py.typed
 
 # Test/coverage caches
 /.pytest_cache/
@@ -43,7 +47,11 @@ coverage.xml
 .vscode/
 .cursor/
 .claude/
+.codex/
+.agents/
 CLAUDE.md
+AGENTS.md
 
 # tmp_scripts
 tmp_scripts/
+/benchmarks/

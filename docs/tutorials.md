@@ -6,17 +6,17 @@ orphan: true
 
 Sample notebooks for the rapids-singlecell package.
 
-To get the datasets for the notebooks, please use [this notebook](https://github.com/scverse/rapids_singlecell-notebooks/blob/main/00_DO_FIRST.ipynb>).
+To get the datasets for the notebooks, please use [this notebook](https://github.com/scverse/rapids_singlecell-notebooks/blob/main/00_DO_FIRST.ipynb).
 
 ```{toctree}
 :maxdepth: 1
 
-notebooks/01_demo_gpu
-notebooks/02_decoupler
-notebooks/03_demo_gpu-PR
-notebooks/04_spatial_autocorr
-notebooks/05_out-of-core
-notebooks/06-multi_gpu_show
-notebooks/demo_gpu-seuratv3-brain-1M
-notebooks/ligrec_benchmark
+notebooks/01_basic_workflow
+notebooks/02_pearson_residuals
+notebooks/03_decoupler
+notebooks/04_squidpy
+notebooks/05_pertpy
+notebooks/06_out-of-core
+notebooks/07_multi_gpu
+notebooks/brain_1M
 ```

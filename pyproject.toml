@@ -1,11 +1,18 @@
 [build-system]
-requires = [ "hatchling", "hatch-vcs" ]
-build-backend = "hatchling.build"
+requires = [
+    "scikit-build-core>=0.10",
+    "nanobind>=2.0.0",
+    "setuptools-scm>=8",
+    # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.
+    # 25.12+ provides the resource-ref API and flat RMM header path we use.
+    "librmm-cu12>=25.12",
+]
+build-backend = "scikit_build_core.build"
 
 [project]
-name = "rapids_singlecell"
+name = "rapids-singlecell"
 description = "running single cell analysis on Nvidia GPUs"
-requires-python = ">=3.12, <3.14"
+requires-python = ">=3.12, <3.15"
 license = { file = "LICENSE" }
 authors = [ { name = "Severin Dicks" } ]
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -28,8 +35,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-rapids13 = [ "cupy-cuda13x", "cudf-cu13>=25.10", "cuml-cu13>=25.10", "cugraph-cu13>=25.10", "cuvs-cu13>=25.10" ]
-rapids12 = [ "cupy-cuda12x", "cudf-cu12>=25.10", "cuml-cu12>=25.10", "cugraph-cu12>=25.10", "cuvs-cu12>=25.10" ]
+rapids-cu13 = [
+    "cupy-cuda13x",
+    "cudf-cu13>=25.12",
+    "cuml-cu13>=25.12",
+    "cugraph-cu13>=25.12",
+    "cuvs-cu13>=25.12",
+    "librmm-cu13>=25.12",
+]
+rapids-cu12 = [
+    "cupy-cuda12x",
+    "cudf-cu12>=25.12",
+    "cuml-cu12>=25.12",
+    "cugraph-cu12>=25.12",
+    "cuvs-cu12>=25.12",
+    "librmm-cu12>=25.12",
+]
 
 doc = [
     "sphinx>=4.5.0",
@@ -39,6 +60,7 @@ doc = [
     "sphinx-design",
     "sphinx-tabs",
     "sphinxext-opengraph",
+    "sphinxcontrib.bibtex",
     "scanpydoc[typehints,theme]>=0.9.4",
     "dask",
     "pytest",
@@ -47,6 +69,7 @@ test-minimal = [
     "pytest",
     "pytest-cov",
     "pytest-timeout",
+    "pytest-rerunfailures",
     "anyio",
     "pooch",
     "profimp",
@@ -117,23 +140,49 @@ addopts = [
 ]
 markers = [
     "gpu: tests that use a GPU (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
+    "array_api: array-API tests (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
 ]
 
-[tool.hatch.build]
-# exclude big files that don’t need to be installed
-exclude = [
-    "tests",
-    "docs",
-    "notebooks",
+[tool.setuptools_scm]
+write_to = "src/rapids_singlecell/_version.py"
+# Optional but useful:
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+
+[tool.scikit-build]
+# Use limited ABI wheels (one wheel for all Python minor versions on one platform)
+wheel.py-api = "cp312"
+wheel.packages = [ "src/rapids_singlecell", "src/testing" ]
+wheel.exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+ninja.version = ">=1.10"
+experimental = false
+# Default: use native arch for source builds (auto-detect user's GPU)
+# CI overrides via SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES env var
+cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
+build-dir = "build"
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+sdist.include = [ "src/rapids_singlecell/_version.py" ]
+
+# Use abi3audit to catch issues with Limited API wheels
+[tool.cibuildwheel.linux]
+# Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+# Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
+repair-wheel-command = [
+    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
+    "pipx run abi3audit --strict --report {wheel}",
 ]
-[tool.hatch.build.hooks.vcs]
-version-file = "src/rapids_singlecell/_version.py"
-
-[tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.build.targets.wheel]
-packages = [ 'src/rapids_singlecell', 'src/testing' ]
+[tool.cibuildwheel.macos]
+repair-wheel-command = [
+    "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}",
+    "pipx run abi3audit --strict --report {wheel}",
+]
+[tool.cibuildwheel.windows]
+repair-wheel-command = [
+    "copy {wheel} {dest_dir}",
+    "pipx run abi3audit --strict --report {wheel}",
+]
 
 [tool.codespell]
 skip = '*.ipynb,*.csv'

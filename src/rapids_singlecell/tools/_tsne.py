@@ -27,6 +27,8 @@ def tsne(
     copy: bool = False,
 ) -> AnnData | None:
     """
+    t-SNE :cite:p:`vanDerMaaten2008` :cite:p:`Chan2018`.
+
     Performs t-distributed stochastic neighborhood embedding (tSNE) using cuml library.
 
     Parameters

@@ -235,3 +235,51 @@ def test_co_occurrence_single_gpu_large_dataset():
     assert occ_prob.shape == (k, k, len(thresholds) - 1)
     # Verify results are finite
     assert cp.all(cp.isfinite(occ_prob))
+
+
+@pytest.mark.parametrize(
+    "n,k,expected_block_size",
+    [
+        # <2.5k cells/cat → 128 threads
+        (500, 5, 128),
+        # ~3k cells/cat → 256 threads
+        (15000, 5, 256),
+        # ~6k cells/cat → 512 threads
+        (30000, 5, 512),
+        # ~20k cells/cat → 1024 threads
+        (100000, 5, 1024),
+    ],
+)
+def test_co_occurrence_block_sizes(n, k, expected_block_size):
+    """Test kernel works correctly with different block sizes.
+
+    Block size is determined by cells per category:
+    - >=10k cells/cat -> 1024 threads
+    - >=5k cells/cat -> 512 threads
+    - >=2.5k cells/cat -> 256 threads
+    - <2.5k cells/cat -> 128 threads
+    """
+    np.random.seed(42)
+    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
+    thresholds = cp.asarray(np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32))
+    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
+
+    # Run fast kernel
+    occ_prob_fast = _co_occurrence_helper(
+        spatial, thresholds, label_idx, fast=True, device_ids=[0]
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    # Run slow (pairwise) kernel as reference
+    occ_prob_slow = _co_occurrence_helper(
+        spatial, thresholds, label_idx, fast=False, device_ids=[0]
+    )
+    cp.cuda.Stream.null.synchronize()
+
+    # Verify results match
+    cp.testing.assert_allclose(occ_prob_fast, occ_prob_slow, rtol=1e-5, atol=1e-5)
+
+    # Verify output shape
+    assert occ_prob_fast.shape == (k, k, len(thresholds) - 1)
+    # Verify results are finite
+    assert cp.all(cp.isfinite(occ_prob_fast))

@@ -16,5 +16,5 @@ build:
       - asdf global uv latest
     build:
       html:
-        - uvx hatch run docs:build
+        - CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" uvx --from "hatch==1.16.5" hatch run docs:build
         - mv docs/_build $READTHEDOCS_OUTPUT

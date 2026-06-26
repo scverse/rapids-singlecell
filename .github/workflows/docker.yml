@@ -1,10 +1,12 @@
-# This workflow will build two Docker image and push then to GitHub Packages Container registry:
-# - a base image with the dependencies
-# - a main image with the application code
+# Build/push two GHCR images: dependency base and application image.
+# Release events push; PR/comment runs only validate.
 
 name: Docker
 
 on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
   push:
     branches: [main]
     paths:
@@ -23,36 +25,95 @@ on:
     types: [published]
 
 jobs:
+  check:
+    name: Check trigger
+    runs-on: ubuntu-latest
+    # Skip issue_comment unless it's /test-docker on a PR
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/test-docker'))
+    outputs:
+      head-sha: ${{ steps.get-sha.outputs.sha }}
+    permissions:
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Check permissions
+        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
+        run: |
+          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
+          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "maintain" ]]; then
+            echo "::error::Only maintainers or admins can trigger this workflow. Your permission: $PERMISSION"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: React to comment
+        if: github.event_name == 'issue_comment'
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions -f content=rocket
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get PR head SHA
+        id: get-sha
+        if: github.event_name == 'issue_comment'
+        run: |
+          SHA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefOid -q .headRefOid)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build_docker_images:
+    needs: check
     strategy:
       matrix:
         RAPIDS_VER:
-          - "25.12"
-    name: Build Docker images
+          - "26.04"
+        CUDA_SUFFIX:
+          - { ver: "12.9.1", label: "cuda12", pkg: "cu12" }
+          - { ver: "13.1.0", label: "cuda13", pkg: "cu13" }
+    name: Build Docker images (${{ matrix.CUDA_SUFFIX.label }})
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       packages: write
       contents: read
       attestations: write
+      statuses: write
     steps:
       - name: Free disk space
         run: |
           echo "=== Disk space before cleanup ==="
           df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/node_modules /usr/share/miniconda
           sudo docker image prune --all --force
+          sudo apt-get clean
           echo "=== Disk space after cleanup ==="
           df -h /
         shell: bash
 
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
+
+      - name: Set pending status on PR
+        if: github.event_name == 'issue_comment'
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ needs.check.outputs.head-sha }} \
+            -f state=pending \
+            -f context="Docker Build (${{ matrix.CUDA_SUFFIX.label }})" \
+            -f description="Docker build running..." \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -60,60 +121,66 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker base image
         id: meta-base
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
-            ghcr.io/${{ github.repository }}-deps
+            ghcr.io/scverse/rapids-singlecell-deps-${{ matrix.CUDA_SUFFIX.pkg }}
 
       - name: create yaml file for conda environment
         run: |
-          grep -v -- '- rapids-singlecell' conda/rsc_rapids_${{ matrix.RAPIDS_VER }}.yml > docker/rsc_rapids.yml
+          grep -v -- '- rapids-singlecell' conda/rsc_rapids_${{ matrix.RAPIDS_VER }}_${{ matrix.CUDA_SUFFIX.label }}.yml > docker/rsc_rapids.yml
         shell: bash
 
       - name: Build and push Docker base images
         id: push-base
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ./docker/
           file: ./docker/Dockerfile.deps
           push: ${{ github.event_name == 'release' }}
           tags: ${{ steps.meta-base.outputs.tags }}
           labels: ${{ steps.meta-base.outputs.labels }}
+          build-args: |
+            CUDA_VER=${{ matrix.CUDA_SUFFIX.ver }}
+            GIT_ID=${{ github.event.pull_request.head.sha || github.sha }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-deps
 
       - name: Generate artifact attestation for base image
         if: github.event_name == 'release'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository }}-deps
+          subject-name: ghcr.io/scverse/rapids-singlecell-deps-${{ matrix.CUDA_SUFFIX.pkg }}
           subject-digest: ${{ steps.push-base.outputs.digest }}
           push-to-registry: true
 
       - name: Extract metadata (tags, labels) for main Docker image
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
-            ghcr.io/${{ github.repository }}
+            ghcr.io/scverse/rapids-singlecell-${{ matrix.CUDA_SUFFIX.pkg }}
 
       - name: Build and push main Docker images
         id: push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ./docker/
           file: ./docker/Dockerfile
           push: ${{ github.event_name == 'release' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CUDA_ARCHS=${{ matrix.CUDA_SUFFIX.label == 'cuda12' && '75-real;80-real;86-real;89-real;90' || '75-real;80-real;86-real;89-real;90-real;100-real;120' }}
+            GIT_ID=${{ github.event.pull_request.head.sha || github.sha }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}
           build-contexts: |
             rapids-singlecell-deps=docker-image://${{ fromJSON(steps.meta-base.outputs.json).tags[0] }}
 
       - name: Generate artifact attestation for main image
         if: github.event_name == 'release'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository }}
+          subject-name: ghcr.io/scverse/rapids-singlecell-${{ matrix.CUDA_SUFFIX.pkg }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
@@ -121,3 +188,25 @@ jobs:
         run: |
           docker image ls -a
         shell: bash
+
+      - name: Set success status on PR
+        if: success() && github.event_name == 'issue_comment'
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ needs.check.outputs.head-sha }} \
+            -f state=success \
+            -f context="Docker Build (${{ matrix.CUDA_SUFFIX.label }})" \
+            -f description="Docker build passed" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set failure status on PR
+        if: failure() && github.event_name == 'issue_comment'
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ needs.check.outputs.head-sha }} \
+            -f state=failure \
+            -f context="Docker Build (${{ matrix.CUDA_SUFFIX.label }})" \
+            -f description="Docker build failed" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

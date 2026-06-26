@@ -10,6 +10,7 @@ from cuml.neighbors import NearestNeighbors
 from cupyx.scipy import sparse
 from scanpy.preprocessing._utils import sample_comb
 
+from rapids_singlecell._compat import _random_state_kwargs
 from rapids_singlecell.preprocessing._utils import get_random_state
 
 from .sparse_utils import subsample_counts
@@ -219,7 +220,11 @@ class Scrublet:
         n_obs = self._counts_obs.shape[0]
         n_sim = int(n_obs * sim_doublet_ratio)
 
-        pair_ix = sample_comb((n_obs, n_obs), n_sim, random_state=self._random_state)
+        pair_ix = sample_comb(
+            (n_obs, n_obs),
+            n_sim,
+            **_random_state_kwargs(sample_comb, self._random_state),
+        )
 
         E1 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 0], :])
         E2 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 1], :])

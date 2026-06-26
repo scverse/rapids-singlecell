@@ -63,12 +63,12 @@ def anndata_to_GPU(
 
     if convert_all:
         anndata_to_GPU(adata)
-        if adata.layers:
-            for key in adata.layers.keys():
+        if adata.layers is not None:
+            for key in adata.layers:
                 anndata_to_GPU(adata, layer=key)
     else:
         X = _get_obs_rep(adata, layer=layer)
-        error = layer if layer else "X"
+        error = layer if layer is not None else "X"
         X = X_to_GPU(X, warning=error)
         _set_obs_rep(adata, X, layer=layer)
 
@@ -150,8 +150,8 @@ def anndata_to_CPU(
 
     if convert_all:
         anndata_to_CPU(adata)
-        if adata.layers:
-            for key in adata.layers.keys():
+        if adata.layers is not None:
+            for key in adata.layers:
                 anndata_to_CPU(adata, layer=key)
     else:
         X = _get_obs_rep(adata, layer=layer)

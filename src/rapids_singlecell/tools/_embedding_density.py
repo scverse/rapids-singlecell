@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -20,7 +19,6 @@ def embedding_density(
     *,
     groupby: str | None = None,
     key_added: str | None = None,
-    batchsize: int = 10000,
     components: str | Sequence[str] = None,
 ) -> None:
     """\
@@ -34,10 +32,6 @@ def embedding_density(
     the same category.
     This function was written by Sophie Tritschler and implemented into
     Scanpy by Malte Luecken.
-    This function uses cuML's KernelDensity. It returns log Likelihood as does
-    sklearn's implementation. scipy.stats implementation, used
-    in scanpy, returns PDF.
-
     Parameters
     ----------
         adata
@@ -51,8 +45,6 @@ def embedding_density(
         key_added
             Name of the `.obs` covariate that will be added with the density
             estimates.
-        batchsize
-            Number of cells that should be processed together.
         components
             The embedding dimensions over which the density should be calculated.
             This is limited to two components.
@@ -76,7 +68,7 @@ def embedding_density(
     if basis == "fa":
         basis = "draw_graph_fa"
 
-    if f"X_{basis}" not in adata.obsm_keys():
+    if f"X_{basis}" not in adata.obsm:
         raise ValueError(
             "Cannot find the embedded representation "
             f"`adata.obsm['X_{basis}']`. Compute the embedding first."
@@ -95,9 +87,6 @@ def embedding_density(
         components += 1
 
     if groupby is not None:
-        if groupby not in adata.obs:
-            raise ValueError(f"Could not find {groupby!r} `.obs` column.")
-
         if adata.obs[groupby].dtype.name != "category":
             raise ValueError(f"{groupby!r} column does not contain categorical data")
 
@@ -120,16 +109,16 @@ def embedding_density(
             embed_x = adata.obsm[f"X_{basis}"][cat_mask, components[0]]
             embed_y = adata.obsm[f"X_{basis}"][cat_mask, components[1]]
 
-            dens_embed = _calc_density(cp.array(embed_x), cp.array(embed_y), batchsize)
+            dens_embed = _calc_density(cp.array(embed_x), cp.array(embed_y))
             density_values[cat_mask] = dens_embed
 
         adata.obs[density_covariate] = density_values
     else:  # if groupby is None
         # Calculate the density over the whole embedding without subsetting
-        embed_x = adata.obsm[f"X_{basis}"][:, components[0]]
-        embed_y = adata.obsm[f"X_{basis}"][:, components[1]]
+        embed_x = cp.asarray(adata.obsm[f"X_{basis}"][:, components[0]])
+        embed_y = cp.asarray(adata.obsm[f"X_{basis}"][:, components[1]])
 
-        adata.obs[density_covariate] = _calc_density(embed_x, embed_y, batchsize)
+        adata.obs[density_covariate] = _calc_density(embed_x, embed_y)
 
     # Reduce diffmap components for labeling
     # Note: plot_scatter takes care of correcting diffmap components
@@ -143,26 +132,47 @@ def embedding_density(
     }
 
 
-def _calc_density(x: cp.ndarray, y: cp.ndarray, batchsize: int):
+def _calc_density(x: cp.ndarray, y: cp.ndarray) -> np.ndarray:
     """\
-    Calculates the density of points in 2 dimensions.
+    Calculates the density of points in 2 dimensions using a Gaussian KDE kernel.
+
+    Uses a covariance-aware bandwidth (Scott's rule) matching
+    :class:`scipy.stats.gaussian_kde`, and min-max scales the PDF.
+    Each GPU thread computes the log-density for one query point via an
+    in-thread streaming logsumexp over all training points.  No intermediate
+    distance matrix is ever materialised.
     """
-    from cuml.neighbors import KernelDensity
+    from rapids_singlecell._cuda import _kde_cuda
 
-    # Calculate the point density
-    xy = np.vstack([x, y]).T
-    bandwidth = np.power(xy.shape[0], (-1.0 / (xy.shape[1] + 4)))
-    kde = KernelDensity(kernel="gaussian", bandwidth=bandwidth).fit(xy)
-    z = cp.zeros(xy.shape[0])
-    n_batches = math.ceil(xy.shape[0] / batchsize)
-    for batch in range(n_batches):
-        start_idx = batch * batchsize
-        stop_idx = min(batch * batchsize + batchsize, xy.shape[0])
-        z[start_idx:stop_idx] = cp.array(kde.score_samples(xy[start_idx:stop_idx, :]))
-    min_z = cp.min(z)
-    max_z = cp.max(z)
+    xy = cp.stack([x, y], axis=1)  # (n, 2), C-contiguous
+    n = xy.shape[0]
+    dtype = xy.dtype
 
-    # Scale between 0 and 1
-    scaled_z = (z - min_z) / (max_z - min_z)
+    # Covariance-aware bandwidth matching scipy.stats.gaussian_kde
+    scotts_factor = n ** (-1.0 / 6.0)
+    data_cov = cp.cov(xy.T)  # (2, 2)
+    inv_cov = cp.linalg.inv(scotts_factor**2 * data_cov)
 
-    return scaled_z.get()
+    # Pre-multiply so the kernel just computes a·dx² + b·dx·dy + c·dy²
+    a = -0.5 * float(inv_cov[0, 0])
+    b = -float(inv_cov[0, 1])
+    c = -0.5 * float(inv_cov[1, 1])
+
+    z = cp.empty(n, dtype=dtype)
+
+    _kde_cuda.gaussian_kde_2d(
+        xy,
+        out=z,
+        n=n,
+        a=a,
+        b=b,
+        c=c,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+
+    # Min-max scale PDF (not log-PDF) to match scipy/scanpy
+    pdf = cp.exp(z)
+    min_pdf = pdf.min()
+    scaled = (pdf - min_pdf) / (pdf.max() - min_pdf)
+
+    return scaled.get()

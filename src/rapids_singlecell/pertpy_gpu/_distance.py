@@ -19,6 +19,31 @@ class MeanVar(NamedTuple):
     variance: float
 
 
+Metric = Literal[
+    "edistance",
+    "euclidean",
+    "root_mean_squared_error",
+    "mse",
+    "mean_absolute_error",
+    "pearson_distance",
+    "cosine_distance",
+    "r2_distance",
+    "wasserstein",
+]
+
+SUPPORTED_METRICS = [
+    "edistance",
+    "euclidean",
+    "root_mean_squared_error",
+    "mse",
+    "mean_absolute_error",
+    "pearson_distance",
+    "cosine_distance",
+    "r2_distance",
+    "wasserstein",
+]
+
+
 class Distance:
     """
     GPU-accelerated distance computation between groups of cells.
@@ -31,24 +56,48 @@ class Distance:
         Twice the mean pairwise distance between cells of two groups minus
         the mean pairwise distance between cells within each group. See
         `Peidli et al. (2023) <https://doi.org/10.1101/2022.08.20.504663>`__.
+        Accepts dense embeddings (e.g. ``obsm_key="X_pca"``) or sparse CSR
+        expression data (a sparse layer or ``layer_key="X"``), which is
+        densified inside the kernel rather than on the host.
+    - ``"euclidean"`` and ``"root_mean_squared_error"``: Euclidean distance
+        between group mean vectors.
+    - ``"mse"``: Mean squared distance between group mean vectors.
+    - ``"mean_absolute_error"``: Mean absolute distance between group mean
+        vectors.
+    - ``"pearson_distance"``: Pearson distance between group mean vectors.
+    - ``"cosine_distance"``: Cosine distance between group mean vectors.
+    - ``"r2_distance"``: One minus the coefficient of determination between
+        group mean vectors.
+    - ``"wasserstein"``: Entropy-regularized 2-Wasserstein via Sinkhorn.
+        Squared-Euclidean ground cost; per-pair auto-epsilon defaulting to
+        ``0.05 * std(C)`` to match OTT-JAX. Returns OTT's
+        ``reg_ot_cost`` value.
 
     Parameters
     ----------
     metric
-        Distance metric to use. Currently only ``"edistance"`` is supported.
+        Distance metric to use.
     layer_key
-        Key in adata.layers for cell data. Mutually exclusive with ``obsm_key``.
+        Key in adata.layers for cell data, or ``"X"`` to use ``adata.X``.
+        Mutually exclusive with ``obsm_key``.
     obsm_key
         Key in adata.obsm for embeddings. Mutually exclusive with ``layer_key``.
         Defaults to ``"X_pca"`` if neither is specified.
 
     Notes
     -----
-    The bootstrap implementation differs from pertpy: rather than precomputing
-    an n×n cell distance matrix and sampling from it, this implementation
-    resamples cells and recomputes distances from scratch each iteration.
-    This scales better for large datasets (O(n) vs O(n²) memory) and leverages
-    multi-GPU parallelism for each bootstrap iteration.
+    The ``edistance`` bootstrap implementation differs from pertpy: rather
+    than precomputing an n×n cell distance matrix and sampling from it, this
+    implementation resamples cells and recomputes distances from scratch each
+    iteration. This scales better for large datasets (O(n) vs O(n²) memory)
+    and leverages multi-GPU parallelism for each bootstrap iteration.
+
+    ``"edistance"`` and ``"wasserstein"`` use multi-GPU (pairs are split across
+    devices). Pseudobulk metrics aggregate cells into K group-mean vectors
+    before computing distances, and the resulting K×K kernel is cheap enough on
+    a single GPU that distributing it is not worth the cost. Passing
+    ``multi_gpu=True`` for those metrics falls back to a single device with a
+    warning.
 
     Examples
     --------
@@ -62,11 +111,18 @@ class Distance:
 
     def __init__(
         self,
-        metric: Literal["edistance"] = "edistance",
+        metric: Metric = "edistance",
         layer_key: str | None = None,
         obsm_key: str | None = None,
+        **kwargs,
     ):
-        """Initialize Distance calculator with specified metric."""
+        """Initialize Distance calculator with specified metric.
+
+        Extra keyword arguments are forwarded to the selected metric's
+        constructor, exposing metric-specific options (e.g. ``relaxation`` for
+        ``metric="wasserstein"``). Passing an option the chosen metric does not
+        accept raises ``TypeError``.
+        """
         if layer_key is not None and obsm_key is not None:
             raise ValueError(
                 "Cannot use 'layer_key' and 'obsm_key' at the same time.\n"
@@ -78,6 +134,7 @@ class Distance:
         self.metric = metric
         self.layer_key = layer_key
         self.obsm_key = obsm_key
+        self._metric_kwargs = kwargs
         self._metric_impl = None
         self._initialize_metric()
 
@@ -91,10 +148,32 @@ class Distance:
             self._metric_impl = EDistanceMetric(
                 layer_key=self.layer_key,
                 obsm_key=self.obsm_key,
+                **self._metric_kwargs,
+            )
+        elif self.metric == "wasserstein":
+            from rapids_singlecell.pertpy_gpu._metrics._wasserstein import (
+                WassersteinMetric,
+            )
+
+            self._metric_impl = WassersteinMetric(
+                layer_key=self.layer_key,
+                obsm_key=self.obsm_key,
+                **self._metric_kwargs,
+            )
+        elif self.metric in SUPPORTED_METRICS:
+            from rapids_singlecell.pertpy_gpu._metrics._pseudobulk import (
+                PSEUDOBULK_METRICS,
+            )
+
+            self._metric_impl = PSEUDOBULK_METRICS[self.metric](
+                metric_name=self.metric,
+                layer_key=self.layer_key,
+                obsm_key=self.obsm_key,
+                **self._metric_kwargs,
             )
         else:
             raise ValueError(
-                f"Unknown metric: {self.metric}. Supported metrics: ['edistance']"
+                f"Unknown metric: {self.metric}. Supported metrics: {SUPPORTED_METRICS}"
             )
 
     def _check_multi_gpu_support(
@@ -232,14 +311,19 @@ class Distance:
         self,
         adata: AnnData,
         groupby: str,
-        selected_group: str,
+        selected_group: Sequence[str] | str,
         *,
         groups: Sequence[str] | None = None,
         bootstrap: bool = False,
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> pd.Series | tuple[pd.Series, pd.Series]:
+    ) -> (
+        pd.Series
+        | pd.DataFrame
+        | tuple[pd.Series, pd.Series]
+        | tuple[pd.DataFrame, pd.DataFrame]
+    ):
         """
         Compute distances from one selected group to all other groups.
 
@@ -346,8 +430,295 @@ class Distance:
         )
         return MeanVar(mean=mean, variance=variance)
 
+    @staticmethod
+    def create_contrasts(
+        adata: AnnData,
+        groupby: str,
+        selected_group: str | Sequence[str],
+        *,
+        groups: Sequence[str] | None = None,
+        split_by: str | Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """
+        Build a contrasts DataFrame for use with :meth:`contrast_distances`.
+
+        Each row represents one contrast: comparing a group against the
+        reference, optionally within each level of ``split_by`` columns.
+        The resulting DataFrame can be filtered or modified before passing
+        to :meth:`contrast_distances`.
+
+        The output layout is:
+
+        - **First column** (``groupby``): the target values to compare
+        - **``reference`` column**: the control value in the groupby column
+        - **Remaining columns** (``split_by``): stratification filters
+
+        Parameters
+        ----------
+        adata
+            Annotated data matrix
+        groupby
+            Column in ``adata.obs`` whose levels are compared against
+            ``selected_group``
+        selected_group
+            The reference (control) value(s) in the ``groupby`` column.
+            When a sequence is passed, each target is compared against
+            every reference, producing one row per (target, reference)
+            combination.
+        groups
+            Specific groups to include. If None, all non-reference groups
+            are included.
+        split_by
+            Column(s) in ``adata.obs`` to stratify by. If provided,
+            contrasts are computed within each unique combination of
+            these columns. Only combinations where the reference group
+            exists are included.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per contrast. First column is ``groupby``, then
+            ``reference``, then any ``split_by`` columns.
+
+        Examples
+        --------
+        >>> # All targets vs control, ignoring celltype
+        >>> contrasts = Distance.create_contrasts(
+        ...     adata, groupby="target_gene", selected_group="Non_target"
+        ... )
+
+        >>> # Multiple references
+        >>> contrasts = Distance.create_contrasts(
+        ...     adata, groupby="target_gene",
+        ...     selected_group=["Non_target", "Scramble"],
+        ... )
+
+        >>> # Stratified by celltype
+        >>> contrasts = Distance.create_contrasts(
+        ...     adata, groupby="target_gene", selected_group="Non_target",
+        ...     split_by="group_name",
+        ... )
+
+        >>> # Filter before computing
+        >>> contrasts = contrasts[contrasts["group_name"] != "rare_type"]
+        >>> result = distance.contrast_distances(adata, contrasts=contrasts)
+
+        >>> # Manual construction (no helper needed)
+        >>> import pandas as pd
+        >>> contrasts = pd.DataFrame({
+        ...     "target_gene": ["Irf7", "Ski"],
+        ...     "reference": ["Non_target", "Non_target"],
+        ...     "group_name": ["CD4", "CD4"],
+        ... })
+        """
+        import pandas as pd
+
+        # Normalize to list
+        if isinstance(selected_group, str):
+            selected_groups = [selected_group]
+        else:
+            selected_groups = list(selected_group)
+
+        obs_values = set(adata.obs[groupby].values)
+        for sg in selected_groups:
+            if sg not in obs_values:
+                raise ValueError(f"Reference '{sg}' not found in column '{groupby}'")
+
+        if split_by is None:
+            split_cols: list[str] = []
+        elif isinstance(split_by, str):
+            split_cols = [split_by]
+        else:
+            split_cols = list(split_by)
+
+        allowed_groups = set(groups) if groups is not None else None
+        selected_set = set(selected_groups)
+        all_cols = [groupby, *split_cols]
+
+        parts: list[pd.DataFrame] = []
+        for sg in selected_groups:
+            if split_cols:
+                existing = adata.obs[all_cols].drop_duplicates().reset_index(drop=True)
+
+                ref_rows = existing[existing[groupby] == sg]
+                if len(ref_rows) == 0:
+                    continue
+                ref_splits = ref_rows[split_cols]
+                targets = existing[~existing[groupby].isin(selected_set)]
+                if allowed_groups is not None:
+                    targets = targets[targets[groupby].isin(allowed_groups)]
+                matched = targets.merge(ref_splits, on=split_cols, how="inner")
+                if len(matched) == 0:
+                    continue
+                matched = matched[all_cols].copy()
+            else:
+                target_vals = [
+                    t
+                    for t in adata.obs[groupby].unique()
+                    if t not in selected_set
+                    and (allowed_groups is None or t in allowed_groups)
+                ]
+                if not target_vals:
+                    continue
+                matched = pd.DataFrame({groupby: target_vals})
+
+            matched.insert(1, "reference", sg)
+            parts.append(matched)
+
+        if not parts:
+            cols = [groupby, "reference", *split_cols]
+            return pd.DataFrame(columns=cols)
+
+        df = pd.concat(parts, ignore_index=True)
+        sort_cols = ["reference", *split_cols, groupby]
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+        return df
+
+    @staticmethod
+    def validate_contrasts(
+        adata: AnnData,
+        contrasts: pd.DataFrame,
+    ) -> None:
+        """
+        Validate a contrasts DataFrame against an AnnData object.
+
+        Expects the DataFrame layout produced by :meth:`create_contrasts`:
+        first column is the groupby column, ``reference`` column contains
+        the control value, remaining columns are split-by filters.
+
+        Parameters
+        ----------
+        adata
+            Annotated data matrix
+        contrasts
+            DataFrame to validate
+
+        Raises
+        ------
+        ValueError
+            If validation fails.
+        """
+        if "reference" not in contrasts.columns:
+            raise ValueError(
+                "Contrasts DataFrame must have a 'reference' column. "
+                "Use Distance.create_contrasts() or add it manually."
+            )
+
+        groupby = contrasts.columns[0]
+        if groupby == "reference":
+            raise ValueError(
+                "First column cannot be 'reference'. The first column "
+                "must be the groupby column."
+            )
+
+        split_by = [c for c in contrasts.columns if c not in (groupby, "reference")]
+
+        # Check columns exist in adata.obs
+        for col in [groupby, *split_by]:
+            if col not in adata.obs.columns:
+                raise ValueError(
+                    f"Column '{col}' not found in adata.obs. "
+                    f"Available columns: {list(adata.obs.columns)}"
+                )
+
+        # Check reference values exist in adata
+        obs_groupby_values = set(adata.obs[groupby].unique())
+        ref_values = set(contrasts["reference"].unique())
+        missing_refs = ref_values - obs_groupby_values
+        if missing_refs:
+            raise ValueError(
+                f"Reference values not found in adata.obs['{groupby}']: {missing_refs}"
+            )
+
+        # Check target values exist in adata
+        target_values = set(contrasts[groupby].unique())
+        missing_targets = target_values - obs_groupby_values
+        if missing_targets:
+            raise ValueError(
+                f"Groups not found in adata.obs['{groupby}']: {missing_targets}"
+            )
+
+        # Check split_by values exist in adata
+        for col in split_by:
+            obs_vals = set(adata.obs[col].unique())
+            contrast_vals = set(contrasts[col].unique())
+            missing_split = contrast_vals - obs_vals
+            if missing_split:
+                raise ValueError(
+                    f"Values not found in adata.obs['{col}']: {missing_split}"
+                )
+
+    def contrast_distances(
+        self,
+        adata: AnnData,
+        contrasts: pd.DataFrame,
+        *,
+        multi_gpu: bool | list[int] | str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Compute distances for contrasts.
+
+        Accepts a DataFrame (from :meth:`create_contrasts` or constructed
+        manually) with the following layout:
+
+        - **First column**: the groupby column (target values to compare)
+        - **``reference`` column**: the control value in the groupby column
+        - **Other columns**: split-by filters (e.g., cell type)
+
+        Parameters
+        ----------
+        adata
+            Annotated data matrix
+        contrasts
+            DataFrame with a groupby column, a ``reference`` column,
+            and optional split columns.
+        multi_gpu
+            GPU selection:
+            - None: Use all GPUs if metric supports it, else GPU 0 (default)
+            - True: Use all available GPUs
+            - False: Use only GPU 0
+            - list[int]: Use specific GPU IDs (e.g., [0, 2])
+            - str: Comma-separated GPU IDs (e.g., "0,2")
+
+        Returns
+        -------
+        pd.DataFrame
+            Copy of the input DataFrame with an added distance column.
+
+        Examples
+        --------
+        >>> distance = Distance(metric='edistance')
+
+        >>> # Using create_contrasts helper
+        >>> contrasts = Distance.create_contrasts(
+        ...     adata, groupby="target_gene", selected_group="Non_target",
+        ...     split_by="group_name",
+        ... )
+        >>> result = distance.contrast_distances(adata, contrasts=contrasts)
+
+        >>> # Manual DataFrame construction
+        >>> import pandas as pd
+        >>> contrasts = pd.DataFrame({
+        ...     "target_gene": ["Irf7", "Ski"],
+        ...     "reference": ["Non_target", "Non_target"],
+        ...     "group_name": ["CD4", "CD4"],
+        ... })
+        >>> result = distance.contrast_distances(adata, contrasts)
+        """
+        if not hasattr(self._metric_impl, "contrast_distances"):
+            raise NotImplementedError(
+                f"Metric '{self.metric}' does not support contrast_distances"
+            )
+        multi_gpu = self._check_multi_gpu_support(multi_gpu=multi_gpu)
+        return self._metric_impl.contrast_distances(
+            adata=adata,
+            contrasts=contrasts,
+            multi_gpu=multi_gpu,
+        )
+
     def __repr__(self) -> str:
         """String representation of Distance object."""
-        if self.layer_key:
+        if self.layer_key is not None:
             return f"Distance(metric='{self.metric}', layer_key='{self.layer_key}')"
         return f"Distance(metric='{self.metric}', obsm_key='{self.obsm_key}')"

@@ -7,26 +7,25 @@ import cupy as cp
 import numpy as np
 from cuml import KMeans as CumlKMeans
 
+from rapids_singlecell._cuda import _harmony_clustering_cuda as _hc_cl
+from rapids_singlecell._cuda import _harmony_correction_batched_cuda as _hc_corr_b
+from rapids_singlecell._cuda import _harmony_correction_cuda as _hc_corr
 from rapids_singlecell._utils import _create_category_index_mapping
 
 from ._fuses import (
     _calc_R,
-    _entropy_kernel,
-    _get_factor,
-    _get_pen,
-    _log_div_OE,
 )
 from ._helper import (
     _choose_colsum_algo_benchmark,
     _choose_colsum_algo_heuristic,
+    _column_sum,
+    _column_sum_atomic,
+    _gemm_colsum,
     _get_aggregated_matrix,
     _get_batch_codes,
     _get_theta_array,
-    _kmeans_error,
     _normalize_cp,
-    _one_hot_tensor_cp,
     _outer_cp,
-    _penalty_term,
     _scatter_add_cp,
     _scatter_add_cp_bias_csr,
     _Z_correction,
@@ -35,7 +34,8 @@ from ._helper import (
 if TYPE_CHECKING:
     import pandas as pd
 
-COLSUM_ALGO = Literal["columns", "atomics", "gemm", "cupy", "benchmark"]
+COLSUM_ALGO = Literal["columns", "atomics", "gemm", "benchmark"]
+_SUPPRESS_PENALTY = 1e30
 
 
 def harmonize(
@@ -53,10 +53,13 @@ def harmonize(
     block_proportion: float = 0.05,
     theta: float | int | list[float] | np.ndarray | cp.ndarray = 2.0,
     tau: int = 0,
-    correction_method: str = "fast",
-    use_gemm: bool = False,
+    correction_method: str | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     random_state: int = 0,
+    stabilized_penalty: bool = True,
+    dynamic_lambda: bool = True,
+    alpha: float = 0.2,
+    batch_prune_threshold: float | None = 1e-5,
     verbose: bool = False,
 ) -> cp.array:
     """
@@ -104,16 +107,29 @@ def harmonize(
         Discounting factor on ``theta``. By default, there is no discounting.
 
     correction_method
-        Choose which method for the correction step: ``original`` for original method, ``fast`` for improved method. By default, use improved method.
-
-    use_gemm
-        If True, use a One-Hot-Encoding Matrix and GEMM to compute Harmony. If False use a label vector. A label vector is more memory efficient and faster for large datasets with a large number of batches.
+        Choose which method for the correction step: ``original`` for original method, ``fast`` for improved method, ``batched`` for batched processing of all clusters simultaneously (fastest but needs more memory). If ``None`` (default), automatically selects ``batched`` unless the workspace would exceed 1 GB, in which case ``fast`` is used.
 
     colsum_algo
         Choose which algorithm to use for column sum. If `None`, choose the algorithm based on the number of rows and columns. If `'benchmark'`, benchmark all algorithms and choose the best one.
 
     random_state
         Random seed for reproducing results.
+
+    stabilized_penalty
+        If ``True`` (default), use the Harmony2 stabilized diversity penalty
+        that prevents overintegration when batches are absent from clusters.
+
+    dynamic_lambda
+        If ``True`` (default), use per-cluster-per-batch ridge regularization
+        ``lambda_kb = alpha * E_kb`` instead of a fixed ``ridge_lambda``.
+
+    alpha
+        Scaling factor for dynamic lambda. Only used when ``dynamic_lambda=True``.
+
+    batch_prune_threshold
+        Prune batches from clusters when ``O_kb / N_b < threshold``.
+        Pruned batches receive zero correction for that cluster.
+        Only used when ``dynamic_lambda=True``. Set to ``None`` to disable pruning.
 
     verbose
         Whether to print benchmarking results for the column sum algorithm and the number of iterations until convergence.
@@ -122,6 +138,7 @@ def harmonize(
     -------
     The integrated embedding by Harmony, of the same shape as the input embedding.
     """
+
     Z_norm = _normalize_cp(Z)
     n_cells = Z.shape[0]
 
@@ -131,23 +148,18 @@ def harmonize(
     N_b = cp.array(batch_codes.value_counts(sort=False).values, dtype=Z.dtype)
     Pr_b = (N_b.reshape(-1, 1) / len(batch_codes)).astype(Z.dtype)
 
-    # Configure matrix representation based on use_gemm flag
-    if use_gemm:
-        Phi = _one_hot_tensor_cp(batch_codes).astype(Z.dtype)
-        cats = None
-        cat_offsets = None
-        cell_indices = None
-    else:
-        Phi = None
-        cats = cp.array(batch_codes.cat.codes.values, dtype=cp.int32)
-        cat_offsets, cell_indices = _create_category_index_mapping(cats, n_batches)
+    cats = cp.array(batch_codes.cat.codes.values, dtype=cp.int32)
+    cat_offsets, cell_indices = _create_category_index_mapping(cats, n_batches)
 
     # Set up parameters
+    if max_iter_harmony < 1:
+        raise ValueError("max_iter_harmony must be >= 1")
     if n_clusters is None:
         n_clusters = int(min(100, n_cells / 30))
+        n_clusters = max(n_clusters, 2)
 
     # TODO: Allow for multiple colsum algorithms in a list
-    assert colsum_algo in ["columns", "atomics", "gemm", "cupy", "benchmark", None]
+    assert colsum_algo in ["columns", "atomics", "gemm", "benchmark", None]
     colsum_func_big = _choose_colsum_algo_heuristic(n_cells, n_clusters, None)
     if colsum_algo == "benchmark":
         colsum_func_small = _choose_colsum_algo_benchmark(
@@ -160,12 +172,32 @@ def harmonize(
     theta_array = _get_theta_array(theta, n_batches, Z.dtype)
     if tau > 0:
         theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
-    theta_array = theta_array.reshape(1, -1)
+    theta_array = cp.ascontiguousarray(theta_array.ravel())
 
     # Validate parameters
     assert block_proportion > 0 and block_proportion <= 1
-    if correction_method not in {"fast", "original"}:
-        raise ValueError("correction_method must be either 'fast' or 'original'.")
+    if dynamic_lambda:
+        if not np.isfinite(alpha) or alpha <= 0:
+            raise ValueError(
+                f"alpha must be a finite positive number when dynamic_lambda=True, got {alpha}."
+            )
+        if batch_prune_threshold is not None and not (0 <= batch_prune_threshold <= 1):
+            raise ValueError(
+                f"batch_prune_threshold must be in [0, 1] or None, got {batch_prune_threshold}."
+            )
+    if correction_method is not None and correction_method not in {
+        "fast",
+        "original",
+        "batched",
+    }:
+        raise ValueError("correction_method must be 'fast', 'original', or 'batched'.")
+
+    # Auto-select correction method: "batched" unless inv_mats would exceed 1 GB
+    if correction_method is None:
+        ONE_GB = 1 << 30
+        nb1 = n_batches + 1
+        inv_mats_bytes = n_clusters * nb1 * nb1 * Z.dtype.itemsize
+        correction_method = "batched" if inv_mats_bytes <= ONE_GB else "fast"
 
     # Set random seed
     cp.random.seed(random_state)
@@ -176,12 +208,22 @@ def harmonize(
         n_clusters=n_clusters,
         sigma=sigma,
         Pr_b=Pr_b,
-        Phi=Phi,
         theta=theta_array,
         random_state=random_state,
         cats=cats,
         n_batches=n_batches,
         colsum_func=colsum_func_big,
+        stabilized_penalty=stabilized_penalty,
+    )
+
+    # Pre-allocate C++ workspace buffers (reused across harmony iterations)
+    cpp_workspace = _allocate_clustering_workspace(
+        n_cells,
+        n_pcs=Z.shape[1],
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        block_size=int(n_cells * block_proportion),
+        dtype=Z_norm.dtype,
     )
 
     # Main harmony iterations
@@ -192,7 +234,6 @@ def harmonize(
         _clustering(
             Z_norm,
             Pr_b=Pr_b,
-            Phi=Phi,
             cats=cats,
             R=R,
             E=E,
@@ -204,14 +245,27 @@ def harmonize(
             sigma=sigma,
             block_proportion=block_proportion,
             colsum_func=colsum_func_small,
+            n_batches=n_batches,
+            random_state=random_state + i * 1000003,
+            stabilized_penalty=stabilized_penalty,
+            cpp_workspace=cpp_workspace,
+        )
+        # Compute per-(k,b) ridge regularization
+        lambda_kb = _compute_lambda_kb(
+            E,
+            O=O,
+            N_b=N_b,
+            alpha=alpha,
+            threshold=batch_prune_threshold,
+            ridge_lambda=ridge_lambda,
+            dynamic_lambda=dynamic_lambda,
         )
         # Correction step
         Z_hat = _correction(
             Z,
             R=R,
-            Phi=Phi,
             O=O,
-            ridge_lambda=ridge_lambda,
+            lambda_kb=lambda_kb,
             correction_method=correction_method,
             cats=cats,
             n_batches=n_batches,
@@ -241,12 +295,12 @@ def _initialize_centroids(
     n_clusters: int,
     sigma: float,
     Pr_b: cp.ndarray,
-    Phi: cp.ndarray | None,
     theta: cp.ndarray,
     random_state: int = 0,
-    cats: cp.ndarray | None = None,
-    n_batches: int = None,
+    cats: cp.ndarray,
+    n_batches: int,
     colsum_func: callable = None,
+    stabilized_penalty: bool = True,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list]:
     """
     Initialize cluster centroids and related matrices for Harmony algorithm.
@@ -270,8 +324,9 @@ def _initialize_centroids(
     Y_norm = _normalize_cp(Y, p=2)
 
     # Initialize cluster assignment matrix R
-    term = cp.float64(-2 / sigma).astype(Z_norm.dtype)
-    R = _calc_R(term, cp.dot(Z_norm, Y_norm.T))
+    term = Z_norm.dtype.type(-2 / sigma)
+    similarities = cp.dot(Z_norm, Y_norm.T)
+    R = _calc_R(term, similarities)
     R = _normalize_cp(R, p=1)
 
     # Initialize E (expected) and O (observed) matrices
@@ -279,34 +334,69 @@ def _initialize_centroids(
     E = cp.zeros((n_batches, R.shape[1]), dtype=Z_norm.dtype)
     _outer_cp(E, Pr_b, R_sum, 1)
 
-    if Phi is None:
-        O = cp.zeros((n_batches, R.shape[1]), dtype=Z_norm.dtype)
-        _scatter_add_cp(R, O, cats, 1)
-    else:
-        O = cp.dot(Phi.T, R)
+    O = cp.zeros((n_batches, R.shape[1]), dtype=Z_norm.dtype)
+    _scatter_add_cp(R, O, cats, 1, n_batches=n_batches)
 
     # Initialize objectives list
     objectives_harmony = []
     _compute_objective(
-        Y_norm,
-        Z_norm,
+        similarities,
         R=R,
         theta=theta,
         sigma=sigma,
         O=O,
         E=E,
         objective_arr=objectives_harmony,
+        stabilized_penalty=stabilized_penalty,
     )
 
     return R, E, O, objectives_harmony
+
+
+def _allocate_clustering_workspace(
+    n_cells: int,
+    *,
+    n_pcs: int,
+    n_clusters: int,
+    n_batches: int,
+    block_size: int,
+    dtype: cp.dtype,
+) -> dict:
+    """Pre-allocate workspace buffers for the C++ clustering loop."""
+    cub_temp_bytes = _hc_cl.get_cub_sort_temp_bytes(n_cells=n_cells)
+    return {
+        "Y": cp.empty((n_clusters, n_pcs), dtype=dtype),
+        "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
+        "similarities": cp.empty((n_cells, n_clusters), dtype=dtype),
+        "idx_list": cp.empty(n_cells, dtype=cp.int32),
+        "idx_list_alt": cp.empty(n_cells, dtype=cp.int32),
+        "sort_keys": cp.empty(n_cells, dtype=cp.uint32),
+        "sort_keys_alt": cp.empty(n_cells, dtype=cp.uint32),
+        "cub_temp": cp.empty(cub_temp_bytes, dtype=cp.uint8),
+        "R_out_buffer": cp.empty((block_size, n_clusters), dtype=dtype),
+        "cats_in": cp.empty(block_size, dtype=cp.int32),
+        "R_in_sum": cp.empty(n_clusters, dtype=dtype),
+        "R_out_sum": cp.empty(n_clusters, dtype=dtype),
+        "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
+        "obj_scalar": cp.empty(1, dtype=dtype),
+        "ones_vec": cp.ones(block_size, dtype=dtype),
+        "last_obj": cp.zeros(1, dtype=dtype),
+    }
+
+
+# Map colsum function to C++ enum: 0=columns, 1=atomics, 2=gemm
+_COLSUM_MAP = {
+    _column_sum: 0,
+    _column_sum_atomic: 1,
+    _gemm_colsum: 2,
+}
 
 
 def _clustering(
     Z_norm: cp.ndarray,
     *,
     Pr_b: cp.ndarray,
-    Phi: cp.ndarray | None,
-    cats: cp.ndarray | None,
+    cats: cp.ndarray,
     R: cp.ndarray,
     E: cp.ndarray,
     O: cp.ndarray,
@@ -317,6 +407,10 @@ def _clustering(
     sigma: float,
     block_proportion: float,
     colsum_func: callable = None,
+    n_batches: int = 0,
+    random_state: int = 0,
+    stabilized_penalty: bool = True,
+    cpp_workspace: dict = None,
 ) -> None:
     """
     Perform iterative clustering updates on normalized input data, adjusting
@@ -327,122 +421,97 @@ def _clustering(
     and penalty-related matrices (O and E).
     """
     n_cells = Z_norm.shape[0]
-    objectives_clustering = []
+    n_clusters = R.shape[1]
     block_size = int(n_cells * block_proportion)
-    term = cp.float64(-2 / sigma).astype(Z_norm.dtype)
+    colsum_algo_int = _COLSUM_MAP.get(colsum_func, 2)
 
-    for _ in range(max_iter):
-        # Compute cluster centroids
-        Y = cp.cublas.gemm("T", "N", R, Z_norm)
-        Y_norm = _normalize_cp(Y, p=2)
+    _hc_cl.clustering_loop(
+        Z_norm,
+        R=R,
+        E=E,
+        O=O,
+        Pr_b=Pr_b.ravel(),
+        cats=cats,
+        theta=theta,
+        **cpp_workspace,
+        n_cells=n_cells,
+        n_pcs=Z_norm.shape[1],
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        block_size=block_size,
+        colsum_algo=colsum_algo_int,
+        sigma=float(sigma),
+        tol=float(tol),
+        max_iter=max_iter,
+        seed=random_state & 0xFFFFFFFF,
+        stabilized=stabilized_penalty,
+        stream=cp.cuda.get_current_stream().ptr,
+        handle=cp.cuda.device.get_cublas_handle(),
+    )
+    objectives_harmony.append(float(cpp_workspace["last_obj"][0]))
 
-        # Randomly shuffle cell indices for block updates
-        idx_list = cp.arange(n_cells)
-        cp.random.shuffle(idx_list)
 
-        pos = 0
-        while pos < len(idx_list):
-            # Get current block of cells
-            idx_in = idx_list[pos : (pos + block_size)]
-            R_in = R[idx_in]
-
-            R_in_sum = colsum_func(R_in)
-
-            # Remove contribution of current block from O
-            if Phi is None:
-                cats_in = cats[idx_in]
-                _scatter_add_cp(R_in, O, cats_in, 0)  # Subtract from O
-            else:
-                Phi_in = Phi[idx_in]
-                cp.cublas.gemm("T", "N", Phi_in, R_in, alpha=-1, beta=1, out=O)
-
-            # Use optimized column sum function
-            _outer_cp(E, Pr_b, R_in_sum, 0)
-
-            # Update cluster assignments for current block
-            R_out = _calc_R(term, cp.dot(Z_norm[idx_in], Y_norm.T))
-            # Apply penalty term to cluster assignments
-            penalty_term = _get_pen(E, O, theta.T)
-            if Phi is None:
-                # R_out *= penalty_term[cats_in]
-                R_out = _penalty_term(R_out, penalty_term, cats_in)
-            else:
-                omega = cp.dot(Phi_in, penalty_term)
-                R_out *= omega
-
-            # Normalize updated cluster assignments
-            R_out = _normalize_cp(R_out, p=1)
-            R[idx_in] = R_out
-            # Use optimized column sum function again
-            R_out_sum = colsum_func(R_out)
-
-            # Add contribution of updated block back to O
-            if Phi is None:
-                _scatter_add_cp(R_out, O, cats_in, 1)  # Add to O
-            else:
-                cp.cublas.gemm("T", "N", Phi_in, R_out, alpha=1, beta=1, out=O)
-
-            # Add contribution of updated block back to E
-            _outer_cp(E, Pr_b, R_out_sum, 1)
-
-            # Move to next block
-            pos += block_size
-
-        # Compute objective function for current iteration
-        _compute_objective(
-            Y_norm,
-            Z_norm,
-            R=R,
-            theta=theta,
-            sigma=sigma,
-            O=O,
-            E=E,
-            objective_arr=objectives_clustering,
-        )
-
-        # Check for convergence
-        if _is_convergent_clustering(objectives_clustering, tol):
-            objectives_harmony.append(objectives_clustering[-1])
-            break
+def _compute_lambda_kb(
+    E: cp.ndarray,
+    *,
+    O: cp.ndarray,
+    N_b: cp.ndarray,
+    alpha: float,
+    threshold: float | None,
+    ridge_lambda: float,
+    dynamic_lambda: bool,
+) -> cp.ndarray:
+    """Compute per-(k,b) ridge regularization array."""
+    sentinel = E.dtype.type(_SUPPRESS_PENALTY)
+    if not dynamic_lambda:
+        lambda_kb = cp.full_like(E, ridge_lambda)
+    else:
+        lambda_kb = (alpha * E).astype(E.dtype)
+        if threshold is not None:
+            safe_N_b = cp.where(N_b > 0, N_b, cp.ones_like(N_b))
+            prune_mask = (O / safe_N_b[:, None]) < threshold
+            prune_mask |= N_b[:, None] == 0
+            lambda_kb[prune_mask] = sentinel
+    # Where both O and lambda_kb are zero, the kernel computes 1/(O+lambda)
+    # which would divide by zero.  Both values are exactly zero here: O comes
+    # from an integer scatter-add of assignments, and lambda_kb is alpha*E
+    # where E is also zero for absent batch-cluster pairs.
+    lambda_kb[(O + lambda_kb) == 0] = sentinel
+    return lambda_kb
 
 
 def _correction(
     X: cp.ndarray,
     *,
     R: cp.ndarray,
-    Phi: cp.ndarray | None,
     O: cp.ndarray,
-    ridge_lambda: float,
-    correction_method: str = "fast",
-    cats: cp.ndarray | None = None,
-    n_batches: int = None,
-    cat_offsets: cp.ndarray | None = None,
-    cell_indices: cp.ndarray | None = None,
+    lambda_kb: cp.ndarray,
+    correction_method: str = "batched",
+    cats: cp.ndarray,
+    n_batches: int,
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
 ) -> cp.ndarray:
     """
     Apply correction to the embedding based on the specified method.
-
-    Args:
-        X: Input embedding
-        R: Cluster assignment matrix
-        Phi: One-hot encoded batch matrix (if use_gemm=True)
-        O: Observed cluster assignment by batch
-        ridge_lambda: Ridge regression parameter
-        correction_method: Method for correction ("fast" or "original")
-        cats: Batch category codes (if use_gemm=False)
-        n_batches: Number of batches
-        cat_offsets, cell_indices: Category mapping for sparse implementation
-
-    Returns:
-        Corrected embedding
     """
-    if correction_method == "fast":
+    if correction_method == "batched":
+        return _correction_batched(
+            X,
+            R,
+            O=O,
+            lambda_kb=lambda_kb,
+            cats=cats,
+            n_batches=n_batches,
+            cat_offsets=cat_offsets,
+            cell_indices=cell_indices,
+        )
+    elif correction_method == "fast":
         return _correction_fast(
             X,
             R,
-            Phi=Phi,
             O=O,
-            ridge_lambda=ridge_lambda,
+            lambda_kb=lambda_kb,
             cats=cats,
             n_batches=n_batches,
             cat_offsets=cat_offsets,
@@ -452,8 +521,7 @@ def _correction(
         return _correction_original(
             X,
             R,
-            Phi=Phi,
-            ridge_lambda=ridge_lambda,
+            lambda_kb=lambda_kb,
             cats=cats,
             n_batches=n_batches,
             cat_offsets=cat_offsets,
@@ -465,55 +533,40 @@ def _correction_original(
     X: cp.ndarray,
     R: cp.ndarray,
     *,
-    Phi: cp.ndarray | None,
-    ridge_lambda: float,
-    cats: cp.ndarray | None = None,
-    n_batches: int = None,
-    cat_offsets: cp.ndarray | None = None,
-    cell_indices: cp.ndarray | None = None,
+    lambda_kb: cp.ndarray,
+    cats: cp.ndarray,
+    n_batches: int,
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
 ) -> cp.ndarray:
     """
     Apply the original correction method from the Harmony paper.
     """
-    n_cells = X.shape[0]
     n_clusters = R.shape[1]
 
-    if Phi is not None:
-        Phi_1 = cp.concatenate((cp.ones((n_cells, 1), dtype=X.dtype), Phi), axis=1)
-        n_batches = Phi.shape[1]
-
     Z = X.copy()
-    id_mat = cp.eye(n_batches + 1, n_batches + 1, dtype=X.dtype)
-    id_mat[0, 0] = 0
-    Lambda = ridge_lambda * id_mat
     for k in range(n_clusters):
-        if Phi is not None:
-            Phi_t_diag_R = Phi_1.T * R[:, k].reshape(1, -1)
-            inv_mat = cp.linalg.inv(cp.dot(Phi_t_diag_R, Phi_1) + Lambda)
-            Phi_t_diag_R = Phi_1.T * R[:, k].reshape(1, -1)
-            Phi_t_diag_R_X = cp.dot(Phi_t_diag_R, X)
-        else:
-            R_col = R[:, k].copy()
-            scatter_sum = cp.zeros(n_batches, dtype=R.dtype)
-            cp.add.at(scatter_sum, cats, R_col)
-            aggregated_matrix = cp.zeros((n_batches + 1, n_batches + 1), dtype=X.dtype)
-            _get_aggregated_matrix(aggregated_matrix, scatter_sum, n_batches=n_batches)
-            inv_mat = cp.linalg.inv(aggregated_matrix + Lambda)
-            Phi_t_diag_R_X = cp.zeros((n_batches + 1, X.shape[1]), dtype=X.dtype)
-            _scatter_add_cp_bias_csr(
-                X,
-                Phi_t_diag_R_X,
-                cat_offsets=cat_offsets,
-                cell_indices=cell_indices,
-                bias=R_col,
-                n_batches=n_batches,
-            )
+        Lambda_diag = cp.zeros(n_batches + 1, dtype=X.dtype)
+        Lambda_diag[1:] = lambda_kb[:, k]
+        Lambda = cp.diag(Lambda_diag)
+        R_col = R[:, k].copy()
+        scatter_sum = cp.zeros(n_batches, dtype=R.dtype)
+        cp.add.at(scatter_sum, cats, R_col)
+        aggregated_matrix = cp.zeros((n_batches + 1, n_batches + 1), dtype=X.dtype)
+        _get_aggregated_matrix(aggregated_matrix, scatter_sum, n_batches=n_batches)
+        inv_mat = cp.linalg.inv(aggregated_matrix + Lambda)
+        Phi_t_diag_R_X = cp.zeros((n_batches + 1, X.shape[1]), dtype=X.dtype)
+        _scatter_add_cp_bias_csr(
+            X,
+            Phi_t_diag_R_X,
+            cat_offsets=cat_offsets,
+            cell_indices=cell_indices,
+            bias=R_col,
+            n_batches=n_batches,
+        )
         W = cp.dot(inv_mat, Phi_t_diag_R_X)
         W[0, :] = 0
-        if Phi is not None:
-            cp.cublas.gemm("T", "N", Phi_t_diag_R, W, alpha=-1, beta=1, out=Z)
-        else:
-            _Z_correction(Z, W, cats, R_col)
+        _Z_correction(Z, W, cats, R_col)
     return Z
 
 
@@ -521,73 +574,115 @@ def _correction_fast(
     X: cp.ndarray,
     R: cp.ndarray,
     *,
-    Phi: cp.ndarray | None,
     O: cp.ndarray,
-    ridge_lambda: float,
-    cats: cp.ndarray | None = None,
-    n_batches: int = None,
-    cat_offsets: cp.ndarray | None = None,
-    cell_indices: cp.ndarray | None = None,
+    lambda_kb: cp.ndarray,
+    cats: cp.ndarray,
+    n_batches: int,
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
 ) -> cp.ndarray:
     """
     Apply the fast correction method (an optimization over the original method).
     """
     n_cells = X.shape[0]
+    n_pcs = X.shape[1]
     n_clusters = R.shape[1]
+    nb1 = n_batches + 1
+    dtype = X.dtype
 
-    if Phi is not None:
-        n_batches = Phi.shape[1]
-        Phi_1 = cp.concatenate((cp.ones((n_cells, 1), dtype=X.dtype), Phi), axis=1)
+    Z = cp.empty_like(X)
+    inv_mat = cp.empty((nb1, nb1), dtype=dtype)
+    R_col = cp.empty(n_cells, dtype=dtype)
+    Phi_t_diag_R_X = cp.empty((nb1, n_pcs), dtype=dtype)
+    W = cp.empty((nb1, n_pcs), dtype=dtype)
+    g_factor = cp.empty(n_batches, dtype=dtype)
+    g_P_row0 = cp.empty(n_batches, dtype=dtype)
 
-    Z = X.copy()
-    P = cp.eye(n_batches + 1, n_batches + 1, dtype=X.dtype)
-    for k in range(n_clusters):
-        O_k = O[:, k]
-        N_k = cp.sum(O_k)
+    _hc_corr.correction_fast(
+        X,
+        R=R,
+        O=O,
+        cats=cats,
+        cat_offsets=cat_offsets,
+        cell_indices=cell_indices,
+        lambda_kb=lambda_kb,
+        n_cells=n_cells,
+        n_pcs=n_pcs,
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        Z=Z,
+        inv_mat=inv_mat,
+        R_col=R_col,
+        Phi_t_diag_R_X=Phi_t_diag_R_X,
+        W=W,
+        g_factor=g_factor,
+        g_P_row0=g_P_row0,
+        stream=cp.cuda.get_current_stream().ptr,
+        handle=cp.cuda.device.get_cublas_handle(),
+    )
+    return Z
 
-        factor = _get_factor(O_k, ridge_lambda)
-        c = N_k + cp.sum(-factor * O_k**2)
-        c_inv = 1 / c
 
-        P[0, 1:] = -factor * O_k
+def _correction_batched(
+    X: cp.ndarray,
+    R: cp.ndarray,
+    *,
+    O: cp.ndarray,
+    lambda_kb: cp.ndarray,
+    cats: cp.ndarray,
+    n_batches: int,
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
+) -> cp.ndarray:
+    """
+    Batched correction method - process all clusters simultaneously.
 
-        P_t_B_inv = cp.zeros((factor.size + 1, factor.size + 1), dtype=X.dtype)
+    Single C++ call that fuses all steps: inv_mats computation, Phi_t_diag_R_X
+    via cuBLAS GEMMs, W_all via strided batched GEMM, and correction kernel.
+    """
+    n_cells, n_pcs = X.shape
+    n_clusters = R.shape[1]
+    nb1 = n_batches + 1
+    dtype = X.dtype
 
-        # Set diagonal entries
-        P_t_B_inv[0, 0] = c_inv
-        P_t_B_inv[1:, 1:] = cp.diag(factor)
+    # Allocate workspace
+    Z = cp.empty_like(X)
+    inv_mats = cp.empty((n_clusters, nb1, nb1), dtype=dtype)
+    Phi_t_diag_R_X_all = cp.empty((n_clusters, nb1, n_pcs), dtype=dtype)
+    W_all = cp.empty((n_clusters, nb1, n_pcs), dtype=dtype)
+    g_factor = cp.empty((n_clusters, n_batches), dtype=dtype)
+    g_P_row0 = cp.empty((n_clusters, n_batches), dtype=dtype)
+    X_sorted = cp.empty((n_cells, n_pcs), dtype=dtype)
+    R_sorted = cp.empty((n_cells, n_clusters), dtype=dtype)
 
-        # Set off-diagonal entries
-        P_t_B_inv[1:, 0] = P[0, 1:] * c_inv
-        inv_mat = cp.dot(P_t_B_inv, P)
-        if Phi is not None:
-            Phi_t_diag_R = Phi_1.T * R[:, k].reshape(1, -1)
-            Phi_t_diag_R_X = cp.dot(Phi_t_diag_R, X)
-        else:
-            R_col = R[:, k].copy()
-            Phi_t_diag_R_X = cp.zeros((n_batches + 1, X.shape[1]), dtype=X.dtype)
-            _scatter_add_cp_bias_csr(
-                X,
-                Phi_t_diag_R_X,
-                cat_offsets=cat_offsets,
-                cell_indices=cell_indices,
-                bias=R_col,
-                n_batches=n_batches,
-            )
-
-        W = cp.dot(inv_mat, Phi_t_diag_R_X)
-        W[0, :] = 0
-
-        if Phi is not None:
-            cp.cublas.gemm("T", "N", Phi_t_diag_R, W, alpha=-1, beta=1, out=Z)
-        else:
-            _Z_correction(Z, W, cats, R_col)
+    _hc_corr_b.correction_batched(
+        X,
+        R=R,
+        O=O,
+        cats=cats,
+        cat_offsets=cat_offsets,
+        cell_indices=cell_indices,
+        lambda_kb=lambda_kb,
+        n_cells=n_cells,
+        n_pcs=n_pcs,
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        Z=Z,
+        inv_mats=inv_mats,
+        Phi_t_diag_R_X_all=Phi_t_diag_R_X_all,
+        W_all=W_all,
+        g_factor=g_factor,
+        g_P_row0=g_P_row0,
+        X_sorted=X_sorted,
+        R_sorted=R_sorted,
+        stream=cp.cuda.get_current_stream().ptr,
+        handle=cp.cuda.device.get_cublas_handle(),
+    )
     return Z
 
 
 def _compute_objective(
-    Y_norm: cp.ndarray,
-    Z_norm: cp.ndarray,
+    similarities: cp.ndarray,
     *,
     R: cp.ndarray,
     theta: cp.ndarray,
@@ -595,22 +690,33 @@ def _compute_objective(
     O: cp.ndarray,
     E: cp.ndarray,
     objective_arr: list,
+    stabilized_penalty: bool = True,
 ) -> None:
     """
     Compute the objective function value for Harmony.
 
-    The objective function consists of:
-    1. K-means error term
-    2. Entropy regularization term
-    3. Diversity penalty term
+    Uses a fused C++ implementation that computes all three terms
+    (kmeans error, entropy, diversity) in a single pass with internal
+    row-normalization of R.
     """
-    kmeans_error = _kmeans_error(R, cp.dot(Z_norm, Y_norm.T))
-    R_normalized = R / R.sum(axis=1, keepdims=True)
-    entropy = _entropy_kernel(R_normalized)
-    entropy_term = sigma * entropy
-    diversity_penalty = sigma * cp.sum(cp.dot(theta, _log_div_OE(O, E)))
-    objective = kmeans_error + entropy_term + diversity_penalty
-    objective_arr.append(objective)
+    n_cells, n_clusters = R.shape
+    n_batches = O.shape[0]
+    obj_scalar = cp.zeros(1, dtype=R.dtype)
+    obj = _hc_cl.compute_objective(
+        R,
+        similarities=similarities,
+        O=O,
+        E=E,
+        theta=theta,
+        sigma=float(sigma),
+        obj_scalar=obj_scalar,
+        n_cells=n_cells,
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        stabilized=stabilized_penalty,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    objective_arr.append(obj)
 
 
 def _is_convergent_harmony(objectives_harmony: list, tol: float) -> bool:
@@ -624,25 +730,5 @@ def _is_convergent_harmony(objectives_harmony: list, tol: float) -> bool:
 
     obj_old = objectives_harmony[-2]
     obj_new = objectives_harmony[-1]
-
-    return (obj_old - obj_new) < tol * np.abs(obj_old)
-
-
-def _is_convergent_clustering(
-    objectives_clustering: list, tol: float, window_size: int = 3
-) -> bool:
-    """
-    Check if the clustering step has converged based on the objective function values.
-
-    Uses a window of objective values to determine convergence.
-    """
-    if len(objectives_clustering) < window_size + 1:
-        return False
-
-    obj_old = 0.0
-    obj_new = 0.0
-    for i in range(window_size):
-        obj_old += objectives_clustering[-2 - i]
-        obj_new += objectives_clustering[-1 - i]
 
     return (obj_old - obj_new) < tol * np.abs(obj_old)
