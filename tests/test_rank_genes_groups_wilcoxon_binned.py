@@ -428,21 +428,43 @@ class TestWilcoxonBinnedEdgeCases:
             assert np.all(pvals >= 0)
             assert np.all(pvals <= 1)
 
-    def test_sparse_negative_values_raises(self, adata_blobs):
-        """Sparse input with negative values should raise ValueError."""
+    def test_sparse_negative_values_fallback(self, adata_blobs):
+        """Sparse negatives must densify so implicit zeros rank correctly."""
         import cupy as cp
         import cupyx.scipy.sparse as cpsp
 
-        adata = adata_blobs.copy()
-        rsc.get.anndata_to_GPU(adata)
-        # Make sparse with negative values
-        dense = cp.array(adata.X)
-        dense[:, 0] = -1.0
-        adata.X = cpsp.csr_matrix(dense)
+        rng = np.random.default_rng(0)
+        n_obs, n_vars = adata_blobs.shape
+        base = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
+        base[base < 2.0] = 0.0  # real structural zeros (~40%)
+        # Negatives in zero-bearing cells: columns then hold structural zeros
+        # AND values below them, the case the fallback must rank correctly.
+        neg = (base == 0.0) & (rng.random(base.shape) < 0.05)
+        base[neg] = -0.5
+        base[0, 1] = 10.0  # keep a positive max so sparse/dense ranges agree
+        assert (base == 0).any() and (base < 0).any() and (base > 0).any()
 
-        with pytest.raises(ValueError, match="Sparse input contains negative values"):
-            rsc.tl.rank_genes_groups(
-                adata, "blobs", method="wilcoxon_binned", use_raw=False
+        dense = cp.asarray(base)
+        sparse_adata = adata_blobs.copy()
+        sparse_adata.X = cpsp.csr_matrix(dense)
+        dense_adata = adata_blobs.copy()
+        dense_adata.X = dense
+
+        rsc.tl.rank_genes_groups(
+            sparse_adata, "blobs", method="wilcoxon_binned", use_raw=False
+        )
+        rsc.tl.rank_genes_groups(
+            dense_adata, "blobs", method="wilcoxon_binned", use_raw=False
+        )
+
+        sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
+        dn_scores = dense_adata.uns["rank_genes_groups"]["scores"]
+        for group in sp_scores.dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(sp_scores[group], dtype=float),
+                np.asarray(dn_scores[group], dtype=float),
+                rtol=1e-13,
+                atol=1e-13,
             )
 
     def test_log1p_warning(self, adata_blobs):
@@ -534,3 +556,122 @@ def test_top_genes_match_scipy(adata_blobs):
         scipy_top = set(adata_blobs.var_names[np.argsort(pvals)[:n_top]])
         overlap = len(binned_top & scipy_top)
         assert overlap >= n_top - 1, f"Group {group}: {overlap}/{n_top} overlap"
+
+
+@pytest.mark.parametrize("reference", ["rest", "1"])
+def test_binned_bin_exact_matches_scipy(reference):
+    """Bin-exact integer data must match scipy.mannwhitneyu."""
+    import pandas as pd
+    from scipy.stats import mannwhitneyu
+
+    rng = np.random.default_rng(20)
+    n_obs, n_genes = 150, 6
+    X = rng.integers(0, 5, size=(n_obs, n_genes)).astype(np.float32)  # bin-exact
+    labels = np.array([str(i % 3) for i in range(n_obs)])
+    genes = [f"v{i}" for i in range(n_genes)]
+
+    def run(tie_correct, use_continuity):
+        a = sc.AnnData(
+            X=X.copy(),
+            obs=pd.DataFrame({"g": pd.Categorical(labels)}),
+            var=pd.DataFrame(index=genes),
+        )
+        a.uns["log1p"] = {"base": None}  # silence the log-norm warning
+        rsc.get.anndata_to_GPU(a)
+        rsc.tl.rank_genes_groups(
+            a,
+            "g",
+            method="wilcoxon_binned",
+            use_raw=False,
+            reference=reference,
+            tie_correct=tie_correct,
+            use_continuity=use_continuity,
+            n_bins=1000,
+            bin_range="auto",
+            n_genes=n_genes,
+        )
+        r = a.uns["rank_genes_groups"]
+        return {
+            grp: dict(zip(r["names"][grp], np.asarray(r["pvals"][grp], float)))
+            for grp in r["names"].dtype.names
+        }
+
+    # correctness vs scipy (tie_correct=True; both continuity settings)
+    for use_continuity in (False, True):
+        pv = run(True, use_continuity)
+        for grp, gm in pv.items():
+            mask_g = labels == grp
+            mask_r = (labels != grp) if reference == "rest" else (labels == reference)
+            for gi, v in enumerate(genes):
+                _, p = mannwhitneyu(
+                    X[mask_g, gi],
+                    X[mask_r, gi],
+                    use_continuity=use_continuity,
+                    alternative="two-sided",
+                    method="asymptotic",
+                )
+                np.testing.assert_allclose(
+                    gm[v], p, rtol=1e-6, atol=1e-6, equal_nan=True
+                )
+
+    # non-vacuity self-guards: each flag must materially change the result
+    def differs(a, b):
+        return any(
+            not np.isclose(a[g][v], b[g][v], rtol=1e-9, atol=1e-12)
+            for g in a
+            for v in a[g]
+        )
+
+    assert differs(run(True, True), run(True, False)), "use_continuity inert (vacuous)"
+    assert differs(run(True, False), run(False, False)), "tie_correct inert (vacuous)"
+
+
+def test_binned_all_zero_sparse_finite(adata_blobs):
+    """All-zero in-memory sparse input (nnz==0 _data_range guard): no crash, all
+    pvals finite and 1.0 (every value in one bin -> z=0)."""
+    import cupy as cp
+    import cupyx.scipy.sparse as cpsp
+
+    adata = adata_blobs.copy()
+    adata.X = cpsp.csr_matrix(cp.zeros(adata.shape, dtype=cp.float32))
+    rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
+    res = adata.uns["rank_genes_groups"]
+    for grp in res["pvals"].dtype.names:
+        p = np.asarray(res["pvals"][grp], dtype=float)
+        assert np.all(np.isfinite(p)) and np.allclose(p, 1.0)
+
+
+def test_binned_log1p_invalid_for_negative_sparse_coerces_to_auto(adata_blobs):
+    """Negative sparse log1p range must warn, coerce to auto, and match auto."""
+    import cupy as cp
+    import cupyx.scipy.sparse as cpsp
+
+    rng = np.random.default_rng(21)
+    n_obs, n_vars = adata_blobs.shape
+    base = (rng.random((n_obs, n_vars)) * 4.0).astype(np.float64)
+    base[base < 1.5] = 0.0
+    neg = (base == 0.0) & (rng.random(base.shape) < 0.05)
+    base[neg] = -0.5
+    base[0, 1] = 10.0  # positive max so sparse/dense ranges align
+    dense = cp.asarray(base)
+
+    sp_ad = adata_blobs.copy()
+    sp_ad.X = cpsp.csr_matrix(dense)
+    auto_ad = adata_blobs.copy()
+    auto_ad.X = cpsp.csr_matrix(dense)
+    with pytest.warns(RuntimeWarning, match="bin_range='log1p' is invalid"):
+        rsc.tl.rank_genes_groups(
+            sp_ad, "blobs", method="wilcoxon_binned", use_raw=False, bin_range="log1p"
+        )
+    rsc.tl.rank_genes_groups(
+        auto_ad, "blobs", method="wilcoxon_binned", use_raw=False, bin_range="auto"
+    )
+    sp_s = sp_ad.uns["rank_genes_groups"]["scores"]
+    au_s = auto_ad.uns["rank_genes_groups"]["scores"]
+    for grp in sp_s.dtype.names:
+        np.testing.assert_allclose(
+            np.asarray(sp_s[grp], dtype=float),
+            np.asarray(au_s[grp], dtype=float),
+            rtol=1e-13,
+            atol=1e-13,
+        )

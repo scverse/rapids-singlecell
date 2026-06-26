@@ -5,8 +5,10 @@ These modules provide GPU-accelerated kernels for various single-cell analysis
 operations. Each module is compiled from CUDA source files and exposed through
 nanobind bindings.
 
-On systems without compiled extensions (e.g., docs builds), imports resolve
-to None so that module-level imports don't raise ImportError.
+On systems without compiled extensions (e.g., docs builds), a genuinely absent
+module resolves to None so that module-level imports don't raise ImportError. A
+module that is present but fails to load (ABI/toolkit mismatch, missing shared
+library) is re-raised with context rather than silently swallowed.
 """
 
 from __future__ import annotations
@@ -43,18 +45,42 @@ __all__ = [
     "_pv_cuda",
     "_qc_cuda",
     "_qc_dask_cuda",
+    "_rank_stats_cuda",
     "_scale_cuda",
     "_sparse2dense_cuda",
     "_spca_cuda",
     "_wilcoxon_binned_cuda",
     "_wilcoxon_cuda",
+    "_wilcoxon_sparse_cuda",
 ]
+
+
+def _preload_rapids_runtime_libs() -> None:
+    """Pre-load RAPIDS runtime libs so extension ``DT_NEEDED`` deps resolve."""
+    for mod in ("librmm", "rapids_logger"):
+        try:
+            importlib.import_module(mod).load_library()
+        except (ImportError, OSError, AttributeError, RuntimeError):
+            pass
+
+
+_preload_rapids_runtime_libs()
 
 
 def __getattr__(name: str):
     if name in __all__:
         try:
             return importlib.import_module(f".{name}", __name__)
-        except ImportError:
+        except ModuleNotFoundError:
+            # Extension genuinely absent (docs/no-GPU): degrade to None.
             return None
+        except ImportError as exc:
+            # Present but failed to load: surface ABI/toolkit/lib errors now.
+            # Returning None would cause a later cryptic attribute error.
+            msg = (
+                f"Failed to load compiled CUDA extension {name!r}: {exc}. "
+                "Ensure a matching rapids-singlecell-cuXX wheel (and librmm) is "
+                "installed for your CUDA version."
+            )
+            raise ImportError(msg) from exc
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -3,6 +3,9 @@ requires = [
     "scikit-build-core>=0.10",
     "nanobind>=2.0.0",
     "setuptools-scm>=8",
+    # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.
+    # 25.12+ provides the resource-ref API and flat RMM header path we use.
+    "librmm-cu12>=25.12",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -32,8 +35,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-rapids-cu13 = [ "cupy-cuda13x", "cudf-cu13>=25.10", "cuml-cu13>=25.10", "cugraph-cu13>=25.10", "cuvs-cu13>=25.10" ]
-rapids-cu12 = [ "cupy-cuda12x", "cudf-cu12>=25.10", "cuml-cu12>=25.10", "cugraph-cu12>=25.10", "cuvs-cu12>=25.10" ]
+rapids-cu13 = [
+    "cupy-cuda13x",
+    "cudf-cu13>=25.12",
+    "cuml-cu13>=25.12",
+    "cugraph-cu13>=25.12",
+    "cuvs-cu13>=25.12",
+    "librmm-cu13>=25.12",
+]
+rapids-cu12 = [
+    "cupy-cuda12x",
+    "cudf-cu12>=25.12",
+    "cuml-cu12>=25.12",
+    "cugraph-cu12>=25.12",
+    "cuvs-cu12>=25.12",
+    "librmm-cu12>=25.12",
+]
 
 doc = [
     "sphinx>=4.5.0",
@@ -150,8 +167,10 @@ sdist.include = [ "src/rapids_singlecell/_version.py" ]
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]
+# Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+# Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
 repair-wheel-command = [
-    "auditwheel repair --exclude libcublas.so.12 --exclude libcublas.so.13 --exclude libcublasLt.so.12 --exclude libcublasLt.so.13 --exclude libcudart.so.12 --exclude libcudart.so.13 -w {dest_dir} {wheel}",
+    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
     "pipx run abi3audit --strict --report {wheel}",
 ]
 [tool.cibuildwheel.macos]

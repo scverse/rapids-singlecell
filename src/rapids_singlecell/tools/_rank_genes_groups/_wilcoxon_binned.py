@@ -11,6 +11,8 @@ import numpy as np
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._cuda import _wilcoxon_binned_cuda as _wb
 
+from ._utils import MIN_GROUP_SIZE_WARNING, _get_column_block
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -23,11 +25,7 @@ _DEFAULT_N_BINS = 1000
 
 
 def _fill_sparse_zero_bin(hist: cp.ndarray, group_counts: cp.ndarray) -> None:
-    """Fill bin 0 with zero counts for sparse histograms (in-place).
-
-    Sparse kernels only populate bins 1..n_bins (nonzero values).
-    Bin 0 = group_size - sum(bins 1..n_bins) for each gene/group.
-    """
+    """Fill sparse histogram bin 0 from group size minus nonzero-bin counts."""
     nonzero_per_group = hist.sum(axis=2)  # (n_genes, n_groups)
     hist[:, :, 0] = group_counts[None, :].astype(cp.uint32) - nonzero_per_group
 
@@ -71,39 +69,7 @@ def wilcoxon_binned(
     chunk_size: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
 ) -> list[tuple[int, NDArray, NDArray]]:
-    """Histogram-based approximate Wilcoxon rank-sum test.
-
-    Approximates ranks by discretizing expression values into ``n_bins``
-    fixed-width bins, then computing rank sums from cumulative histogram
-    counts. This avoids the O(n log n) per-gene sort required by exact
-    Wilcoxon, making it feasible for datasets with millions of cells and
-    compatible with Dask arrays.
-
-    Supports both one-vs-rest (``reference='rest'``) and one-vs-one
-    (``reference='<group>'``) comparisons.
-
-    Parameters
-    ----------
-    rg
-        The _RankGenes instance.
-    tie_correct
-        Adjust the variance for ties. In the binned approach each bin
-        acts as a tie group, so the correction uses the bin counts
-        directly.
-    n_bins
-        Number of histogram bins. Higher = better approximation.
-        Default is 1000 for in-memory arrays and 200 for Dask arrays.
-    chunk_size
-        Genes processed per GPU batch. Controls peak GPU memory.
-    bin_range
-        How to determine the histogram bin range.
-        ``None`` (default) uses ``'auto'`` for in-memory arrays and
-        ``'log1p'`` for Dask arrays (to avoid a costly data scan).
-        ``'log1p'`` uses a fixed [0, 15] range suitable for
-        log1p-normalized data.
-        ``'auto'`` computes the actual (min, max) of the data. Use this
-        for z-scored or unnormalized data.
-    """
+    """Histogram-based approximate Wilcoxon rank-sum test."""
     if not rg.is_log1p:
         warnings.warn(
             "wilcoxon_binned expects log-normalized data "
@@ -119,36 +85,43 @@ def wilcoxon_binned(
     if n_bins is None:
         n_bins = _DASK_N_BINS if isinstance(X, DaskArray) else _DEFAULT_N_BINS
 
-    # Sparse kernels assume non-negative data (pre-fill+correct pattern).
-    # Dense kernel handles any range.
-    # NOTE: Dask sparse is not validated here because checking .data.min()
-    # would require materializing all blocks. The sparse histogram kernels
-    # will silently produce incorrect results for negative Dask sparse data.
-    if not isinstance(X, DaskArray) and cpsp.issparse(X) and X.nnz > 0:
-        if float(X.data.min()) < 0:
-            msg = (
-                "Sparse input contains negative values. The sparse histogram "
-                "kernels assume non-negative data. Convert to dense or use "
-                "bin_range='auto' with a dense array."
-            )
-            raise ValueError(msg)
-
     n_groups = len(rg.groups_order)
     n_cells, n_genes = X.shape
     group_sizes = rg.group_sizes
 
-    # group_codes: 0..n_groups-1 for selected cells, n_groups (sentinel)
-    # for unselected. For vs-rest, unselected cells are binned into a
-    # dummy group so they contribute to total counts for correct midranks.
-    # For vs-reference, the kernel bounds guard (grp >= n_groups) skips them.
+    # Dask sparse cannot bin negatives correctly because implicit zeros use bin 0.
+    # Refuse instead of silently mis-ranking; in-memory sparse uses dense fallback.
+    if isinstance(X, DaskArray) and cpsp.issparse(X._meta):
+
+        def _block_data_min(block):
+            if block.nnz > 0:
+                return block.data.min().reshape(1)
+            return cp.zeros(1, dtype=block.dtype)
+
+        data_min = float(
+            X.map_blocks(
+                _block_data_min,
+                dtype=X.dtype,
+                drop_axis=1,
+                chunks=((1,) * len(X.chunks[0]),),
+            )
+            .min()
+            .compute()
+        )
+        if data_min < 0:
+            raise ValueError(
+                "wilcoxon_binned does not support negative values in Dask "
+                "sparse input; the binned approximation mis-ranks implicit "
+                "zeros. Densify the data or use a nonnegative representation."
+            )
+
+    # group_codes use n_groups as sentinel for unselected cells.
+    # vs-rest bins sentinels for totals; vs-reference kernels skip them.
     group_codes_np = rg.group_codes
     has_unselected = bool(np.any(group_codes_np == n_groups))
 
-    # For one-vs-one with a group subset, only the selected groups' cells
-    # matter for pairwise rankings. Filter X down so kernels don't iterate
-    # over irrelevant cells. For Dask we can't cheaply subset rows, but
-    # the kernel bounds guard (grp >= n_groups → skip) avoids wasted
-    # atomicAdds, so we just clear the flag without allocating a dummy group.
+    # One-vs-one only ranks selected groups; filter in-memory rows.
+    # Dask keeps rows but kernels skip sentinels, avoiding dummy-group atomics.
     if ireference is not None and has_unselected:
         if isinstance(X, DaskArray):
             has_unselected = False
@@ -173,7 +146,7 @@ def wilcoxon_binned(
         ):
             if gi == ireference:
                 continue
-            if size <= 25 or n_ref <= 25:
+            if size <= MIN_GROUP_SIZE_WARNING or n_ref <= MIN_GROUP_SIZE_WARNING:
                 warnings.warn(
                     f"Group {name} has size {size} (reference {n_ref}); normal "
                     "approximation of the Wilcoxon statistic may be inaccurate.",
@@ -183,7 +156,7 @@ def wilcoxon_binned(
     else:
         for name, size in zip(rg.groups_order, group_sizes, strict=True):
             rest = n_cells - size
-            if size <= 25 or rest <= 25:
+            if size <= MIN_GROUP_SIZE_WARNING or rest <= MIN_GROUP_SIZE_WARNING:
                 warnings.warn(
                     f"Group {name} has size {size} (rest {rest}); normal "
                     "approximation of the Wilcoxon statistic may be inaccurate.",
@@ -194,6 +167,17 @@ def wilcoxon_binned(
     # Resolve bin range: None → auto for in-memory, log1p for Dask
     if bin_range is None:
         bin_range = "log1p" if isinstance(X, DaskArray) else "auto"
+
+    # The fixed log1p range assumes nonnegative data.
+    # Signed sparse fallback needs data-driven auto range to avoid clamping.
+    if rg._sparse_negative_fallback and bin_range == "log1p":
+        warnings.warn(
+            "bin_range='log1p' is invalid for sparse input with negative values "
+            "(the fixed [0, 15] range would clamp them); using bin_range='auto'.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+        bin_range = "auto"
 
     # Prepare GPU arrays and bin arithmetic
     if bin_range == "auto":
@@ -224,6 +208,7 @@ def wilcoxon_binned(
         "tie_correct": tie_correct,
         "use_continuity": use_continuity,
         "ireference": ireference,
+        "force_dense": rg._sparse_negative_fallback,
     }
 
     # Pre-allocate output
@@ -270,13 +255,25 @@ def process_gene_batch(
     tie_correct: bool = False,
     use_continuity: bool = False,
     ireference: int | None = None,
+    force_dense: bool = False,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Process one gene batch, dispatching on Dask vs in-memory."""
     n_hist_groups = n_cells_per_group_hist.shape[0]
     n_genes_batch = stop - start
 
     is_sparse = False
-    if isinstance(X, DaskArray):
+    if force_dense and cpsp.issparse(X):
+        # Negative sparse fallback: bin 0 is only correct for nonnegative data.
+        # Densify the column window so dense bins span the full [min, max].
+        hist = _launch_dense(
+            _get_column_block(X, start, stop),
+            group_codes,
+            n_hist_groups,
+            n_bins=n_bins,
+            bin_low=bin_low,
+            inv_bin_width=inv_bin_width,
+        )
+    elif isinstance(X, DaskArray):
         hist = _process_dask(
             X,
             start=start,
@@ -403,12 +400,7 @@ def _compute_stats_vs_ref(
     tie_correct: bool = False,
     use_continuity: bool = False,
 ) -> tuple[cp.ndarray, cp.ndarray]:
-    """Compute Wilcoxon z-scores for each group vs a specific reference.
-
-    For each group *g*, midranks are derived from the pairwise histogram
-    ``hist_g + hist_ref`` so that only cells in the compared pair
-    contribute to the ranking.
-    """
+    """Compute Wilcoxon z-scores for each group vs a specific reference."""
     # hist shape: (n_genes, n_groups, n_bins_total)
     ref_hist = hist[:, ireference : ireference + 1, :]  # (n_genes, 1, n_bins_total)
 
@@ -556,13 +548,7 @@ def _process_dask(
     inv_bin_width: float,
     n_bins_total: int,
 ) -> cp.ndarray:
-    """Build histogram from a Dask array.
-
-    Receives the full (unsliced) Dask array and column range
-    ``[start, stop)``.  Column selection happens inside each block
-    handler on the materialised CuPy chunk, keeping the Dask graph
-    simple (no column-slice node per gene batch).
-    """
+    """Build a column-range histogram from an unsliced Dask array."""
     import dask.array as da
 
     if cpsp.isspmatrix_csr(X._meta):

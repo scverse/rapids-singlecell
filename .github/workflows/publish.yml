@@ -69,16 +69,46 @@ jobs:
           path = pathlib.Path("pyproject.toml")
           text = path.read_text()
 
+          def remove_toml_array(text, key):
+              lines = text.splitlines(keepends=True)
+              out = []
+              i = 0
+              while i < len(lines):
+                  if lines[i].startswith(f"{key} = ["):
+                      depth = lines[i].count("[") - lines[i].count("]")
+                      i += 1
+                      while i < len(lines) and depth > 0:
+                          depth += lines[i].count("[") - lines[i].count("]")
+                          i += 1
+                      continue
+                  out.append(lines[i])
+                  i += 1
+              return "".join(out)
+
           # Rename package
           text = text.replace(
               'name = "rapids-singlecell"',
               f'name = "rapids-singlecell-cu{cuda}"',
           )
           # Rename matching extra to "rapids", remove the other
-          text = text.replace(f'rapids-cu{cuda} =', 'rapids =')
-          # Remove the other CUDA extra line entirely
-          lines = text.splitlines(keepends=True)
-          text = "".join(l for l in lines if f'rapids-cu{other}' not in l)
+          text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
+          text = remove_toml_array(text, f"rapids-cu{other}")
+
+          # CMake links CUDA extensions against librmm.
+          # Add the matching wheel to isolated build requirements.
+          for dep in (
+              f'    "librmm-cu{other}>=25.12",\n',
+              f'    "rmm-cu{other}>=25.12",\n',
+          ):
+              text = text.replace(dep, "")
+          rmm_build_req = f'    "librmm-cu{cuda}>=25.12",\n'
+          build_system_text = text.split("[project]", 1)[0]
+          if f'"librmm-cu{cuda}>=25.12"' not in build_system_text:
+              text = text.replace(
+                  ']\nbuild-backend = "scikit_build_core.build"',
+                  f'{rmm_build_req}]\nbuild-backend = "scikit_build_core.build"',
+                  1,
+              )
 
           # Set CUDA architectures (replace "native" with CI target archs)
           text = text.replace(
@@ -96,6 +126,7 @@ jobs:
 
       - name: Sanity check pyproject.toml
         run: |
+          python3 -c "import tomllib; tomllib.load(open('pyproject.toml', 'rb'))"
           grep -E "name|rapids|CUDA_ARCH" pyproject.toml
 
       - name: Build CUDA manylinux image
@@ -116,18 +147,25 @@ jobs:
             LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
             PATH=/usr/local/cuda/bin:$PATH
           CIBW_BEFORE_BUILD: >
+            rm -f build/.librmm_dir &&
+            mkdir -p build &&
             python -m pip install -U pip
             scikit-build-core cmake ninja nanobind
+            librmm-cu${{ matrix.cuda_major }} &&
+            RMM_ROOT=$(python -c "import librmm; print(librmm.__path__[0])") &&
+            LOG_ROOT=$(python -c "import rapids_logger; print(rapids_logger.__path__[0])") &&
+            echo "[rsc-build] librmm=$RMM_ROOT" &&
+            echo "[rsc-build] rapids_logger=$LOG_ROOT" &&
+            ln -sf "$RMM_ROOT/lib64/librmm.so" /usr/local/lib/librmm.so &&
+            ln -sf "$LOG_ROOT/lib64/librapids_logger.so" /usr/local/lib/librapids_logger.so &&
+            ldconfig &&
+            python -c "import librmm; print(librmm.__path__[0])" > build/.librmm_dir &&
+            echo "[rsc-build] marker=$(cat build/.librmm_dir)"
           CIBW_TEST_SKIP: "*"
           CIBW_TEST_COMMAND: ""
-          # Exclude CUDA libs by SONAME glob (auditwheel >=6.2): the runtime
-          # stack (CuPy / nvidia-* wheels) provides them. Globs are version
-          # agnostic -- cusolver's SONAME is libcusolver.so.11 on CUDA 12 but
-          # .12 on CUDA 13, and nvJitLink is .12 vs .13, so pinning to the CUDA
-          # major would graft the wrong (or no) lib. cusolver's transitive deps
-          # (cublasLt, cusparse ~186MB, nvJitLink) are reached by auditwheel's
-          # tree walk and must each be excluded or they bloat the wheel.
-          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}"
+          # Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+          # Use SONAME globs so CUDA 12/13 suffix changes do not bundle them.
+          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 
       - uses: actions/upload-artifact@v7
