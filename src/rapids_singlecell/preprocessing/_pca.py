@@ -57,17 +57,10 @@ def _resolve_mask_var(
     if mask_var is _empty or mask_var is None:
         return None, None
 
-    if isinstance(mask_var, str):
-        mask_array = adata.var[mask_var].to_numpy()
-        return mask_var, mask_array
-
-    mask_var = np.asarray(mask_var)
-    if mask_var.shape != (adata.n_vars,):
-        raise ValueError(
-            f"The shape of the mask ({mask_var.shape}) does not match "
-            f"the number of variables ({adata.n_vars})."
-        )
-    return None, mask_var
+    # `_check_mask` validates boolean dtype + shape (and resolves a column name),
+    # matching scanpy. Keep the param as the column name for strings, else None.
+    mask_var_param = mask_var if isinstance(mask_var, str) else None
+    return mask_var_param, _check_mask(adata, mask_var, "var")
 
 
 def pca(

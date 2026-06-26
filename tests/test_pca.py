@@ -381,8 +381,15 @@ def test_mask_length_error():
     """Check error for mask length mismatch."""
     adata = AnnData(np.array(A_list).astype("float32"))
     mask_var = np.random.choice([True, False], adata.shape[1] + 1)
-    with pytest.raises(ValueError, match=r"The shape of the mask .* does not match"):
+    with pytest.raises(ValueError, match=r"shape of the mask do not match"):
         rsc.pp.pca(adata, mask_var=mask_var)
+
+
+def test_mask_var_non_boolean_error():
+    """Non-boolean mask_var is rejected (Scanpy parity via `_check_mask`)."""
+    adata = AnnData(np.array(A_list).astype("float32"))
+    with pytest.raises(ValueError, match="boolean"):
+        rsc.pp.pca(adata, mask_var=np.arange(adata.shape[1]))
 
 
 @pytest.mark.parametrize("float_dtype", [np.float32, np.float64])
