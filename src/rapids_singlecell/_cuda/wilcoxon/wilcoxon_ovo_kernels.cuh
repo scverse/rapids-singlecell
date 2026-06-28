@@ -1,5 +1,7 @@
 #pragma once
 
+#include <climits>
+
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include "../sparse_extract/sparse_extract.cuh"
@@ -62,35 +64,42 @@ struct OvoTierPlan {
     int max_grp_size = 0;
     bool run_medium = false;    // MEDIUM band: any group ≤ OVO_MEDIUM_MAX
     bool run_large = false;     // LARGE band: (OVO_MEDIUM_MAX, OVO_LARGE_MAX]
+    bool run_huge = false;      // HUGE band: > OVO_LARGE_MAX
     bool above_medium = false;  // at least one group exceeds OVO_MEDIUM_MAX
+    int huge_skip_le = OVO_MEDIUM_MAX;  // HUGE/CUB ranks groups > this
     int large_padded = 0;
     int large_tpb = 0;
     size_t large_smem = 0;
 };
 
-// Single OVO tier planner shared by dense and all sparse implementations.
-// MEDIUM co-launches; LARGE falls back to HUGE if smem exceeds device limits.
+// MEDIUM, LARGE, and HUGE bands are launched independently.
 static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
     OvoTierPlan c;
     for (int g = 0; g < n_groups; g++) {
         int sz = h_grp_offsets[g + 1] - h_grp_offsets[g];
         if (sz > c.max_grp_size) c.max_grp_size = sz;
-        if (sz <= OVO_MEDIUM_MAX) c.run_medium = true;
-        if (sz > OVO_MEDIUM_MAX) c.above_medium = true;
+        if (sz <= OVO_MEDIUM_MAX)
+            c.run_medium = true;
+        else if (sz <= OVO_LARGE_MAX)
+            c.run_large = true;
+        else
+            c.run_huge = true;
     }
+    c.above_medium = c.run_large || c.run_huge;
+    c.huge_skip_le = OVO_LARGE_MAX;
 
-    // run_large: fused smem-sort fast path for groups > MEDIUM but <= LARGE.
-    c.run_large = c.above_medium && (c.max_grp_size <= OVO_LARGE_MAX);
+    // Size smem for the largest LARGE-band group.
     if (c.run_large) {
+        int large_max = std::min(c.max_grp_size, OVO_LARGE_MAX);
         c.large_padded = 1;
-        while (c.large_padded < c.max_grp_size) c.large_padded <<= 1;
+        while (c.large_padded < large_max) c.large_padded <<= 1;
         c.large_tpb = std::min(c.large_padded, MAX_THREADS_PER_BLOCK);
-        // dynamic smem = grp_smem only; warp_buf is static in the kernel.
         c.large_smem = (size_t)c.large_padded * sizeof(float);
-        // Device-adapt fused-sort smem to the per-block limit.
-        // If it no longer fits, fall back to HUGE with no smem cap.
+        // Fall back to CUB if the smem kernel would not launch.
         if (c.large_smem > wilcoxon_max_smem_per_block()) {
             c.run_large = false;
+            c.run_huge = c.above_medium;
+            c.huge_skip_le = OVO_MEDIUM_MAX;
         }
     }
     return c;
@@ -120,16 +129,24 @@ static inline void launch_ovo_medium(
     const float* ref_sorted, const float* grp_dense, const int* grp_offsets,
     const double* ref_tie_sums, double* rank_sums, double* tie_corr, int n_ref,
     int n_all_grp, int sb_cols, int K, bool compute_tie_corr, int skip_n_grp_le,
-    cudaStream_t stream) {
+    bool analytic_zeros, cudaStream_t stream) {
     constexpr int tpb = 256;
     size_t smem = (size_t)OVO_MEDIUM_MAX * sizeof(float) +
                   WARP_REDUCE_BUF * sizeof(double);
     dim3 grid(sb_cols, K);
-    ovo_rank_medium_kernel<<<grid, tpb, smem, stream>>>(
-        ref_sorted, grp_dense, grp_offsets, ref_tie_sums, rank_sums, tie_corr,
-        n_ref, n_all_grp, sb_cols, K, compute_tie_corr, skip_n_grp_le,
-        OVO_MEDIUM_MAX);
-    CUDA_CHECK_LAST_ERROR(ovo_rank_medium_kernel);
+    if (analytic_zeros) {
+        ovo_rank_medium_analytic_kernel<<<grid, tpb, smem, stream>>>(
+            ref_sorted, grp_dense, grp_offsets, ref_tie_sums, rank_sums,
+            tie_corr, n_ref, n_all_grp, sb_cols, K, compute_tie_corr,
+            skip_n_grp_le, OVO_MEDIUM_MAX);
+        CUDA_CHECK_LAST_ERROR(ovo_rank_medium_analytic_kernel);
+    } else {
+        ovo_rank_medium_kernel<<<grid, tpb, smem, stream>>>(
+            ref_sorted, grp_dense, grp_offsets, ref_tie_sums, rank_sums,
+            tie_corr, n_ref, n_all_grp, sb_cols, K, compute_tie_corr,
+            skip_n_grp_le, OVO_MEDIUM_MAX);
+        CUDA_CHECK_LAST_ERROR(ovo_rank_medium_kernel);
+    }
 }
 
 // Per-stream scratch for ovo_dispatch_tiers (one set per CUDA stream).
@@ -142,6 +159,7 @@ struct OvoTierScratch {
     int* grp_seg_offsets;   // HUGE: CUB segment begins
     int* grp_seg_ends;      // HUGE: CUB segment ends
     uint8_t* grp_cub_temp;  // HUGE: CUB scratch
+    float* grp_nz = nullptr;  // HUGE analytic CUB input
 };
 
 // Single OVO ranking engine shared by dense and all sparse host/device paths.
@@ -151,7 +169,8 @@ static inline void ovo_dispatch_tiers(
     const OvoTierPlan& plan, const OvoTierScratch& sc,
     const int* d_sort_group_ids, int n_sort_groups, size_t grp_cub_temp_bytes,
     int sb_grp_items_actual, int tpb_rank, int n_ref, int n_all_grp,
-    int sb_cols, int n_groups, bool compute_tie_corr, cudaStream_t stream) {
+    int sb_cols, int n_groups, bool compute_tie_corr, bool analytic_zeros,
+    cudaStream_t stream) {
     // No-tie fast path: rank unsorted group values vs sorted ref (U-identity).
     // Skips group sort and all tier kernels.
     if (!compute_tie_corr) {
@@ -163,36 +182,67 @@ static inline void ovo_dispatch_tiers(
         CUDA_CHECK_LAST_ERROR(ovo_rank_dense_vs_ref_kernel);
         return;
     }
-    bool run_large = plan.above_medium && plan.run_large;
-    bool run_huge = plan.above_medium && !run_large;
-
-    // All tiers share the precomputed reference tie base; compute once/column.
+    // One reference tie base is shared by all active tiers.
     if (compute_tie_corr) {
         launch_ref_tie_sums(ref_sorted, sc.ref_tie_sums, n_ref, sb_cols,
                             stream);
     }
-    // MEDIUM handles every group <= OVO_MEDIUM_MAX (skip_n_grp_le = 0);
-    // LARGE/HUGE take the groups above MEDIUM.
     if (plan.run_medium) {
         launch_ovo_medium(ref_sorted, grp_dense, grp_offsets, sc.ref_tie_sums,
                           sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp,
                           sb_cols, n_groups, compute_tie_corr, /*skip=*/0,
-                          stream);
+                          analytic_zeros, stream);
     }
 
-    int upper_skip_le = plan.above_medium ? OVO_MEDIUM_MAX : 0;
-    if (plan.above_medium && run_large) {
+    if (plan.run_large) {
         dim3 grid(sb_cols, n_groups);
-        ovo_rank_sorted_kernel<true>
-            <<<grid, plan.large_tpb, plan.large_smem, stream>>>(
+        if (analytic_zeros) {
+            ovo_rank_smem_analytic_kernel<<<grid, plan.large_tpb,
+                                            plan.large_smem, stream>>>(
                 ref_sorted, grp_dense, grp_offsets, sc.ref_tie_sums,
                 sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp, sb_cols,
-                n_groups, compute_tie_corr, plan.large_padded, upper_skip_le);
-        CUDA_CHECK_LAST_ERROR(ovo_rank_sorted_kernel);
-    } else if (run_huge) {
+                n_groups, compute_tie_corr, /*skip_n_grp_le=*/OVO_MEDIUM_MAX,
+                /*skip_n_grp_gt=*/OVO_LARGE_MAX);
+            CUDA_CHECK_LAST_ERROR(ovo_rank_smem_analytic_kernel);
+        } else {
+            ovo_rank_sorted_kernel<true>
+                <<<grid, plan.large_tpb, plan.large_smem, stream>>>(
+                    ref_sorted, grp_dense, grp_offsets, sc.ref_tie_sums,
+                    sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp,
+                    sb_cols, n_groups, compute_tie_corr, plan.large_padded,
+                    /*skip_n_grp_le=*/OVO_MEDIUM_MAX,
+                    /*skip_n_grp_gt=*/OVO_LARGE_MAX);
+            CUDA_CHECK_LAST_ERROR(ovo_rank_sorted_kernel);
+        }
+    }
+    if (plan.run_huge) {
         int sb_grp_seg =
             checked_int_product((size_t)n_sort_groups, (size_t)sb_cols,
                                 "OVO active group segment count");
+        if (analytic_zeros) {
+            // CUB sorts only compacted positives.
+            dim3 cgrid(sb_cols, n_sort_groups);
+            compact_huge_nonzeros_kernel<<<cgrid, UTIL_BLOCK_SIZE, 0, stream>>>(
+                grp_dense, grp_offsets, d_sort_group_ids, sc.grp_nz,
+                sc.grp_seg_offsets, sc.grp_seg_ends, n_all_grp, n_sort_groups,
+                sb_cols);
+            CUDA_CHECK_LAST_ERROR(compact_huge_nonzeros_kernel);
+
+            cub_segmented_sortkeys(sc.grp_cub_temp, grp_cub_temp_bytes,
+                                   sc.grp_nz, sc.grp_sorted,
+                                   sb_grp_items_actual, sb_grp_seg,
+                                   sc.grp_seg_offsets, sc.grp_seg_ends, stream,
+                                   "OVO huge-tier non-zero segmented sort");
+
+            dim3 grid(sb_cols, n_sort_groups);
+            ovo_rank_huge_analytic_kernel<<<grid, tpb_rank, 0, stream>>>(
+                ref_sorted, sc.grp_sorted, grp_offsets, d_sort_group_ids,
+                sc.grp_seg_offsets, sc.grp_seg_ends, sc.ref_tie_sums,
+                sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp, sb_cols,
+                n_sort_groups, compute_tie_corr);
+            CUDA_CHECK_LAST_ERROR(ovo_rank_huge_analytic_kernel);
+            return;
+        }
         int blk = (sb_grp_seg + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
         build_huge_seg_offsets_kernel<<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(
             grp_offsets, d_sort_group_ids, sc.grp_seg_offsets, sc.grp_seg_ends,
@@ -208,7 +258,8 @@ static inline void ovo_dispatch_tiers(
         ovo_rank_sorted_kernel<false><<<grid, tpb_rank, 0, stream>>>(
             ref_sorted, sc.grp_sorted, grp_offsets, sc.ref_tie_sums,
             sc.sub_rank_sums, sc.sub_tie_corr, n_ref, n_all_grp, sb_cols,
-            n_groups, compute_tie_corr, /*large_padded=*/0, upper_skip_le);
+            n_groups, compute_tie_corr, /*large_padded=*/0,
+            /*skip_n_grp_le=*/plan.huge_skip_le, /*skip_n_grp_gt=*/INT_MAX);
         CUDA_CHECK_LAST_ERROR(ovo_rank_sorted_kernel);
     }
 }
