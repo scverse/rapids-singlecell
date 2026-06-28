@@ -30,7 +30,7 @@ __global__ void jaccard_shared_counts_kernel(const int* __restrict__ knn,
                 c += (va == Nj[b]);
             }
         }
-        jaccard_vals[edge] = (float)c / (2 * (k - 1) - c);
-        ;
+        const int denom = 2 * (k - 1) - c;
+        jaccard_vals[edge] = denom > 0 ? (float)c / denom : 0.0f;
     }
 }
