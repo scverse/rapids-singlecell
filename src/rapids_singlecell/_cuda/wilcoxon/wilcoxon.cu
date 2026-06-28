@@ -366,7 +366,7 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
                "dense OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool run_huge = t1.run_huge;
+    bool run_huge = compute_tie_corr && t1.run_huge;
 
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
@@ -552,7 +552,7 @@ static void launch_ovo_rank_dense_host_streaming(
 
     auto tier_plan = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = tier_plan.max_grp_size;
-    bool run_huge = tier_plan.run_huge;
+    bool run_huge = compute_tie_corr && tier_plan.run_huge;
 
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;

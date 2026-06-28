@@ -246,7 +246,7 @@ __global__ void ovo_rank_smem_analytic_kernel(
     const float* grp_col = grp_in + (long long)col * n_all_grp + g_start;
 
     extern __shared__ float grp_smem[];
-    __shared__ double warp_buf[32];
+    __shared__ double warp_buf[WARP_REDUCE_BUF];
     __shared__ int sh_nnz;
     __shared__ int sh_ref_zeros;
     if (threadIdx.x == 0) {
@@ -372,7 +372,7 @@ __global__ void ovo_rank_huge_analytic_kernel(
     const float* nz = grp_nz_sorted + b;
     const float* ref_col = ref_sorted + (long long)col * n_ref;
 
-    __shared__ double warp_buf[32];
+    __shared__ double warp_buf[WARP_REDUCE_BUF];
     __shared__ int sh_ref_zeros;
     if (threadIdx.x == 0)
         sh_ref_zeros = sorted_upper_bound(ref_col, 0, n_ref, 0.0f);

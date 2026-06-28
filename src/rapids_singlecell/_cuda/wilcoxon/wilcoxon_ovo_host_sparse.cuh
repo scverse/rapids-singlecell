@@ -123,7 +123,7 @@ static void ovo_streaming_csc_host_impl(
 
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool run_huge = t1.run_huge;
+    bool run_huge = compute_tie_corr && t1.run_huge;
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
     if (run_huge) {
@@ -551,7 +551,7 @@ static void ovo_streaming_csr_host_impl(
 
     // Phase 2: Per-pack streaming
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_test);
-    bool may_need_cub = (t1.max_grp_size > OVO_LARGE_MAX);
+    bool may_need_cub = compute_tie_corr && t1.run_huge;
 
     constexpr int MAX_GROUP_STREAMS = 4;
     int n_streams = MAX_GROUP_STREAMS;
@@ -671,7 +671,8 @@ static void ovo_streaming_csr_host_impl(
         int pack_huge_skip_le = pack_t1.huge_skip_le;
         std::vector<int> h_sort_group_ids;
         int pack_n_sort_groups = K;
-        if (pack_t1.run_huge) {
+        bool pack_run_huge = compute_tie_corr && pack_t1.run_huge;
+        if (pack_run_huge) {
             h_sort_group_ids = make_sort_group_ids(h_grp_offsets + pack.first,
                                                    K, pack_huge_skip_le);
             pack_n_sort_groups = (int)h_sort_group_ids.size();
@@ -681,7 +682,7 @@ static void ovo_streaming_csr_host_impl(
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
 
-        if (pack_t1.run_huge) {
+        if (pack_run_huge) {
             cudaMemcpyAsync(buf.d_sort_group_ids, h_sort_group_ids.data(),
                             h_sort_group_ids.size() * sizeof(int),
                             cudaMemcpyHostToDevice, stream);

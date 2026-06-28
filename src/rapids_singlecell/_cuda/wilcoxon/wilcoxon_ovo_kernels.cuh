@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <climits>
 
 #include <cub/device/device_segmented_radix_sort.cuh>
@@ -75,22 +76,24 @@ struct OvoTierPlan {
 // MEDIUM, LARGE, and HUGE bands are launched independently.
 static OvoTierPlan make_ovo_tier_plan(const int* h_grp_offsets, int n_groups) {
     OvoTierPlan c;
+    int large_max = 0;
     for (int g = 0; g < n_groups; g++) {
         int sz = h_grp_offsets[g + 1] - h_grp_offsets[g];
         if (sz > c.max_grp_size) c.max_grp_size = sz;
         if (sz <= OVO_MEDIUM_MAX)
             c.run_medium = true;
-        else if (sz <= OVO_LARGE_MAX)
+        else if (sz <= OVO_LARGE_MAX) {
             c.run_large = true;
-        else
+            large_max = std::max(large_max, sz);
+        } else {
             c.run_huge = true;
+        }
     }
     c.above_medium = c.run_large || c.run_huge;
     c.huge_skip_le = OVO_LARGE_MAX;
 
     // Size smem for the largest LARGE-band group.
     if (c.run_large) {
-        int large_max = std::min(c.max_grp_size, OVO_LARGE_MAX);
         c.large_padded = 1;
         while (c.large_padded < large_max) c.large_padded <<= 1;
         c.large_tpb = std::min(c.large_padded, MAX_THREADS_PER_BLOCK);
@@ -220,6 +223,12 @@ static inline void ovo_dispatch_tiers(
             checked_int_product((size_t)n_sort_groups, (size_t)sb_cols,
                                 "OVO active group segment count");
         if (analytic_zeros) {
+            if (sc.grp_nz == nullptr) {
+                throw std::runtime_error(
+                    "OVO analytic huge tier requires non-zero scratch");
+            }
+            checked_int_product((size_t)sb_cols, (size_t)n_all_grp,
+                                "OVO analytic huge dense item span");
             // CUB sorts only compacted positives.
             dim3 cgrid(sb_cols, n_sort_groups);
             compact_huge_nonzeros_kernel<<<cgrid, UTIL_BLOCK_SIZE, 0, stream>>>(
