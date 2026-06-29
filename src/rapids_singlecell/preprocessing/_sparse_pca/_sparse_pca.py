@@ -19,9 +19,18 @@ from ._helper import _check_matrix_for_zero_genes, _compute_cov, _copy_gram
 
 
 class PCA_sparse:
-    def __init__(self, n_components: int | None, *, zero_center: bool = True) -> None:
+    def __init__(
+        self,
+        n_components: int | None,
+        *,
+        zero_center: bool = True,
+        offset: cp.ndarray | None = None,
+    ) -> None:
         self.n_components = n_components
         self.zero_center = zero_center
+        # Optional per-cell offset (CLR centering term); folded into the gram,
+        # mean and transform as a rank-1 composite, never densified.
+        self.offset_ = offset
 
     def fit(self, x: spmatrix | DaskArray) -> Self:
         if self.n_components is None:
@@ -37,7 +46,7 @@ class PCA_sparse:
         self.dtype = x.dtype
 
         if self.zero_center:
-            covariance, self.mean_ = _cov_sparse(x)
+            covariance, self.mean_ = _cov_sparse(x, offset=self.offset_)
         else:
             # For truncated SVD (uncentered), operate on the Gram matrix (1/n * X^T X)
             # We don't subtract the mean in this path
@@ -88,6 +97,10 @@ class PCA_sparse:
                 (X.shape[0], 1), dtype=cp.float32
             ) @ precomputed_mean_impact.reshape(1, -1)
             X_transformed = X.dot(self.components_.T) - mean_impact
+            if self.offset_ is not None:
+                # Per-cell offset impact: r ⊗ (V·1), the row-sum of each component.
+                v_sum = self.components_.sum(axis=1)
+                X_transformed -= self.offset_[:, None] * v_sum[None, :]
         else:
             # Uncentered projection for truncated SVD
             X_transformed = X.dot(self.components_.T)
@@ -127,16 +140,22 @@ class PCA_sparse:
 
 @overload
 def _cov_sparse(
-    x: spmatrix | DaskArray, *, return_gram: Literal[False] = False
+    x: spmatrix | DaskArray,
+    *,
+    return_gram: Literal[False] = False,
+    offset: cp.ndarray | None = None,
 ) -> tuple[cp.ndarray, cp.ndarray]: ...
 @overload
 def _cov_sparse(
-    x: spmatrix | DaskArray, *, return_gram: Literal[True]
+    x: spmatrix | DaskArray, *, return_gram: Literal[True], offset: None = None
 ) -> cp.ndarray: ...
 
 
 def _cov_sparse(
-    x: spmatrix | DaskArray, *, return_gram: bool = False
+    x: spmatrix | DaskArray,
+    *,
+    return_gram: bool = False,
+    offset: cp.ndarray | None = None,
 ) -> cp.ndarray | tuple[cp.ndarray, cp.ndarray]:
     """
     Computes the mean and the covariance of matrix X of
@@ -192,6 +211,17 @@ def _cov_sparse(
             gram_matrix = _copy_gram(gram_matrix, x.shape[1])
 
         mean_x = mean_x.astype(x.dtype)
+        if offset is not None:
+            # Correct the gram of M = X - r·1ᵀ on the symmetrized G:
+            #   MᵀM = G - g·1ᵀ - 1·gᵀ + s·11ᵀ,  g = Xᵀr,  s = Σrᵢ²,
+            # and shift the column mean by mean(r). No densification.
+            offset = offset.astype(x.dtype)
+            g = x.T.dot(offset)
+            s = float(offset @ offset)
+            gram_matrix -= g[:, None]
+            gram_matrix -= g[None, :]
+            gram_matrix += s
+            mean_x = mean_x - offset.mean().astype(x.dtype)
         gram_matrix *= 1 / x.shape[0]
 
         cov_result = gram_matrix

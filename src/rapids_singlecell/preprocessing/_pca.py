@@ -15,6 +15,7 @@ from scipy.sparse import issparse
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.get import _check_mask, _get_obs_rep
 
+from ._normalize import CLR_LAYER, CLR_RESIDUALS_KEY
 from ._utils import _check_gpu_X
 
 if TYPE_CHECKING:
@@ -265,6 +266,27 @@ def pca(
     del use_highly_variable
     X = X[:, mask_var] if mask_var is not None else X
 
+    # CLR (`normalize_clr`) stores a factored log1p(PF) in `layers["clr"]` plus a
+    # per-cell centering offset in `obsm`; fold it in so PCA sees the centered CLR.
+    obs_offset = None
+    if layer == CLR_LAYER and CLR_RESIDUALS_KEY in adata.obsm:
+        if not zero_center:
+            raise ValueError(
+                "The `clr` layer requires `zero_center=True`; truncated SVD "
+                "(`zero_center=False`) is not meaningful for centered log-ratio data."
+            )
+        if isinstance(X, DaskArray):
+            raise NotImplementedError(
+                "PCA on a Dask `clr` layer is not implemented yet."
+            )
+        offset = cp.asarray(adata.obsm[CLR_RESIDUALS_KEY]).reshape(-1)
+        if isinstance(X, cp.ndarray):
+            # Dense: collapse the per-cell offset in, then run standard PCA.
+            X = X - offset[:, None]
+        else:
+            # Sparse: pass it to the matrix-free composite path (no densify).
+            obs_offset = offset
+
     pca_func, X_pca, n_comps = _pca_compute(
         X,
         n_comps,
@@ -275,6 +297,7 @@ def pca(
         chunk_size=chunk_size,
         dtype=dtype,
         kwargs=kwargs,
+        obs_offset=obs_offset,
     )
 
     key_obsm, key_varm, key_uns = (
@@ -312,6 +335,7 @@ def _pca_compute(
     chunk_size: int | None,
     dtype: str,
     kwargs: dict,
+    obs_offset: cp.ndarray | None = None,
 ):
     if n_comps is None:
         min_dim = min(X.shape[0], X.shape[1])
@@ -365,9 +389,12 @@ def _pca_compute(
                     random_state=random_state,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
+                    offset=obs_offset,
                 )
             else:
-                pca_func, X_pca = _run_covariance_pca(X, n_comps, zero_center)
+                pca_func, X_pca = _run_covariance_pca(
+                    X, n_comps, zero_center, offset=obs_offset
+                )
         else:
             pca_func, X_pca = _run_cuml_pca(X, n_comps, svd_solver=svd_solver)
 
@@ -401,7 +428,7 @@ def _as_numpy(X):
         return X
 
 
-def _run_covariance_pca(X, n_comps, zero_center):
+def _run_covariance_pca(X, n_comps, zero_center, *, offset=None):
     """Run PCA using covariance matrix eigendecomposition."""
     if issparse(X):
         X = sparse_scipy_to_cp(X, dtype=X.dtype)
@@ -412,7 +439,7 @@ def _run_covariance_pca(X, n_comps, zero_center):
     if issparse_cupy(X):
         X.sort_indices()
 
-    pca_func = PCA_sparse(n_components=n_comps, zero_center=zero_center)
+    pca_func = PCA_sparse(n_components=n_comps, zero_center=zero_center, offset=offset)
     X_pca = pca_func.fit_transform(X)
     return pca_func, X_pca
 
@@ -426,6 +453,7 @@ def _run_sparse_svd_pca(
     random_state: int = 0,
     n_oversamples: int | None = None,
     n_iter: int | None = None,
+    offset=None,
 ):
     """Run PCA using SVD solvers (lanczos, randomized)."""
     if issparse(X):
@@ -443,6 +471,7 @@ def _run_sparse_svd_pca(
         "svd_solver": svd_solver,
         "zero_center": zero_center,
         "random_state": random_state,
+        "offset": offset,
     }
     if n_oversamples is not None:
         kwargs["n_oversamples"] = n_oversamples

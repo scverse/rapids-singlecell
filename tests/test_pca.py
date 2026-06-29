@@ -1021,3 +1021,47 @@ class TestSVDSolvers:
             Vt_np = Vt.get()
             np.testing.assert_allclose(U_np.T @ U_np, np.eye(k), atol=1e-6)
             np.testing.assert_allclose(Vt_np @ Vt_np.T, np.eye(k), atol=1e-6)
+
+
+@pytest.mark.parametrize("svd_solver", ["covariance_eigh", "lanczos"])
+def test_pca_clr_sparse_matches_dense(svd_solver):
+    """PCA on the factored `clr` layer matches PCA on the densely-collapsed CLR.
+
+    `normalize_clr` keeps a sparse `log1p(PF)` in `layers["clr"]` plus a per-cell
+    offset in `obsm`; PCA must fold the offset in via the gram/operator composites
+    (no densify) and reproduce the result of PCA on the explicit centered matrix.
+    """
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(2.0, size=(200, 60)).astype("float32")
+    n_comps = 10
+
+    # Dense reference: collapse the offset, then standard PCA.
+    ref = AnnData(cp.asarray(counts.copy()))
+    rsc.pp.normalize_clr(ref)
+    rsc.pp.pca(ref, layer="clr", n_comps=n_comps)
+    ref_vr = np.asarray(ref.uns["pca"]["variance_ratio"])
+    ref_emb = cp.asnumpy(ref.obsm["X_pca"])
+
+    # Sparse factored path: offset applied as a composite, never densified.
+    adata = AnnData(cusparse.csr_matrix(cp.asarray(counts.copy())))
+    rsc.pp.normalize_clr(adata)
+    rsc.pp.pca(adata, layer="clr", n_comps=n_comps, svd_solver=svd_solver)
+
+    np.testing.assert_allclose(adata.uns["pca"]["variance_ratio"], ref_vr, atol=1e-4)
+    # components carry an arbitrary sign; compare magnitudes
+    emb = cp.asnumpy(adata.obsm["X_pca"])
+    np.testing.assert_allclose(np.abs(emb), np.abs(ref_emb), atol=1e-2)
+    # the sparse `clr` layer is untouched (no densification in place)
+    assert cusparse.issparse(adata.layers["clr"])
+
+
+@pytest.mark.parametrize(
+    "array_type", [cp.asarray, lambda c: cusparse.csr_matrix(cp.asarray(c))]
+)
+def test_pca_clr_tsvd_raises(array_type):
+    """CLR is centered log-ratio data; truncated SVD (`zero_center=False`) is blocked."""
+    counts = np.random.default_rng(0).poisson(2.0, size=(80, 20)).astype("float32")
+    adata = AnnData(array_type(counts.copy()))
+    rsc.pp.normalize_clr(adata)
+    with pytest.raises(ValueError, match="zero_center=True"):
+        rsc.pp.pca(adata, layer="clr", zero_center=False)
