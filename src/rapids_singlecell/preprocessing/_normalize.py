@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import warnings
 from functools import partial
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 import cupy as cp
 from anndata import AnnData
@@ -17,7 +17,7 @@ from rapids_singlecell._compat import (
     _meta_sparse,
 )
 
-from ._utils import _check_gpu_X, _check_nonnegative_integers
+from ._utils import _check_gpu_X, _check_nonnegative_integers, _get_mean_var
 
 if TYPE_CHECKING:
     from cupyx.scipy.sparse import spmatrix
@@ -124,6 +124,61 @@ def normalize_total(
         return X
 
 
+def _normalize_total(
+    X: ArrayTypesDask,
+    target_sum: float | None,
+    *,
+    exclude_highly_expressed: bool = False,
+    max_fraction: float = 0.05,
+) -> ArrayTypesDask:
+    if isinstance(X, DaskArray):
+        return _normalize_total_dask(X, target_sum)
+    elif isinstance(X, sparse.csr_matrix):
+        X = _normalize_total_csr(
+            X,
+            target_sum,
+            exclude_highly_expressed=exclude_highly_expressed,
+            max_fraction=max_fraction,
+        )
+    elif isinstance(X, cp.ndarray):
+        X = _normalize_total_dense(
+            X,
+            target_sum,
+            exclude_highly_expressed=exclude_highly_expressed,
+            max_fraction=max_fraction,
+        )
+    else:
+        raise ValueError(f"Cannot normalize {type(X)}")
+    return X
+
+
+def _sum_axis1(X: ArrayTypesDask) -> cp.ndarray | DaskArray:
+    """Per-cell counts (sum over axis=1) for a CSR matrix, dense cupy array, or Dask array."""
+    if isinstance(X, DaskArray):
+        return X.map_blocks(
+            _sum_axis1,
+            meta=cp.array((1.0,), dtype=X.dtype),
+            dtype=X.dtype,
+            chunks=(X.chunksize[0],),
+            drop_axis=1,
+        )
+    if isinstance(X, sparse.csr_matrix):
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        counts = cp.zeros(X.shape[0], dtype=X.dtype)
+        _nc.sum_major(
+            X.indptr,
+            X.data,
+            sums=counts,
+            major=X.shape[0],
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+        return counts
+    elif isinstance(X, cp.ndarray):
+        return X.sum(axis=1)
+    raise ValueError(f"Cannot compute row sums for {type(X)}")
+
+
 def _counts_to_scales(
     counts_per_cell: cp.ndarray, target_sum: float | None = None
 ) -> cp.ndarray:
@@ -191,14 +246,7 @@ def _normalize_total_csr(
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
         if gene_is_hi is None:
-            counts = cp.zeros(n_cells, dtype=X.dtype)
-            _nc.sum_major(
-                X.indptr,
-                X.data,
-                sums=counts,
-                major=n_cells,
-                stream=cp.cuda.get_current_stream().ptr,
-            )
+            counts = _sum_axis1(X)
         else:
             counts = cp.zeros(n_cells, dtype=X.dtype)
             _nc.masked_sum_major(
@@ -250,11 +298,11 @@ def _normalize_total_dense(
         # Compute per-cell counts, then prescaled multiply
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
-        counts_per_cell = X.sum(axis=1)
+        counts_per_cell = _sum_axis1(X)
         if exclude_highly_expressed:
             hi_exp = X > max_fraction * counts_per_cell.reshape(-1, 1)
             gene_subset = ~hi_exp.any(axis=0)
-            counts_per_cell = X[:, gene_subset].sum(axis=1)
+            counts_per_cell = _sum_axis1(X[:, gene_subset])
 
         scales = _counts_to_scales(counts_per_cell, target_sum)
         _nc.prescaled_mul_dense(
@@ -306,37 +354,153 @@ def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
 
 
 def _get_target_sum_dask(X: DaskArray) -> int:
-    if isinstance(X._meta, sparse.csr_matrix):
-        from rapids_singlecell._cuda import _norm_cuda as _nc
-
-        def __sum(X_part):
-            counts_per_cell = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
-            _nc.sum_major(
-                X_part.indptr,
-                X_part.data,
-                sums=counts_per_cell,
-                major=X_part.shape[0],
-                stream=cp.cuda.get_current_stream().ptr,
-            )
-            return counts_per_cell
-
-    elif isinstance(X._meta, cp.ndarray):
-
-        def __sum(X_part):
-            return X_part.sum(axis=1)
-    else:
-        raise ValueError(f"Cannot compute target sum for {type(X)}")
-    target_sum_chunk_matrices = X.map_blocks(
-        __sum,
-        meta=cp.array((1.0,), dtype=X.dtype),
-        dtype=X.dtype,
-        chunks=(X.chunksize[0],),
-        drop_axis=1,
-    )
-    counts_per_cell = target_sum_chunk_matrices.compute()
+    counts_per_cell = _sum_axis1(X).compute()
     counts_per_cell = counts_per_cell[counts_per_cell > 0]
     target_sum = cp.median(counts_per_cell)
     return target_sum
+
+
+def normalize_clr(
+    adata: AnnData,
+    *,
+    target_sum: float | None = None,
+    alpha: float | Literal["auto"] | None = None,
+    layer: str | None = None,
+    inplace: bool = True,
+    copy: bool = False,
+) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
+    r"""\
+    Normalize counts with the shifted centered log-ratio (PFlog1pPF) transform.
+
+    Computes the shifted centered log-ratio (CLR) transform
+
+    .. math::
+        T(x)_i = \log(u_i + 1) - \frac{1}{D} \sum_{j=1}^D \log(u_j + 1),
+
+    where :math:`u_i = K \, x_i / \sum_j x_j` are the depth-normalized counts
+    (proportional fitting to a target depth :math:`K`) and :math:`D` is the number
+    of genes. Equivalently this is proportional fitting, then ``log1p``, then
+    per-cell mean-centering in log space (the centered-log-ratio step). The
+    transform is simultaneously variance-stabilizing, depth-invariant, and
+    rank-preserving :cite:p:`Booeshaghi2026`.
+
+    To avoid densifying the matrix, the centering term is *not* subtracted in
+    place: ``adata.X`` (or `layer`) holds the sparse :math:`\log(u + 1)`, while the
+    per-cell centering offset :math:`\frac{1}{D}\sum_j \log(u_j + 1)` is written to
+    ``adata.obsm["clr_residuals"]`` and the raw per-cell depths to
+    ``adata.obsm["clr_cell_depths"]``. The full centered CLR is recovered as
+    ``adata.X - adata.obsm["clr_residuals"][:, None]``.
+
+    .. note::
+        When `adata.X` is a Dask array, deriving the proportional-fitting target
+        :math:`K` from the data requires a global reduction and therefore triggers
+        a blocking ``.compute()`` (for the default mean-depth target, and for
+        `alpha`, including ``alpha="auto"``). Only the scalar reduction is
+        materialized, not the matrix. Passing `target_sum` explicitly keeps it lazy.
+
+    Parameters
+    ----------
+        adata
+            The annotated data matrix of shape `n_obs` × `n_vars`. Rows correspond
+            to cells and columns to genes.
+        target_sum
+            Target depth :math:`K` for the proportional-fitting step. If `None`
+            (and `alpha` is not given), the empirical mean cell depth is used. This
+            is only an *intermediate* target: the subsequent log and centering steps
+            put each cell on the zero-sum hyperplane regardless of `K`.
+        alpha
+            Negative-binomial overdispersion of the dataset (``var = μ + α·μ²``).
+            When given, it overrides `target_sum` and sets :math:`K = 4 \cdot α \cdot s`
+            by the delta method, where :math:`s` is the mean cell depth, calibrating
+            the count-scale pseudocount to the variance-stabilizing value
+            ``y0 = 1/(4·α)`` :cite:p:`Booeshaghi2026`. Pass ``"auto"`` to estimate
+            :math:`α` from the data (closed-form least squares of ``var = μ + α·μ²``
+            across genes). Raises a :class:`ValueError` if the estimated or supplied
+            :math:`α` is not positive (e.g. underdispersed data); pass `target_sum`
+            instead.
+        layer
+            Layer to normalize instead of `X`. If `None`, `X` is normalized.
+        inplace
+            Whether to update `adata` or return the result.
+        copy
+            Whether to return a copy or update `adata`. Not compatible with
+            `inplace=False`.
+
+    Returns
+    -------
+        Depending on `inplace`:
+
+        - `inplace=True` (default): updates `adata.X` (or `layer`) with the sparse
+          :math:`\log(u + 1)`, writes ``adata.obsm["clr_cell_depths"]`` and
+          ``adata.obsm["clr_residuals"]``, and returns `None`.
+        - `copy=True`: performs the in-place update on a copy and returns it.
+        - `inplace=False`: returns the tuple ``(X, cell_depths, residuals)`` and
+          leaves `adata` untouched.
+    """
+    if copy:
+        if not inplace:
+            msg = "`copy=True` cannot be used with `inplace=False`."
+            raise ValueError(msg)
+        adata = adata.copy()
+    X = _get_obs_rep(adata, layer=layer)
+    _check_gpu_X(X, allow_dask=True)
+    if not inplace:
+        X = X.copy()
+    if sparse.isspmatrix_csc(X):
+        X = X.tocsr()
+    X, cell_depths, residuals = _normalize_clr(X, target_sum=target_sum, alpha=alpha)
+    if inplace:
+        _set_obs_rep(adata, X, layer=layer)
+        adata.obsm["clr_cell_depths"] = cell_depths
+        adata.obsm["clr_residuals"] = residuals
+    if copy:
+        return adata
+    if not inplace:
+        return X, cell_depths, residuals
+    return None
+
+
+def _estimate_overdispersion(X: ArrayTypesDask) -> tuple[float, cp.ndarray]:
+    mean, var = _get_mean_var(X, axis=0, correction=0)
+    cell_depths = _sum_axis1(X)
+    if isinstance(X, DaskArray):
+        import dask
+
+        mean, var, cell_depths = dask.compute(mean, var, cell_depths)
+    mean_sq = mean**2
+    numerator = cp.sum((var - mean) * mean_sq)
+    denominator = cp.sum(mean_sq**2)
+    if float(denominator) == 0:
+        msg = "Cannot estimate overdispersion: all gene means are zero."
+        raise ValueError(msg)
+    return numerator / denominator, cell_depths
+
+
+def _normalize_clr(
+    X: ArrayTypesDask, target_sum: float | None, alpha: float | Literal["auto"] | None
+) -> tuple[ArrayTypesDask, cp.ndarray, cp.ndarray]:
+    if alpha == "auto":
+        alpha, cell_depths = _estimate_overdispersion(X)
+    else:
+        cell_depths = _sum_axis1(X)
+        if isinstance(cell_depths, DaskArray):
+            cell_depths = cell_depths.compute()
+    if bool((cell_depths == 0).any()):
+        warnings.warn("Some cells have zero counts", UserWarning)
+    if alpha is not None:
+        if alpha <= 0:
+            raise ValueError("alpha must be positive")
+        target_sum = 4.0 * alpha * float(cell_depths.mean())
+    elif target_sum is None:
+        target_sum = float(cell_depths.mean())
+
+    X = _normalize_total(X, target_sum)
+    X = _calc_log1p(X)
+    # Centering offset = per-cell mean of log1p(PF) = row sum / n_genes.
+    # `_sum_axis1` already covers CSR/dense/Dask; avoids the unused variance pass.
+    residuals = _sum_axis1(X) / X.shape[1]
+
+    return X, cell_depths, residuals
 
 
 def _calc_log1p(X: ArrayTypesDask, base: float | None = None) -> ArrayTypesDask:
