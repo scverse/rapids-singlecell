@@ -319,6 +319,11 @@ def _reconstruct_clr(X, residuals) -> np.ndarray:
     return _to_np(X) - cp.asnumpy(residuals).reshape(-1, 1)
 
 
+def _clr_result(adata) -> np.ndarray:
+    """Centered CLR from the factored output written to `layers["clr"]`."""
+    return _reconstruct_clr(adata.layers["clr"], adata.obsm["clr_residuals"])
+
+
 @pytest.mark.parametrize("array_type", CLR_ARRAY_TYPES, ids=lambda f: f.__name__)
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 def test_normalize_clr_values(array_type, dtype):
@@ -328,12 +333,15 @@ def test_normalize_clr_values(array_type, dtype):
     also proves the sparse "offset trick" matches the dense path.
     """
     adata = AnnData(array_type(cp.asarray(X_clr).astype(dtype)))
+    x_before = _to_np(adata.X).copy()
     rsc.pp.normalize_clr(adata)
 
-    result = _reconstruct_clr(adata.X, adata.obsm["clr_residuals"])
+    result = _clr_result(adata)
     np.testing.assert_allclose(result, _clr_reference(X_clr), rtol=1e-5, atol=1e-5)
     # zero-sum (Aitchison) hyperplane
     np.testing.assert_allclose(result.sum(axis=1), 0.0, atol=1e-5)
+    # source matrix is left untouched (result goes to layers["clr"])
+    np.testing.assert_array_equal(_to_np(adata.X), x_before)
 
 
 @pytest.mark.parametrize("array_type", CLR_ARRAY_TYPES, ids=lambda f: f.__name__)
@@ -346,7 +354,7 @@ def test_normalize_clr_params(array_type, kwargs):
     adata = AnnData(array_type(cp.asarray(X_clr)))
     rsc.pp.normalize_clr(adata, **kwargs)
     np.testing.assert_allclose(
-        _reconstruct_clr(adata.X, adata.obsm["clr_residuals"]),
+        _clr_result(adata),
         _clr_reference(X_clr, **kwargs),
         rtol=1e-5,
         atol=1e-5,
@@ -364,8 +372,8 @@ def test_normalize_clr_alpha_overrides_target_sum():
     via_target = AnnData(csr_matrix(cp.asarray(X_clr)))
     rsc.pp.normalize_clr(via_target, target_sum=4.0 * alpha * scale)
     np.testing.assert_allclose(
-        _reconstruct_clr(via_alpha.X, via_alpha.obsm["clr_residuals"]),
-        _reconstruct_clr(via_target.X, via_target.obsm["clr_residuals"]),
+        _clr_result(via_alpha),
+        _clr_result(via_target),
         rtol=1e-5,
         atol=1e-5,
     )
@@ -374,8 +382,8 @@ def test_normalize_clr_alpha_overrides_target_sum():
     both = AnnData(csr_matrix(cp.asarray(X_clr)))
     rsc.pp.normalize_clr(both, alpha=alpha, target_sum=999.0)
     np.testing.assert_allclose(
-        _reconstruct_clr(both.X, both.obsm["clr_residuals"]),
-        _reconstruct_clr(via_alpha.X, via_alpha.obsm["clr_residuals"]),
+        _clr_result(both),
+        _clr_result(via_alpha),
         rtol=1e-5,
         atol=1e-5,
     )
@@ -393,8 +401,8 @@ def test_normalize_clr_alpha_auto(array_type):
     explicit = AnnData(array_type(cp.asarray(X_clr)))
     rsc.pp.normalize_clr(explicit, alpha=estimated)
     np.testing.assert_allclose(
-        _reconstruct_clr(auto.X, auto.obsm["clr_residuals"]),
-        _reconstruct_clr(explicit.X, explicit.obsm["clr_residuals"]),
+        _clr_result(auto),
+        _clr_result(explicit),
         rtol=1e-5,
         atol=1e-5,
     )
@@ -423,7 +431,7 @@ def test_normalize_clr_zero_cell(array_type):
     adata = AnnData(array_type(cp.asarray(x)))
     with pytest.warns(UserWarning, match="zero counts"):
         rsc.pp.normalize_clr(adata)
-    result = _reconstruct_clr(adata.X, adata.obsm["clr_residuals"])
+    result = _clr_result(adata)
     assert np.isfinite(result).all()
     np.testing.assert_allclose(result[1], 0.0, atol=1e-6)
 
@@ -438,22 +446,28 @@ def test_normalize_clr_inplace_false():
     np.testing.assert_allclose(
         _reconstruct_clr(X, residuals), _clr_reference(X_clr), rtol=1e-5, atol=1e-5
     )
-    # input is left untouched
+    # input is left untouched and nothing is written to the object
     np.testing.assert_array_equal(_to_np(adata.X), x_before)
+    assert "clr" not in adata.layers
+    assert "clr_residuals" not in adata.obsm
 
 
 def test_normalize_clr_copy():
     adata = AnnData(csr_matrix(cp.asarray(X_clr)))
+    x_before = _to_np(adata.X).copy()
     returned = rsc.pp.normalize_clr(adata, copy=True)
 
     assert isinstance(returned, AnnData)
     assert returned is not adata
     np.testing.assert_allclose(
-        _reconstruct_clr(returned.X, returned.obsm["clr_residuals"]),
+        _clr_result(returned),
         _clr_reference(X_clr),
         rtol=1e-5,
         atol=1e-5,
     )
+    # source matrix on the copy is preserved; original object untouched
+    np.testing.assert_array_equal(_to_np(returned.X), x_before)
+    assert "clr" not in adata.layers
 
 
 def test_normalize_clr_copy_inplace_error():
@@ -465,17 +479,20 @@ def test_normalize_clr_copy_inplace_error():
 
 
 def test_normalize_clr_layer():
-    """`layer` targets that layer and leaves `X` untouched."""
+    """`layer` selects the input; output always goes to layers["clr"], sources kept."""
     adata = AnnData(
         csr_matrix(cp.asarray(X_clr)),
         layers={"counts": csr_matrix(cp.asarray(X_clr))},
     )
     x_before = _to_np(adata.X).copy()
+    counts_before = _to_np(adata.layers["counts"]).copy()
     rsc.pp.normalize_clr(adata, layer="counts")
 
+    # both X and the source layer are untouched; result lands in layers["clr"]
     np.testing.assert_array_equal(_to_np(adata.X), x_before)
+    np.testing.assert_array_equal(_to_np(adata.layers["counts"]), counts_before)
     np.testing.assert_allclose(
-        _reconstruct_clr(adata.layers["counts"], adata.obsm["clr_residuals"]),
+        _clr_result(adata),
         _clr_reference(X_clr),
         rtol=1e-5,
         atol=1e-5,

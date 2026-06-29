@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
     from rapids_singlecell._utils import ArrayTypesDask
 
+# normalize_clr writes its factored output to these fixed keys.
+CLR_LAYER = "clr"
+CLR_CELL_DEPTHS_KEY = "clr_cell_depths"
+CLR_RESIDUALS_KEY = "clr_residuals"
+
 
 def normalize_total(
     adata: AnnData,
@@ -385,14 +390,17 @@ def normalize_clr(
     rank-preserving :cite:p:`Booeshaghi2026`.
 
     To avoid densifying the matrix, the centering term is *not* subtracted in
-    place: ``adata.X`` (or `layer`) holds the sparse :math:`\log(u + 1)`, while the
-    per-cell centering offset :math:`\frac{1}{D}\sum_j \log(u_j + 1)` is written to
-    ``adata.obsm["clr_residuals"]`` and the raw per-cell depths to
+    place and the source matrix is left untouched. ``adata.layers["clr"]`` holds
+    the sparse :math:`\log(u + 1)`, the per-cell centering offset
+    :math:`\frac{1}{D}\sum_j \log(u_j + 1)` is written to
+    ``adata.obsm["clr_residuals"]``, and the raw per-cell depths to
     ``adata.obsm["clr_cell_depths"]``. The full centered CLR is recovered as
-    ``adata.X - adata.obsm["clr_residuals"][:, None]``.
+    ``adata.layers["clr"] - adata.obsm["clr_residuals"][:, None]``;
+    :func:`~rapids_singlecell.pp.pca` consumes this factored form directly via
+    ``layer="clr"`` without ever materializing it.
 
     .. note::
-        When `adata.X` is a Dask array, deriving the proportional-fitting target
+        When the input is a Dask array, deriving the proportional-fitting target
         :math:`K` from the data requires a global reduction and therefore triggers
         a blocking ``.compute()`` (for the default mean-depth target, and for
         `alpha`, including ``alpha="auto"``). Only the scalar reduction is
@@ -419,7 +427,8 @@ def normalize_clr(
             :math:`α` is not positive (e.g. underdispersed data); pass `target_sum`
             instead.
         layer
-            Layer to normalize instead of `X`. If `None`, `X` is normalized.
+            Layer to read the counts from. If `None`, `X` is used. The result is
+            always written to ``adata.layers["clr"]``; the source is not modified.
         inplace
             Whether to update `adata` or return the result.
         copy
@@ -430,10 +439,11 @@ def normalize_clr(
     -------
         Depending on `inplace`:
 
-        - `inplace=True` (default): updates `adata.X` (or `layer`) with the sparse
-          :math:`\log(u + 1)`, writes ``adata.obsm["clr_cell_depths"]`` and
-          ``adata.obsm["clr_residuals"]``, and returns `None`.
-        - `copy=True`: performs the in-place update on a copy and returns it.
+        - `inplace=True` (default): writes the sparse :math:`\log(u + 1)` to
+          ``adata.layers["clr"]`` and the centering offsets / depths to
+          ``adata.obsm["clr_residuals"]`` / ``adata.obsm["clr_cell_depths"]``,
+          leaving the source matrix untouched, and returns `None`.
+        - `copy=True`: performs the update on a copy and returns it.
         - `inplace=False`: returns the tuple ``(X, cell_depths, residuals)`` and
           leaves `adata` untouched.
     """
@@ -444,15 +454,17 @@ def normalize_clr(
         adata = adata.copy()
     X = _get_obs_rep(adata, layer=layer)
     _check_gpu_X(X, allow_dask=True)
-    if not inplace:
-        X = X.copy()
+    # The PF step mutates the matrix in place; copy so the source (X / `layer`)
+    # is preserved (CSC `.tocsr()` already yields a fresh matrix).
     if sparse.isspmatrix_csc(X):
         X = X.tocsr()
+    else:
+        X = X.copy()
     X, cell_depths, residuals = _normalize_clr(X, target_sum=target_sum, alpha=alpha)
     if inplace:
-        _set_obs_rep(adata, X, layer=layer)
-        adata.obsm["clr_cell_depths"] = cell_depths
-        adata.obsm["clr_residuals"] = residuals
+        adata.layers[CLR_LAYER] = X
+        adata.obsm[CLR_CELL_DEPTHS_KEY] = cell_depths
+        adata.obsm[CLR_RESIDUALS_KEY] = residuals
     if copy:
         return adata
     if not inplace:
