@@ -21,13 +21,12 @@ static void ovo_streaming_csr_impl(
                "device OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool run_large = t1.above_medium && t1.run_large;
-    bool run_huge = t1.above_medium && !run_large;
+    bool run_huge = compute_tie_corr && t1.run_huge;
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
     if (run_huge) {
         h_sort_group_ids =
-            make_sort_group_ids(h_offsets.data(), n_groups, OVO_MEDIUM_MAX);
+            make_sort_group_ids(h_offsets.data(), n_groups, t1.huge_skip_le);
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
@@ -207,7 +206,8 @@ static void ovo_streaming_csr_impl(
             ovo_dispatch_tiers(ref_sub, buf.grp_dense, grp_offsets, t1, sc,
                                d_sort_group_ids, n_sort_groups, cub_temp_bytes,
                                sb_grp_items_actual, tpb_rank, n_ref, n_all_grp,
-                               sb_cols, n_groups, compute_tie_corr, stream);
+                               sb_cols, n_groups, compute_tie_corr,
+                               /*analytic_zeros=*/false, stream);
 
             cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
                               buf.sub_rank_sums, sb_cols * sizeof(double),
@@ -249,13 +249,12 @@ static void ovo_streaming_csc_impl(
                "device OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool run_large = t1.above_medium && t1.run_large;
-    bool run_huge = t1.above_medium && !run_large;
+    bool run_huge = compute_tie_corr && t1.run_huge;
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
     if (run_huge) {
         h_sort_group_ids =
-            make_sort_group_ids(h_offsets.data(), n_groups, OVO_MEDIUM_MAX);
+            make_sort_group_ids(h_offsets.data(), n_groups, t1.huge_skip_le);
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
@@ -392,7 +391,8 @@ static void ovo_streaming_csc_impl(
         ovo_dispatch_tiers(buf.ref_sorted, buf.grp_dense, grp_offsets, t1, sc,
                            d_sort_group_ids, n_sort_groups, cub_temp_bytes,
                            sb_grp_items_actual, tpb_rank, n_ref, n_all_grp,
-                           sb_cols, n_groups, compute_tie_corr, stream);
+                           sb_cols, n_groups, compute_tie_corr,
+                           /*analytic_zeros=*/false, stream);
 
         cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
                           buf.sub_rank_sums, sb_cols * sizeof(double),

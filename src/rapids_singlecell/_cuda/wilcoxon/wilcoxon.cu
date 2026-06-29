@@ -366,14 +366,13 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
                "dense OVO group offsets D2H");
     auto t1 = make_ovo_tier_plan(h_offsets.data(), n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool run_large = t1.above_medium && t1.run_large;
-    bool run_huge = t1.above_medium && !run_large;
+    bool run_huge = compute_tie_corr && t1.run_huge;
 
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
     if (run_huge) {
         h_sort_group_ids =
-            make_sort_group_ids(h_offsets.data(), n_groups, OVO_MEDIUM_MAX);
+            make_sort_group_ids(h_offsets.data(), n_groups, t1.huge_skip_le);
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
@@ -507,7 +506,8 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         ovo_dispatch_tiers(ref_sub, grp_sub, grp_offsets, t1, sc,
                            d_sort_group_ids, n_sort_groups, grp_cub_temp_bytes,
                            sb_grp_items_actual, tpb_rank, n_ref, n_all_grp,
-                           sb_cols, n_groups, compute_tie_corr, stream);
+                           sb_cols, n_groups, compute_tie_corr,
+                           /*analytic_zeros=*/false, stream);
 
         cuda_check(
             cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),
@@ -552,14 +552,13 @@ static void launch_ovo_rank_dense_host_streaming(
 
     auto tier_plan = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = tier_plan.max_grp_size;
-    bool run_large = tier_plan.above_medium && tier_plan.run_large;
-    bool run_huge = tier_plan.above_medium && !run_large;
+    bool run_huge = compute_tie_corr && tier_plan.run_huge;
 
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
     if (run_huge) {
-        h_sort_group_ids =
-            make_sort_group_ids(h_grp_offsets, n_groups, OVO_MEDIUM_MAX);
+        h_sort_group_ids = make_sort_group_ids(h_grp_offsets, n_groups,
+                                               tier_plan.huge_skip_le);
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
@@ -794,7 +793,8 @@ static void launch_ovo_rank_dense_host_streaming(
         ovo_dispatch_tiers(ref_sub, grp_sub, d_grp_offsets, tier_plan, sc,
                            d_sort_group_ids, n_sort_groups, grp_cub_temp_bytes,
                            sb_grp_items_actual, tpb_rank, n_ref, n_all_grp,
-                           sb_cols, n_groups, compute_tie_corr, stream);
+                           sb_cols, n_groups, compute_tie_corr,
+                           /*analytic_zeros=*/false, stream);
 
         cuda_check(
             cudaMemcpy2DAsync(rank_sums + col, n_cols * sizeof(double),

@@ -105,7 +105,8 @@ static void ovo_streaming_csc_host_impl(
     const int* h_grp_offsets, const int* h_stats_codes, double* d_rank_sums,
     double* d_tie_corr, double* d_group_sums, double* d_group_nnz, int n_ref,
     int n_all_grp, int n_rows, int n_cols, int n_groups, int n_groups_stats,
-    bool compute_tie_corr, bool compute_nnz, int sub_batch_cols) {
+    bool compute_tie_corr, bool compute_nnz, int sub_batch_cols,
+    bool analytic_zeros) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0) return;
 
     // Cap sub_batch_cols so neither the dense ref/group slabs (rows ×
@@ -122,13 +123,12 @@ static void ovo_streaming_csc_host_impl(
 
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_groups);
     int max_grp_size = t1.max_grp_size;
-    bool run_large = t1.above_medium && t1.run_large;
-    bool run_huge = t1.above_medium && !run_large;
+    bool run_huge = compute_tie_corr && t1.run_huge;
     std::vector<int> h_sort_group_ids;
     int n_sort_groups = n_groups;
     if (run_huge) {
         h_sort_group_ids =
-            make_sort_group_ids(h_grp_offsets, n_groups, OVO_MEDIUM_MAX);
+            make_sort_group_ids(h_grp_offsets, n_groups, t1.huge_skip_le);
         n_sort_groups = (int)h_sort_group_ids.size();
     }
 
@@ -157,6 +157,8 @@ static void ovo_streaming_csc_host_impl(
     size_t max_nnz = batches.max_nnz;
     constexpr size_t window_value_bytes =
         sizeof(WilcoxonSparseWindowDTypes::value_type);
+    size_t group_slab_count = run_huge ? 2 : 1;
+    if (run_huge && analytic_zeros) ++group_slab_count;
 
     // Clamp streams so per-stream scratch fits the budget: dense slabs scale
     // with cell counts, so a fixed N_STREAMS would OOM at scale.
@@ -164,7 +166,7 @@ static void ovo_streaming_csc_host_impl(
         size_t per_stream =
             sparse_window_nnz_bytes<WilcoxonSparseWindowDTypes>(max_nnz) +
             2 * sub_ref_items * window_value_bytes +
-            (run_huge ? 2 : 1) * sub_grp_items * window_value_bytes +
+            group_slab_count * sub_grp_items * window_value_bytes +
             sparse_window_accum_bytes<WilcoxonSparseWindowDTypes>(
                 2 * (size_t)n_groups * sub_batch_cols) +
             (compute_nnz ? 2 : 1) *
@@ -213,6 +215,7 @@ static void ovo_streaming_csc_host_impl(
         float* ref_sorted;
         float* grp_dense;
         float* grp_sorted;
+        float* grp_nz;
         int* ref_seg_offsets;
         int* grp_seg_offsets;
         int* grp_seg_ends;
@@ -251,10 +254,13 @@ static void ovo_streaming_csc_host_impl(
                 "OVO host CSC stream group segment count");
             bufs[s].grp_seg_offsets = pool.alloc<int>(max_grp_seg);
             bufs[s].grp_seg_ends = pool.alloc<int>(max_grp_seg);
+            bufs[s].grp_nz =
+                analytic_zeros ? pool.alloc<float>(sub_grp_items) : nullptr;
         } else {
             bufs[s].grp_sorted = nullptr;
             bufs[s].grp_seg_offsets = nullptr;
             bufs[s].grp_seg_ends = nullptr;
+            bufs[s].grp_nz = nullptr;
         }
     }
 
@@ -331,11 +337,11 @@ static void ovo_streaming_csc_host_impl(
         OvoTierScratch sc{buf.ref_tie_sums,    buf.d_rank_sums,
                           buf.d_tie_corr,      buf.grp_sorted,
                           buf.grp_seg_offsets, buf.grp_seg_ends,
-                          buf.cub_temp};
+                          buf.cub_temp,        buf.grp_nz};
         ovo_dispatch_tiers(buf.ref_sorted, buf.grp_dense, d_grp_offsets, t1, sc,
                            d_sort_group_ids, n_sort_groups, cub_temp_bytes,
                            sb_grp_actual, tpb_rank, n_ref, n_all_grp, sb_cols,
-                           n_groups, compute_tie_corr, stream);
+                           n_groups, compute_tie_corr, analytic_zeros, stream);
 
         // D2D: scatter sub-batch results into caller's GPU buffers
         scatter_cols_2d(d_rank_sums + col, buf.d_rank_sums, n_groups, n_cols,
@@ -368,7 +374,8 @@ static void ovo_streaming_csr_host_impl(
     const int* h_grp_row_ids, const int* h_grp_offsets, int n_all_grp,
     int n_test, double* d_rank_sums, double* d_tie_corr, double* d_group_sums,
     double* d_group_nnz, int n_cols, int n_groups_stats, bool compute_tie_corr,
-    bool compute_nnz, bool compute_sums, int sub_batch_cols) {
+    bool compute_nnz, bool compute_sums, int sub_batch_cols,
+    bool analytic_zeros) {
     if (n_cols == 0 || n_ref == 0 || n_test == 0 || n_all_grp == 0) return;
 
     // Compacted indptrs on host. IndptrT for grp (can exceed 2^31 nnz when
@@ -544,7 +551,7 @@ static void ovo_streaming_csr_host_impl(
 
     // Phase 2: Per-pack streaming
     auto t1 = make_ovo_tier_plan(h_grp_offsets, n_test);
-    bool may_need_cub = (t1.max_grp_size > OVO_LARGE_MAX);
+    bool may_need_cub = compute_tie_corr && t1.run_huge;
 
     constexpr int MAX_GROUP_STREAMS = 4;
     int n_streams = MAX_GROUP_STREAMS;
@@ -568,6 +575,8 @@ static void ovo_streaming_csr_host_impl(
                             "OVO host CSR pack segment buffer");
     constexpr size_t window_value_bytes =
         sizeof(WilcoxonSparseWindowDTypes::value_type);
+    size_t cub_group_slab_count = 0;
+    if (may_need_cub) cub_group_slab_count = analytic_zeros ? 2 : 1;
 
     // Clamp streams to the post-ref free-memory budget.
     // Per-stream pack buffers dominate; fewer streams reduce overlap only.
@@ -584,7 +593,8 @@ static void ovo_streaming_csr_host_impl(
                   (size_t)max_pack_sb_cols)  // ref tie
             +
             (may_need_cub
-                 ? max_sub_items * window_value_bytes      // grp sorted
+                 ? cub_group_slab_count * max_sub_items *
+                           window_value_bytes              // grp sorted/nz
                        + (size_t)max_pack_K * sizeof(int)  // sort ids
                        + 2 * (size_t)max_pack_kernel_seg * sizeof(int)  // segs
                        + cub_grp_bytes  // cub temp
@@ -603,6 +613,7 @@ static void ovo_streaming_csr_host_impl(
         int* d_pack_stats_codes;
         float* d_grp_dense;
         float* d_grp_sorted;
+        float* d_grp_nz;
         double* d_ref_tie_sums;
         int* d_sort_group_ids;
         int* d_grp_seg_offsets;
@@ -630,12 +641,15 @@ static void ovo_streaming_csr_host_impl(
             bufs[s].d_grp_seg_offsets = pool.alloc<int>(max_pack_kernel_seg);
             bufs[s].d_grp_seg_ends = pool.alloc<int>(max_pack_kernel_seg);
             bufs[s].cub_temp = pool.alloc<uint8_t>(cub_grp_bytes);
+            bufs[s].d_grp_nz =
+                analytic_zeros ? pool.alloc<float>(max_sub_items) : nullptr;
         } else {
             bufs[s].d_grp_sorted = nullptr;
             bufs[s].d_sort_group_ids = nullptr;
             bufs[s].d_grp_seg_offsets = nullptr;
             bufs[s].d_grp_seg_ends = nullptr;
             bufs[s].cub_temp = nullptr;
+            bufs[s].d_grp_nz = nullptr;
         }
     }
 
@@ -654,11 +668,11 @@ static void ovo_streaming_csr_host_impl(
         OvoTierPlan pack_t1 = make_ovo_tier_plan(h_grp_offsets + pack.first, K);
         int pack_tpb_rank = round_up_to_warp(
             std::min(pack_t1.max_grp_size, MAX_THREADS_PER_BLOCK));
-        // HUGE skips groups MEDIUM already handled (≤ OVO_MEDIUM_MAX).
-        int pack_huge_skip_le = OVO_MEDIUM_MAX;
+        int pack_huge_skip_le = pack_t1.huge_skip_le;
         std::vector<int> h_sort_group_ids;
         int pack_n_sort_groups = K;
-        if (pack_t1.above_medium && !pack_t1.run_large) {
+        bool pack_run_huge = compute_tie_corr && pack_t1.run_huge;
+        if (pack_run_huge) {
             h_sort_group_ids = make_sort_group_ids(h_grp_offsets + pack.first,
                                                    K, pack_huge_skip_le);
             pack_n_sort_groups = (int)h_sort_group_ids.size();
@@ -668,7 +682,7 @@ static void ovo_streaming_csr_host_impl(
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
 
-        if (pack_t1.above_medium && !pack_t1.run_large) {
+        if (pack_run_huge) {
             cudaMemcpyAsync(buf.d_sort_group_ids, h_sort_group_ids.data(),
                             h_sort_group_ids.size() * sizeof(int),
                             cudaMemcpyHostToDevice, stream);
@@ -775,12 +789,12 @@ static void ovo_streaming_csr_host_impl(
             OvoTierScratch sc{buf.d_ref_tie_sums,    buf.d_rank_sums,
                               buf.d_tie_corr,        buf.d_grp_sorted,
                               buf.d_grp_seg_offsets, buf.d_grp_seg_ends,
-                              buf.cub_temp};
+                              buf.cub_temp,          buf.d_grp_nz};
             ovo_dispatch_tiers(ref_sub, buf.d_grp_dense, buf.d_pack_grp_offsets,
                                pack_t1, sc, buf.d_sort_group_ids,
                                pack_n_sort_groups, cub_grp_bytes, sb_items,
                                pack_tpb_rank, n_ref, pack_rows, sb_cols, K,
-                               compute_tie_corr, stream);
+                               compute_tie_corr, analytic_zeros, stream);
 
             scatter_cols_2d(d_rank_sums + (size_t)pack.first * n_cols + col,
                             buf.d_rank_sums, K, n_cols, sb_cols, stream);
