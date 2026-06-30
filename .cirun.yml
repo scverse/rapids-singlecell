@@ -3,8 +3,8 @@ runners:
   - name: aws-gpu-runner-g5
     cloud: aws
     instance_type: g5.xlarge
-    machine_image: ami-067a4ba2816407ee9
-    region: eu-north-1
+    machine_image: ami-0f07c7f3983ea4561
+    region: eu-west-1
     preemptible:
       - true
       - false
@@ -14,8 +14,8 @@ runners:
   - name: aws-gpu-runner-g4dn
     cloud: aws
     instance_type: g4dn.xlarge
-    machine_image: ami-067a4ba2816407ee9
-    region: eu-north-1
+    machine_image: ami-0f07c7f3983ea4561
+    region: eu-west-1
     preemptible:
       - true
       - false
