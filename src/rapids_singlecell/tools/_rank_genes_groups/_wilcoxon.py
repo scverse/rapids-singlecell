@@ -1230,6 +1230,7 @@ def _run_ovo_host_sparse(
             compute_tie_corr=tie_correct,
             compute_nnz=compute_nnz,
             sub_batch_cols=OVO_HOST_SPARSE_SUB_BATCH,
+            analytic_zeros=not rg._sparse_negative_fallback,
         )
     else:
         X.sort_indices()
@@ -1254,6 +1255,7 @@ def _run_ovo_host_sparse(
             compute_nnz=compute_nnz,
             compute_sums=compute_sums,
             sub_batch_cols=OVO_HOST_SPARSE_SUB_BATCH,
+            analytic_zeros=not rg._sparse_negative_fallback,
         )
 
     logfoldchanges_gpu = _finish_ovo_sparse_stats(

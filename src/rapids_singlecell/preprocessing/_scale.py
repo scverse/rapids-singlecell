@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
 import cupy as cp
 import dask
@@ -22,9 +22,12 @@ from rapids_singlecell.preprocessing._utils import (
     _sparse_to_dense,
 )
 
+if TYPE_CHECKING:
+    from rapids_singlecell._utils import ArrayTypesDask
+
 
 def scale(
-    data: AnnData,
+    data: AnnData | ArrayTypesDask,
     *,
     zero_center: bool = True,
     max_value: float | None = None,
@@ -40,7 +43,9 @@ def scale(
     Parameters
     ----------
         data
-            AnnData object
+            The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
+            to cells and columns to genes. If a matrix is passed instead of an
+            :class:`~anndata.AnnData` object, the scaled matrix is returned.
 
         zero_center
             If `False`, omit zero-centering variables, which allows to handle sparse
@@ -51,7 +56,8 @@ def scale(
 
         copy
             Whether this function should be performed inplace. If an AnnData object
-            is passed, this also determines if a copy is returned.
+            is passed, this also determines if a copy is returned. Only applies to
+            :class:`~anndata.AnnData` input.
 
         layer
             If provided, which element of layers to scale.
@@ -65,23 +71,39 @@ def scale(
             or a string referring to an array in :attr:`~anndata.AnnData.obs`. If the matrix is in csc format and a mask is provided, the matrix will be transformed to csr format.
 
         inplace
-            If True, update AnnData with results. Otherwise, return results. See below for details of what is returned.
+            If True, update AnnData with results. Otherwise, return results. See below for details of what is returned. For matrix input the scaled matrix is always returned.
 
 
     Returns
     -------
-    Returns a scaled copy or updates `adata` with a scaled version of the original :attr:`~anndata.AnnData.X` and `adata.layers['layer']`, \
-    depending on `inplace`.
+    Returns a scaled copy or updates `data` with a scaled version of the original :attr:`~anndata.AnnData.X` and `data.layers['layer']`, \
+    depending on `inplace`. If a matrix is passed, the scaled matrix is returned.
 
     """
+    if not isinstance(data, AnnData):
+        if layer is not None or obsm is not None:
+            raise ValueError(
+                "`layer` and `obsm` can only be used with an AnnData object."
+            )
+        X = data
+        _check_gpu_X(X, allow_dask=True)
+        mask_obs = _check_mask(X, mask_obs, "obs")
+        X, _, _ = _scale_dispatch(
+            X,
+            mask_obs=mask_obs,
+            zero_center=zero_center,
+            inplace=inplace,
+            max_value=max_value,
+        )
+        return X
+
     adata = data
     if copy:
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
         adata = adata.copy()
 
-    if isinstance(adata, AnnData):
-        view_to_actual(adata)
+    view_to_actual(adata)
 
     X = _get_obs_rep(adata, layer=layer, obsm=obsm)
     _check_gpu_X(X, allow_dask=True)
@@ -94,39 +116,13 @@ def scale(
             str_mean_std = ("mean with mask", "std with mask")
         mask_obs = _check_mask(adata, mask_obs, "obs")
 
-    if isinstance(X, DaskArray):
-        X, means, std = _scale_dask(
-            X,
-            mask_obs=mask_obs,
-            zero_center=zero_center,
-            inplace=inplace,
-            max_value=max_value,
-        )
-
-    elif isinstance(X, cp.ndarray):
-        X, means, std = _scale_array(
-            X,
-            mask_obs=mask_obs,
-            zero_center=zero_center,
-            inplace=inplace,
-            max_value=max_value,
-        )
-    elif isinstance(X, sparse.csr_matrix):
-        X, means, std = _scale_sparse_csr(
-            X,
-            mask_obs=mask_obs,
-            zero_center=zero_center,
-            inplace=inplace,
-            max_value=max_value,
-        )
-    elif isinstance(X, sparse.csc_matrix):
-        X, means, std = _scale_sparse_csc(
-            X,
-            mask_obs=mask_obs,
-            zero_center=zero_center,
-            inplace=inplace,
-            max_value=max_value,
-        )
+    X, means, std = _scale_dispatch(
+        X,
+        mask_obs=mask_obs,
+        zero_center=zero_center,
+        inplace=inplace,
+        max_value=max_value,
+    )
 
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
@@ -137,6 +133,43 @@ def scale(
         return adata
     elif not inplace:
         return X
+
+
+def _scale_dispatch(X, *, mask_obs, zero_center, inplace, max_value):
+    if isinstance(X, DaskArray):
+        return _scale_dask(
+            X,
+            mask_obs=mask_obs,
+            zero_center=zero_center,
+            inplace=inplace,
+            max_value=max_value,
+        )
+    elif isinstance(X, cp.ndarray):
+        return _scale_array(
+            X,
+            mask_obs=mask_obs,
+            zero_center=zero_center,
+            inplace=inplace,
+            max_value=max_value,
+        )
+    elif isinstance(X, sparse.csr_matrix):
+        return _scale_sparse_csr(
+            X,
+            mask_obs=mask_obs,
+            zero_center=zero_center,
+            inplace=inplace,
+            max_value=max_value,
+        )
+    elif isinstance(X, sparse.csc_matrix):
+        return _scale_sparse_csc(
+            X,
+            mask_obs=mask_obs,
+            zero_center=zero_center,
+            inplace=inplace,
+            max_value=max_value,
+        )
+    else:
+        raise TypeError(f"Unsupported array type for scaling: {type(X)}")
 
 
 def _scale_array(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=None):
