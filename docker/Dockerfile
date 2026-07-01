@@ -1,7 +1,5 @@
 FROM rapids-singlecell-deps
 
-ARG GIT_ID=main
-
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ENV PATH=/opt/conda/bin:$PATH
@@ -12,14 +10,12 @@ ENV PATH=/opt/conda/bin:$PATH
 ENV CMAKE_PREFIX_PATH=/opt/conda
 ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;100-real;120"
 
+COPY --from=source . /src/rapids_singlecell
+
 RUN <<EOF
 # install rapids_singlecell from source (compiled for all supported GPU architectures)
 set -x
-mkdir /src
-cd /src
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
-git checkout ${GIT_ID}
+cd /src/rapids_singlecell
 # Set CUDA architectures directly in pyproject.toml (avoids SKBUILD_CMAKE_ARGS semicolon splitting)
 sed -i 's/CMAKE_CUDA_ARCHITECTURES = "native"/CMAKE_CUDA_ARCHITECTURES = "'"${CUDA_ARCHS}"'"/' pyproject.toml
 grep CMAKE_CUDA_ARCHITECTURES pyproject.toml
