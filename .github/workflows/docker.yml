@@ -101,6 +101,17 @@ jobs:
         with:
           ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
 
+      - name: Set source package version
+        id: source-version
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0.dev0+g$(git rev-parse --short=12 HEAD)"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+        shell: bash
+
       - name: Set pending status on PR
         if: github.event_name == 'issue_comment'
         run: |
@@ -142,8 +153,9 @@ jobs:
           labels: ${{ steps.meta-base.outputs.labels }}
           build-args: |
             CUDA_VER=${{ matrix.CUDA_SUFFIX.ver }}
-            GIT_ID=${{ github.event.pull_request.head.sha || github.sha }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-deps
+          build-contexts: |
+            source=.
 
       - name: Generate artifact attestation for base image
         if: github.event_name == 'release'
@@ -171,10 +183,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CUDA_ARCHS=${{ matrix.CUDA_SUFFIX.label == 'cuda12' && '75-real;80-real;86-real;89-real;90' || '75-real;80-real;86-real;89-real;90-real;100-real;120' }}
-            GIT_ID=${{ github.event.pull_request.head.sha || github.sha }}
+            SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RAPIDS_SINGLECELL=${{ steps.source-version.outputs.version }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}
           build-contexts: |
             rapids-singlecell-deps=docker-image://${{ fromJSON(steps.meta-base.outputs.json).tags[0] }}
+            source=.
 
       - name: Generate artifact attestation for main image
         if: github.event_name == 'release'
