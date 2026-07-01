@@ -6,14 +6,13 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 from anndata import AnnData
-from cuml.internals.input_utils import sparse_scipy_to_cp
 from cupyx.scipy.sparse import issparse as cpissparse
 from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.get import _check_mask, _get_obs_rep
+from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
 from ._utils import _check_gpu_X
 
@@ -404,7 +403,7 @@ def _as_numpy(X):
 def _run_covariance_pca(X, n_comps, zero_center):
     """Run PCA using covariance matrix eigendecomposition."""
     if issparse(X):
-        X = sparse_scipy_to_cp(X, dtype=X.dtype)
+        X = X_to_GPU(X)
     from ._sparse_pca._sparse_pca import PCA_sparse
 
     if not isspmatrix_csr(X) and not isinstance(X, DaskArray):
@@ -429,7 +428,7 @@ def _run_sparse_svd_pca(
 ):
     """Run PCA using SVD solvers (lanczos, randomized)."""
     if issparse(X):
-        X = sparse_scipy_to_cp(X, dtype=X.dtype)
+        X = X_to_GPU(X)
     from ._sparse_pca._sparse_svd_pca import PCA_sparse_svd
 
     if not isspmatrix_csr(X):
