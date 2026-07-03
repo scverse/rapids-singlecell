@@ -10,7 +10,7 @@ runners:
       - false
     labels:
       - cirun-aws-gpu-a10
-  # T4 for stable (cu12). scverse-standard AMI, eu-west-1.
+  # T4 for stable (cu13). scverse-standard AMI, eu-west-1.
   - name: aws-gpu-runner-g4dn
     cloud: aws
     instance_type: g4dn.xlarge

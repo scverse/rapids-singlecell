@@ -39,13 +39,13 @@ jobs:
           enable-cache: false
       - id: get-envs
         run: |
-          # Stable (cu12 -> T4) and dev (cu13 -> A10) environments
+          # Stable + dev, all cu13 (stable -> T4, dev -> A10)
           STABLE_DEV_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
               select(.key | startswith("hatch-test"))
               | select(
-                ((.key | contains("stable")) and (.key | endswith("12")))
+                ((.key | contains("stable")) and (.key | endswith("13")))
                 or ((.key | contains("dev")) and (.key | endswith("13")))
               )
               | {
