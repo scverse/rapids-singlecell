@@ -10,12 +10,12 @@ runners:
       - false
     labels:
       - cirun-aws-gpu-a10
-  # T4 for stable (cu12). Old AMI, eu-north-1.
+  # T4 for stable (cu12). scverse-standard AMI, eu-west-1.
   - name: aws-gpu-runner-g4dn
     cloud: aws
     instance_type: g4dn.xlarge
-    machine_image: ami-067a4ba2816407ee9
-    region: eu-north-1
+    machine_image: ami-0756bd122da9b2618
+    region: eu-west-1
     preemptible:
       - true
       - false
