@@ -1,9 +1,9 @@
 runners:
-  # A10G for dev + prerelease (cu13). New AMI, eu-west-1.
+  # A10G for dev + prerelease (cu13). scverse-standard AMI, eu-west-1.
   - name: aws-gpu-runner-g5
     cloud: aws
     instance_type: g5.xlarge
-    machine_image: ami-0f07c7f3983ea4561
+    machine_image: ami-0756bd122da9b2618
     region: eu-west-1
     preemptible:
       - true
