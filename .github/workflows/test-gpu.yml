@@ -39,26 +39,32 @@ jobs:
           enable-cache: false
       - id: get-envs
         run: |
-          # Stable and dev environments
+          # Stable (cu12 -> T4) and dev (cu13 -> A10) environments
           STABLE_DEV_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
-              select(.key | startswith("hatch-test") and endswith("12") and (contains("prerelease") | not))
+              select(.key | startswith("hatch-test"))
+              | select(
+                ((.key | contains("stable")) and (.key | endswith("12")))
+                or ((.key | contains("dev")) and (.key | endswith("13")))
+              )
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
+                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4" else "cirun-aws-gpu-a10" end),
               }
             )')
           echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
 
-          # Prerelease environments
+          # Prerelease environments (cu13 -> A10)
           PRERELEASE_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
-              select(.key | startswith("hatch-test") and endswith("12") and contains("prerelease"))
+              select(.key | startswith("hatch-test") and endswith("13") and contains("prerelease"))
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
+                runner: "cirun-aws-gpu-a10",
               }
             )')
           echo "prerelease=${PRERELEASE_JSON}" | tee -a $GITHUB_OUTPUT
@@ -66,7 +72,7 @@ jobs:
   test-stable-dev:
     name: Test (${{ matrix.env.name }})
     needs: get-envs
-    runs-on: cirun-aws-gpu
+    runs-on: ${{ matrix.env.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -128,7 +134,7 @@ jobs:
   test-prerelease:
     name: Test (${{ matrix.env.name }})
     needs: get-envs
-    runs-on: cirun-aws-gpu
+    runs-on: ${{ matrix.env.runner }}
     timeout-minutes: 30
     continue-on-error: true  # Prerelease failures don't fail the workflow
     strategy:
