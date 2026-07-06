@@ -80,7 +80,9 @@ def normalize_total(
 
     _check_gpu_X(X, allow_dask=True)
 
-    if not inplace:
+    if X.dtype.kind in "iu":
+        X = X.astype(cp.float32)
+    elif not inplace:
         X = X.copy()
 
     if sparse.isspmatrix_csc(X):
