@@ -422,9 +422,9 @@ def log1p(
         X = X.copy()
 
     X = _calc_log1p(X, base=base)
-    adata.uns["log1p"] = {"base": base}
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
+        adata.uns["log1p"] = {"base": base}
 
     if copy:
         return adata

@@ -126,8 +126,9 @@ def scale(
 
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
-        adata.var[str_mean_std[0]] = means.get()
-        adata.var[str_mean_std[1]] = std.get()
+        if obsm is None:
+            adata.var[str_mean_std[0]] = means.get()
+            adata.var[str_mean_std[1]] = std.get()
 
     if copy:
         return adata

@@ -122,6 +122,19 @@ def test_scale_promotes_dense_integers(dtype):
     assert adata.X.dtype == cp.float64
     cp.testing.assert_allclose(adata.X, X_centered_original)
 
+def test_scale_obsm_does_not_write_var_statistics():
+    adata = AnnData(cp.ones((3, 4), dtype=cp.float32))
+    adata.obsm["X_embedding"] = cp.array([[1, 2], [2, 4], [3, 6]], dtype=cp.float32)
+
+    rsc.pp.scale(adata, obsm="X_embedding")
+
+    cp.testing.assert_allclose(
+        adata.obsm["X_embedding"],
+        cp.array([[-1, -1], [0, 0], [1, 1]], dtype=cp.float32),
+    )
+    assert "mean" not in adata.var
+    assert "std" not in adata.var
+
 
 @pytest.mark.parametrize(
     "typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
