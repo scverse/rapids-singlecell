@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Literal, Union, get_args
 
 import cupy as cp
@@ -63,8 +64,18 @@ class Aggregate:
     ) -> None:
         self.mask = mask
         self.groupby = cp.array(groupby.codes, dtype=cp.int32)
-        self.n_cells = cp.array(cp.bincount(self.groupby), dtype=cp.float64).reshape(
-            -1, 1
+        weights = None
+        if mask is not None:
+            weights = cp.asarray(mask, dtype=cp.float64)
+        self.n_cells = (
+            cp.bincount(
+                self.groupby, weights=weights, minlength=len(groupby.categories)
+            )
+            .astype(cp.float64, copy=False)
+            .reshape(
+                -1,
+                1,
+            )
         )
         if data.dtype.kind != "f" and not isinstance(data, DaskArray):
             data = data.astype(cp.float32, copy=False)
@@ -264,6 +275,16 @@ class Aggregate:
         """
 
         assert dof >= 0
+        undefined_mean = "mean" in funcs and bool(cp.any(self.n_cells == 0))
+        undefined_var = "var" in funcs and bool(cp.any(self.n_cells <= dof))
+        if undefined_mean or undefined_var:
+            warnings.warn(
+                "Sparse output cannot represent undefined mean or variance values "
+                "at implicit-zero entries. These entries remain zero; use "
+                "`return_sparse=False` to represent them as NaN.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
         from ._kernels._aggr_elementwise import (
             _scatter_count_nonzero,
             _scatter_mean_var,

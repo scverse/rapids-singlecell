@@ -96,6 +96,8 @@ class PseudobulkMetric(BaseMetric):
         :func:`rapids_singlecell.get.aggregate`, which handles those formats
         natively.
         """
+        if self.layer_key == "X":
+            return adata.X
         if self.layer_key is not None:
             return adata.layers[self.layer_key]
         return adata.obsm[self.obsm_key]
