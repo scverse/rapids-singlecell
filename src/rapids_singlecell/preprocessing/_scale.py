@@ -137,6 +137,8 @@ def scale(
 
 
 def _scale_dispatch(X, *, mask_obs, zero_center, inplace, max_value):
+    if X.dtype.kind in "iu":
+        X = X.astype(cp.float64)
     if isinstance(X, DaskArray):
         return _scale_dask(
             X,
