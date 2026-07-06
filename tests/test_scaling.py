@@ -113,6 +113,16 @@ def test_scale_simple(dtype):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_scale_promotes_dense_integers(dtype):
+    adata = AnnData(cp.array(X_original, dtype=dtype))
+
+    rsc.pp.scale(adata)
+
+    assert adata.X.dtype == cp.float64
+    cp.testing.assert_allclose(adata.X, X_centered_original)
+
+
 @pytest.mark.parametrize(
     "typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
 )

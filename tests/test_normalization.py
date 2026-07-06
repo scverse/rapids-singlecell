@@ -27,6 +27,18 @@ def test_normalize_total(dtype, sparse):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_normalize_total_promotes_dense_integers(dtype):
+    cudata = AnnData(cp.array([[1, 1], [2, 4]], dtype=dtype))
+
+    rsc.pp.normalize_total(cudata, target_sum=10)
+
+    assert cudata.X.dtype == cp.float32
+    cp.testing.assert_allclose(
+        cudata.X.sum(axis=1), cp.full(cudata.n_obs, 10, dtype=cp.float32)
+    )
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_normalize_total_layers(dtype):
     cudata = AnnData(csr_matrix(X_total, dtype=dtype))
