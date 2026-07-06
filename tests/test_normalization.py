@@ -158,6 +158,17 @@ def test_log1p_base(use_array, dtype, sparse, base):
         assert cudata.uns["log1p"]["base"] == base
 
 
+def test_log1p_inplace_false_does_not_write_metadata():
+    X = cp.array([[1.0, 2.0], [3.0, 4.0]], dtype=cp.float32)
+    adata = AnnData(X.copy())
+
+    result = rsc.pp.log1p(adata, inplace=False)
+
+    cp.testing.assert_array_equal(adata.X, X)
+    cp.testing.assert_allclose(result, cp.log1p(X))
+    assert "log1p" not in adata.uns
+
+
 @pytest.mark.parametrize("use_array", [False, True])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("sparse", [True, False])
