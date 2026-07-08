@@ -27,6 +27,18 @@ def test_normalize_total(dtype, sparse):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_normalize_total_promotes_dense_integers(dtype):
+    cudata = AnnData(cp.array([[1, 1], [2, 4]], dtype=dtype))
+
+    rsc.pp.normalize_total(cudata, target_sum=10)
+
+    assert cudata.X.dtype == cp.float32
+    cp.testing.assert_allclose(
+        cudata.X.sum(axis=1), cp.full(cudata.n_obs, 10, dtype=cp.float32)
+    )
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_normalize_total_layers(dtype):
     cudata = AnnData(csr_matrix(X_total, dtype=dtype))
@@ -156,6 +168,17 @@ def test_log1p_base(use_array, dtype, sparse, base):
     cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
     if not use_array:
         assert cudata.uns["log1p"]["base"] == base
+
+
+def test_log1p_inplace_false_does_not_write_metadata():
+    X = cp.array([[1.0, 2.0], [3.0, 4.0]], dtype=cp.float32)
+    adata = AnnData(X.copy())
+
+    result = rsc.pp.log1p(adata, inplace=False)
+
+    cp.testing.assert_array_equal(adata.X, X)
+    cp.testing.assert_allclose(result, cp.log1p(X))
+    assert "log1p" not in adata.uns
 
 
 @pytest.mark.parametrize("use_array", [False, True])

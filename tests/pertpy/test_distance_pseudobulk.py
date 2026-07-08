@@ -171,7 +171,14 @@ def test_pseudobulk_multi_gpu_falls_back_with_warning(
 
 @pytest.mark.parametrize(
     "input_kind",
-    ["obsm_numpy", "obsm_dataframe", "layer_dense", "layer_sparse"],
+    [
+        "X_dense",
+        "X_sparse",
+        "obsm_numpy",
+        "obsm_dataframe",
+        "layer_dense",
+        "layer_sparse",
+    ],
 )
 def test_pseudobulk_input_variants(input_kind: str) -> None:
     rng = np.random.default_rng(7)
@@ -182,7 +189,13 @@ def test_pseudobulk_input_variants(input_kind: str) -> None:
     adata = AnnData(X.copy(), obs=obs)
 
     layer_key, obsm_key = None, None
-    if input_kind == "obsm_numpy":
+    if input_kind == "X_dense":
+        adata.X = cp.asarray(X)
+        layer_key = "X"
+    elif input_kind == "X_sparse":
+        adata.X = sparse.csr_matrix(X)
+        layer_key = "X"
+    elif input_kind == "obsm_numpy":
         adata.obsm["X_pca"] = X.copy()
         obsm_key = "X_pca"
     elif input_kind == "obsm_dataframe":

@@ -91,6 +91,38 @@ def test_mask(axis):
 
 
 @pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
+def test_masked_mean_var(array_type):
+    X = np.array(
+        [
+            [1, 2],
+            [3, 6],
+            [100, 100],
+            [2, 4],
+            [4, 8],
+            [200, 200],
+        ],
+        dtype=np.float32,
+    )
+    obs = pd.DataFrame(
+        {
+            "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
+            "mask": [True, True, False, True, True, False],
+        }
+    )
+    adata = ad.AnnData(X=array_type(X), obs=obs)
+    rsc.get.anndata_to_GPU(adata)
+
+    result = rsc.get.aggregate(adata, by="group", func=["mean", "var"], mask="mask")
+
+    cp.testing.assert_allclose(
+        result.layers["mean"], cp.array([[2, 4], [3, 6]], dtype=cp.float64)
+    )
+    cp.testing.assert_allclose(
+        result.layers["var"], cp.array([[2, 8], [2, 8]], dtype=cp.float64)
+    )
+
+
+@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
 @pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero"])
 def test_aggregate_vs_pandas(metric, array_type):
     adata = pbmc3k_processed().raw.to_adata()
@@ -349,17 +381,28 @@ def test_sparse_vs_dense(metric):
     rsc.get.anndata_to_GPU(adata)
     mask = adata.obs.louvain == "Megakaryocytes"
     rsc_get = rsc.get.aggregate(adata, by="louvain", func=metric, mask=mask)
-    rsc_get_sparse = rsc.get.aggregate(
-        adata,
-        by="louvain",
-        func=metric,
-        mask=mask,
-        return_sparse=True,
-    )
+    kwargs = {
+        "by": "louvain",
+        "func": metric,
+        "mask": mask,
+        "return_sparse": True,
+    }
+    if metric in {"mean", "var"}:
+        with pytest.warns(RuntimeWarning, match="implicit-zero entries"):
+            rsc_get_sparse = rsc.get.aggregate(adata, **kwargs)
+    else:
+        rsc_get_sparse = rsc.get.aggregate(adata, **kwargs)
 
     a = rsc_get_sparse.layers[metric].toarray()
     b = rsc_get.layers[metric]
-    cp.testing.assert_allclose(a, b)
+    if metric in {"mean", "var"}:
+        selected_group = np.flatnonzero(
+            rsc_get.obs["louvain"].to_numpy() == "Megakaryocytes"
+        )
+        cp.testing.assert_allclose(a[selected_group], b[selected_group])
+        assert cp.any(a[cp.isnan(b)] == 0)
+    else:
+        cp.testing.assert_allclose(a, b)
 
 
 def test_c_contiguous_vs_fortran_contiguous():
