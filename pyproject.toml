@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    "scikit-build-core>=0.10",
+    "scikit-build-core>=1.0.1",
     "nanobind>=2.0.0",
     "setuptools-scm>=8",
     # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.

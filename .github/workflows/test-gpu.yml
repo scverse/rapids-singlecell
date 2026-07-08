@@ -56,7 +56,7 @@ jobs:
             )')
           echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
 
-          # Prerelease environments (cu13 -> A10)
+          # Prerelease environments (cu13 -> T4; only dev runs on A10)
           PRERELEASE_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
@@ -64,7 +64,7 @@ jobs:
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
-                runner: "cirun-aws-gpu-a10",
+                runner: "cirun-aws-gpu-t4",
               }
             )')
           echo "prerelease=${PRERELEASE_JSON}" | tee -a $GITHUB_OUTPUT
