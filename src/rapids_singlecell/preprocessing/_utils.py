@@ -63,7 +63,7 @@ def _sanitize_column(adata: AnnData, column: str):
         adata.obs[column] = c
 
 
-def _mean_var_major(X, major, minor):
+def _mean_var_major(X, major, minor, *, correction=1):
     from rapids_singlecell._cuda import _mean_var_cuda as _mv
 
     mean = cp.zeros(major, dtype=cp.float64)
@@ -81,11 +81,11 @@ def _mean_var_major(X, major, minor):
     mean = mean / minor
     var = var / minor
     var -= cp.power(mean, 2)
-    var *= minor / (minor - 1)
+    var *= minor / (minor - correction)
     return mean, var
 
 
-def _mean_var_minor(X, major, minor):
+def _mean_var_minor(X, major, minor, *, correction=1):
     from rapids_singlecell._cuda import _mean_var_cuda as _mv
 
     mean = cp.zeros(minor, dtype=cp.float64)
@@ -101,11 +101,11 @@ def _mean_var_minor(X, major, minor):
     mean /= major
     var /= major
     var -= mean**2
-    var *= major / (major - 1)
+    var *= major / (major - correction)
     return mean, var
 
 
-def _mean_var_minor_dask(X, major, minor):
+def _mean_var_minor_dask(X, major, minor, *, correction=1):
     """
     Implements sum operation for dask array when the backend is cupy sparse csr matrix
     """
@@ -135,12 +135,12 @@ def _mean_var_minor_dask(X, major, minor):
     ).sum(axis=0)
     mean /= major
     var /= major
-    var = (var - mean**2) * (major / (major - 1))
+    var = (var - mean**2) * (major / (major - correction))
     return mean, var
 
 
 # todo: Implement this dynamically for csc matrix as well
-def _mean_var_major_dask(X, major, minor):
+def _mean_var_major_dask(X, major, minor, *, correction=1):
     """
     Implements sum operation for dask array when the backend is cupy sparse csr matrix
     """
@@ -173,11 +173,11 @@ def _mean_var_major_dask(X, major, minor):
     mean = mean / minor
     var = var / minor
     var -= mean**2
-    var *= minor / (minor - 1)
+    var *= minor / (minor - correction)
     return mean, var
 
 
-def _mean_var_dense_dask(X, axis):
+def _mean_var_dense_dask(X, axis, *, correction=1):
     """
     Implements sum operation for dask array when the backend is cupy dense matrix
     """
@@ -209,11 +209,11 @@ def _mean_var_dense_dask(X, axis):
     mean = mean / X.shape[axis]
     var = var / X.shape[axis]
     var -= mean**2
-    var *= X.shape[axis] / (X.shape[axis] - 1)
+    var *= X.shape[axis] / (X.shape[axis] - correction)
     return mean, var
 
 
-def _mean_var_dense(X, axis):
+def _mean_var_dense(X, axis, *, correction=1):
     from ._kernels._mean_var_kernel import mean_sum, sq_sum
 
     var = sq_sum(X, axis=axis)
@@ -221,30 +221,30 @@ def _mean_var_dense(X, axis):
     mean = mean / X.shape[axis]
     var = var / X.shape[axis]
     var -= cp.power(mean, 2)
-    var *= X.shape[axis] / (X.shape[axis] - 1)
+    var *= X.shape[axis] / (X.shape[axis] - correction)
     return mean, var
 
 
-def _get_mean_var(X, axis=0):
+def _get_mean_var(X, axis=0, *, correction=1):
     if issparse(X):
         if axis == 0:
             if isspmatrix_csr(X):
                 major = X.shape[0]
                 minor = X.shape[1]
-                mean, var = _mean_var_minor(X, major, minor)
+                mean, var = _mean_var_minor(X, major, minor, correction=correction)
             elif isspmatrix_csc(X):
                 major = X.shape[1]
                 minor = X.shape[0]
-                mean, var = _mean_var_major(X, major, minor)
+                mean, var = _mean_var_major(X, major, minor, correction=correction)
         elif axis == 1:
             if isspmatrix_csr(X):
                 major = X.shape[0]
                 minor = X.shape[1]
-                mean, var = _mean_var_major(X, major, minor)
+                mean, var = _mean_var_major(X, major, minor, correction=correction)
             elif isspmatrix_csc(X):
                 major = X.shape[1]
                 minor = X.shape[0]
-                mean, var = _mean_var_minor(X, major, minor)
+                mean, var = _mean_var_minor(X, major, minor, correction=correction)
         else:
             raise ValueError("axis must be either 0 or 1")
     elif isinstance(X, DaskArray):
@@ -252,19 +252,19 @@ def _get_mean_var(X, axis=0):
             if axis == 0:
                 major = X.shape[0]
                 minor = X.shape[1]
-                mean, var = _mean_var_minor_dask(X, major, minor)
+                mean, var = _mean_var_minor_dask(X, major, minor, correction=correction)
             if axis == 1:
                 major = X.shape[0]
                 minor = X.shape[1]
-                mean, var = _mean_var_major_dask(X, major, minor)
+                mean, var = _mean_var_major_dask(X, major, minor, correction=correction)
         elif isinstance(X._meta, cp.ndarray):
-            mean, var = _mean_var_dense_dask(X, axis)
+            mean, var = _mean_var_dense_dask(X, axis, correction=correction)
         else:
             raise ValueError(
                 "Type not supported. Please provide a CuPy ndarray or a CuPy sparse matrix. Or a Dask array with a CuPy ndarray or a CuPy sparse matrix as meta."
             )
     else:
-        mean, var = _mean_var_dense(X, axis)
+        mean, var = _mean_var_dense(X, axis, correction=correction)
     return mean, var
 
 

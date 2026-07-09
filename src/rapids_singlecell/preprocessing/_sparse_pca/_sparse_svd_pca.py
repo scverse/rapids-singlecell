@@ -65,6 +65,7 @@ class PCA_sparse_svd:
         n_oversamples: int = 10,
         n_iter: int | None = None,
         random_state: int | None = 0,
+        offset: cp.ndarray | None = None,
     ) -> None:
         self.n_components = n_components
         self.svd_solver = svd_solver
@@ -72,6 +73,9 @@ class PCA_sparse_svd:
         self.n_oversamples = n_oversamples
         self.n_iter = n_iter
         self.random_state = random_state
+        # Optional per-cell offset (CLR centering term); applied via the operator
+        # and the transform as a rank-1 composite, never densified.
+        self.offset_ = offset
 
     def fit(self, X: spmatrix) -> Self:
         """
@@ -104,12 +108,16 @@ class PCA_sparse_svd:
         if self.zero_center:
             self.mean_, _ = _get_mean_var(X, axis=0)
             self.mean_ = self.mean_.astype(X.dtype)
+            if self.offset_ is not None:
+                # Centering M = X - r·1ᵀ shifts every gene mean by mean(r).
+                self.offset_ = self.offset_.astype(X.dtype)
+                self.mean_ = self.mean_ - self.offset_.mean().astype(X.dtype)
         else:
             self.mean_ = None
 
         # Create operator (centered or raw)
         if self.zero_center:
-            X_op = mean_centered_operator(X, self.mean_)
+            X_op = mean_centered_operator(X, self.mean_, row_offset=self.offset_)
         else:
             X_op = X
 
@@ -121,7 +129,9 @@ class PCA_sparse_svd:
         self.explained_variance_ = (S**2) / (self.n_samples_ - 1)
 
         # Compute total variance for variance ratio
-        if self.zero_center:
+        if self.zero_center and self.offset_ is not None:
+            total_variance = self._total_variance_with_offset(X)
+        elif self.zero_center:
             _, var_x = _get_mean_var(X, axis=0)
             total_variance = cp.sum(var_x)
         else:
@@ -133,6 +143,20 @@ class PCA_sparse_svd:
         self.explained_variance_ratio_ = self.explained_variance_ / total_variance
 
         return self
+
+    def _total_variance_with_offset(self, X) -> cp.ndarray:
+        """Total variance of the centered M = X - r·1ᵀ, without densifying.
+
+        ``‖M‖_F² = ‖X‖_F² - 2·Σ rᵢ·rowsumᵢ(X) + n_features·Σ rᵢ²`` and
+        ``total_var = (‖M‖_F² - n·‖mean_M‖²) / (n - 1)`` (``self.mean_`` already
+        carries the ``-mean(r)`` shift).
+        """
+        r = self.offset_
+        x_norm2 = cp.sum(X.data**2) if hasattr(X, "data") else cp.sum(X**2)
+        row_sums = cp.asarray(X.sum(axis=1)).ravel()
+        m_norm2 = x_norm2 - 2.0 * cp.dot(r, row_sums) + X.shape[1] * cp.dot(r, r)
+        n = self.n_samples_
+        return (m_norm2 - n * cp.dot(self.mean_, self.mean_)) / (n - 1)
 
     def _run_svd(self, X_op):
         """Run the selected SVD solver."""
@@ -176,6 +200,10 @@ class PCA_sparse_svd:
             X_transformed = X.dot(self.components_.T)
             mean_projection = cp.dot(self.mean_, self.components_.T)
             X_transformed -= mean_projection
+            if self.offset_ is not None:
+                # Per-cell offset impact: r ⊗ (V·1), the row-sum of each component.
+                v_sum = self.components_.sum(axis=1)
+                X_transformed -= self.offset_[:, None] * v_sum[None, :]
             return X_transformed
         else:
             return X.dot(self.components_.T)
