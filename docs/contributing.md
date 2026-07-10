@@ -29,10 +29,14 @@ this range; override only if your toolkit defines the enum with `-DRSC_SKIP_CUDA
 ### Clone and install
 
 ```bash
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
+git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
+cd rapids-singlecell
 (uv) pip install -e ".[test]"
 ```
+
+The documentation notebooks live in a Git submodule. If the repository was
+already cloned without `--recurse-submodules`, initialize them with
+`git submodule update --init` before building the documentation.
 
 The editable install compiles the CUDA kernels for your local GPU architecture.
 After the install, compiled `.so` modules and `.pyi` type stubs are placed in `src/rapids_singlecell/_cuda/`.

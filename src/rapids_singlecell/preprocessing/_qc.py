@@ -41,7 +41,7 @@ def calculate_qc_metrics(
             The kind of thing the variables are.
         qc_vars
             Keys for boolean columns of :attr:`~anndata.AnnData.var` which identify variables you could want to control for (e.g. Mito).
-            Run flag_gene_family first
+            Create these boolean columns before calculating QC metrics.
         log1p
             Set to `False` to skip computing `log1p` transformed annotations.
         layer
