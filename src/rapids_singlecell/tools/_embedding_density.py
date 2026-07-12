@@ -32,22 +32,23 @@ def embedding_density(
     the same category.
     This function was written by Sophie Tritschler and implemented into
     Scanpy by Malte Luecken.
+
     Parameters
     ----------
-        adata
-            The annotated data matrix.
-        basis
-            The embedding over which the density will be calculated. This embedded
-            representation should be found in `adata.obsm['X_[basis]']``.
-        groupby
-            Key for categorical observation/cell annotation for which densities
-            are calculated per category.
-        key_added
-            Name of the `.obs` covariate that will be added with the density
-            estimates.
-        components
-            The embedding dimensions over which the density should be calculated.
-            This is limited to two components.
+    adata
+        The annotated data matrix.
+    basis
+        The embedding over which the density will be calculated. This embedded
+        representation should be found in `adata.obsm['X_[basis]']`.
+    groupby
+        Key for categorical observation/cell annotation for which densities
+        are calculated per category.
+    key_added
+        Name of the `.obs` covariate that will be added with the density
+        estimates.
+    components
+        The embedding dimensions over which the density should be calculated.
+        This is limited to two components.
 
     Returns
     -------

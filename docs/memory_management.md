@@ -5,18 +5,21 @@ This is facilitated by the integration of the RAPIDS Memory Manager ({mod}`rmm`)
 Integrating {mod}`rmm` with `rapids-singlecell` slightly modifies the execution speed of {mod}`cupy`. This change typically results in a minimal performance trade-off.
 However, it's crucial to be aware that certain specific functions, like {func}`~.pp.harmony_integrate`, might experience a more significant impact on performance efficiency due to this integration.
 Users can overwrite the default behavior with {func}`rmm.reinitialize`.
+Configure RMM before creating GPU arrays; reinitializing while earlier RMM
+allocations are still alive results in undefined behavior.
 
 ## Quick start
 
-Pick one mode based on your dataset and hardware:
+For the common cases, pick one mode based on your dataset and hardware:
 
 - If your data fits in GPU VRAM: use the pool allocator for speed → see [Pool Allocator](#pool-allocator).
 - If your data is larger than VRAM: use managed memory to spill to host RAM → see [Managed Memory](#managed-memory).
 
-Why not both? Pool allocation and managed memory target different trade-offs.
-Pooling assumes you keep data in VRAM and optimizes allocation speed.
-Managed memory assumes you will exceed VRAM and optimizes for correctness by spilling to host RAM.
-Combining both can negate benefits and increase fragmentation, so choose one.
+RMM also supports a pool backed by managed memory. This can reduce allocation
+overhead while retaining oversubscription, but it requires deliberate
+`initial_pool_size` and `maximum_pool_size` values. In particular, the maximum
+must be large enough to grow beyond VRAM if oversubscription is required.
+Managed memory remains incompatible with NVLink.
 
 ## Managed Memory
 
@@ -59,7 +62,7 @@ To achieve optimal memory management in rapids-singlecell, consider the followin
 
 * **Large-scale Data Analysis:** Utilize `managed_memory` for datasets exceeding your VRAM's capacity, keeping in mind the potential performance penalties.
 * **Performance-Critical Operations:** Choose `pool_allocator` when speed is critical and sufficient VRAM is available.
-* **Do not enable both together:** Pooling prefers staying in VRAM; managed memory prefers spilling when needed. Mixing them can lead to unexpected performance and memory fragmentation.
+* **Advanced managed-memory pool:** Combining `managed_memory=True` and `pool_allocator=True` is supported, but size the pool explicitly and benchmark it for the workload.
 
 ### Troubleshooting
 
@@ -81,5 +84,8 @@ Ensure your system has a CUDA-capable GPU with sufficient VRAM for your datasets
 For larger datasets, use {mod}`~rmm` managed memory to oversubscribe GPU memory to host RAM (similar to SWAP).
 This may introduce a performance penalty but can still outperform CPU-only runs. See the Managed Memory section above for how to enable it.
 
-Limit note: For GPU-backed {class}`~anndata.AnnData`, the upper limit is governed by the sparse matrix `.nnz` value of 2**31-1 (2,147,483,647).
-This is due to the maximum `indptr` size currently supported by {mod}`~cupy` for sparse matrices.
+Limit note: CuPy sparse matrices normally use 32-bit `indices` and `indptr`,
+which limits a single matrix or Dask block to at most 2**31-1
+(2,147,483,647) explicitly stored values. rapids-singlecell kernels support
+64-bit sparse indices, but high-level use still depends on CuPy preserving
+those index buffers. Row-chunked Dask arrays avoid the per-block limit.

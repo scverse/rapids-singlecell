@@ -9,6 +9,8 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 import anndata  # noqa
 import fast_array_utils  # noqa
+from docutils import nodes
+from docutils.parsers.rst import roles
 
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
@@ -29,7 +31,7 @@ title = "GPU accelerated single cell analysis"
 author = info["Author"]
 copyright = f"{datetime.now():%Y}, {author}"
 version = info["Version"]
-repository_url = "https://github.com/scverse/rapids_singlecell"
+repository_url = "https://github.com/scverse/rapids-singlecell"
 
 # The full version, including alpha/beta/rc tags
 release = info["Version"]
@@ -140,6 +142,18 @@ exclude_patterns = [
     "release-notes/blank.md",
 ]
 
+# These DOI records are valid, but their publishers reject automated link checks.
+linkcheck_ignore = [
+    r"https://doi\.org/10\.1002/spe\.4380211102",
+    r"https://doi\.org/10\.1073/pnas\.0500334102",
+    r"https://doi\.org/10\.1093/bioinformatics/btv325",
+    r"https://doi\.org/10\.1093/bioinformatics/btw777",
+    r"https://doi\.org/10\.1093/bioadv/vbac016",
+    r"https://doi\.org/10\.1093/bioinformatics/bty1044",
+    r"https://doi\.org/10\.1093/bioinformatics/btz625",
+    r"https://doi\.org/10\.1177/10943420231179699",
+]
+
 
 # -- Options for HTML output -------------------------------------------------
 
@@ -186,7 +200,8 @@ nitpick_ignore = [
 
 def setup(app: Sphinx) -> None:
     """App setup hook."""
-    app.warningiserror = True
+    app.add_role("small", roles.GenericRole("small", nodes.inline))
+    app.add_role("smaller", roles.GenericRole("smaller", nodes.inline))
     app.add_config_value(
         "recommonmark_config",
         default={
@@ -202,6 +217,6 @@ def setup(app: Sphinx) -> None:
 
 # extlinks config
 extlinks = {
-    "issue": ("https://github.com/scverse/rapids_singlecell/issues/%s", "issue%s"),
-    "pr": ("https://github.com/scverse/rapids_singlecell/pull/%s", "pr%s"),
+    "issue": ("https://github.com/scverse/rapids-singlecell/issues/%s", "issue%s"),
+    "pr": ("https://github.com/scverse/rapids-singlecell/pull/%s", "pr%s"),
 }
