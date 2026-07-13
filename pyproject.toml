@@ -1,13 +1,14 @@
 [build-system]
 requires = [
-    "scikit-build-core>=1.0.1",
+    "hatchling",
+    "scikit-build-core[hatchling]>=1.0.1",
+    "hatch-vcs",
     "nanobind>=2.0.0",
-    "setuptools-scm>=8",
     # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.
     # 25.12+ provides the resource-ref API and flat RMM header path we use.
     "librmm-cu12>=25.12",
 ]
-build-backend = "scikit_build_core.build"
+build-backend = "hatchling.build"
 
 [project]
 name = "rapids-singlecell"
@@ -143,27 +144,32 @@ markers = [
     "array_api: array-API tests (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
 ]
 
-[tool.setuptools_scm]
-write_to = "src/rapids_singlecell/_version.py"
-# Optional but useful:
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
 version_scheme = "guess-next-dev"
 local_scheme = "node-and-date"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/rapids_singlecell/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = [ "src/rapids_singlecell", "src/testing" ]
+exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
+
+[tool.hatch.build.targets.wheel.hooks.scikit-build]
 
 [tool.scikit-build]
 # Use limited ABI wheels (one wheel for all Python minor versions on one platform)
 wheel.py-api = "cp312"
-wheel.packages = [ "src/rapids_singlecell", "src/testing" ]
-wheel.exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
 cmake.version = ">=3.24"
 cmake.build-type = "Release"
 ninja.version = ">=1.10"
-experimental = false
 # Default: use native arch for source builds (auto-detect user's GPU)
 # CI overrides via SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES env var
 cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
 build-dir = "build"
-metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
-sdist.include = [ "src/rapids_singlecell/_version.py" ]
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]

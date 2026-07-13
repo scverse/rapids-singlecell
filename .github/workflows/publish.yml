@@ -112,8 +112,8 @@ jobs:
           rmm_build_req = f'    "librmm-cu{cuda}>=25.12,<25.13",\n'
           if f'"librmm-cu{cuda}>=25.12"' not in build_system_text:
               build_system_text = build_system_text.replace(
-                  ']\nbuild-backend = "scikit_build_core.build"',
-                  f'{rmm_build_req}]\nbuild-backend = "scikit_build_core.build"',
+                  ']\nbuild-backend =',
+                  f'{rmm_build_req}]\nbuild-backend =',
                   1,
               )
           text = build_system_text + "[project]" + project_text
