@@ -1,11 +1,3 @@
-```{eval-rst}
-.. role:: small
-```
-
-```{eval-rst}
-.. role:: smaller
-```
-
 ```{include} basic.md
 ```
 
@@ -45,6 +37,6 @@ contributing.md
 :maxdepth: 1
 
 acknowledgements.md
-GitHub <https://github.com/scverse/rapids_singlecell>
+GitHub <https://github.com/scverse/rapids-singlecell>
 Discourse <https://discourse.scverse.org/c/help/rsc/48>
 ```

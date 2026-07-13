@@ -19,4 +19,5 @@ notebooks/05_pertpy
 notebooks/06_out-of-core
 notebooks/07_multi_gpu
 notebooks/brain_1M
+notebooks/ligrec_benchmark
 ```
