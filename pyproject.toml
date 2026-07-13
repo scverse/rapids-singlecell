@@ -37,7 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 rapids-cu13 = [
-    "cupy-cuda13x",
+    "cupy-cuda13x[ctk]",
     "cudf-cu13>=25.12",
     "cuml-cu13>=25.12",
     "cugraph-cu13>=25.12",
@@ -45,7 +45,7 @@ rapids-cu13 = [
     "librmm-cu13>=25.12",
 ]
 rapids-cu12 = [
-    "cupy-cuda12x",
+    "cupy-cuda12x[ctk]",
     "cudf-cu12>=25.12",
     "cuml-cu12>=25.12",
     "cugraph-cu12>=25.12",
