@@ -28,6 +28,6 @@ grep CMAKE_CUDA_ARCHITECTURES pyproject.toml
 # errors on both cu12 (toolkit older than the latest librmm) and cu13 (wrong
 # cu12 variant). Install the PEP 517 backend deps first since isolation is off;
 # the conda env already provides the librmm/rapids_logger headers + cmake config.
-/opt/conda/bin/python -m pip install --no-cache-dir scikit-build-core nanobind setuptools-scm cmake ninja
+/opt/conda/bin/python -m pip install --no-cache-dir hatchling 'scikit-build-core[hatchling]' hatch-vcs nanobind cmake ninja
 /opt/conda/bin/python -m pip install --no-cache-dir --no-build-isolation -e .
 EOF
