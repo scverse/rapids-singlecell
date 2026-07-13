@@ -50,21 +50,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get version from setuptools-scm
+      - name: Get version from hatch-vcs
         id: version
         run: |
-          pip install setuptools-scm
-          VERSION=$(python -m setuptools_scm)
+          pip install hatchling hatch-vcs
+          VERSION=$(python -m hatchling version)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Detected version: $VERSION"
 
       - name: Set package name, extras, and CUDA archs for CUDA ${{ matrix.cuda_major }}
         run: |
-          python3 - ${{ matrix.cuda_major }} "${{ matrix.cuda_archs }}" <<'SCRIPT'
+          python3 - ${{ matrix.cuda_major }} "${{ matrix.cuda_archs }}" "${{ steps.version.outputs.version }}" <<'SCRIPT'
           import sys, pathlib
 
           cuda = sys.argv[1]
           cuda_archs = sys.argv[2]
+          version = sys.argv[3]
           other = "13" if cuda == "12" else "12"
           path = pathlib.Path("pyproject.toml")
           text = path.read_text()
@@ -89,6 +90,10 @@ jobs:
           text = text.replace(
               'name = "rapids-singlecell"',
               f'name = "rapids-singlecell-cu{cuda}"',
+          )
+          text = text.replace(
+              'dynamic = [ "version" ]',
+              f'version = "{version}"',
           )
           # Rename matching extra to "rapids", remove the other
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
@@ -140,12 +145,10 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.4.1
         env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
           CIBW_BUILD: 'cp312-*'
           CIBW_SKIP: '*-musllinux*'
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.os == 'linux-intel' && matrix.cibw_image || '' }}
           CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.os == 'linux-arm' && matrix.cibw_image || '' }}
-          CIBW_ENVIRONMENT_PASS_LINUX: SETUPTOOLS_SCM_PRETEND_VERSION
           CIBW_ENVIRONMENT: >
             CUDA_PATH=/usr/local/cuda
             LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
