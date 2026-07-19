@@ -26,26 +26,24 @@ def _array_result_to_records(
 ) -> np.ndarray:
     group_names = tuple(str(name) for name in arrays["group_names"])
     values = np.asarray(arrays[field])
-    out = np.empty(
-        values.shape[1],
-        dtype=[(group_name, np.dtype(dtype)) for group_name in group_names],
+    record_dtype = np.dtype(
+        [(group_name, np.dtype(dtype)) for group_name in group_names]
     )
-    for row, group_name in enumerate(group_names):
-        out[group_name] = values[row]
-    return out
+    if values.shape[1] == 0:
+        return np.empty(0, dtype=record_dtype)
+    record_matrix = np.ascontiguousarray(values.T, dtype=dtype)
+    return np.ndarray(values.shape[1], dtype=record_dtype, buffer=record_matrix)
 
 
 def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
     group_names = tuple(str(name) for name in arrays["group_names"])
-    var_names = np.asarray(arrays["var_names"])
+    var_names = np.asarray(arrays["var_names"], dtype=object)
     gene_indices = np.asarray(arrays["gene_indices"], dtype=np.intp)
-    out = np.empty(
-        gene_indices.shape[1],
-        dtype=[(group_name, object) for group_name in group_names],
-    )
-    for row, group_name in enumerate(group_names):
-        out[group_name] = var_names[gene_indices[row]]
-    return out
+    record_dtype = np.dtype([(group_name, object) for group_name in group_names])
+    if gene_indices.shape[1] == 0:
+        return np.empty(0, dtype=record_dtype)
+    record_matrix = np.ascontiguousarray(np.take(var_names, gene_indices.T))
+    return np.ndarray(gene_indices.shape[1], dtype=record_dtype, buffer=record_matrix)
 
 
 def rank_genes_groups(
@@ -67,6 +65,7 @@ def rank_genes_groups(
     return_u_values: bool = False,
     layer: str | None = None,
     chunk_size: int | None = None,
+    multi_gpu: bool | list[int] | str | None = False,
     n_bins: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
     skip_empty_groups: bool = False,
@@ -76,10 +75,10 @@ def rank_genes_groups(
     Rank genes for characterizing groups using GPU acceleration.
 
     Log1p/log-normalized data is expected for biologically meaningful log fold
-    changes. In-memory sparse ``wilcoxon`` inputs with explicit negative values
-    use sign-safe dense ranking in the CUDA sparse streamers, materializing
-    bounded dense tiles inside the nanobind path. Dense inputs are ranked
-    directly and support any sign.
+    changes. Exact sparse ``wilcoxon`` versus rest ranks signed stored values
+    and implicit zeros directly. Sparse ``wilcoxon`` with an explicit reference
+    uses sign-safe dense ranking in bounded CUDA streamer tiles. Dense inputs
+    are ranked directly and support any sign.
     (``wilcoxon_binned`` rejects negative Dask sparse input, which it cannot
     bin correctly.)
 
@@ -161,6 +160,12 @@ def rank_genes_groups(
         `'wilcoxon_binned'`. Default is 512 for `'wilcoxon'`. For
         `'wilcoxon_binned'` the default is sized dynamically based on
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
+    multi_gpu
+        GPU selection for host-resident `'wilcoxon'` input. ``False`` uses
+        the current GPU (default), ``None`` or ``True`` uses all available
+        GPUs, a list selects GPU IDs, and a string supplies comma-separated GPU IDs.
+        Multi-GPU execution supports NumPy dense and SciPy CSR/CSC input;
+        device-resident input continues to use its owning GPU.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000
@@ -238,6 +243,10 @@ def rank_genes_groups(
         msg = "return_u_values is only supported for method='wilcoxon'."
         raise ValueError(msg)
 
+    if multi_gpu is not False and method != "wilcoxon":
+        msg = "multi_gpu is only supported for method='wilcoxon'."
+        raise ValueError(msg)
+
     if chunk_size is not None and chunk_size <= 0:
         msg = "chunk_size must be a positive integer."
         raise ValueError(msg)
@@ -283,6 +292,7 @@ def rank_genes_groups(
         use_continuity=use_continuity,
         return_u_values=return_u_values,
         chunk_size=chunk_size,
+        multi_gpu=multi_gpu,
         n_bins=n_bins,
         bin_range=bin_range,
         **kwds,

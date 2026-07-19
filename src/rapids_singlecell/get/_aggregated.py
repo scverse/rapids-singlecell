@@ -263,6 +263,7 @@ class Aggregate:
             n_cells=self.data.shape[0],
             n_genes=n_genes,
             is_csc=self.data.format == "csc",
+            stream=cp.cuda.get_current_stream().ptr,
         )
         return self._build_result(
             funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
@@ -425,6 +426,7 @@ class Aggregate:
             n_cells=self.data.shape[0],
             n_genes=n_genes,
             is_fortran=self.data.flags.f_contiguous,
+            stream=cp.cuda.get_current_stream().ptr,
         )
         return self._build_result(
             funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof

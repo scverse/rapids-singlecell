@@ -129,14 +129,13 @@ template <typename T>
 static void launch_ovr_rank_dense_host_streaming(
     const T* h_X, bool f_order, const int* group_codes, double* rank_sums,
     double* tie_corr, double* group_sums, double* group_nnz, double* total_sums,
-    double* total_nnz, int n_rows, int n_cols, int n_groups,
-    bool compute_tie_corr, bool compute_nnz, bool compute_totals,
+    double* total_nnz, int n_rows, int input_n_cols, int col_start, int n_cols,
+    int n_groups, bool compute_tie_corr, bool compute_nnz, bool compute_totals,
     int sub_batch_cols) {
     if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
-    const bool compute_stats = group_sums != nullptr;
     compute_nnz = compute_nnz && (group_nnz != nullptr);
-    compute_totals = compute_stats && compute_totals && (total_sums != nullptr);
+    compute_totals = compute_totals && (total_sums != nullptr);
     // F-order float32 input feeds the sort directly (no cast/transpose buffer).
     const bool fast_keys = f_order && std::is_same<T, float>::value;
 
@@ -159,8 +158,7 @@ static void launch_ovr_rank_dense_host_streaming(
         cub_temp_bytes + (size_t)(sub_batch_cols + 1) * sizeof(int) +
         (size_t)n_groups * sub_batch_cols * sizeof(double) +
         (size_t)sub_batch_cols * sizeof(double) +
-        (compute_stats ? (size_t)n_groups * sub_batch_cols * sizeof(double)
-                       : 0) +
+        (size_t)n_groups * sub_batch_cols * sizeof(double) +
         (compute_nnz ? (size_t)n_groups * sub_batch_cols * sizeof(double) : 0) +
         (compute_totals ? (size_t)sub_batch_cols * sizeof(double) : 0) +
         (compute_totals && compute_nnz ? (size_t)sub_batch_cols * sizeof(double)
@@ -170,10 +168,6 @@ static void launch_ovr_rank_dense_host_streaming(
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
-    // Best-effort pin for faster async H2D; on failure proceed unpinned.
-    HostRegisterGuard _pin(const_cast<T*>(h_X),
-                           (size_t)n_rows * n_cols * sizeof(T), 0,
-                           /*best_effort=*/true);
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
 
     struct StreamBuf {
@@ -204,9 +198,7 @@ static void launch_ovr_rank_dense_host_streaming(
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_tie_corr = pool.alloc<double>(sub_batch_cols);
         bufs[s].sub_group_sums =
-            compute_stats
-                ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
-                : nullptr;
+            pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_group_nnz =
             compute_nnz ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
                         : nullptr;
@@ -235,14 +227,14 @@ static void launch_ovr_rank_dense_host_streaming(
 
         // H2D the column window (overlaps the prior batch rank).
         if (f_order) {
-            cudaMemcpyAsync(buf.d_stg, h_X + (size_t)col * n_rows,
+            cudaMemcpyAsync(buf.d_stg, h_X + (size_t)(col_start + col) * n_rows,
                             (size_t)sb_items * sizeof(T),
                             cudaMemcpyHostToDevice, stream);
         } else {
-            cudaMemcpy2DAsync(buf.d_stg, (size_t)sb_cols * sizeof(T), h_X + col,
-                              (size_t)n_cols * sizeof(T),
-                              (size_t)sb_cols * sizeof(T), n_rows,
-                              cudaMemcpyHostToDevice, stream);
+            cudaMemcpy2DAsync(
+                buf.d_stg, (size_t)sb_cols * sizeof(T), h_X + col_start + col,
+                (size_t)input_n_cols * sizeof(T), (size_t)sb_cols * sizeof(T),
+                n_rows, cudaMemcpyHostToDevice, stream);
         }
 
         const float* keys_in;
@@ -299,47 +291,43 @@ static void launch_ovr_rank_dense_host_streaming(
 
         // Group sums (+nnz) for means/pts, f64 from native staging (matches
         // the Aggregate path).
-        if (compute_stats) {
-            cudaMemsetAsync(buf.sub_group_sums, 0,
+        cudaMemsetAsync(buf.sub_group_sums, 0,
+                        (size_t)n_groups * sb_cols * sizeof(double), stream);
+        if (compute_nnz) {
+            cudaMemsetAsync(buf.sub_group_nnz, 0,
                             (size_t)n_groups * sb_cols * sizeof(double),
                             stream);
+        }
+        if (compute_totals) {
+            cudaMemsetAsync(buf.sub_total_sums, 0, sb_cols * sizeof(double),
+                            stream);
             if (compute_nnz) {
-                cudaMemsetAsync(buf.sub_group_nnz, 0,
-                                (size_t)n_groups * sb_cols * sizeof(double),
+                cudaMemsetAsync(buf.sub_total_nnz, 0, sb_cols * sizeof(double),
                                 stream);
             }
-            if (compute_totals) {
-                cudaMemsetAsync(buf.sub_total_sums, 0, sb_cols * sizeof(double),
-                                stream);
-                if (compute_nnz) {
-                    cudaMemsetAsync(buf.sub_total_nnz, 0,
-                                    sb_cols * sizeof(double), stream);
-                }
-            }
-            dense_group_accumulate_kernel<T>
-                <<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
-                    buf.d_stg, group_codes, buf.sub_group_sums,
-                    compute_nnz ? buf.sub_group_nnz : buf.sub_group_sums,
-                    buf.sub_total_sums,
-                    compute_nnz ? buf.sub_total_nnz : buf.sub_total_sums,
-                    n_rows, sb_cols, n_groups, f_order, compute_nnz,
-                    compute_totals);
-            CUDA_CHECK_LAST_ERROR(dense_group_accumulate_kernel);
-            scatter_cols_2d(group_sums + col, buf.sub_group_sums, n_groups,
+        }
+        dense_group_accumulate_kernel<T>
+            <<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
+                buf.d_stg, group_codes, buf.sub_group_sums,
+                compute_nnz ? buf.sub_group_nnz : buf.sub_group_sums,
+                buf.sub_total_sums,
+                compute_nnz ? buf.sub_total_nnz : buf.sub_total_sums, n_rows,
+                sb_cols, n_groups, f_order, compute_nnz, compute_totals);
+        CUDA_CHECK_LAST_ERROR(dense_group_accumulate_kernel);
+        scatter_cols_2d(group_sums + col, buf.sub_group_sums, n_groups, n_cols,
+                        sb_cols, stream);
+        if (compute_nnz) {
+            scatter_cols_2d(group_nnz + col, buf.sub_group_nnz, n_groups,
                             n_cols, sb_cols, stream);
+        }
+        if (compute_totals) {
+            cudaMemcpyAsync(total_sums + col, buf.sub_total_sums,
+                            sb_cols * sizeof(double), cudaMemcpyDeviceToDevice,
+                            stream);
             if (compute_nnz) {
-                scatter_cols_2d(group_nnz + col, buf.sub_group_nnz, n_groups,
-                                n_cols, sb_cols, stream);
-            }
-            if (compute_totals) {
-                cudaMemcpyAsync(total_sums + col, buf.sub_total_sums,
+                cudaMemcpyAsync(total_nnz + col, buf.sub_total_nnz,
                                 sb_cols * sizeof(double),
                                 cudaMemcpyDeviceToDevice, stream);
-                if (compute_nnz) {
-                    cudaMemcpyAsync(total_nnz + col, buf.sub_total_nnz,
-                                    sb_cols * sizeof(double),
-                                    cudaMemcpyDeviceToDevice, stream);
-                }
             }
         }
 
@@ -410,7 +398,8 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
                       : 0) +
             (run_huge ? grp_cub_temp_bytes : 0) +
             (compute_tie_corr ? (size_t)sub_batch_cols * sizeof(double) : 0) +
-            2 * (size_t)n_groups * sub_batch_cols * sizeof(double);
+            (size_t)(1 + compute_tie_corr) * n_groups * sub_batch_cols *
+                sizeof(double);
         n_streams = clamp_streams_by_budget(n_streams, per_stream,
                                             rmm_available_device_bytes(0.8));
     }
@@ -459,7 +448,9 @@ static void launch_ovo_rank_dense_tiered_unsorted_ref(
         bufs[s].sub_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_tie_corr =
-            pool.alloc<double>((size_t)n_groups * sub_batch_cols);
+            compute_tie_corr
+                ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
+                : nullptr;
         if (run_huge) {
             bufs[s].grp_sorted = pool.alloc<float>(sub_grp_items);
             int max_seg = checked_int_product((size_t)n_sort_groups,
@@ -535,16 +526,11 @@ template <typename T>
 static void launch_ovo_rank_dense_host_streaming(
     const T* h_X, bool f_order, const int* h_ref_row_ids,
     const int* h_grp_row_ids, const int* h_grp_offsets, double* rank_sums,
-    double* tie_corr, double* group_sums, double* group_sum_sq,
-    double* group_nnz, int n_full_rows, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, int n_groups_stats, bool compute_tie_corr, bool compute_nnz,
-    bool compute_stats, int sub_batch_cols) {
+    double* tie_corr, double* group_sums, double* group_nnz, int n_full_rows,
+    int input_n_cols, int col_start, int n_ref, int n_all_grp, int n_cols,
+    int n_groups, bool compute_tie_corr, bool compute_nnz, int sub_batch_cols) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0 || n_groups == 0) return;
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
-    if (compute_stats && n_groups_stats != n_groups + 1) {
-        throw std::runtime_error(
-            "dense OVO host stats require n_groups_stats == n_groups + 1");
-    }
     if (h_grp_offsets[0] != 0 || h_grp_offsets[n_groups] != n_all_grp) {
         throw std::runtime_error(
             "dense OVO host group offsets must span n_all_grp");
@@ -600,10 +586,9 @@ static void launch_ovo_rank_dense_host_streaming(
                       : 0) +
             (run_huge ? grp_cub_temp_bytes : 0) +
             (compute_tie_corr ? (size_t)sub_batch_cols * sizeof(double) : 0) +
-            2 * (size_t)n_groups * sub_batch_cols * sizeof(double) +
-            (compute_stats
-                 ? 2 * (size_t)n_stats_rows * sub_batch_cols * sizeof(double)
-                 : 0) +
+            (size_t)(1 + compute_tie_corr) * n_groups * sub_batch_cols *
+                sizeof(double) +
+            (size_t)n_stats_rows * sub_batch_cols * sizeof(double) +
             (compute_nnz
                  ? (size_t)n_stats_rows * sub_batch_cols * sizeof(double)
                  : 0);
@@ -630,25 +615,21 @@ static void launch_ovo_rank_dense_host_streaming(
                    "dense host OVO sort group ids H2D");
     }
 
-    int* d_grp_codes = nullptr;
-    if (compute_stats) {
-        std::vector<int> h_grp_codes(n_all_grp, -1);
-        for (int g = 0; g < n_groups; g++) {
-            int begin = h_grp_offsets[g];
-            int end = h_grp_offsets[g + 1];
-            if (begin < 0 || end < begin || end > n_all_grp) {
-                throw std::runtime_error(
-                    "dense OVO host group offsets are invalid");
-            }
-            std::fill(h_grp_codes.begin() + begin, h_grp_codes.begin() + end,
-                      g);
+    std::vector<int> h_grp_codes(n_all_grp, -1);
+    for (int g = 0; g < n_groups; g++) {
+        int begin = h_grp_offsets[g];
+        int end = h_grp_offsets[g + 1];
+        if (begin < 0 || end < begin || end > n_all_grp) {
+            throw std::runtime_error(
+                "dense OVO host group offsets are invalid");
         }
-        d_grp_codes = pool.alloc<int>(n_all_grp);
-        cuda_check(
-            cudaMemcpy(d_grp_codes, h_grp_codes.data(),
-                       (size_t)n_all_grp * sizeof(int), cudaMemcpyHostToDevice),
-            "dense host OVO group codes H2D");
+        std::fill(h_grp_codes.begin() + begin, h_grp_codes.begin() + end, g);
     }
+    int* d_grp_codes = pool.alloc<int>(n_all_grp);
+    cuda_check(
+        cudaMemcpy(d_grp_codes, h_grp_codes.data(),
+                   (size_t)n_all_grp * sizeof(int), cudaMemcpyHostToDevice),
+        "dense host OVO group codes H2D");
 
     struct StreamBuf {
         T* ref_native;
@@ -666,7 +647,6 @@ static void launch_ovo_rank_dense_host_streaming(
         double* sub_rank_sums;
         double* sub_tie_corr;
         double* sub_group_sums;
-        double* sub_group_sum_sq;
         double* sub_group_nnz;
     };
     std::vector<StreamBuf> bufs(n_streams);
@@ -687,7 +667,9 @@ static void launch_ovo_rank_dense_host_streaming(
         bufs[s].sub_rank_sums =
             pool.alloc<double>((size_t)n_groups * sub_batch_cols);
         bufs[s].sub_tie_corr =
-            pool.alloc<double>((size_t)n_groups * sub_batch_cols);
+            compute_tie_corr
+                ? pool.alloc<double>((size_t)n_groups * sub_batch_cols)
+                : nullptr;
         if (run_huge) {
             bufs[s].grp_sorted = pool.alloc<float>(sub_grp_items);
             int max_seg = checked_int_product((size_t)n_sort_groups,
@@ -701,13 +683,7 @@ static void launch_ovo_rank_dense_host_streaming(
             bufs[s].grp_seg_ends = nullptr;
         }
         bufs[s].sub_group_sums =
-            compute_stats
-                ? pool.alloc<double>((size_t)n_stats_rows * sub_batch_cols)
-                : nullptr;
-        bufs[s].sub_group_sum_sq =
-            compute_stats
-                ? pool.alloc<double>((size_t)n_stats_rows * sub_batch_cols)
-                : nullptr;
+            pool.alloc<double>((size_t)n_stats_rows * sub_batch_cols);
         bufs[s].sub_group_nnz =
             compute_nnz
                 ? pool.alloc<double>((size_t)n_stats_rows * sub_batch_cols)
@@ -736,12 +712,12 @@ static void launch_ovo_rank_dense_host_streaming(
         T* h_ref_stage = stage.template get<0>(s);
         T* h_grp_stage = stage.template get<1>(s);
 
-        host_materialize_dense_rows_window(h_X, f_order, n_full_rows, n_cols,
-                                           h_ref_row_ids, n_ref, col, sb_cols,
-                                           h_ref_stage);
-        host_materialize_dense_rows_window(h_X, f_order, n_full_rows, n_cols,
-                                           h_grp_row_ids, n_all_grp, col,
-                                           sb_cols, h_grp_stage);
+        host_materialize_dense_rows_window(
+            h_X, f_order, n_full_rows, input_n_cols, h_ref_row_ids, n_ref,
+            col_start + col, sb_cols, h_ref_stage);
+        host_materialize_dense_rows_window(
+            h_X, f_order, n_full_rows, input_n_cols, h_grp_row_ids, n_all_grp,
+            col_start + col, sb_cols, h_grp_stage);
 
         cuda_check(cudaMemcpyAsync(buf.ref_native, h_ref_stage,
                                    (size_t)sb_ref_items_actual * sizeof(T),
@@ -811,38 +787,27 @@ static void launch_ovo_rank_dense_host_streaming(
                 "dense host OVO tie_corr D2D copy");
         }
 
-        if (compute_stats) {
+        cuda_check(cudaMemsetAsync(
+                       buf.sub_group_sums, 0,
+                       (size_t)n_stats_rows * sb_cols * sizeof(double), stream),
+                   "dense host OVO group sums memset");
+        if (compute_nnz) {
             cuda_check(
-                cudaMemsetAsync(buf.sub_group_sums, 0,
+                cudaMemsetAsync(buf.sub_group_nnz, 0,
                                 (size_t)n_stats_rows * sb_cols * sizeof(double),
                                 stream),
-                "dense host OVO group sums memset");
-            cuda_check(
-                cudaMemsetAsync(buf.sub_group_sum_sq, 0,
-                                (size_t)n_stats_rows * sb_cols * sizeof(double),
-                                stream),
-                "dense host OVO group sumsq memset");
-            if (compute_nnz) {
-                cuda_check(cudaMemsetAsync(
-                               buf.sub_group_nnz, 0,
-                               (size_t)n_stats_rows * sb_cols * sizeof(double),
-                               stream),
-                           "dense host OVO group nnz memset");
-            }
-            dense_ovo_group_stats_kernel<T><<<sb_cols, tpb, 0, stream>>>(
-                buf.ref_native, buf.grp_native, d_grp_codes, buf.sub_group_sums,
-                buf.sub_group_sum_sq,
-                compute_nnz ? buf.sub_group_nnz : buf.sub_group_sums, n_ref,
-                n_all_grp, sb_cols, n_groups, compute_nnz);
-            CUDA_CHECK_LAST_ERROR(dense_ovo_group_stats_kernel);
-            scatter_cols_2d(group_sums + col, buf.sub_group_sums, n_stats_rows,
+                "dense host OVO group nnz memset");
+        }
+        dense_ovo_group_stats_kernel<T><<<sb_cols, tpb, 0, stream>>>(
+            buf.ref_native, buf.grp_native, d_grp_codes, buf.sub_group_sums,
+            compute_nnz ? buf.sub_group_nnz : buf.sub_group_sums, n_ref,
+            n_all_grp, sb_cols, n_groups, compute_nnz);
+        CUDA_CHECK_LAST_ERROR(dense_ovo_group_stats_kernel);
+        scatter_cols_2d(group_sums + col, buf.sub_group_sums, n_stats_rows,
+                        n_cols, sb_cols, stream);
+        if (compute_nnz) {
+            scatter_cols_2d(group_nnz + col, buf.sub_group_nnz, n_stats_rows,
                             n_cols, sb_cols, stream);
-            scatter_cols_2d(group_sum_sq + col, buf.sub_group_sum_sq,
-                            n_stats_rows, n_cols, sb_cols, stream);
-            if (compute_nnz) {
-                scatter_cols_2d(group_nnz + col, buf.sub_group_nnz,
-                                n_stats_rows, n_cols, sb_cols, stream);
-            }
         }
 
         col += sb_cols;
@@ -862,11 +827,17 @@ static void def_ovr_rank_dense_host_streaming(nb::module_& m) {
            gpu_array_c<double, Device> group_sums,
            gpu_array_c<double, Device> group_nnz,
            gpu_array_c<double, Device> total_sums,
-           gpu_array_c<double, Device> total_nnz, int n_groups,
-           bool compute_tie_corr, bool compute_nnz, bool compute_stats,
-           bool compute_totals, int sub_batch_cols) {
+           gpu_array_c<double, Device> total_nnz, bool compute_tie_corr,
+           bool compute_nnz, bool compute_totals, int col_start, int col_stop,
+           int sub_batch_cols) {
             int n_rows = (int)X.shape(0);
-            int n_cols = (int)X.shape(1);
+            int input_n_cols = (int)X.shape(1);
+            if (col_stop < 0) col_stop = input_n_cols;
+            nb_require(col_start >= 0 && col_start <= col_stop &&
+                           col_stop <= input_n_cols,
+                       "ovr_rank_host: invalid input column range");
+            int n_cols = col_stop - col_start;
+            int n_groups = (int)rank_sums.shape(0);
             nb_require((int)group_codes.shape(0) == n_rows,
                        "ovr_rank_host: group_codes length must be n_rows");
             nb_require(
@@ -877,17 +848,19 @@ static void def_ovr_rank_dense_host_streaming(nb::module_& m) {
                        "ovr_rank_host: tie_corr length must be n_cols");
             launch_ovr_rank_dense_host_streaming<T>(
                 X.data(), FOrder, group_codes.data(), rank_sums.data(),
-                tie_corr.data(), compute_stats ? group_sums.data() : nullptr,
+                tie_corr.data(), group_sums.data(),
                 compute_nnz ? group_nnz.data() : nullptr,
                 compute_totals ? total_sums.data() : nullptr,
                 (compute_totals && compute_nnz) ? total_nnz.data() : nullptr,
-                n_rows, n_cols, n_groups, compute_tie_corr, compute_nnz,
-                compute_totals, sub_batch_cols);
+                n_rows, input_n_cols, col_start, n_cols, n_groups,
+                compute_tie_corr, compute_nnz, compute_totals, sub_batch_cols);
         },
         "X"_a, "group_codes"_a, "rank_sums"_a, "tie_corr"_a, "group_sums"_a,
         "group_nnz"_a, "total_sums"_a, "total_nnz"_a, nb::kw_only(),
-        "n_groups"_a, "compute_tie_corr"_a, "compute_nnz"_a, "compute_stats"_a,
-        "compute_totals"_a, "sub_batch_cols"_a = SUB_BATCH_COLS);
+        "compute_tie_corr"_a, "compute_nnz"_a, "compute_totals"_a,
+        "col_start"_a = 0, "col_stop"_a = -1,
+        "sub_batch_cols"_a = SUB_BATCH_COLS,
+        nb::call_guard<nb::gil_scoped_release>());
 }
 
 template <typename T, typename Device, typename HostArray, bool FOrder>
@@ -899,59 +872,57 @@ static void def_ovo_rank_dense_host_streaming(nb::module_& m) {
            gpu_array_c<double, Device> rank_sums,
            gpu_array_c<double, Device> tie_corr,
            gpu_array_c<double, Device> group_sums,
-           gpu_array_c<double, Device> group_sum_sq,
-           gpu_array_c<double, Device> group_nnz, int n_groups,
-           bool compute_tie_corr, bool compute_nnz, bool compute_stats,
-           int sub_batch_cols) {
+           gpu_array_c<double, Device> group_nnz, bool compute_tie_corr,
+           bool compute_nnz, int col_start, int col_stop, int sub_batch_cols) {
             int n_full_rows = (int)X.shape(0);
-            int n_cols = (int)X.shape(1);
+            int input_n_cols = (int)X.shape(1);
+            if (col_stop < 0) col_stop = input_n_cols;
+            nb_require(col_start >= 0 && col_start <= col_stop &&
+                           col_stop <= input_n_cols,
+                       "ovo_rank_host: invalid input column range");
+            int n_cols = col_stop - col_start;
             int n_ref = (int)ref_row_ids.shape(0);
             int n_all_grp = (int)grp_row_ids.shape(0);
+            nb_require(rank_sums.ndim() == 2,
+                       "ovo_rank_host: rank_sums must be 2D");
+            int n_groups = (int)rank_sums.shape(0);
             nb_require((int)grp_offsets.shape(0) == n_groups + 1,
                        "ovo_rank_host: grp_offsets length must be n_groups+1");
-            nb_require(rank_sums.ndim() == 2 && tie_corr.ndim() == 2,
-                       "ovo_rank_host: rank_sums/tie_corr must be 2D");
             nb_require((int)rank_sums.shape(0) == n_groups &&
                            (int)rank_sums.shape(1) == n_cols,
                        "ovo_rank_host: rank_sums shape must be "
                        "(n_groups, n_cols)");
-            nb_require((int)tie_corr.shape(0) == n_groups &&
-                           (int)tie_corr.shape(1) == n_cols,
-                       "ovo_rank_host: tie_corr shape must be "
-                       "(n_groups, n_cols)");
-            int n_groups_stats = compute_stats ? (int)group_sums.shape(0) : 0;
-            if (compute_stats) {
-                nb_require(group_sums.ndim() == 2 && group_sum_sq.ndim() == 2,
-                           "ovo_rank_host: stats outputs must be 2D");
-                nb_require(n_groups_stats == n_groups + 1 &&
-                               (int)group_sums.shape(1) == n_cols,
-                           "ovo_rank_host: group_sums shape must be "
+            nb_require(
+                has_ovo_tie_shape(tie_corr, n_groups, n_cols, compute_tie_corr),
+                "ovo_rank_host: tie_corr must be (n_groups, n_cols) "
+                "when enabled or length 1 when disabled");
+            int n_groups_stats = (int)group_sums.shape(0);
+            nb_require(group_sums.ndim() == 2,
+                       "ovo_rank_host: group_sums must be 2D");
+            nb_require(n_groups_stats == n_groups + 1 &&
+                           (int)group_sums.shape(1) == n_cols,
+                       "ovo_rank_host: group_sums shape must be "
+                       "(n_groups+1, n_cols)");
+            if (compute_nnz) {
+                nb_require(group_nnz.ndim() == 2 &&
+                               (int)group_nnz.shape(0) == n_groups + 1 &&
+                               (int)group_nnz.shape(1) == n_cols,
+                           "ovo_rank_host: group_nnz shape must be "
                            "(n_groups+1, n_cols)");
-                nb_require((int)group_sum_sq.shape(0) == n_groups + 1 &&
-                               (int)group_sum_sq.shape(1) == n_cols,
-                           "ovo_rank_host: group_sum_sq shape must be "
-                           "(n_groups+1, n_cols)");
-                if (compute_nnz) {
-                    nb_require(group_nnz.ndim() == 2 &&
-                                   (int)group_nnz.shape(0) == n_groups + 1 &&
-                                   (int)group_nnz.shape(1) == n_cols,
-                               "ovo_rank_host: group_nnz shape must be "
-                               "(n_groups+1, n_cols)");
-                }
             }
             launch_ovo_rank_dense_host_streaming<T>(
                 X.data(), FOrder, ref_row_ids.data(), grp_row_ids.data(),
-                grp_offsets.data(), rank_sums.data(), tie_corr.data(),
-                compute_stats ? group_sums.data() : nullptr,
-                compute_stats ? group_sum_sq.data() : nullptr,
-                compute_nnz ? group_nnz.data() : nullptr, n_full_rows, n_ref,
-                n_all_grp, n_cols, n_groups, n_groups_stats, compute_tie_corr,
-                compute_nnz, compute_stats, sub_batch_cols);
+                grp_offsets.data(), rank_sums.data(),
+                compute_tie_corr ? tie_corr.data() : nullptr, group_sums.data(),
+                compute_nnz ? group_nnz.data() : nullptr, n_full_rows,
+                input_n_cols, col_start, n_ref, n_all_grp, n_cols, n_groups,
+                compute_tie_corr, compute_nnz, sub_batch_cols);
         },
         "X"_a, "ref_row_ids"_a, "grp_row_ids"_a, "grp_offsets"_a, "rank_sums"_a,
-        "tie_corr"_a, "group_sums"_a, "group_sum_sq"_a, "group_nnz"_a,
-        nb::kw_only(), "n_groups"_a, "compute_tie_corr"_a, "compute_nnz"_a,
-        "compute_stats"_a, "sub_batch_cols"_a = SUB_BATCH_COLS);
+        "tie_corr"_a, "group_sums"_a, "group_nnz"_a, nb::kw_only(),
+        "compute_tie_corr"_a, "compute_nnz"_a, "col_start"_a = 0,
+        "col_stop"_a = -1, "sub_batch_cols"_a = SUB_BATCH_COLS,
+        nb::call_guard<nb::gil_scoped_release>());
 }
 
 template <typename Device>
@@ -981,52 +952,49 @@ void register_bindings(nb::module_& m) {
            gpu_array_f<const float, Device> grp_data,
            gpu_array_c<const int, Device> grp_offsets,
            gpu_array_c<double, Device> rank_sums,
-           gpu_array_c<double, Device> tie_corr, int n_ref, int n_all_grp,
-           int n_cols, int n_groups, bool compute_tie_corr, int sub_batch_cols,
-           std::uintptr_t stream) {
+           gpu_array_c<double, Device> tie_corr, bool compute_tie_corr,
+           int sub_batch_cols, std::uintptr_t stream) {
             nb_require(ref_data.ndim() == 2 && grp_data.ndim() == 2 &&
-                           rank_sums.ndim() == 2 && tie_corr.ndim() == 2 &&
-                           grp_offsets.ndim() == 1,
-                       "ovo_rank: data/outputs must be 2D, grp_offsets 1D");
-            nb_require((int)ref_data.shape(0) == n_ref &&
-                           (int)ref_data.shape(1) == n_cols,
-                       "ovo_rank: ref_data shape must be (n_ref, n_cols)");
-            nb_require((int)grp_data.shape(0) == n_all_grp &&
-                           (int)grp_data.shape(1) == n_cols,
+                           rank_sums.ndim() == 2 && grp_offsets.ndim() == 1,
+                       "ovo_rank: data/rank_sums must be 2D, grp_offsets 1D");
+            int n_ref = (int)ref_data.shape(0);
+            int n_all_grp = (int)grp_data.shape(0);
+            int n_cols = (int)ref_data.shape(1);
+            int n_groups = (int)rank_sums.shape(0);
+            nb_require((int)grp_data.shape(1) == n_cols,
                        "ovo_rank: grp_data shape must be (n_all_grp, n_cols)");
             nb_require((int)grp_offsets.shape(0) >= n_groups + 1,
                        "ovo_rank: grp_offsets length must be >= n_groups + 1");
             nb_require((int)rank_sums.shape(0) == n_groups &&
                            (int)rank_sums.shape(1) == n_cols,
                        "ovo_rank: rank_sums shape must be (n_groups, n_cols)");
-            nb_require((int)tie_corr.shape(0) == n_groups &&
-                           (int)tie_corr.shape(1) == n_cols,
-                       "ovo_rank: tie_corr shape must be (n_groups, n_cols)");
+            nb_require(
+                has_ovo_tie_shape(tie_corr, n_groups, n_cols, compute_tie_corr),
+                "ovo_rank: tie_corr must be (n_groups, n_cols) when "
+                "enabled or length 1 when disabled");
             launch_ovo_rank_dense_tiered_unsorted_ref(
                 ref_data.data(), grp_data.data(), grp_offsets.data(),
-                rank_sums.data(), tie_corr.data(), n_ref, n_all_grp, n_cols,
-                n_groups, compute_tie_corr, sub_batch_cols,
-                (cudaStream_t)stream);
+                rank_sums.data(), compute_tie_corr ? tie_corr.data() : nullptr,
+                n_ref, n_all_grp, n_cols, n_groups, compute_tie_corr,
+                sub_batch_cols, (cudaStream_t)stream);
         },
         "ref_data"_a, "grp_data"_a, "grp_offsets"_a, "rank_sums"_a,
-        "tie_corr"_a, nb::kw_only(), "n_ref"_a, "n_all_grp"_a, "n_cols"_a,
-        "n_groups"_a, "compute_tie_corr"_a, "sub_batch_cols"_a = SUB_BATCH_COLS,
-        "stream"_a = 0);
+        "tie_corr"_a, nb::kw_only(), "compute_tie_corr"_a,
+        "sub_batch_cols"_a = SUB_BATCH_COLS, "stream"_a = 0);
 
     m.def(
         "ovr_rank_dense_streaming",
         [](gpu_array_f<const float, Device> block,
            gpu_array_c<const int, Device> group_codes,
            gpu_array_c<double, Device> rank_sums,
-           gpu_array_c<double, Device> tie_corr, int n_rows, int n_cols,
-           int n_groups, bool compute_tie_corr, int sub_batch_cols,
-           std::uintptr_t stream) {
+           gpu_array_c<double, Device> tie_corr, bool compute_tie_corr,
+           int sub_batch_cols, std::uintptr_t stream) {
             nb_require(block.ndim() == 2 && rank_sums.ndim() == 2 &&
                            group_codes.ndim() == 1 && tie_corr.ndim() == 1,
                        "ovr_rank: block/rank_sums 2D, group_codes/tie_corr 1D");
-            nb_require(
-                (int)block.shape(0) == n_rows && (int)block.shape(1) == n_cols,
-                "ovr_rank: block shape must be (n_rows, n_cols)");
+            int n_rows = (int)block.shape(0);
+            int n_cols = (int)block.shape(1);
+            int n_groups = (int)rank_sums.shape(0);
             nb_require((int)group_codes.shape(0) == n_rows,
                        "ovr_rank: group_codes length must be n_rows");
             nb_require((int)rank_sums.shape(0) == n_groups &&
@@ -1040,10 +1008,11 @@ void register_bindings(nb::module_& m) {
                 sub_batch_cols, (cudaStream_t)stream);
         },
         "block"_a, "group_codes"_a, "rank_sums"_a, "tie_corr"_a, nb::kw_only(),
-        "n_rows"_a, "n_cols"_a, "n_groups"_a, "compute_tie_corr"_a,
-        "sub_batch_cols"_a = SUB_BATCH_COLS, "stream"_a = 0);
+        "compute_tie_corr"_a, "sub_batch_cols"_a = SUB_BATCH_COLS,
+        "stream"_a = 0);
 }
 
 NB_MODULE(_wilcoxon_cuda, m) {
+    m.def("_set_host_worker_limit", &set_host_worker_limit, "limit"_a);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

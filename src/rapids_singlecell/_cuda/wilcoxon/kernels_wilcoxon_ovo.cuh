@@ -55,18 +55,11 @@ __device__ __forceinline__ int sorted_upper_bound(const float* arr, int lo,
 }
 
 // Mid-rank of `v` in merged (ref, grp) arrays with incremental bounds.
-// Also reports equal counts per array for tie correction.
-struct OvoRank {
-    double mid_rank;
-    int n_eq_ref;
-    int n_eq_grp;
-};
-
-__device__ __forceinline__ OvoRank ovo_mid_rank(const float* ref, int n_ref,
-                                                const float* grp, int n_grp,
-                                                float v, int& ref_lb,
-                                                int& ref_ub, int& grp_lb,
-                                                int& grp_ub) {
+__device__ __forceinline__ double ovo_mid_rank(const float* ref, int n_ref,
+                                               const float* grp, int n_grp,
+                                               float v, int& ref_lb,
+                                               int& ref_ub, int& grp_lb,
+                                               int& grp_ub) {
     int n_lt_ref = sorted_lower_bound(ref, ref_lb, n_ref, v);
     ref_lb = n_lt_ref;
     ref_ub = sorted_upper_bound(ref, ref_ub > n_lt_ref ? ref_ub : n_lt_ref,
@@ -79,12 +72,8 @@ __device__ __forceinline__ OvoRank ovo_mid_rank(const float* ref, int n_ref,
                                 n_grp, v);
     int n_eq_grp = grp_ub - n_lt_grp;
 
-    OvoRank r;
-    r.mid_rank = (double)(n_lt_ref + n_lt_grp) +
-                 ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
-    r.n_eq_ref = n_eq_ref;
-    r.n_eq_grp = n_eq_grp;
-    return r;
+    return (double)(n_lt_ref + n_lt_grp) +
+           ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
 }
 
 // Amortized tie correction for sorted LARGE/HUGE groups.
@@ -117,13 +106,30 @@ __device__ __forceinline__ void compute_tie_delta_sorted_grp(
         *out = finalize_tie_corr(n_ref + n_grp, ref_base + tie);
 }
 
+// The host CSR OVO path needs group sums for LFC even when points are not
+// requested. Reuse the rank block's already-loaded values so each (group,
+// column) owns one deterministic output instead of issuing one FP64 atomic per
+// sparse entry.
+__device__ __forceinline__ void ovo_write_value_sum(double local_value_sum,
+                                                    double* warp_buf,
+                                                    double* value_sums,
+                                                    int value_sum_stride,
+                                                    int grp, int col) {
+    if (value_sums == nullptr) return;
+    __syncthreads();
+    double total = wilcoxon_block_sum(local_value_sum, warp_buf);
+    if (threadIdx.x == 0)
+        value_sums[(size_t)grp * value_sum_stride + col] = total;
+}
+
 // No-tie fast path: group-internal ranks collapse to the U closed form.
 // Each unsorted group value binary-searches the sorted reference; no group
 // sort.
 __global__ void ovo_rank_dense_vs_ref_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets, double* __restrict__ rank_sums,
-    int n_ref, int n_all_grp, int n_cols, int n_groups) {
+    double* __restrict__ value_sums, int value_sum_stride, int n_ref,
+    int n_all_grp, int n_cols, int n_groups) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
@@ -131,18 +137,24 @@ __global__ void ovo_rank_dense_vs_ref_kernel(
     int g_start = grp_offsets[grp];
     int n_grp = grp_offsets[grp + 1] - g_start;
     if (n_grp == 0) {
-        if (threadIdx.x == 0) rank_sums[(size_t)grp * n_cols + col] = 0.0;
+        if (threadIdx.x == 0) {
+            rank_sums[(size_t)grp * n_cols + col] = 0.0;
+            if (value_sums != nullptr)
+                value_sums[(size_t)grp * value_sum_stride + col] = 0.0;
+        }
         return;
     }
     const float* ref_col = ref_sorted + (long long)col * n_ref;
     const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
 
     double local_sum = 0.0;
+    double local_value_sum = 0.0;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
         float v = grp_col[i];
         int n_lt = sorted_lower_bound(ref_col, 0, n_ref, v);
         int n_eq = sorted_upper_bound(ref_col, n_lt, n_ref, v) - n_lt;
         local_sum += (double)n_lt + 0.5 * (double)n_eq;
+        if (value_sums != nullptr) local_value_sum += (double)v;
     }
     __shared__ double warp_buf[32];
     double total = wilcoxon_block_sum(local_sum, warp_buf);
@@ -150,20 +162,20 @@ __global__ void ovo_rank_dense_vs_ref_kernel(
         rank_sums[(size_t)grp * n_cols + col] =
             total + (double)n_grp * ((double)n_grp + 1.0) / 2.0;
     }
+    ovo_write_value_sum(local_value_sum, warp_buf, value_sums, value_sum_stride,
+                        grp, col);
 }
 
 // LARGE/HUGE rank kernel; LARGE smem-sorts, HUGE reads CUB-sorted groups.
 // Post-sort mid-rank/tie body is shared and each group owns its output row.
 template <bool SMEM_SORT>
-__global__ void ovo_rank_sorted_kernel(const float* __restrict__ ref_sorted,
-                                       const float* __restrict__ grp_in,
-                                       const int* __restrict__ grp_offsets,
-                                       const double* __restrict__ ref_tie_sums,
-                                       double* __restrict__ rank_sums,
-                                       double* __restrict__ tie_corr, int n_ref,
-                                       int n_all_grp, int n_cols, int n_groups,
-                                       bool compute_tie_corr, int large_padded,
-                                       int skip_n_grp_le, int skip_n_grp_gt) {
+__global__ void ovo_rank_sorted_kernel(
+    const float* __restrict__ ref_sorted, const float* __restrict__ grp_in,
+    const int* __restrict__ grp_offsets,
+    const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
+    double* __restrict__ tie_corr, double* __restrict__ value_sums,
+    int value_sum_stride, int n_ref, int n_all_grp, int n_cols, int n_groups,
+    int large_padded, int skip_n_grp_le, int skip_n_grp_gt) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
@@ -172,13 +184,6 @@ __global__ void ovo_rank_sorted_kernel(const float* __restrict__ ref_sorted,
     int n_grp = grp_offsets[grp + 1] - g_start;
     if (n_grp <= skip_n_grp_le) return;
     if (n_grp > skip_n_grp_gt) return;
-    if (n_grp == 0) {
-        if (threadIdx.x == 0) {
-            rank_sums[grp * n_cols + col] = 0.0;
-            if (compute_tie_corr) tie_corr[grp * n_cols + col] = 1.0;
-        }
-        return;
-    }
 
     const float* ref_col = ref_sorted + (long long)col * n_ref;
     __shared__ double warp_buf[32];
@@ -201,15 +206,18 @@ __global__ void ovo_rank_sorted_kernel(const float* __restrict__ ref_sorted,
 
     int ref_lb = 0, ref_ub = 0, grp_lb = 0, grp_ub = 0;
     double local_sum = 0.0;
+    double local_value_sum = 0.0;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
-        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_col, n_grp, grp_col[i],
-                                 ref_lb, ref_ub, grp_lb, grp_ub);
-        local_sum += r.mid_rank;
+        local_sum += ovo_mid_rank(ref_col, n_ref, grp_col, n_grp, grp_col[i],
+                                  ref_lb, ref_ub, grp_lb, grp_ub);
+        if (value_sums != nullptr) local_value_sum += (double)grp_col[i];
     }
     double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
-    if (!compute_tie_corr) return;
+    ovo_write_value_sum(local_value_sum, warp_buf, value_sums, value_sum_stride,
+                        grp, col);
+
     __syncthreads();
     // grp_col is sorted: amortize the ref tie contribution via the precomputed
     // base instead of rescanning the ref per group.
@@ -224,8 +232,9 @@ __global__ void ovo_rank_smem_analytic_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_in,
     const int* __restrict__ grp_offsets,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
-    double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int skip_n_grp_le, int skip_n_grp_gt) {
+    double* __restrict__ tie_corr, double* __restrict__ value_sums,
+    int value_sum_stride, int n_ref, int n_all_grp, int n_cols, int n_groups,
+    int skip_n_grp_le, int skip_n_grp_gt) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
@@ -234,13 +243,6 @@ __global__ void ovo_rank_smem_analytic_kernel(
     int n_grp = grp_offsets[grp + 1] - g_start;
     if (n_grp <= skip_n_grp_le) return;
     if (n_grp > skip_n_grp_gt) return;
-    if (n_grp == 0) {
-        if (threadIdx.x == 0) {
-            rank_sums[grp * n_cols + col] = 0.0;
-            if (compute_tie_corr) tie_corr[grp * n_cols + col] = 1.0;
-        }
-        return;
-    }
 
     const float* ref_col = ref_sorted + (long long)col * n_ref;
     const float* grp_col = grp_in + (long long)col * n_all_grp + g_start;
@@ -255,8 +257,10 @@ __global__ void ovo_rank_smem_analytic_kernel(
     }
     __syncthreads();
 
+    double local_value_sum = 0.0;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
         float v = grp_col[i];
+        if (value_sums != nullptr) local_value_sum += (double)v;
         if (v > 0.0f) grp_smem[atomicAdd(&sh_nnz, 1)] = v;
     }
     __syncthreads();
@@ -281,14 +285,16 @@ __global__ void ovo_rank_smem_analytic_kernel(
         (threadIdx.x == 0) ? (double)n_grp_zero * zero_rank : 0.0;
     int ref_lb = 0, ref_ub = 0, grp_lb = 0, grp_ub = 0;
     for (int i = threadIdx.x; i < nnz; i += blockDim.x) {
-        OvoRank r = ovo_mid_rank(ref_col, n_ref, grp_smem, nnz, grp_smem[i],
-                                 ref_lb, ref_ub, grp_lb, grp_ub);
-        local_sum += r.mid_rank + (double)n_grp_zero;
+        local_sum += ovo_mid_rank(ref_col, n_ref, grp_smem, nnz, grp_smem[i],
+                                  ref_lb, ref_ub, grp_lb, grp_ub) +
+                     (double)n_grp_zero;
     }
     double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
-    if (!compute_tie_corr) return;
+    ovo_write_value_sum(local_value_sum, warp_buf, value_sums, value_sum_stride,
+                        grp, col);
+
     __syncthreads();
 
     // Add nonzero tie deltas; zero ties are added below via T(ref+grp)-T(ref).
@@ -327,7 +333,8 @@ __global__ void compact_huge_nonzeros_kernel(
     const float* __restrict__ grp_dense, const int* __restrict__ grp_offsets,
     const int* __restrict__ group_ids, float* __restrict__ grp_nz,
     int* __restrict__ seg_begins, int* __restrict__ seg_ends, int n_all_grp,
-    int n_sort_groups, int sb_cols) {
+    int n_sort_groups, int sb_cols, double* __restrict__ value_sums,
+    int value_sum_stride) {
     int col = blockIdx.x;
     int local = blockIdx.y;
     if (col >= sb_cols || local >= n_sort_groups) return;
@@ -338,10 +345,13 @@ __global__ void compact_huge_nonzeros_kernel(
     int f = col * n_sort_groups + local;
 
     __shared__ int cnt;
+    __shared__ double warp_buf[WARP_REDUCE_BUF];
     if (threadIdx.x == 0) cnt = 0;
     __syncthreads();
+    double local_value_sum = 0.0;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
         float v = grp_dense[base + i];
+        if (value_sums != nullptr) local_value_sum += (double)v;
         if (v > 0.0f) grp_nz[base + atomicAdd(&cnt, 1)] = v;
     }
     __syncthreads();
@@ -349,6 +359,8 @@ __global__ void compact_huge_nonzeros_kernel(
         seg_begins[f] = (int)base;
         seg_ends[f] = (int)base + cnt;
     }
+    ovo_write_value_sum(local_value_sum, warp_buf, value_sums, value_sum_stride,
+                        g, col);
 }
 
 // Rank HUGE-band groups from sorted positives plus the zero block.
@@ -358,8 +370,7 @@ __global__ void ovo_rank_huge_analytic_kernel(
     const int* __restrict__ grp_offsets, const int* __restrict__ group_ids,
     const int* __restrict__ seg_begins, const int* __restrict__ seg_ends,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
-    double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_sort_groups, bool compute_tie_corr) {
+    double* __restrict__ tie_corr, int n_ref, int n_cols, int n_sort_groups) {
     int col = blockIdx.x;
     int local = blockIdx.y;
     if (col >= n_cols || local >= n_sort_groups) return;
@@ -387,14 +398,13 @@ __global__ void ovo_rank_huge_analytic_kernel(
         (threadIdx.x == 0) ? (double)n_grp_zero * zero_rank : 0.0;
     int ref_lb = 0, ref_ub = 0, grp_lb = 0, grp_ub = 0;
     for (int i = threadIdx.x; i < nnz; i += blockDim.x) {
-        OvoRank r = ovo_mid_rank(ref_col, n_ref, nz, nnz, nz[i], ref_lb, ref_ub,
-                                 grp_lb, grp_ub);
-        local_sum += r.mid_rank + (double)n_grp_zero;
+        local_sum += ovo_mid_rank(ref_col, n_ref, nz, nnz, nz[i], ref_lb,
+                                  ref_ub, grp_lb, grp_ub) +
+                     (double)n_grp_zero;
     }
     double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
-    if (!compute_tie_corr) return;
     __syncthreads();
     double local_tie = 0.0;
     for (int i = threadIdx.x; i < nnz; i += blockDim.x) {
@@ -452,14 +462,31 @@ __global__ void ref_tie_sum_kernel(const float* __restrict__ ref_sorted,
     if (threadIdx.x == 0) ref_tie_sums[col] = total;
 }
 
+// Coalesced reference sums for the host CSR LFC-only fast path. The reference
+// dense chunk is column-major, matching the rank cache layout.
+__global__ void ovo_dense_column_sum_kernel(const float* __restrict__ values,
+                                            double* __restrict__ value_sums,
+                                            int n_rows, int n_cols) {
+    int col = blockIdx.x;
+    if (col >= n_cols) return;
+    const float* values_col = values + (size_t)col * n_rows;
+    double local_sum = 0.0;
+    for (int row = threadIdx.x; row < n_rows; row += blockDim.x)
+        local_sum += (double)values_col[row];
+    __shared__ double warp_buf[WARP_REDUCE_BUF];
+    double total = wilcoxon_block_sum(local_sum, warp_buf);
+    if (threadIdx.x == 0) value_sums[col] = total;
+}
+
 // MEDIUM fused kernel: ref binary searches plus in-group scan over smem values.
 // Tie correction starts from ref_tie_sums[col] and adds only group deltas.
 __global__ void ovo_rank_medium_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
-    double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int skip_n_grp_le, int max_n_grp_le) {
+    double* __restrict__ tie_corr, double* __restrict__ value_sums,
+    int value_sum_stride, int n_ref, int n_all_grp, int n_cols, int n_groups,
+    int skip_n_grp_le, int max_n_grp_le) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
@@ -480,6 +507,7 @@ __global__ void ovo_rank_medium_kernel(
 
     const float* ref_col = ref_sorted + (long long)col * n_ref;
     double local_sum = 0.0;
+    double local_value_sum = 0.0;
     double local_tie_delta = 0.0;
 
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
@@ -503,8 +531,9 @@ __global__ void ovo_rank_medium_kernel(
 
         local_sum += (double)(n_lt_ref + n_lt_grp) +
                      ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
+        if (value_sums != nullptr) local_value_sum += (double)v;
 
-        if (compute_tie_corr && first_in_grp) {
+        if (first_in_grp) {
             double cg = (double)n_eq_grp;
             double cr = (double)n_eq_ref;
             double group_tie = (cg > 1.0) ? (cg * cg * cg - cg) : 0.0;
@@ -521,7 +550,9 @@ __global__ void ovo_rank_medium_kernel(
     double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
-    if (!compute_tie_corr) return;
+    ovo_write_value_sum(local_value_sum, warp_buf, value_sums, value_sum_stride,
+                        grp, col);
+
     __syncthreads();
 
     double tie_delta = wilcoxon_block_sum(local_tie_delta, warp_buf);
@@ -535,8 +566,9 @@ __global__ void ovo_rank_medium_analytic_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets,
     const double* __restrict__ ref_tie_sums, double* __restrict__ rank_sums,
-    double* __restrict__ tie_corr, int n_ref, int n_all_grp, int n_cols,
-    int n_groups, bool compute_tie_corr, int skip_n_grp_le, int max_n_grp_le) {
+    double* __restrict__ tie_corr, double* __restrict__ value_sums,
+    int value_sum_stride, int n_ref, int n_all_grp, int n_cols, int n_groups,
+    int skip_n_grp_le, int max_n_grp_le) {
     int col = blockIdx.x;
     int grp = blockIdx.y;
     if (col >= n_cols || grp >= n_groups) return;
@@ -558,8 +590,10 @@ __global__ void ovo_rank_medium_analytic_kernel(
         sh_ref_zeros = sorted_upper_bound(ref_col, 0, n_ref, 0.0f);
     }
     __syncthreads();
+    double local_value_sum = 0.0;
     for (int i = threadIdx.x; i < n_grp; i += blockDim.x) {
         float v = grp_col[i];
+        if (value_sums != nullptr) local_value_sum += (double)v;
         if (v > 0.0f) grp_smem[atomicAdd(&sh_nnz, 1)] = v;
     }
     __syncthreads();
@@ -591,7 +625,7 @@ __global__ void ovo_rank_medium_analytic_kernel(
         }
         local_sum += (double)(n_lt_ref + n_lt_grp + n_grp_zero) +
                      ((double)(n_eq_ref + n_eq_grp) + 1.0) / 2.0;
-        if (compute_tie_corr && first_in_grp) {
+        if (first_in_grp) {
             double cg = (double)n_eq_grp;
             double cr = (double)n_eq_ref;
             double group_tie = (cg > 1.0) ? (cg * cg * cg - cg) : 0.0;
@@ -607,7 +641,9 @@ __global__ void ovo_rank_medium_analytic_kernel(
     double total = wilcoxon_block_sum(local_sum, warp_buf);
     if (threadIdx.x == 0) rank_sums[grp * n_cols + col] = total;
 
-    if (!compute_tie_corr) return;
+    ovo_write_value_sum(local_value_sum, warp_buf, value_sums, value_sum_stride,
+                        grp, col);
+
     __syncthreads();
     double tie = wilcoxon_block_sum(local_tie, warp_buf);
     if (threadIdx.x == 0) {
