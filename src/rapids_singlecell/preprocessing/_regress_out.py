@@ -10,9 +10,9 @@ from cuml.linear_model import LinearRegression
 from cupyx.scipy import sparse
 from pandas.api.types import CategoricalDtype
 from scanpy._utils import view_to_actual
-from scanpy.get import _get_obs_rep, _set_obs_rep
 
 from rapids_singlecell._compat import DaskArray, _meta_dense
+from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 
 from ._utils import _check_gpu_X, _sparse_to_dense
 

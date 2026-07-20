@@ -8,7 +8,6 @@ import numpy as np
 from cupyx.scipy.sparse import csc_matrix as csc_matrix_gpu
 from cupyx.scipy.sparse import csr_matrix as csr_matrix_gpu
 from dask.array import Array as DaskArray
-from scanpy.get import _get_obs_rep, _set_obs_rep
 from scipy.sparse import csc_array as csc_array_cpu
 from scipy.sparse import csc_matrix as csc_matrix_cpu
 from scipy.sparse import csr_array as csr_array_cpu
@@ -21,6 +20,8 @@ from rapids_singlecell._compat import (
     _meta_sparse_csc_cpu,
     _meta_sparse_csr_cpu,
 )
+
+from ._utils import _get_obs_rep, _set_obs_rep
 
 if TYPE_CHECKING:
     from anndata import AnnData
