@@ -232,7 +232,7 @@ class _RankGenes:
         tie_correct: bool = False,
         use_continuity: bool = False,
         chunk_size: int | None = None,
-        multi_gpu: bool | list[int] | str | None = False,
+        multi_gpu: bool | list[int] | str | None = None,
         n_bins: int | None = None,
         bin_range: Literal["log1p", "auto"] | None = None,
         return_u_values: bool = False,

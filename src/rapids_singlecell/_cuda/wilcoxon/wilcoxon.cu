@@ -980,7 +980,8 @@ void register_bindings(nb::module_& m) {
         },
         "ref_data"_a, "grp_data"_a, "grp_offsets"_a, "rank_sums"_a,
         "tie_corr"_a, nb::kw_only(), "compute_tie_corr"_a,
-        "sub_batch_cols"_a = SUB_BATCH_COLS, "stream"_a = 0);
+        "sub_batch_cols"_a = SUB_BATCH_COLS, "stream"_a = 0,
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "ovr_rank_dense_streaming",
@@ -1009,7 +1010,7 @@ void register_bindings(nb::module_& m) {
         },
         "block"_a, "group_codes"_a, "rank_sums"_a, "tie_corr"_a, nb::kw_only(),
         "compute_tie_corr"_a, "sub_batch_cols"_a = SUB_BATCH_COLS,
-        "stream"_a = 0);
+        "stream"_a = 0, nb::call_guard<nb::gil_scoped_release>());
 }
 
 NB_MODULE(_wilcoxon_cuda, m) {

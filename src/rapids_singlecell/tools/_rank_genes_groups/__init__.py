@@ -65,7 +65,7 @@ def rank_genes_groups(
     return_u_values: bool = False,
     layer: str | None = None,
     chunk_size: int | None = None,
-    multi_gpu: bool | list[int] | str | None = False,
+    multi_gpu: bool | list[int] | str | None = None,
     n_bins: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
     skip_empty_groups: bool = False,
@@ -161,11 +161,12 @@ def rank_genes_groups(
         `'wilcoxon_binned'` the default is sized dynamically based on
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
     multi_gpu
-        GPU selection for host-resident `'wilcoxon'` input. ``False`` uses
-        the current GPU (default), ``None`` or ``True`` uses all available
-        GPUs, a list selects GPU IDs, and a string supplies comma-separated GPU IDs.
-        Multi-GPU execution supports NumPy dense and SciPy CSR/CSC input;
-        device-resident input continues to use its owning GPU.
+        GPU selection for exact `'wilcoxon'`. ``None`` uses all visible GPUs
+        for host input and device OVO, while device OVR stays on its input-owning
+        GPU. ``False`` uses one GPU, ``True`` uses all visible GPUs, and a list
+        or comma-separated string selects device IDs. Multi-GPU supports
+        host/device dense, CSR, and CSC input. Device input must fit on its
+        owning GPU; forced multi-GPU may be slower due to transfers.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000
@@ -243,7 +244,7 @@ def rank_genes_groups(
         msg = "return_u_values is only supported for method='wilcoxon'."
         raise ValueError(msg)
 
-    if multi_gpu is not False and method != "wilcoxon":
+    if multi_gpu is not None and multi_gpu is not False and method != "wilcoxon":
         msg = "multi_gpu is only supported for method='wilcoxon'."
         raise ValueError(msg)
 

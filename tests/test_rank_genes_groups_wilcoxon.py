@@ -10,6 +10,9 @@ import scipy.sparse as sp
 from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
+from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_host
+
+MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
 
 def _to_format(X_dense, fmt):
@@ -2121,3 +2124,314 @@ def test_host_sparse_mismatched_index_dtype_raises(reference, layout):
     }
     with pytest.raises(TypeError, match="indices and indptr must have the same dtype"):
         rsc.tl.rank_genes_groups(adata, "group", **kw)
+
+
+def _make_multi_gpu_wilcoxon_adata(fmt, *, source_device=0, all_zero=False):
+    rng = np.random.default_rng(21)
+    if all_zero:
+        dense = np.zeros((120, 12), dtype=np.float32)
+    else:
+        dense = rng.integers(0, 7, size=(192, 18)).astype(np.float32)
+        dense[dense < 2] = 0.0
+    labels = np.asarray([str(i % 4) for i in range(dense.shape[0])])
+    obs = pd.DataFrame(
+        {"group": pd.Categorical(labels)},
+        index=[f"cell{i}" for i in range(dense.shape[0])],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(dense.shape[1])])
+    if fmt.startswith("cupy"):
+        with cp.cuda.Device(source_device):
+            matrix = _to_format(dense, fmt)
+            if cpsp.issparse(matrix):
+                matrix.indices = matrix.indices.astype(cp.int64)
+                matrix.indptr = matrix.indptr.astype(cp.int64)
+    else:
+        matrix = _to_format(dense, fmt)
+    adata = sc.AnnData(X=matrix, obs=obs, var=var)
+    adata.uns["log1p"] = {"base": None}
+    return adata
+
+
+def _assert_multi_gpu_wilcoxon_equal(actual, expected):
+    actual_result = actual.uns["rank_genes_groups"]
+    expected_result = expected.uns["rank_genes_groups"]
+    np.testing.assert_array_equal(actual_result["names"], expected_result["names"])
+    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+        for group in expected_result[field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(actual_result[field][group], dtype=float),
+                np.asarray(expected_result[field][group], dtype=float),
+                rtol=0.0,
+                atol=0.0,
+                equal_nan=True,
+            )
+    for field in ("pts", "pts_rest"):
+        if field in expected_result:
+            pd.testing.assert_frame_equal(
+                actual_result[field], expected_result[field], check_exact=True
+            )
+
+
+@pytest.mark.parametrize(
+    "peer_case",
+    [
+        pytest.param((False, None, False), id="inaccessible"),
+        pytest.param((True, None, True), id="enabled"),
+        pytest.param(
+            (True, _wilcoxon_host.CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED, True),
+            id="already_enabled",
+        ),
+        pytest.param(
+            (True, _wilcoxon_host.CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, False),
+            id="unsupported",
+        ),
+        pytest.param(
+            (True, _wilcoxon_host.CUDA_ERROR_TOO_MANY_PEERS, False),
+            id="too_many_peers",
+        ),
+    ],
+)
+def test_wilcoxon_enable_peer_access_expected_outcomes(monkeypatch, peer_case):
+    can_access, error_status, expected = peer_case
+    calls = {"can_access": 0, "enable": 0}
+
+    def device_can_access_peer(device_id, source_device):
+        calls["can_access"] += 1
+        return can_access
+
+    def device_enable_peer_access(source_device):
+        calls["enable"] += 1
+        if error_status is not None:
+            raise cp.cuda.runtime.CUDARuntimeError(error_status)
+
+    monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", device_can_access_peer)
+    monkeypatch.setattr(
+        cp.cuda.runtime, "deviceEnablePeerAccess", device_enable_peer_access
+    )
+    _wilcoxon_host._enable_peer_access.cache_clear()
+    try:
+        assert _wilcoxon_host._enable_peer_access(0, 0) is expected
+        assert _wilcoxon_host._enable_peer_access(0, 0) is expected
+    finally:
+        _wilcoxon_host._enable_peer_access.cache_clear()
+
+    assert calls["can_access"] == 1
+    assert calls["enable"] == int(can_access)
+
+
+def test_wilcoxon_enable_peer_access_reraises_unexpected_error(monkeypatch):
+    unexpected_status = 999
+
+    monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+
+    def raise_unexpected(source_device):
+        raise cp.cuda.runtime.CUDARuntimeError(unexpected_status)
+
+    monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", raise_unexpected)
+    _wilcoxon_host._enable_peer_access.cache_clear()
+    try:
+        with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
+            _wilcoxon_host._enable_peer_access(0, 0)
+    finally:
+        _wilcoxon_host._enable_peer_access.cache_clear()
+
+    assert error.value.status == unexpected_status
+
+
+@pytest.mark.parametrize(
+    "route_case",
+    [
+        pytest.param(
+            ("numpy_dense", "rest", False, None, [None]), id="host_ovr_default"
+        ),
+        pytest.param(("numpy_dense", "1", False, None, [None]), id="host_ovo_default"),
+        pytest.param(("cupy_dense", "rest", False, None, []), id="device_ovr_default"),
+        pytest.param(("cupy_dense", "1", False, None, [None]), id="device_ovo_default"),
+        pytest.param(("cupy_dense", "rest", True, False, []), id="device_force_one"),
+        pytest.param(("cupy_dense", "rest", True, True, [True]), id="device_force_all"),
+        pytest.param(
+            ("cupy_dense", "rest", True, "current", ["current"]), id="device_ids"
+        ),
+    ],
+)
+def test_wilcoxon_multi_gpu_routing_policy(monkeypatch, route_case):
+    fmt, reference, pass_multi_gpu, multi_gpu, expected_parse = route_case
+    current_device = cp.cuda.Device().id
+    selected = [current_device] if multi_gpu == "current" else multi_gpu
+    expected = [selected] if expected_parse == ["current"] else expected_parse
+    parse_calls = []
+
+    def parse_device_ids_spy(*, multi_gpu):
+        parse_calls.append(multi_gpu)
+        return [current_device]
+
+    monkeypatch.setattr(_wilcoxon_host, "parse_device_ids", parse_device_ids_spy)
+    adata = _make_multi_gpu_wilcoxon_adata(fmt, source_device=current_device)
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "n_genes": adata.n_vars,
+    }
+    if pass_multi_gpu:
+        kwargs["multi_gpu"] = selected
+    rsc.tl.rank_genes_groups(adata, "group", **kwargs)
+
+    assert parse_calls == expected
+    assert "scores" in adata.uns["rank_genes_groups"]
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.parametrize("fmt", ["cupy_dense", "cupy_csr", "cupy_csc"])
+@pytest.mark.parametrize("reference", ["rest", "1"])
+@pytest.mark.parametrize("tie_correct", [False, True])
+def test_wilcoxon_device_two_gpu_matches_single(fmt, reference, tie_correct):
+    source_device = cp.cuda.Device().id
+    peer_device = next(
+        device_id
+        for device_id in range(cp.cuda.runtime.getDeviceCount())
+        if device_id != source_device
+    )
+    single = _make_multi_gpu_wilcoxon_adata(fmt, source_device=source_device)
+    multi = _make_multi_gpu_wilcoxon_adata(fmt, source_device=source_device)
+    if cpsp.issparse(multi.X):
+        assert multi.X.indices.dtype == cp.int64
+        assert multi.X.indptr.dtype == cp.int64
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "tie_correct": tie_correct,
+        "pts": True,
+        "n_genes": single.n_vars,
+    }
+    rsc.tl.rank_genes_groups(single, "group", multi_gpu=False, **kwargs)
+    rsc.tl.rank_genes_groups(
+        multi,
+        "group",
+        multi_gpu=[source_device, peer_device],
+        **kwargs,
+    )
+
+    _assert_multi_gpu_wilcoxon_equal(multi, single)
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.parametrize("fmt", ["cupy_csr", "cupy_csc"])
+@pytest.mark.parametrize("reference", ["rest", "1"])
+def test_wilcoxon_device_zero_nnz_multi_gpu_matches_single(fmt, reference):
+    source_device = cp.cuda.Device().id
+    peer_device = next(
+        device_id
+        for device_id in range(cp.cuda.runtime.getDeviceCount())
+        if device_id != source_device
+    )
+    single = _make_multi_gpu_wilcoxon_adata(
+        fmt, source_device=source_device, all_zero=True
+    )
+    multi = _make_multi_gpu_wilcoxon_adata(
+        fmt, source_device=source_device, all_zero=True
+    )
+    assert multi.X.nnz == 0
+    assert multi.X.indices.dtype == cp.int64
+    assert multi.X.indptr.dtype == cp.int64
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "tie_correct": True,
+        "pts": True,
+        "n_genes": single.n_vars,
+    }
+    rsc.tl.rank_genes_groups(single, "group", multi_gpu=False, **kwargs)
+    rsc.tl.rank_genes_groups(
+        multi,
+        "group",
+        multi_gpu=[source_device, peer_device],
+        **kwargs,
+    )
+
+    _assert_multi_gpu_wilcoxon_equal(multi, single)
+
+
+@pytest.mark.parametrize(
+    "boundary", [512, 513, 2500, 2501], ids=["medium", "large_min", "large_max", "huge"]
+)
+def test_wilcoxon_ovo_exact_tier_boundaries_match_scanpy(boundary):
+    adata = _anndata_with_group_sizes(
+        {"ref": 30, "boundary": boundary, "small": 30}, n_genes=3, seed=22
+    )
+    expected = adata.copy()
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": "ref",
+        "tie_correct": True,
+        "n_genes": adata.n_vars,
+    }
+    rsc.tl.rank_genes_groups(adata, "group", multi_gpu=False, **kwargs)
+    sc.tl.rank_genes_groups(expected, "group", **kwargs)
+
+    actual_result = adata.uns["rank_genes_groups"]
+    expected_result = expected.uns["rank_genes_groups"]
+    for field in ("scores", "pvals", "pvals_adj"):
+        for group in expected_result[field].dtype.names:
+            actual_by_gene = dict(
+                zip(
+                    actual_result["names"][group],
+                    np.asarray(actual_result[field][group], dtype=float),
+                )
+            )
+            expected_by_gene = dict(
+                zip(
+                    expected_result["names"][group],
+                    np.asarray(expected_result[field][group], dtype=float),
+                )
+            )
+            for gene, expected_value in expected_by_gene.items():
+                np.testing.assert_allclose(
+                    actual_by_gene[gene],
+                    expected_value,
+                    rtol=1e-12,
+                    atol=1e-13,
+                    equal_nan=True,
+                )
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.parametrize(
+    ("reference", "route"),
+    [
+        pytest.param("rest", "default", id="default_ovr"),
+        pytest.param("1", "default", id="default_ovo"),
+        pytest.param("1", "explicit", id="explicit_ovo"),
+    ],
+)
+def test_wilcoxon_device_source_gpu_differs_from_caller(reference, route):
+    caller_device = 0
+    source_device = 1
+    single = _make_multi_gpu_wilcoxon_adata("cupy_csr", source_device=source_device)
+    multi = _make_multi_gpu_wilcoxon_adata("cupy_csr", source_device=source_device)
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "tie_correct": True,
+        "pts": True,
+        "n_genes": single.n_vars,
+    }
+    with cp.cuda.Device(caller_device):
+        rsc.tl.rank_genes_groups(single, "group", multi_gpu=False, **kwargs)
+        assert cp.cuda.Device().id == caller_device
+        if route == "default":
+            rsc.tl.rank_genes_groups(multi, "group", **kwargs)
+        else:
+            rsc.tl.rank_genes_groups(
+                multi,
+                "group",
+                multi_gpu=[caller_device, source_device],
+                **kwargs,
+            )
+        assert cp.cuda.Device().id == caller_device
+
+    _assert_multi_gpu_wilcoxon_equal(multi, single)

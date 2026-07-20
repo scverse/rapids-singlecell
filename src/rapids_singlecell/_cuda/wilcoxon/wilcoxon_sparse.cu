@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <vector>
 
+#include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include "../nb_types.h"
@@ -20,6 +21,121 @@ template <typename Array>
 static bool has_matrix_shape(const Array& array, int n_rows, int n_cols) {
     return array.ndim() == 2 && (int)array.shape(0) == n_rows &&
            (int)array.shape(1) == n_cols;
+}
+
+template <typename IndexT, typename IndptrT, typename Device>
+static void def_csr_column_range_indptr_device(nb::module_& m) {
+    m.def(
+        "csr_column_range_indptr_device",
+        [](gpu_array_c<const IndexT, Device> indices,
+           gpu_array_c<const IndptrT, Device> indptr,
+           gpu_array_c<IndptrT, Device> local_indptr, int col_start,
+           int col_stop, std::uintptr_t stream) -> int64_t {
+            nb_require(indptr.ndim() == 1 && indices.ndim() == 1 &&
+                           local_indptr.ndim() == 1,
+                       "csr_column_range_indptr_device: arrays must be 1D");
+            nb_require(
+                indptr.shape(0) >= 1 &&
+                    indptr.shape(0) <= (size_t)std::numeric_limits<int>::max(),
+                "csr_column_range_indptr_device: invalid indptr length");
+            nb_require(local_indptr.shape(0) == indptr.shape(0),
+                       "csr_column_range_indptr_device: local_indptr must "
+                       "match indptr length");
+            nb_require(col_start >= 0 && col_start <= col_stop,
+                       "csr_column_range_indptr_device: invalid column range");
+
+            int n_rows = (int)indptr.shape(0) - 1;
+            cudaStream_t cuda_stream = (cudaStream_t)stream;
+            cuda_check(cudaMemsetAsync(local_indptr.data(), 0, sizeof(IndptrT),
+                                       cuda_stream),
+                       "CSR column range local indptr zero");
+            IndptrT local_nnz = 0;
+            if (n_rows > 0) {
+                constexpr int BLOCK_SIZE = 256;
+                unsigned int grid = strided_grid(n_rows, BLOCK_SIZE);
+                csr_column_range_count_kernel<<<grid, BLOCK_SIZE, 0,
+                                                cuda_stream>>>(
+                    indices.data(), indptr.data(), local_indptr.data(), n_rows,
+                    col_start, col_stop);
+                CUDA_CHECK_LAST_ERROR(csr_column_range_count_kernel);
+
+                size_t scan_bytes = 0;
+                cuda_check(cub::DeviceScan::InclusiveSum(
+                               nullptr, scan_bytes, local_indptr.data() + 1,
+                               local_indptr.data() + 1, n_rows, cuda_stream),
+                           "CSR column range scan temp-size query");
+                ScopedCudaBuffer scan_temp(scan_bytes);
+                cuda_check(
+                    cub::DeviceScan::InclusiveSum(
+                        scan_temp.data(), scan_bytes, local_indptr.data() + 1,
+                        local_indptr.data() + 1, n_rows, cuda_stream),
+                    "CSR column range indptr scan");
+                cuda_check(
+                    cudaMemcpyAsync(&local_nnz, local_indptr.data() + n_rows,
+                                    sizeof(IndptrT), cudaMemcpyDeviceToHost,
+                                    cuda_stream),
+                    "CSR column range nnz D2H");
+                cuda_check(cudaStreamSynchronize(cuda_stream),
+                           "CSR column range indptr sync");
+            } else {
+                cuda_check(cudaStreamSynchronize(cuda_stream),
+                           "CSR column range empty indptr sync");
+            }
+            nb_require(local_nnz >= 0,
+                       "csr_column_range_indptr_device: local nnz overflow");
+            return (int64_t)local_nnz;
+        },
+        "indices"_a, "indptr"_a, "local_indptr"_a, nb::kw_only(), "col_start"_a,
+        "col_stop"_a, "stream"_a = 0);
+}
+
+template <typename InT, typename IndexT, typename IndptrT, typename Device>
+static void def_csr_column_range_gather_device(nb::module_& m) {
+    m.def(
+        "csr_column_range_gather_device",
+        [](gpu_array_c<const InT, Device> data,
+           gpu_array_c<const IndexT, Device> indices,
+           gpu_array_c<const IndptrT, Device> indptr,
+           gpu_array_c<const IndptrT, Device> local_indptr,
+           gpu_array_c<InT, Device> local_data,
+           gpu_array_c<IndexT, Device> local_indices, int64_t local_nnz,
+           int col_start, int col_stop, std::uintptr_t stream) {
+            nb_require(data.ndim() == 1 && indices.ndim() == 1 &&
+                           indptr.ndim() == 1 && local_indptr.ndim() == 1 &&
+                           local_data.ndim() == 1 && local_indices.ndim() == 1,
+                       "csr_column_range_gather_device: arrays must be 1D");
+            nb_require(data.shape(0) == indices.shape(0),
+                       "csr_column_range_gather_device: data and indices "
+                       "lengths must match");
+            nb_require(
+                indptr.shape(0) >= 1 &&
+                    indptr.shape(0) <= (size_t)std::numeric_limits<int>::max(),
+                "csr_column_range_gather_device: invalid indptr length");
+            nb_require(local_indptr.shape(0) == indptr.shape(0),
+                       "csr_column_range_gather_device: local_indptr must "
+                       "match indptr length");
+            nb_require(local_nnz >= 0 &&
+                           (size_t)local_nnz == local_data.shape(0) &&
+                           local_data.shape(0) == local_indices.shape(0),
+                       "csr_column_range_gather_device: output lengths must "
+                       "equal local_nnz");
+            nb_require(col_start >= 0 && col_start <= col_stop,
+                       "csr_column_range_gather_device: invalid column range");
+
+            int n_rows = (int)indptr.shape(0) - 1;
+            if (n_rows == 0 || local_nnz == 0) return;
+            constexpr int BLOCK_SIZE = 256;
+            unsigned int grid = strided_grid(n_rows, 1);
+            csr_column_range_gather_kernel<<<grid, BLOCK_SIZE, 0,
+                                             (cudaStream_t)stream>>>(
+                data.data(), indices.data(), indptr.data(), local_indptr.data(),
+                local_data.data(), local_indices.data(), n_rows, col_start,
+                col_stop);
+            CUDA_CHECK_LAST_ERROR(csr_column_range_gather_kernel);
+        },
+        "data"_a, "indices"_a, "indptr"_a, "local_indptr"_a, "local_data"_a,
+        "local_indices"_a, nb::kw_only(), "local_nnz"_a, "col_start"_a,
+        "col_stop"_a, "stream"_a = 0);
 }
 
 template <typename IndexT, typename IndptrT>
@@ -236,6 +352,13 @@ template <typename Device>
 void register_sparse_bindings(nb::module_& m) {
     m.doc() = "Sparse-native host Wilcoxon CUDA kernels";
 
+    def_csr_column_range_indptr_device<int, int, Device>(m);
+    def_csr_column_range_indptr_device<int64_t, int64_t, Device>(m);
+    def_csr_column_range_gather_device<float, int, int, Device>(m);
+    def_csr_column_range_gather_device<double, int, int, Device>(m);
+    def_csr_column_range_gather_device<float, int64_t, int64_t, Device>(m);
+    def_csr_column_range_gather_device<double, int64_t, int64_t, Device>(m);
+
 #define RSC_OVR_SPARSE_DEVICE_BINDING(NAME, IMPL, IndexCType, IndptrCType)    \
     m.def(                                                                    \
         NAME,                                                                 \
@@ -258,7 +381,8 @@ void register_sparse_bindings(nb::module_& m) {
         },                                                                    \
         "data"_a, "indices"_a, "indptr"_a, "group_codes"_a, "group_sizes"_a,  \
         "rank_sums"_a, "tie_corr"_a, nb::kw_only(), "compute_tie_corr"_a,     \
-        "sub_batch_cols"_a = SUB_BATCH_COLS)
+        "sub_batch_cols"_a = SUB_BATCH_COLS,                                  \
+        nb::call_guard<nb::gil_scoped_release>())
 
     RSC_OVR_SPARSE_DEVICE_BINDING("ovr_sparse_csc_device",
                                   ovr_sparse_csc_streaming_impl, int, int);
@@ -341,7 +465,8 @@ void register_sparse_bindings(nb::module_& m) {
         "data"_a, "indices"_a, "indptr"_a, "ref_rows"_a, "grp_rows"_a,        \
         "grp_offsets"_a, "rank_sums"_a, "tie_corr"_a, nb::kw_only(),          \
         "n_ref"_a, "n_all_grp"_a, "compute_tie_corr"_a,                       \
-        "sub_batch_cols"_a = SUB_BATCH_COLS)
+        "sub_batch_cols"_a = SUB_BATCH_COLS,                                  \
+        nb::call_guard<nb::gil_scoped_release>())
 
     RSC_OVO_DEVICE_BINDING("ovo_streaming_csc_device", ovo_streaming_csc_impl,
                            int, int);

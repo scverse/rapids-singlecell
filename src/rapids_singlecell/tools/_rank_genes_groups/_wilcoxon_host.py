@@ -4,9 +4,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import cupyx.scipy.sparse as cpsp
 import numpy as np
 
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
@@ -21,6 +23,9 @@ if TYPE_CHECKING:
     from ._core import _RankGenes
 
 CUDA_HOST_REGISTER_PORTABLE = 1
+CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217
+CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704
+CUDA_ERROR_TOO_MANY_PEERS = 711
 MIN_SPARSE_GENE_WORK = 1
 MAX_SPARSE_SPLIT_SAMPLES = 10_000_000
 SPARSE_SPLIT_SAMPLE_BLOCKS = 32
@@ -140,7 +145,7 @@ def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
     )
 
 
-def _split_host_gene_ranges(
+def _split_gene_ranges(
     X,
     *,
     n_devices: int,
@@ -152,13 +157,42 @@ def _split_host_gene_ranges(
     if n_shards <= 1:
         return [(0, n_genes)]
 
-    if isinstance(X, np.ndarray) or dense_fallback:
+    if isinstance(X, np.ndarray | cp.ndarray) or dense_fallback:
         weights = np.ones(n_genes, dtype=np.int64)
     elif X.format == "csc":
-        weights = np.diff(X.indptr).astype(np.int64, copy=False) + MIN_SPARSE_GENE_WORK
+        if cpsp.issparse(X):
+            with cp.cuda.Device(X.data.device.id):
+                weights = cp.asnumpy(cp.diff(X.indptr)).astype(np.int64, copy=False)
+        else:
+            weights = np.diff(X.indptr).astype(np.int64, copy=False)
+        weights += MIN_SPARSE_GENE_WORK
     else:
         indices = X.indices
-        if indices.size <= MAX_SPARSE_SPLIT_SAMPLES:
+        if cpsp.issparse(X):
+            if indices.size == 0:
+                weights = np.zeros(n_genes, dtype=np.int64)
+            else:
+                with cp.cuda.Device(X.data.device.id):
+                    if indices.size <= MAX_SPARSE_SPLIT_SAMPLES:
+                        weights_gpu = cp.bincount(indices, minlength=n_genes)
+                    else:
+                        weights_gpu = cp.zeros(n_genes, dtype=cp.int64)
+                        block_size = (
+                            MAX_SPARSE_SPLIT_SAMPLES // SPARSE_SPLIT_SAMPLE_BLOCKS
+                        )
+                        last_start = indices.size - block_size
+                        for block_index in range(SPARSE_SPLIT_SAMPLE_BLOCKS):
+                            start = (
+                                last_start
+                                * block_index
+                                // (SPARSE_SPLIT_SAMPLE_BLOCKS - 1)
+                            )
+                            weights_gpu += cp.bincount(
+                                indices[start : start + block_size],
+                                minlength=n_genes,
+                            )
+                    weights = cp.asnumpy(weights_gpu).astype(np.int64, copy=False)
+        elif indices.size <= MAX_SPARSE_SPLIT_SAMPLES:
             weights = np.bincount(indices, minlength=n_genes).astype(
                 np.int64, copy=False
             )
@@ -211,25 +245,52 @@ def _concat_shard_stat(workers: list[_RankGenes], name: str) -> NDArray | None:
     if all(array is None for array in arrays):
         return None
     if any(array is None for array in arrays):
-        msg = f"Inconsistent host Wilcoxon shard statistic: {name}."
+        msg = f"Inconsistent sharded Wilcoxon statistic: {name}."
         raise RuntimeError(msg)
     return np.concatenate(arrays, axis=1)
+
+
+@cache
+def _enable_peer_access(device_id: int, source_device: int) -> bool:
+    """Enable destination-to-source peer access."""
+    with cp.cuda.Device(device_id):
+        if not cp.cuda.runtime.deviceCanAccessPeer(device_id, source_device):
+            return False
+        try:
+            cp.cuda.runtime.deviceEnablePeerAccess(source_device)
+        except cp.cuda.runtime.CUDARuntimeError as error:
+            if error.status == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED:
+                return True
+            if error.status in {
+                CUDA_ERROR_PEER_ACCESS_UNSUPPORTED,
+                CUDA_ERROR_TOO_MANY_PEERS,
+            }:
+                return False
+            raise
+    return True
 
 
 def _copy_gpu_array_to_device(array: cp.ndarray, device_id: int) -> cp.ndarray:
     if array.device.id == device_id:
         return array
+    source_device = array.device.id
     with cp.cuda.Device(device_id):
         copied = cp.empty_like(array)
-    try:
-        cp.cuda.runtime.memcpyPeer(
-            copied.data.ptr,
-            device_id,
-            array.data.ptr,
-            array.device.id,
-            array.nbytes,
-        )
-    except cp.cuda.runtime.CUDARuntimeError:
+        if array.nbytes == 0:
+            return copied
+        peer_access = _enable_peer_access(device_id, source_device)
+        if peer_access:
+            # Do not hide peer-copy errors; they may report earlier async failures.
+            cp.cuda.runtime.memcpyPeer(
+                copied.data.ptr,
+                device_id,
+                array.data.ptr,
+                source_device,
+                array.nbytes,
+            )
+            return copied
+
+    if not peer_access:
         with cp.cuda.Device(array.device.id):
             host = array.get()
         with cp.cuda.Device(device_id):
@@ -237,16 +298,137 @@ def _copy_gpu_array_to_device(array: cp.ndarray, device_id: int) -> cp.ndarray:
     return copied
 
 
+def _device_sparse_from_arrays(X, data, indices, indptr, shape):
+    result = type(X)((data, indices, indptr), shape=shape, copy=False)
+    # CuPyX may narrow int64 metadata; restore the validated source dtype.
+    result.data = data
+    result.indices = indices
+    result.indptr = indptr
+    return result
+
+
+def _copy_device_sparse_to_device(X, device_id: int):
+    if X.data.device.id == device_id:
+        return X
+    data = _copy_gpu_array_to_device(X.data, device_id)
+    indices = _copy_gpu_array_to_device(X.indices, device_id)
+    indptr = _copy_gpu_array_to_device(X.indptr, device_id)
+    with cp.cuda.Device(device_id):
+        return _device_sparse_from_arrays(X, data, indices, indptr, X.shape)
+
+
+def _device_csc_column_shard(X, start: int, stop: int):
+    with cp.cuda.Device(X.data.device.id):
+        ptr_start = int(X.indptr[start].item())
+        ptr_stop = int(X.indptr[stop].item())
+        indptr = X.indptr[start : stop + 1] - ptr_start
+        return _device_sparse_from_arrays(
+            X,
+            X.data[ptr_start:ptr_stop],
+            X.indices[ptr_start:ptr_stop],
+            indptr,
+            (X.shape[0], stop - start),
+        )
+
+
+def _device_csr_column_shard(X, start: int, stop: int):
+    with cp.cuda.Device(X.data.device.id):
+        stream = cp.cuda.get_current_stream()
+        local_indptr = cp.empty_like(X.indptr)
+        local_nnz = _wcs.csr_column_range_indptr_device(
+            X.indices,
+            X.indptr,
+            local_indptr,
+            col_start=start,
+            col_stop=stop,
+            stream=stream.ptr,
+        )
+        local_data = cp.empty(local_nnz, dtype=X.data.dtype)
+        local_indices = cp.empty(local_nnz, dtype=X.indices.dtype)
+        _wcs.csr_column_range_gather_device(
+            X.data,
+            X.indices,
+            X.indptr,
+            local_indptr,
+            local_data,
+            local_indices,
+            local_nnz=local_nnz,
+            col_start=start,
+            col_stop=stop,
+            stream=stream.ptr,
+        )
+        stream.synchronize()
+        return _device_sparse_from_arrays(
+            X,
+            local_data,
+            local_indices,
+            local_indptr,
+            (X.shape[0], stop - start),
+        )
+
+
+def _device_column_shard(X, start: int, stop: int, device_id: int):
+    source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id
+    if start == 0 and stop == X.shape[1] and device_id == source_device:
+        return X
+
+    with cp.cuda.Device(source_device):
+        if isinstance(X, cp.ndarray):
+            # Pack columns contiguously for the dense binding and peer copy.
+            local = cp.asfortranarray(X[:, start:stop])
+        elif X.format == "csc":
+            local = _device_csc_column_shard(X, start, stop)
+        else:
+            local = _device_csr_column_shard(X, start, stop)
+
+    result = (
+        _copy_gpu_array_to_device(local, device_id)
+        if isinstance(local, cp.ndarray)
+        else _copy_device_sparse_to_device(local, device_id)
+    )
+    if device_id != source_device:
+        # Finish remote use before releasing source-side shard buffers.
+        with cp.cuda.Device(device_id):
+            cp.cuda.runtime.deviceSynchronize()
+    return result
+
+
+def _prepare_device_column_shards(X, ranges, device_ids):
+    source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id
+    if (
+        len(device_ids) == 1
+        and device_ids[0] == source_device
+        and ranges[0] == (0, X.shape[1])
+    ):
+        return [X]
+    with cp.cuda.Device(source_device):
+        cp.cuda.get_current_stream().synchronize()
+
+    # Build remote shards first to limit concurrent source-side buffers.
+    order = sorted(
+        range(len(device_ids)), key=lambda index: device_ids[index] == source_device
+    )
+    shards = [None] * len(device_ids)
+    for index in order:
+        start, stop = ranges[index]
+        shards[index] = _device_column_shard(X, start, stop, device_ids[index])
+    # Finish source-stream packing before worker threads consume the shards.
+    with cp.cuda.Device(source_device):
+        cp.cuda.get_current_stream().synchronize()
+    return shards
+
+
 def _concat_gpu_shards(arrays: list[cp.ndarray], device_id: int) -> cp.ndarray:
     if len(arrays) == 1:
         return arrays[0]
-    return cp.concatenate(
-        [_copy_gpu_array_to_device(array, device_id) for array in arrays],
-        axis=1,
-    )
+    local_arrays = [_copy_gpu_array_to_device(array, device_id) for array in arrays]
+    result = cp.concatenate(local_arrays, axis=1)
+    # Keep peer-copy buffers alive until concatenation finishes.
+    cp.cuda.runtime.deviceSynchronize()
+    return result
 
 
-def _run_host_wilcoxon(
+def _run_sharded_wilcoxon(
     rg: _RankGenes,
     *,
     tie_correct: bool,
@@ -256,15 +438,29 @@ def _run_host_wilcoxon(
     return_u_values: bool,
     shard_runner: Callable[..., _WilcoxonResult | None],
 ) -> _WilcoxonResult | None:
-    """Run and gather the common host-resident single/multi-GPU path."""
+    """Run Wilcoxon across one or more GPU shards."""
     X = rg.X
     n_cells, n_total_genes = X.shape
-    device_ids = (
-        [cp.cuda.Device().id]
-        if multi_gpu is False
-        else list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
+    is_device_input = isinstance(X, cp.ndarray) or cpsp.issparse(X)
+    source_device = (
+        X.device.id
+        if isinstance(X, cp.ndarray)
+        else X.data.device.id
+        if cpsp.issparse(X)
+        else None
     )
-    ranges = _split_host_gene_ranges(
+    auto_single_device = multi_gpu is None and is_device_input and rg.ireference is None
+    if multi_gpu is False or auto_single_device:
+        device_ids = [
+            source_device if source_device is not None else cp.cuda.Device().id
+        ]
+    else:
+        device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
+        if source_device in device_ids:
+            device_ids = [source_device] + [
+                device_id for device_id in device_ids if device_id != source_device
+            ]
+    ranges = _split_gene_ranges(
         X,
         n_devices=len(device_ids),
         dense_fallback=rg._sparse_negative_fallback,
@@ -275,7 +471,9 @@ def _run_host_wilcoxon(
     )
     dense_source = _host_dense_matrix(X) if isinstance(X, np.ndarray) else None
     csr_row_spans = [None] * len(ranges)
-    if dense_source is not None:
+    if is_device_input:
+        kernel_inputs = _prepare_device_column_shards(X, ranges, device_ids)
+    elif dense_source is not None:
         kernel_inputs = [dense_source] * len(ranges)
     else:
         sparse_source = _host_sparse_kernel_source(X)
@@ -319,10 +517,11 @@ def _run_host_wilcoxon(
     ) -> tuple[_RankGenes, _WilcoxonResult | None]:
         worker = copy(rg)
         worker.X = kernel_inputs[shard_index]
-        column_range = ranges[shard_index]
-        host_workers = max(1, MAX_HOST_STAGING_WORKERS // len(device_ids))
-        _wc._set_host_worker_limit(host_workers)
-        _wcs._set_host_worker_limit(host_workers)
+        column_range = None if is_device_input else ranges[shard_index]
+        if not is_device_input:
+            host_workers = max(1, MAX_HOST_STAGING_WORKERS // len(device_ids))
+            _wc._set_host_worker_limit(host_workers)
+            _wcs._set_host_worker_limit(host_workers)
         with cp.cuda.Device(device_ids[shard_index]):
             result = shard_runner(
                 worker,
@@ -334,12 +533,17 @@ def _run_host_wilcoxon(
                 sparse_row_spans=csr_row_spans[shard_index],
                 ovo_host_context=ovo_host_context,
             )
+            # Synchronize ranker streams before gathering or releasing inputs.
+            cp.cuda.runtime.deviceSynchronize()
         return worker, result
 
     register_dense = dense_source is not None and rg.ireference is None
     with _shared_dense_host_registration(dense_source, enabled=register_dense):
-        with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
-            shards = list(executor.map(run_shard, range(len(device_ids))))
+        if len(device_ids) == 1:
+            shards = [run_shard(0)]
+        else:
+            with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+                shards = list(executor.map(run_shard, range(len(device_ids))))
 
     workers = [worker for worker, _ in shards]
 
@@ -349,12 +553,15 @@ def _run_host_wilcoxon(
     rg.means_rest = _concat_shard_stat(workers, "means_rest")
     rg.vars_rest = None
     rg.pts_rest = _concat_shard_stat(workers, "pts_rest")
+    for worker in workers:
+        worker.X = None
+    kernel_inputs.clear()
 
     gpu_results = [result for _, result in shards]
     if all(result is None for result in gpu_results):
         return None
     if any(result is None for result in gpu_results):
-        msg = "Inconsistent host Wilcoxon GPU result state."
+        msg = "Inconsistent sharded Wilcoxon GPU result state."
         raise RuntimeError(msg)
     complete_gpu_results = [result for result in gpu_results if result is not None]
     group_indices = complete_gpu_results[0][0]
@@ -362,7 +569,7 @@ def _run_host_wilcoxon(
         not np.array_equal(result[0], group_indices)
         for result in complete_gpu_results[1:]
     ):
-        msg = "Inconsistent host Wilcoxon group ordering."
+        msg = "Inconsistent sharded Wilcoxon group ordering."
         raise RuntimeError(msg)
     result_device = device_ids[0]
     with cp.cuda.Device(result_device):

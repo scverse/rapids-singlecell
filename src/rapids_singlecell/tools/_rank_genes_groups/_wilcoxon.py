@@ -22,7 +22,7 @@ from ._utils import (
 from ._wilcoxon_host import (
     _build_ovo_host_context,
     _OvoHostContext,
-    _run_host_wilcoxon,
+    _run_sharded_wilcoxon,
 )
 
 if TYPE_CHECKING:
@@ -298,7 +298,7 @@ def wilcoxon(
     tie_correct: bool,
     use_continuity: bool = False,
     chunk_size: int | None = None,
-    multi_gpu: bool | list[int] | str | None = False,
+    multi_gpu: bool | list[int] | str | None = None,
     return_u_values: bool = False,
 ) -> _WilcoxonResult | None:
     """Compute Wilcoxon rank-sum test statistics."""
@@ -315,29 +315,15 @@ def wilcoxon(
     else:
         _warn_small_ovo_groups(rg, group_sizes)
 
-    if isinstance(X, np.ndarray | sp.spmatrix | sp.sparray):
-        return _run_host_wilcoxon(
-            rg,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-            chunk_size=chunk_size,
-            multi_gpu=multi_gpu,
-            return_u_values=return_u_values,
-            shard_runner=_run_wilcoxon_device_shard,
-        )
-
-    if multi_gpu is not False:
-        msg = "Multi-GPU Wilcoxon requires host-resident NumPy or SciPy input."
-        raise ValueError(msg)
-    device_id = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id
-    with cp.cuda.Device(device_id):
-        return _run_wilcoxon_device_shard(
-            rg,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-            chunk_size=chunk_size,
-            return_u_values=return_u_values,
-        )
+    return _run_sharded_wilcoxon(
+        rg,
+        tie_correct=tie_correct,
+        use_continuity=use_continuity,
+        chunk_size=chunk_size,
+        multi_gpu=multi_gpu,
+        return_u_values=return_u_values,
+        shard_runner=_run_wilcoxon_device_shard,
+    )
 
 
 def _run_wilcoxon_device_shard(

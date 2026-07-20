@@ -5,6 +5,93 @@
 #include "wilcoxon_block_reduce.cuh"
 #include "wilcoxon_ovr_tie_walk.cuh"
 
+// Count entries in [col_start, col_stop) for each canonical CSR row.
+template <typename IndexT, typename IndptrT>
+__global__ void csr_column_range_count_kernel(
+    const IndexT* __restrict__ indices, const IndptrT* __restrict__ indptr,
+    IndptrT* __restrict__ local_indptr, int n_rows, int col_start,
+    int col_stop) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long row = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         row < n_rows; row += stride) {
+        IndptrT row_start = indptr[row];
+        IndptrT row_stop = indptr[row + 1];
+
+        IndptrT lo = row_start;
+        IndptrT hi = row_stop;
+        while (lo < hi) {
+            IndptrT mid = lo + ((hi - lo) >> 1);
+            if (indices[mid] < (IndexT)col_start)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        IndptrT range_start = lo;
+
+        hi = row_stop;
+        while (lo < hi) {
+            IndptrT mid = lo + ((hi - lo) >> 1);
+            if (indices[mid] < (IndexT)col_stop)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        local_indptr[row + 1] = lo - range_start;
+    }
+}
+
+// Gather a column range into compact CSR and rebase its column indices.
+template <typename InT, typename IndexT, typename IndptrT>
+__global__ void csr_column_range_gather_kernel(
+    const InT* __restrict__ data, const IndexT* __restrict__ indices,
+    const IndptrT* __restrict__ indptr,
+    const IndptrT* __restrict__ local_indptr, InT* __restrict__ local_data,
+    IndexT* __restrict__ local_indices, int n_rows, int col_start,
+    int col_stop) {
+    __shared__ IndptrT source_start;
+    __shared__ IndptrT source_stop;
+
+    for (int row = (int)blockIdx.x; row < n_rows; row += (int)gridDim.x) {
+        if (threadIdx.x == 0) {
+            IndptrT row_start = indptr[row];
+            IndptrT row_stop = indptr[row + 1];
+
+            IndptrT lo = row_start;
+            IndptrT hi = row_stop;
+            while (lo < hi) {
+                IndptrT mid = lo + ((hi - lo) >> 1);
+                if (indices[mid] < (IndexT)col_start)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            source_start = lo;
+
+            hi = row_stop;
+            while (lo < hi) {
+                IndptrT mid = lo + ((hi - lo) >> 1);
+                if (indices[mid] < (IndexT)col_stop)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            source_stop = lo;
+        }
+        __syncthreads();
+
+        IndptrT destination = local_indptr[row];
+        IndptrT count = source_stop - source_start;
+        for (IndptrT item = (IndptrT)threadIdx.x; item < count;
+             item += (IndptrT)blockDim.x) {
+            IndptrT source = source_start + item;
+            local_data[destination + item] = data[source];
+            local_indices[destination + item] =
+                indices[source] - (IndexT)col_start;
+        }
+        __syncthreads();
+    }
+}
+
 // Sparse OVR rank with implicit zeros inserted analytically between sorted
 // negative and positive stored values. CRITICAL: keep the gmem fallback for
 // large n_groups.
