@@ -5,9 +5,8 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 import pandas as pd
-from scanpy.get import _get_obs_rep
 
-from rapids_singlecell.get import X_to_GPU
+from rapids_singlecell.get import X_to_GPU, _get_obs_rep
 
 from ._base import PerturbationEfficacyAnalyzer, _to_dense_gpu
 

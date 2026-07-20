@@ -8,9 +8,9 @@ import pandas as pd
 from anndata import AnnData
 from cupyx.scipy import sparse
 from scanpy import logging as logg
-from scanpy.get import _get_obs_rep
 
 from rapids_singlecell import preprocessing as pp
+from rapids_singlecell.get import _get_obs_rep
 
 from . import pipeline
 from .core import Scrublet
