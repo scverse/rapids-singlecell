@@ -145,6 +145,26 @@ def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
     )
 
 
+def _csr_column_weights(indices, n_genes: int, xp) -> np.ndarray:
+    """Estimate CSR column work with exact or evenly sampled histograms."""
+    if indices.size == 0:
+        return np.zeros(n_genes, dtype=np.int64)
+    if indices.size <= MAX_SPARSE_SPLIT_SAMPLES:
+        weights = xp.bincount(indices, minlength=n_genes)
+    else:
+        weights = xp.zeros(n_genes, dtype=xp.int64)
+        block_size = MAX_SPARSE_SPLIT_SAMPLES // SPARSE_SPLIT_SAMPLE_BLOCKS
+        last_start = indices.size - block_size
+        for block_index in range(SPARSE_SPLIT_SAMPLE_BLOCKS):
+            start = last_start * block_index // (SPARSE_SPLIT_SAMPLE_BLOCKS - 1)
+            weights += xp.bincount(
+                indices[start : start + block_size], minlength=n_genes
+            )
+    if xp is cp:
+        weights = cp.asnumpy(weights)
+    return weights.astype(np.int64, copy=False)
+
+
 def _split_gene_ranges(
     X,
     *,
@@ -169,47 +189,10 @@ def _split_gene_ranges(
     else:
         indices = X.indices
         if cpsp.issparse(X):
-            if indices.size == 0:
-                weights = np.zeros(n_genes, dtype=np.int64)
-            else:
-                with cp.cuda.Device(X.data.device.id):
-                    if indices.size <= MAX_SPARSE_SPLIT_SAMPLES:
-                        weights_gpu = cp.bincount(indices, minlength=n_genes)
-                    else:
-                        weights_gpu = cp.zeros(n_genes, dtype=cp.int64)
-                        block_size = (
-                            MAX_SPARSE_SPLIT_SAMPLES // SPARSE_SPLIT_SAMPLE_BLOCKS
-                        )
-                        last_start = indices.size - block_size
-                        for block_index in range(SPARSE_SPLIT_SAMPLE_BLOCKS):
-                            start = (
-                                last_start
-                                * block_index
-                                // (SPARSE_SPLIT_SAMPLE_BLOCKS - 1)
-                            )
-                            weights_gpu += cp.bincount(
-                                indices[start : start + block_size],
-                                minlength=n_genes,
-                            )
-                    weights = cp.asnumpy(weights_gpu).astype(np.int64, copy=False)
-        elif indices.size <= MAX_SPARSE_SPLIT_SAMPLES:
-            weights = np.bincount(indices, minlength=n_genes).astype(
-                np.int64, copy=False
-            )
+            with cp.cuda.Device(X.data.device.id):
+                weights = _csr_column_weights(indices, n_genes, cp)
         else:
-            # An exact CSR column histogram scans the entire index buffer. At
-            # real scale that planning pass can cost more than the Wilcoxon
-            # itself, so sample small contiguous blocks spread across the
-            # buffer. Contiguous sampling keeps host reads bounded and the
-            # evenly-spaced blocks avoid depending on one cell/group region.
-            weights = np.zeros(n_genes, dtype=np.int64)
-            block_size = MAX_SPARSE_SPLIT_SAMPLES // SPARSE_SPLIT_SAMPLE_BLOCKS
-            last_start = indices.size - block_size
-            for block_index in range(SPARSE_SPLIT_SAMPLE_BLOCKS):
-                start = last_start * block_index // (SPARSE_SPLIT_SAMPLE_BLOCKS - 1)
-                weights += np.bincount(
-                    indices[start : start + block_size], minlength=n_genes
-                )
+            weights = _csr_column_weights(indices, n_genes, np)
         weights += MIN_SPARSE_GENE_WORK
 
     total = int(weights.sum(dtype=np.int64))
@@ -278,8 +261,7 @@ def _copy_gpu_array_to_device(array: cp.ndarray, device_id: int) -> cp.ndarray:
         copied = cp.empty_like(array)
         if array.nbytes == 0:
             return copied
-        peer_access = _enable_peer_access(device_id, source_device)
-        if peer_access:
+        if _enable_peer_access(device_id, source_device):
             # Do not hide peer-copy errors; they may report earlier async failures.
             cp.cuda.runtime.memcpyPeer(
                 copied.data.ptr,
@@ -290,11 +272,10 @@ def _copy_gpu_array_to_device(array: cp.ndarray, device_id: int) -> cp.ndarray:
             )
             return copied
 
-    if not peer_access:
-        with cp.cuda.Device(array.device.id):
-            host = array.get()
-        with cp.cuda.Device(device_id):
-            copied.set(host)
+    with cp.cuda.Device(array.device.id):
+        host = array.get()
+    with cp.cuda.Device(device_id):
+        copied.set(host)
     return copied
 
 
@@ -352,7 +333,6 @@ def _device_csr_column_shard(X, start: int, stop: int):
             local_indptr,
             local_data,
             local_indices,
-            local_nnz=local_nnz,
             col_start=start,
             col_stop=stop,
             stream=stream.ptr,
@@ -456,10 +436,7 @@ def _run_sharded_wilcoxon(
         ]
     else:
         device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
-        if source_device in device_ids:
-            device_ids = [source_device] + [
-                device_id for device_id in device_ids if device_id != source_device
-            ]
+        device_ids.sort(key=lambda device_id: device_id != source_device)
     ranges = _split_gene_ranges(
         X,
         n_devices=len(device_ids),
@@ -588,9 +565,4 @@ def _run_sharded_wilcoxon(
             if all(part is not None for part in logfoldchange_parts)
             else None
         )
-    return (
-        group_indices,
-        scores,
-        pvals,
-        logfoldchanges,
-    )
+    return group_indices, scores, pvals, logfoldchanges

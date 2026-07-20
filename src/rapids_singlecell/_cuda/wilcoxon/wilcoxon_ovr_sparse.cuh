@@ -161,9 +161,9 @@ static void ovr_sparse_csc_host_streaming_impl(
             // slot instead of page-locking the whole host CSC.
             stage->wait(s);
             if (batch_nnz > 0) {
-                host_copy_slice(h_data, h_indices, (size_t)ptr_start, batch_nnz,
-                                stage->template get<0>(s),
-                                stage->template get<1>(s));
+                host_copy_slice_as<InT, IndexT>(
+                    h_data, h_indices, (size_t)ptr_start, batch_nnz,
+                    stage->template get<0>(s), stage->template get<1>(s));
                 cudaMemcpyAsync(buf.d_sparse_data_orig,
                                 stage->template get<0>(s),
                                 (size_t)batch_nnz * sizeof(InT),

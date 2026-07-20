@@ -602,22 +602,6 @@ static void host_copy_slice_as(const InT* h_data, const IndexT* h_indices,
     });
 }
 
-template <typename InT, typename IndexT>
-static void host_copy_slice(const InT* h_data, const IndexT* h_indices,
-                            size_t start, int nnz, InT* stage_vals,
-                            IndexT* stage_cols) {
-    host_copy_slice_as<InT, IndexT>(h_data, h_indices, start, nnz, stage_vals,
-                                    stage_cols);
-}
-
-template <typename InT, typename IndexT>
-static void host_cast_copy_slice(const InT* h_data, const IndexT* h_indices,
-                                 size_t start, int nnz, float* stage_vals,
-                                 int* stage_cols) {
-    host_copy_slice_as<float, int>(h_data, h_indices, start, nnz, stage_vals,
-                                   stage_cols);
-}
-
 // Threaded host gather of selected dense rows and contiguous columns.
 // Output staging is always F-order [n_window_rows, n_window_cols].
 template <typename StageT, typename InT>
@@ -640,17 +624,6 @@ static void host_materialize_dense_rows_window_as(
                 (StageT)h_X[src];
         }
     });
-}
-
-template <typename InT>
-static void host_materialize_dense_rows_window(const InT* h_X, bool f_order,
-                                               int n_full_rows, int n_full_cols,
-                                               const int* row_ids,
-                                               int n_window_rows, int col_start,
-                                               int n_window_cols, InT* stage) {
-    host_materialize_dense_rows_window_as<InT>(
-        h_X, f_order, n_full_rows, n_full_cols, row_ids, n_window_rows,
-        col_start, n_window_cols, stage);
 }
 
 /** Fill linear segment offsets [0, stride, ...] on the supplied stream (avoids

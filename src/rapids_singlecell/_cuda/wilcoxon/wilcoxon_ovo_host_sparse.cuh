@@ -299,8 +299,8 @@ static void ovo_streaming_csc_host_impl(
         // Cast-copy column batch into pinned staging, bulk H2D; the event lets
         // the next copy overlap compute.
         stage.wait(s);
-        host_cast_copy_slice(h_data, h_indices, (size_t)ptr_start, nnz_i,
-                             stage.get<0>(s), stage.get<1>(s));
+        host_copy_slice_as<float, int>(h_data, h_indices, (size_t)ptr_start,
+                                       nnz_i, stage.get<0>(s), stage.get<1>(s));
         cudaMemcpyAsync(buf.d_sparse_data_f32, stage.get<0>(s),
                         nnz * sizeof(float), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(buf.d_sparse_indices, stage.get<1>(s),

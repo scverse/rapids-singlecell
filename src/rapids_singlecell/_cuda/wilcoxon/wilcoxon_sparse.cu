@@ -98,8 +98,8 @@ static void def_csr_column_range_gather_device(nb::module_& m) {
            gpu_array_c<const IndptrT, Device> indptr,
            gpu_array_c<const IndptrT, Device> local_indptr,
            gpu_array_c<InT, Device> local_data,
-           gpu_array_c<IndexT, Device> local_indices, int64_t local_nnz,
-           int col_start, int col_stop, std::uintptr_t stream) {
+           gpu_array_c<IndexT, Device> local_indices, int col_start,
+           int col_stop, std::uintptr_t stream) {
             nb_require(data.ndim() == 1 && indices.ndim() == 1 &&
                            indptr.ndim() == 1 && local_indptr.ndim() == 1 &&
                            local_data.ndim() == 1 && local_indices.ndim() == 1,
@@ -114,11 +114,10 @@ static void def_csr_column_range_gather_device(nb::module_& m) {
             nb_require(local_indptr.shape(0) == indptr.shape(0),
                        "csr_column_range_gather_device: local_indptr must "
                        "match indptr length");
-            nb_require(local_nnz >= 0 &&
-                           (size_t)local_nnz == local_data.shape(0) &&
-                           local_data.shape(0) == local_indices.shape(0),
+            size_t local_nnz = local_data.shape(0);
+            nb_require(local_nnz == local_indices.shape(0),
                        "csr_column_range_gather_device: output lengths must "
-                       "equal local_nnz");
+                       "match");
             nb_require(col_start >= 0 && col_start <= col_stop,
                        "csr_column_range_gather_device: invalid column range");
 
@@ -134,8 +133,8 @@ static void def_csr_column_range_gather_device(nb::module_& m) {
             CUDA_CHECK_LAST_ERROR(csr_column_range_gather_kernel);
         },
         "data"_a, "indices"_a, "indptr"_a, "local_indptr"_a, "local_data"_a,
-        "local_indices"_a, nb::kw_only(), "local_nnz"_a, "col_start"_a,
-        "col_stop"_a, "stream"_a = 0);
+        "local_indices"_a, nb::kw_only(), "col_start"_a, "col_stop"_a,
+        "stream"_a = 0);
 }
 
 template <typename IndexT, typename IndptrT>

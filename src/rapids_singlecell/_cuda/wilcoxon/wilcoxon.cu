@@ -712,10 +712,10 @@ static void launch_ovo_rank_dense_host_streaming(
         T* h_ref_stage = stage.template get<0>(s);
         T* h_grp_stage = stage.template get<1>(s);
 
-        host_materialize_dense_rows_window(
+        host_materialize_dense_rows_window_as<T>(
             h_X, f_order, n_full_rows, input_n_cols, h_ref_row_ids, n_ref,
             col_start + col, sb_cols, h_ref_stage);
-        host_materialize_dense_rows_window(
+        host_materialize_dense_rows_window_as<T>(
             h_X, f_order, n_full_rows, input_n_cols, h_grp_row_ids, n_all_grp,
             col_start + col, sb_cols, h_grp_stage);
 

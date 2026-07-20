@@ -1504,7 +1504,7 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
 
 
 def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
-    """Host CSR OVR ranks signed stored values correctly across chunks."""
+    """Host CSR OVR ranks signed stored values correctly."""
     rng = np.random.default_rng(0)
     n_obs, n_vars = 200, 24
     X = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
@@ -1525,7 +1525,6 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
         pts=True,
         tie_correct=True,
         n_genes=n_vars,
-        chunk_size=8,  # < n_vars -> multiple chunks
     )
     sc.tl.rank_genes_groups(
         cpu,
@@ -2429,14 +2428,17 @@ def test_wilcoxon_device_two_gpu_matches_single(fmt, reference, tie_correct):
         pytest.param("numpy_dense", "rest", False, id="dense-ovr"),
         pytest.param("numpy_dense", "1", False, id="dense-ovo"),
         pytest.param("scipy_csr", "rest", False, id="csr-ovr"),
+        pytest.param("scipy_csr", "rest", True, id="csr-ovr-signed"),
         pytest.param("scipy_csr", "1", False, id="csr-ovo"),
         pytest.param("scipy_csr", "1", True, id="csr-ovo-signed"),
         pytest.param("scipy_csc", "rest", False, id="csc-ovr"),
+        pytest.param("scipy_csc", "rest", True, id="csc-ovr-signed"),
         pytest.param("scipy_csc", "1", False, id="csc-ovo"),
         pytest.param("scipy_csc", "1", True, id="csc-ovo-signed"),
     ],
 )
-def test_wilcoxon_host_two_gpu_matches_single(fmt, reference, signed):
+@pytest.mark.parametrize("tie_correct", [False, True])
+def test_wilcoxon_host_two_gpu_matches_single(fmt, reference, signed, tie_correct):
     source_device = cp.cuda.Device().id
     peer_device = next(
         device_id
@@ -2449,7 +2451,7 @@ def test_wilcoxon_host_two_gpu_matches_single(fmt, reference, signed):
         "method": "wilcoxon",
         "use_raw": False,
         "reference": reference,
-        "tie_correct": True,
+        "tie_correct": tie_correct,
         "pts": True,
         "n_genes": single.n_vars,
     }

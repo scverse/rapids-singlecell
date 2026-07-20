@@ -21,31 +21,31 @@ type _Method = Literal[
 ]
 
 
-def _array_result_to_records(
-    arrays: dict[str, object], field: str, dtype: str | np.dtype
+def _matrix_to_records(
+    values: np.ndarray, group_names: Iterable[object], dtype: str | np.dtype
 ) -> np.ndarray:
-    group_names = tuple(str(name) for name in arrays["group_names"])
-    values = np.asarray(arrays[field])
+    field_dtype = np.dtype(dtype)
     record_dtype = np.dtype(
-        [(group_name, np.dtype(dtype)) for group_name in group_names]
+        [(str(group_name), field_dtype) for group_name in group_names]
     )
     if values.shape[1] == 0:
         return np.empty(0, dtype=record_dtype)
-    record_matrix = np.ascontiguousarray(values.T, dtype=dtype)
+    record_matrix = np.ascontiguousarray(values.T, dtype=field_dtype)
     # Reinterpret rows as records; the returned view retains its backing matrix.
     return np.ndarray(values.shape[1], dtype=record_dtype, buffer=record_matrix)
 
 
+def _array_result_to_records(
+    arrays: dict[str, object], field: str, dtype: str | np.dtype
+) -> np.ndarray:
+    return _matrix_to_records(np.asarray(arrays[field]), arrays["group_names"], dtype)
+
+
 def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
-    group_names = tuple(str(name) for name in arrays["group_names"])
     var_names = np.asarray(arrays["var_names"], dtype=object)
     gene_indices = np.asarray(arrays["gene_indices"], dtype=np.intp)
-    record_dtype = np.dtype([(group_name, object) for group_name in group_names])
-    if gene_indices.shape[1] == 0:
-        return np.empty(0, dtype=record_dtype)
-    record_matrix = np.ascontiguousarray(np.take(var_names, gene_indices.T))
-    # Reinterpret rows as records; the returned view retains its backing matrix.
-    return np.ndarray(gene_indices.shape[1], dtype=record_dtype, buffer=record_matrix)
+    values = np.take(var_names, gene_indices)
+    return _matrix_to_records(values, arrays["group_names"], np.dtype(object))
 
 
 def rank_genes_groups(
