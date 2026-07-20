@@ -60,8 +60,9 @@ static OvoHostCsrPackPlan plan_ovo_host_csr_packs(
         size_t nnz_g = (size_t)(h_grp_indptr_compact[h_grp_offsets[g + 1]] -
                                 h_grp_indptr_compact[h_grp_offsets[g]]);
         int new_rows = cur_rows + n_g;
-        bool can_add = (cur_rows == 0) || (new_rows <= target_rows &&
-                                           cur_nnz + nnz_g <= pack_nnz_cap);
+        bool can_add =
+            (n_g == 0) || (cur_rows == 0) ||
+            (new_rows <= target_rows && cur_nnz + nnz_g <= pack_nnz_cap);
         if (!can_add) {
             size_t sb_size = std::min(
                 (size_t)n_cols, GROUP_DENSE_BUDGET_ITEMS / (size_t)cur_rows);

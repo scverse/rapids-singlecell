@@ -494,7 +494,7 @@ __global__ void ovo_rank_medium_kernel(
     int g_start = grp_offsets[grp];
     int g_end = grp_offsets[grp + 1];
     int n_grp = g_end - g_start;
-    if (n_grp <= skip_n_grp_le || n_grp > max_n_grp_le) return;
+    if ((n_grp > 0 && n_grp <= skip_n_grp_le) || n_grp > max_n_grp_le) return;
 
     extern __shared__ char smem_raw[];
     float* grp_smem = (float*)smem_raw;
@@ -575,7 +575,7 @@ __global__ void ovo_rank_medium_analytic_kernel(
 
     int g_start = grp_offsets[grp];
     int n_grp = grp_offsets[grp + 1] - g_start;
-    if (n_grp <= skip_n_grp_le || n_grp > max_n_grp_le) return;
+    if ((n_grp > 0 && n_grp <= skip_n_grp_le) || n_grp > max_n_grp_le) return;
 
     extern __shared__ char smem_raw[];
     float* grp_smem = (float*)smem_raw;

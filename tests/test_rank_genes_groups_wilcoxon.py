@@ -10,6 +10,8 @@ import scipy.sparse as sp
 from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
+from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
+from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_host
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
@@ -1501,8 +1503,8 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
     )
 
 
-def test_wilcoxon_host_sparse_negative_chunked_stats_match_scanpy():
-    """Host sparse negatives fallback must match scanpy stats across chunks."""
+def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
+    """Host CSR OVR ranks signed stored values correctly across chunks."""
     rng = np.random.default_rng(0)
     n_obs, n_vars = 200, 24
     X = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
@@ -1521,25 +1523,37 @@ def test_wilcoxon_host_sparse_negative_chunked_stats_match_scanpy():
         use_raw=False,
         reference="rest",
         pts=True,
+        tie_correct=True,
         n_genes=n_vars,
         chunk_size=8,  # < n_vars -> multiple chunks
     )
     sc.tl.rank_genes_groups(
-        cpu, "group", method="wilcoxon", use_raw=False, reference="rest", pts=True
+        cpu,
+        "group",
+        method="wilcoxon",
+        use_raw=False,
+        reference="rest",
+        pts=True,
+        tie_correct=True,
     )
     g = gpu.uns["rank_genes_groups"]
     c = cpu.uns["rank_genes_groups"]
-    for group in g["names"].dtype.names:
-        g_lfc = dict(
-            zip(g["names"][group], np.asarray(g["logfoldchanges"][group], float))
-        )
-        c_lfc = dict(
-            zip(c["names"][group], np.asarray(c["logfoldchanges"][group], float))
-        )
-        for gene, val in g_lfc.items():
-            np.testing.assert_allclose(
-                val, c_lfc[gene], rtol=1e-12, atol=1e-13, equal_nan=True
+    for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
+        for group in g["names"].dtype.names:
+            actual = dict(
+                zip(g["names"][group], np.asarray(g[field][group], dtype=float))
             )
+            expected = dict(
+                zip(c["names"][group], np.asarray(c[field][group], dtype=float))
+            )
+            for gene, value in actual.items():
+                np.testing.assert_allclose(
+                    value,
+                    expected[gene],
+                    rtol=1e-12,
+                    atol=1e-13,
+                    equal_nan=True,
+                )
     for frame in ("pts", "pts_rest"):
         for col in c[frame].columns:
             np.testing.assert_allclose(
@@ -1900,6 +1914,15 @@ def test_singleton_group_without_skip_raises():
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
 
 
+def test_unused_category_without_skip_raises():
+    adata = _anndata_with_group_sizes({"a": 10, "b": 10}, seed=5)
+    adata.obs["group"] = adata.obs["group"].cat.add_categories(["unused"])
+    with pytest.raises(ValueError, match="unused"):
+        rsc.tl.rank_genes_groups(
+            adata, "group", method="wilcoxon", use_raw=False, reference="a"
+        )
+
+
 @pytest.mark.parametrize("use_raw", [None, True])
 def test_rank_genes_groups_reads_raw_matches_scanpy(use_raw):
     """use_raw=None and use_raw=True both read adata.raw, matching scanpy."""
@@ -2126,13 +2149,18 @@ def test_host_sparse_mismatched_index_dtype_raises(reference, layout):
         rsc.tl.rank_genes_groups(adata, "group", **kw)
 
 
-def _make_multi_gpu_wilcoxon_adata(fmt, *, source_device=0, all_zero=False):
+def _make_multi_gpu_wilcoxon_adata(
+    fmt, *, source_device=0, all_zero=False, signed=False
+):
     rng = np.random.default_rng(21)
     if all_zero:
         dense = np.zeros((120, 12), dtype=np.float32)
     else:
         dense = rng.integers(0, 7, size=(192, 18)).astype(np.float32)
         dense[dense < 2] = 0.0
+        if signed:
+            for col in (0, 5, 10, 15):
+                dense[col::17, col] = -1.0
     labels = np.asarray([str(i % 4) for i in range(dense.shape[0])])
     obs = pd.DataFrame(
         {"group": pd.Categorical(labels)},
@@ -2150,6 +2178,84 @@ def _make_multi_gpu_wilcoxon_adata(fmt, *, source_device=0, all_zero=False):
     adata = sc.AnnData(X=matrix, obs=obs, var=var)
     adata.uns["log1p"] = {"base": None}
     return adata
+
+
+@pytest.mark.parametrize("empty_group", [0, 1], ids=["first", "last"])
+def test_wilcoxon_ovo_empty_group_outputs_are_initialized(empty_group):
+    n_cols = 5
+    ref = cp.asfortranarray(
+        cp.tile(cp.asarray([0, 0, 1], dtype=cp.float32)[:, None], (1, n_cols))
+    )
+    groups = cp.asfortranarray(
+        cp.tile(cp.asarray([0, 2, 3, 4], dtype=cp.float32)[:, None], (1, n_cols))
+    )
+    offsets = cp.asarray([0, 0, 4] if empty_group == 0 else [0, 4, 4], dtype=cp.int32)
+    rank_sums = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
+    tie_corr = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
+
+    _wc.ovo_rank_dense_tiered_unsorted_ref(
+        ref,
+        groups,
+        offsets,
+        rank_sums,
+        tie_corr,
+        compute_tie_corr=True,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    cp.cuda.get_current_stream().synchronize()
+
+    valid_group = 1 - empty_group
+    assert bool(cp.isfinite(cp.sum(rank_sums + tie_corr)).item())
+    cp.testing.assert_array_equal(rank_sums[empty_group], cp.zeros(n_cols))
+    cp.testing.assert_array_equal(rank_sums[valid_group], cp.full(n_cols, 20.0))
+    cp.testing.assert_array_equal(tie_corr[empty_group], cp.full(n_cols, 0.75))
+    cp.testing.assert_allclose(tie_corr[valid_group], cp.full(n_cols, 13.0 / 14.0))
+
+
+@pytest.mark.parametrize("empty_group", [0, 1], ids=["first", "last"])
+def test_wilcoxon_ovo_sparse_empty_group_outputs_are_initialized(empty_group):
+    n_cols = 5
+    matrix = sp.csr_matrix(
+        np.tile(
+            np.asarray([0, 0, 1, 0, 2, 3, 4], dtype=np.float32)[:, None], (1, n_cols)
+        )
+    )
+    ref_rows = np.asarray([0, 1, 2], dtype=np.int32)
+    group_rows = np.asarray([3, 4, 5, 6], dtype=np.int32)
+    offsets = np.asarray([0, 0, 4] if empty_group == 0 else [0, 4, 4], dtype=np.int32)
+    rank_sums = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
+    tie_corr = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
+    group_sums = cp.full((3, n_cols), cp.nan, dtype=cp.float64)
+
+    _wcs.ovo_streaming_csr_host(
+        matrix.data,
+        matrix.indices,
+        matrix.indptr[:-1],
+        matrix.indptr[1:],
+        ref_rows,
+        group_rows,
+        offsets,
+        rank_sums,
+        tie_corr,
+        group_sums,
+        cp.empty(1, dtype=cp.float64),
+        n_cols=n_cols,
+        compute_tie_corr=True,
+        compute_nnz=False,
+        analytic_zeros=True,
+    )
+    cp.cuda.get_current_stream().synchronize()
+
+    valid_group = 1 - empty_group
+    probe = cp.sum(rank_sums + tie_corr) + cp.sum(group_sums)
+    assert bool(cp.isfinite(probe).item())
+    cp.testing.assert_array_equal(rank_sums[empty_group], cp.zeros(n_cols))
+    cp.testing.assert_array_equal(rank_sums[valid_group], cp.full(n_cols, 20.0))
+    cp.testing.assert_array_equal(tie_corr[empty_group], cp.full(n_cols, 0.75))
+    cp.testing.assert_allclose(tie_corr[valid_group], cp.full(n_cols, 13.0 / 14.0))
+    cp.testing.assert_array_equal(group_sums[empty_group], cp.zeros(n_cols))
+    cp.testing.assert_array_equal(group_sums[valid_group], cp.full(n_cols, 9.0))
+    cp.testing.assert_array_equal(group_sums[2], cp.full(n_cols, 1.0))
 
 
 def _assert_multi_gpu_wilcoxon_equal(actual, expected):
@@ -2302,6 +2408,48 @@ def test_wilcoxon_device_two_gpu_matches_single(fmt, reference, tie_correct):
         "use_raw": False,
         "reference": reference,
         "tie_correct": tie_correct,
+        "pts": True,
+        "n_genes": single.n_vars,
+    }
+    rsc.tl.rank_genes_groups(single, "group", multi_gpu=False, **kwargs)
+    rsc.tl.rank_genes_groups(
+        multi,
+        "group",
+        multi_gpu=[source_device, peer_device],
+        **kwargs,
+    )
+
+    _assert_multi_gpu_wilcoxon_equal(multi, single)
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.parametrize(
+    ("fmt", "reference", "signed"),
+    [
+        pytest.param("numpy_dense", "rest", False, id="dense-ovr"),
+        pytest.param("numpy_dense", "1", False, id="dense-ovo"),
+        pytest.param("scipy_csr", "rest", False, id="csr-ovr"),
+        pytest.param("scipy_csr", "1", False, id="csr-ovo"),
+        pytest.param("scipy_csr", "1", True, id="csr-ovo-signed"),
+        pytest.param("scipy_csc", "rest", False, id="csc-ovr"),
+        pytest.param("scipy_csc", "1", False, id="csc-ovo"),
+        pytest.param("scipy_csc", "1", True, id="csc-ovo-signed"),
+    ],
+)
+def test_wilcoxon_host_two_gpu_matches_single(fmt, reference, signed):
+    source_device = cp.cuda.Device().id
+    peer_device = next(
+        device_id
+        for device_id in range(cp.cuda.runtime.getDeviceCount())
+        if device_id != source_device
+    )
+    single = _make_multi_gpu_wilcoxon_adata(fmt, signed=signed)
+    multi = _make_multi_gpu_wilcoxon_adata(fmt, signed=signed)
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": reference,
+        "tie_correct": True,
         "pts": True,
         "n_genes": single.n_vars,
     }

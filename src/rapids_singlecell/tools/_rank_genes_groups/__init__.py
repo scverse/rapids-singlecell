@@ -32,6 +32,7 @@ def _array_result_to_records(
     if values.shape[1] == 0:
         return np.empty(0, dtype=record_dtype)
     record_matrix = np.ascontiguousarray(values.T, dtype=dtype)
+    # Reinterpret rows as records; the returned view retains its backing matrix.
     return np.ndarray(values.shape[1], dtype=record_dtype, buffer=record_matrix)
 
 
@@ -43,6 +44,7 @@ def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
     if gene_indices.shape[1] == 0:
         return np.empty(0, dtype=record_dtype)
     record_matrix = np.ascontiguousarray(np.take(var_names, gene_indices.T))
+    # Reinterpret rows as records; the returned view retains its backing matrix.
     return np.ndarray(gene_indices.shape[1], dtype=record_dtype, buffer=record_matrix)
 
 
