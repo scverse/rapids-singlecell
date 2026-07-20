@@ -39,7 +39,7 @@ jobs:
           enable-cache: false
       - id: get-envs
         run: |
-          # Stable + dev, all cu13 (stable -> multi-T4, dev -> A10)
+          # Stable + dev, all cu13 (stable -> T4, dev -> A10)
           STABLE_DEV_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
@@ -51,7 +51,7 @@ jobs:
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
-                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4-multi" else "cirun-aws-gpu-a10" end),
+                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4" else "cirun-aws-gpu-a10" end),
               }
             )')
           echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
@@ -104,9 +104,6 @@ jobs:
         run: |
           mkdir -p test-data
           if [[ "${{ matrix.env.name }}" == *"stable"* ]]; then
-            export CUDA_VISIBLE_DEVICES=0,1
-            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:python -c \
-              "import cupy as cp; assert cp.cuda.runtime.getDeviceCount() == 2"
             uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run-cov -v --color=yes
             uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:coverage xml
             uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:cov-report

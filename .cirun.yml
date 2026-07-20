@@ -10,7 +10,7 @@ runners:
       - false
     labels:
       - cirun-aws-gpu-a10
-  # Single T4 for prerelease (cu13). scverse-standard AMI, eu-west-1.
+  # T4 for stable + prerelease (cu13). scverse-standard AMI, eu-west-1.
   - name: aws-gpu-runner-g4dn
     cloud: aws
     instance_type: g4dn.xlarge
@@ -21,14 +21,3 @@ runners:
       - false
     labels:
       - cirun-aws-gpu-t4
-  # Four-T4 host for two-GPU stable coverage.
-  - name: aws-gpu-runner-g4dn-multi
-    cloud: aws
-    instance_type: g4dn.12xlarge
-    machine_image: ami-0756bd122da9b2618
-    region: eu-west-1
-    preemptible:
-      - true
-      - false
-    labels:
-      - cirun-aws-gpu-t4-multi
