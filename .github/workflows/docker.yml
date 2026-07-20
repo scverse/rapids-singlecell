@@ -183,7 +183,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CUDA_ARCHS=${{ matrix.CUDA_SUFFIX.label == 'cuda12' && '75-real;80-real;86-real;89-real;90' || '75-real;80-real;86-real;89-real;90-real;100-real;120' }}
-            SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RAPIDS_SINGLECELL=${{ steps.source-version.outputs.version }}
+            RSC_VERSION=${{ steps.source-version.outputs.version }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}
           build-contexts: |
             rapids-singlecell-deps=docker-image://${{ fromJSON(steps.meta-base.outputs.json).tags[0] }}

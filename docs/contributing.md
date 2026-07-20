@@ -259,7 +259,7 @@ Each wheel contains:
 - `.pyi` type stubs for IDE support
 - `py.typed` PEP 561 marker
 
-Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via `wheel.exclude` in `pyproject.toml`.
+Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via Hatchling's wheel target configuration in `pyproject.toml`.
 They are included in the source distribution for self-compilation.
 
 ### CUDA architectures

@@ -10,7 +10,6 @@ import pandas as pd
 from anndata import AnnData
 from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
-from scanpy.get import _get_obs_rep
 from scipy.sparse import csr_matrix, issparse
 from tqdm.auto import tqdm
 
@@ -195,6 +194,10 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
         r = data.index.to_numpy(dtype="U")
         c = data.columns.to_numpy(dtype="U")
     elif isinstance(data, AnnData):
+        # Import lazily to avoid loading ``rapids_singlecell.get`` while the
+        # preprocessing package is still being initialized.
+        from rapids_singlecell.get import _get_obs_rep
+
         use_raw = _check_use_raw(data, layer, use_raw=raw)
         m = _get_obs_rep(data, layer=layer, use_raw=raw)
         c = (

@@ -7,9 +7,9 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 from cupyx.scipy.sparse import issparse, isspmatrix_csc
-from scanpy.get import _get_obs_rep
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell.get import _get_obs_rep
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
     _check_nonnegative_integers,

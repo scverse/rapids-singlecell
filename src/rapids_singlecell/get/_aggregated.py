@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from inspect import signature
 from typing import TYPE_CHECKING, Literal, Union, get_args
 
 import cupy as cp
@@ -540,7 +541,11 @@ def aggregate(
         data = data.T
     _check_gpu_X(data, allow_dask=True)
     dim_df = getattr(adata, axis_name)
-    categorical, new_label_df = _combine_categories(dim_df, by)
+    if len(signature(_combine_categories).parameters) == 1:
+        cols = [by] if isinstance(by, str) else list(by)
+        categorical, new_label_df = _combine_categories(dim_df[cols])
+    else:
+        categorical, new_label_df = _combine_categories(dim_df, by)
     groupby = Aggregate(groupby=categorical, data=data, mask=mask)
 
     funcs = set([func] if isinstance(func, str) else func)

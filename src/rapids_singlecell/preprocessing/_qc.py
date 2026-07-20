@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 from cupyx.scipy import sparse
-from scanpy.get import _get_obs_rep
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell.get import _get_obs_rep
 
 from ._utils import _check_gpu_X
 
