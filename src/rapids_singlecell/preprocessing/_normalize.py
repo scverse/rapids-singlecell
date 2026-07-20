@@ -9,13 +9,13 @@ import cupy as cp
 from anndata import AnnData
 from cupyx.scipy import sparse
 from cupyx.scipy.sparse import csr_matrix
-from scanpy.get import _get_obs_rep, _set_obs_rep
 
 from rapids_singlecell._compat import (
     DaskArray,
     _meta_dense,
     _meta_sparse,
 )
+from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 
 from ._utils import _check_gpu_X, _check_nonnegative_integers
 
