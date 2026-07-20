@@ -7,9 +7,8 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 from cupyx.scipy.sparse import issparse as cp_issparse
-from scanpy.get import _get_obs_rep, _set_obs_rep
 
-from rapids_singlecell.get import X_to_GPU
+from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
 
 if TYPE_CHECKING:
     from anndata import AnnData
