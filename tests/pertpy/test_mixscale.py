@@ -175,7 +175,7 @@ def _ref_mixscale_gene(block, is_guide, is_nt, *, do_scale):
     pvec = ((x - cmean) / sd) @ vec / max(dotvv, 1e-12)
     nt = pvec[is_nt]
     nt_mean = nt.mean()
-    nt_std = nt.std(ddof=0) or 1.0
+    nt_std = nt.std(ddof=1) or 1.0
     out = np.zeros(n)
     out[is_guide] = (pvec[is_guide] - nt_mean) / nt_std
     return out
