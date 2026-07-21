@@ -1525,6 +1525,7 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
         pts=True,
         tie_correct=True,
         n_genes=n_vars,
+        chunk_size=8,  # < n_vars -> multiple chunks
     )
     sc.tl.rank_genes_groups(
         cpu,
