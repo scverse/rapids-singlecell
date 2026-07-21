@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -13,16 +15,37 @@ if TYPE_CHECKING:
 
 EPS = 1e-9
 MIN_GROUP_SIZE_WARNING = 25
+SPARSE_NEGATIVE_SCAN_MIN_ITEMS = 64_000_000
+SPARSE_NEGATIVE_SCAN_MAX_WORKERS = 64
 
 
 def _sparse_has_negative(X) -> bool:
     """Return whether an in-memory sparse matrix stores a negative value.
     Signed sparse Wilcoxon needs the sign-safe sparse-dense ranker."""
-    if sp.issparse(X) or cpsp.issparse(X):
-        if np.dtype(X.data.dtype).kind == "c":
-            return False
-        return X.nnz > 0 and float(X.data.min()) < 0
-    return False
+    is_host = sp.issparse(X)
+    if not is_host and not cpsp.issparse(X):
+        return False
+    data = X.data
+    if np.dtype(data.dtype).kind in {"b", "c", "u"} or data.size == 0:
+        return False
+    if not is_host or data.size < SPARSE_NEGATIVE_SCAN_MIN_ITEMS:
+        return float(data.min()) < 0
+
+    n_workers = min(
+        SPARSE_NEGATIVE_SCAN_MAX_WORKERS,
+        os.cpu_count() or 1,
+        max(1, data.size // SPARSE_NEGATIVE_SCAN_MIN_ITEMS),
+    )
+    bounds = np.linspace(0, data.size, n_workers + 1, dtype=np.intp)
+
+    def chunk_min(chunk_index: int):
+        start = int(bounds[chunk_index])
+        stop = int(bounds[chunk_index + 1])
+        return data[start:stop].min()
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        minima = list(executor.map(chunk_min, range(n_workers)))
+    return float(np.min(minima)) < 0
 
 
 def _canonicalize_sparse(X):
@@ -79,18 +102,14 @@ def _select_groups(
     n_groups = len(selected)
     groups_order = np.array(selected)
 
-    # Map original category index → selected group index
     str_to_sel = {str(name): idx for idx, name in enumerate(selected)}
-    orig_to_sel: dict[int, int] = {}
-    for cat_idx, cat_name in enumerate(all_categories):
-        sel_idx = str_to_sel.get(str(cat_name))
-        if sel_idx is not None:
-            orig_to_sel[cat_idx] = sel_idx
-
     orig_codes = labels.cat.codes.to_numpy()
-    group_codes = np.full(len(orig_codes), n_groups, dtype=np.int32)
-    for orig_idx, sel_idx in orig_to_sel.items():
-        group_codes[orig_codes == orig_idx] = sel_idx
+    # The extra final slot maps pandas' missing-category code (-1) to the
+    # unselected sentinel through normal negative indexing.
+    code_lookup = np.full(len(all_categories) + 1, n_groups, dtype=np.int32)
+    for category_index, category in enumerate(all_categories):
+        code_lookup[category_index] = str_to_sel.get(str(category), n_groups)
+    group_codes = code_lookup[orig_codes]
 
     group_sizes = np.bincount(group_codes, minlength=n_groups + 1)[:n_groups].astype(
         np.int64

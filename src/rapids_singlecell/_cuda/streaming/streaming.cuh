@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -26,9 +29,125 @@ constexpr size_t HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES =
     16ULL * 1024ULL * 1024ULL * 1024ULL;
 
 // Host thread count for CPU-side staging passes: hardware concurrency, capped.
+// Multi-GPU callers can set a per-calling-thread limit so concurrent device
+// workers do not each consume the full host thread pool.
+inline thread_local int host_worker_limit = 0;
+
+static inline int set_host_worker_limit(int limit) {
+    int previous = host_worker_limit;
+    host_worker_limit = std::max(0, limit);
+    return previous;
+}
+
 static inline int host_worker_count() {
     unsigned hw = std::thread::hardware_concurrency();
-    return (int)std::min<unsigned>(hw ? hw : 4u, 32u);
+    int workers = (int)std::min<unsigned>(hw ? hw : 4u, 32u);
+    if (host_worker_limit > 0) workers = std::min(workers, host_worker_limit);
+    return workers;
+}
+
+// Reuse staging workers for the lifetime of one calling thread. Host
+// Wilcoxon runs each device shard on its own Python executor thread, so this
+// naturally gives every shard an independent pool while avoiding thousands
+// of create/join cycles across bounded staging blocks.
+class HostWorkerPool {
+   public:
+    explicit HostWorkerPool(int n_threads) : n_threads_(n_threads) {
+        workers_.reserve(n_threads_);
+        try {
+            for (int thread_index = 0; thread_index < n_threads_;
+                 thread_index++) {
+                workers_.emplace_back(
+                    [this, thread_index]() { worker_loop(thread_index); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            ready_.notify_all();
+            for (std::thread& worker : workers_) worker.join();
+            throw;
+        }
+    }
+
+    HostWorkerPool(const HostWorkerPool&) = delete;
+    HostWorkerPool& operator=(const HostWorkerPool&) = delete;
+
+    ~HostWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_all();
+        for (std::thread& worker : workers_) worker.join();
+    }
+
+    int size() const {
+        return n_threads_;
+    }
+
+    int run(int n, std::function<void(int, int, int)> fn) {
+        int chunk = (n + n_threads_ - 1) / n_threads_;
+        int used = (n + chunk - 1) / chunk;
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        active_fn_ = std::move(fn);
+        active_n_ = n;
+        active_chunk_ = chunk;
+        active_threads_ = used;
+        completed_threads_ = 0;
+        generation_++;
+        ready_.notify_all();
+        finished_.wait(
+            lock, [this]() { return completed_threads_ == active_threads_; });
+        active_fn_ = {};
+        return used;
+    }
+
+   private:
+    void worker_loop(int thread_index) {
+        size_t observed_generation = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ready_.wait(lock, [this, observed_generation]() {
+                return stopping_ || generation_ != observed_generation;
+            });
+            if (stopping_) return;
+            observed_generation = generation_;
+            if (thread_index >= active_threads_) continue;
+
+            int r0 = thread_index * active_chunk_;
+            int r1 = std::min(active_n_, r0 + active_chunk_);
+            auto* fn = &active_fn_;
+            lock.unlock();
+            (*fn)(thread_index, r0, r1);
+            lock.lock();
+            completed_threads_++;
+            if (completed_threads_ == active_threads_) finished_.notify_one();
+        }
+    }
+
+    int n_threads_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::condition_variable finished_;
+    std::function<void(int, int, int)> active_fn_;
+    int active_n_ = 0;
+    int active_chunk_ = 0;
+    int active_threads_ = 0;
+    int completed_threads_ = 0;
+    size_t generation_ = 0;
+    bool stopping_ = false;
+};
+
+static inline HostWorkerPool& host_worker_pool(int n_threads) {
+    thread_local std::unique_ptr<HostWorkerPool> pool;
+    if (!pool || pool->size() != n_threads) {
+        pool = std::make_unique<HostWorkerPool>(n_threads);
+    }
+    return *pool;
 }
 
 // Run fn(chunk, r0, r1) over partitions of [0, n), serial for small n.
@@ -41,18 +160,9 @@ static inline int host_parallel_chunks(int n, F fn) {
         fn(0, 0, n);
         return 1;
     }
-    int chunk = (n + n_threads - 1) / n_threads;
-    std::vector<std::thread> pool;
-    pool.reserve(n_threads);
-    for (int t = 0; t < n_threads; t++) {
-        int r0 = t * chunk;
-        if (r0 >= n) break;
-        int r1 = std::min(n, r0 + chunk);
-        pool.emplace_back([&fn, t, r0, r1]() { fn(t, r0, r1); });
-    }
-    int used = (int)pool.size();
-    for (std::thread& th : pool) th.join();
-    return used;
+    return host_worker_pool(n_threads).run(
+        n,
+        [&fn](int thread_index, int r0, int r1) { fn(thread_index, r0, r1); });
 }
 
 // Run fn(r0, r1) over a partition of [0, n) across hardware threads (serial for
@@ -107,34 +217,6 @@ static inline size_t sparse_window_nnz_bytes(size_t nnz) {
 template <typename DTypes>
 static inline size_t sparse_window_accum_bytes(size_t count) {
     return count * sizeof(typename DTypes::accum_type);
-}
-
-static inline void host_clear_id_map(int* id_map, int n_items) {
-    std::fill(id_map, id_map + n_items, -1);
-}
-
-static inline void host_build_id_map(const int* ids, int n_ids, int* id_map,
-                                     int n_items, const char* what) {
-    host_clear_id_map(id_map, n_items);
-    for (int local = 0; local < n_ids; local++) {
-        int id = ids[local];
-        if (id < 0 || id >= n_items) {
-            throw std::runtime_error(std::string(what) +
-                                     " id is out of bounds");
-        }
-        id_map[id] = local;
-    }
-}
-
-static inline void host_build_contiguous_id_map(int first, int count,
-                                                int* id_map, int n_items,
-                                                const char* what) {
-    if (first < 0 || count < 0 || first > n_items - count) {
-        throw std::runtime_error(std::string(what) +
-                                 " contiguous id window is out of bounds");
-    }
-    host_clear_id_map(id_map, n_items);
-    for (int local = 0; local < count; local++) id_map[first + local] = local;
 }
 
 // Stream-count clamps: never use more streams than column batches, nor more
@@ -195,15 +277,8 @@ struct ColumnBatchPlan {
     std::vector<size_t> nnz;
 };
 
-struct HostCompactSparseWindowPlan {
-    int major_count = 0;
-    size_t nnz = 0;
-    std::vector<int> indptr;
-};
-
 struct DenseColumnBatchPlan {
     int sub_batch_cols = 0;
-    int n_batches = 0;
     size_t max_items = 0;
 };
 
@@ -220,7 +295,6 @@ static inline DenseColumnBatchPlan plan_dense_column_batches(
     if ((size_t)sub_batch_cols > max_cols) sub_batch_cols = (int)max_cols;
 
     plan.sub_batch_cols = sub_batch_cols;
-    plan.n_batches = (n_cols + sub_batch_cols - 1) / sub_batch_cols;
     plan.max_items = (size_t)n_rows * (size_t)sub_batch_cols;
     checked_cub_items(plan.max_items, what);
     return plan;
@@ -267,81 +341,6 @@ static inline int* upload_batch_offsets(const ColumnBatchPlan& plan,
     cudaMemcpy(d_all_offsets, plan.offsets.data(),
                plan.offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
     return d_all_offsets;
-}
-
-template <typename CountAt>
-static HostCompactSparseWindowPlan plan_compact_sparse_window(
-    int major_count, CountAt count_at, const char* what) {
-    HostCompactSparseWindowPlan plan;
-    plan.major_count = major_count;
-    plan.indptr.assign((size_t)major_count + 1, 0);
-    if (major_count <= 0) return plan;
-
-    std::vector<size_t> counts(major_count, 0);
-    host_parallel_ranges(major_count, [&](int i0, int i1) {
-        for (int i = i0; i < i1; i++) counts[i] = count_at(i);
-    });
-
-    size_t run = 0;
-    for (int i = 0; i < major_count; i++) {
-        plan.indptr[i] = checked_int_span(run, what);
-        run += counts[i];
-    }
-    plan.indptr[major_count] = checked_int_span(run, what);
-    plan.nnz = run;
-    return plan;
-}
-
-template <typename IndexT, typename IndptrT, typename RowToLocal>
-static HostCompactSparseWindowPlan plan_csc_rows_window(
-    const IndexT* h_indices, const IndptrT* h_indptr, int col_start,
-    int n_window_cols, RowToLocal row_to_local, const char* what) {
-    return plan_compact_sparse_window(
-        n_window_cols,
-        [&](int local_col) {
-            int col = col_start + local_col;
-            size_t count = 0;
-            for (IndptrT p = h_indptr[col]; p < h_indptr[col + 1]; p++) {
-                if (row_to_local((int)h_indices[p]) >= 0) count++;
-            }
-            return count;
-        },
-        what);
-}
-
-template <typename IndexT, typename IndptrT, typename ColToLocal>
-static HostCompactSparseWindowPlan plan_csr_cols_window(
-    const IndexT* h_indices, const IndptrT* h_indptr, const int* row_ids,
-    int n_window_rows, ColToLocal col_to_local, const char* what) {
-    return plan_compact_sparse_window(
-        n_window_rows,
-        [&](int local_row) {
-            int row = row_ids ? row_ids[local_row] : local_row;
-            size_t count = 0;
-            for (IndptrT p = h_indptr[row]; p < h_indptr[row + 1]; p++) {
-                if (col_to_local((int)h_indices[p]) >= 0) count++;
-            }
-            return count;
-        },
-        what);
-}
-
-template <typename IndexT, typename IndptrT>
-static HostCompactSparseWindowPlan plan_csc_rows_window_from_map(
-    const IndexT* h_indices, const IndptrT* h_indptr, int col_start,
-    int n_window_cols, const int* row_map, const char* what) {
-    return plan_csc_rows_window(
-        h_indices, h_indptr, col_start, n_window_cols,
-        [&](int row) { return row_map[row]; }, what);
-}
-
-template <typename IndexT, typename IndptrT>
-static HostCompactSparseWindowPlan plan_csr_cols_window_from_map(
-    const IndexT* h_indices, const IndptrT* h_indptr, const int* row_ids,
-    int n_window_rows, const int* col_map, const char* what) {
-    return plan_csr_cols_window(
-        h_indices, h_indptr, row_ids, n_window_rows,
-        [&](int col) { return col_map[col]; }, what);
 }
 
 // RAII guard for cudaHostRegister: unregisters on scope exit (incl. exception
@@ -395,7 +394,6 @@ struct HostRegisterGuard {
 struct ScopedCudaStream {
     cudaStream_t stream = nullptr;
 
-    ScopedCudaStream() = default;
     explicit ScopedCudaStream(unsigned int flags) {
         cuda_check(cudaStreamCreateWithFlags(&stream, flags),
                    "cudaStreamCreateWithFlags");
@@ -469,7 +467,6 @@ static inline void sync_streams(const ScopedCudaStreams& streams,
 struct ScopedCudaEvent {
     cudaEvent_t event = nullptr;
 
-    ScopedCudaEvent() = default;
     explicit ScopedCudaEvent(unsigned int flags) {
         cuda_check(cudaEventCreateWithFlags(&event, flags),
                    "cudaEventCreateWithFlags");
@@ -488,23 +485,37 @@ struct ScopedCudaEvent {
 };
 
 template <typename T>
+struct CudaHostFree {
+    void operator()(T* ptr) const noexcept {
+        if (ptr) cudaFreeHost(ptr);
+    }
+};
+
+template <typename T>
 struct PinnedRingArray {
     std::vector<std::unique_ptr<T[]>> data;
+    std::vector<std::unique_ptr<T, CudaHostFree<T>>> write_combined_data;
     std::vector<HostRegisterGuard> pins;
 
-    PinnedRingArray() = default;
-    PinnedRingArray(int n_slots, size_t count) : data(n_slots), pins(n_slots) {
+    PinnedRingArray(int n_slots, size_t count, bool write_combined)
+        : data(n_slots), write_combined_data(n_slots), pins(n_slots) {
         size_t n = count ? count : 1;
         for (int s = 0; s < n_slots; s++) {
-            data[s].reset(new T[n]);
-            pins[s] = HostRegisterGuard(data[s].get(), n * sizeof(T));
+            if (write_combined) {
+                T* ptr = nullptr;
+                cuda_check(cudaHostAlloc((void**)&ptr, n * sizeof(T),
+                                         cudaHostAllocWriteCombined),
+                           "PinnedRing write-combined allocation");
+                write_combined_data[s].reset(ptr);
+            } else {
+                data[s].reset(new T[n]);
+                pins[s] = HostRegisterGuard(data[s].get(), n * sizeof(T));
+            }
         }
     }
     T* get(int slot) {
-        return data[slot].get();
-    }
-    const T* get(int slot) const {
-        return data[slot].get();
+        T* ptr = write_combined_data[slot].get();
+        return ptr ? ptr : data[slot].get();
     }
 };
 
@@ -515,16 +526,14 @@ struct PinnedRing {
     std::tuple<PinnedRingArray<Ts>...> arrays;
     std::vector<cudaEvent_t> evt;
     std::vector<char> used;
-    int n_slots = 0;
     size_t capacity = 0;
 
-    PinnedRing(int n_slots_, size_t count)
-        : arrays(PinnedRingArray<Ts>(n_slots_, count)...),
+    PinnedRing(int n_slots_, size_t count, bool write_combined = false)
+        : arrays(PinnedRingArray<Ts>(n_slots_, count, write_combined)...),
           evt(n_slots_, nullptr),
           used(n_slots_, 0) {
-        n_slots = n_slots_;
         capacity = count ? count : 1;
-        for (int s = 0; s < n_slots; s++) {
+        for (int s = 0; s < n_slots_; s++) {
             cuda_check(
                 cudaEventCreateWithFlags(&evt[s], cudaEventDisableTiming),
                 "PinnedRing event create");
@@ -548,11 +557,6 @@ struct PinnedRing {
     }
     template <size_t I>
     typename std::tuple_element<I, std::tuple<Ts...>>::type* get(int slot) {
-        return std::get<I>(arrays).get(slot);
-    }
-    template <size_t I>
-    const typename std::tuple_element<I, std::tuple<Ts...>>::type* get(
-        int slot) const {
         return std::get<I>(arrays).get(slot);
     }
     PinnedRing(const PinnedRing&) = delete;
@@ -583,40 +587,6 @@ __global__ void rebase_indptr_kernel(const IdxIn* __restrict__ indptr,
     if (i < count) out[i] = (IdxOut)(indptr[col + i] - indptr[col]);
 }
 
-// Threaded selected-row gather into compact staging at disjoint offsets.
-// No-pin alternative: only the compacted slice crosses the bus.
-template <typename StageValT, typename StageIndexT, typename InT,
-          typename IndexT, typename IndptrT, typename CompactT>
-static void host_gather_rows_compact_as(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    const int* row_ids, const CompactT* compact_indptr, CompactT base,
-    int n_target, StageValT* stage_vals, StageIndexT* stage_cols) {
-    host_parallel_ranges(n_target, [&](int i0, int i1) {
-        for (int i = i0; i < i1; i++) {
-            int r = row_ids[i];
-            IndptrT rs = h_indptr[r];
-            int nnz = (int)(h_indptr[r + 1] - rs);
-            size_t ds = (size_t)(compact_indptr[i] - base);
-            for (int k = 0; k < nnz; k++) {
-                stage_vals[ds + k] = (StageValT)h_data[rs + k];
-                stage_cols[ds + k] = (StageIndexT)h_indices[rs + k];
-            }
-        }
-    });
-}
-
-template <typename InT, typename IndexT, typename IndptrT, typename CompactT>
-static void host_gather_rows_compact(const InT* h_data, const IndexT* h_indices,
-                                     const IndptrT* h_indptr,
-                                     const int* row_ids,
-                                     const CompactT* compact_indptr,
-                                     CompactT base, int n_target,
-                                     float* stage_vals, int* stage_cols) {
-    host_gather_rows_compact_as<float, int>(h_data, h_indices, h_indptr,
-                                            row_ids, compact_indptr, base,
-                                            n_target, stage_vals, stage_cols);
-}
-
 // Threaded host cast-copy of a contiguous nnz slice into staging.
 // CSC analogue of row gather: contiguous column batch, bounded int32 nnz.
 template <typename StageValT, typename StageIndexT, typename InT,
@@ -630,22 +600,6 @@ static void host_copy_slice_as(const InT* h_data, const IndexT* h_indices,
             stage_cols[k] = (StageIndexT)h_indices[start + k];
         }
     });
-}
-
-template <typename InT, typename IndexT>
-static void host_copy_slice(const InT* h_data, const IndexT* h_indices,
-                            size_t start, int nnz, InT* stage_vals,
-                            IndexT* stage_cols) {
-    host_copy_slice_as<InT, IndexT>(h_data, h_indices, start, nnz, stage_vals,
-                                    stage_cols);
-}
-
-template <typename InT, typename IndexT>
-static void host_cast_copy_slice(const InT* h_data, const IndexT* h_indices,
-                                 size_t start, int nnz, float* stage_vals,
-                                 int* stage_cols) {
-    host_copy_slice_as<float, int>(h_data, h_indices, start, nnz, stage_vals,
-                                   stage_cols);
 }
 
 // Threaded host gather of selected dense rows and contiguous columns.
@@ -670,138 +624,6 @@ static void host_materialize_dense_rows_window_as(
                 (StageT)h_X[src];
         }
     });
-}
-
-template <typename InT>
-static void host_materialize_dense_rows_window(const InT* h_X, bool f_order,
-                                               int n_full_rows, int n_full_cols,
-                                               const int* row_ids,
-                                               int n_window_rows, int col_start,
-                                               int n_window_cols, InT* stage) {
-    host_materialize_dense_rows_window_as<InT>(
-        h_X, f_order, n_full_rows, n_full_cols, row_ids, n_window_rows,
-        col_start, n_window_cols, stage);
-}
-
-// Cross-axis CSC materialization: filter a contiguous column window by selected
-// rows and emit compact CSC with local row ids.
-template <typename StageValT, typename StageIndexT, typename InT,
-          typename IndexT, typename IndptrT, typename RowToLocal>
-static void host_materialize_csc_rows_window_as(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    int col_start, int n_window_cols, const int* compact_indptr,
-    RowToLocal row_to_local, StageValT* stage_vals, StageIndexT* stage_rows) {
-    host_parallel_ranges(n_window_cols, [&](int c0, int c1) {
-        for (int local_col = c0; local_col < c1; local_col++) {
-            int col = col_start + local_col;
-            size_t dst = (size_t)compact_indptr[local_col];
-            for (IndptrT p = h_indptr[col]; p < h_indptr[col + 1]; p++) {
-                int local_row = row_to_local((int)h_indices[p]);
-                if (local_row < 0) continue;
-                stage_vals[dst] = (StageValT)h_data[p];
-                stage_rows[dst] = (StageIndexT)local_row;
-                dst++;
-            }
-        }
-    });
-}
-
-template <typename InT, typename IndexT, typename IndptrT>
-static void host_materialize_csc_rows_window(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    int col_start, int n_window_cols, const int* compact_indptr,
-    const int* row_map, float* stage_vals, int* stage_rows) {
-    host_materialize_csc_rows_window_as<float, int>(
-        h_data, h_indices, h_indptr, col_start, n_window_cols, compact_indptr,
-        [&](int row) { return row_map[row]; }, stage_vals, stage_rows);
-}
-
-// Cross-axis CSR materialization: filter selected rows by selected columns and
-// emit compact CSR with local column ids.
-template <typename StageValT, typename StageIndexT, typename InT,
-          typename IndexT, typename IndptrT, typename ColToLocal>
-static void host_materialize_csr_cols_window_as(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    const int* row_ids, int n_window_rows, const int* compact_indptr,
-    ColToLocal col_to_local, StageValT* stage_vals, StageIndexT* stage_cols) {
-    host_parallel_ranges(n_window_rows, [&](int r0, int r1) {
-        for (int local_row = r0; local_row < r1; local_row++) {
-            int row = row_ids ? row_ids[local_row] : local_row;
-            size_t dst = (size_t)compact_indptr[local_row];
-            for (IndptrT p = h_indptr[row]; p < h_indptr[row + 1]; p++) {
-                int local_col = col_to_local((int)h_indices[p]);
-                if (local_col < 0) continue;
-                stage_vals[dst] = (StageValT)h_data[p];
-                stage_cols[dst] = (StageIndexT)local_col;
-                dst++;
-            }
-        }
-    });
-}
-
-template <typename InT, typename IndexT, typename IndptrT>
-static void host_materialize_csr_cols_window(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    const int* row_ids, int n_window_rows, const int* compact_indptr,
-    const int* col_map, float* stage_vals, int* stage_cols) {
-    host_materialize_csr_cols_window_as<float, int>(
-        h_data, h_indices, h_indptr, row_ids, n_window_rows, compact_indptr,
-        [&](int col) { return col_map[col]; }, stage_vals, stage_cols);
-}
-
-// Optimized CSR -> contiguous-column-window materialization for sorted rows.
-// The per-row cursor examines each nonzero once across the full stream.
-template <typename StageValT, typename StageIndexT, typename InT,
-          typename IndexT, typename IndptrT>
-static int host_materialize_csr_column_interval_cursor_as(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    int n_rows, int col_start, int col_end, IndptrT* cursor, int* row_counts,
-    int* compact_indptr, StageValT* stage_vals, StageIndexT* stage_cols,
-    const char* what) {
-    host_parallel_ranges(n_rows, [&](int r0, int r1) {
-        for (int r = r0; r < r1; r++) {
-            const IndexT* row_base = h_indices + h_indptr[r];
-            const IndexT* lo = row_base + cursor[r];
-            const IndexT* hi = h_indices + h_indptr[r + 1];
-            if (lo < hi && *lo < (IndexT)col_start) {
-                lo = std::lower_bound(lo, hi, (IndexT)col_start);
-                cursor[r] = (IndptrT)(lo - row_base);
-            }
-            row_counts[r] =
-                (int)(std::lower_bound(lo, hi, (IndexT)col_end) - lo);
-        }
-    });
-
-    compact_indptr[0] = 0;
-    for (int r = 0; r < n_rows; r++) {
-        compact_indptr[r + 1] = checked_int_span(
-            (size_t)compact_indptr[r] + (size_t)row_counts[r], what);
-    }
-    int batch_nnz = compact_indptr[n_rows];
-
-    host_parallel_ranges(n_rows, [&](int r0, int r1) {
-        for (int r = r0; r < r1; r++) {
-            IndptrT base = h_indptr[r] + cursor[r];
-            size_t dst = (size_t)compact_indptr[r];
-            int count = row_counts[r];
-            for (int k = 0; k < count; k++) {
-                stage_vals[dst + k] = (StageValT)h_data[base + k];
-                stage_cols[dst + k] = (StageIndexT)h_indices[base + k];
-            }
-            cursor[r] += count;
-        }
-    });
-    return batch_nnz;
-}
-
-template <typename InT, typename IndexT, typename IndptrT>
-static int host_materialize_csr_column_interval_cursor(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
-    int n_rows, int col_start, int col_end, IndptrT* cursor, int* row_counts,
-    int* compact_indptr, InT* stage_vals, int* stage_cols, const char* what) {
-    return host_materialize_csr_column_interval_cursor_as<InT, int>(
-        h_data, h_indices, h_indptr, n_rows, col_start, col_end, cursor,
-        row_counts, compact_indptr, stage_vals, stage_cols, what);
 }
 
 /** Fill linear segment offsets [0, stride, ...] on the supplied stream (avoids

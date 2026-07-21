@@ -41,8 +41,18 @@ constexpr size_t OVO_PACK_FIXED_PER_STREAM =
 constexpr size_t OVO_MIN_PACK_NNZ = 64 * 1024 * 1024;  // 64M nnz
 
 // H2D staging-ring slot cap: keeps page-locked footprint bounded per row-block.
-// 32M nnz was the best compromise across small and multi-billion-nnz scales.
+// 32M nnz preserves steady H2D throughput on the production-scale stream.
 constexpr size_t STAGE_RING_NNZ_CAP = 32 * 1024 * 1024;
+
+template <typename Array>
+static inline bool has_ovo_tie_shape(const Array& array, int n_groups,
+                                     int n_cols, bool compute_tie_corr) {
+    if (!compute_tie_corr) {
+        return array.ndim() == 1 && (int)array.shape(0) == 1;
+    }
+    return array.ndim() == 2 && (int)array.shape(0) == n_groups &&
+           (int)array.shape(1) == n_cols;
+}
 
 // Query CUB segmented-radix-sort scratch size. Float keys, int values/offsets.
 static inline size_t cub_segmented_sortkeys_temp_bytes(int num_items,
@@ -151,12 +161,13 @@ __global__ void fill_pack_stats_codes_kernel(
 
 // Per-group stats over compact CSR, decoupled for host-staged data.
 // Slot comes from stats_codes[r] or fixed_slot; out-of-range slots are skipped.
+template <typename IndexT = int>
 __global__ void csr_compact_accumulate_kernel(
-    const float* __restrict__ d_data_f32, const int* __restrict__ d_indices,
+    const float* __restrict__ d_data_f32, const IndexT* __restrict__ d_indices,
     const int* __restrict__ d_indptr, const int* __restrict__ d_stats_codes,
     int fixed_slot, double* __restrict__ group_sums,
     double* __restrict__ group_nnz, int n_target_rows, int n_cols,
-    int n_groups_stats, bool compute_sums, bool compute_nnz) {
+    int n_groups_stats, bool compute_nnz) {
     int r = blockIdx.x;
     if (r >= n_target_rows) return;
     int slot = (d_stats_codes != nullptr) ? d_stats_codes[r] : fixed_slot;
@@ -164,9 +175,9 @@ __global__ void csr_compact_accumulate_kernel(
     int rs = d_indptr[r];
     int re = d_indptr[r + 1];
     for (int i = rs + threadIdx.x; i < re; i += blockDim.x) {
-        int c = d_indices[i];
+        int c = (int)d_indices[i];
         double v = (double)d_data_f32[i];
-        if (compute_sums) atomicAdd(&group_sums[(size_t)slot * n_cols + c], v);
+        atomicAdd(&group_sums[(size_t)slot * n_cols + c], v);
         if (compute_nnz && v != 0.0)
             atomicAdd(&group_nnz[(size_t)slot * n_cols + c], 1.0);
     }

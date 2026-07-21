@@ -5,9 +5,96 @@
 #include "wilcoxon_block_reduce.cuh"
 #include "wilcoxon_ovr_tie_walk.cuh"
 
-// Sparse OVR rank for nonnegative stored values; zeros rank analytically.
-// CRITICAL: negative rejection and gmem fallback are required at large
-// n_groups.
+// Count entries in [col_start, col_stop) for each canonical CSR row.
+template <typename IndexT, typename IndptrT>
+__global__ void csr_column_range_count_kernel(
+    const IndexT* __restrict__ indices, const IndptrT* __restrict__ indptr,
+    IndptrT* __restrict__ local_indptr, int n_rows, int col_start,
+    int col_stop) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long row = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         row < n_rows; row += stride) {
+        IndptrT row_start = indptr[row];
+        IndptrT row_stop = indptr[row + 1];
+
+        IndptrT lo = row_start;
+        IndptrT hi = row_stop;
+        while (lo < hi) {
+            IndptrT mid = lo + ((hi - lo) >> 1);
+            if (indices[mid] < (IndexT)col_start)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        IndptrT range_start = lo;
+
+        hi = row_stop;
+        while (lo < hi) {
+            IndptrT mid = lo + ((hi - lo) >> 1);
+            if (indices[mid] < (IndexT)col_stop)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        local_indptr[row + 1] = lo - range_start;
+    }
+}
+
+// Gather a column range into compact CSR and rebase its column indices.
+template <typename InT, typename IndexT, typename IndptrT>
+__global__ void csr_column_range_gather_kernel(
+    const InT* __restrict__ data, const IndexT* __restrict__ indices,
+    const IndptrT* __restrict__ indptr,
+    const IndptrT* __restrict__ local_indptr, InT* __restrict__ local_data,
+    IndexT* __restrict__ local_indices, int n_rows, int col_start,
+    int col_stop) {
+    __shared__ IndptrT source_start;
+    __shared__ IndptrT source_stop;
+
+    for (int row = (int)blockIdx.x; row < n_rows; row += (int)gridDim.x) {
+        if (threadIdx.x == 0) {
+            IndptrT row_start = indptr[row];
+            IndptrT row_stop = indptr[row + 1];
+
+            IndptrT lo = row_start;
+            IndptrT hi = row_stop;
+            while (lo < hi) {
+                IndptrT mid = lo + ((hi - lo) >> 1);
+                if (indices[mid] < (IndexT)col_start)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            source_start = lo;
+
+            hi = row_stop;
+            while (lo < hi) {
+                IndptrT mid = lo + ((hi - lo) >> 1);
+                if (indices[mid] < (IndexT)col_stop)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            source_stop = lo;
+        }
+        __syncthreads();
+
+        IndptrT destination = local_indptr[row];
+        IndptrT count = source_stop - source_start;
+        for (IndptrT item = (IndptrT)threadIdx.x; item < count;
+             item += (IndptrT)blockDim.x) {
+            IndptrT source = source_start + item;
+            local_data[destination + item] = data[source];
+            local_indices[destination + item] =
+                indices[source] - (IndexT)col_start;
+        }
+        __syncthreads();
+    }
+}
+
+// Sparse OVR rank with implicit zeros inserted analytically between sorted
+// negative and positive stored values. CRITICAL: keep the gmem fallback for
+// large n_groups.
 template <typename IndexT = int>
 __global__ void rank_sums_sparse_ovr_kernel(
     const float* __restrict__ sorted_vals,
@@ -50,10 +137,23 @@ __global__ void rank_sums_sparse_ovr_kernel(
         __syncthreads();
     }
 
-    // pos_start = first index where sv[i] > 0 (stored zeros precede positives).
+    // Split sorted stored values around zero. Implicit zeros join the explicit
+    // zero run between [0, neg_end) and [pos_start, nnz_stored).
+    __shared__ int sh_neg_end;
     __shared__ int sh_pos_start;
     if (threadIdx.x == 0) {
         int lo = 0, hi = nnz_stored;
+        while (lo < hi) {
+            int mid = lo + ((hi - lo) >> 1);
+            if (sv[mid] < 0.0f)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        sh_neg_end = lo;
+
+        lo = 0;
+        hi = nnz_stored;
         while (lo < hi) {
             int mid = lo + ((hi - lo) >> 1);
             if (sv[mid] <= 0.0f)
@@ -65,17 +165,25 @@ __global__ void rank_sums_sparse_ovr_kernel(
     }
     __syncthreads();
 
+    int neg_end = sh_neg_end;
     int pos_start = sh_pos_start;
-    int n_stored_zero = pos_start;
+    int n_stored_zero = pos_start - neg_end;
     int n_implicit_zero = n_rows - nnz_stored;
     int total_zero = n_implicit_zero + n_stored_zero;
-    double zero_avg_rank = (total_zero > 0) ? (total_zero + 1.0) / 2.0 : 0.0;
+    double zero_avg_rank =
+        (total_zero > 0) ? (double)neg_end + (total_zero + 1.0) / 2.0 : 0.0;
 
-    // Positive rank offset: full_pos(i)=i+n_implicit_zero; tie group [a,b)
-    // avg_rank = n_implicit_zero + (a+b+1)/2.
+    // Positive ranks use the stored index plus the inserted implicit zeros.
     int offset_pos = n_implicit_zero;
 
-    // Count stored positives per group.
+    // Count stored negatives and positives per group. Explicit and implicit
+    // zeros both receive the analytic zero contribution below.
+    for (int i = threadIdx.x; i < neg_end; i += blockDim.x) {
+        int grp = group_codes[si[i]];
+        if (grp >= 0 && grp < n_groups) {
+            atomicAdd(&grp_nz_count[(size_t)grp * acc_stride], 1.0);
+        }
+    }
     for (int i = pos_start + threadIdx.x; i < nnz_stored; i += blockDim.x) {
         int grp = group_codes[si[i]];
         if (grp >= 0 && grp < n_groups) {
@@ -92,14 +200,26 @@ __global__ void rank_sums_sparse_ovr_kernel(
     }
     __syncthreads();
 
-    // Walk stored positives and compute tie-averaged ranks.
+    // Walk stored negatives and positives separately so the implicit-zero tie
+    // occupies its exact position between them.
+    int n_neg = neg_end;
+    int neg_chunk = (n_neg + blockDim.x - 1) / blockDim.x;
+    int my_neg_start = threadIdx.x * neg_chunk;
+    int my_neg_end = my_neg_start + neg_chunk;
+    if (my_neg_end > neg_end) my_neg_end = neg_end;
+
+    double local_tie_sum = ovr_walk_tie_runs<IndexT>(
+        sv, si, group_codes, grp_sums, acc_stride, n_groups, my_neg_start,
+        my_neg_end, /*seg_floor=*/0, /*seg_ceil=*/neg_end,
+        /*rank_offset=*/0.0, compute_tie_corr);
+
     int n_pos = nnz_stored - pos_start;
     int chunk = (n_pos + blockDim.x - 1) / blockDim.x;
     int my_start = pos_start + threadIdx.x * chunk;
     int my_end = my_start + chunk;
     if (my_end > nnz_stored) my_end = nnz_stored;
 
-    double local_tie_sum = ovr_walk_tie_runs<IndexT>(
+    local_tie_sum += ovr_walk_tie_runs<IndexT>(
         sv, si, group_codes, grp_sums, acc_stride, n_groups, my_start, my_end,
         /*seg_floor=*/pos_start, /*seg_ceil=*/nnz_stored,
         /*rank_offset=*/(double)offset_pos, compute_tie_corr);
