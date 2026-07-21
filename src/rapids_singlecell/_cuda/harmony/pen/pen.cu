@@ -68,26 +68,6 @@ static inline void launch_penalty(const T* E, const T* O, const T* theta,
 }
 
 template <typename T, typename Device>
-static void register_fused_pen_norm(nb::module_& m) {
-    m.def(
-        "fused_pen_norm",
-        [](gpu_array_c<const T, Device> similarities,
-           gpu_array_c<const T, Device> penalty,
-           gpu_array_c<const int, Device> cats,
-           gpu_array_c<const size_t, Device> idx_in,
-           gpu_array_c<T, Device> R_out, double term, int n_rows, int n_cols,
-           int n_covariates, std::uintptr_t stream) {
-            launch_fused_pen_norm<T, size_t>(
-                similarities.data(), penalty.data(), cats.data(), idx_in.data(),
-                R_out.data(), static_cast<T>(term), n_rows, n_cols,
-                n_covariates, (cudaStream_t)stream);
-        },
-        "similarities"_a, nb::kw_only(), "penalty"_a, "cats"_a, "idx_in"_a,
-        "R_out"_a, "term"_a, "n_rows"_a, "n_cols"_a, "n_covariates"_a = 1,
-        "stream"_a = 0);
-}
-
-template <typename T, typename Device>
 static void register_penalty(nb::module_& m) {
     m.def(
         "penalty",
@@ -125,8 +105,6 @@ static void register_fused_pen_norm_int(nb::module_& m) {
 
 template <typename Device>
 void register_bindings(nb::module_& m) {
-    register_fused_pen_norm<float, Device>(m);
-    register_fused_pen_norm<double, Device>(m);
     register_penalty<float, Device>(m);
     register_penalty<double, Device>(m);
 

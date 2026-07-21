@@ -131,6 +131,7 @@ __global__ void fused_pen_norm_multi_kernel(
             fmax(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
 
     __shared__ T shared_reduce[32];
+    __shared__ T shared_row_max;
     int warp_id = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
 
@@ -148,9 +149,9 @@ __global__ void fused_pen_norm_multi_kernel(
                 fmax(row_max, __shfl_down_sync(0xffffffff, row_max, offset));
     }
 
-    if (threadIdx.x == 0) shared_reduce[0] = row_max;
+    if (threadIdx.x == 0) shared_row_max = row_max;
     __syncthreads();
-    row_max = shared_reduce[0];
+    row_max = shared_row_max;
 
     T local_sum = T(0);
     for (int col = threadIdx.x; col < n_cols; col += blockDim.x) {

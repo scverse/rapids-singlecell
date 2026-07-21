@@ -145,87 +145,9 @@ __global__ void add_joint_cross_kernel(const T* __restrict__ joint_O,
     }
 }
 
-// Compute all non-intercept rows of
-//   Phi* diag(R[:, k]) X
-// in one launch. cat_offsets/cell_indices form a CSR-like marginal category
-// index. Every cell occurs once per covariate in cell_indices. A block owns one
-// (marginal level, cluster, PC pair), so the reduced result needs no atomics.
-template <typename T>
-__global__ void segmented_multi_rhs_kernel(const T* __restrict__ X,
-                                           const T* __restrict__ R,
-                                           const int* __restrict__ cat_offsets,
-                                           const int* __restrict__ cell_indices,
-                                           const uint8_t* __restrict__ active,
-                                           T* __restrict__ rhs, int n_pcs,
-                                           int n_clusters, int n_batches) {
-    int pc_pairs = (n_pcs + 1) / 2;
-    size_t blocks_per_batch = (size_t)n_clusters * pc_pairs;
-    size_t linear_block = blockIdx.x;
-    int batch = (int)(linear_block / blocks_per_batch);
-    if (batch >= n_batches) return;
-
-    size_t remainder = linear_block % blocks_per_batch;
-    int cluster = (int)(remainder / pc_pairs);
-    int pc0 = (int)(remainder % pc_pairs) * 2;
-    int pc1 = pc0 + 1;
-    bool has_pc1 = pc1 < n_pcs;
-
-    size_t bk = (size_t)batch * n_clusters + cluster;
-    if (active[bk] == 0) return;
-
-    T sum0 = T(0);
-    T sum1 = T(0);
-    int begin = cat_offsets[batch];
-    int end = cat_offsets[batch + 1];
-
-    using Vec = typename std::conditional<std::is_same<T, float>::value, float2,
-                                          double2>::type;
-    for (int position = begin + threadIdx.x; position < end;
-         position += blockDim.x) {
-        int cell = cell_indices[position];
-        T weight = __ldg(R + (size_t)cell * n_clusters + cluster);
-        const T* x_ptr = X + (size_t)cell * n_pcs + pc0;
-        if (has_pc1 && (((uintptr_t)x_ptr & (sizeof(Vec) - 1)) == 0)) {
-            Vec values = *reinterpret_cast<const Vec*>(x_ptr);
-            sum0 += (T)values.x * weight;
-            sum1 += (T)values.y * weight;
-        } else {
-            sum0 += x_ptr[0] * weight;
-            if (has_pc1) sum1 += x_ptr[1] * weight;
-        }
-    }
-
-    sum0 = warp_sum_multi_correction(sum0);
-    sum1 = warp_sum_multi_correction(sum1);
-
-    __shared__ T shared0[32];
-    __shared__ T shared1[32];
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) {
-        shared0[warp] = sum0;
-        shared1[warp] = sum1;
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        int n_warps = (blockDim.x + 31) >> 5;
-        T block_sum0 = lane < n_warps ? shared0[lane] : T(0);
-        T block_sum1 = lane < n_warps ? shared1[lane] : T(0);
-        block_sum0 = warp_sum_multi_correction(block_sum0);
-        block_sum1 = warp_sum_multi_correction(block_sum1);
-        if (lane == 0) {
-            int nb1 = n_batches + 1;
-            size_t out = ((size_t)cluster * nb1 + (batch + 1)) * n_pcs + pc0;
-            rhs[out] = block_sum0;
-            if (has_pc1) rhs[out + 1] = block_sum1;
-        }
-    }
-}
-
 // Compute one weighted X cross-product per observed joint category.  Unlike
-// the marginal-category reduction above, every cell is scanned only once:
-// the much smaller joint result is expanded into the F marginal rows by
+// a marginal-category reduction, every cell is scanned only once. The much
+// smaller joint result is expanded into the F marginal rows by
 // marginal_from_joint_rhs_kernel below.
 template <typename T>
 __global__ void segmented_joint_rhs_kernel(

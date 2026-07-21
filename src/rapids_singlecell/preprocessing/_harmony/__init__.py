@@ -22,14 +22,11 @@ from ._helper import (
     _column_sum_atomic,
     _factorize_joint_codes,
     _gemm_colsum,
-    _get_aggregated_matrix,
     _get_batch_codes,
     _get_theta_array,
     _normalize_cp,
     _outer_cp,
     _scatter_add_cp,
-    _scatter_add_cp_bias_csr,
-    _Z_correction,
 )
 
 if TYPE_CHECKING:
@@ -38,8 +35,6 @@ if TYPE_CHECKING:
 COLSUM_ALGO = Literal["columns", "atomics", "gemm", "benchmark"]
 _SUPPRESS_PENALTY = 1e30
 _CORRECTION_WORKSPACE_LIMIT_BYTES = 1 << 30
-_KMEANS_MAX_CELLS = 1_000_000
-_KMEANS_MAX_SAMPLE_BYTES = 512 << 20
 
 
 def harmonize(
@@ -57,7 +52,7 @@ def harmonize(
     block_proportion: float = 0.05,
     theta: float | int | list[float] | np.ndarray | cp.ndarray = 2.0,
     tau: int = 0,
-    correction_method: str | None = None,
+    correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     random_state: int = 0,
     stabilized_penalty: bool = True,
@@ -113,12 +108,13 @@ def harmonize(
         Discounting factor on ``theta``. By default, there is no discounting.
 
     correction_method
-        Choose which method for the correction step: ``original`` for original
-        method, ``fast`` for improved method, or ``batched`` for batched
-        processing. With one key, ``None`` automatically selects ``batched``
+        Choose ``fast`` for bounded-memory correction or ``batched`` for
+        batched processing. With one key, ``None`` automatically selects ``batched``
         unless its workspace would exceed 1 GiB, in which case ``fast`` is
         used. Multiple keys use the exact general-design solve and process
-        clusters in workspace-bounded chunks when needed.
+        clusters in workspace-bounded chunks when needed. For multiple keys,
+        ``None`` and ``batched`` select this solve; ``fast`` is ignored with a
+        warning.
 
     colsum_algo
         Choose which algorithm to use for column sum. If `None`, choose the algorithm based on the number of rows and columns. If `'benchmark'`, benchmark all algorithms and choose the best one.
@@ -231,21 +227,43 @@ def harmonize(
         "original",
         "batched",
     }:
-        raise ValueError("correction_method must be 'fast', 'original', or 'batched'.")
+        raise ValueError("correction_method must be 'fast' or 'batched'.")
+    if correction_method == "original":
+        if n_covariates == 1:
+            replacement = "fast"
+            replacement_message = (
+                "Use correction_method='fast' instead; it computes the same "
+                "correction with the optimized bounded-memory implementation."
+            )
+        else:
+            replacement = "batched"
+            replacement_message = (
+                "With multiple batch keys, omit correction_method or use "
+                "correction_method='batched' for the exact general-design solve."
+            )
+        warnings.warn(
+            "correction_method='original' is deprecated and will be removed in "
+            f"a future release. {replacement_message}",
+            FutureWarning,
+            stacklevel=3,
+        )
+        correction_method = replacement
+    if n_covariates > 1 and correction_method == "fast":
+        warnings.warn(
+            f"correction_method={correction_method!r} is ignored when multiple "
+            "batch keys are provided; using the exact general-design correction.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     # Multi-covariate correction uses its own exact cluster-chunked solve.
     # For one covariate, retain the established arrowhead auto-selection.
-    if correction_method is None:
-        if n_covariates > 1:
-            correction_method = "batched"
-        else:
-            nb1 = n_batches + 1
-            inv_mats_bytes = n_clusters * nb1 * nb1 * Z.dtype.itemsize
-            correction_method = (
-                "batched"
-                if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES
-                else "fast"
-            )
+    if correction_method is None and n_covariates == 1:
+        nb1 = n_batches + 1
+        inv_mats_bytes = n_clusters * nb1 * nb1 * Z.dtype.itemsize
+        correction_method = (
+            "batched" if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
+        )
 
     # Set random seed
     cp.random.seed(random_state)
@@ -420,23 +438,6 @@ def _initialize_centroids(
         O: Observed cluster assignment by batch
         objectives_harmony: List to store objective function values
     """
-    # cuML's k-means initialization is not reliable at tens of millions of
-    # rows. Fit centroids on a deterministic uniform sample, then compute the
-    # initial assignments against all rows below.
-    max_sample_cells = min(
-        _KMEANS_MAX_CELLS,
-        max(1, _KMEANS_MAX_SAMPLE_BYTES // (Z_norm.shape[1] * Z_norm.dtype.itemsize)),
-    )
-    kmeans_input = Z_norm
-    if Z_norm.shape[0] > max_sample_cells:
-        sample_indices = np.random.default_rng(random_state).choice(
-            Z_norm.shape[0], size=max_sample_cells, replace=False
-        )
-        sample_indices.sort()
-        kmeans_input = cp.ascontiguousarray(
-            Z_norm[cp.asarray(sample_indices, dtype=cp.int32)]
-        )
-
     # Run k-means to get initial cluster centers
     kmeans = CumlKMeans(
         n_clusters=n_clusters,
@@ -445,10 +446,8 @@ def _initialize_centroids(
         max_iter=25,
         random_state=random_state,
     )
-    kmeans.fit(kmeans_input)
+    kmeans.fit(Z_norm)
     Y = kmeans.cluster_centers_.astype(Z_norm.dtype)
-    if kmeans_input is not Z_norm:
-        del kmeans_input
     Y_norm = _normalize_cp(Y, p=2)
 
     # Initialize cluster assignment matrix R
@@ -635,7 +634,7 @@ def _correction(
     R: cp.ndarray,
     O: cp.ndarray,
     lambda_kb: cp.ndarray,
-    correction_method: str = "batched",
+    correction_method: Literal["fast", "batched"] = "batched",
     cats: cp.ndarray,
     n_batches: int,
     cat_offsets: cp.ndarray,
@@ -669,17 +668,7 @@ def _correction(
             cell_indices=cell_indices,
             output=output,
         )
-    else:
-        return _correction_original(
-            X,
-            R,
-            lambda_kb=lambda_kb,
-            cats=cats,
-            n_batches=n_batches,
-            cat_offsets=cat_offsets,
-            cell_indices=cell_indices,
-            output=output,
-        )
+    raise ValueError("correction_method must be 'fast' or 'batched'.")
 
 
 def _correction_multi(
@@ -807,14 +796,14 @@ def _correction_multi(
 
 
 def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
-    """Solve the symmetric positive-definite cluster systems in one batch."""
+    """Solve cluster systems, using least squares when a Gram matrix is singular."""
     n_matrices, matrix_size, _ = gram.shape
     n_rhs = rhs.shape[2]
     if n_matrices == 0:
         return cp.empty_like(rhs)
 
     # potrf and trsm are in-place. Preserve the original inputs so an unusual
-    # rank-deficient system can fall back to the general LU solve.
+    # rank-deficient system can fall back to a minimum-norm solve.
     gram_work = cp.array(gram, order="C", copy=True)
     rhs_work = cp.array(rhs, order="C", copy=True)
     info = cp.empty(n_matrices, dtype=cp.int32)
@@ -876,8 +865,11 @@ def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
             n_rhs,
             n_matrices,
         )
-    if np.any(cp.asnumpy(info) != 0):
-        return cp.ascontiguousarray(cp.linalg.solve(gram, rhs))
+    failed = np.flatnonzero(cp.asnumpy(info))
+    for matrix_index in failed:
+        rhs_work[matrix_index] = cp.linalg.lstsq(
+            gram[matrix_index], rhs[matrix_index], rcond=None
+        )[0]
     return rhs_work
 
 
@@ -942,49 +934,6 @@ def _correction_output(X: cp.ndarray, output: cp.ndarray | None = None) -> cp.nd
     return output
 
 
-def _correction_original(
-    X: cp.ndarray,
-    R: cp.ndarray,
-    *,
-    lambda_kb: cp.ndarray,
-    cats: cp.ndarray,
-    n_batches: int,
-    cat_offsets: cp.ndarray,
-    cell_indices: cp.ndarray,
-    output: cp.ndarray | None = None,
-) -> cp.ndarray:
-    """
-    Apply the original correction method from the Harmony paper.
-    """
-    n_clusters = R.shape[1]
-
-    Z = _correction_output(X, output)
-    cp.copyto(Z, X)
-    for k in range(n_clusters):
-        Lambda_diag = cp.zeros(n_batches + 1, dtype=X.dtype)
-        Lambda_diag[1:] = lambda_kb[:, k]
-        Lambda = cp.diag(Lambda_diag)
-        R_col = R[:, k].copy()
-        scatter_sum = cp.zeros(n_batches, dtype=R.dtype)
-        cp.add.at(scatter_sum, cats, R_col)
-        aggregated_matrix = cp.zeros((n_batches + 1, n_batches + 1), dtype=X.dtype)
-        _get_aggregated_matrix(aggregated_matrix, scatter_sum, n_batches=n_batches)
-        inv_mat = cp.linalg.inv(aggregated_matrix + Lambda)
-        Phi_t_diag_R_X = cp.zeros((n_batches + 1, X.shape[1]), dtype=X.dtype)
-        _scatter_add_cp_bias_csr(
-            X,
-            Phi_t_diag_R_X,
-            cat_offsets=cat_offsets,
-            cell_indices=cell_indices,
-            bias=R_col,
-            n_batches=n_batches,
-        )
-        W = cp.dot(inv_mat, Phi_t_diag_R_X)
-        W[0, :] = 0
-        _Z_correction(Z, W, cats, R_col)
-    return Z
-
-
 def _correction_fast(
     X: cp.ndarray,
     R: cp.ndarray,
@@ -997,9 +946,7 @@ def _correction_fast(
     cell_indices: cp.ndarray,
     output: cp.ndarray | None = None,
 ) -> cp.ndarray:
-    """
-    Apply the fast correction method (an optimization over the original method).
-    """
+    """Apply the bounded-memory correction method."""
     n_cells = X.shape[0]
     n_pcs = X.shape[1]
     n_clusters = R.shape[1]

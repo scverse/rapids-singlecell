@@ -67,22 +67,6 @@ __global__ void materialize_marginal_from_joint_kernel(
 }
 
 template <typename T>
-__global__ void aggregated_matrix_kernel(T* __restrict__ aggregated_matrix,
-                                         const T* __restrict__ sum,
-                                         T top_corner, int n_batches) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_batches + 1) return;
-
-    if (i == 0) {
-        aggregated_matrix[0] = top_corner;
-    } else {
-        aggregated_matrix[i] = sum[i - 1];
-        aggregated_matrix[(n_batches + 1) * i] = sum[i - 1];
-        aggregated_matrix[(n_batches + 1) * i + i] = sum[i - 1];
-    }
-}
-
-template <typename T>
 __global__ void scatter_add_kernel_with_bias_cat0(const T* __restrict__ v,
                                                   int n_cells, int n_pcs,
                                                   T* __restrict__ a,

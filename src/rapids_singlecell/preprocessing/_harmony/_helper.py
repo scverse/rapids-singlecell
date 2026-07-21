@@ -8,7 +8,6 @@ import numpy as np
 from rapids_singlecell._cuda import _harmony_colsum_cuda as _hc_cs
 from rapids_singlecell._cuda import _harmony_normalize_cuda as _hc_norm
 from rapids_singlecell._cuda import _harmony_outer_cuda as _hc_out
-from rapids_singlecell._cuda import _harmony_pen_cuda as _hc_pen
 from rapids_singlecell._cuda import _harmony_scatter_cuda as _hc_sc
 
 if TYPE_CHECKING:
@@ -19,9 +18,6 @@ MIN_CELLS_FOR_SHARED = 50_000
 MIN_CELLS_PER_BATCH_SHARED = 10_000
 MAX_SHARED_MEM_BYTES = 48 * 1024  # 48 KB shared memory budget
 MIN_CELLS_PER_BLOCK = 64
-
-# Kernel selection threshold for scatter_add_bias_csr
-SCATTER_BIAS_KERNEL_THRESHOLD = 300_000
 
 # Column-sum heuristic thresholds (rows x cols regions)
 _COLSUM_COLS_SMALL = 200
@@ -146,29 +142,6 @@ def _scatter_add_cp(
         )
 
 
-def _Z_correction(
-    Z: cp.ndarray,
-    W: cp.ndarray,
-    cats: cp.ndarray,
-    R: cp.ndarray,
-) -> None:
-    """
-    Scatter add operation for Harmony algorithm.
-    """
-    n_cells = Z.shape[0]
-    n_pcs = Z.shape[1]
-
-    _hc_out.harmony_corr(
-        Z,
-        W=W,
-        cats=cats,
-        R=R,
-        n_cells=n_cells,
-        n_pcs=n_pcs,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-
 def _outer_cp(
     E: cp.ndarray, Pr_b: cp.ndarray, R_sum: cp.ndarray, switcher: int
 ) -> None:
@@ -217,22 +190,6 @@ def _normalize_cp(
         return _normalize_cp_p1(X)
 
 
-def _get_aggregated_matrix(
-    aggregated_matrix: cp.ndarray, sum: cp.ndarray, n_batches: int
-) -> None:
-    """
-    Get the aggregated matrix for the correction step.
-    """
-
-    _hc_sc.aggregated_matrix(
-        aggregated_matrix,
-        sum=sum,
-        top_corner=float(sum.sum()),
-        n_batches=n_batches,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-
 def _get_batch_codes(
     batch_mat: pd.DataFrame, batch_key: str | list[str]
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -271,7 +228,10 @@ def _factorize_joint_codes(
     for level in levels:
         joint_cardinality *= int(level)
         if joint_cardinality > np.iinfo(np.int64).max:
-            return np.unique(batch_codes, axis=0, return_inverse=True)
+            joint_cats, joint_codes = np.unique(
+                batch_codes, axis=0, return_inverse=True
+            )
+            return joint_cats, np.asarray(joint_codes).reshape(-1)
 
     offsets = np.empty(levels.size, dtype=np.int64)
     offsets[0] = 0
@@ -293,44 +253,6 @@ def _factorize_joint_codes(
     return joint_cats, joint_codes
 
 
-def _scatter_add_cp_bias_csr(
-    X: cp.ndarray,
-    out: cp.ndarray,
-    *,
-    cat_offsets: cp.ndarray,
-    cell_indices: cp.ndarray,
-    bias: cp.ndarray,
-    n_batches: int,
-) -> None:
-    n_cells = X.shape[0]
-    n_pcs = X.shape[1]
-
-    if n_cells < SCATTER_BIAS_KERNEL_THRESHOLD:
-        _hc_sc.scatter_add_cat0(
-            X,
-            n_cells=n_cells,
-            n_pcs=n_pcs,
-            a=out,
-            bias=bias,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-
-    else:
-        out[0] = X.T @ bias
-
-    _hc_sc.scatter_add_block(
-        X,
-        cat_offsets=cat_offsets,
-        cell_indices=cell_indices,
-        n_cells=n_cells,
-        n_pcs=n_pcs,
-        n_batches=n_batches,
-        a=out,
-        bias=bias,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-
 def _get_theta_array(
     theta: float | int | list[float | int] | np.ndarray | cp.ndarray,
     n_levels: int | np.ndarray,
@@ -343,7 +265,13 @@ def _get_theta_array(
     n_covariates = levels.size
     n_categories = int(levels.sum())
 
-    theta_array = cp.asarray(theta, dtype=dtype)
+    try:
+        theta_array = cp.asarray(theta, dtype=dtype)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "Theta must be a scalar or an array-like collection of numeric values, "
+            f"got {type(theta).__name__}"
+        ) from e
     if theta_array.ndim == 0:
         return cp.full(n_categories, theta_array, dtype=dtype)
 
@@ -554,145 +482,3 @@ def _choose_colsum_algo_benchmark(
     if verbose:
         print(f"Using {algo} for column sum")
     return func
-
-
-def _fused_calc_pen_norm(
-    similarities: cp.ndarray,
-    penalty: cp.ndarray,
-    cats: cp.ndarray,
-    idx_in: cp.ndarray,
-    R_out: cp.ndarray,
-    *,
-    term: float,
-) -> None:
-    """
-    Fused kernel that computes _calc_R + _penalty_term + _normalize_cp in one pass.
-
-
-    Parameters
-    ----------
-    similarities
-        Full similarity matrix, shape (n_cells, n_clusters)
-    penalty
-        Penalty term matrix, shape (n_batches, n_clusters)
-    cats
-        Batch categories for current block, shape (block_size,)
-    idx_in
-        Cell indices for current block, shape (block_size,)
-    R_out
-        Output buffer, shape (block_size, n_clusters), modified in-place
-    term
-        Softmax temperature term (-2 / sigma)
-    """
-    block_size, n_clusters = R_out.shape
-
-    # Convert idx_in to size_t (uint64) for kernel compatibility
-    if idx_in.dtype != cp.uint64:
-        idx_in = idx_in.astype(cp.uint64)
-
-    n_covariates = cats.shape[1] if cats.ndim == 2 else 1
-    _hc_pen.fused_pen_norm(
-        similarities,
-        penalty=penalty,
-        cats=cats,
-        idx_in=idx_in,
-        R_out=R_out,
-        term=float(term),
-        n_rows=block_size,
-        n_cols=n_clusters,
-        n_covariates=n_covariates,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-
-def _scatter_add_bias_batched(
-    X: cp.ndarray,
-    R: cp.ndarray,
-    *,
-    cat_offsets: cp.ndarray,
-    cell_indices: cp.ndarray,
-    n_batches: int,
-) -> cp.ndarray:
-    """
-    Compute Phi.T @ diag(R[:, k]) @ X for all clusters k simultaneously.
-
-    Parameters
-    ----------
-    X
-        Input data, shape (n_cells, n_pcs)
-    R
-        Cluster assignment matrix, shape (n_cells, n_clusters)
-    cat_offsets
-        CSR-like offsets for each batch category
-    cell_indices
-        CSR-like cell indices sorted by batch
-    n_batches
-        Number of batches
-
-    Returns
-    -------
-    Phi_t_diag_R_X_all
-        Shape (n_clusters, n_batches+1, n_pcs)
-    """
-    n_clusters = R.shape[1]
-    n_pcs = X.shape[1]
-
-    # Output array
-    result = cp.zeros((n_clusters, n_batches + 1, n_pcs), dtype=X.dtype)
-
-    # Row 0: bias contribution = R.T @ X for all clusters
-    result[:, 0, :] = cp.dot(R.T, X)
-
-    # Sort X and R by batch order once to avoid repeated fancy indexing
-    X_sorted = X[cell_indices]
-    R_sorted = R[cell_indices]
-
-    # Rows 1 to n_batches: contiguous slices on sorted data
-    for b in range(n_batches):
-        start_idx = int(cat_offsets[b])
-        end_idx = int(cat_offsets[b + 1])
-
-        if end_idx > start_idx:
-            # Contiguous slices - no copy needed!
-            X_batch = X_sorted[start_idx:end_idx]
-            R_batch = R_sorted[start_idx:end_idx]
-            result[:, b + 1, :] = cp.dot(R_batch.T, X_batch)
-
-    return result
-
-
-def _apply_batched_correction(
-    Z: cp.ndarray,
-    W_all: cp.ndarray,
-    cats: cp.ndarray,
-    R: cp.ndarray,
-) -> None:
-    """
-    Apply corrections from all clusters at once using a fused kernel.
-
-    Parameters
-    ----------
-    Z
-        Data to correct, shape (n_cells, n_pcs), modified in-place
-    W_all
-        All W matrices, shape (n_clusters, n_batches+1, n_pcs)
-    cats
-        Batch categories for each cell, shape (n_cells,)
-    R
-        Cluster assignment matrix, shape (n_cells, n_clusters)
-    """
-    n_cells, n_pcs = Z.shape
-    n_clusters = R.shape[1]
-    n_batches_p1 = W_all.shape[1]
-
-    _hc_out.batched_correction(
-        Z,
-        W_all=W_all,
-        cats=cats,
-        R=R,
-        n_cells=n_cells,
-        n_pcs=n_pcs,
-        n_clusters=n_clusters,
-        n_batches_p1=n_batches_p1,
-        stream=cp.cuda.get_current_stream().ptr,
-    )

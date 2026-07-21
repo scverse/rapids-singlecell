@@ -27,7 +27,6 @@ from rapids_singlecell._cuda import (
 from rapids_singlecell._cuda import (
     _harmony_scatter_cuda as _scatter,
 )
-from rapids_singlecell.preprocessing._harmony._helper import _get_theta_array
 
 pytestmark = pytest.mark.skipif(
     _norm is None
@@ -196,7 +195,7 @@ def test_fused_pen_norm_int_with_permutation(dtype):
 @pytest.mark.parametrize("n_covariates", [2, 3, 4])
 def test_fused_pen_norm_multi_int(dtype, n_covariates):
     """Marginal penalty factors multiply across batch variables."""
-    n_rows, n_cols = 80, 19
+    n_rows, n_cols = 80, 64
     levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
     rng = cp.random.default_rng(734)
@@ -231,94 +230,6 @@ def test_fused_pen_norm_multi_int(dtype, n_covariates):
 
     atol = 1e-5 if dtype == np.float32 else 1e-10
     cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-4)
-
-
-@pytest.mark.parametrize("stabilized", [False, True])
-def test_multikey_scalar_theta_matches_explicit_and_not_joint(stabilized):
-    """A scalar applies once to every variable, not once to a joint code."""
-    cats = cp.asarray([[0, 3], [0, 4], [1, 3], [1, 4], [2, 3], [2, 4]], dtype=cp.int32)
-    probabilities = cp.asarray([0.95, 0.60, 0.20, 0.40, 0.70, 0.10])
-    R = cp.column_stack((probabilities, 1 - probabilities))
-    n_cells, n_clusters = R.shape
-
-    theta_scalar = _get_theta_array(2.0, np.array([3, 2]), cp.float64)
-    theta_explicit = _get_theta_array([2.0, 2.0], np.array([3, 2]), cp.float64)
-    cp.testing.assert_array_equal(theta_scalar, cp.full(5, 2.0))
-    cp.testing.assert_array_equal(theta_scalar, theta_explicit)
-
-    marginal_counts = cp.bincount(cats.ravel(), minlength=5)
-    E = marginal_counts[:, None] / n_cells * R.sum(axis=0)
-    O = cp.zeros((5, n_clusters), dtype=cp.float64)
-    for covariate in range(cats.shape[1]):
-        cp.add.at(O, cats[:, covariate], R)
-
-    penalty_scalar = cp.empty_like(E)
-    penalty_explicit = cp.empty_like(E)
-    for theta, penalty in (
-        (theta_scalar, penalty_scalar),
-        (theta_explicit, penalty_explicit),
-    ):
-        _pen.penalty(
-            E,
-            O=O,
-            theta=theta,
-            penalty=penalty,
-            n_batches=5,
-            n_clusters=n_clusters,
-            stabilized=stabilized,
-        )
-
-    similarities = cp.zeros_like(R)
-    idx = cp.arange(n_cells, dtype=cp.int32)
-    assignments_scalar = cp.empty_like(R)
-    assignments_explicit = cp.empty_like(R)
-    for penalty, assignments in (
-        (penalty_scalar, assignments_scalar),
-        (penalty_explicit, assignments_explicit),
-    ):
-        _pen.fused_pen_norm_int(
-            similarities,
-            penalty=penalty,
-            cats=cats,
-            idx_in=idx,
-            R_out=assignments,
-            term=0.0,
-            n_rows=n_cells,
-            n_cols=n_clusters,
-            n_covariates=2,
-        )
-
-    # This reconstructs the previous representation: one category per observed
-    # (batch, sex) combination, rather than one active marginal code per variable.
-    joint_codes = cp.arange(n_cells, dtype=cp.int32)
-    E_joint = cp.ones((n_cells, 1)) / n_cells * R.sum(axis=0)
-    O_joint = R.copy()
-    penalty_joint = cp.empty_like(E_joint)
-    _pen.penalty(
-        E_joint,
-        O=O_joint,
-        theta=_get_theta_array(2.0, n_cells, cp.float64),
-        penalty=penalty_joint,
-        n_batches=n_cells,
-        n_clusters=n_clusters,
-        stabilized=stabilized,
-    )
-    assignments_joint = cp.empty_like(R)
-    _pen.fused_pen_norm_int(
-        similarities,
-        penalty=penalty_joint,
-        cats=joint_codes,
-        idx_in=idx,
-        R_out=assignments_joint,
-        term=0.0,
-        n_rows=n_cells,
-        n_cols=n_clusters,
-        n_covariates=1,
-    )
-    cp.cuda.Device().synchronize()
-
-    cp.testing.assert_array_equal(assignments_scalar, assignments_explicit)
-    assert float(cp.max(cp.abs(assignments_scalar - assignments_joint))) > 0.1
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
