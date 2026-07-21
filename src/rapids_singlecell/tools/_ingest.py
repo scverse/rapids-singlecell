@@ -509,7 +509,6 @@ def _map_umap(
         raise ValueError("Reference UMAP metadata does not contain `a` and `b`.")
 
     from cuml.internals.array import CumlArray
-    from cuml.internals.array_sparse import SparseCumlArray
     from cuml.manifold import UMAP
 
     ref_is_sparse = cp_sparse.issparse(ref_rep)
@@ -534,16 +533,10 @@ def _map_umap(
         random_state=umap_params.get("random_state", 0),
         output_type="cupy",
     )
-    model._a = a
-    model._b = b
-    model._n_neighbors = n_neighbors
-    model._raw_data = (
-        SparseCumlArray(ref_rep) if ref_is_sparse else CumlArray(data=ref_rep)
-    )
-    model._sparse_data = ref_is_sparse
-    model._supervised = False
-    model._input_hash = None
-    model.n_features_in_ = ref_rep.shape[1]
+    # Fit on the reference to populate cuML's internal state via the public
+    # API, then swap in the stored reference embedding so the query maps into
+    # the existing coordinate system instead of the freshly fitted one.
+    model.fit(ref_rep)
     model.embedding_ = CumlArray(data=ref_embedding)
 
     return cp.asarray(model.transform(query_rep), dtype=cp.float32)
