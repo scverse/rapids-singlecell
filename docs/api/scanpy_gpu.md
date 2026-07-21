@@ -79,6 +79,15 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
     tl.embedding_density
 ```
 
+### Data integration
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+
+    tl.ingest
+```
+
 ### Clustering
 
 ```{eval-rst}
