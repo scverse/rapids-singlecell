@@ -57,7 +57,8 @@ def harmony_integrate(
         The annotated data matrix.
     key
         The key(s) of the column(s) in ``adata.obs`` that differentiate(s) among experiments/batches.
-        When multiple keys are provided, a combined batch variable is created from all columns.
+        Multiple keys are modeled as separate batch variables, with one active
+        categorical level per variable and cell.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
     adjusted_basis
@@ -97,8 +98,10 @@ def harmony_integrate(
         to contain a balanced representation of all batches.
         Higher values (e.g. ``4``) produce more aggressive mixing;
         lower values (e.g. ``0.5``) allow more batch-specific clusters.
-        Set to ``0`` to disable batch correction entirely.
-        A list can be provided to set different weights per batch variable.
+        Set to ``0`` to disable the diversity penalty for a batch variable.
+        A scalar is applied to every key. A sequence may contain one value per
+        key, expanded over that key's categorical levels, or one value per
+        categorical level across all keys.
     tau
         Discounting factor on ``theta``.
         When ``tau > 0``,
@@ -128,8 +131,11 @@ def harmony_integrate(
         ``"fast"`` uses a precomputed factorization that avoids the full inversion,
         which can be faster for datasets with many batches.
         ``"batched"`` processes all clusters simultaneously (fastest but requires more memory).
-        If ``None`` (default), automatically selects ``"batched"`` unless
-        the workspace would exceed 1 GB, in which case ``"fast"`` is used.
+        With one key, ``None`` automatically selects ``"batched"`` unless its
+        workspace would exceed 1 GiB, in which case ``"fast"`` is used.
+        Multiple keys always use the exact general-design solve because the
+        arrowhead optimization applies only to one batch variable; clusters are
+        processed in workspace-bounded chunks when needed.
     colsum_algo
         Algorithm for column sums.
         If ``None``, chosen automatically.

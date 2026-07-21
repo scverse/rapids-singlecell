@@ -97,12 +97,13 @@ def _scatter_add_cp(
     """
     n_cells = X.shape[0]
     n_pcs = X.shape[1]
+    n_covariates = cats.shape[1] if cats.ndim == 2 else 1
 
     # Determine whether to use shared memory kernel
     if use_shared is None:
         use_shared = False
         if n_batches is not None and n_cells >= MIN_CELLS_FOR_SHARED:
-            cells_per_batch = n_cells // n_batches
+            cells_per_batch = n_cells * n_covariates // n_batches
             shared_mem_needed = n_batches * n_pcs * X.dtype.itemsize
             if (
                 shared_mem_needed <= MAX_SHARED_MEM_BYTES
@@ -126,18 +127,19 @@ def _scatter_add_cp(
             n_cells=n_cells,
             n_pcs=n_pcs,
             n_batches=n_batches,
+            n_covariates=n_covariates,
             switcher=switcher,
             a=out,
             n_blocks=n_blocks,
             stream=cp.cuda.get_current_stream().ptr,
         )
     else:
-        # Use nanobind .cu kernel
         _hc_sc.scatter_add(
             X,
             cats=cats,
             n_cells=n_cells,
             n_pcs=n_pcs,
+            n_covariates=n_covariates,
             switcher=switcher,
             a=out,
             stream=cp.cuda.get_current_stream().ptr,
@@ -183,24 +185,35 @@ def _outer_cp(
     )
 
 
-def _normalize_cp(X: cp.ndarray, p: int = 2) -> cp.ndarray:
+def _normalize_cp(
+    X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None
+) -> cp.ndarray:
     """
     Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`.
     """
     if p == 2:
         X = cp.ascontiguousarray(X)
-        dst = cp.empty_like(X)
+        if out is None:
+            out = cp.empty_like(X)
+        elif out.shape != X.shape or out.dtype != X.dtype:
+            raise ValueError(
+                "Normalization output must match the input shape and dtype"
+            )
+        elif not out.flags.c_contiguous:
+            raise ValueError("Normalization output must be C-contiguous")
         rows, cols = X.shape
         _hc_norm.l2_row_normalize(
             X,
-            dst=dst,
+            dst=out,
             n_rows=rows,
             n_cols=cols,
             stream=cp.cuda.get_current_stream().ptr,
         )
-        return dst
+        return out
 
     else:
+        if out is not None and out is not X:
+            raise ValueError("An output buffer is only supported for L2 normalization")
         return _normalize_cp_p1(X)
 
 
@@ -220,20 +233,64 @@ def _get_aggregated_matrix(
     )
 
 
-def _get_batch_codes(batch_mat: pd.DataFrame, batch_key: str | list[str]) -> pd.Series:
-    if isinstance(batch_key, str):
-        batch_vec = batch_mat[batch_key]
+def _get_batch_codes(
+    batch_mat: pd.DataFrame, batch_key: str | list[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Encode each batch variable into a disjoint range of marginal codes."""
+    keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
+    if not keys:
+        raise ValueError("batch_key must contain at least one column name")
 
-    elif len(batch_key) == 1:
-        batch_key = batch_key[0]
+    codes = np.empty((len(batch_mat), len(keys)), dtype=np.int32)
+    n_levels = np.empty(len(keys), dtype=np.int32)
+    offset = 0
 
-        batch_vec = batch_mat[batch_key]
+    for covariate, key in enumerate(keys):
+        batch_vec = batch_mat[key].astype("category")
+        local_codes = batch_vec.cat.codes.to_numpy(dtype=np.int32, copy=False)
+        if np.any(local_codes < 0):
+            raise ValueError(f"Batch variable {key!r} contains missing values")
 
-    else:
-        df = batch_mat[batch_key].astype("str")
-        batch_vec = df.apply(lambda row: ",".join(row), axis=1)
+        n_categories = batch_vec.cat.categories.size
+        n_levels[covariate] = n_categories
+        codes[:, covariate] = local_codes + offset
+        offset += n_categories
 
-    return batch_vec.astype("category")
+    return codes, n_levels
+
+
+def _factorize_joint_codes(
+    batch_codes: np.ndarray, n_levels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Factorize marginal category tuples in lexicographic order."""
+    levels = np.asarray(n_levels, dtype=np.int64)
+    if batch_codes.ndim != 2 or batch_codes.shape[1] != levels.size:
+        raise ValueError("Batch codes and category levels have incompatible shapes")
+
+    joint_cardinality = 1
+    for level in levels:
+        joint_cardinality *= int(level)
+        if joint_cardinality > np.iinfo(np.int64).max:
+            return np.unique(batch_codes, axis=0, return_inverse=True)
+
+    offsets = np.empty(levels.size, dtype=np.int64)
+    offsets[0] = 0
+    if levels.size > 1:
+        np.cumsum(levels[:-1], out=offsets[1:])
+
+    linear_codes = batch_codes[:, 0].astype(np.int64) - offsets[0]
+    for covariate in range(1, levels.size):
+        linear_codes *= levels[covariate]
+        linear_codes += batch_codes[:, covariate] - offsets[covariate]
+
+    observed_codes, joint_codes = np.unique(linear_codes, return_inverse=True)
+    joint_cats = np.empty((observed_codes.size, levels.size), dtype=np.int32)
+    remainder = observed_codes.copy()
+    for covariate in range(levels.size - 1, -1, -1):
+        joint_cats[:, covariate] = remainder % levels[covariate]
+        remainder //= levels[covariate]
+    joint_cats += offsets.astype(np.int32)
+    return joint_cats, joint_codes
 
 
 def _scatter_add_cp_bias_csr(
@@ -276,35 +333,30 @@ def _scatter_add_cp_bias_csr(
 
 def _get_theta_array(
     theta: float | int | list[float | int] | np.ndarray | cp.ndarray,
-    n_batches: int,
+    n_levels: int | np.ndarray,
     dtype: cp.dtype,
 ) -> cp.ndarray:
     """
-    Convert theta parameter to a CuPy array of appropriate shape.
+    Normalize scalar, per-variable, or per-category theta values.
     """
-    # Handle scalar inputs (float, int)
-    if isinstance(theta, float | int):
-        return cp.ones(n_batches, dtype=dtype) * float(theta)
+    levels = np.atleast_1d(n_levels).astype(np.int64, copy=False)
+    n_covariates = levels.size
+    n_categories = int(levels.sum())
 
-    # Handle array-like inputs (list, numpy array, cupy array)
-    if isinstance(theta, list):
-        theta_array = cp.array(theta, dtype=dtype)
-    elif isinstance(theta, np.ndarray):
-        theta_array = cp.array(theta, dtype=dtype)
-    elif isinstance(theta, cp.ndarray):
-        theta_array = theta.astype(dtype)
-    else:
-        raise ValueError(
-            f"Theta must be float, int, list, numpy array, or cupy array, got {type(theta)}"
-        )
+    theta_array = cp.asarray(theta, dtype=dtype)
+    if theta_array.ndim == 0:
+        return cp.full(n_categories, theta_array, dtype=dtype)
 
-    # Verify dimensions
-    if theta_array.size != n_batches:
-        raise ValueError(
-            f"Theta array size ({theta_array.size}) must match number of batches ({n_batches})"
-        )
+    theta_array = theta_array.ravel()
+    if theta_array.size == n_covariates:
+        return cp.repeat(theta_array, cp.asarray(levels))
+    if theta_array.size == n_categories:
+        return theta_array
 
-    return theta_array.ravel()
+    raise ValueError(
+        f"Theta array size ({theta_array.size}) must match the number of batch "
+        f"variables ({n_covariates}) or categorical levels ({n_categories})"
+    )
 
 
 def _column_sum(X: cp.ndarray) -> cp.ndarray:
@@ -538,6 +590,7 @@ def _fused_calc_pen_norm(
     if idx_in.dtype != cp.uint64:
         idx_in = idx_in.astype(cp.uint64)
 
+    n_covariates = cats.shape[1] if cats.ndim == 2 else 1
     _hc_pen.fused_pen_norm(
         similarities,
         penalty=penalty,
@@ -547,6 +600,7 @@ def _fused_calc_pen_norm(
         term=float(term),
         n_rows=block_size,
         n_cols=n_clusters,
+        n_covariates=n_covariates,
         stream=cp.cuda.get_current_stream().ptr,
     )
 
