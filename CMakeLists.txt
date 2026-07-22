@@ -270,6 +270,7 @@ if (RSC_BUILD_EXTENSIONS)
   add_rmm_cuda_module(_wilcoxon_cuda        src/rapids_singlecell/_cuda/wilcoxon/wilcoxon.cu)
   add_rmm_cuda_module(_wilcoxon_sparse_cuda src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_sparse.cu)
   add_nb_cuda_module(_rank_stats_cuda   src/rapids_singlecell/_cuda/rank_genes/rank_stats.cu)
+  add_rmm_cuda_module(_rank_stream_cuda src/rapids_singlecell/_cuda/rank_genes/rank_stream.cu)
   # Harmony CUDA modules
   add_nb_cuda_module(_harmony_scatter_cuda   src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu)
   add_nb_cuda_module(_harmony_outer_cuda     src/rapids_singlecell/_cuda/harmony/outer/outer.cu)

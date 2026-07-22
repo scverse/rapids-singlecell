@@ -124,27 +124,61 @@ class _RankGenes:
         self.stats_arrays: dict[str, object] | None = None
         self._sparse_negative_fallback = False
         self._score_dtype = np.dtype(np.float32)
+        self._multi_gpu: bool | list[int] | str | None = None
 
-    def _basic_stats(self) -> None:
-        """Compute means, vars, and pts for device-resident input."""
-        agg = Aggregate(groupby=self.labels.cat, data=self.X)
-        # Only sum and sq_sum are needed (means/vars are derived locally below);
-        # count_nonzero is only needed when comp_pts is requested.
+    def _accumulate_planes(
+        self,
+    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+        """Sum / sq_sum / (count_nonzero) over ALL categories → (n_cats, n_genes).
+
+        Host input (numpy / scipy) streams blocks to the GPU (no full copy);
+        device / Dask uses the device ``Aggregate``. ``count_nonzero`` only when
+        ``comp_pts``.
+        """
+        X = self.X
+        if isinstance(X, np.ndarray) or sp.issparse(X):
+            return self._stream_planes()
+        agg = Aggregate(groupby=self.labels.cat, data=X)
         funcs = {"sum", "sq_sum"}
         if self.comp_pts:
             funcs.add("count_nonzero")
         result = agg.count_mean_var(funcs, dof=1)
+        return (
+            result["sum"],
+            result["sq_sum"],
+            result["count_nonzero"] if self.comp_pts else None,
+        )
 
-        # Map Aggregate category order → selected groups order
+    def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+        """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
+        from ._stream_multi_gpu import (
+            aggr_host_planes,
+            resolve_stream_devices,
+            stream_planes_multi,
+        )
+
+        codes = self.labels.cat.codes.to_numpy()
+        if codes.size and int(codes.min()) < 0:
+            # The streaming kernels index out[group, gene] directly; a missing
+            # (NaN) category (code -1) would corrupt memory, so refuse it — the
+            # device Aggregate path rejects it too.
+            msg = "groupby contains unassigned (NaN) categories; drop them first."
+            raise ValueError(msg)
+        device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
+        n_cats = len(self.labels.cat.categories)
+        if len(device_ids) > 1:
+            return stream_planes_multi(self, device_ids)
+        cats = cp.asarray(codes, dtype=cp.int32)
+        return aggr_host_planes(self.X, cats, n_cats, comp_pts=self.comp_pts)
+
+    def _basic_stats(self) -> None:
+        """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
+        sums_all, sq_sums_all, nnz_all = self._accumulate_planes()
+
+        # Map category order → selected groups order.
         cat_names = list(self.labels.cat.categories)
         cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
         order = [cat_to_idx[str(name)] for name in self.groups_order]
-
-        # Aggregate returns all categories; slice selected groups for outputs.
-        # Keep all-category totals so ``groups`` subsets get correct rest stats.
-        sums_all = result["sum"]
-        sq_sums_all = result["sq_sum"]
-        nnz_all = result["count_nonzero"] if self.comp_pts else None
 
         n = cp.asarray(self.group_sizes, dtype=cp.float64)[:, None]
         sums = sums_all[order]
@@ -162,7 +196,7 @@ class _RankGenes:
         # For reference='rest', rest includes every category not in this group.
         # That includes categories omitted by a strict ``groups=`` selection.
         if self.ireference is None:
-            n_total = agg.n_cells.sum()
+            n_total = cp.float64(self.X.shape[0])
             n_rest = n_total - n
             means_rest = (sums_all.sum(axis=0) - sums) / n_rest
             rest_ss = (sq_sums_all.sum(axis=0) - sq_sums) - n_rest * means_rest**2
@@ -239,6 +273,8 @@ class _RankGenes:
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
+        # Devices for the host-streaming t-test / binned shards.
+        self._multi_gpu = multi_gpu
         # Exact OVR inserts implicit zeros between negative and positive stored
         # values analytically. Binned and host OVO sparse paths still need the
         # sign check; device OVO does not use its result.
@@ -252,12 +288,10 @@ class _RankGenes:
             )
             if needs_signed_fallback:
                 self._sparse_negative_fallback = _sparse_has_negative(self.X)
-        if method in {
-            "t-test",
-            "t-test_overestim_var",
-            "wilcoxon_binned",
-        }:
-            self.X = X_to_GPU(self.X)
+        if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
+            # Host input streams (no full copy); device / Dask move to the GPU.
+            if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
+                self.X = X_to_GPU(self.X)
 
         n_genes = self.X.shape[1]
         if n_genes_user is None:

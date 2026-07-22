@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import anndata as ad
+import cupy as cp
 import numpy as np
 import pytest
 import scanpy as sc
@@ -9,6 +10,8 @@ from scanpy.datasets import pbmc68k_reduced
 from scipy import stats
 
 import rapids_singlecell as rsc
+
+MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
 
 def _make_nonnegative(adata):
@@ -609,3 +612,75 @@ def test_rank_genes_groups_ttest_key_added(method):
     assert "pvals_adj" in result
     assert "logfoldchanges" in result
     assert "params" in result
+
+
+# ---------------------------------------------------------------------------
+# Streamed host-resident input: CSC coverage and multi-GPU parity — {pr}`737`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reference", ["rest", "1"])
+@pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
+def test_ttest_host_csc_matches_scanpy(reference, method):
+    """Host CSC input streams to the GPU and matches scanpy."""
+    np.random.seed(42)
+    a = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
+    a.obs["blobs"] = a.obs["blobs"].astype("category")
+    _make_nonnegative(a)
+    gpu = a.copy()
+    gpu.X = sp.csc_matrix(gpu.X.astype(np.float32))
+    cpu = a.copy()
+    cpu.X = cpu.X.astype(np.float64)
+
+    rsc.tl.rank_genes_groups(
+        gpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference
+    )
+    sc.tl.rank_genes_groups(
+        cpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference
+    )
+    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+        for group in gpu.uns["rank_genes_groups"][field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(gpu.uns["rank_genes_groups"][field][group], dtype=float),
+                np.asarray(cpu.uns["rank_genes_groups"][field][group], dtype=float),
+                rtol=1e-6,
+                atol=1e-8,
+                equal_nan=True,
+            )
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.parametrize("layout", ["dense", "csr", "csc"])
+@pytest.mark.parametrize("reference", ["rest", "1"])
+def test_ttest_host_multi_gpu_matches_single(layout, reference):
+    """Sharded multi-GPU host t-test matches the single-GPU result."""
+    np.random.seed(0)
+    base = sc.datasets.blobs(n_variables=12, n_centers=4, n_observations=600)
+    base.obs["blobs"] = base.obs["blobs"].astype("category")
+    _make_nonnegative(base)
+    mk = {"dense": lambda x: x, "csr": sp.csr_matrix, "csc": sp.csc_matrix}[layout]
+    base.X = mk(base.X.astype(np.float32))
+    devices = [0, 1]
+
+    single = base.copy()
+    multi = base.copy()
+    kwargs = {
+        "method": "t-test",
+        "use_raw": False,
+        "reference": reference,
+        "n_genes": 12,
+    }
+    rsc.tl.rank_genes_groups(single, "blobs", multi_gpu=False, **kwargs)
+    rsc.tl.rank_genes_groups(multi, "blobs", multi_gpu=devices, **kwargs)
+
+    rs, rm = single.uns["rank_genes_groups"], multi.uns["rank_genes_groups"]
+    assert rs["names"].dtype.names == rm["names"].dtype.names
+    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+        for group in rs[field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(rm[field][group], dtype=float),
+                np.asarray(rs[field][group], dtype=float),
+                rtol=1e-5,
+                atol=1e-7,
+                equal_nan=True,
+            )

@@ -428,3 +428,78 @@ def test_c_contiguous_vs_fortran_contiguous():
         a = rsc_get_C.layers[c]
         b = rsc_get_F.layers[c]
         cp.testing.assert_allclose(a, b)
+
+
+# ---------------------------------------------------------------------------
+# In-memory host input is streamed to the GPU (no prior transfer) — {pr}`737`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
+@pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero", "sq_sum"])
+def test_aggregate_host_matches_device(array_type, metric):
+    """Host-resident input streams to the GPU and matches the device path."""
+    np.random.seed(0)
+    adata = sc.datasets.blobs(n_variables=15, n_centers=5, n_observations=300)
+    adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    adata.X = array_type(np.abs(adata.X).astype(np.float32))
+
+    host = adata.copy()  # left on host -> streamed
+    dev = adata.copy()
+    rsc.get.anndata_to_GPU(dev)
+
+    r_host = rsc.get.aggregate(host, "blobs", metric)
+    r_dev = rsc.get.aggregate(dev, "blobs", metric)
+    cp.testing.assert_allclose(
+        cp.asarray(r_host.layers[metric]),
+        cp.asarray(r_dev.layers[metric]),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
+def test_aggregate_host_masked(array_type):
+    """A mask is honored on streamed host input (same known values as device)."""
+    X = np.array(
+        [[1, 2], [3, 6], [100, 100], [2, 4], [4, 8], [200, 200]], dtype=np.float32
+    )
+    obs = pd.DataFrame(
+        {
+            "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
+            "mask": [True, True, False, True, True, False],
+        }
+    )
+    adata = ad.AnnData(X=array_type(X), obs=obs)  # host, not transferred
+
+    result = rsc.get.aggregate(adata, by="group", func=["mean", "var"], mask="mask")
+    cp.testing.assert_allclose(
+        result.layers["mean"], cp.array([[2, 4], [3, 6]], dtype=cp.float64)
+    )
+    cp.testing.assert_allclose(
+        result.layers["var"], cp.array([[2, 8], [2, 8]], dtype=cp.float64)
+    )
+
+
+def test_aggregate_host_multi_column():
+    """Multi-column groupby streams host input and matches the device path."""
+    np.random.seed(0)
+    adata = sc.datasets.blobs(n_variables=8, n_centers=4, n_observations=200)
+    adata.obs["blobs"] = adata.obs["blobs"].astype("category")
+    adata.obs["b2"] = pd.Categorical(np.random.randint(0, 3, 200).astype(str))
+    adata.X = csr_matrix(np.abs(adata.X).astype(np.float32))
+
+    host = adata.copy()
+    dev = adata.copy()
+    rsc.get.anndata_to_GPU(dev)
+
+    r_host = rsc.get.aggregate(host, ["blobs", "b2"], ["mean", "count_nonzero"])
+    r_dev = rsc.get.aggregate(dev, ["blobs", "b2"], ["mean", "count_nonzero"])
+    assert r_host.obs_names.equals(r_dev.obs_names)
+    for metric in ("mean", "count_nonzero"):
+        cp.testing.assert_allclose(
+            cp.asarray(r_host.layers[metric]),
+            cp.asarray(r_dev.layers[metric]),
+            rtol=1e-4,
+            atol=1e-5,
+        )
