@@ -199,11 +199,15 @@ def run_binned_hist_multi(
     bin_low: float,
     inv_bin_width: float,
     comp_pts: bool,
+    start: int,
+    stop: int,
+    accumulate_means: bool,
 ):
-    """Sharded binned histogram + fused group sums, gathered onto the caller.
+    """Build one sharded gene-window histogram and gather onto the caller.
 
-    Returns ``(hist, group_sums_ext, group_nnz_ext)`` where ``hist`` is the full
-    ``(n_genes, n_hist_groups, n_bins+1)`` histogram (bin 0 not yet filled).
+    Fused group sums are optional. For CSC they cover ``[start, stop)``; for
+    dense/CSR row shards they retain the full input width required by the
+    aggregation kernels.
     """
     from ._wilcoxon_binned import (
         _launch_csc_host,
@@ -212,8 +216,10 @@ def run_binned_hist_multi(
     )
 
     n_cells, n_genes = X.shape
+    if not 0 <= start < stop <= n_genes:
+        raise ValueError("invalid multi-GPU histogram gene window")
     col_shard = _is_col_shard(X)
-    axis_len = n_genes if col_shard else n_cells
+    axis_len = stop - start if col_shard else n_cells
     bands = _bands(axis_len, len(device_ids))
     device_ids = device_ids[: len(bands)]
 
@@ -222,27 +228,35 @@ def run_binned_hist_multi(
         b0, b1 = bands[index]
         with cp.cuda.Device(device_id):
             _limit_host_workers(len(device_ids))
-            shard = _shard_view(X, b0, b1)
             if col_shard:
+                shard = _shard_view(X, start + b0, start + b1)
                 codes = cp.asarray(group_codes_np, dtype=cp.int32)
                 band_genes = b1 - b0
                 launch = _launch_csc_host
+                launch_start, launch_stop = 0, band_genes
             else:
+                shard = _shard_view(X, b0, b1)
                 codes = cp.asarray(group_codes_np[b0:b1], dtype=cp.int32)
-                band_genes = n_genes
+                band_genes = stop - start
                 launch = _launch_csr_host if sp.issparse(X) else _launch_dense_host
-            gsum = cp.zeros((n_groups + 1, band_genes), dtype=cp.float64)
+                launch_start, launch_stop = start, stop
+            sum_genes = band_genes if col_shard else n_genes
+            gsum = (
+                cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64)
+                if accumulate_means
+                else None
+            )
             gnnz = (
-                cp.zeros((n_groups + 1, band_genes), dtype=cp.float64)
-                if comp_pts
+                cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64)
+                if accumulate_means and comp_pts
                 else None
             )
             hist = launch(
                 shard,
                 codes,
                 n_hist_groups,
-                start=0,
-                stop=band_genes,
+                start=launch_start,
+                stop=launch_stop,
                 n_bins=n_bins,
                 bin_low=bin_low,
                 inv_bin_width=inv_bin_width,
@@ -258,14 +272,24 @@ def run_binned_hist_multi(
     home = cp.cuda.Device().id
     if col_shard:
         hist = _concat_to_device([s[0] for s in shards], home, axis=0)
-        gsum = _concat_to_device([s[1] for s in shards], home, axis=1)
+        gsum = (
+            _concat_to_device([s[1] for s in shards], home, axis=1)
+            if accumulate_means
+            else None
+        )
         gnnz = (
             _concat_to_device([s[2] for s in shards], home, axis=1)
-            if comp_pts
+            if accumulate_means and comp_pts
             else None
         )
     else:
         hist = _sum_to_device([s[0] for s in shards], home)
-        gsum = _sum_to_device([s[1] for s in shards], home)
-        gnnz = _sum_to_device([s[2] for s in shards], home) if comp_pts else None
+        gsum = (
+            _sum_to_device([s[1] for s in shards], home) if accumulate_means else None
+        )
+        gnnz = (
+            _sum_to_device([s[2] for s in shards], home)
+            if accumulate_means and comp_pts
+            else None
+        )
     return hist, gsum, gnnz

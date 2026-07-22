@@ -218,69 +218,27 @@ def wilcoxon_binned(
 
     if chunk_size is not None:
         chunk_width = chunk_size
-    elif sp.issparse(X) and X.format == "csr" and not rg._sparse_negative_fallback:
-        # Host CSR: single row-block pass, one gene chunk (no per-chunk re-scan).
-        chunk_width = n_genes
     else:
         # Scale chunk inversely with n_groups * n_bins to keep histogram memory stable.
         # Budget = 500 genes * 60 groups * 1000 bins = 30M.
-        chunk_width = _CHUNK_BUDGET // max(n_groups * n_bins, 1)
+        chunk_width = max(1, _CHUNK_BUDGET // max(n_groups * n_bins, 1))
 
     # Fuse exact-mean accumulation into the histogram pass for host input (one
-    # transfer, not a separate _basic_stats pass). Needs each value streamed
-    # once: CSC/dense chunks are disjoint columns; CSR needs a single full pass;
-    # the force_dense densify path can't accumulate sums.
+    # transfer, not a separate _basic_stats pass). CSC/dense chunks accumulate
+    # their disjoint columns. CSR accumulates every column during the first
+    # histogram window only; later windows disable the fused planes.
     is_host = isinstance(X, np.ndarray) or sp.issparse(X)
-    csr_single_pass = sp.issparse(X) and X.format == "csr" and chunk_width >= n_genes
     fuse_means = (
         is_host
         and not rg._sparse_negative_fallback
         and (
-            isinstance(X, np.ndarray)
-            or (sp.issparse(X) and X.format == "csc")
-            or csr_single_pass
+            isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"})
         )
     )
     n_hist_groups = n_cells_per_group_hist.shape[0]
     from ._stream_multi_gpu import resolve_stream_devices
 
     device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [0]
-    if fuse_means and len(device_ids) > 1:
-        # Multi-GPU: shard the hist + group-sum build, then finish on the gather.
-        from ._stream_multi_gpu import run_binned_hist_multi
-
-        hist, group_sums_ext, group_nnz_ext = run_binned_hist_multi(
-            X,
-            group_codes_np,
-            device_ids,
-            n_groups=n_groups,
-            n_hist_groups=n_hist_groups,
-            n_bins=n_bins,
-            bin_low=bin_low,
-            inv_bin_width=inv_bin_width,
-            comp_pts=rg.comp_pts,
-        )
-        z, p = _finish_binned_stats(
-            hist,
-            is_sparse=sp.issparse(X),
-            n_groups=n_groups,
-            n_cells_per_group=n_cells_per_group,
-            n_cells_total=n_cells,
-            n_cells_per_group_hist=n_cells_per_group_hist_gpu,
-            total_counts_from_all=has_unselected,
-            ireference=ireference,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-        )
-        all_z = cp.asnumpy(z)
-        all_p = cp.asnumpy(p)
-        _fill_binned_means(rg, group_sums_ext, group_nnz_ext, n_cells)
-        return [
-            (group_index, all_z[group_index], all_p[group_index])
-            for group_index in range(n_groups)
-            if group_index != ireference
-        ]
-
     if fuse_means:
         group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
         group_nnz_ext = (
@@ -291,10 +249,61 @@ def wilcoxon_binned(
     else:
         rg._basic_stats()
 
+    use_multi_stream = fuse_means and len(device_ids) > 1
+    if use_multi_stream:
+        from ._stream_multi_gpu import run_binned_hist_multi
+
+    is_host_csr = sp.issparse(X) and X.format == "csr"
+    is_host_csc = sp.issparse(X) and X.format == "csc"
     for start in range(0, n_genes, chunk_width):
         stop = min(start + chunk_width, n_genes)
 
-        z_b, p_b = process_gene_batch(X, start=start, stop=stop, **batch_kwargs)
+        if use_multi_stream:
+            # CSR aggregation covers all genes, so fuse it only into the first
+            # histogram window. Dense/CSC aggregation follows the gene windows.
+            accumulate_means = not is_host_csr or start == 0
+            hist, sums_b, nnz_b = run_binned_hist_multi(
+                X,
+                group_codes_np,
+                device_ids,
+                n_groups=n_groups,
+                n_hist_groups=n_hist_groups,
+                n_bins=n_bins,
+                bin_low=bin_low,
+                inv_bin_width=inv_bin_width,
+                comp_pts=rg.comp_pts,
+                start=start,
+                stop=stop,
+                accumulate_means=accumulate_means,
+            )
+            z_b, p_b = _finish_binned_stats(
+                hist,
+                is_sparse=sp.issparse(X),
+                n_groups=n_groups,
+                n_cells_per_group=n_cells_per_group,
+                n_cells_total=n_cells,
+                n_cells_per_group_hist=n_cells_per_group_hist_gpu,
+                total_counts_from_all=has_unselected,
+                ireference=ireference,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+            )
+            if accumulate_means:
+                if is_host_csc:
+                    group_sums_ext[:, start:stop] = sums_b
+                    if group_nnz_ext is not None:
+                        group_nnz_ext[:, start:stop] = nnz_b
+                else:
+                    group_sums_ext += sums_b
+                    if group_nnz_ext is not None:
+                        group_nnz_ext += nnz_b
+        else:
+            z_b, p_b = process_gene_batch(X, start=start, stop=stop, **batch_kwargs)
+            if is_host_csr and fuse_means and start == 0:
+                # The CSR fused aggregation traverses every stored value, not
+                # only the histogram window. Do not add it again next batch.
+                batch_kwargs["group_sums"] = None
+                batch_kwargs["group_nnz"] = None
 
         all_z[:, start:stop] = cp.asnumpy(z_b)
         all_p[:, start:stop] = cp.asnumpy(p_b)

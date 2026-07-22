@@ -352,6 +352,7 @@ void def_aggr_dense_host(nb::module_& m) {
             int n_cats = out_sum     ? (int)out_sum->shape(0)
                          : out_count ? (int)out_count->shape(0)
                                      : (int)out_sqsum->shape(0);
+            if (n_cells == 0 || n_genes == 0) return;
             const T* h_X = X.data();
             const int* d_cats = cats.data();
             int sb = sub_batch > 0 ? sub_batch : DEFAULT_SUB_BATCH;
@@ -361,8 +362,39 @@ void def_aggr_dense_host(nb::module_& m) {
 
             size_t budget = rmm_available_device_bytes(0.8);
             size_t other = FOrder ? (size_t)n_cells : (size_t)n_genes;
-            size_t max_items = (size_t)sb * other;
+            int n_planes = (ps ? 1 : 0) + (pc ? 1 : 0) + (pq ? 1 : 0);
+            if (other > std::numeric_limits<size_t>::max() / sizeof(T))
+                throw std::runtime_error(
+                    "aggr_dense_host: streaming item size overflow");
+            size_t bytes_per_axis_item = other * sizeof(T);
+            if (FOrder) {
+                size_t scratch_items = (size_t)n_cats * n_planes;
+                if (scratch_items >
+                    (std::numeric_limits<size_t>::max() - bytes_per_axis_item) /
+                        sizeof(double))
+                    throw std::runtime_error(
+                        "aggr_dense_host: window scratch size overflow");
+                bytes_per_axis_item += scratch_items * sizeof(double);
+            }
+            // Leave room for the generated mask and allocator/stream overhead.
+            size_t mask_bytes = (size_t)n_cells * sizeof(bool);
+            size_t window_budget =
+                budget > mask_bytes ? budget - mask_bytes : budget;
             int n_streams = N_STREAMS;
+            size_t max_sb =
+                window_budget / (size_t)n_streams / bytes_per_axis_item;
+            if (max_sb < 1) {
+                n_streams = 1;
+                max_sb = window_budget / bytes_per_axis_item;
+            }
+            if (max_sb < 1)
+                throw std::runtime_error(
+                    "aggr_dense_host: one streaming row/column exceeds the "
+                    "available device-memory budget");
+            if ((size_t)sb > max_sb) sb = (int)max_sb;
+            int n_batches = (axis - 1) / sb + 1;
+            if (n_streams > n_batches) n_streams = n_batches;
+            size_t max_items = (size_t)sb * other;
 
             RmmScratchPool pool;
             const bool* d_mask = alloc_or_mask(mask, n_cells, pool);
@@ -379,7 +411,6 @@ void def_aggr_dense_host(nb::module_& m) {
                         w_sqsum[s] = pool.alloc<double>((size_t)n_cats * sb);
                 }
             }
-            (void)budget;
             ScopedCudaStreams streams(n_streams, cudaStreamDefault);
             // Pageable async copies (see stream_sparse_blocks) — no per-call
             // pin.

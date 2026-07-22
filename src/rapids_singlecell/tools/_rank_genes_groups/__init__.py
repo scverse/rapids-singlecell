@@ -164,13 +164,15 @@ def rank_genes_groups(
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
     multi_gpu
         GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
-        and `'wilcoxon_binned'`. ``None``/``False`` use one GPU, ``True`` uses
-        all visible GPUs, and a list or comma-separated string selects device
-        IDs. For the streaming t-test/binned paths, in-memory host input is
-        sharded across the selected GPUs (CSR/dense by cell rows, CSC by gene
-        columns) and gathered on the first device. On small inputs the sharding
-        overhead can make multi-GPU slower than a single GPU; it pays off for
-        large host matrices where the host->device transfer dominates.
+        and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
+        visible GPUs for host input and device OVO, while device OVR stays on
+        its input-owning GPU. For the streaming t-test/binned paths, ``None``
+        and ``False`` use the current GPU. ``True`` uses all visible GPUs, and a
+        list or comma-separated string selects device IDs. Streaming multi-GPU
+        is host-only: CSR/dense input is sharded by cell rows, CSC by gene
+        columns, and results are gathered on the current device. Device-resident
+        t-test/binned input runs on its owning GPU. On small host inputs the
+        sharding overhead can make multi-GPU slower than a single GPU.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000

@@ -157,11 +157,18 @@ class _RankGenes:
             stream_planes_multi,
         )
 
+        codes = self.labels.cat.codes.to_numpy()
+        if codes.size and int(codes.min()) < 0:
+            # The streaming kernels index out[group, gene] directly; a missing
+            # (NaN) category (code -1) would corrupt memory, so refuse it — the
+            # device Aggregate path rejects it too.
+            msg = "groupby contains unassigned (NaN) categories; drop them first."
+            raise ValueError(msg)
         device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
         n_cats = len(self.labels.cat.categories)
         if len(device_ids) > 1:
             return stream_planes_multi(self, device_ids)
-        cats = cp.asarray(self.labels.cat.codes.to_numpy(), dtype=cp.int32)
+        cats = cp.asarray(codes, dtype=cp.int32)
         return aggr_host_planes(self.X, cats, n_cats, comp_pts=self.comp_pts)
 
     def _basic_stats(self) -> None:
