@@ -53,18 +53,20 @@ def _random_idx(n_src, n_dst, seed=42):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("n_rows,n_cols", [(100, 50), (1, 20), (500, 3)])
-def test_l2_row_normalize(dtype, n_rows, n_cols):
+@pytest.mark.parametrize("in_place", [False, True])
+def test_l2_row_normalize(dtype, n_rows, n_cols, in_place):
     rng = cp.random.default_rng(42)
     src = rng.standard_normal((n_rows, n_cols), dtype=dtype)
-    dst = cp.empty_like(src)
+    expected = src.copy()
+    dst = src if in_place else cp.empty_like(src)
 
     _norm.l2_row_normalize(src, dst=dst, n_rows=n_rows, n_cols=n_cols)
     cp.cuda.Device().synchronize()
 
     # Reference: L2 row normalize
-    norms = cp.linalg.norm(src, axis=1, keepdims=True)
+    norms = cp.linalg.norm(expected, axis=1, keepdims=True)
     norms = cp.maximum(norms, 1e-12)
-    expected = src / norms
+    expected /= norms
 
     atol = 1e-6 if dtype == np.float32 else 1e-12
     cp.testing.assert_allclose(dst, expected, atol=atol, rtol=1e-5)
@@ -189,6 +191,136 @@ def test_fused_pen_norm_int_with_permutation(dtype):
 
     atol = 1e-5 if dtype == np.float32 else 1e-10
     cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("n_covariates", [2, 3, 4])
+def test_fused_pen_norm_multi_int(dtype, n_covariates):
+    """Marginal penalty factors multiply across batch variables."""
+    n_rows, n_cols = 80, 64
+    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
+    offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
+    rng = cp.random.default_rng(734)
+
+    similarities = rng.random((n_rows + 13, n_cols), dtype=dtype)
+    penalty = rng.random((int(levels.sum()), n_cols), dtype=dtype) + 0.2
+    local_codes = cp.stack(
+        [rng.integers(0, int(level), size=n_rows) for level in levels], axis=1
+    ).astype(cp.int32)
+    cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
+    idx_in = _random_idx(n_rows + 13, n_rows, seed=734)
+    R_out = cp.empty((n_rows, n_cols), dtype=dtype)
+    term = -7.0
+
+    _pen.fused_pen_norm_int(
+        similarities,
+        penalty=penalty,
+        cats=cats,
+        idx_in=idx_in,
+        R_out=R_out,
+        term=term,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        n_covariates=n_covariates,
+    )
+    cp.cuda.Device().synchronize()
+
+    raw = cp.exp(dtype(term) * (1 - similarities[idx_in]))
+    for covariate in range(n_covariates):
+        raw *= penalty[cats[:, covariate]]
+    expected = raw / raw.sum(axis=1, keepdims=True)
+
+    atol = 1e-5 if dtype == np.float32 else 1e-10
+    cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("n_covariates", [2, 3, 4])
+def test_fused_pen_norm_multi_int_avoids_product_overflow(dtype, n_covariates):
+    """Large finite marginal factors are normalized without overflow."""
+    n_rows, n_cols = 7, 19
+    levels = np.full(n_covariates, 2, dtype=np.int32)
+    offsets = np.arange(n_covariates, dtype=np.int32) * 2
+    rng = cp.random.default_rng(735)
+
+    similarities = rng.random((n_rows, n_cols), dtype=dtype)
+    scale = dtype(1e30 if dtype == np.float32 else 1e200)
+    relative = rng.uniform(0.5, 1.0, size=(int(levels.sum()), n_cols)).astype(dtype)
+    penalty = scale * relative
+    local_codes = cp.stack(
+        [rng.integers(0, int(level), size=n_rows) for level in levels], axis=1
+    ).astype(cp.int32)
+    cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
+    idx_in = cp.arange(n_rows, dtype=cp.int32)
+    R_out = cp.empty((n_rows, n_cols), dtype=dtype)
+    term = -7.0
+
+    _pen.fused_pen_norm_int(
+        similarities,
+        penalty=penalty,
+        cats=cats,
+        idx_in=idx_in,
+        R_out=R_out,
+        term=term,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        n_covariates=n_covariates,
+    )
+    cp.cuda.Device().synchronize()
+
+    log_raw = dtype(term) * (1 - similarities)
+    for covariate in range(n_covariates):
+        log_raw += cp.log(penalty[cats[:, covariate]])
+    log_raw -= log_raw.max(axis=1, keepdims=True)
+    expected = cp.exp(log_raw)
+    expected /= expected.sum(axis=1, keepdims=True)
+
+    assert bool(cp.isfinite(R_out).all())
+    cp.testing.assert_allclose(R_out.sum(axis=1), 1, atol=1e-6, rtol=1e-6)
+    atol = 1e-5 if dtype == np.float32 else 1e-12
+    cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("n_covariates", [2, 3, 4])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("switcher", [0, 1])
+def test_scatter_add_multi(dtype, n_covariates, shared, switcher):
+    """Each cell value is scattered once to every marginal level."""
+    n_cells, n_cols = 257, 11
+    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
+    offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
+    n_batches = int(levels.sum())
+    rng = cp.random.default_rng(991)
+
+    values = rng.random((n_cells, n_cols), dtype=dtype)
+    local_codes = cp.stack(
+        [rng.integers(0, int(level), size=n_cells) for level in levels], axis=1
+    ).astype(cp.int32)
+    cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
+    out = cp.zeros((n_batches, n_cols), dtype=dtype)
+
+    kwargs = {
+        "cats": cats,
+        "n_cells": n_cells,
+        "n_pcs": n_cols,
+        "n_covariates": n_covariates,
+        "switcher": switcher,
+        "a": out,
+    }
+    if shared:
+        _scatter.scatter_add_shared(values, n_batches=n_batches, n_blocks=3, **kwargs)
+    else:
+        _scatter.scatter_add(values, **kwargs)
+    cp.cuda.Device().synchronize()
+
+    expected = cp.zeros_like(out)
+    signed_values = values if switcher == 1 else -values
+    for covariate in range(n_covariates):
+        cp.add.at(expected, cats[:, covariate], signed_values)
+
+    atol = 1e-5 if dtype == np.float32 else 1e-12
+    cp.testing.assert_allclose(out, expected, atol=atol, rtol=1e-5)
 
 
 # ---------- gather_rows ----------
