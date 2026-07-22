@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cstdint>
 #include "../nb_types.h"
 #include <nanobind/stl/tuple.h>
 
@@ -187,12 +186,12 @@ static void dispatch_tiles(const Launcher& launcher, int cell_tile,
 }
 
 template <typename T, typename Device, typename IndptrT>
-void def_compute_distances_sparse(nb::module_& m, const char* name) {
+void def_compute_distances_sparse(nb::module_& m) {
     m.def(
-        name,
-        [](gpu_array_c<const T, Device> data,
+        "compute_distances_sparse",
+        [](gpu_array_c<const IndptrT, Device> indptr,
            gpu_array_c<const int, Device> indices,
-           gpu_array_c<const IndptrT, Device> indptr,
+           gpu_array_c<const T, Device> data,
            gpu_array_c<const int, Device> cat_offsets,
            gpu_array_c<const int, Device> cell_indices,
            gpu_array_c<const int, Device> pair_left,
@@ -217,7 +216,7 @@ void def_compute_distances_sparse(nb::module_& m, const char* name) {
                 reinterpret_cast<cudaStream_t>(stream)};
             dispatch_tiles<T>(launcher, cell_tile, feat_tile);
         },
-        "data"_a, "indices"_a, "indptr"_a, "cat_offsets"_a, "cell_indices"_a,
+        "indptr"_a, "indices"_a, "data"_a, "cat_offsets"_a, "cell_indices"_a,
         "pair_left"_a, "pair_right"_a, "pairwise_sums"_a, "num_pairs"_a,
         "n_features"_a, "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a,
         "block_size"_a, "shared_mem"_a, "stream"_a = 0);
@@ -261,16 +260,12 @@ void register_bindings(nb::module_& m) {
     def_compute_distances<double, Device>(m);
     def_compute_distances<float, Device>(m);
 
-    // Sparse (CSR) variants. int32 indptr -> compute_distances_sparse;
-    // int64 indptr -> compute_distances_sparse_i64. f64 before f32.
-    def_compute_distances_sparse<double, Device, int>(
-        m, "compute_distances_sparse");
-    def_compute_distances_sparse<float, Device, int>(
-        m, "compute_distances_sparse");
-    def_compute_distances_sparse<double, Device, int64_t>(
-        m, "compute_distances_sparse_i64");
-    def_compute_distances_sparse<float, Device, int64_t>(
-        m, "compute_distances_sparse_i64");
+    // Sparse (CSR) variants. Nanobind dispatches on data and indptr dtype.
+    // Keep f64 before f32 for proper overload dispatch.
+    def_compute_distances_sparse<double, Device, int>(m);
+    def_compute_distances_sparse<float, Device, int>(m);
+    def_compute_distances_sparse<double, Device, long long>(m);
+    def_compute_distances_sparse<float, Device, long long>(m);
 }
 
 NB_MODULE(_edistance_cuda, m) {
