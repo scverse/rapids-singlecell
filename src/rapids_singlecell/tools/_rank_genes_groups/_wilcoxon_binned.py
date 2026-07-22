@@ -20,10 +20,57 @@ if TYPE_CHECKING:
 
     from ._core import _RankGenes
 
-_CHUNK_BUDGET = 30_000_000  # default chunk * n_groups * n_bins (500 * 60 * 1000)
+_AUTO_CHUNK_MEMORY_FRACTION = 0.60
+_COUNT_BYTES = np.dtype(np.uint32).itemsize
+_FLOAT_BYTES = np.dtype(np.float64).itemsize
 _LOG1P_RANGE = (0.0, 15.0)  # covers log1p(x) for raw counts up to ~3.3 million
 _DASK_N_BINS = 200
 _DEFAULT_N_BINS = 1000
+
+
+def _auto_chunk_width(
+    n_genes: int,
+    n_groups: int,
+    n_hist_groups: int,
+    n_bins_total: int,
+    *,
+    device_ids: list[int],
+    ireference: int | None,
+    tie_correct: bool,
+    gathers_multi_gpu: bool,
+) -> int:
+    """Choose a histogram width from the least-free selected device."""
+    free_bytes = []
+    for device_id in device_ids:
+        with cp.cuda.Device(device_id):
+            free, _ = cp.cuda.runtime.memGetInfo()
+            free_bytes.append(int(free))
+
+    # Histograms are uint32. The gather device can briefly hold both its shard
+    # and the reduced histogram; include both even though the memory pool can
+    # normally reuse the released shard for downstream temporaries.
+    histogram_copies = 2 if gathers_multi_gpu else 1
+    bytes_per_gene = histogram_copies * n_hist_groups * n_bins_total * _COUNT_BYTES
+
+    if ireference is None:
+        # One-vs-rest keeps a float64 histogram plus per-bin totals, cumulative
+        # counts, and midranks. Tie correction adds one more per-bin plane.
+        bytes_per_gene += n_groups * n_bins_total * _FLOAT_BYTES
+        n_bin_planes = 3 + int(tie_correct)
+        bytes_per_gene += n_bin_planes * n_bins_total * _FLOAT_BYTES
+    else:
+        # Reference comparisons materialize pair totals, cumulative counts,
+        # midranks, and the float64 histogram for every group and bin.
+        n_group_bin_bytes = _COUNT_BYTES + 3 * _FLOAT_BYTES
+        if tie_correct:
+            n_group_bin_bytes += _FLOAT_BYTES
+        bytes_per_gene += n_groups * n_bins_total * n_group_bin_bytes
+
+    # Account for group-wise statistic/result temporaries, then reserve the
+    # remaining 40% for the input, allocator fragmentation, and other clients.
+    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES
+    usable_bytes = int(min(free_bytes) * _AUTO_CHUNK_MEMORY_FRACTION)
+    return min(n_genes, max(1, usable_bytes // max(bytes_per_gene, 1)))
 
 
 def _fill_sparse_zero_bin(hist: cp.ndarray, group_counts: cp.ndarray) -> None:
@@ -216,13 +263,6 @@ def wilcoxon_binned(
     all_z = np.empty((n_groups, n_genes), dtype=np.float64)
     all_p = np.empty((n_groups, n_genes), dtype=np.float64)
 
-    if chunk_size is not None:
-        chunk_width = chunk_size
-    else:
-        # Scale chunk inversely with n_groups * n_bins to keep histogram memory stable.
-        # Budget = 500 genes * 60 groups * 1000 bins = 30M.
-        chunk_width = max(1, _CHUNK_BUDGET // max(n_groups * n_bins, 1))
-
     # Fuse exact-mean accumulation into the histogram pass for host input (one
     # transfer, not a separate _basic_stats pass). CSC/dense chunks accumulate
     # their disjoint columns. CSR accumulates every column during the first
@@ -252,6 +292,20 @@ def wilcoxon_binned(
     use_multi_stream = fuse_means and len(device_ids) > 1
     if use_multi_stream:
         from ._stream_multi_gpu import run_binned_hist_multi
+
+    if chunk_size is not None:
+        chunk_width = chunk_size
+    else:
+        chunk_width = _auto_chunk_width(
+            n_genes,
+            n_groups,
+            n_hist_groups,
+            n_bins_total,
+            device_ids=device_ids,
+            ireference=ireference,
+            tie_correct=tie_correct,
+            gathers_multi_gpu=use_multi_stream,
+        )
 
     is_host_csr = sp.issparse(X) and X.format == "csr"
     is_host_csc = sp.issparse(X) and X.format == "csc"
