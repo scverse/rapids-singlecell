@@ -5,6 +5,8 @@ from inspect import signature
 from typing import TYPE_CHECKING, Literal, Union, get_args
 
 import cupy as cp
+import numpy as np
+import scipy.sparse as sp
 from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
 from scanpy._utils import _resolve_axis
@@ -18,7 +20,6 @@ from rapids_singlecell.preprocessing._utils import _check_gpu_X
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
 
-    import numpy as np
     import pandas as pd
     from numpy.typing import NDArray
 
@@ -126,8 +127,62 @@ class Aggregate:
             return self.count_mean_var_dask(funcs, dof=dof, split_every=split_every)
         elif cp_sparse.issparse(self.data):
             return self.count_mean_var_sparse(funcs, dof=dof)
+        elif isinstance(self.data, np.ndarray) or sp.issparse(self.data):
+            return self.count_mean_var_host(funcs, dof=dof)
         else:
             return self.count_mean_var_dense(funcs, dof=dof)
+
+    def count_mean_var_host(self, funcs=None, *, dof: int = 1):
+        """Aggregate in-memory host input (numpy / scipy sparse) by streaming
+        row/column blocks to the GPU without materializing the full matrix."""
+        from rapids_singlecell._cuda import _rank_stream_cuda as _rss
+
+        assert dof >= 0
+        funcs = _ALL_FUNCS if funcs is None else set(funcs)
+        need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
+        n_groups, n_genes = self.n_cells.shape[0], self.data.shape[1]
+
+        sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
+        counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
+        sq_sums = (
+            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
+        )
+        kw = {}
+        if sums is not None:
+            kw["out_sum"] = sums
+        if counts is not None:
+            kw["out_count"] = counts
+        if sq_sums is not None:
+            kw["out_sqsum"] = sq_sums
+        if self.mask is not None:
+            kw["mask"] = cp.asarray(self.mask, dtype=bool)
+
+        X = self.data
+        if sp.issparse(X):
+            if X.format not in {"csr", "csc"}:
+                X = X.tocsr()
+            data = X.data
+            if data.dtype not in (np.float32, np.float64):
+                data = data.astype(np.float32)
+            launch = _rss.aggr_csr_host if X.format == "csr" else _rss.aggr_csc_host
+            launch(
+                data,
+                X.indices,
+                X.indptr,
+                self.groupby,
+                n_cells=X.shape[0],
+                n_genes=n_genes,
+                **kw,
+            )
+        else:
+            if X.dtype not in (np.float32, np.float64):
+                X = X.astype(np.float32)
+            if not (X.flags.c_contiguous or X.flags.f_contiguous):
+                X = np.ascontiguousarray(X)
+            _rss.aggr_dense_host(X, self.groupby, **kw)
+        return self._build_result(
+            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
+        )
 
     def count_mean_var_dask(self, funcs=None, *, dof: int = 1, split_every: int = 2):
         """
@@ -482,7 +537,9 @@ def aggregate(
     varm
         If not None, key for aggregation data.
     return_sparse
-        Whether to return a sparse matrix. Only works for sparse input data.
+        Whether to return a sparse matrix. Only works for device-resident sparse
+        input. In-memory host input is not streamed for sparse output; it is
+        copied to the GPU first, so it must fit in GPU memory.
 
     Returns
     -------
@@ -541,7 +598,16 @@ def aggregate(
     elif axis == 1:
         # i.e., all of `varm`, `obsm`, `layers` are None so we use `X` which must be transposed
         data = data.T
-    _check_gpu_X(data, allow_dask=True)
+    # In-memory host input streams to the GPU (no full copy); ``return_sparse``
+    # still needs the device path, so copy that case to the GPU.
+    is_host = isinstance(data, np.ndarray) or sp.issparse(data)
+    if is_host and return_sparse:
+        from ._anndata import X_to_GPU
+
+        data = X_to_GPU(data)
+        is_host = False
+    if not is_host:
+        _check_gpu_X(data, allow_dask=True)
     dim_df = getattr(adata, axis_name)
     if len(signature(_combine_categories).parameters) == 1:
         cols = [by] if isinstance(by, str) else list(by)
