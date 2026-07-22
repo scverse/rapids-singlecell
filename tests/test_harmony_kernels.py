@@ -53,18 +53,20 @@ def _random_idx(n_src, n_dst, seed=42):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("n_rows,n_cols", [(100, 50), (1, 20), (500, 3)])
-def test_l2_row_normalize(dtype, n_rows, n_cols):
+@pytest.mark.parametrize("in_place", [False, True])
+def test_l2_row_normalize(dtype, n_rows, n_cols, in_place):
     rng = cp.random.default_rng(42)
     src = rng.standard_normal((n_rows, n_cols), dtype=dtype)
-    dst = cp.empty_like(src)
+    expected = src.copy()
+    dst = src if in_place else cp.empty_like(src)
 
     _norm.l2_row_normalize(src, dst=dst, n_rows=n_rows, n_cols=n_cols)
     cp.cuda.Device().synchronize()
 
     # Reference: L2 row normalize
-    norms = cp.linalg.norm(src, axis=1, keepdims=True)
+    norms = cp.linalg.norm(expected, axis=1, keepdims=True)
     norms = cp.maximum(norms, 1e-12)
-    expected = src / norms
+    expected /= norms
 
     atol = 1e-6 if dtype == np.float32 else 1e-12
     cp.testing.assert_allclose(dst, expected, atol=atol, rtol=1e-5)

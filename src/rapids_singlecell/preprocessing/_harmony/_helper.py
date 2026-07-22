@@ -158,6 +158,19 @@ def _outer_cp(
     )
 
 
+def _validate_output_buffer(
+    X: cp.ndarray,
+    out: cp.ndarray,
+    *,
+    operation: str,
+) -> None:
+    """Validate a caller-provided output buffer."""
+    if out.shape != X.shape or out.dtype != X.dtype:
+        raise ValueError(f"{operation} output must match the input shape and dtype")
+    if not out.flags.c_contiguous:
+        raise ValueError(f"{operation} output must be C-contiguous")
+
+
 def _normalize_cp(
     X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None
 ) -> cp.ndarray:
@@ -168,12 +181,8 @@ def _normalize_cp(
         X = cp.ascontiguousarray(X)
         if out is None:
             out = cp.empty_like(X)
-        elif out.shape != X.shape or out.dtype != X.dtype:
-            raise ValueError(
-                "Normalization output must match the input shape and dtype"
-            )
-        elif not out.flags.c_contiguous:
-            raise ValueError("Normalization output must be C-contiguous")
+        else:
+            _validate_output_buffer(X, out, operation="Normalization")
         rows, cols = X.shape
         _hc_norm.l2_row_normalize(
             X,

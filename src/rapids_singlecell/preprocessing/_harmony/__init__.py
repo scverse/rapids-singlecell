@@ -27,6 +27,7 @@ from ._helper import (
     _normalize_cp,
     _outer_cp,
     _scatter_add_cp,
+    _validate_output_buffer,
 )
 
 if TYPE_CHECKING:
@@ -187,6 +188,7 @@ def harmonize(
     else:
         n_joint_categories = 0
         cat_offsets, cell_indices = _create_category_index_mapping(cats, n_batches)
+        max_batch_cells = int(batch_counts.max())
 
     # Set up parameters
     if max_iter_harmony < 1:
@@ -365,8 +367,6 @@ def harmonize(
         )
         # Correction step
         if n_covariates > 1:
-            if joint_cats is None or joint_codes is None:
-                raise RuntimeError("Multi-key correction requires joint codes")
             Z_hat = _correction_multi(
                 Z,
                 R,
@@ -394,6 +394,7 @@ def harmonize(
                 n_batches=n_batches,
                 cat_offsets=cat_offsets,
                 cell_indices=cell_indices,
+                max_batch_cells=max_batch_cells,
                 output=Z_norm,
             )
         # Check for convergence
@@ -639,6 +640,7 @@ def _correction(
     n_batches: int,
     cat_offsets: cp.ndarray,
     cell_indices: cp.ndarray,
+    max_batch_cells: int,
     output: cp.ndarray | None = None,
 ) -> cp.ndarray:
     """
@@ -654,6 +656,7 @@ def _correction(
             n_batches=n_batches,
             cat_offsets=cat_offsets,
             cell_indices=cell_indices,
+            max_batch_cells=max_batch_cells,
             output=output,
         )
     elif correction_method == "fast":
@@ -927,10 +930,7 @@ def _correction_output(X: cp.ndarray, output: cp.ndarray | None = None) -> cp.nd
     """Return a validated correction output buffer."""
     if output is None:
         return cp.empty_like(X)
-    if output.shape != X.shape or output.dtype != X.dtype:
-        raise ValueError("Correction output must match the input shape and dtype")
-    if not output.flags.c_contiguous:
-        raise ValueError("Correction output must be C-contiguous")
+    _validate_output_buffer(X, output, operation="Correction")
     return output
 
 
@@ -996,6 +996,7 @@ def _correction_batched(
     n_batches: int,
     cat_offsets: cp.ndarray,
     cell_indices: cp.ndarray,
+    max_batch_cells: int,
     output: cp.ndarray | None = None,
 ) -> cp.ndarray:
     """
@@ -1017,7 +1018,6 @@ def _correction_batched(
     W_all = cp.empty((n_clusters, nb1, n_pcs), dtype=dtype)
     g_factor = cp.empty((n_clusters, n_batches), dtype=dtype)
     g_P_row0 = cp.empty((n_clusters, n_batches), dtype=dtype)
-    max_batch_cells = int(cp.max(cp.diff(cat_offsets)).item())
     # A category containing every cell can use X and R directly in C++.
     batch_chunk_size = 1 if max_batch_cells == n_cells else max_batch_cells
     X_batch = cp.empty((batch_chunk_size, n_pcs), dtype=dtype)

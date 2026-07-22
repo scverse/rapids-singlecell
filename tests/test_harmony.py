@@ -664,8 +664,8 @@ def test_compute_lambda_kb_zero_denom(dtype):
     [
         (cp.float32, "fast"),
         (cp.float32, "batched"),
-        # Float64 agreement between correction methods is covered separately.
         (cp.float64, "fast"),
+        (cp.float64, "batched"),
     ],
 )
 def test_harmony2_ircolitis_reference(
