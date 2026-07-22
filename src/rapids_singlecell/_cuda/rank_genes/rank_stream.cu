@@ -1,12 +1,8 @@
 // Host-streaming aggregation (sum/sq_sum/count) and binned histograms.
-//
-// Aggregation and histogram binning are additive-scatter reductions: every
-// stored value is independently accumulated into out[group, gene] /
-// hist[gene, group, bin]. Unlike Wilcoxon (which sorts each gene column), they
-// need no column-local ordering, so a host matrix can be streamed in contiguous
-// row-blocks (CSR / C-dense) or column-windows (CSC / F-dense) straight into
-// the device output, and the existing device kernels are reused verbatim. This
-// keeps only a window of the (large) host input on the GPU at any time.
+// Additive-scatter reductions (no per-column ordering, unlike Wilcoxon) →
+// stream host row-blocks (CSR/C-dense) or column-windows (CSC/F-dense) into the
+// device output, reusing the existing device kernels; only a window is ever
+// on-GPU.
 #include <cuda_runtime.h>
 #include <nanobind/stl/optional.h>
 
@@ -27,13 +23,8 @@ constexpr int HIST_BLOCK = 256;
 constexpr int N_STREAMS = DEFAULT_STREAMING_STREAMS;
 constexpr int STREAM_ROW_CAP = 1 << 20;  // bound the per-block indptr buffer
 constexpr int DEFAULT_SUB_BATCH = 4096;  // rows (CSR/C-dense) or cols (CSC/F)
-// Pin the whole host arrays for async H2D when small enough; above this use
-// unpinned copies (the driver stages them, with less overlap).
-constexpr size_t DIRECT_PIN_LIMIT = HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES;
 
-// Greedy contiguous blocks over `n` segments (rows or cols) whose per-segment
-// nnz = indptr[i+1]-indptr[i]: advance until the block would exceed `nnz_cap`
-// or `seg_cap` segments (always at least one segment).
+// Greedy contiguous blocks bounded by nnz_cap and seg_cap (>=1 segment).
 template <typename IdxT>
 std::vector<int> plan_nnz_blocks(const IdxT* indptr, int n, size_t nnz_cap,
                                  int seg_cap) {
@@ -54,8 +45,7 @@ std::vector<int> plan_nnz_blocks(const IdxT* indptr, int n, size_t nnz_cap,
     return bounds;
 }
 
-// Rebase indptr[col .. col+count) to a local origin on-device (out[i] =
-// indptr[col+i] - indptr[col]); fill_linear_offsets style launch.
+// Rebase indptr[col .. col+count) to a local origin on-device.
 template <typename IdxT>
 void rebase_block_indptr(const IdxT* d_indptr_full, IdxT* d_out, int col,
                          int count, cudaStream_t stream) {
@@ -88,12 +78,10 @@ struct SparseStreamBufs {
     IdxT* d_indptr = nullptr;  // rebased, seg_cap+1
 };
 
-// Stream contiguous nnz-bounded blocks of a host CSR/CSC through N_STREAMS
-// streams, invoking `consume(slot, d_data, d_indices, d_indptr_rebased, seg0,
-// n_seg, block_nnz, stream)` per block. `slot` (== stream index) lets the
-// consumer key its own per-stream window buffers so reuse stays same-stream
-// ordered. `d_indptr_rebased` has length n_seg+1 (local origin). The full
-// indptr is uploaded once; data/indices slices are copied per block.
+// Stream nnz-bounded blocks of a host CSR/CSC through N_STREAMS streams,
+// calling consume(slot, d_data, d_indices, d_indptr_rebased, seg0, n_seg,
+// block_nnz, stream) per block. slot == stream index (keeps per-stream buffer
+// reuse ordered).
 template <typename InT, typename IdxT, typename Consume>
 void stream_sparse_blocks(const InT* h_data, const IdxT* h_indices,
                           const IdxT* h_indptr, int n_seg, int sub_batch,
@@ -132,15 +120,11 @@ void stream_sparse_blocks(const InT* h_data, const IdxT* h_indices,
         bufs[s].d_indptr = pool.alloc<IdxT>((size_t)seg_cap + 1);
     }
     ScopedCudaStreams streams(N_STREAMS, cudaStreamDefault);
-
-    bool pin = total_nnz * bytes_per_nnz <= DIRECT_PIN_LIMIT;
-    HostRegisterGuard pin_data, pin_indices;
-    if (pin) {
-        pin_data = HostRegisterGuard(const_cast<InT*>(h_data),
-                                     total_nnz * sizeof(InT), 0, true);
-        pin_indices = HostRegisterGuard(const_cast<IdxT*>(h_indices),
-                                        total_nnz * sizeof(IdxT), 0, true);
-    }
+    // Pinned staging ring (host cast-copy pageable->pinned, then async
+    // pinned->device): beats whole-array register and pageable staging, and
+    // gives true async DMA that overlaps across devices (mirrors wilcoxon).
+    (void)total_nnz;
+    PinnedRing<InT, IdxT> stage(N_STREAMS, max_nnz);
 
     cuda_check(
         cudaMemcpy(d_indptr_full, h_indptr, ((size_t)n_seg + 1) * sizeof(IdxT),
@@ -157,16 +141,22 @@ void stream_sparse_blocks(const InT* h_data, const IdxT* h_indices,
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
 
+        stage.wait(s);  // slot free once its prior async copy finished
         if (block_nnz > 0) {
-            cuda_check(cudaMemcpyAsync(buf.d_data, h_data + ptr_start,
-                                       block_nnz * sizeof(InT),
-                                       cudaMemcpyHostToDevice, stream),
-                       "stream_sparse_blocks data H2D");
-            cuda_check(cudaMemcpyAsync(buf.d_indices, h_indices + ptr_start,
-                                       block_nnz * sizeof(IdxT),
-                                       cudaMemcpyHostToDevice, stream),
-                       "stream_sparse_blocks indices H2D");
+            InT* h_vals = stage.template get<0>(s);
+            IdxT* h_idx = stage.template get<1>(s);
+            host_copy_slice_as<InT, IdxT>(h_data, h_indices, ptr_start,
+                                          (int)block_nnz, h_vals, h_idx);
+            cuda_check(
+                cudaMemcpyAsync(buf.d_data, h_vals, block_nnz * sizeof(InT),
+                                cudaMemcpyHostToDevice, stream),
+                "stream_sparse_blocks data H2D");
+            cuda_check(
+                cudaMemcpyAsync(buf.d_indices, h_idx, block_nnz * sizeof(IdxT),
+                                cudaMemcpyHostToDevice, stream),
+                "stream_sparse_blocks indices H2D");
         }
+        stage.record(s, stream);  // slot reusable after these copies finish
         rebase_block_indptr(d_indptr_full, buf.d_indptr, seg0, n_block_seg + 1,
                             stream);
         consume(s, buf.d_data, buf.d_indices, buf.d_indptr, seg0, n_block_seg,
@@ -175,8 +165,7 @@ void stream_sparse_blocks(const InT* h_data, const IdxT* h_indices,
     sync_streams(streams, "stream_sparse_blocks");
 }
 
-// Aggregation MASK dispatch mirroring aggr.cu (kept local so we don't depend on
-// aggr.cu internals; the kernels themselves come from kernels_aggr.cuh).
+// Aggregation MASK dispatch (mirrors aggr.cu; kernels from kernels_aggr.cuh).
 #define RANK_STREAM_AGGR_DISPATCH(active, LAUNCH)                        \
     switch (active) {                                                    \
         case 1:                                                          \
@@ -209,6 +198,18 @@ int aggr_active_mask(double* ps, double* pc, double* pq) {
     return (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) | (pq ? AGGR_SQSUM : 0);
 }
 
+// Return the caller's cell mask, or an all-ones mask allocated from `pool`
+// (which must outlive the streaming call that reads it).
+template <typename Device>
+const bool* alloc_or_mask(
+    const std::optional<gpu_array_c<const bool, Device>>& mask, int n_cells,
+    RmmScratchPool& pool) {
+    if (mask) return mask->data();
+    bool* ones = pool.alloc<bool>((size_t)n_cells);
+    cudaMemset(ones, 1, (size_t)n_cells);
+    return ones;
+}
+
 // ---- aggregation: CSR host (row-block stream, full-output accumulation) ----
 template <typename T, typename IdxT, typename Device>
 void def_aggr_csr_host(nb::module_& m) {
@@ -218,7 +219,8 @@ void def_aggr_csr_host(nb::module_& m) {
            host_array<const IdxT> indptr, gpu_array_c<const int, Device> cats,
            std::optional<gpu_array_c<double, Device>> out_sum,
            std::optional<gpu_array_c<double, Device>> out_count,
-           std::optional<gpu_array_c<double, Device>> out_sqsum, int n_cells,
+           std::optional<gpu_array_c<double, Device>> out_sqsum,
+           std::optional<gpu_array_c<const bool, Device>> mask, int n_cells,
            int n_genes, int sub_batch_rows) {
             double* ps = out_sum ? out_sum->data() : nullptr;
             double* pc = out_count ? out_count->data() : nullptr;
@@ -228,8 +230,7 @@ void def_aggr_csr_host(nb::module_& m) {
                        "aggr_csr_host: indptr length must be n_cells+1");
             const int* d_cats = cats.data();
             RmmScratchPool mask_pool;
-            bool* d_mask = mask_pool.alloc<bool>((size_t)n_cells);
-            cudaMemset(d_mask, 1, (size_t)n_cells);
+            const bool* d_mask = alloc_or_mask(mask, n_cells, mask_pool);
             auto consume = [&](int s, const T* d_data, const IdxT* d_indices,
                                const IdxT* d_indptr, int seg0, int n_block_seg,
                                int block_nnz, cudaStream_t stream) {
@@ -251,8 +252,8 @@ void def_aggr_csr_host(nb::module_& m) {
         },
         "data"_a, "indices"_a, "indptr"_a, "cats"_a, nb::kw_only(),
         "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
-        "out_sqsum"_a = nb::none(), "n_cells"_a, "n_genes"_a,
-        "sub_batch_rows"_a = DEFAULT_SUB_BATCH,
+        "out_sqsum"_a = nb::none(), "mask"_a = nb::none(), "n_cells"_a,
+        "n_genes"_a, "sub_batch_rows"_a = DEFAULT_SUB_BATCH,
         nb::call_guard<nb::gil_scoped_release>());
 }
 
@@ -266,7 +267,8 @@ void def_aggr_csc_host(nb::module_& m) {
            host_array<const IdxT> indptr, gpu_array_c<const int, Device> cats,
            std::optional<gpu_array_c<double, Device>> out_sum,
            std::optional<gpu_array_c<double, Device>> out_count,
-           std::optional<gpu_array_c<double, Device>> out_sqsum, int n_cells,
+           std::optional<gpu_array_c<double, Device>> out_sqsum,
+           std::optional<gpu_array_c<const bool, Device>> mask, int n_cells,
            int n_genes, int sub_batch_cols) {
             double* ps = out_sum ? out_sum->data() : nullptr;
             double* pc = out_count ? out_count->data() : nullptr;
@@ -280,8 +282,7 @@ void def_aggr_csc_host(nb::module_& m) {
             const int* d_cats = cats.data();
             int sb = sub_batch_cols > 0 ? sub_batch_cols : DEFAULT_SUB_BATCH;
             RmmScratchPool wpool;
-            bool* d_mask = wpool.alloc<bool>((size_t)n_cells);
-            cudaMemset(d_mask, 1, (size_t)n_cells);
+            const bool* d_mask = alloc_or_mask(mask, n_cells, wpool);
             // Per-stream window output planes, scattered into the full output.
             double* w_sum[N_STREAMS] = {nullptr};
             double* w_count[N_STREAMS] = {nullptr};
@@ -326,14 +327,13 @@ void def_aggr_csc_host(nb::module_& m) {
         },
         "data"_a, "indices"_a, "indptr"_a, "cats"_a, nb::kw_only(),
         "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
-        "out_sqsum"_a = nb::none(), "n_cells"_a, "n_genes"_a,
-        "sub_batch_cols"_a = DEFAULT_SUB_BATCH,
+        "out_sqsum"_a = nb::none(), "mask"_a = nb::none(), "n_cells"_a,
+        "n_genes"_a, "sub_batch_cols"_a = DEFAULT_SUB_BATCH,
         nb::call_guard<nb::gil_scoped_release>());
 }
 
-// ---- aggregation: dense host ----
-// C-order: row-block stream (contiguous), dense_aggr_kernel_C, full output.
-// F-order: column-window stream (contiguous), dense_aggr_kernel_F, scatter.
+// ---- aggregation: dense host (C-order row-block, full out; F-order
+// column-window + scatter) ----
 template <typename T, typename Device, typename HostArray, bool FOrder>
 void def_aggr_dense_host(nb::module_& m) {
     m.def(
@@ -342,7 +342,7 @@ void def_aggr_dense_host(nb::module_& m) {
            std::optional<gpu_array_c<double, Device>> out_sum,
            std::optional<gpu_array_c<double, Device>> out_count,
            std::optional<gpu_array_c<double, Device>> out_sqsum,
-           int sub_batch) {
+           std::optional<gpu_array_c<const bool, Device>> mask, int sub_batch) {
             double* ps = out_sum ? out_sum->data() : nullptr;
             double* pc = out_count ? out_count->data() : nullptr;
             double* pq = out_sqsum ? out_sqsum->data() : nullptr;
@@ -365,8 +365,7 @@ void def_aggr_dense_host(nb::module_& m) {
             int n_streams = N_STREAMS;
 
             RmmScratchPool pool;
-            bool* d_mask = pool.alloc<bool>((size_t)n_cells);
-            cudaMemset(d_mask, 1, (size_t)n_cells);
+            const bool* d_mask = alloc_or_mask(mask, n_cells, pool);
             std::vector<T*> d_block(n_streams, nullptr);
             std::vector<double*> w_sum(n_streams, nullptr),
                 w_count(n_streams, nullptr), w_sqsum(n_streams, nullptr);
@@ -382,11 +381,8 @@ void def_aggr_dense_host(nb::module_& m) {
             }
             (void)budget;
             ScopedCudaStreams streams(n_streams, cudaStreamDefault);
-            HostRegisterGuard pin;
-            size_t total_bytes = (size_t)n_cells * n_genes * sizeof(T);
-            if (total_bytes <= DIRECT_PIN_LIMIT)
-                pin = HostRegisterGuard(const_cast<T*>(h_X), total_bytes, 0,
-                                        true);
+            // Pageable async copies (see stream_sparse_blocks) — no per-call
+            // pin.
             cudaDeviceSynchronize();
 
             int b = 0;
@@ -453,15 +449,13 @@ void def_aggr_dense_host(nb::module_& m) {
         },
         "X"_a, "cats"_a, nb::kw_only(), "out_sum"_a = nb::none(),
         "out_count"_a = nb::none(), "out_sqsum"_a = nb::none(),
-        "sub_batch"_a = DEFAULT_SUB_BATCH,
+        "mask"_a = nb::none(), "sub_batch"_a = DEFAULT_SUB_BATCH,
         nb::call_guard<nb::gil_scoped_release>());
 }
 
-// ---- histogram: CSR host (row-block stream, single pass over the full hist)
-// ---- csr_hist_kernel is per-cell-row and filters the gene window internally,
-// so one pass over row-blocks fills the whole (n_genes, n_groups, nbt)
-// histogram; only stored nonzeros are binned (bin 0 is filled by the Python
-// zero-bin pass).
+// ---- histogram: CSR host (row-block stream, single pass into the full hist)
+// ---- csr_hist_kernel filters the gene window per row; bin 0 is filled
+// Python-side.
 template <typename T, typename IdxT, typename Device>
 void def_hist_csr_host(nb::module_& m) {
     m.def(
@@ -483,9 +477,8 @@ void def_hist_csr_host(nb::module_& m) {
             const int* d_gcodes = gcodes.data();
             unsigned int* d_hist = hist.data();
             int window = col_stop - col_start;
-            // Fused means: accumulate group sums (+nnz) on the same window.
-            // Only valid for a single full-width pass (col range == whole
-            // matrix), so each stored value is added exactly once.
+            // Fused means: accumulate group sums (+nnz) on the same window
+            // (single full-width pass only, so each value is added once).
             double* d_gsum = group_sums ? group_sums->data() : nullptr;
             double* d_gnnz = group_nnz ? group_nnz->data() : nullptr;
             int aggr_mask = (d_gsum ? AGGR_SUM : 0) | (d_gnnz ? AGGR_COUNT : 0);
@@ -500,9 +493,7 @@ void def_hist_csr_host(nb::module_& m) {
                                int block_nnz, cudaStream_t stream) {
                 (void)s;
                 (void)block_nnz;
-                // gene_start=col_start, n_genes=window → row-block fills the
-                // chunk hist (n_genes=window wide); columns outside are
-                // skipped.
+                // gene_start=col_start, n_genes=window → fills the chunk hist.
                 csr_hist_kernel<T, IdxT>
                     <<<(unsigned)n_block_seg, HIST_BLOCK, 0, stream>>>(
                         d_data, d_indices, d_indptr, d_gcodes + seg0, d_hist,
@@ -534,9 +525,8 @@ void def_hist_csr_host(nb::module_& m) {
 }
 
 // ---- histogram: CSC host (column-window stream into the chunk hist) ----
-// The chunk hist is (col_stop-col_start, n_groups, nbt); each streamed column
-// sub-block writes at its leading-dim offset (gene_start=0 on the rebased
-// view).
+// Chunk hist (col_stop-col_start, n_groups, nbt); sub-blocks write at their
+// leading-dim offset (gene_start=0 on the rebased view).
 template <typename T, typename IdxT, typename Device>
 void def_hist_csc_host(nb::module_& m) {
     m.def(
@@ -556,8 +546,8 @@ void def_hist_csc_host(nb::module_& m) {
             const int* d_gcodes = gcodes.data();
             unsigned int* d_hist = hist.data();
             int window = col_stop - col_start;
-            // Fused means: accumulate straight into group_sums[:, col] using
-            // the full n_genes stride and the window's global column offset.
+            // Fused means: accumulate into group_sums[:, col] via full n_genes
+            // stride + the window's global column offset.
             double* d_gsum = group_sums ? group_sums->data() : nullptr;
             double* d_gnnz = group_nnz ? group_nnz->data() : nullptr;
             int aggr_mask = (d_gsum ? AGGR_SUM : 0) | (d_gnnz ? AGGR_COUNT : 0);
@@ -605,9 +595,9 @@ void def_hist_csc_host(nb::module_& m) {
         nb::call_guard<nb::gil_scoped_release>());
 }
 
-// ---- histogram: dense host (column-window stream; dense_hist needs whole
-// columns). F-order: contiguous window. C-order: strided 2D H2D into a C block,
-// then transposed to F. ----
+// ---- histogram: dense host (column-window; dense_hist needs whole columns.
+// F-order: contiguous. C-order: strided 2D H2D to a C block, transposed to F)
+// ----
 template <typename T, typename Device, typename HostArray, bool FOrder>
 void def_hist_dense_host(nb::module_& m) {
     m.def(
@@ -647,8 +637,8 @@ void def_hist_dense_host(nb::module_& m) {
             if (mem_cols >= 1 && (size_t)sb > mem_cols) sb = (int)mem_cols;
             if (sb < 1) sb = 1;
 
-            // dense_aggr_kernel_F ties data layout to n_genes, so the fused
-            // sum uses a per-window buffer scattered into group_sums[:, c].
+            // dense_aggr_kernel_F ties data layout to n_genes → fused sum uses
+            // a per-window buffer scattered into group_sums[:, c].
             int n_sum_rows = d_gsum ? (int)group_sums->shape(0)
                                     : (d_gnnz ? (int)group_nnz->shape(0) : 0);
             RmmScratchPool pool;
@@ -665,11 +655,8 @@ void def_hist_dense_host(nb::module_& m) {
                     w_gnnz[s] = pool.alloc<double>((size_t)n_sum_rows * sb);
             }
             ScopedCudaStreams streams(N_STREAMS, cudaStreamDefault);
-            HostRegisterGuard pin;
-            size_t total_bytes = (size_t)n_cells * n_genes_full * sizeof(T);
-            if (total_bytes <= DIRECT_PIN_LIMIT)
-                pin = HostRegisterGuard(const_cast<T*>(h_X), total_bytes, 0,
-                                        true);
+            // Pageable async copies (see stream_sparse_blocks) — no per-call
+            // pin.
             cudaDeviceSynchronize();
 
             int b = 0;

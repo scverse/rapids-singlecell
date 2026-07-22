@@ -163,12 +163,14 @@ def rank_genes_groups(
         `'wilcoxon_binned'` the default is sized dynamically based on
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
     multi_gpu
-        GPU selection for exact `'wilcoxon'`. ``None`` uses all visible GPUs
-        for host input and device OVO, while device OVR stays on its input-owning
-        GPU. ``False`` uses one GPU, ``True`` uses all visible GPUs, and a list
-        or comma-separated string selects device IDs. Multi-GPU supports
-        host/device dense, CSR, and CSC input. Device input must fit on its
-        owning GPU; forced multi-GPU may be slower due to transfers.
+        GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
+        and `'wilcoxon_binned'`. ``None``/``False`` use one GPU, ``True`` uses
+        all visible GPUs, and a list or comma-separated string selects device
+        IDs. For the streaming t-test/binned paths, in-memory host input is
+        sharded across the selected GPUs (CSR/dense by cell rows, CSC by gene
+        columns) and gathered on the first device. On small inputs the sharding
+        overhead can make multi-GPU slower than a single GPU; it pays off for
+        large host matrices where the host->device transfer dominates.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000
@@ -246,8 +248,16 @@ def rank_genes_groups(
         msg = "return_u_values is only supported for method='wilcoxon'."
         raise ValueError(msg)
 
-    if multi_gpu is not None and multi_gpu is not False and method != "wilcoxon":
-        msg = "multi_gpu is only supported for method='wilcoxon'."
+    if (
+        multi_gpu is not None
+        and multi_gpu is not False
+        and method
+        not in {"wilcoxon", "t-test", "t-test_overestim_var", "wilcoxon_binned"}
+    ):
+        msg = (
+            "multi_gpu is only supported for method in {'wilcoxon', 't-test', "
+            "'t-test_overestim_var', 'wilcoxon_binned'}."
+        )
         raise ValueError(msg)
 
     if chunk_size is not None and chunk_size <= 0:

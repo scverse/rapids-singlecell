@@ -124,16 +124,16 @@ class _RankGenes:
         self.stats_arrays: dict[str, object] | None = None
         self._sparse_negative_fallback = False
         self._score_dtype = np.dtype(np.float32)
+        self._multi_gpu: bool | list[int] | str | None = None
 
     def _accumulate_planes(
         self,
     ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
         """Sum / sq_sum / (count_nonzero) over ALL categories → (n_cats, n_genes).
 
-        In-memory host input (numpy / scipy sparse) streams row/column blocks to
-        the GPU without ever materializing the full matrix (mirroring the
-        Wilcoxon host path); device / Dask input uses the device ``Aggregate``.
-        ``count_nonzero`` is only accumulated when ``comp_pts`` is requested.
+        Host input (numpy / scipy) streams blocks to the GPU (no full copy);
+        device / Dask uses the device ``Aggregate``. ``count_nonzero`` only when
+        ``comp_pts``.
         """
         X = self.X
         if isinstance(X, np.ndarray) or sp.issparse(X):
@@ -151,38 +151,18 @@ class _RankGenes:
 
     def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
         """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
-        from rapids_singlecell._cuda import _rank_stream_cuda as _rss
-
-        X = self.X
-        n_cells, n_genes = X.shape
-        n_cats = len(self.labels.cat.categories)
-        cats = cp.asarray(self.labels.cat.codes.to_numpy(), dtype=cp.int32)
-        out_sum = cp.zeros((n_cats, n_genes), dtype=cp.float64)
-        out_sqsum = cp.zeros((n_cats, n_genes), dtype=cp.float64)
-        out_count = (
-            cp.zeros((n_cats, n_genes), dtype=cp.float64) if self.comp_pts else None
+        from ._stream_multi_gpu import (
+            aggr_host_planes,
+            resolve_stream_devices,
+            stream_planes_multi,
         )
-        kw = {"out_sum": out_sum, "out_sqsum": out_sqsum}
-        if out_count is not None:
-            kw["out_count"] = out_count
 
-        if sp.issparse(X):
-            if X.format not in {"csr", "csc"}:
-                X = X.tocsr()
-            data = X.data
-            if data.dtype not in (np.float32, np.float64):
-                data = data.astype(np.float32)
-            launch = _rss.aggr_csr_host if X.format == "csr" else _rss.aggr_csc_host
-            launch(
-                data, X.indices, X.indptr, cats, n_cells=n_cells, n_genes=n_genes, **kw
-            )
-        else:
-            if X.dtype not in (np.float32, np.float64):
-                X = X.astype(np.float32)
-            if not (X.flags.c_contiguous or X.flags.f_contiguous):
-                X = np.ascontiguousarray(X)
-            _rss.aggr_dense_host(X, cats, **kw)
-        return out_sum, out_sqsum, out_count
+        device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
+        n_cats = len(self.labels.cat.categories)
+        if len(device_ids) > 1:
+            return stream_planes_multi(self, device_ids)
+        cats = cp.asarray(self.labels.cat.codes.to_numpy(), dtype=cp.int32)
+        return aggr_host_planes(self.X, cats, n_cats, comp_pts=self.comp_pts)
 
     def _basic_stats(self) -> None:
         """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
@@ -286,6 +266,8 @@ class _RankGenes:
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
+        # Devices for the host-streaming t-test / binned shards.
+        self._multi_gpu = multi_gpu
         # Exact OVR inserts implicit zeros between negative and positive stored
         # values analytically. Binned and host OVO sparse paths still need the
         # sign check; device OVO does not use its result.
@@ -300,8 +282,7 @@ class _RankGenes:
             if needs_signed_fallback:
                 self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
-            # In-memory host input streams (basic stats + binned histogram) with
-            # no full-matrix copy; device / Dask still move to the GPU.
+            # Host input streams (no full copy); device / Dask move to the GPU.
             if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
                 self.X = X_to_GPU(self.X)
 

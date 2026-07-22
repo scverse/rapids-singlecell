@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import cupy as cp
 import numpy as np
 import pytest
 import scanpy as sc
 
 import rapids_singlecell as rsc
 from testing.rapids_singlecell._helper import ARRAY_TYPES_MEM
+
+MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
 
 @pytest.fixture
@@ -675,3 +678,29 @@ def test_binned_log1p_invalid_for_negative_sparse_coerces_to_auto(adata_blobs):
             rtol=1e-13,
             atol=1e-13,
         )
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
+@pytest.mark.parametrize("reference", ["rest", "1"])
+def test_binned_host_multi_gpu_matches_single(adata_blobs, array_type, reference):
+    """Sharded multi-GPU host wilcoxon_binned matches the single-GPU result."""
+    base = adata_blobs.copy()
+    base.X = array_type(base.X)
+    single = base.copy()
+    multi = base.copy()
+    kwargs = {"method": "wilcoxon_binned", "use_raw": False, "reference": reference}
+    rsc.tl.rank_genes_groups(single, "blobs", multi_gpu=False, **kwargs)
+    rsc.tl.rank_genes_groups(multi, "blobs", multi_gpu=[0, 1], **kwargs)
+
+    rs, rm = single.uns["rank_genes_groups"], multi.uns["rank_genes_groups"]
+    assert set(rs["names"].dtype.names) == set(rm["names"].dtype.names)
+    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+        for group in rs[field].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(rm[field][group], dtype=float),
+                np.asarray(rs[field][group], dtype=float),
+                rtol=1e-5,
+                atol=1e-7,
+                equal_nan=True,
+            )

@@ -219,19 +219,17 @@ def wilcoxon_binned(
     if chunk_size is not None:
         chunk_width = chunk_size
     elif sp.issparse(X) and X.format == "csr" and not rg._sparse_negative_fallback:
-        # Host CSR streams row-blocks in a single pass; one gene chunk avoids
-        # re-scanning the matrix per chunk (the histogram is the only large buffer).
+        # Host CSR: single row-block pass, one gene chunk (no per-chunk re-scan).
         chunk_width = n_genes
     else:
         # Scale chunk inversely with n_groups * n_bins to keep histogram memory stable.
         # Budget = 500 genes * 60 groups * 1000 bins = 30M.
         chunk_width = _CHUNK_BUDGET // max(n_groups * n_bins, 1)
 
-    # Fuse exact-mean accumulation into the histogram pass for in-memory host
-    # input (one host->device transfer instead of the separate _basic_stats
-    # pass). Requires each value be streamed once: CSC/dense chunks are disjoint
-    # columns; CSR needs a single full-width pass. The negative-sparse densify
-    # path (force_dense) does not accumulate group sums, so it can't fuse.
+    # Fuse exact-mean accumulation into the histogram pass for host input (one
+    # transfer, not a separate _basic_stats pass). Needs each value streamed
+    # once: CSC/dense chunks are disjoint columns; CSR needs a single full pass;
+    # the force_dense densify path can't accumulate sums.
     is_host = isinstance(X, np.ndarray) or sp.issparse(X)
     csr_single_pass = sp.issparse(X) and X.format == "csr" and chunk_width >= n_genes
     fuse_means = (
@@ -243,6 +241,46 @@ def wilcoxon_binned(
             or csr_single_pass
         )
     )
+    n_hist_groups = n_cells_per_group_hist.shape[0]
+    from ._stream_multi_gpu import resolve_stream_devices
+
+    device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [0]
+    if fuse_means and len(device_ids) > 1:
+        # Multi-GPU: shard the hist + group-sum build, then finish on the gather.
+        from ._stream_multi_gpu import run_binned_hist_multi
+
+        hist, group_sums_ext, group_nnz_ext = run_binned_hist_multi(
+            X,
+            group_codes_np,
+            device_ids,
+            n_groups=n_groups,
+            n_hist_groups=n_hist_groups,
+            n_bins=n_bins,
+            bin_low=bin_low,
+            inv_bin_width=inv_bin_width,
+            comp_pts=rg.comp_pts,
+        )
+        z, p = _finish_binned_stats(
+            hist,
+            is_sparse=sp.issparse(X),
+            n_groups=n_groups,
+            n_cells_per_group=n_cells_per_group,
+            n_cells_total=n_cells,
+            n_cells_per_group_hist=n_cells_per_group_hist_gpu,
+            total_counts_from_all=has_unselected,
+            ireference=ireference,
+            tie_correct=tie_correct,
+            use_continuity=use_continuity,
+        )
+        all_z = cp.asnumpy(z)
+        all_p = cp.asnumpy(p)
+        _fill_binned_means(rg, group_sums_ext, group_nnz_ext, n_cells)
+        return [
+            (group_index, all_z[group_index], all_p[group_index])
+            for group_index in range(n_groups)
+            if group_index != ireference
+        ]
+
     if fuse_means:
         group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
         group_nnz_ext = (
@@ -295,9 +333,8 @@ def process_gene_batch(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Process one gene batch, dispatching on Dask vs in-memory.
 
-    When ``group_sums`` (shape ``(n_groups+1, n_genes)``) is provided the host
-    branches also accumulate exact group sums (and ``group_nnz``) on the same
-    streamed window, so binned needs no separate ``_basic_stats`` pass.
+    When ``group_sums`` is given, host branches also accumulate exact group sums
+    (+ ``group_nnz``) on the streamed window (fused means, no ``_basic_stats``).
     """
     n_hist_groups = n_cells_per_group_hist.shape[0]
     n_genes_batch = stop - start
@@ -404,6 +441,35 @@ def process_gene_batch(
             inv_bin_width=inv_bin_width,
         )
 
+    return _finish_binned_stats(
+        hist,
+        is_sparse=is_sparse,
+        n_groups=n_groups,
+        n_cells_per_group=n_cells_per_group,
+        n_cells_total=n_cells_total,
+        n_cells_per_group_hist=n_cells_per_group_hist,
+        total_counts_from_all=total_counts_from_all,
+        ireference=ireference,
+        tie_correct=tie_correct,
+        use_continuity=use_continuity,
+    )
+
+
+def _finish_binned_stats(
+    hist: cp.ndarray,
+    *,
+    is_sparse: bool,
+    n_groups: int,
+    n_cells_per_group: cp.ndarray,
+    n_cells_total: int,
+    n_cells_per_group_hist: cp.ndarray,
+    total_counts_from_all: bool,
+    ireference: int | None,
+    tie_correct: bool,
+    use_continuity: bool,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Zero-bin fill + z-scores/p-values from a full (n_genes, n_hist_groups, nbt)
+    histogram (single-GPU chunk or the gathered multi-GPU histogram)."""
     # Sparse kernels only fill bins 1..n_bins; compute bin 0 (zeros) here.
     if is_sparse:
         _fill_sparse_zero_bin(hist, n_cells_per_group_hist)
@@ -631,11 +697,8 @@ def _fill_binned_means(
     group_nnz_ext: cp.ndarray | None,
     n_cells: int,
 ) -> None:
-    """Fill exact means/pts on ``rg`` from fused ``(n_groups+1, n_genes)`` sums.
-
-    Row ``n_groups`` holds unselected-cell sums, so the total over all cells is
-    the sum across rows; this reproduces ``_basic_stats`` without a second pass.
-    """
+    """Fill exact means/pts from fused ``(n_groups+1, n_genes)`` sums (row
+    ``n_groups`` = unselected cells, so total = sum across rows)."""
     n_groups = len(rg.groups_order)
     group_sums = group_sums_ext[:n_groups]
     sizes = cp.asarray(rg.group_sizes, dtype=cp.float64)[:, None]
