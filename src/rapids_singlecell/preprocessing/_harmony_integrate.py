@@ -117,6 +117,7 @@ def harmony_integrate(
         Ridge regression regularization for the correction step.
         Larger values produce more conservative (smaller) corrections,
         preventing over-fitting.
+        Must be finite and greater than zero.
         Only used with ``flavor="harmony1"``.
     alpha
         Scaling factor for the dynamic per-cluster-per-batch ridge regularization.

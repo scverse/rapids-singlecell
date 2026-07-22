@@ -158,8 +158,9 @@ def test_harmony_multikey_singular_gram_uses_least_squares(dtype):
     cp.testing.assert_allclose(result, expected, atol=atol, rtol=atol)
 
 
-@pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony1_multikey_zero_ridge_is_finite():
+@pytest.mark.parametrize("ridge_lambda", [0.0, -0.1, float("inf"), float("nan")])
+@pytest.mark.parametrize("multikey", [False, True])
+def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
     rng = np.random.default_rng(734)
     batch = np.resize(["a", "b", "c"], 60)
     adata = ad.AnnData(
@@ -170,21 +171,21 @@ def test_harmony1_multikey_zero_ridge_is_finite():
         ),
         obsm={"X_pca": rng.normal(size=(60, 6)).astype(np.float32)},
     )
+    key = ["batch", "duplicate_batch"] if multikey else "batch"
 
-    rsc.pp.harmony_integrate(
-        adata,
-        ["batch", "duplicate_batch"],
-        flavor="harmony1",
-        ridge_lambda=0.0,
-        n_clusters=3,
-        max_iter_harmony=1,
-        max_iter_clustering=2,
-        block_proportion=1.0,
-        random_state=734,
-        dtype=cp.float32,
-    )
-
-    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
+    with pytest.raises(ValueError, match="ridge_lambda must be a finite positive"):
+        rsc.pp.harmony_integrate(
+            adata,
+            key,
+            flavor="harmony1",
+            ridge_lambda=ridge_lambda,
+            n_clusters=3,
+            max_iter_harmony=1,
+            max_iter_clustering=2,
+            block_proportion=1.0,
+            random_state=734,
+            dtype=cp.float32,
+        )
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
@@ -610,29 +611,6 @@ def test_compute_lambda_kb_dynamic_false(dtype):
         dynamic_lambda=False,
     )
     cp.testing.assert_array_equal(result, cp.full_like(E, 1.0))
-
-
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_compute_lambda_kb_fixed_ridge_zero(dtype):
-    """dynamic_lambda=False with ridge_lambda=0 still guards zero-denominator."""
-    sentinel = dtype(_SUPPRESS_PENALTY)
-    E = cp.array([[5.0, 0.0]], dtype=dtype)
-    O = cp.array([[10.0, 0.0]], dtype=dtype)
-    N_b = cp.array([100.0], dtype=dtype)
-
-    result = _compute_lambda_kb(
-        E,
-        O=O,
-        N_b=N_b,
-        alpha=0.2,
-        threshold=None,
-        ridge_lambda=0.0,
-        dynamic_lambda=False,
-    )
-    # (0,0): O=10 + lambda=0 = 10 → no guard, stays 0.0
-    assert result[0, 0] == dtype(0.0)
-    # (0,1): O=0 + lambda=0 = 0 → sentinel
-    assert result[0, 1] == sentinel
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])

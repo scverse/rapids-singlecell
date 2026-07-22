@@ -93,6 +93,7 @@ def harmonize(
 
     ridge_lambda
         Hyperparameter of ridge regression on the correction step.
+        Must be finite and greater than zero when ``dynamic_lambda=False``.
 
     sigma
         Weight of the entropy term in objective function.
@@ -224,6 +225,11 @@ def harmonize(
             raise ValueError(
                 f"batch_prune_threshold must be in [0, 1] or None, got {batch_prune_threshold}."
             )
+    elif not np.isfinite(ridge_lambda) or ridge_lambda <= 0:
+        raise ValueError(
+            "ridge_lambda must be a finite positive number when "
+            f"dynamic_lambda=False, got {ridge_lambda}."
+        )
     if correction_method is not None and correction_method not in {
         "fast",
         "original",
