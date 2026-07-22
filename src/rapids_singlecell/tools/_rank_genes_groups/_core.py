@@ -125,26 +125,73 @@ class _RankGenes:
         self._sparse_negative_fallback = False
         self._score_dtype = np.dtype(np.float32)
 
-    def _basic_stats(self) -> None:
-        """Compute means, vars, and pts for device-resident input."""
-        agg = Aggregate(groupby=self.labels.cat, data=self.X)
-        # Only sum and sq_sum are needed (means/vars are derived locally below);
-        # count_nonzero is only needed when comp_pts is requested.
+    def _accumulate_planes(
+        self,
+    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+        """Sum / sq_sum / (count_nonzero) over ALL categories → (n_cats, n_genes).
+
+        In-memory host input (numpy / scipy sparse) streams row/column blocks to
+        the GPU without ever materializing the full matrix (mirroring the
+        Wilcoxon host path); device / Dask input uses the device ``Aggregate``.
+        ``count_nonzero`` is only accumulated when ``comp_pts`` is requested.
+        """
+        X = self.X
+        if isinstance(X, np.ndarray) or sp.issparse(X):
+            return self._stream_planes()
+        agg = Aggregate(groupby=self.labels.cat, data=X)
         funcs = {"sum", "sq_sum"}
         if self.comp_pts:
             funcs.add("count_nonzero")
         result = agg.count_mean_var(funcs, dof=1)
+        return (
+            result["sum"],
+            result["sq_sum"],
+            result["count_nonzero"] if self.comp_pts else None,
+        )
 
-        # Map Aggregate category order → selected groups order
+    def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+        """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
+        from rapids_singlecell._cuda import _rank_stream_cuda as _rss
+
+        X = self.X
+        n_cells, n_genes = X.shape
+        n_cats = len(self.labels.cat.categories)
+        cats = cp.asarray(self.labels.cat.codes.to_numpy(), dtype=cp.int32)
+        out_sum = cp.zeros((n_cats, n_genes), dtype=cp.float64)
+        out_sqsum = cp.zeros((n_cats, n_genes), dtype=cp.float64)
+        out_count = (
+            cp.zeros((n_cats, n_genes), dtype=cp.float64) if self.comp_pts else None
+        )
+        kw = {"out_sum": out_sum, "out_sqsum": out_sqsum}
+        if out_count is not None:
+            kw["out_count"] = out_count
+
+        if sp.issparse(X):
+            if X.format not in {"csr", "csc"}:
+                X = X.tocsr()
+            data = X.data
+            if data.dtype not in (np.float32, np.float64):
+                data = data.astype(np.float32)
+            launch = _rss.aggr_csr_host if X.format == "csr" else _rss.aggr_csc_host
+            launch(
+                data, X.indices, X.indptr, cats, n_cells=n_cells, n_genes=n_genes, **kw
+            )
+        else:
+            if X.dtype not in (np.float32, np.float64):
+                X = X.astype(np.float32)
+            if not (X.flags.c_contiguous or X.flags.f_contiguous):
+                X = np.ascontiguousarray(X)
+            _rss.aggr_dense_host(X, cats, **kw)
+        return out_sum, out_sqsum, out_count
+
+    def _basic_stats(self) -> None:
+        """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
+        sums_all, sq_sums_all, nnz_all = self._accumulate_planes()
+
+        # Map category order → selected groups order.
         cat_names = list(self.labels.cat.categories)
         cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
         order = [cat_to_idx[str(name)] for name in self.groups_order]
-
-        # Aggregate returns all categories; slice selected groups for outputs.
-        # Keep all-category totals so ``groups`` subsets get correct rest stats.
-        sums_all = result["sum"]
-        sq_sums_all = result["sq_sum"]
-        nnz_all = result["count_nonzero"] if self.comp_pts else None
 
         n = cp.asarray(self.group_sizes, dtype=cp.float64)[:, None]
         sums = sums_all[order]
@@ -162,7 +209,7 @@ class _RankGenes:
         # For reference='rest', rest includes every category not in this group.
         # That includes categories omitted by a strict ``groups=`` selection.
         if self.ireference is None:
-            n_total = agg.n_cells.sum()
+            n_total = cp.float64(self.X.shape[0])
             n_rest = n_total - n
             means_rest = (sums_all.sum(axis=0) - sums) / n_rest
             rest_ss = (sq_sums_all.sum(axis=0) - sq_sums) - n_rest * means_rest**2
@@ -252,12 +299,11 @@ class _RankGenes:
             )
             if needs_signed_fallback:
                 self._sparse_negative_fallback = _sparse_has_negative(self.X)
-        if method in {
-            "t-test",
-            "t-test_overestim_var",
-            "wilcoxon_binned",
-        }:
-            self.X = X_to_GPU(self.X)
+        if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
+            # In-memory host input streams (basic stats + binned histogram) with
+            # no full-matrix copy; device / Dask still move to the GPU.
+            if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
+                self.X = X_to_GPU(self.X)
 
         n_genes = self.X.shape[1]
         if n_genes_user is None:

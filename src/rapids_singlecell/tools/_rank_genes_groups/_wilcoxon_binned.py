@@ -7,8 +7,10 @@ import cupy as cp
 import cupyx.scipy.sparse as cpsp
 import cupyx.scipy.special as cupyx_special
 import numpy as np
+import scipy.sparse as sp
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._cuda import _rank_stream_cuda as _rss
 from rapids_singlecell._cuda import _wilcoxon_binned_cuda as _wb
 
 from ._utils import MIN_GROUP_SIZE_WARNING, _get_column_block
@@ -52,7 +54,7 @@ def _data_range(X) -> tuple[float, float]:
 
         lo, hi = dask.compute(X.min(), X.max())
         return float(lo), float(hi)
-    if cpsp.issparse(X):
+    if cpsp.issparse(X) or sp.issparse(X):
         if X.nnz == 0:
             return 0.0, 0.0
         d = X.data
@@ -78,7 +80,6 @@ def wilcoxon_binned(
             stacklevel=4,
         )
 
-    rg._basic_stats()
     X = rg.X
     ireference = rg.ireference
 
@@ -217,10 +218,41 @@ def wilcoxon_binned(
 
     if chunk_size is not None:
         chunk_width = chunk_size
+    elif sp.issparse(X) and X.format == "csr" and not rg._sparse_negative_fallback:
+        # Host CSR streams row-blocks in a single pass; one gene chunk avoids
+        # re-scanning the matrix per chunk (the histogram is the only large buffer).
+        chunk_width = n_genes
     else:
         # Scale chunk inversely with n_groups * n_bins to keep histogram memory stable.
         # Budget = 500 genes * 60 groups * 1000 bins = 30M.
         chunk_width = _CHUNK_BUDGET // max(n_groups * n_bins, 1)
+
+    # Fuse exact-mean accumulation into the histogram pass for in-memory host
+    # input (one host->device transfer instead of the separate _basic_stats
+    # pass). Requires each value be streamed once: CSC/dense chunks are disjoint
+    # columns; CSR needs a single full-width pass. The negative-sparse densify
+    # path (force_dense) does not accumulate group sums, so it can't fuse.
+    is_host = isinstance(X, np.ndarray) or sp.issparse(X)
+    csr_single_pass = sp.issparse(X) and X.format == "csr" and chunk_width >= n_genes
+    fuse_means = (
+        is_host
+        and not rg._sparse_negative_fallback
+        and (
+            isinstance(X, np.ndarray)
+            or (sp.issparse(X) and X.format == "csc")
+            or csr_single_pass
+        )
+    )
+    if fuse_means:
+        group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
+        group_nnz_ext = (
+            cp.zeros((n_groups + 1, n_genes), dtype=cp.float64) if rg.comp_pts else None
+        )
+        batch_kwargs["group_sums"] = group_sums_ext
+        batch_kwargs["group_nnz"] = group_nnz_ext
+    else:
+        rg._basic_stats()
+
     for start in range(0, n_genes, chunk_width):
         stop = min(start + chunk_width, n_genes)
 
@@ -229,7 +261,9 @@ def wilcoxon_binned(
         all_z[:, start:stop] = cp.asnumpy(z_b)
         all_p[:, start:stop] = cp.asnumpy(p_b)
 
-    # LFC computed from exact means in _basic_stats() via compute_statistics
+    if fuse_means:
+        _fill_binned_means(rg, group_sums_ext, group_nnz_ext, n_cells)
+
     return [
         (group_index, all_z[group_index], all_p[group_index])
         for group_index in range(n_groups)
@@ -256,13 +290,20 @@ def process_gene_batch(
     use_continuity: bool = False,
     ireference: int | None = None,
     force_dense: bool = False,
+    group_sums: cp.ndarray | None = None,
+    group_nnz: cp.ndarray | None = None,
 ) -> tuple[cp.ndarray, cp.ndarray]:
-    """Process one gene batch, dispatching on Dask vs in-memory."""
+    """Process one gene batch, dispatching on Dask vs in-memory.
+
+    When ``group_sums`` (shape ``(n_groups+1, n_genes)``) is provided the host
+    branches also accumulate exact group sums (and ``group_nnz``) on the same
+    streamed window, so binned needs no separate ``_basic_stats`` pass.
+    """
     n_hist_groups = n_cells_per_group_hist.shape[0]
     n_genes_batch = stop - start
 
     is_sparse = False
-    if force_dense and cpsp.issparse(X):
+    if force_dense and (cpsp.issparse(X) or sp.issparse(X)):
         # Negative sparse fallback: bin 0 is only correct for nonnegative data.
         # Densify the column window so dense bins span the full [min, max].
         hist = _launch_dense(
@@ -273,6 +314,48 @@ def process_gene_batch(
             bin_low=bin_low,
             inv_bin_width=inv_bin_width,
         )
+    elif isinstance(X, np.ndarray):
+        # In-memory host dense: stream column windows (no full-matrix copy).
+        hist = _launch_dense_host(
+            X,
+            group_codes,
+            n_hist_groups,
+            start=start,
+            stop=stop,
+            n_bins=n_bins,
+            bin_low=bin_low,
+            inv_bin_width=inv_bin_width,
+            group_sums=group_sums,
+            group_nnz=group_nnz,
+        )
+    elif sp.issparse(X) and X.format == "csc":
+        hist = _launch_csc_host(
+            X,
+            group_codes,
+            n_hist_groups,
+            start=start,
+            stop=stop,
+            n_bins=n_bins,
+            bin_low=bin_low,
+            inv_bin_width=inv_bin_width,
+            group_sums=group_sums,
+            group_nnz=group_nnz,
+        )
+        is_sparse = True
+    elif sp.issparse(X) and X.format == "csr":
+        hist = _launch_csr_host(
+            X,
+            group_codes,
+            n_hist_groups,
+            start=start,
+            stop=stop,
+            n_bins=n_bins,
+            bin_low=bin_low,
+            inv_bin_width=inv_bin_width,
+            group_sums=group_sums,
+            group_nnz=group_nnz,
+        )
+        is_sparse = True
     elif isinstance(X, DaskArray):
         hist = _process_dask(
             X,
@@ -531,6 +614,156 @@ def _launch_csr(
         inv_bin_width=float(inv_bin_width),
         gene_start=start,
         stream=cp.cuda.get_current_stream().ptr,
+    )
+    return hist
+
+
+def _host_hist_data(data):
+    """Cast host sparse values to a kernel dtype (float32/float64) as needed."""
+    if data.dtype in (np.float32, np.float64):
+        return data
+    return data.astype(np.float32)
+
+
+def _fill_binned_means(
+    rg: _RankGenes,
+    group_sums_ext: cp.ndarray,
+    group_nnz_ext: cp.ndarray | None,
+    n_cells: int,
+) -> None:
+    """Fill exact means/pts on ``rg`` from fused ``(n_groups+1, n_genes)`` sums.
+
+    Row ``n_groups`` holds unselected-cell sums, so the total over all cells is
+    the sum across rows; this reproduces ``_basic_stats`` without a second pass.
+    """
+    n_groups = len(rg.groups_order)
+    group_sums = group_sums_ext[:n_groups]
+    sizes = cp.asarray(rg.group_sizes, dtype=cp.float64)[:, None]
+    rg.means = cp.asnumpy(group_sums / sizes)
+    rg.vars = None
+    rg.pts = (
+        cp.asnumpy(group_nnz_ext[:n_groups] / sizes)
+        if group_nnz_ext is not None
+        else None
+    )
+    if rg.ireference is None:
+        n_rest = cp.float64(n_cells) - sizes
+        total_sums = group_sums_ext.sum(axis=0, keepdims=True)
+        rg.means_rest = cp.asnumpy((total_sums - group_sums) / n_rest)
+        rg.vars_rest = None
+        if group_nnz_ext is not None:
+            total_nnz = group_nnz_ext.sum(axis=0, keepdims=True)
+            rg.pts_rest = cp.asnumpy((total_nnz - group_nnz_ext[:n_groups]) / n_rest)
+        else:
+            rg.pts_rest = None
+    else:
+        rg.means_rest = None
+        rg.vars_rest = None
+        rg.pts_rest = None
+
+
+def _launch_csr_host(
+    X,
+    group_codes: cp.ndarray,
+    n_groups: int,
+    *,
+    start: int,
+    stop: int,
+    n_bins: int,
+    bin_low: float,
+    inv_bin_width: float,
+    group_sums: cp.ndarray | None = None,
+    group_nnz: cp.ndarray | None = None,
+) -> cp.ndarray:
+    """Host CSR histogram: stream row-blocks, filling the [start, stop) window."""
+    n_cells, n_genes = X.shape
+    hist = cp.zeros((stop - start, n_groups, n_bins + 1), dtype=cp.uint32)
+    _rss.hist_csr_host(
+        _host_hist_data(X.data),
+        X.indices,
+        X.indptr,
+        group_codes,
+        hist,
+        group_sums=group_sums,
+        group_nnz=group_nnz,
+        n_cells=n_cells,
+        n_genes=n_genes,
+        n_groups=n_groups,
+        n_bins=n_bins,
+        bin_low=float(bin_low),
+        inv_bin_width=float(inv_bin_width),
+        col_start=start,
+        col_stop=stop,
+    )
+    return hist
+
+
+def _launch_csc_host(
+    X,
+    group_codes: cp.ndarray,
+    n_groups: int,
+    *,
+    start: int,
+    stop: int,
+    n_bins: int,
+    bin_low: float,
+    inv_bin_width: float,
+    group_sums: cp.ndarray | None = None,
+    group_nnz: cp.ndarray | None = None,
+) -> cp.ndarray:
+    """Host CSC histogram: stream the [start, stop) column window."""
+    n_cells, n_genes = X.shape
+    hist = cp.zeros((stop - start, n_groups, n_bins + 1), dtype=cp.uint32)
+    _rss.hist_csc_host(
+        _host_hist_data(X.data),
+        X.indices,
+        X.indptr,
+        group_codes,
+        hist,
+        group_sums=group_sums,
+        group_nnz=group_nnz,
+        n_cells=n_cells,
+        n_genes=n_genes,
+        n_groups=n_groups,
+        n_bins=n_bins,
+        bin_low=float(bin_low),
+        inv_bin_width=float(inv_bin_width),
+        col_start=start,
+        col_stop=stop,
+    )
+    return hist
+
+
+def _launch_dense_host(
+    X: np.ndarray,
+    group_codes: cp.ndarray,
+    n_groups: int,
+    *,
+    start: int,
+    stop: int,
+    n_bins: int,
+    bin_low: float,
+    inv_bin_width: float,
+    group_sums: cp.ndarray | None = None,
+    group_nnz: cp.ndarray | None = None,
+) -> cp.ndarray:
+    """Host dense histogram: stream the [start, stop) column window."""
+    hist = cp.zeros((stop - start, n_groups, n_bins + 1), dtype=cp.uint32)
+    Xh = X if X.dtype in (np.float32, np.float64) else X.astype(np.float32)
+    if not (Xh.flags.c_contiguous or Xh.flags.f_contiguous):
+        Xh = np.ascontiguousarray(Xh)
+    _rss.hist_dense_host(
+        Xh,
+        group_codes,
+        hist,
+        group_sums=group_sums,
+        group_nnz=group_nnz,
+        n_groups=n_groups,
+        n_bins=n_bins,
+        bin_low=float(bin_low),
+        inv_bin_width=float(inv_bin_width),
+        col_start=start,
+        col_stop=stop,
     )
     return hist
 
