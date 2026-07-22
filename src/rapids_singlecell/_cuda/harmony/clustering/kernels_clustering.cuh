@@ -23,6 +23,7 @@ __global__ void entropy_kernel(const T* __restrict__ R, T sigma, int n_cells,
         row_sum += __shfl_down_sync(0xffffffff, row_sum, offset);
 
     __shared__ T shared[32];
+    __shared__ T shared_inv_rsum;
     int warp_id = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int num_warps = (blockDim.x + 31) >> 5;
@@ -34,10 +35,10 @@ __global__ void entropy_kernel(const T* __restrict__ R, T sigma, int n_cells,
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             val += __shfl_down_sync(0xffffffff, val, offset);
-        if (threadIdx.x == 0) shared[0] = val;
+        if (threadIdx.x == 0) shared_inv_rsum = T(1) / val;
     }
     __syncthreads();
-    T inv_rsum = T(1) / shared[0];
+    T inv_rsum = shared_inv_rsum;
 
     // Phase 2: entropy = sum(x_norm * log(x_norm + eps))
     T entropy = T(0);
