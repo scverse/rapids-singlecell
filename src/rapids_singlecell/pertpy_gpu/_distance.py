@@ -440,12 +440,13 @@ class Distance:
         split_by: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
         """
-        Build a contrasts DataFrame for use with :meth:`contrast_distances`.
+        Build a contrasts DataFrame for use with
+        :meth:`~Distance.contrast_distances`.
 
         Each row represents one contrast: comparing a group against the
         reference, optionally within each level of ``split_by`` columns.
         The resulting DataFrame can be filtered or modified before passing
-        to :meth:`contrast_distances`.
+        to :meth:`~Distance.contrast_distances`.
 
         The output layout is:
 

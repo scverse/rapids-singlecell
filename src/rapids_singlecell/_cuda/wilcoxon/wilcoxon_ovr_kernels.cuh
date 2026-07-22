@@ -18,6 +18,32 @@ __global__ void csr_col_histogram_kernel(const IndexT* __restrict__ indices,
     }
 }
 
+// Histogram compacted shard-local column ids. Each block accumulates into a
+// small shared histogram, then merges one count per column to global memory.
+// This avoids one contended global atomic for every staged nonzero.
+template <typename IndexT>
+__global__ void compact_col_histogram_kernel(const IndexT* __restrict__ indices,
+                                             int* __restrict__ col_counts,
+                                             int n_items, int col_start,
+                                             int n_cols) {
+    extern __shared__ int block_counts[];
+    for (int c = threadIdx.x; c < n_cols; c += blockDim.x) block_counts[c] = 0;
+    __syncthreads();
+
+    long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long item = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         item < n_items; item += stride) {
+        int c = (int)indices[item] - col_start;
+        if (c >= 0 && c < n_cols) atomicAdd(&block_counts[c], 1);
+    }
+    __syncthreads();
+
+    for (int c = threadIdx.x; c < n_cols; c += blockDim.x) {
+        int count = block_counts[c];
+        if (count != 0) atomicAdd(&col_counts[c], count);
+    }
+}
+
 // CRITICAL: dense OVR gmem fallback is load-bearing for large n_groups.
 // Shared-memory thresholds are device-queried; oversized smem would not launch.
 static size_t ovr_smem_config(int n_groups, bool& use_gmem) {

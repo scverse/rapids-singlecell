@@ -126,8 +126,9 @@ def scale(
 
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
-        adata.var[str_mean_std[0]] = means.get()
-        adata.var[str_mean_std[1]] = std.get()
+        if obsm is None:
+            adata.var[str_mean_std[0]] = means.get()
+            adata.var[str_mean_std[1]] = std.get()
 
     if copy:
         return adata
@@ -136,6 +137,8 @@ def scale(
 
 
 def _scale_dispatch(X, *, mask_obs, zero_center, inplace, max_value):
+    if X.dtype.kind in "iu":
+        X = X.astype(cp.float64)
     if isinstance(X, DaskArray):
         return _scale_dask(
             X,

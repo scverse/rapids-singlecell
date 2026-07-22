@@ -31,7 +31,7 @@ def harmony_integrate(
     ridge_lambda: float = 1.0,
     alpha: float = 0.2,
     batch_prune_threshold: float | None = 1e-5,
-    correction_method: Literal["fast", "original", "batched"] | None = None,
+    correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     block_proportion: float = 0.05,
     random_state: int = 0,
@@ -39,7 +39,10 @@ def harmony_integrate(
 ) -> None:
     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
 
-    This GPU-accelerated implementation is based on the harmony-pytorch package.
+    This GPU-accelerated implementation was originally based on the
+    harmony-pytorch package. Multiple batch variables now follow the
+    per-covariate formulation described in the Harmony papers: each key is
+    modeled separately instead of combining all keys into one joint category.
     As Harmony works by adjusting the principal components,
     this function should be run after performing PCA but before computing the neighbor graph.
 
@@ -57,7 +60,10 @@ def harmony_integrate(
         The annotated data matrix.
     key
         The key(s) of the column(s) in ``adata.obs`` that differentiate(s) among experiments/batches.
-        When multiple keys are provided, a combined batch variable is created from all columns.
+        Multiple keys are modeled as separate batch variables, with one active
+        categorical level per variable and cell.
+        To retain the joint-combination behavior of earlier releases, combine
+        the desired columns into one categorical column and pass that single key.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
     adjusted_basis
@@ -97,8 +103,10 @@ def harmony_integrate(
         to contain a balanced representation of all batches.
         Higher values (e.g. ``4``) produce more aggressive mixing;
         lower values (e.g. ``0.5``) allow more batch-specific clusters.
-        Set to ``0`` to disable batch correction entirely.
-        A list can be provided to set different weights per batch variable.
+        Set to ``0`` to disable the diversity penalty for a batch variable.
+        A scalar is applied to every key. A sequence may contain one value per
+        key, expanded over that key's categorical levels, or one value per
+        categorical level across all keys.
     tau
         Discounting factor on ``theta``.
         When ``tau > 0``,
@@ -109,6 +117,7 @@ def harmony_integrate(
         Ridge regression regularization for the correction step.
         Larger values produce more conservative (smaller) corrections,
         preventing over-fitting.
+        Must be finite and greater than zero.
         Only used with ``flavor="harmony1"``.
     alpha
         Scaling factor for the dynamic per-cluster-per-batch ridge regularization.
@@ -124,12 +133,16 @@ def harmony_integrate(
         Set to ``None`` to disable pruning.
     correction_method
         Method for the correction step.
-        ``"original"`` uses per-cluster ridge regression with explicit matrix inversion.
         ``"fast"`` uses a precomputed factorization that avoids the full inversion,
         which can be faster for datasets with many batches.
         ``"batched"`` processes all clusters simultaneously (fastest but requires more memory).
-        If ``None`` (default), automatically selects ``"batched"`` unless
-        the workspace would exceed 1 GB, in which case ``"fast"`` is used.
+        With one key, ``None`` automatically selects ``"batched"`` unless its
+        workspace would exceed 1 GiB, in which case ``"fast"`` is used.
+        Multiple keys always use the exact general-design solve because the
+        arrowhead optimization applies only to one batch variable; clusters are
+        processed in workspace-bounded chunks when needed. For multiple keys,
+        use ``None`` or ``"batched"``; passing ``"fast"`` emits a warning and
+        uses the exact solve.
     colsum_algo
         Algorithm for column sums.
         If ``None``, chosen automatically.

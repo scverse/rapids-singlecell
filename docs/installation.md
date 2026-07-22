@@ -1,6 +1,6 @@
 # Installation
 ## Conda
-The easiest way to install *rapids-singlecell* is to use one of the *yaml* files provided in the [conda](https://github.com/scverse/rapids_singlecell/tree/main/conda) folder.
+The easiest way to install *rapids-singlecell* is to use one of the *yaml* files provided in the [conda](https://github.com/scverse/rapids-singlecell/tree/main/conda) folder.
 These *yaml* files install everything needed to run the example notebooks and get you started.
 
 `````{tab-set}
@@ -39,11 +39,11 @@ The prebuilt wheels support the following CUDA runtime versions:
 |---|---|---|---|
 | `rapids-singlecell` | Source distribution | Any supported CUDA | Compiles for your local GPU architecture |
 | `rapids-singlecell-cu12` | CUDA 12.2 | CUDA 12.2–12.9+ | Turing through Hopper (native), Blackwell (via PTX JIT) |
-| `rapids-singlecell-cu13` | CUDA 13.0 | CUDA 13.0+ | Turing through Blackwell (all native) |
+| `rapids-singlecell-cu13` | CUDA 13.0 | CUDA 13.0+ | Turing through Blackwell (precompiled cubins) |
 
 The CUDA 12 wheels are compiled with CUDA 12.2 to match the [RAPIDS 26.04 support matrix](https://docs.rapids.ai/platform-support/) (CUDA 12.2–12.9).
-Blackwell GPUs (CC 100, 120) are supported via PTX just-in-time compilation from the `sm_90` PTX included in the wheel.
-The CUDA 13 wheels include native Blackwell binaries, so no JIT is needed.
+Blackwell GPUs (CC 100, 103, and 120) are supported via PTX just-in-time compilation from the `sm_90` PTX included in the wheel.
+The CUDA 13 wheels include compatible Blackwell cubins, so no PTX JIT is needed.
 
 ### Prebuilt wheels (recommended)
 
@@ -127,24 +127,24 @@ so the build uses the environment's `librmm` instead of the cu12 wheel.
 To install the latest development version directly from GitHub:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids_singlecell.git"
+pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 ```
 
 Or from a specific branch or tag:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids_singlecell.git@main"
+pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
 ```
 
 This compiles the CUDA kernels during installation. By default, kernels are compiled for your local GPU architecture only (`native`).
-To compile for different or multiple architectures, pass a config setting to override the CUDA architectures:
+To compile for different or multiple architectures, set the scikit-build-core environment variable that overrides the CUDA architectures:
 
 ```bash
 # Compile for a specific architecture (e.g., Ampere)
-pip install -C cmake.define.CMAKE_CUDA_ARCHITECTURES="80-real" "rapids-singlecell @ git+https://github.com/scverse/rapids_singlecell.git"
+SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES="80-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 
 # Compile for multiple architectures
-pip install -C cmake.define.CMAKE_CUDA_ARCHITECTURES="80-real;86-real;89-real;90-real" "rapids-singlecell @ git+https://github.com/scverse/rapids_singlecell.git"
+SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES="80-real;86-real;89-real;90-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 ```
 
 Common architecture codes:
@@ -157,7 +157,8 @@ Common architecture codes:
 | `89` | Ada Lovelace | L4, L40, RTX 4090 |
 | `90` | Hopper | H100, H200 |
 | `100` | Blackwell | B200, GB200 |
-| `120` | Blackwell | B300, RTX PRO 6000 |
+| `103` | Blackwell | B300, GB300 |
+| `120` | Blackwell | RTX PRO 6000 |
 
 ```{tip}
 Use `native` (the default) for the fastest compilation when you only need to run on your local GPU.

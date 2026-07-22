@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "../../cublas_helpers.cuh"
@@ -111,28 +112,101 @@ static inline void colsum_dispatch(int algo, cublasHandle_t handle, const T* A,
 
 // ---------- Scatter-add to O (add/subtract block contribution) ----------
 
-template <typename T>
-static inline void scatter_add_to_O(const T* R_buf, const int* cats_in,
-                                    int current_bs, int n_clusters,
-                                    int n_batches, int switcher, T* O,
-                                    bool use_shared, size_t shared_bytes,
-                                    int n_sm, cudaStream_t stream) {
+template <typename T, int N_COVARIATES>
+static inline void scatter_add_to_O_impl(const T* R_buf, const int* cats_in,
+                                         int current_bs, int n_clusters,
+                                         int n_batches, int n_covariates,
+                                         int switcher, T* O, bool use_shared,
+                                         size_t shared_bytes, int n_sm,
+                                         cudaStream_t stream) {
     if (use_shared) {
         int max_blocks =
             std::max(1, (current_bs + SCATTER_SHARED_CELLS_PER_BLOCK - 1) /
                             SCATTER_SHARED_CELLS_PER_BLOCK);
         int blocks = std::min(n_sm * SCATTER_SHARED_BLOCKS_PER_SM, max_blocks);
-        scatter_add_shared_kernel<T>
+        scatter_add_shared_kernel<T, N_COVARIATES>
             <<<blocks, BLOCK_DIM_1D, shared_bytes, stream>>>(
-                R_buf, cats_in, current_bs, n_clusters, n_batches, switcher, O);
+                R_buf, cats_in, current_bs, n_clusters, n_batches, n_covariates,
+                switcher, O);
         CUDA_CHECK_LAST_ERROR(scatter_add_shared_kernel);
     } else {
         size_t N = (size_t)current_bs * n_clusters;
-        scatter_add_kernel<T>
+        scatter_add_kernel<T, N_COVARIATES>
             <<<grid_1d((long long)N, n_sm), BLOCK_DIM_1D, 0, stream>>>(
                 R_buf, cats_in, (size_t)current_bs, (size_t)n_clusters,
-                (size_t)switcher, O);
+                n_covariates, switcher, O);
         CUDA_CHECK_LAST_ERROR(scatter_add_kernel);
+    }
+}
+
+template <typename T>
+static inline void scatter_add_to_O_dispatch(
+    const T* R_buf, const int* cats_in, int current_bs, int n_clusters,
+    int n_batches, int n_covariates, int switcher, T* O, bool use_shared,
+    size_t shared_bytes, int n_sm, cudaStream_t stream) {
+    if (n_covariates == 1) {
+        scatter_add_to_O_impl<T, 1>(R_buf, cats_in, current_bs, n_clusters,
+                                    n_batches, n_covariates, switcher, O,
+                                    use_shared, shared_bytes, n_sm, stream);
+    } else if (n_covariates == 2) {
+        scatter_add_to_O_impl<T, 2>(R_buf, cats_in, current_bs, n_clusters,
+                                    n_batches, n_covariates, switcher, O,
+                                    use_shared, shared_bytes, n_sm, stream);
+    } else if (n_covariates == 3) {
+        scatter_add_to_O_impl<T, 3>(R_buf, cats_in, current_bs, n_clusters,
+                                    n_batches, n_covariates, switcher, O,
+                                    use_shared, shared_bytes, n_sm, stream);
+    } else {
+        scatter_add_to_O_impl<T, 0>(R_buf, cats_in, current_bs, n_clusters,
+                                    n_batches, n_covariates, switcher, O,
+                                    use_shared, shared_bytes, n_sm, stream);
+    }
+}
+
+template <typename T>
+static inline void materialize_marginal_from_joint(
+    const T* O_joint, const int* marginal_joint_offsets,
+    const int* marginal_joint_indices, T* O, int n_batches, int n_clusters,
+    int n_sm, cudaStream_t stream) {
+    long long total = (long long)n_batches * n_clusters;
+    materialize_marginal_from_joint_kernel<T>
+        <<<grid_1d(total, n_sm), BLOCK_DIM_1D, 0, stream>>>(
+            O_joint, marginal_joint_offsets, marginal_joint_indices, O,
+            n_batches, n_clusters);
+    CUDA_CHECK_LAST_ERROR(materialize_marginal_from_joint_kernel);
+}
+
+template <typename T>
+static inline void fused_pen_norm_dispatch(const T* similarities,
+                                           const T* penalty, const int* cats_in,
+                                           const int* block_idx, T* R_out,
+                                           T term, int n_rows, int n_clusters,
+                                           int n_covariates,
+                                           cudaStream_t stream) {
+    unsigned block_dim = warp_aligned_bdim(n_clusters);
+    if (n_covariates == 1) {
+        fused_pen_norm_kernel<T, int><<<n_rows, block_dim, 0, stream>>>(
+            similarities, penalty, cats_in, block_idx, R_out, term, n_rows,
+            n_clusters);
+        CUDA_CHECK_LAST_ERROR(fused_pen_norm_kernel);
+    } else if (n_covariates == 2) {
+        fused_pen_norm_multi_kernel<T, int, 2>
+            <<<n_rows, block_dim, 0, stream>>>(similarities, penalty, cats_in,
+                                               block_idx, R_out, term, n_rows,
+                                               n_clusters, n_covariates);
+        CUDA_CHECK_LAST_ERROR(fused_pen_norm_multi_kernel);
+    } else if (n_covariates == 3) {
+        fused_pen_norm_multi_kernel<T, int, 3>
+            <<<n_rows, block_dim, 0, stream>>>(similarities, penalty, cats_in,
+                                               block_idx, R_out, term, n_rows,
+                                               n_clusters, n_covariates);
+        CUDA_CHECK_LAST_ERROR(fused_pen_norm_multi_kernel);
+    } else {
+        fused_pen_norm_multi_kernel<T, int, 0>
+            <<<n_rows, block_dim, 0, stream>>>(similarities, penalty, cats_in,
+                                               block_idx, R_out, term, n_rows,
+                                               n_clusters, n_covariates);
+        CUDA_CHECK_LAST_ERROR(fused_pen_norm_multi_kernel);
     }
 }
 
@@ -148,6 +222,10 @@ struct ClusteringArgs {
     const T* Pr_b;
     const int* cats;
     const T* theta;
+    const int* joint_codes;
+    const int* marginal_joint_offsets;
+    const int* marginal_joint_indices;
+    T* O_joint;
 
     // Workspace
     T* Y;
@@ -160,6 +238,7 @@ struct ClusteringArgs {
     uint8_t* cub_temp;
     T* R_out_buffer;
     int* cats_in;
+    int* joint_codes_in;
     T* R_in_sum;
     T* R_out_sum;
     T* penalty;
@@ -172,6 +251,8 @@ struct ClusteringArgs {
     int n_pcs;
     int n_clusters;
     int n_batches;
+    int n_covariates;
+    int n_joint_categories;
     int block_size;
     int colsum_algo;
     T sigma;
@@ -179,6 +260,7 @@ struct ClusteringArgs {
     int max_iter;
     unsigned int seed;
     bool stabilized;
+    bool use_joint_scatter;
     cudaStream_t stream;
     cublasHandle_t handle;
 };
@@ -240,6 +322,13 @@ static T compute_objective_impl(const T* R, const T* similarities, const T* O,
 
 template <typename T>
 static void clustering_loop_impl(const ClusteringArgs<T>& a) {
+    if (a.n_covariates < 1)
+        throw std::invalid_argument(
+            "clustering_loop requires at least one covariate");
+    if (a.use_joint_scatter && a.n_joint_categories < 1)
+        throw std::invalid_argument(
+            "joint scatter requires at least one joint category");
+
     size_t cub_temp_bytes = get_cub_sort_temp_bytes(a.n_cells);
 
     cublasHandle_t handle = a.handle;
@@ -261,6 +350,11 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
         (size_t)a.n_batches * a.n_clusters * sizeof(T);
     bool use_scatter_shared =
         (scatter_shared_bytes <= (size_t)prop.sharedMemPerBlock);
+    size_t joint_scatter_shared_bytes =
+        (size_t)a.n_joint_categories * a.n_clusters * sizeof(T);
+    bool use_joint_scatter_shared =
+        a.use_joint_scatter &&
+        (joint_scatter_shared_bytes <= (size_t)prop.sharedMemPerBlock);
 
     // Host-side convergence tracking
     std::vector<T> objectives;
@@ -314,17 +408,45 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
                                     BLOCK_DIM_1D, 0, a.stream>>>(
                 a.R, block_idx, a.R_out_buffer, bs, a.n_clusters);
             CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
-            gather_int_kernel<<<grid_1d(bs, n_sm), BLOCK_DIM_1D, 0, a.stream>>>(
-                a.cats, block_idx, a.cats_in, bs);
-            CUDA_CHECK_LAST_ERROR(gather_int_kernel);
+            if (a.n_covariates == 1) {
+                gather_int_kernel<<<grid_1d(bs, n_sm), BLOCK_DIM_1D, 0,
+                                    a.stream>>>(a.cats, block_idx, a.cats_in,
+                                                bs);
+                CUDA_CHECK_LAST_ERROR(gather_int_kernel);
+            } else {
+                gather_rows_kernel<int>
+                    <<<grid_1d((long long)bs * a.n_covariates, n_sm),
+                       BLOCK_DIM_1D, 0, a.stream>>>(
+                        a.cats, block_idx, a.cats_in, bs, a.n_covariates);
+                CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+            }
+            if (a.use_joint_scatter) {
+                gather_int_kernel<<<grid_1d(bs, n_sm), BLOCK_DIM_1D, 0,
+                                    a.stream>>>(a.joint_codes, block_idx,
+                                                a.joint_codes_in, bs);
+                CUDA_CHECK_LAST_ERROR(gather_int_kernel);
+            }
 
             // Remove old contribution: O -= scatter(R_in), E -= Pr_b @ R_in_sum
             colsum_dispatch<T>(a.colsum_algo, handle, a.R_out_buffer,
                                a.R_in_sum, a.ones_vec, bs, a.n_clusters, n_sm,
                                a.stream);
-            scatter_add_to_O<T>(a.R_out_buffer, a.cats_in, bs, a.n_clusters,
-                                a.n_batches, 0, a.O, use_scatter_shared,
-                                scatter_shared_bytes, n_sm, a.stream);
+            if (a.use_joint_scatter) {
+                scatter_add_to_O_impl<T, 1>(
+                    a.R_out_buffer, a.joint_codes_in, bs, a.n_clusters,
+                    a.n_joint_categories, 1, 0, a.O_joint,
+                    use_joint_scatter_shared, joint_scatter_shared_bytes, n_sm,
+                    a.stream);
+                materialize_marginal_from_joint<T>(
+                    a.O_joint, a.marginal_joint_offsets,
+                    a.marginal_joint_indices, a.O, a.n_batches, a.n_clusters,
+                    n_sm, a.stream);
+            } else {
+                scatter_add_to_O_dispatch<T>(
+                    a.R_out_buffer, a.cats_in, bs, a.n_clusters, a.n_batches,
+                    a.n_covariates, 0, a.O, use_scatter_shared,
+                    scatter_shared_bytes, n_sm, a.stream);
+            }
             outer_kernel<T><<<(ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
                               BLOCK_DIM_1D, 0, a.stream>>>(
                 a.E, a.Pr_b, a.R_in_sum, (long long)a.n_batches,
@@ -345,11 +467,9 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
                                                     a.penalty, a.n_batches,
                                                     a.n_clusters);
             CUDA_CHECK_LAST_ERROR(penalty_kernel);
-            fused_pen_norm_kernel<T, int>
-                <<<bs, warp_aligned_bdim(a.n_clusters), 0, a.stream>>>(
-                    a.similarities, a.penalty, a.cats_in, block_idx,
-                    a.R_out_buffer, term, bs, a.n_clusters);
-            CUDA_CHECK_LAST_ERROR(fused_pen_norm_kernel);
+            fused_pen_norm_dispatch<T>(a.similarities, a.penalty, a.cats_in,
+                                       block_idx, a.R_out_buffer, term, bs,
+                                       a.n_clusters, a.n_covariates, a.stream);
 
             // Write back and add new contribution: O += scatter(R_out), E +=
             // Pr_b @ R_out_sum
@@ -361,14 +481,29 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
             colsum_dispatch<T>(a.colsum_algo, handle, a.R_out_buffer,
                                a.R_out_sum, a.ones_vec, bs, a.n_clusters, n_sm,
                                a.stream);
-            scatter_add_to_O<T>(a.R_out_buffer, a.cats_in, bs, a.n_clusters,
-                                a.n_batches, 1, a.O, use_scatter_shared,
-                                scatter_shared_bytes, n_sm, a.stream);
+            if (a.use_joint_scatter) {
+                scatter_add_to_O_impl<T, 1>(
+                    a.R_out_buffer, a.joint_codes_in, bs, a.n_clusters,
+                    a.n_joint_categories, 1, 1, a.O_joint,
+                    use_joint_scatter_shared, joint_scatter_shared_bytes, n_sm,
+                    a.stream);
+            } else {
+                scatter_add_to_O_dispatch<T>(
+                    a.R_out_buffer, a.cats_in, bs, a.n_clusters, a.n_batches,
+                    a.n_covariates, 1, a.O, use_scatter_shared,
+                    scatter_shared_bytes, n_sm, a.stream);
+            }
             outer_kernel<T><<<(ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
                               BLOCK_DIM_1D, 0, a.stream>>>(
                 a.E, a.Pr_b, a.R_out_sum, (long long)a.n_batches,
                 (long long)a.n_clusters, 1LL);
             CUDA_CHECK_LAST_ERROR(outer_kernel);
+        }
+
+        if (a.use_joint_scatter) {
+            materialize_marginal_from_joint<T>(
+                a.O_joint, a.marginal_joint_offsets, a.marginal_joint_indices,
+                a.O, a.n_batches, a.n_clusters, n_sm, a.stream);
         }
 
         // ---- Objective function (reuses similarities buffer) ----
@@ -402,7 +537,11 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<T, Device> E, gpu_array_c<T, Device> O,
            gpu_array_c<const T, Device> Pr_b,
            gpu_array_c<const int, Device> cats,
-           gpu_array_c<const T, Device> theta, gpu_array_c<T, Device> Y,
+           gpu_array_c<const T, Device> theta,
+           gpu_array_c<const int, Device> joint_codes,
+           gpu_array_c<const int, Device> marginal_joint_offsets,
+           gpu_array_c<const int, Device> marginal_joint_indices,
+           gpu_array_c<T, Device> O_joint, gpu_array_c<T, Device> Y,
            gpu_array_c<T, Device> Y_norm, gpu_array_c<T, Device> similarities,
            gpu_array_c<int, Device> idx_list,
            gpu_array_c<int, Device> idx_list_alt,
@@ -410,14 +549,18 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<unsigned int, Device> sort_keys_alt,
            gpu_array_c<uint8_t, Device> cub_temp,
            gpu_array_c<T, Device> R_out_buffer,
-           gpu_array_c<int, Device> cats_in, gpu_array_c<T, Device> R_in_sum,
-           gpu_array_c<T, Device> R_out_sum, gpu_array_c<T, Device> penalty_buf,
+           gpu_array_c<int, Device> cats_in,
+           gpu_array_c<int, Device> joint_codes_in,
+           gpu_array_c<T, Device> R_in_sum, gpu_array_c<T, Device> R_out_sum,
+           gpu_array_c<T, Device> penalty_buf,
            gpu_array_c<T, Device> obj_scalar,
            gpu_array_c<const T, Device> ones_vec,
            gpu_array_c<T, Device> last_obj, int n_cells, int n_pcs,
-           int n_clusters, int n_batches, int block_size, int colsum_algo,
+           int n_clusters, int n_batches, int n_covariates,
+           int n_joint_categories, int block_size, int colsum_algo,
            double sigma, double tol, int max_iter, unsigned int seed,
-           bool stabilized, std::uintptr_t stream, std::uintptr_t handle) {
+           bool stabilized, bool use_joint_scatter, std::uintptr_t stream,
+           std::uintptr_t handle) {
             ClusteringArgs<T> a{
                 Z_norm.data(),
                 R.data(),
@@ -426,6 +569,10 @@ static void register_clustering_loop(nb::module_& m) {
                 Pr_b.data(),
                 cats.data(),
                 theta.data(),
+                joint_codes.data(),
+                marginal_joint_offsets.data(),
+                marginal_joint_indices.data(),
+                O_joint.data(),
                 Y.data(),
                 Y_norm.data(),
                 similarities.data(),
@@ -436,6 +583,7 @@ static void register_clustering_loop(nb::module_& m) {
                 cub_temp.data(),
                 R_out_buffer.data(),
                 cats_in.data(),
+                joint_codes_in.data(),
                 R_in_sum.data(),
                 R_out_sum.data(),
                 penalty_buf.data(),
@@ -446,6 +594,8 @@ static void register_clustering_loop(nb::module_& m) {
                 n_pcs,
                 n_clusters,
                 n_batches,
+                n_covariates,
+                n_joint_categories,
                 block_size,
                 colsum_algo,
                 static_cast<T>(sigma),
@@ -453,19 +603,23 @@ static void register_clustering_loop(nb::module_& m) {
                 max_iter,
                 seed,
                 stabilized,
+                use_joint_scatter,
                 (cudaStream_t)stream,
                 (cublasHandle_t)handle,
             };
             clustering_loop_impl(a);
         },
         "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "cats"_a,
-        "theta"_a, "Y"_a, "Y_norm"_a, "similarities"_a, "idx_list"_a,
-        "idx_list_alt"_a, "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a,
-        "R_out_buffer"_a, "cats_in"_a, "R_in_sum"_a, "R_out_sum"_a, "penalty"_a,
+        "theta"_a, "joint_codes"_a, "marginal_joint_offsets"_a,
+        "marginal_joint_indices"_a, "O_joint"_a, "Y"_a, "Y_norm"_a,
+        "similarities"_a, "idx_list"_a, "idx_list_alt"_a, "sort_keys"_a,
+        "sort_keys_alt"_a, "cub_temp"_a, "R_out_buffer"_a, "cats_in"_a,
+        "joint_codes_in"_a, "R_in_sum"_a, "R_out_sum"_a, "penalty"_a,
         "obj_scalar"_a, "ones_vec"_a, "last_obj"_a, "n_cells"_a, "n_pcs"_a,
-        "n_clusters"_a, "n_batches"_a, "block_size"_a, "colsum_algo"_a,
-        "sigma"_a, "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a,
-        "stream"_a = 0, "handle"_a);
+        "n_clusters"_a, "n_batches"_a, "n_covariates"_a, "n_joint_categories"_a,
+        "block_size"_a, "colsum_algo"_a, "sigma"_a, "tol"_a, "max_iter"_a,
+        "seed"_a, "stabilized"_a, "use_joint_scatter"_a, "stream"_a = 0,
+        "handle"_a);
 }
 
 template <typename T, typename Device>

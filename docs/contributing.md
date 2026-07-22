@@ -29,10 +29,14 @@ this range; override only if your toolkit defines the enum with `-DRSC_SKIP_CUDA
 ### Clone and install
 
 ```bash
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
+git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
+cd rapids-singlecell
 (uv) pip install -e ".[test]"
 ```
+
+The documentation notebooks live in a Git submodule. If the repository was
+already cloned without `--recurse-submodules`, initialize them with
+`git submodule update --init` before building the documentation.
 
 The editable install compiles the CUDA kernels for your local GPU architecture.
 After the install, compiled `.so` modules and `.pyi` type stubs are placed in `src/rapids_singlecell/_cuda/`.
@@ -255,7 +259,7 @@ Each wheel contains:
 - `.pyi` type stubs for IDE support
 - `py.typed` PEP 561 marker
 
-Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via `wheel.exclude` in `pyproject.toml`.
+Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via Hatchling's wheel target configuration in `pyproject.toml`.
 They are included in the source distribution for self-compilation.
 
 ### CUDA architectures
@@ -280,15 +284,14 @@ These are built by `docker-push.sh`, which strips the `rapids-singlecell` pip li
 
 **CI manylinux images** (for building PyPI wheels):
 
-| File | Purpose |
-|---|---|
-| `manylinux_2_28_x86_64_cuda12.2.Dockerfile` | x86_64 build image with CUDA 12.2 toolkit |
-| `manylinux_2_28_aarch64_cuda12.2.Dockerfile` | aarch64 build image with CUDA 12.2 toolkit |
-| `manylinux_2_28_x86_64_cuda13.0.Dockerfile` | x86_64 build image with CUDA 13.0 toolkit |
-| `manylinux_2_28_aarch64_cuda13.0.Dockerfile` | aarch64 build image with CUDA 13.0 toolkit |
+Wheels are built by cibuildwheel against prebuilt manylinux + CUDA images published at
+`quay.io/manylinux_cuda/manylinux_2_28_<arch>_cuda<ver>`. `publish.yml` selects the image
+per matrix entry via `cibw_image`.
 
-These are based on `quay.io/pypa/manylinux_2_28` and only install the CUDA toolkit packages needed for compilation (nvcc, cudart, cublas, cusparse).
-They are used by cibuildwheel in `publish.yml` to produce portable wheels.
+These images ship nvcc, cudart, and cublas (plus gcc-toolset-12 on the CUDA 12.2 image,
+since nvcc on 12.2 requires GCC 12 or older). The remaining libraries rapids-singlecell
+links against (cusolver, cusparse, and nvJitLink) are installed at build time via
+`CIBW_BEFORE_ALL` in `publish.yml`.
 
 ### Release process
 

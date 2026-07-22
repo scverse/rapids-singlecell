@@ -4,40 +4,65 @@
 #include <stdint.h>
 #include <type_traits>
 
-template <typename T>
+// ---------- scatter_add ----------
+// `cats` is a cell-major (n_cells, n_covariates) matrix of global category
+// indices. Each input value is loaded once and scattered to every active
+// covariate level. N_COVARIATES=1, 2, and 3 are compile-time-specialized; zero
+// is the runtime fallback.
+template <typename T, int N_COVARIATES>
 __global__ void scatter_add_kernel(const T* __restrict__ v,
                                    const int* __restrict__ cats, size_t n_cells,
-                                   size_t n_pcs, size_t switcher,
+                                   size_t n_pcs, int n_covariates, int switcher,
                                    T* __restrict__ a) {
     size_t N = n_cells * n_pcs;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < N;
          i += (size_t)blockDim.x * gridDim.x) {
         size_t row = i / n_pcs;
         size_t col = i % n_pcs;
+        T value = switcher == 0 ? -v[i] : v[i];
 
-        size_t cat = static_cast<size_t>(cats[row]);
-        size_t out_index = cat * n_pcs + col;
-
-        if (switcher == 0)
-            atomicAdd(&a[out_index], -v[i]);
-        else
-            atomicAdd(&a[out_index], v[i]);
+        if constexpr (N_COVARIATES > 0) {
+            const int* row_cats = cats + row * N_COVARIATES;
+#pragma unroll
+            for (int covariate = 0; covariate < N_COVARIATES; ++covariate) {
+                size_t cat = static_cast<size_t>(row_cats[covariate]);
+                atomicAdd(&a[cat * n_pcs + col], value);
+            }
+        } else {
+            const int* row_cats = cats + row * n_covariates;
+            for (int covariate = 0; covariate < n_covariates; ++covariate) {
+                size_t cat = static_cast<size_t>(row_cats[covariate]);
+                atomicAdd(&a[cat * n_pcs + col], value);
+            }
+        }
     }
 }
 
+// Materialize marginal observed counts from the persistent joint-code table.
+// `marginal_joint_offsets` / `marginal_joint_indices` are a CSR mapping from
+// each marginal category to the joint categories that contain it. One thread
+// owns one (marginal category, cluster) output and reduces its joint list in a
+// fixed order, so this stage needs neither atomics nor a preceding memset.
 template <typename T>
-__global__ void aggregated_matrix_kernel(T* __restrict__ aggregated_matrix,
-                                         const T* __restrict__ sum,
-                                         T top_corner, int n_batches) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_batches + 1) return;
+__global__ void materialize_marginal_from_joint_kernel(
+    const T* __restrict__ joint_values,
+    const int* __restrict__ marginal_joint_offsets,
+    const int* __restrict__ marginal_joint_indices, T* __restrict__ marginal,
+    int n_batches, int n_clusters) {
+    size_t total = (size_t)n_batches * n_clusters;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (size_t)blockDim.x * gridDim.x) {
+        int batch = (int)(i / n_clusters);
+        int cluster = (int)(i % n_clusters);
+        int begin = marginal_joint_offsets[batch];
+        int end = marginal_joint_offsets[batch + 1];
 
-    if (i == 0) {
-        aggregated_matrix[0] = top_corner;
-    } else {
-        aggregated_matrix[i] = sum[i - 1];
-        aggregated_matrix[(n_batches + 1) * i] = sum[i - 1];
-        aggregated_matrix[(n_batches + 1) * i + i] = sum[i - 1];
+        T sum = T(0);
+        for (int position = begin; position < end; ++position) {
+            int joint = marginal_joint_indices[position];
+            sum += joint_values[(size_t)joint * n_clusters + cluster];
+        }
+        marginal[i] = sum;
     }
 }
 
@@ -127,50 +152,59 @@ __global__ void scatter_add_kernel_with_bias_cat0(const T* __restrict__ v,
     }
 }
 
-// ---------- scatter_add_shared ----------
-// Uses dynamic shared memory for local accumulation to reduce global atomic
-// contention.
-template <typename T>
+// Shared-memory counterpart of scatter_add_kernel. The output remains a flat
+// (n_batches, n_pcs) matrix over all marginal category levels.
+template <typename T, int N_COVARIATES>
 __global__ void scatter_add_shared_kernel(const T* __restrict__ v,
                                           const int* __restrict__ cats,
                                           int n_cells, int n_pcs, int n_batches,
-                                          int switcher, T* __restrict__ a) {
-    // Dynamic shared memory: [n_batches * n_pcs] for local accumulation
+                                          int n_covariates, int switcher,
+                                          T* __restrict__ a) {
     extern __shared__ unsigned char smem_raw[];
     T* shared_acc = reinterpret_cast<T*>(smem_raw);
 
-    // Initialize shared memory to zero
     for (int i = threadIdx.x; i < n_batches * n_pcs; i += blockDim.x)
         shared_acc[i] = T(0);
     __syncthreads();
 
-    // Calculate cell range for this block
     int cells_per_block = (n_cells + gridDim.x - 1) / gridDim.x;
     int start_cell = blockIdx.x * cells_per_block;
     int end_cell = min(start_cell + cells_per_block, n_cells);
 
-    // Each thread processes cells with stride, accumulating into shared memory
     for (int cell = start_cell + threadIdx.x; cell < end_cell;
          cell += blockDim.x) {
-        int cat = cats[cell];
         size_t v_base = (size_t)cell * n_pcs;
-        int shared_base = cat * n_pcs;
 
-        for (int pc = 0; pc < n_pcs; pc++) {
-            T val = v[v_base + pc];
-            atomicAdd(&shared_acc[shared_base + pc], val);
+        if constexpr (N_COVARIATES > 0) {
+            const int* row_cats = cats + (size_t)cell * N_COVARIATES;
+            for (int pc = 0; pc < n_pcs; ++pc) {
+                T value = v[v_base + pc];
+#pragma unroll
+                for (int covariate = 0; covariate < N_COVARIATES; ++covariate) {
+                    int shared_index = row_cats[covariate] * n_pcs + pc;
+                    atomicAdd(&shared_acc[shared_index], value);
+                }
+            }
+        } else {
+            const int* row_cats = cats + (size_t)cell * n_covariates;
+            for (int pc = 0; pc < n_pcs; ++pc) {
+                T value = v[v_base + pc];
+                for (int covariate = 0; covariate < n_covariates; ++covariate) {
+                    int shared_index = row_cats[covariate] * n_pcs + pc;
+                    atomicAdd(&shared_acc[shared_index], value);
+                }
+            }
         }
     }
     __syncthreads();
 
-    // Write shared memory results to global memory
     for (int i = threadIdx.x; i < n_batches * n_pcs; i += blockDim.x) {
-        T val = shared_acc[i];
-        if (val != T(0)) {
+        T value = shared_acc[i];
+        if (value != T(0)) {
             if (switcher == 0)
-                atomicAdd(&a[i], -val);
+                atomicAdd(&a[i], -value);
             else
-                atomicAdd(&a[i], val);
+                atomicAdd(&a[i], value);
         }
     }
 }

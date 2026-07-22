@@ -15,8 +15,8 @@ ENV PYTHON_VERSION=${PYTHON_VER}
 COPY --from=condaforge/miniforge3:26.1.1-3 /opt/conda /opt/conda
 
 COPY rsc_rapids.yml rsc_rapids.yml
+COPY --from=source pyproject.toml /tmp/rapids_singlecell_pyproject.toml
 
-ARG GIT_ID=main
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN <<EOF
@@ -24,7 +24,6 @@ RUN <<EOF
 set -x
 apt-get -qq update
 apt-get -q -o=Dpkg::Use-Pty=0 -y dist-upgrade
-apt-get -q install -y -o=Dpkg::Use-Pty=0 git
 apt-get -q clean -y
 rm -rf /var/lib/apt/lists/*
 EOF
@@ -75,17 +74,13 @@ EOF
 RUN <<EOF
 # install rapids_singlecell pip dependencies (without building the package)
 set -x
-cd /tmp
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
-git checkout ${GIT_ID}
 /opt/conda/bin/python -c "
 import tomllib
-with open('pyproject.toml', 'rb') as f:
+with open('/tmp/rapids_singlecell_pyproject.toml', 'rb') as f:
     data = tomllib.load(f)
 with open('/tmp/deps.txt', 'w') as f:
     f.write('\n'.join(data['project']['dependencies']))
 "
 /opt/conda/bin/python -m pip install --no-cache-dir -r /tmp/deps.txt
-rm -rf /tmp/rapids_singlecell /tmp/deps.txt
+rm -f /tmp/rapids_singlecell_pyproject.toml /tmp/deps.txt
 EOF

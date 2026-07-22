@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import pytest
+from anndata import AnnData
 from cupyx.scipy import sparse as cusparse
 from scanpy.datasets import pbmc3k_processed
 
@@ -51,3 +53,36 @@ def test_dask_aggr(client, data_kind, use_mask):
         a = out_in_memory.layers[c]
         b = out_dask.layers[c]
         cp.testing.assert_allclose(a, b)
+
+
+@pytest.mark.parametrize(
+    "as_dask_array", [as_dense_cupy_dask_array, as_sparse_cupy_dask_array]
+)
+def test_dask_aggr_masked_mean_var(client, as_dask_array):
+    X = np.array(
+        [
+            [1, 2],
+            [3, 6],
+            [100, 100],
+            [2, 4],
+            [4, 8],
+            [200, 200],
+        ],
+        dtype=np.float32,
+    )
+    obs = pd.DataFrame(
+        {
+            "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
+            "mask": [True, True, False, True, True, False],
+        }
+    )
+    adata = AnnData(X=as_dask_array(X), obs=obs)
+
+    result = rsc.get.aggregate(adata, by="group", func=["mean", "var"], mask="mask")
+
+    cp.testing.assert_allclose(
+        result.layers["mean"], cp.array([[2, 4], [3, 6]], dtype=cp.float64)
+    )
+    cp.testing.assert_allclose(
+        result.layers["var"], cp.array([[2, 8], [2, 8]], dtype=cp.float64)
+    )

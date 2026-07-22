@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, Literal, assert_never
 import cupy as cp
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.get._aggregated import Aggregate
-from rapids_singlecell.preprocessing._utils import _check_gpu_X
 
 from ._utils import (
     EPS,
@@ -123,74 +123,62 @@ class _RankGenes:
 
         self.stats_arrays: dict[str, object] | None = None
         self._sparse_negative_fallback = False
-        self._store_wilcoxon_gpu_result = False
-        self._wilcoxon_gpu_result: (
-            tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None] | None
-        ) = None
-        self._compute_stats_in_chunks: bool = False
         self._score_dtype = np.dtype(np.float32)
+        self._multi_gpu: bool | list[int] | str | None = None
 
-    def _init_stats_arrays(self, n_genes: int) -> None:
-        """Pre-allocate stats arrays before chunk loop."""
-        n_groups = len(self.groups_order)
+    def _accumulate_planes(
+        self,
+    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+        """Sum / sq_sum / (count_nonzero) over ALL categories → (n_cats, n_genes).
 
-        self.means = np.zeros((n_groups, n_genes), dtype=np.float64)
-        self.vars = np.zeros((n_groups, n_genes), dtype=np.float64)
-        self.pts = (
-            np.zeros((n_groups, n_genes), dtype=np.float64) if self.comp_pts else None
-        )
-
-        if self.ireference is None:
-            self.means_rest = np.zeros((n_groups, n_genes), dtype=np.float64)
-            self.vars_rest = np.zeros((n_groups, n_genes), dtype=np.float64)
-            self.pts_rest = (
-                np.zeros((n_groups, n_genes), dtype=np.float64)
-                if self.comp_pts
-                else None
-            )
-        else:
-            self.means_rest = None
-            self.vars_rest = None
-            self.pts_rest = None
-
-    def _basic_stats(self) -> None:
-        """Compute means, vars, and pts for each group.
-        Host data defers stats to the Wilcoxon chunk/streaming path."""
-        n_genes = self.X.shape[1]
-
-        try:
-            _check_gpu_X(self.X, allow_dask=True)
-        except TypeError:
-            is_on_gpu = False
-        else:
-            is_on_gpu = True
-
-        if not is_on_gpu:
-            # Not on GPU: defer to chunk-based computation in the wilcoxon loop
-            self._compute_stats_in_chunks = True
-            self._init_stats_arrays(n_genes)
-            return
-
-        self._compute_stats_in_chunks = False
-
-        agg = Aggregate(groupby=self.labels.cat, data=self.X)
-        # Only sum and sq_sum are needed (means/vars are derived locally below);
-        # count_nonzero is only needed when comp_pts is requested.
+        Host input (numpy / scipy) streams blocks to the GPU (no full copy);
+        device / Dask uses the device ``Aggregate``. ``count_nonzero`` only when
+        ``comp_pts``.
+        """
+        X = self.X
+        if isinstance(X, np.ndarray) or sp.issparse(X):
+            return self._stream_planes()
+        agg = Aggregate(groupby=self.labels.cat, data=X)
         funcs = {"sum", "sq_sum"}
         if self.comp_pts:
             funcs.add("count_nonzero")
         result = agg.count_mean_var(funcs, dof=1)
+        return (
+            result["sum"],
+            result["sq_sum"],
+            result["count_nonzero"] if self.comp_pts else None,
+        )
 
-        # Map Aggregate category order → selected groups order
+    def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+        """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
+        from ._stream_multi_gpu import (
+            aggr_host_planes,
+            resolve_stream_devices,
+            stream_planes_multi,
+        )
+
+        codes = self.labels.cat.codes.to_numpy()
+        if codes.size and int(codes.min()) < 0:
+            # The streaming kernels index out[group, gene] directly; a missing
+            # (NaN) category (code -1) would corrupt memory, so refuse it — the
+            # device Aggregate path rejects it too.
+            msg = "groupby contains unassigned (NaN) categories; drop them first."
+            raise ValueError(msg)
+        device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
+        n_cats = len(self.labels.cat.categories)
+        if len(device_ids) > 1:
+            return stream_planes_multi(self, device_ids)
+        cats = cp.asarray(codes, dtype=cp.int32)
+        return aggr_host_planes(self.X, cats, n_cats, comp_pts=self.comp_pts)
+
+    def _basic_stats(self) -> None:
+        """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
+        sums_all, sq_sums_all, nnz_all = self._accumulate_planes()
+
+        # Map category order → selected groups order.
         cat_names = list(self.labels.cat.categories)
         cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
         order = [cat_to_idx[str(name)] for name in self.groups_order]
-
-        # Aggregate returns all categories; slice selected groups for outputs.
-        # Keep all-category totals so ``groups`` subsets get correct rest stats.
-        sums_all = result["sum"]
-        sq_sums_all = result["sq_sum"]
-        nnz_all = result["count_nonzero"] if self.comp_pts else None
 
         n = cp.asarray(self.group_sizes, dtype=cp.float64)[:, None]
         sums = sums_all[order]
@@ -208,7 +196,7 @@ class _RankGenes:
         # For reference='rest', rest includes every category not in this group.
         # That includes categories omitted by a strict ``groups=`` selection.
         if self.ireference is None:
-            n_total = agg.n_cells.sum()
+            n_total = cp.float64(self.X.shape[0])
             n_rest = n_total - n
             means_rest = (sums_all.sum(axis=0) - sums) / n_rest
             rest_ss = (sq_sums_all.sum(axis=0) - sq_sums) - n_rest * means_rest**2
@@ -233,72 +221,6 @@ class _RankGenes:
         self.vars = cp.asnumpy(vars_)
         self.pts = cp.asnumpy(pts) if pts is not None else None
 
-    def _accumulate_chunk_stats_vs_rest(
-        self,
-        block: cp.ndarray,
-        start: int,
-        stop: int,
-        *,
-        group_codes_dev: cp.ndarray,
-        group_sizes_dev: cp.ndarray,
-        n_cells: int,
-    ) -> None:
-        """Compute and store stats for one gene chunk (vs rest mode)."""
-        if not self._compute_stats_in_chunks:
-            return  # Stats already computed via Aggregate
-
-        rest_sizes = n_cells - group_sizes_dev
-
-        n_groups = len(self.groups_order)
-        n_cols = stop - start
-        group_sums = cp.zeros((n_groups, n_cols), dtype=cp.float64)
-        group_sum_sq = cp.zeros((n_groups, n_cols), dtype=cp.float64)
-        group_nnz = (
-            cp.zeros((n_groups, n_cols), dtype=cp.float64) if self.comp_pts else None
-        )
-        from rapids_singlecell._cuda import _rank_stats_cuda as _rs
-
-        _rs.group_chunk_stats(
-            block,
-            group_codes_dev,
-            group_sums,
-            group_sum_sq,
-            group_nnz if group_nnz is not None else group_sums,
-            compute_nnz=bool(self.comp_pts),
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-
-        chunk_means = group_sums / group_sizes_dev[:, None]
-        self.means[:, start:stop] = cp.asnumpy(chunk_means)
-
-        # variance with Bessel correction
-        chunk_vars = group_sum_sq / group_sizes_dev[:, None] - chunk_means**2
-        chunk_vars *= group_sizes_dev[:, None] / (group_sizes_dev[:, None] - 1)
-        self.vars[:, start:stop] = cp.asnumpy(chunk_vars)
-
-        if self.comp_pts:
-            self.pts[:, start:stop] = cp.asnumpy(group_nnz / group_sizes_dev[:, None])
-
-        if self.ireference is None:
-            total_sum = block.sum(axis=0)
-            total_sum_sq = (block**2).sum(axis=0)
-
-            rest_sums = total_sum[None, :] - group_sums
-            rest_means = rest_sums / rest_sizes[:, None]
-            self.means_rest[:, start:stop] = cp.asnumpy(rest_means)
-
-            rest_sum_sq = total_sum_sq[None, :] - group_sum_sq
-            rest_vars = rest_sum_sq / rest_sizes[:, None] - rest_means**2
-            rest_vars *= rest_sizes[:, None] / (rest_sizes[:, None] - 1)
-            self.vars_rest[:, start:stop] = cp.asnumpy(rest_vars)
-
-            if self.comp_pts:
-                total_nnz = (block != 0).sum(axis=0)
-                rest_nnz = total_nnz[None, :] - group_nnz
-                self.pts_rest[:, start:stop] = cp.asnumpy(
-                    rest_nnz / rest_sizes[:, None]
-                )
-
     def t_test(
         self, method: Literal["t-test", "t-test_overestim_var"]
     ) -> list[tuple[int, NDArray, NDArray]]:
@@ -306,25 +228,6 @@ class _RankGenes:
         from ._ttest import t_test
 
         return t_test(self, method)
-
-    def wilcoxon(
-        self,
-        *,
-        tie_correct: bool,
-        use_continuity: bool = False,
-        chunk_size: int | None = None,
-        return_u_values: bool = False,
-    ) -> list[tuple[int, NDArray, NDArray]]:
-        """Compute Wilcoxon rank-sum test statistics."""
-        from ._wilcoxon import wilcoxon
-
-        return wilcoxon(
-            self,
-            tie_correct=tie_correct,
-            use_continuity=use_continuity,
-            chunk_size=chunk_size,
-            return_u_values=return_u_values,
-        )
 
     def wilcoxon_binned(
         self,
@@ -363,49 +266,56 @@ class _RankGenes:
         tie_correct: bool = False,
         use_continuity: bool = False,
         chunk_size: int | None = None,
+        multi_gpu: bool | list[int] | str | None = None,
         n_bins: int | None = None,
         bin_range: Literal["log1p", "auto"] | None = None,
         return_u_values: bool = False,
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
-        # Sparse Wilcoxon handles implicit zeros analytically only for nonnegative data.
-        # Signed sparse Wilcoxon routes to sign-safe dense ranking inside streamers.
+        # Devices for the host-streaming t-test / binned shards.
+        self._multi_gpu = multi_gpu
+        # Exact OVR inserts implicit zeros between negative and positive stored
+        # values analytically. Binned and host OVO sparse paths still need the
+        # sign check; device OVO does not use its result.
         self._sparse_negative_fallback = False
         if method in {"wilcoxon", "wilcoxon_binned"}:
-            # Canonicalize before the negative check because summing duplicates can change signs.
-            # Fast paths rank stored nnz once, so they must see scanpy's summed view.
+            # Fast paths rank each stored coordinate once, so they must see
+            # scanpy's summed duplicate view even when no sign scan is needed.
             self.X = _canonicalize_sparse(self.X)
-            self._sparse_negative_fallback = _sparse_has_negative(self.X)
-        if method in {
-            "t-test",
-            "t-test_overestim_var",
-            "wilcoxon_binned",
-        }:
-            self.X = X_to_GPU(self.X)
+            needs_signed_fallback = method == "wilcoxon_binned" or (
+                self.ireference is not None and sp.issparse(self.X)
+            )
+            if needs_signed_fallback:
+                self._sparse_negative_fallback = _sparse_has_negative(self.X)
+        if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
+            # Host input streams (no full copy); device / Dask move to the GPU.
+            if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
+                self.X = X_to_GPU(self.X)
 
         n_genes = self.X.shape[1]
         if n_genes_user is None:
             n_genes_user = n_genes
 
+        wilcoxon_result = None
         if method in {"t-test", "t-test_overestim_var"}:
             test_results = self.t_test(method)
         elif method == "wilcoxon":
+            from ._wilcoxon import wilcoxon
+
             if isinstance(self.X, DaskArray):
                 msg = "Wilcoxon test is not supported for Dask arrays. Please convert your data to CuPy arrays."
                 raise ValueError(msg)
             self._score_dtype = np.dtype(np.float64 if return_u_values else np.float32)
-            self._wilcoxon_gpu_result = None
-            self._store_wilcoxon_gpu_result = True
-            try:
-                test_results = self.wilcoxon(
-                    tie_correct=tie_correct,
-                    use_continuity=use_continuity,
-                    chunk_size=chunk_size,
-                    return_u_values=return_u_values,
-                )
-            finally:
-                self._store_wilcoxon_gpu_result = False
+            wilcoxon_result = wilcoxon(
+                self,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                chunk_size=chunk_size,
+                multi_gpu=multi_gpu,
+                return_u_values=return_u_values,
+            )
+            test_results = []
         elif method == "wilcoxon_binned":
             test_results = self.wilcoxon_binned(
                 tie_correct=tie_correct,
@@ -419,7 +329,7 @@ class _RankGenes:
         else:
             assert_never(method)
 
-        if not test_results and self._wilcoxon_gpu_result is None:
+        if not test_results and wilcoxon_result is None:
             self.stats_arrays = {
                 "group_indices": np.empty(0, dtype=np.intp),
                 "group_names": np.empty(0, dtype=object),
@@ -428,11 +338,9 @@ class _RankGenes:
             }
             return
 
-        if self._wilcoxon_gpu_result is not None:
-            group_indices, scores_gpu, pvals_gpu, logfoldchanges_gpu = (
-                self._wilcoxon_gpu_result
-            )
-            try:
+        if wilcoxon_result is not None:
+            group_indices, scores_gpu, pvals_gpu, logfoldchanges_gpu = wilcoxon_result
+            with cp.cuda.Device(scores_gpu.device.id):
                 self._compute_statistics_gpu_arrays(
                     group_indices,
                     scores_gpu,
@@ -443,8 +351,6 @@ class _RankGenes:
                     n_genes=n_genes,
                     rankby_abs=rankby_abs,
                 )
-            finally:
-                self._wilcoxon_gpu_result = None
             return
 
         self._compute_statistics_arrays(
@@ -594,7 +500,7 @@ class _RankGenes:
         scores = cp.asnumpy(scores_gpu)
         sort_scores = np.abs(scores) if rankby_abs else scores
         top_idx = self._rank_indices_matrix(sort_scores, n_genes_user)
-        top_idx_gpu = cp.asarray(top_idx)
+        top_idx_gpu = cp.asarray(top_idx, dtype=cp.int32)
 
         arrays: dict[str, object] = {
             "group_indices": group_indices,
@@ -606,9 +512,12 @@ class _RankGenes:
             "scores": cp.asnumpy(
                 cp.take_along_axis(scores_gpu, top_idx_gpu, axis=1).astype(
                     self._score_dtype, copy=False
-                )
+                ),
+                order="F",
             ),
-            "pvals": cp.asnumpy(cp.take_along_axis(pvals_gpu, top_idx_gpu, axis=1)),
+            "pvals": cp.asnumpy(
+                cp.take_along_axis(pvals_gpu, top_idx_gpu, axis=1), order="F"
+            ),
         }
 
         if corr_method == "benjamini-hochberg":
@@ -619,14 +528,15 @@ class _RankGenes:
             msg = f"Unsupported correction method: {corr_method!r}."
             raise ValueError(msg)
         arrays["pvals_adj"] = cp.asnumpy(
-            cp.take_along_axis(pvals_adj_gpu, top_idx_gpu, axis=1)
+            cp.take_along_axis(pvals_adj_gpu, top_idx_gpu, axis=1), order="F"
         )
 
         if logfoldchanges_gpu is not None:
             arrays["logfoldchanges"] = cp.asnumpy(
                 cp.take_along_axis(logfoldchanges_gpu, top_idx_gpu, axis=1).astype(
                     cp.float32, copy=False
-                )
+                ),
+                order="F",
             )
         elif self.means is not None:
             self._logfoldchanges_into(arrays, group_indices, top_idx)

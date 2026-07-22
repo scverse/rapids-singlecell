@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import warnings
 from typing import TYPE_CHECKING
 
@@ -100,21 +101,29 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
     ddf = dd.from_map(mapper, pairs, meta=meta).to_backend("cudf").persist()
     import cugraph.dask.comms.comms as Comms
 
-    Comms.initialize(p2p=True)
-    g = Graph()
-    if use_weights:
-        g.from_dask_cudf_edgelist(
-            ddf,
-            source="src",
-            destination="dst",
-            weight="weight",
-        )
-    else:
-        g.from_dask_cudf_edgelist(
-            ddf,
-            source="src",
-            destination="dst",
-        )
+    try:
+        Comms.initialize(p2p=True)
+        g = Graph()
+        if use_weights:
+            g.from_dask_cudf_edgelist(
+                ddf,
+                source="src",
+                destination="dst",
+                weight="weight",
+            )
+        else:
+            g.from_dask_cudf_edgelist(
+                ddf,
+                source="src",
+                destination="dst",
+            )
+    except BaseException:
+        # A worker dying mid-handshake leaves cugraph's global communicator
+        # half-initialized; tear it down (best effort) so later calls don't
+        # fail with "already initialized".
+        with contextlib.suppress(Exception):
+            Comms.destroy()
+        raise
     return g
 
 
@@ -230,45 +239,52 @@ def leiden(
     else:
         resolutions = resolution
     modularities = []
-    for resolution in resolutions:
-        leiden_parts, modularity = culeiden(
-            g,
-            resolution=resolution,
-            random_state=random_state,
-            theta=theta,
-            max_iter=n_iterations,
-        )
-        if use_dask:
-            leiden_parts = leiden_parts.to_backend("pandas").compute()
-        else:
-            leiden_parts = leiden_parts.to_pandas()
-        modularities.append(modularity)
-
-        # Format output
-        groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-        key_added_to_use = key_added
-        if restrict_to is not None:
-            if key_added == "leiden":
-                key_added_to_use += "_R"
-            groups = rename_groups(
-                adata,
-                key_added=key_added_to_use,
-                restrict_key=restrict_key,
-                restrict_categories=restrict_categories,
-                restrict_indices=restrict_indices,
-                groups=groups,
+    try:
+        for resolution in resolutions:
+            leiden_parts, modularity = culeiden(
+                g,
+                resolution=resolution,
+                random_state=random_state,
+                theta=theta,
+                max_iter=n_iterations,
             )
-        if len(resolutions) > 1:
-            key_added_to_use += f"_{resolution}"
+            if use_dask:
+                leiden_parts = leiden_parts.to_backend("pandas").compute()
+            else:
+                leiden_parts = leiden_parts.to_pandas()
+            modularities.append(modularity)
 
-        adata.obs[key_added_to_use] = pd.Categorical(
-            values=groups.astype("U"),
-            categories=natsorted(map(str, np.unique(groups))),
-        )
-    if use_dask:
-        import cugraph.dask.comms.comms as Comms
+            # Format output
+            groups = (
+                leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
+            )
+            key_added_to_use = key_added
+            if restrict_to is not None:
+                if key_added == "leiden":
+                    key_added_to_use += "_R"
+                groups = rename_groups(
+                    adata,
+                    key_added=key_added_to_use,
+                    restrict_key=restrict_key,
+                    restrict_categories=restrict_categories,
+                    restrict_indices=restrict_indices,
+                    groups=groups,
+                )
+            if len(resolutions) > 1:
+                key_added_to_use += f"_{resolution}"
 
-        Comms.destroy()
+            adata.obs[key_added_to_use] = pd.Categorical(
+                values=groups.astype("U"),
+                categories=natsorted(map(str, np.unique(groups))),
+            )
+    finally:
+        # Always tear down the raft/NCCL comms, even if clustering raised, so a
+        # single failure can't leak the global cugraph communicator and make
+        # every later dask clustering call fail with "already initialized".
+        if use_dask:
+            import cugraph.dask.comms.comms as Comms
+
+            Comms.destroy()
     # store information on the clustering parameters
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
@@ -389,44 +405,51 @@ def louvain(
     else:
         resolutions = resolution
     modularities = []
-    for resolution in resolutions:
-        louvain_parts, modularity = culouvain(
-            g,
-            resolution=resolution,
-            max_level=n_iterations,
-            threshold=threshold,
-        )
-        if use_dask:
-            louvain_parts = louvain_parts.to_backend("pandas").compute()
-        else:
-            louvain_parts = louvain_parts.to_pandas()
-        modularities.append(modularity)
-
-        # Format output
-        groups = louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-        key_added_to_use = key_added
-        if restrict_to is not None:
-            if key_added == "louvain":
-                key_added_to_use += "_R"
-            groups = rename_groups(
-                adata,
-                key_added=key_added_to_use,
-                restrict_key=restrict_key,
-                restrict_categories=restrict_categories,
-                restrict_indices=restrict_indices,
-                groups=groups,
+    try:
+        for resolution in resolutions:
+            louvain_parts, modularity = culouvain(
+                g,
+                resolution=resolution,
+                max_level=n_iterations,
+                threshold=threshold,
             )
-        if len(resolutions) > 1:
-            key_added_to_use += f"_{resolution}"
+            if use_dask:
+                louvain_parts = louvain_parts.to_backend("pandas").compute()
+            else:
+                louvain_parts = louvain_parts.to_pandas()
+            modularities.append(modularity)
 
-        adata.obs[key_added_to_use] = pd.Categorical(
-            values=groups.astype("U"),
-            categories=natsorted(map(str, np.unique(groups))),
-        )
-    if use_dask:
-        import cugraph.dask.comms.comms as Comms
+            # Format output
+            groups = (
+                louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
+            )
+            key_added_to_use = key_added
+            if restrict_to is not None:
+                if key_added == "louvain":
+                    key_added_to_use += "_R"
+                groups = rename_groups(
+                    adata,
+                    key_added=key_added_to_use,
+                    restrict_key=restrict_key,
+                    restrict_categories=restrict_categories,
+                    restrict_indices=restrict_indices,
+                    groups=groups,
+                )
+            if len(resolutions) > 1:
+                key_added_to_use += f"_{resolution}"
 
-        Comms.destroy()
+            adata.obs[key_added_to_use] = pd.Categorical(
+                values=groups.astype("U"),
+                categories=natsorted(map(str, np.unique(groups))),
+            )
+    finally:
+        # Always tear down the raft/NCCL comms, even if clustering raised, so a
+        # single failure can't leak the global cugraph communicator and make
+        # every later dask clustering call fail with "already initialized".
+        if use_dask:
+            import cugraph.dask.comms.comms as Comms
+
+            Comms.destroy()
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
         "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
