@@ -508,7 +508,6 @@ def _map_umap(
     if "a" not in umap_params or "b" not in umap_params:
         raise ValueError("Reference UMAP metadata does not contain `a` and `b`.")
 
-    from cuml.internals.array import CumlArray
     from cuml.manifold import UMAP
 
     ref_is_sparse = cp_sparse.issparse(ref_rep)
@@ -537,6 +536,18 @@ def _map_umap(
     # API, then swap in the stored reference embedding so the query maps into
     # the existing coordinate system instead of the freshly fitted one.
     model.fit(ref_rep)
-    model.embedding_ = CumlArray(data=ref_embedding)
+    _set_reference_embedding(model, ref_embedding)
 
     return cp.asarray(model.transform(query_rep), dtype=cp.float32)
+
+
+def _set_reference_embedding(model, ref_embedding: cp.ndarray) -> None:
+    # cuml>=26.08 removed `CumlArray` and stores `embedding_` as an `ArrayIndexPair`.
+    try:
+        from cuml.internals.outputs import ArrayIndexPair
+
+        model.embedding_ = ArrayIndexPair(ref_embedding, None)
+    except ImportError:
+        from cuml.internals.array import CumlArray
+
+        model.embedding_ = CumlArray(data=ref_embedding)
