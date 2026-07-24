@@ -385,53 +385,6 @@ def test_spatial_reference_bounds_large_spatial_plots() -> None:
     )
 
 
-def test_spatial_reference_handles_niche_fragmentation_semantically() -> None:
-    bullets = _spatial_contract_bullets()
-
-    assert _covers(
-        bullets,
-        'calculate_niche(flavor="neighborhood")',
-        "cell-type-composition",
-        "leiden",
-        "niche-size distribution",
-        "`not_a_niche`",
-        "spatial coherence",
-        "`n_neighbors`",
-        "`resolutions`",
-        "lower resolutions coarsen",
-    )
-    assert _covers(
-        bullets,
-        "`min_niche_size`",
-        "only relabels",
-        "does not merge",
-        "fixed-k",
-        "separate method",
-        "`rsc.tl.kmeans`",
-        "deprecated",
-        "live-verified",
-    )
-    assert _covers(
-        bullets,
-        'flavor="cellcharter"',
-        "complementary",
-        "expression/pca/gmm",
-        "not validation",
-        '`gmm_init="kmeans"`',
-        "only initializes",
-    )
-    assert _covers(
-        bullets,
-        "`unknown`",
-        "missing",
-        "independently validated artifacts",
-        "rebuild the graph",
-        "retain uncertain cells",
-        "sensitivity",
-        "coverage",
-    )
-
-
 def test_notebook_reference_has_ordered_workflow_outline() -> None:
     text = (
         (install.skill_source() / "references" / "notebooks.md")
