@@ -797,5 +797,6 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_rank_stream_cuda, m) {
     m.def("_set_host_worker_limit", &set_host_worker_limit, "limit"_a);
+    register_scratch_allocator(m);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

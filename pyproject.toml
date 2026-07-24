@@ -4,9 +4,6 @@ requires = [
     "scikit-build-core[hatchling]>=1.0.1",
     "hatch-vcs",
     "nanobind>=2.0.0",
-    # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.
-    # 25.12+ provides the resource-ref API and flat RMM header path we use.
-    "librmm-cu12>=25.12",
 ]
 build-backend = "hatchling.build"
 

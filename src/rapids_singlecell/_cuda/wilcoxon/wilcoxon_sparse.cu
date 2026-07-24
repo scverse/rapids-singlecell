@@ -538,6 +538,7 @@ void register_sparse_bindings(nb::module_& m) {
 
 NB_MODULE(_wilcoxon_sparse_cuda, m) {
     m.def("_set_host_worker_limit", &set_host_worker_limit, "limit"_a);
+    register_scratch_allocator(m);
     def_csr_row_boundaries_host<int, int>(m);
     def_csr_row_boundaries_host<int64_t, int64_t>(m);
     REGISTER_GPU_BINDINGS(register_sparse_bindings, m);
