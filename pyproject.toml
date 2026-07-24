@@ -18,6 +18,8 @@ license = { file = "LICENSE" }
 authors = [ { name = "Severin Dicks" } ]
 readme = { file = "README.md", content-type = "text/markdown" }
 dynamic = [ "version" ]
+scripts.rapids-singlecell-install-skills = "rapids_singlecell_skills.install:main"
+scripts.rapids-singlecell-check-kernel = "rapids_singlecell_skills.kernel:main"
 
 dependencies = [
     "anndata>=0.10.0",
@@ -155,7 +157,7 @@ local_scheme = "node-and-date"
 version-file = "src/rapids_singlecell/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = [ "src/rapids_singlecell", "src/testing" ]
+packages = [ "src/rapids_singlecell", "src/rapids_singlecell_skills", "src/testing" ]
 exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
 
 [tool.hatch.build.targets.wheel.hooks.scikit-build]

@@ -279,6 +279,8 @@ def bbknn(
         of a symmetrical matrix of connectivities.
     n_pcs
         Use this many PCs. If `n_pcs==0` and `use_rep is None`, use `.X`.
+    batch_key
+        Key in `adata.obs` containing the batch labels to balance. Required.
     use_rep
         Use the indicated representation. `'X'` or any key for `.obsm` is valid.
         If `None`, the representation is chosen automatically: For `.n_vars < 50`, `.X`
