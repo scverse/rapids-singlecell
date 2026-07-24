@@ -47,6 +47,7 @@ __all__ = [
     "_qc_cuda",
     "_qc_dask_cuda",
     "_rank_stats_cuda",
+    "_rank_stream_cuda",
     "_scale_cuda",
     "_sparse2dense_cuda",
     "_spca_cuda",
@@ -67,11 +68,39 @@ def _preload_rapids_runtime_libs() -> None:
 
 _preload_rapids_runtime_libs()
 
+# Modules whose CUDA kernels use device scratch. They allocate through a
+# CuPy-backed allocator injected here, so temporaries land on the caller's
+# current device resource (RMM pool / UVM aware) without linking librmm.
+_SCRATCH_MODULES = frozenset(
+    {"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"}
+)
+_scratch_allocator = None
+
+
+def _get_scratch_allocator():
+    """(alloc, free) backed by CuPy's current allocator; shared process-wide."""
+    global _scratch_allocator
+    if _scratch_allocator is None:
+        import cupy as cp
+
+        live = {}
+
+        def _alloc(nbytes: int) -> int:
+            mem = cp.cuda.alloc(int(nbytes))
+            live[int(mem.ptr)] = mem
+            return int(mem.ptr)
+
+        def _free(ptr: int) -> None:
+            live.pop(int(ptr), None)
+
+        _scratch_allocator = (_alloc, _free)
+    return _scratch_allocator
+
 
 def __getattr__(name: str):
     if name in __all__:
         try:
-            return importlib.import_module(f".{name}", __name__)
+            mod = importlib.import_module(f".{name}", __name__)
         except ModuleNotFoundError:
             # Extension genuinely absent (docs/no-GPU): degrade to None.
             return None
@@ -84,4 +113,7 @@ def __getattr__(name: str):
                 "installed for your CUDA version."
             )
             raise ImportError(msg) from exc
+        if name in _SCRATCH_MODULES:
+            mod._set_scratch_allocator(*_get_scratch_allocator())
+        return mod
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -113,16 +113,19 @@ if (RSC_BUILD_EXTENSIONS)
   if (RSC_RMM_HINTS)
     list(GET RSC_RMM_HINTS 0 _rsc_rmm_dir)
     set(rmm_DIR "${_rsc_rmm_dir}" CACHE PATH "Path to rmm package config" FORCE)
-    find_package(rmm CONFIG REQUIRED)
-  else()
-    find_package(rmm CONFIG REQUIRED)
   endif()
+  # rmm is no longer linked -- kernels use a CuPy-backed scratch allocator. When
+  # librmm is present it only pins CCCL/nvtx3 hints; absent it, nvcc's toolkit
+  # CCCL is used, so it is optional rather than REQUIRED.
+  find_package(rmm CONFIG QUIET)
 
   # CCCL 3.3.0 gates cudaDevAttrHostNumaMemoryPoolsSupported too loosely.
   # Fail fast for CUDA 12.6-12.8 source builds with that buggy CCCL.
-  set(_rsc_cccl_buggy_numa_guard TRUE)
-  if (DEFINED CCCL_VERSION AND CCCL_VERSION VERSION_GREATER 3.3.0)
-    set(_rsc_cccl_buggy_numa_guard FALSE)
+  # Only relevant when librmm pins CCCL 3.3.0 (RAPIDS 26.04). With no rmm at
+  # build time nvcc uses the toolkit's own (self-consistent) CCCL, so skip it.
+  set(_rsc_cccl_buggy_numa_guard FALSE)
+  if (DEFINED CCCL_VERSION AND CCCL_VERSION VERSION_LESS_EQUAL 3.3.0)
+    set(_rsc_cccl_buggy_numa_guard TRUE)
   endif()
   if (NOT RSC_SKIP_CUDA_VERSION_CHECK
       AND _rsc_cccl_buggy_numa_guard
@@ -137,7 +140,7 @@ if (RSC_BUILD_EXTENSIONS)
       "If your toolkit does define this enum, override with -DRSC_SKIP_CUDA_VERSION_CHECK=ON.")
   endif()
 
-  message(STATUS "Using RMM for CUDA extension scratch allocations")
+  message(STATUS "CUDA extension scratch uses a CuPy-backed allocator (no librmm link)")
   message(STATUS "Building for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 else()
   message(STATUS "RSC_BUILD_EXTENSIONS=OFF -> skipping compiled extensions for docs")
@@ -186,54 +189,14 @@ function(add_nb_cuda_module target src)
   endif()
 endfunction()
 
-# RMM-backed nanobind CUDA module: normal module plus shared scratch allocator.
-# Wheels use sibling RAPIDS packages; editable imports still preload fallbacks.
+# nanobind CUDA module that also uses the shared device-scratch allocator.
+# Scratch is CuPy-backed (allocator injected from Python), so these modules link
+# no RAPIDS C++ libs -- just add_nb_cuda_module (cudart) plus rmm_scratch.cu.
 function(add_rmm_cuda_module target src)
   add_nb_cuda_module(${target} ${src})
   if (RSC_BUILD_EXTENSIONS)
     target_sources(${target} PRIVATE
         src/rapids_singlecell/_cuda/rmm_scratch.cu)
-    target_link_libraries(${target} PRIVATE rmm::rmm)
-    set(_rsc_rmm_build_rpath)
-    set(_rsc_rmm_have_build_librmm FALSE)
-    set(_rsc_rmm_have_build_rapids_logger FALSE)
-    if (DEFINED ENV{CONDA_PREFIX})
-      set(_rsc_rmm_env_site
-          "$ENV{CONDA_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
-      if (EXISTS "${_rsc_rmm_env_site}/librmm/lib64")
-        list(APPEND _rsc_rmm_build_rpath
-            "${_rsc_rmm_env_site}/librmm/lib64")
-        set(_rsc_rmm_have_build_librmm TRUE)
-      endif()
-      if (EXISTS "${_rsc_rmm_env_site}/rapids_logger/lib64")
-        list(APPEND _rsc_rmm_build_rpath
-            "${_rsc_rmm_env_site}/rapids_logger/lib64")
-        set(_rsc_rmm_have_build_rapids_logger TRUE)
-      endif()
-    endif()
-    if (NOT _rsc_rmm_have_build_librmm AND rmm_DIR)
-      get_filename_component(_rsc_rmm_build_librmm_dir
-          "${rmm_DIR}/../.." REALPATH)
-      list(APPEND _rsc_rmm_build_rpath "${_rsc_rmm_build_librmm_dir}")
-    endif()
-    if (NOT _rsc_rmm_have_build_rapids_logger AND rapids_logger_DIR)
-      get_filename_component(_rsc_rmm_build_rapids_logger_dir
-          "${rapids_logger_DIR}/../.." REALPATH)
-      list(APPEND _rsc_rmm_build_rpath
-          "${_rsc_rmm_build_rapids_logger_dir}")
-    endif()
-    set(_rsc_rmm_install_rpath
-        "\$ORIGIN/../../librmm/lib64"
-        "\$ORIGIN/../../rapids_logger/lib64"
-    )
-    if (CUDAToolkit_LIBRARY_DIR)
-      list(APPEND _rsc_rmm_build_rpath "${CUDAToolkit_LIBRARY_DIR}")
-      list(APPEND _rsc_rmm_install_rpath "${CUDAToolkit_LIBRARY_DIR}")
-    endif()
-    set_target_properties(${target} PROPERTIES
-        BUILD_RPATH "${_rsc_rmm_build_rpath}"
-        INSTALL_RPATH "${_rsc_rmm_install_rpath}"
-    )
   endif()
 endfunction()
 
