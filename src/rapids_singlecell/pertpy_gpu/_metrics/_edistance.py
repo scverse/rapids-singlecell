@@ -836,15 +836,10 @@ class EDistanceMetric(BaseMetric):
                 blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
 
                 if is_sparse:
-                    # int64 indptr -> _i64 binding; int32 -> default.
-                    if data["indptr"].dtype == cp.int64:
-                        kernel = _ed.compute_distances_sparse_i64
-                    else:
-                        kernel = _ed.compute_distances_sparse
-                    kernel(
-                        data["data"],
-                        data["indices"],
+                    _ed.compute_distances_sparse(
                         data["indptr"],
+                        data["indices"],
+                        data["data"],
                         data["off"],
                         data["idx"],
                         data["pair_left"],
