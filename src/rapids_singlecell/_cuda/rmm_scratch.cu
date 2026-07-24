@@ -1,7 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <stdexcept>
+#include <utility>
 
 #include <cuda_runtime.h>
 #include <nanobind/nanobind.h>
@@ -18,30 +18,40 @@ using namespace nb::literals;
 namespace {
 std::function<std::uintptr_t(std::size_t)> g_alloc;
 std::function<void(std::uintptr_t)> g_dealloc;
+
+void set_scratch_allocator(nb::callable alloc, nb::callable dealloc) {
+    g_alloc = [alloc](std::size_t bytes) -> std::uintptr_t {
+        nb::gil_scoped_acquire gil;
+        return nb::cast<std::uintptr_t>(alloc(bytes));
+    };
+    g_dealloc = [dealloc](std::uintptr_t ptr) {
+        nb::gil_scoped_acquire gil;
+        dealloc(ptr);
+    };
+}
+
+void ensure_scratch_allocator() {
+    nb::gil_scoped_acquire gil;
+    if (g_alloc) return;
+    nb::tuple callbacks =
+        nb::cast<nb::tuple>(nb::module_::import_("rapids_singlecell._cuda")
+                                .attr("_get_scratch_allocator")());
+    set_scratch_allocator(nb::borrow<nb::callable>(callbacks[0]),
+                          nb::borrow<nb::callable>(callbacks[1]));
+}
 }  // namespace
 
 void register_scratch_allocator(nb::module_& m) {
     m.def(
         "_set_scratch_allocator",
         [](nb::callable alloc, nb::callable dealloc) {
-            g_alloc = [alloc](std::size_t bytes) -> std::uintptr_t {
-                nb::gil_scoped_acquire gil;
-                return nb::cast<std::uintptr_t>(alloc(bytes));
-            };
-            g_dealloc = [dealloc](std::uintptr_t ptr) {
-                nb::gil_scoped_acquire gil;
-                dealloc(ptr);
-            };
+            set_scratch_allocator(std::move(alloc), std::move(dealloc));
         },
         "alloc"_a, "dealloc"_a);
 }
 
 void* rmm_allocate(size_t bytes) {
-    if (!g_alloc) {
-        throw std::runtime_error(
-            "rapids-singlecell scratch allocator not initialized; import "
-            "rapids_singlecell before invoking CUDA kernels");
-    }
+    ensure_scratch_allocator();
     return reinterpret_cast<void*>(g_alloc(bytes));
 }
 
