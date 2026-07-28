@@ -17,6 +17,12 @@ related = [ "dcg.mlm", "dcg.ulm", "dcg.waggr", "dcg.zscore" ]
 keywords = [ "niche analysis", "spatial niches", "squidpy", "squidpy gpu" ]
 related = [ "gr.co_occurrence", "gr.spatial_autocorr" ]
 
+[[entries."gr.calculate_niche".notes]]
+kind = "snapshot"
+claim = "Prefer flavor='cellcharter' as the default: its fixed component count yields an interpretable number of niches, whereas the Leiden-based composition flavors pick their own granularity and can return thousands of micro-niches on a large section. Check niche count and size against data scale whichever flavor you choose."
+source = "https://rapids-singlecell.readthedocs.io/en/latest/api/generated/rapids_singlecell.gr.calculate_niche.html"
+as_of = { rsc = "0.16.1.dev12+g8810e5dcd.d20260728" }
+
 [entries."get.aggregate".index]
 keywords = [ "aggregate", "aggregation", "grouped summary" ]
 related = [  ]

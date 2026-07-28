@@ -31,16 +31,17 @@ def test_skill_bundle_is_minimal() -> None:
         "references/dask.md",
         "references/memory.md",
         "references/notebooks.md",
+        "references/perturbation.md",
         "references/setup.md",
         "references/spatial.md",
     }
 
     text = (source / "SKILL.md").read_text(encoding="utf-8")
     assert len(text.splitlines()) <= 100
-    assert len(text.split()) <= 850
+    assert len(text.split()) <= 1150
     description = re.search(r"(?m)^description:\s*(.+)$", text)
     assert description is not None
-    assert len(description.group(1).strip("\"'")) <= 200
+    assert len(description.group(1).strip("\"'")) <= 500
     normalized_text = " ".join(text.split())
     for phrase in (
         "rapids-singlecell-check-kernel",
@@ -48,16 +49,24 @@ def test_skill_bundle_is_minimal() -> None:
         "references/memory.md",
         "references/dask.md",
         "references/notebooks.md",
+        "references/perturbation.md",
         "references/setup.md",
         "references/spatial.md",
         "executed `.ipynb`",
     ):
         assert phrase in normalized_text
 
-    for name in ("memory.md", "dask.md", "notebooks.md", "setup.md", "spatial.md"):
+    for name in (
+        "memory.md",
+        "dask.md",
+        "notebooks.md",
+        "perturbation.md",
+        "setup.md",
+        "spatial.md",
+    ):
         reference = (source / "references" / name).read_text(encoding="utf-8")
         assert len(reference.splitlines()) <= 100
-        assert len(reference.split()) <= 900
+        assert len(reference.split()) <= 1000
 
 
 def _markdown_bullets(path: Path) -> list[str]:
@@ -77,6 +86,10 @@ def _notebook_contract_bullets() -> list[str]:
 
 def _spatial_contract_bullets() -> list[str]:
     return _markdown_bullets(install.skill_source() / "references" / "spatial.md")
+
+
+def _perturbation_contract_bullets() -> list[str]:
+    return _markdown_bullets(install.skill_source() / "references" / "perturbation.md")
 
 
 def _covers(bullets: list[str], *terms: str) -> bool:
@@ -301,6 +314,40 @@ def test_notebook_reference_preserves_notebook_contract() -> None:
     )
 
 
+def test_notebook_reference_guards_kernel_level_reproducibility() -> None:
+    """Regression guards for the run3 notebook defects (6x RMM re-init, 95-line cells)."""
+    bullets = _notebook_contract_bullets()
+    outline = (
+        (install.skill_source() / "references" / "notebooks.md")
+        .read_text(encoding="utf-8")
+        .casefold()
+    )
+
+    assert "exactly once in this first cell" in " ".join(outline.split())
+    assert "undefined behavior" in outline
+    assert _covers(
+        bullets,
+        "author the analysis in the notebook",
+        "never assemble a notebook by pasting",
+        "shared kernel",
+    )
+    assert _covers(bullets, "under roughly 25 lines", "several tasks, not one")
+
+
+def test_core_shows_a_worked_skeleton() -> None:
+    """The skeleton is the shape agents copy; prose alone let run3 drift into scripts."""
+    text = (install.skill_source() / "SKILL.md").read_text(encoding="utf-8")
+
+    for phrase in (
+        "configure RMM exactly once per kernel",
+        "one stage per cell",
+        "rsc.get.anndata_to_GPU(adata, convert_all=True)",
+        'rsc.tl.leiden(adata, dtype="float64", random_state=SEED)',
+        "rsc.get.anndata_to_CPU(adata)",
+    ):
+        assert phrase in text
+
+
 def test_notebook_reference_preserves_scverse_data_flow() -> None:
     bullets = _notebook_contract_bullets()
 
@@ -383,6 +430,71 @@ def test_spatial_reference_bounds_large_spatial_plots() -> None:
         "stop",
         "rerender",
     )
+
+
+def test_perturbation_reference_orders_workflow_and_bounds_pertpy() -> None:
+    bullets = _perturbation_contract_bullets()
+
+    assert _covers(
+        bullets,
+        "rsc.ptg.guideassignment",
+        "perturbation_signature",
+        "mixscape",
+        "mixscale",
+        "`lda` requires",
+        "x_pert",
+    )
+    assert _covers(
+        bullets,
+        "unscaled log-normalized",
+        "scaling beforehand",
+        "no error is raised",
+    )
+    assert _covers(bullets, "split_by", "biological replicate")
+    assert _covers(
+        bullets,
+        "`distance`",
+        "`guideassignment`",
+        "`mixscape`",
+        "`mixscale`",
+        "meanvar",
+        "deprecated",
+    )
+    assert _covers(
+        bullets,
+        "no rsc equivalent",
+        "pertpy skill",
+        "attributed boundary",
+        "reimplementing",
+    )
+    assert _covers(bullets, "permute over", "rather than over cells", "significance")
+    assert _covers(
+        bullets,
+        "`pairwise`",
+        "`onesided_distances`",
+        "`contrast_distances`",
+        "create_contrasts",
+        "split_by",
+        "stratifies",
+    )
+    # contrast_distances has no bootstrap parameter; the skill must not imply it does
+    assert _covers(
+        bullets, "`contrast_distances` takes no `bootstrap` argument", "resample"
+    )
+
+    # the two-step call shape: staticmethod on the class, then a configured instance
+    text = (
+        (install.skill_source() / "references" / "perturbation.md")
+        .read_text(encoding="utf-8")
+        .casefold()
+    )
+    for phrase in (
+        "rsc.ptg.distance.create_contrasts(",
+        "staticmethod: call on the class",
+        'split_by="cell_type"',
+        'rsc.ptg.distance(metric="edistance").contrast_distances(adata, contrasts)',
+    ):
+        assert phrase in text
 
 
 def test_notebook_reference_has_ordered_workflow_outline() -> None:
@@ -468,6 +580,28 @@ def test_api_index_finds_explicit_method_preferences() -> None:
         and "input graph" in note["claim"]
         for note in leiden["notes"]
     )
+
+
+def test_parameter_choices_resolve_aliased_literals() -> None:
+    """Choices must survive private aliases and PEP 695 `type` statements.
+
+    `typing.get_type_hints` resolves a whole signature at once and dies on the first
+    TYPE_CHECKING-only name, which would hide every parameter on these functions.
+    """
+    rsc = pytest.importorskip("rapids_singlecell")
+    api = pytest.importorskip("rapids_singlecell_skills.api")
+
+    # `flavor: flavors` -- a module-level alias, not an inline Literal
+    hvg = api._parameter_choices(rsc.pp.highly_variable_genes)
+    assert "seurat_v3" in hvg["flavor"]
+    assert "poisson_gene_selection" in hvg["flavor"]
+
+    # `method: _Method | None` -- a PEP 695 `type` alias inside a union
+    ranked = api._parameter_choices(rsc.tl.rank_genes_groups)
+    assert {"wilcoxon", "logreg", "t-test"} <= set(ranked["method"])
+
+    # an inline Literal still works, and unresolvable annotations are skipped
+    assert "cellcharter" in api._parameter_choices(rsc.gr.calculate_niche)["flavor"]
 
 
 def test_install_check_and_force(tmp_path: Path) -> None:
@@ -563,6 +697,20 @@ def test_managed_memory_toggle() -> None:
         "managed_memory": True,
         "devices": 2,
     }
+
+
+def test_managed_pool_route_is_checkable() -> None:
+    """memory.md documents a sized managed pool, so preflight must be able to test it."""
+    assert kernel._rmm_options(
+        "managed-pool", 0, initial_pool_size="1GiB", maximum_pool_size="8GiB"
+    ) == {
+        "pool_allocator": True,
+        "managed_memory": True,
+        "devices": 0,
+        "initial_pool_size": "1GiB",
+        "maximum_pool_size": "8GiB",
+    }
+    assert "api" in kernel._STEPS
 
 
 def test_preflight_reports_setup_failure(monkeypatch: pytest.MonkeyPatch) -> None:

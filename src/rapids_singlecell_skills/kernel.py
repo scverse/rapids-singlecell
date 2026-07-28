@@ -10,10 +10,11 @@ from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from typing import Any, Literal
 
-Mode = Literal["pool", "managed"]
+Mode = Literal["pool", "managed", "managed-pool"]
 Report = dict[str, Any]
 
-_STEPS = ("rmm", "gpu", "cuda", "rsc", "extensions")
+_MODES = ("pool", "managed", "managed-pool")
+_STEPS = ("rmm", "gpu", "cuda", "rsc", "extensions", "api")
 
 
 def _pass(report: Report, step: str, summary: str) -> None:
@@ -42,25 +43,58 @@ def _finish(report: Report, *, display: bool) -> Report:
     return report
 
 
-def _rmm_options(mode: Mode, device: int) -> dict[str, bool | int]:
-    if mode not in {"pool", "managed"}:
-        raise ValueError("mode must be 'pool' or 'managed'")
+def _rmm_options(
+    mode: Mode,
+    device: int,
+    *,
+    initial_pool_size: str | None = None,
+    maximum_pool_size: str | None = None,
+) -> dict[str, bool | int | str]:
+    if mode not in _MODES:
+        raise ValueError(f"mode must be one of {', '.join(_MODES)}")
     if device < 0:
         raise ValueError("device must be non-negative")
-    return {
-        "pool_allocator": mode == "pool",
-        "managed_memory": mode == "managed",
+    options: dict[str, bool | int | str] = {
+        "pool_allocator": mode in {"pool", "managed-pool"},
+        "managed_memory": mode in {"managed", "managed-pool"},
         "devices": device,
     }
+    if initial_pool_size is not None:
+        options["initial_pool_size"] = initial_pool_size
+    if maximum_pool_size is not None:
+        options["maximum_pool_size"] = maximum_pool_size
+    return options
 
 
-def _init_rmm(mode: Mode, *, device: int) -> Any:
-    options = _rmm_options(mode, device)
+def _visible_device_count() -> int:
+    """Count GPUs without importing CuPy, which must follow RMM configuration."""
+    from rmm._cuda.gpu import getDeviceCount
+
+    return int(getDeviceCount())
+
+
+def _init_rmm(
+    mode: Mode,
+    *,
+    device: int,
+    initial_pool_size: str | None = None,
+    maximum_pool_size: str | None = None,
+) -> Any:
+    options = _rmm_options(
+        mode,
+        device,
+        initial_pool_size=initial_pool_size,
+        maximum_pool_size=maximum_pool_size,
+    )
     loaded = [name for name in ("cupy", "rapids_singlecell") if name in sys.modules]
     if loaded:
         raise RuntimeError(f"already imported: {', '.join(loaded)}; start fresh")
 
     import rmm
+
+    count = _visible_device_count()
+    if count == 0 or device >= count:
+        raise RuntimeError(f"device {device} unavailable; {count} GPU(s) visible")
 
     rmm.reinitialize(**options)
 
@@ -85,7 +119,14 @@ def _extension_names(directory: Path) -> list[str]:
     )
 
 
-def _preflight(mode: Mode = "pool", *, device: int = 0, display: bool = True) -> Report:
+def _preflight(
+    mode: Mode = "pool",
+    *,
+    device: int = 0,
+    display: bool = True,
+    initial_pool_size: str | None = None,
+    maximum_pool_size: str | None = None,
+) -> Report:
     report: Report = {"checks": {}}
     if "ipykernel" in sys.modules:
         _fail(
@@ -96,7 +137,12 @@ def _preflight(mode: Mode = "pool", *, device: int = 0, display: bool = True) ->
         return _finish(report, display=display)
 
     try:
-        cp = _init_rmm(mode, device=device)
+        cp = _init_rmm(
+            mode,
+            device=device,
+            initial_pool_size=initial_pool_size,
+            maximum_pool_size=maximum_pool_size,
+        )
         _pass(report, "rmm", mode)
     except Exception as error:  # noqa: BLE001 - this command diagnoses import failures
         _fail(report, "rmm", error)
@@ -161,18 +207,35 @@ def _preflight(mode: Mode = "pool", *, device: int = 0, display: bool = True) ->
     except Exception as error:  # noqa: BLE001 - this command diagnoses kernel failures
         _fail(report, "extensions", error)
 
+    try:
+        from rapids_singlecell_skills import api
+
+        contract = api._contract(rsc)
+        api._validate_hand_symbols(api._load_hand_layer(), contract)
+        _pass(report, "api", f"discovery ready; {len(contract)} public symbols")
+    except Exception as error:  # noqa: BLE001 - this command diagnoses helper failures
+        _fail(report, "api", error)
+
     return _finish(report, display=display)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the disposable preflight."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("pool", "managed"), default="pool")
+    parser.add_argument("--mode", choices=_MODES, default="pool")
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--initial-pool-size", help="e.g. 1GiB; managed-pool or pool")
+    parser.add_argument("--maximum-pool-size", help="e.g. 32GiB; managed-pool or pool")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    report = _preflight(args.mode, device=args.device, display=not args.json)
+    report = _preflight(
+        args.mode,
+        device=args.device,
+        display=not args.json,
+        initial_pool_size=args.initial_pool_size,
+        maximum_pool_size=args.maximum_pool_size,
+    )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ready"] else 1

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import textwrap
 import tomllib
+import typing
 from importlib import resources
 from pathlib import Path
 from types import ModuleType
@@ -878,6 +879,7 @@ def _merged_view(
     generated = dict(surface_entry["generated"])
     generated["kind"] = kind
     generated["params"] = [item["name"] for item in parameters]
+    generated["choices"] = _parameter_choices(value)
     generated["sections"] = sorted(sections)
 
     if parameter is not None:
@@ -1037,6 +1039,8 @@ def _print_view(view: dict[str, Any]) -> None:
             summary = generated["summary"] or "Undocumented."
             print(f"summary: {_display_text(summary)}")
             print("parameters: " + ", ".join(generated["params"]))
+            for name, members in generated.get("choices", {}).items():
+                print(f"  {name} choices: {', '.join(members)}")
             if deprecated := generated.get("deprecated"):
                 print(f"deprecated: {deprecated}")
 
@@ -1052,9 +1056,99 @@ def _print_json(payload: dict[str, Any]) -> None:
     )
 
 
+_MAP_SUMMARY_CHARS = 68
+
+
+def _literal_values(resolved: Any) -> list[str]:
+    """Collect Literal string members, unwrapping PEP 695 aliases and unions."""
+    resolved = getattr(resolved, "__value__", resolved)
+    values = [arg for arg in typing.get_args(resolved) if isinstance(arg, str)]
+    for arg in typing.get_args(resolved):
+        arg = getattr(arg, "__value__", arg)
+        values += [item for item in typing.get_args(arg) if isinstance(item, str)]
+    return sorted(set(values))
+
+
+def _parameter_choices(value: Any) -> dict[str, list[str]]:
+    """Resolve each annotation on its own so one unresolvable name is not fatal.
+
+    ``typing.get_type_hints`` resolves a whole signature at once and raises on the
+    first ``TYPE_CHECKING``-only name, which hides every other parameter's choices.
+    Annotations are strings under ``from __future__ import annotations``, so each is
+    evaluated against its defining module namespace and skipped when that fails.
+    """
+    try:
+        signature = inspect.signature(value)
+    except (TypeError, ValueError):
+        return {}
+    module = sys.modules.get(getattr(value, "__module__", "") or "")
+    namespace = {**vars(typing), **(vars(module) if module else {})}
+    choices: dict[str, list[str]] = {}
+    for name, parameter in signature.parameters.items():
+        annotation = parameter.annotation
+        if isinstance(annotation, str):
+            try:
+                annotation = eval(annotation, namespace)
+            except Exception:  # noqa: BLE001 - an unresolvable name is not an error
+                continue
+        if members := _literal_values(annotation):
+            choices[name] = members
+    return choices
+
+
+def _map_rows(
+    contract: dict[str, Any], *, namespace: str | None
+) -> list[tuple[str, str]]:
+    """Return one compact (symbol, summary) row per public symbol."""
+    rows = []
+    for symbol in sorted(contract):
+        if namespace is not None and not symbol.startswith(f"{namespace}."):
+            continue
+        summary = _display_text(_summary(contract[symbol]) or "")
+        rows.append(
+            (
+                symbol,
+                textwrap.shorten(
+                    summary or "No summary documented.",
+                    width=_MAP_SUMMARY_CHARS,
+                    placeholder=" …",
+                ),
+            )
+        )
+    return rows
+
+
+def _print_map(
+    built_against: dict[str, Any],
+    rows: list[tuple[str, str]],
+    *,
+    contract: dict[str, Any] | None = None,
+) -> None:
+    print(f"built against: rsc={built_against['rsc']}")
+    print(f"public symbols: {len(rows)}")
+    width = max((len(symbol) for symbol, _ in rows), default=0)
+    for symbol, summary in rows:
+        print(f"rsc.{symbol.ljust(width)}  {summary}")
+        if contract is None:
+            continue
+        for name, members in _parameter_choices(contract[symbol]).items():
+            print(f"{' ' * (width + 6)}{name}: {', '.join(members)}")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    map_parser = subparsers.add_parser(
+        "map", help="print the whole public API surface in one pass"
+    )
+    map_parser.add_argument("--namespace")
+    map_parser.add_argument(
+        "--options",
+        action="store_true",
+        help="also list the accepted values of every enumerated argument",
+    )
+    map_parser.add_argument("--json", action="store_true")
 
     search_parser = subparsers.add_parser("search", help="search the live RSC API")
     search_parser.add_argument("query", nargs="+")
@@ -1110,6 +1204,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"{len(entries)} have sparse annotations"
                 )
                 _print_diagnostics(_freshness_diagnostics(built_against))
+            return 0
+
+        if args.command == "map":
+            rows = _map_rows(contract, namespace=args.namespace)
+            if not rows:
+                raise QueryError(f"no public symbols in namespace {args.namespace!r}")
+            if args.json:
+                payload = {
+                    "built_against": built_against["rsc"],
+                    "symbols": {f"rsc.{s}": summary for s, summary in rows},
+                }
+                if args.options:
+                    payload["choices"] = {
+                        f"rsc.{s}": choices
+                        for s, _ in rows
+                        if (choices := _parameter_choices(contract[s]))
+                    }
+                _print_json(payload)
+            else:
+                _print_map(
+                    built_against, rows, contract=contract if args.options else None
+                )
             return 0
 
         if args.command == "search":
