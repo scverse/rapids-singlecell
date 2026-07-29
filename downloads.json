@@ -1,0 +1,22 @@
+{
+  "data_date": "2026-07-28",
+  "source": "https://clickpy.clickhouse.com",
+  "packages": {
+    "rapids-singlecell": {
+      "total": 281481,
+      "last_30_days": 5839
+    },
+    "rapids-singlecell-cu12": {
+      "total": 11658,
+      "last_30_days": 2707
+    },
+    "rapids-singlecell-cu13": {
+      "total": 10576,
+      "last_30_days": 2699
+    }
+  },
+  "combined": {
+    "total": 303715,
+    "last_30_days": 11245
+  }
+}
