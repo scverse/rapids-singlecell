@@ -1,6 +1,6 @@
 ```{include} ../README.md
 :start-line: 0
-:end-line: 17
+:end-line: 18
 ```
 
 [//]: # (numfocus-fiscal-sponsor-attribution)
