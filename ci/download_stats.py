@@ -188,8 +188,6 @@ def write_badge(path: Path, label: str, count: int) -> None:
                 "label": label,
                 "message": humanize(count),
                 "color": "blue",
-                "logo": "pypi",
-                "logoColor": "white",
             },
             indent=2,
         )
