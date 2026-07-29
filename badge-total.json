@@ -2,7 +2,5 @@
   "schemaVersion": 1,
   "label": "downloads",
   "message": "304k",
-  "color": "blue",
-  "logo": "pypi",
-  "logoColor": "white"
+  "color": "blue"
 }
