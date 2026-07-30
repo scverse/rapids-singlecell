@@ -51,7 +51,10 @@ overrides.matrix.deps.extra-dependencies = [
     # prereleases (numba 0.63.0b1 -> removed np.trapz; numba 0.66.0rc2 + numba-cuda
     # 0.30.2 -> missing numba.cuda.types.NPDatetime). Pin the known-good stable pair
     # (numba 0.64.x + numba-cuda 0.28.x) so only RAPIDS uses nightlies.
+    # `stable` needs numba pinned too: uv reaches for 0.63.0b1 there (the only numba
+    # without a `numpy<2.5` cap) and the numpy pin alone doesn't walk it back.
     { if = [
+        "stable",
         "dev",
         "rapids_prerelease",
     ], value = "numba>=0.64,<0.65" },
