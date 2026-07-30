@@ -39,9 +39,11 @@ overrides.matrix.deps.extra-dependencies = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
     # numpy 2.5 removed `np.row_stack`, which numba-cuda still calls -> the whole
-    # suite fails at collection. Pin <2.5 for the prerelease-allowing envs until
-    # numba-cuda drops the call; remove this once that lands.
+    # suite fails at collection. Now that 2.5 is a stable release it hits every env,
+    # so `stable` needs it too. Remove once numba-cuda guards the call
+    # (NVIDIA/numba-cuda#907, fix in #916).
     { if = [
+        "stable",
         "dev",
         "rapids_prerelease",
     ], value = "numpy<2.5" },
@@ -49,7 +51,10 @@ overrides.matrix.deps.extra-dependencies = [
     # prereleases (numba 0.63.0b1 -> removed np.trapz; numba 0.66.0rc2 + numba-cuda
     # 0.30.2 -> missing numba.cuda.types.NPDatetime). Pin the known-good stable pair
     # (numba 0.64.x + numba-cuda 0.28.x) so only RAPIDS uses nightlies.
+    # `stable` needs numba pinned too: uv reaches for 0.63.0b1 there (the only numba
+    # without a `numpy<2.5` cap) and the numpy pin alone doesn't walk it back.
     { if = [
+        "stable",
         "dev",
         "rapids_prerelease",
     ], value = "numba>=0.64,<0.65" },
