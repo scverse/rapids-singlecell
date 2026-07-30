@@ -39,9 +39,11 @@ overrides.matrix.deps.extra-dependencies = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
     # numpy 2.5 removed `np.row_stack`, which numba-cuda still calls -> the whole
-    # suite fails at collection. Pin <2.5 for the prerelease-allowing envs until
-    # numba-cuda drops the call; remove this once that lands.
+    # suite fails at collection. Now that 2.5 is a stable release it hits every env,
+    # so `stable` needs it too. Remove once numba-cuda guards the call
+    # (NVIDIA/numba-cuda#907, fix in #916).
     { if = [
+        "stable",
         "dev",
         "rapids_prerelease",
     ], value = "numpy<2.5" },

@@ -103,11 +103,11 @@ def highly_variable_genes(
             Only used if `flavor='seurat_v3'` or `'pearson_residuals'`.
         theta
             The negative binomial overdispersion parameter `theta` for Pearson residuals.
-            Higher values correspond to less overdispersion (`var = mean + mean^2/theta`), and `theta=np.Inf` corresponds to a Poisson model.
+            Higher values correspond to less overdispersion (`var = mean + mean^2/theta`), and `theta=np.inf` corresponds to a Poisson model.
         clip
             Only used if `flavor='pearson_residuals'`. Determines if and how residuals are clipped:
                 * If `None`, residuals are clipped to the interval `[-sqrt(n_obs), sqrt(n_obs)]`, where `n_obs` is the number of cells in the dataset (default behavior).
-                * If any scalar `c`, residuals are clipped to the interval `[-c, c]`. Set `clip=np.Inf` for no clipping.
+                * If any scalar `c`, residuals are clipped to the interval `[-c, c]`. Set `clip=np.inf` for no clipping.
         chunksize
             If `'poisson_gene_selection'`, this dertermines how many genes are processed at
             once. Choosing a smaller value will reduce the required memory.
