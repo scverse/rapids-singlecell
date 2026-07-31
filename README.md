@@ -1,6 +1,7 @@
 [![Stars](https://img.shields.io/github/stars/scverse/rapids-singlecell?style=flat&logo=GitHub&color=blue)](https://github.com/scverse/rapids-singlecell)
 [![PyPI](https://img.shields.io/pypi/v/rapids-singlecell?logo=PyPI)](https://pypi.org/project/rapids-singlecell)
-[![Downloads](https://static.pepy.tech/badge/rapids-singlecell)](https://pepy.tech/project/rapids-singlecell)
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-total.json)](https://pypi.org/project/rapids-singlecell)
+[![Downloads/month](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-month.json)](https://pypi.org/project/rapids-singlecell)
 [![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.readthedocs.io/en/latest/?badge=latest)
 [![CI-Pass](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml)
 [![codecov](https://codecov.io/gh/scverse/rapids-singlecell/graph/badge.svg?token=PFHJEQD94X)](https://codecov.io/gh/scverse/rapids-singlecell)

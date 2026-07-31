@@ -178,6 +178,11 @@ ogp_image = "_static/logo_RTD.svg"
 
 qualname_overrides = {
     "numpy.bool_": "numpy.bool",  # Since numpy 2, numpy.bool is the canonical dtype
+    # Since numpy 2.5, NDArray is a TypeAliasType defined in numpy._typing._array_like,
+    # so a subscripted NDArray[...] reports that private module and sphinx-autodoc-typehints
+    # builds the target as <annotation module>.<type qualname> -- a name numpy does not
+    # document. Same treatment as anndata gives the pre-2.5 spelling of this alias.
+    "numpy._typing._array_like.GenericAlias": ("py:data", "numpy.typing.NDArray"),
 }
 
 nitpick_ignore = [

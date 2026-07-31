@@ -535,11 +535,11 @@ def normalize_pearson_residuals(
             AnnData object
         theta
             The negative binomial overdispersion parameter theta for Pearson residuals.
-            Higher values correspond to less overdispersion `(var = mean + mean^2/theta)`, and `theta=np.Inf` corresponds to a Poisson model.
+            Higher values correspond to less overdispersion `(var = mean + mean^2/theta)`, and `theta=np.inf` corresponds to a Poisson model.
         clip
             Determines if and how residuals are clipped:
             If None, residuals are clipped to the interval [-sqrt(n_obs), sqrt(n_obs)], where n_obs is the number of cells in the dataset (default behavior).
-            If any scalar c, residuals are clipped to the interval `[-c, c]`. Set `clip=np.Inf` for no clipping.
+            If any scalar c, residuals are clipped to the interval `[-c, c]`. Set `clip=np.inf` for no clipping.
         check_values
             If True, checks if counts in selected layer are integers as expected by this function,
             and return a warning if non-integers are found. Otherwise, proceed without checking. Setting this to False can speed up code for large datasets.
