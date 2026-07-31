@@ -6,10 +6,8 @@
 ```{rubric} Performance
 ```
 
-
 ```{rubric} Bug fixes
 ```
-
 
 ```{rubric} Misc
 ```

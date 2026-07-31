@@ -2,12 +2,15 @@
 
 #include <cuda_runtime.h>
 
+// CUDA's 64-bit integer atomicAdd overload is for unsigned long long.
+using cooc_count_t = unsigned long long;
+
 // Fallback pairwise kernel (for when shared memory is insufficient for CSR
 // kernel)
 __global__ void occur_count_kernel_pairwise(
     const float* __restrict__ spatial, const float* __restrict__ thresholds,
-    const int* __restrict__ label_idx, int* __restrict__ result, int n, int k,
-    int l_val) {
+    const int* __restrict__ label_idx, cooc_count_t* __restrict__ result, int n,
+    int k, int l_val) {
     int i = blockIdx.x;
     int s = i % 2;
     if (i >= n) return;
@@ -37,16 +40,16 @@ __global__ void occur_count_kernel_pairwise(
             if (dist_sq <= thresholds[r]) {
                 int index =
                     low * (k * l_val * 2) + high * l_val * 2 + r + offset;
-                atomicAdd(&result[index], 1);
+                atomicAdd(&result[index], 1ULL);
             }
         }
     }
 }
 
 // Reduction kernel using shared memory (for small k)
-__global__ void occur_reduction_kernel_shared(const int* __restrict__ result,
-                                              float* __restrict__ out, int k,
-                                              int l_val, int format) {
+__global__ void occur_reduction_kernel_shared(
+    const cooc_count_t* __restrict__ result, float* __restrict__ out, int k,
+    int l_val, int format) {
     // Each block handles one threshold index.
     int r_th = blockIdx.x;  // threshold index
 
@@ -157,10 +160,9 @@ __global__ void occur_reduction_kernel_shared(const int* __restrict__ result,
 }
 
 // Reduction kernel using global memory (for large k)
-__global__ void occur_reduction_kernel_global(const int* __restrict__ result,
-                                              float* __restrict__ inter_out,
-                                              float* __restrict__ out, int k,
-                                              int l_val, int format) {
+__global__ void occur_reduction_kernel_global(
+    const cooc_count_t* __restrict__ result, float* __restrict__ inter_out,
+    float* __restrict__ out, int k, int l_val, int format) {
     // Each block handles one threshold index.
     int r_th = blockIdx.x;  // threshold index
     if (r_th >= l_val) return;
@@ -271,20 +273,20 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
     const float* __restrict__ spatial, const float* __restrict__ thresholds,
     const int* __restrict__ cat_offsets, const int* __restrict__ cell_indices,
     const int* __restrict__ pair_left, const int* __restrict__ pair_right,
-    int* __restrict__ counts, int k, int l_val, int blocks_per_pair,
+    cooc_count_t* __restrict__ counts, int k, int l_val, int blocks_per_pair,
     int l_pad) {
     // Shared memory layout:
     // - B-tile coords: CELL_TILE * 2 floats
-    // - Warp histograms: warps_per_block * l_pad ints
+    // - Warp histograms: warps_per_block * l_pad counters
     extern __shared__ char smem[];
     float* smem_b = reinterpret_cast<float*>(smem);
-    int* shared_hist =
-        reinterpret_cast<int*>(smem + CELL_TILE * 2 * sizeof(float));
+    cooc_count_t* shared_hist =
+        reinterpret_cast<cooc_count_t*>(smem + CELL_TILE * 2 * sizeof(float));
 
     const int lane = threadIdx.x & 31;
     const int warp_id = threadIdx.x >> 5;
     const int warps_per_block = blockDim.x >> 5;
-    int* warp_hist = shared_hist + warp_id * l_pad;
+    cooc_count_t* warp_hist = shared_hist + warp_id * l_pad;
 
     // Zero per-warp histograms
     for (int r = lane; r < l_pad; r += 32) {
@@ -360,7 +362,7 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
                         lo = mid + 1;
                 }
                 if (lo < l_val) {
-                    atomicAdd(&warp_hist[lo], 1);
+                    atomicAdd(&warp_hist[lo], 1ULL);
                 }
             }
         }
@@ -371,7 +373,7 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
     if (warp_id == 0) {
         // Sum each bin across warps into warp0's histogram
         for (int r = lane; r < l_pad; r += 32) {
-            int sum = 0;
+            cooc_count_t sum = 0;
             for (int w = 0; w < warps_per_block; ++w) {
                 sum += shared_hist[w * l_pad + r];
             }
@@ -381,7 +383,7 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
 
         // Inclusive scan (cumulative) along thresholds
         if (threadIdx.x == 0) {
-            int acc = 0;
+            cooc_count_t acc = 0;
             for (int r = 0; r < l_val; ++r) {
                 acc += shared_hist[r];
                 shared_hist[r] = acc;

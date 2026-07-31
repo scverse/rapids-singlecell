@@ -4,9 +4,9 @@
 
 // Compute column sums (sums_genes) and row sums (sums_cells) from CSC sparse
 // matrix One thread per column (gene), atomicAdd for row sums
-template <typename T>
-__global__ void sparse_sum_csc_kernel(const int* __restrict__ indptr,
-                                      const int* __restrict__ index,
+template <typename T, typename IdxT>
+__global__ void sparse_sum_csc_kernel(const IdxT* __restrict__ indptr,
+                                      const IdxT* __restrict__ index,
                                       const T* __restrict__ data,
                                       T* __restrict__ sums_genes,
                                       T* __restrict__ sums_cells, int n_genes) {
@@ -14,10 +14,10 @@ __global__ void sparse_sum_csc_kernel(const int* __restrict__ indptr,
     if (gene >= n_genes) {
         return;
     }
-    int start = indptr[gene];
-    int stop = indptr[gene + 1];
+    IdxT start = indptr[gene];
+    IdxT stop = indptr[gene + 1];
     T col_sum = (T)0;
-    for (int i = start; i < stop; ++i) {
+    for (IdxT i = start; i < stop; ++i) {
         T val = data[i];
         col_sum += val;
         atomicAdd(&sums_cells[index[i]], val);
@@ -27,9 +27,9 @@ __global__ void sparse_sum_csc_kernel(const int* __restrict__ indptr,
 
 // Welford's single-pass algorithm for variance of clipped Pearson residuals
 // (CSC sparse)
-template <typename T>
+template <typename T, typename IdxT>
 __global__ void csc_hvg_res_kernel(
-    const int* __restrict__ indptr, const int* __restrict__ index,
+    const IdxT* __restrict__ indptr, const IdxT* __restrict__ index,
     const T* __restrict__ data, const T* __restrict__ sums_genes,
     const T* __restrict__ sums_cells, T* __restrict__ residuals,
     const T inv_sum_total, const T clip, const T inv_theta, int n_genes,
@@ -37,15 +37,15 @@ __global__ void csc_hvg_res_kernel(
     int gene = blockDim.x * blockIdx.x + threadIdx.x;
     if (gene >= n_genes) return;
 
-    int start = indptr[gene];
-    int stop = indptr[gene + 1];
+    IdxT start = indptr[gene];
+    IdxT stop = indptr[gene + 1];
 
     T gene_sum = sums_genes[gene];
 
     // Welford's online algorithm: single pass for mean and variance
     T mean = (T)0;
     T M2 = (T)0;
-    int sparse_idx = start;
+    IdxT sparse_idx = start;
 
     for (int cell = 0; cell < n_cells; ++cell) {
         T mu = gene_sum * sums_cells[cell] * inv_sum_total;

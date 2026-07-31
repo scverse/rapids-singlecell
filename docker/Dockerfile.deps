@@ -1,4 +1,4 @@
-ARG CUDA_VER=13.0.2
+ARG CUDA_VER=13.1.0
 ARG LINUX_VER=ubuntu24.04
 
 FROM nvidia/cuda:${CUDA_VER}-devel-${LINUX_VER}
@@ -6,6 +6,8 @@ FROM nvidia/cuda:${CUDA_VER}-devel-${LINUX_VER}
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ARG PYTHON_VER=3.13
+# Re-declare after FROM so it is available to RUN steps (passed by docker.yml build-args)
+ARG CUDA_VER=13.1.0
 
 ENV PATH=/opt/conda/bin:$PATH
 ENV PYTHON_VERSION=${PYTHON_VER}
@@ -13,8 +15,8 @@ ENV PYTHON_VERSION=${PYTHON_VER}
 COPY --from=condaforge/miniforge3:26.1.1-3 /opt/conda /opt/conda
 
 COPY rsc_rapids.yml rsc_rapids.yml
+COPY --from=source pyproject.toml /tmp/rapids_singlecell_pyproject.toml
 
-ARG GIT_ID=main
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN <<EOF
@@ -22,7 +24,6 @@ RUN <<EOF
 set -x
 apt-get -qq update
 apt-get -q -o=Dpkg::Use-Pty=0 -y dist-upgrade
-apt-get -q install -y -o=Dpkg::Use-Pty=0 git
 apt-get -q clean -y
 rm -rf /var/lib/apt/lists/*
 EOF
@@ -36,19 +37,50 @@ mamba clean --all -y
 EOF
 
 RUN <<EOF
+# Guard against cu12/cu13 package mixing (see issue #677): fail the build if any
+# installed CUDA Python package's major version does not match the image's CUDA major.
+set -x
+CUDA_MAJOR="${CUDA_VER%%.*}"
+echo "Verifying all CUDA packages match CUDA major ${CUDA_MAJOR}"
+/opt/conda/bin/python - "${CUDA_MAJOR}" <<'PY'
+import sys
+import importlib.metadata as md
+
+target = sys.argv[1]
+bad = []
+# cuda-bindings and cuda-python track the CUDA major in their version.
+# (cuda-core is intentionally excluded: it uses its own 0.x versioning.)
+for name in ("cuda-bindings", "cuda-python"):
+    try:
+        version = md.version(name)
+    except md.PackageNotFoundError:
+        continue
+    if version.split(".")[0] != target:
+        bad.append(f"{name}=={version} (expected CUDA {target}.x)")
+# cupy wheels encode the CUDA major in the project name
+for name in ("cupy-cuda12x", "cupy-cuda13x"):
+    try:
+        md.version(name)
+    except md.PackageNotFoundError:
+        continue
+    if name != f"cupy-cuda{target}x":
+        bad.append(f"{name} installed (expected cupy-cuda{target}x)")
+if bad:
+    sys.exit("ERROR: CUDA major mismatch in cu%s image:\n  - %s" % (target, "\n  - ".join(bad)))
+print(f"OK: all CUDA packages match CUDA {target}.x")
+PY
+EOF
+
+RUN <<EOF
 # install rapids_singlecell pip dependencies (without building the package)
 set -x
-cd /tmp
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
-git checkout ${GIT_ID}
 /opt/conda/bin/python -c "
 import tomllib
-with open('pyproject.toml', 'rb') as f:
+with open('/tmp/rapids_singlecell_pyproject.toml', 'rb') as f:
     data = tomllib.load(f)
 with open('/tmp/deps.txt', 'w') as f:
     f.write('\n'.join(data['project']['dependencies']))
 "
 /opt/conda/bin/python -m pip install --no-cache-dir -r /tmp/deps.txt
-rm -rf /tmp/rapids_singlecell /tmp/deps.txt
+rm -f /tmp/rapids_singlecell_pyproject.toml /tmp/deps.txt
 EOF

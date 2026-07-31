@@ -7,14 +7,36 @@
 - NVIDIA GPU with CUDA support
 - [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
 - A RAPIDS environment (e.g., conda `rapids-26.04` or pip-installed RAPIDS)
+- **CUDA toolkit ≥ 12.9, or ≤ 12.5, for building from source** (see note below)
+
+```{important}
+**On RAPIDS 26.04, building from source needs CUDA ≥ 12.9 (or ≤ 12.5) on CUDA 12.**
+RAPIDS 26.04 ships CCCL 3.3.0, which references the `cudaDevAttrHostNumaMemoryPoolsSupported`
+device attribute whenever the toolkit is ≥ 12.6, but NVIDIA only added that enum in
+CUDA 12.9. So compiling the RMM/CCCL-using kernels (the Wilcoxon scratch allocator)
+against a **CUDA 12.6–12.8** toolkit fails with
+`error: the global scope has no "cudaDevAttrHostNumaMemoryPoolsSupported"`.
+
+This is an upstream CCCL guard bug, **fixed in CCCL > 3.3.0 (RAPIDS ≥ 26.06)** — so
+the gap only affects RAPIDS 26.04. CUDA 13.x is unaffected. If you're on RAPIDS 26.04
++ CUDA 12.6–12.8, either build with CUDA ≥ 12.9 (or ≤ 12.5), upgrade to RAPIDS ≥ 26.06,
+or just use the **prebuilt wheel** (`pip install rapids-singlecell-cu12`) — wheels are
+built on CUDA 12.2 (below the guard), so the enum is never referenced and they run fine
+on any CUDA 12.x runtime, including 12.6–12.8. The build emits an actionable error in
+this range; override only if your toolkit defines the enum with `-DRSC_SKIP_CUDA_VERSION_CHECK=ON`.
+```
 
 ### Clone and install
 
 ```bash
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
+git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
+cd rapids-singlecell
 (uv) pip install -e ".[test]"
 ```
+
+The documentation notebooks live in a Git submodule. If the repository was
+already cloned without `--recurse-submodules`, initialize them with
+`git submodule update --init` before building the documentation.
 
 The editable install compiles the CUDA kernels for your local GPU architecture.
 After the install, compiled `.so` modules and `.pyi` type stubs are placed in `src/rapids_singlecell/_cuda/`.
@@ -237,7 +259,7 @@ Each wheel contains:
 - `.pyi` type stubs for IDE support
 - `py.typed` PEP 561 marker
 
-Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via `wheel.exclude` in `pyproject.toml`.
+Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via Hatchling's wheel target configuration in `pyproject.toml`.
 They are included in the source distribution for self-compilation.
 
 ### CUDA architectures
@@ -262,15 +284,14 @@ These are built by `docker-push.sh`, which strips the `rapids-singlecell` pip li
 
 **CI manylinux images** (for building PyPI wheels):
 
-| File | Purpose |
-|---|---|
-| `manylinux_2_28_x86_64_cuda12.2.Dockerfile` | x86_64 build image with CUDA 12.2 toolkit |
-| `manylinux_2_28_aarch64_cuda12.2.Dockerfile` | aarch64 build image with CUDA 12.2 toolkit |
-| `manylinux_2_28_x86_64_cuda13.0.Dockerfile` | x86_64 build image with CUDA 13.0 toolkit |
-| `manylinux_2_28_aarch64_cuda13.0.Dockerfile` | aarch64 build image with CUDA 13.0 toolkit |
+Wheels are built by cibuildwheel against prebuilt manylinux + CUDA images published at
+`quay.io/manylinux_cuda/manylinux_2_28_<arch>_cuda<ver>`. `publish.yml` selects the image
+per matrix entry via `cibw_image`.
 
-These are based on `quay.io/pypa/manylinux_2_28` and only install the CUDA toolkit packages needed for compilation (nvcc, cudart, cublas, cusparse).
-They are used by cibuildwheel in `publish.yml` to produce portable wheels.
+These images ship nvcc, cudart, and cublas (plus gcc-toolset-12 on the CUDA 12.2 image,
+since nvcc on 12.2 requires GCC 12 or older). The remaining libraries rapids-singlecell
+links against (cusolver, cusparse, and nvJitLink) are installed at build time via
+`CIBW_BEFORE_ALL` in `publish.yml`.
 
 ### Release process
 

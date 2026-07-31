@@ -53,7 +53,7 @@ def test_scanpy_backend_entrypoint_is_declared():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
 
     assert pyproject["project"]["entry-points"]["scanpy.backends"] == {
-        "rapids_singlecell": "rapids_singlecell._backends.scanpy"
+        "rapids-singlecell": "rapids_singlecell._backends.scanpy"
     }
 
 
@@ -104,7 +104,7 @@ def test_scanpy_backend_dispatch_smoke(monkeypatch):
         registry._discovered = True
         registry._register_backend(
             scanpy_backend,
-            entrypoint_name="rapids_singlecell",
+            entrypoint_name="rapids-singlecell",
             distribution_name="rapids-singlecell",
             object_ref="rapids_singlecell._backends.scanpy",
         )

@@ -1,6 +1,5 @@
-# This workflow will build two Docker image and push then to GitHub Packages Container registry:
-# - a base image with the dependencies
-# - a main image with the application code
+# Build/push two GHCR images: dependency base and application image.
+# Release events push; PR/comment runs only validate.
 
 name: Docker
 
@@ -73,8 +72,8 @@ jobs:
         RAPIDS_VER:
           - "26.04"
         CUDA_SUFFIX:
-          - { ver: "12.8.0", label: "cuda12", pkg: "cu12" }
-          - { ver: "13.0.2", label: "cuda13", pkg: "cu13" }
+          - { ver: "12.9.1", label: "cuda12", pkg: "cu12" }
+          - { ver: "13.1.0", label: "cuda13", pkg: "cu13" }
     name: Build Docker images (${{ matrix.CUDA_SUFFIX.label }})
     runs-on: ubuntu-latest
     permissions:
@@ -98,9 +97,20 @@ jobs:
         shell: bash
 
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
+
+      - name: Set source package version
+        id: source-version
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0.dev0+g$(git rev-parse --short=12 HEAD)"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+        shell: bash
 
       - name: Set pending status on PR
         if: github.event_name == 'issue_comment'
@@ -114,7 +124,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -122,7 +132,7 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker base image
         id: meta-base
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ghcr.io/scverse/rapids-singlecell-deps-${{ matrix.CUDA_SUFFIX.pkg }}
@@ -134,7 +144,7 @@ jobs:
 
       - name: Build and push Docker base images
         id: push-base
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ./docker/
           file: ./docker/Dockerfile.deps
@@ -143,12 +153,13 @@ jobs:
           labels: ${{ steps.meta-base.outputs.labels }}
           build-args: |
             CUDA_VER=${{ matrix.CUDA_SUFFIX.ver }}
-            GIT_ID=${{ github.event.pull_request.head.sha || github.sha }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-deps
+          build-contexts: |
+            source=.
 
       - name: Generate artifact attestation for base image
         if: github.event_name == 'release'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/scverse/rapids-singlecell-deps-${{ matrix.CUDA_SUFFIX.pkg }}
           subject-digest: ${{ steps.push-base.outputs.digest }}
@@ -156,14 +167,14 @@ jobs:
 
       - name: Extract metadata (tags, labels) for main Docker image
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ghcr.io/scverse/rapids-singlecell-${{ matrix.CUDA_SUFFIX.pkg }}
 
       - name: Build and push main Docker images
         id: push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: ./docker/
           file: ./docker/Dockerfile
@@ -172,14 +183,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CUDA_ARCHS=${{ matrix.CUDA_SUFFIX.label == 'cuda12' && '75-real;80-real;86-real;89-real;90' || '75-real;80-real;86-real;89-real;90-real;100-real;120' }}
-            GIT_ID=${{ github.event.pull_request.head.sha || github.sha }}
+            RSC_VERSION=${{ steps.source-version.outputs.version }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}
           build-contexts: |
             rapids-singlecell-deps=docker-image://${{ fromJSON(steps.meta-base.outputs.json).tags[0] }}
+            source=.
 
       - name: Generate artifact attestation for main image
         if: github.event_name == 'release'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/scverse/rapids-singlecell-${{ matrix.CUDA_SUFFIX.pkg }}
           subject-digest: ${{ steps.push.outputs.digest }}

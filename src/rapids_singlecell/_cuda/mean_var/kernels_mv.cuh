@@ -2,9 +2,11 @@
 
 #include <cuda_runtime.h>
 
-template <typename T>
-__global__ void mean_var_major_kernel(const int* __restrict__ indptr,
-                                      const int* __restrict__ indices,
+constexpr int BLOCK_SIZE_MAJOR = 64;
+
+template <typename T, typename IdxT>
+__global__ void mean_var_major_kernel(const IdxT* __restrict__ indptr,
+                                      const IdxT* __restrict__ indices,
                                       const T* __restrict__ data,
                                       double* __restrict__ means,
                                       double* __restrict__ vars, int major,
@@ -12,17 +14,17 @@ __global__ void mean_var_major_kernel(const int* __restrict__ indptr,
     int major_idx = blockIdx.x;
     if (major_idx >= major) return;
 
-    int start_idx = indptr[major_idx];
-    int stop_idx = indptr[major_idx + 1];
+    IdxT start_idx = indptr[major_idx];
+    IdxT stop_idx = indptr[major_idx + 1];
 
-    __shared__ double mean_place[64];
-    __shared__ double var_place[64];
+    __shared__ double mean_place[BLOCK_SIZE_MAJOR];
+    __shared__ double var_place[BLOCK_SIZE_MAJOR];
 
     mean_place[threadIdx.x] = 0.0;
     var_place[threadIdx.x] = 0.0;
     __syncthreads();
 
-    for (int minor_idx = start_idx + threadIdx.x; minor_idx < stop_idx;
+    for (IdxT minor_idx = start_idx + threadIdx.x; minor_idx < stop_idx;
          minor_idx += blockDim.x) {
         double value = static_cast<double>(data[minor_idx]);
         mean_place[threadIdx.x] += value;
@@ -43,15 +45,18 @@ __global__ void mean_var_major_kernel(const int* __restrict__ indptr,
     }
 }
 
-template <typename T>
-__global__ void mean_var_minor_kernel(const int* __restrict__ indices,
+template <typename T, typename IdxT>
+__global__ void mean_var_minor_kernel(const IdxT* __restrict__ indices,
                                       const T* __restrict__ data,
                                       double* __restrict__ means,
-                                      double* __restrict__ vars, int nnz) {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= nnz) return;
-    double value = static_cast<double>(data[idx]);
-    int minor_pos = indices[idx];
-    atomicAdd(&means[minor_pos], value);
-    atomicAdd(&vars[minor_pos], value * value);
+                                      double* __restrict__ vars,
+                                      long long nnz) {
+    const long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+         idx < nnz; idx += stride) {
+        double value = static_cast<double>(data[idx]);
+        IdxT minor_pos = indices[idx];
+        atomicAdd(&means[minor_pos], value);
+        atomicAdd(&vars[minor_pos], value * value);
+    }
 }

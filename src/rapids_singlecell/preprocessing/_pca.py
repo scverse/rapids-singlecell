@@ -5,20 +5,21 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
-from cuml.internals.input_utils import sparse_scipy_to_cp
+from anndata import AnnData
 from cupyx.scipy.sparse import issparse as cpissparse
 from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.get import _get_obs_rep
+from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
 from ._utils import _check_gpu_X
 
 if TYPE_CHECKING:
-    from anndata import AnnData
     from numpy.typing import NDArray
+
+    from rapids_singlecell._utils import ArrayTypesDask
 
 _empty = object()
 
@@ -55,21 +56,14 @@ def _resolve_mask_var(
     if mask_var is _empty or mask_var is None:
         return None, None
 
-    if isinstance(mask_var, str):
-        mask_array = adata.var[mask_var].to_numpy()
-        return mask_var, mask_array
-
-    mask_var = np.asarray(mask_var)
-    if mask_var.shape != (adata.n_vars,):
-        raise ValueError(
-            f"The shape of the mask ({mask_var.shape}) does not match "
-            f"the number of variables ({adata.n_vars})."
-        )
-    return None, mask_var
+    # `_check_mask` validates boolean dtype + shape (and resolves a column name),
+    # matching scanpy. Keep the param as the column name for strings, else None.
+    mask_var_param = mask_var if isinstance(mask_var, str) else None
+    return mask_var_param, _check_mask(adata, mask_var, "var")
 
 
 def pca(
-    data: AnnData,
+    data: AnnData | ArrayTypesDask,
     n_comps: int | None = None,
     *,
     layer: str = None,
@@ -82,9 +76,10 @@ def pca(
     chunked: bool = False,
     chunk_size: int = None,
     key_added: str | None = None,
+    return_info: bool = False,
     copy: bool = False,
     **kwargs,
-) -> None | AnnData:
+) -> None | AnnData | ArrayTypesDask:
     """\
     Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
 
@@ -113,7 +108,9 @@ def pca(
     Parameters
     ----------
     data
-        AnnData object
+        The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
+        to cells and columns to genes. If a matrix is passed instead of an
+        :class:`~anndata.AnnData` object, the PCA representation is returned.
 
     n_comps
         Number of principal components to compute. Defaults to 50, or 1 - minimum
@@ -184,8 +181,13 @@ def pca(
         :attr:`~anndata.AnnData.varm`\\ `[key_added]`, and the parameters in
         :attr:`~anndata.AnnData.uns`\\ `[key_added]`.
 
+    return_info
+        Only relevant when passing a matrix instead of an
+        :class:`~anndata.AnnData`: see "Returns".
+
     copy
-        Whether to return a copy or update `adata`.
+        Whether to return a copy or update `data`. Only applies to
+        :class:`~anndata.AnnData` input.
 
     **kwargs
         Additional arguments for specific SVD solvers.
@@ -198,7 +200,11 @@ def pca(
 
     Returns
     -------
-        adds fields to `adata`:
+        If a matrix is passed and `return_info=False`, the PCA representation is \
+        returned. If a matrix is passed and `return_info=True`, a tuple of \
+        ``(X_pca, components, variance_ratio, variance)`` is returned.
+
+        If an AnnData object is passed, adds fields to `adata`:
 
             `.obsm['X_pca' | key_added]`
                 PCA representation of data.
@@ -210,6 +216,36 @@ def pca(
                 Explained variance, equivalent to the eigenvalues of the \
                 covariance matrix.
     """
+    if not isinstance(data, AnnData):
+        if layer is not None:
+            raise ValueError("`layer` can only be used with an AnnData object.")
+        if use_highly_variable is not None:
+            raise ValueError(
+                "`use_highly_variable` can only be used with an AnnData object."
+            )
+        X = data
+        mask_var = None if mask_var is _empty else _check_mask(X, mask_var, "var")
+        X = X[:, mask_var] if mask_var is not None else X
+        pca_func, X_pca, _ = _pca_compute(
+            X,
+            n_comps,
+            zero_center=zero_center,
+            svd_solver=svd_solver,
+            random_state=random_state,
+            chunked=chunked,
+            chunk_size=chunk_size,
+            dtype=dtype,
+            kwargs=kwargs,
+        )
+        if return_info:
+            return (
+                X_pca,
+                pca_func.components_,
+                pca_func.explained_variance_ratio_,
+                pca_func.explained_variance_,
+            )
+        return X_pca
+
     adata = data
     if use_highly_variable is True and "highly_variable" not in adata.var.keys():
         raise ValueError(
@@ -228,6 +264,54 @@ def pca(
     del use_highly_variable
     X = X[:, mask_var] if mask_var is not None else X
 
+    pca_func, X_pca, n_comps = _pca_compute(
+        X,
+        n_comps,
+        zero_center=zero_center,
+        svd_solver=svd_solver,
+        random_state=random_state,
+        chunked=chunked,
+        chunk_size=chunk_size,
+        dtype=dtype,
+        kwargs=kwargs,
+    )
+
+    key_obsm, key_varm, key_uns = (
+        ("X_pca", "PCs", "pca") if key_added is None else [key_added] * 3
+    )
+    adata.obsm[key_obsm] = X_pca
+    adata.uns[key_uns] = {
+        "params": {
+            "zero_center": zero_center,
+            "use_highly_variable": mask_var_param == "highly_variable",
+            "mask_var": mask_var_param,
+            **({"layer": layer} if layer is not None else {}),
+        },
+        "variance": _as_numpy(pca_func.explained_variance_),
+        "variance_ratio": _as_numpy(pca_func.explained_variance_ratio_),
+    }
+    if mask_var is not None:
+        adata.varm[key_varm] = np.zeros(shape=(adata.n_vars, n_comps))
+        adata.varm[key_varm][mask_var] = _as_numpy(pca_func.components_.T)
+    else:
+        adata.varm[key_varm] = _as_numpy(pca_func.components_.T)
+
+    if copy:
+        return adata
+
+
+def _pca_compute(
+    X,
+    n_comps,
+    *,
+    zero_center: bool,
+    svd_solver: str | None,
+    random_state: int | None,
+    chunked: bool,
+    chunk_size: int | None,
+    dtype: str,
+    kwargs: dict,
+):
     if n_comps is None:
         min_dim = min(X.shape[0], X.shape[1])
         if 50 >= min_dim:
@@ -306,28 +390,7 @@ def pca(
     if X_pca.dtype.descr != np.dtype(dtype).descr:
         X_pca = X_pca.astype(dtype)
 
-    key_obsm, key_varm, key_uns = (
-        ("X_pca", "PCs", "pca") if key_added is None else [key_added] * 3
-    )
-    adata.obsm[key_obsm] = X_pca
-    adata.uns[key_uns] = {
-        "params": {
-            "zero_center": zero_center,
-            "use_highly_variable": mask_var_param == "highly_variable",
-            "mask_var": mask_var_param,
-            **({"layer": layer} if layer is not None else {}),
-        },
-        "variance": _as_numpy(pca_func.explained_variance_),
-        "variance_ratio": _as_numpy(pca_func.explained_variance_ratio_),
-    }
-    if mask_var is not None:
-        adata.varm[key_varm] = np.zeros(shape=(adata.n_vars, n_comps))
-        adata.varm[key_varm][mask_var] = _as_numpy(pca_func.components_.T)
-    else:
-        adata.varm[key_varm] = _as_numpy(pca_func.components_.T)
-
-    if copy:
-        return adata
+    return pca_func, X_pca, n_comps
 
 
 def _as_numpy(X):
@@ -340,7 +403,7 @@ def _as_numpy(X):
 def _run_covariance_pca(X, n_comps, zero_center):
     """Run PCA using covariance matrix eigendecomposition."""
     if issparse(X):
-        X = sparse_scipy_to_cp(X, dtype=X.dtype)
+        X = X_to_GPU(X)
     from ._sparse_pca._sparse_pca import PCA_sparse
 
     if not isspmatrix_csr(X) and not isinstance(X, DaskArray):
@@ -365,7 +428,7 @@ def _run_sparse_svd_pca(
 ):
     """Run PCA using SVD solvers (lanczos, randomized)."""
     if issparse(X):
-        X = sparse_scipy_to_cp(X, dtype=X.dtype)
+        X = X_to_GPU(X)
     from ._sparse_pca._sparse_svd_pca import PCA_sparse_svd
 
     if not isspmatrix_csr(X):

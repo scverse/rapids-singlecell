@@ -48,19 +48,19 @@ __global__ void dense_row_scale_kernel(T* __restrict__ data, int nrows,
 }
 
 // One block per row. Parallel row sum + scale in one pass.
-template <typename T>
-__global__ void csr_row_scale_kernel(const int* __restrict__ indptr,
+template <typename T, typename IdxT>
+__global__ void csr_row_scale_kernel(const IdxT* __restrict__ indptr,
                                      T* __restrict__ data, int nrows,
                                      T target_sum) {
     int row = blockIdx.x;
     if (row >= nrows) return;
 
-    int start = indptr[row];
-    int end = indptr[row + 1];
+    IdxT start = indptr[row];
+    IdxT end = indptr[row + 1];
 
     // Parallel row sum
     T val = (T)0;
-    for (int i = start + threadIdx.x; i < end; i += blockDim.x) val += data[i];
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x) val += data[i];
 
     // Warp-level reduction
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
@@ -88,24 +88,24 @@ __global__ void csr_row_scale_kernel(const int* __restrict__ indptr,
     // Parallel multiply
     T scale = warp_sums[0];
     if (scale > (T)0) {
-        for (int i = start + threadIdx.x; i < end; i += blockDim.x)
+        for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
             data[i] *= scale;
     }
 }
 
 // One block per row. Warp-shuffle reduction for row sum.
-template <typename T>
-__global__ void csr_sum_major_kernel(const int* __restrict__ indptr,
+template <typename T, typename IdxT>
+__global__ void csr_sum_major_kernel(const IdxT* __restrict__ indptr,
                                      const T* __restrict__ data,
                                      T* __restrict__ sums, int major) {
     int major_idx = blockIdx.x;
     if (major_idx >= major) return;
 
-    int start_idx = indptr[major_idx];
-    int stop_idx = indptr[major_idx + 1];
+    IdxT start_idx = indptr[major_idx];
+    IdxT stop_idx = indptr[major_idx + 1];
 
     T val = (T)0;
-    for (int i = start_idx + threadIdx.x; i < stop_idx; i += blockDim.x)
+    for (IdxT i = start_idx + threadIdx.x; i < stop_idx; i += blockDim.x)
         val += data[i];
 
     // Warp-level reduction
@@ -132,21 +132,21 @@ __global__ void csr_sum_major_kernel(const int* __restrict__ indptr,
 // ---------- find_hi_genes_csr ----------
 // One block per row. Computes row sum, then marks genes whose value >
 // max_fraction * row_sum.
-template <typename T>
-__global__ void find_hi_genes_csr_kernel(const int* __restrict__ indptr,
-                                         const int* __restrict__ indices,
+template <typename T, typename IdxT>
+__global__ void find_hi_genes_csr_kernel(const IdxT* __restrict__ indptr,
+                                         const IdxT* __restrict__ indices,
                                          const T* __restrict__ data,
                                          bool* __restrict__ gene_is_hi,
                                          T max_fraction, int nrows) {
     int row = blockIdx.x;
     if (row >= nrows) return;
 
-    int start = indptr[row];
-    int end = indptr[row + 1];
+    IdxT start = indptr[row];
+    IdxT end = indptr[row + 1];
 
     // Phase 1: partial row sum
     T val = (T)0;
-    for (int i = start + threadIdx.x; i < end; i += blockDim.x) val += data[i];
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x) val += data[i];
 
     // Warp-level reduction
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
@@ -172,7 +172,7 @@ __global__ void find_hi_genes_csr_kernel(const int* __restrict__ indptr,
 
     // Phase 2: check elements against threshold
     T threshold = warp_sums[0];
-    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x) {
         if (data[i] > threshold) gene_is_hi[indices[i]] = true;
     }
 }
@@ -180,21 +180,21 @@ __global__ void find_hi_genes_csr_kernel(const int* __restrict__ indptr,
 // ---------- masked_mul_csr ----------
 // One block per row. Computes masked row sum (skipping masked genes), then
 // scales all data.
-template <typename T>
-__global__ void masked_mul_csr_kernel(const int* __restrict__ indptr,
-                                      const int* __restrict__ indices,
+template <typename T, typename IdxT>
+__global__ void masked_mul_csr_kernel(const IdxT* __restrict__ indptr,
+                                      const IdxT* __restrict__ indices,
                                       T* __restrict__ data,
                                       const bool* __restrict__ gene_mask,
                                       int nrows, T tsum) {
     int row = blockIdx.x;
     if (row >= nrows) return;
 
-    int start = indptr[row];
-    int end = indptr[row + 1];
+    IdxT start = indptr[row];
+    IdxT end = indptr[row + 1];
 
     // Phase 1: masked row sum
     T val = (T)0;
-    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x) {
         if (!gene_mask[indices[i]]) val += data[i];
     }
 
@@ -223,27 +223,27 @@ __global__ void masked_mul_csr_kernel(const int* __restrict__ indptr,
     // Phase 2: multiply
     T scale = warp_sums[0];
     if (scale > (T)0) {
-        for (int i = start + threadIdx.x; i < end; i += blockDim.x)
+        for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
             data[i] *= scale;
     }
 }
 
 // ---------- masked_sum_major ----------
 // One block per row. Computes sum skipping masked genes.
-template <typename T>
-__global__ void masked_sum_major_kernel(const int* __restrict__ indptr,
-                                        const int* __restrict__ indices,
+template <typename T, typename IdxT>
+__global__ void masked_sum_major_kernel(const IdxT* __restrict__ indptr,
+                                        const IdxT* __restrict__ indices,
                                         const T* __restrict__ data,
                                         const bool* __restrict__ gene_mask,
                                         T* __restrict__ sums, int major) {
     int major_idx = blockIdx.x;
     if (major_idx >= major) return;
 
-    int start_idx = indptr[major_idx];
-    int stop_idx = indptr[major_idx + 1];
+    IdxT start_idx = indptr[major_idx];
+    IdxT stop_idx = indptr[major_idx + 1];
 
     T val = (T)0;
-    for (int i = start_idx + threadIdx.x; i < stop_idx; i += blockDim.x) {
+    for (IdxT i = start_idx + threadIdx.x; i < stop_idx; i += blockDim.x) {
         if (!gene_mask[indices[i]]) val += data[i];
     }
 
@@ -270,8 +270,8 @@ __global__ void masked_sum_major_kernel(const int* __restrict__ indptr,
 
 // ---------- prescaled_mul_csr ----------
 // One block per row. Multiplies each element by a pre-computed per-row scale.
-template <typename T>
-__global__ void prescaled_mul_csr_kernel(const int* __restrict__ indptr,
+template <typename T, typename IdxT>
+__global__ void prescaled_mul_csr_kernel(const IdxT* __restrict__ indptr,
                                          T* __restrict__ data,
                                          const T* __restrict__ scales,
                                          int nrows) {
@@ -279,10 +279,10 @@ __global__ void prescaled_mul_csr_kernel(const int* __restrict__ indptr,
     if (row >= nrows) return;
 
     T scale = scales[row];
-    int start = indptr[row];
-    int end = indptr[row + 1];
+    IdxT start = indptr[row];
+    IdxT end = indptr[row + 1];
 
-    for (int i = start + threadIdx.x; i < end; i += blockDim.x)
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
         data[i] *= scale;
 }
 

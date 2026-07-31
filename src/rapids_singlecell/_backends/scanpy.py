@@ -42,8 +42,8 @@ if TYPE_CHECKING:
     from anndata import AnnData
     from numpy.typing import DTypeLike, NDArray
 
-name = "rapids_singlecell"
-aliases = ["cuda", "rapids", "rapids-singlecell", "rsc"]
+name = "rapids-singlecell"
+aliases = ["cuda", "rapids", "rapids_singlecell"]
 
 
 def log1p(

@@ -4,7 +4,9 @@ These functions offer accelerated near drop-in replacements for common tools pro
 
 ## Scanpy backend
 
-With Scanpy versions that support computational backends, RAPIDS-singlecell is available as the `rapids_singlecell` backend with the aliases `cuda`, `rapids`, `rapids-singlecell`, and `rsc`.
+With Scanpy versions that support computational backends, RAPIDS-singlecell is
+available as the `rapids-singlecell` backend with the aliases `cuda`, `rapids`,
+and `rapids_singlecell`.
 
 ```python
 import scanpy as sc
@@ -32,13 +34,12 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.filter_genes
    pp.normalize_total
    pp.log1p
+   pp.sqrt
    pp.highly_variable_genes
    pp.regress_out
    pp.scale
    pp.pca
    pp.normalize_pearson_residuals
-   pp.flag_gene_family
-   pp.filter_highly_variable
 ```
 
 ### Batch effect correction
@@ -92,6 +93,15 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
     tl.embedding_density
 ```
 
+### Data integration
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+
+    tl.ingest
+```
+
 ### Clustering
 
 ```{eval-rst}
@@ -100,7 +110,6 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 
     tl.louvain
     tl.leiden
-    tl.kmeans
 ```
 
 ### Gene scores, Cell cycle

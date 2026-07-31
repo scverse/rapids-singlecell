@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <type_traits>
 
 // ---- Fused entropy kernel ----
 // One block per row. Row-normalize R, accumulate x*log(x+eps), atomicAdd scaled
@@ -24,6 +23,7 @@ __global__ void entropy_kernel(const T* __restrict__ R, T sigma, int n_cells,
         row_sum += __shfl_down_sync(0xffffffff, row_sum, offset);
 
     __shared__ T shared[32];
+    __shared__ T shared_inv_rsum;
     int warp_id = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int num_warps = (blockDim.x + 31) >> 5;
@@ -35,19 +35,16 @@ __global__ void entropy_kernel(const T* __restrict__ R, T sigma, int n_cells,
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             val += __shfl_down_sync(0xffffffff, val, offset);
-        if (threadIdx.x == 0) shared[0] = val;
+        if (threadIdx.x == 0) shared_inv_rsum = T(1) / val;
     }
     __syncthreads();
-    T inv_rsum = T(1) / shared[0];
+    T inv_rsum = shared_inv_rsum;
 
     // Phase 2: entropy = sum(x_norm * log(x_norm + eps))
     T entropy = T(0);
     for (int col = threadIdx.x; col < n_clusters; col += blockDim.x) {
         T x = R_row[col] * inv_rsum;
-        if constexpr (std::is_same<T, float>::value)
-            entropy += x * logf(x + T(1e-12));
-        else
-            entropy += x * log(x + T(1e-12));
+        entropy += x * log(x + T(1e-12));
     }
 
 #pragma unroll
@@ -83,12 +80,7 @@ __global__ void diversity_kernel(const T* __restrict__ O,
         int batch = i / n_clusters;
         T numer = Stabilized ? (O[i] + E[i] + T(1)) : (O[i] + T(1));
         T ratio = numer / (E[i] + T(1));
-        T log_val;
-        if constexpr (std::is_same<T, float>::value)
-            log_val = logf(ratio);
-        else
-            log_val = log(ratio);
-        acc += theta[batch] * O[i] * log_val;
+        acc += theta[batch] * O[i] * log(ratio);
     }
 
 #pragma unroll

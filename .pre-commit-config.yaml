@@ -1,14 +1,10 @@
 repos:
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.16.0
     hooks:
     -   id: ruff-check
         args: ["--fix"]
     -   id: ruff-format
-    # The following can be removed once PLR0917 is out of preview
-    -   name: ruff preview rules
-        id: ruff-check
-        args: ["--preview", "--select=PLR0917"]
 -   repo: https://github.com/ComPWA/taplo-pre-commit
     rev: v0.9.3
     hooks:
@@ -27,7 +23,7 @@ repos:
         args: [--branch=main]
     -   id: detect-private-key
 -   repo: https://github.com/codespell-project/codespell
-    rev: v2.4.2
+    rev: v2.4.3
     hooks:
     -   id: codespell
         additional_dependencies:
@@ -37,7 +33,7 @@ repos:
               docs/references.bib|
           )
 -   repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v22.1.4
+    rev: v22.1.8
     hooks:
     -   id: clang-format
         args: [--style=file, -i]

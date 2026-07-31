@@ -19,6 +19,31 @@ class MeanVar(NamedTuple):
     variance: float
 
 
+Metric = Literal[
+    "edistance",
+    "euclidean",
+    "root_mean_squared_error",
+    "mse",
+    "mean_absolute_error",
+    "pearson_distance",
+    "cosine_distance",
+    "r2_distance",
+    "wasserstein",
+]
+
+SUPPORTED_METRICS = [
+    "edistance",
+    "euclidean",
+    "root_mean_squared_error",
+    "mse",
+    "mean_absolute_error",
+    "pearson_distance",
+    "cosine_distance",
+    "r2_distance",
+    "wasserstein",
+]
+
+
 class Distance:
     """
     GPU-accelerated distance computation between groups of cells.
@@ -31,24 +56,48 @@ class Distance:
         Twice the mean pairwise distance between cells of two groups minus
         the mean pairwise distance between cells within each group. See
         `Peidli et al. (2023) <https://doi.org/10.1101/2022.08.20.504663>`__.
+        Accepts dense embeddings (e.g. ``obsm_key="X_pca"``) or sparse CSR
+        expression data (a sparse layer or ``layer_key="X"``), which is
+        densified inside the kernel rather than on the host.
+    - ``"euclidean"`` and ``"root_mean_squared_error"``: Euclidean distance
+        between group mean vectors.
+    - ``"mse"``: Mean squared distance between group mean vectors.
+    - ``"mean_absolute_error"``: Mean absolute distance between group mean
+        vectors.
+    - ``"pearson_distance"``: Pearson distance between group mean vectors.
+    - ``"cosine_distance"``: Cosine distance between group mean vectors.
+    - ``"r2_distance"``: One minus the coefficient of determination between
+        group mean vectors.
+    - ``"wasserstein"``: Entropy-regularized 2-Wasserstein via Sinkhorn.
+        Squared-Euclidean ground cost; per-pair auto-epsilon defaulting to
+        ``0.05 * std(C)`` to match OTT-JAX. Returns OTT's
+        ``reg_ot_cost`` value.
 
     Parameters
     ----------
     metric
-        Distance metric to use. Currently only ``"edistance"`` is supported.
+        Distance metric to use.
     layer_key
-        Key in adata.layers for cell data. Mutually exclusive with ``obsm_key``.
+        Key in adata.layers for cell data, or ``"X"`` to use ``adata.X``.
+        Mutually exclusive with ``obsm_key``.
     obsm_key
         Key in adata.obsm for embeddings. Mutually exclusive with ``layer_key``.
         Defaults to ``"X_pca"`` if neither is specified.
 
     Notes
     -----
-    The bootstrap implementation differs from pertpy: rather than precomputing
-    an n×n cell distance matrix and sampling from it, this implementation
-    resamples cells and recomputes distances from scratch each iteration.
-    This scales better for large datasets (O(n) vs O(n²) memory) and leverages
-    multi-GPU parallelism for each bootstrap iteration.
+    The ``edistance`` bootstrap implementation differs from pertpy: rather
+    than precomputing an n×n cell distance matrix and sampling from it, this
+    implementation resamples cells and recomputes distances from scratch each
+    iteration. This scales better for large datasets (O(n) vs O(n²) memory)
+    and leverages multi-GPU parallelism for each bootstrap iteration.
+
+    ``"edistance"`` and ``"wasserstein"`` use multi-GPU (pairs are split across
+    devices). Pseudobulk metrics aggregate cells into K group-mean vectors
+    before computing distances, and the resulting K×K kernel is cheap enough on
+    a single GPU that distributing it is not worth the cost. Passing
+    ``multi_gpu=True`` for those metrics falls back to a single device with a
+    warning.
 
     Examples
     --------
@@ -62,11 +111,18 @@ class Distance:
 
     def __init__(
         self,
-        metric: Literal["edistance"] = "edistance",
+        metric: Metric = "edistance",
         layer_key: str | None = None,
         obsm_key: str | None = None,
+        **kwargs,
     ):
-        """Initialize Distance calculator with specified metric."""
+        """Initialize Distance calculator with specified metric.
+
+        Extra keyword arguments are forwarded to the selected metric's
+        constructor, exposing metric-specific options (e.g. ``relaxation`` for
+        ``metric="wasserstein"``). Passing an option the chosen metric does not
+        accept raises ``TypeError``.
+        """
         if layer_key is not None and obsm_key is not None:
             raise ValueError(
                 "Cannot use 'layer_key' and 'obsm_key' at the same time.\n"
@@ -78,6 +134,7 @@ class Distance:
         self.metric = metric
         self.layer_key = layer_key
         self.obsm_key = obsm_key
+        self._metric_kwargs = kwargs
         self._metric_impl = None
         self._initialize_metric()
 
@@ -91,10 +148,32 @@ class Distance:
             self._metric_impl = EDistanceMetric(
                 layer_key=self.layer_key,
                 obsm_key=self.obsm_key,
+                **self._metric_kwargs,
+            )
+        elif self.metric == "wasserstein":
+            from rapids_singlecell.pertpy_gpu._metrics._wasserstein import (
+                WassersteinMetric,
+            )
+
+            self._metric_impl = WassersteinMetric(
+                layer_key=self.layer_key,
+                obsm_key=self.obsm_key,
+                **self._metric_kwargs,
+            )
+        elif self.metric in SUPPORTED_METRICS:
+            from rapids_singlecell.pertpy_gpu._metrics._pseudobulk import (
+                PSEUDOBULK_METRICS,
+            )
+
+            self._metric_impl = PSEUDOBULK_METRICS[self.metric](
+                metric_name=self.metric,
+                layer_key=self.layer_key,
+                obsm_key=self.obsm_key,
+                **self._metric_kwargs,
             )
         else:
             raise ValueError(
-                f"Unknown metric: {self.metric}. Supported metrics: ['edistance']"
+                f"Unknown metric: {self.metric}. Supported metrics: {SUPPORTED_METRICS}"
             )
 
     def _check_multi_gpu_support(
@@ -361,12 +440,13 @@ class Distance:
         split_by: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
         """
-        Build a contrasts DataFrame for use with :meth:`contrast_distances`.
+        Build a contrasts DataFrame for use with
+        :meth:`~Distance.contrast_distances`.
 
         Each row represents one contrast: comparing a group against the
         reference, optionally within each level of ``split_by`` columns.
         The resulting DataFrame can be filtered or modified before passing
-        to :meth:`contrast_distances`.
+        to :meth:`~Distance.contrast_distances`.
 
         The output layout is:
 

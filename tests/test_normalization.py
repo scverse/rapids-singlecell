@@ -27,6 +27,18 @@ def test_normalize_total(dtype, sparse):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_normalize_total_promotes_dense_integers(dtype):
+    cudata = AnnData(cp.array([[1, 1], [2, 4]], dtype=dtype))
+
+    rsc.pp.normalize_total(cudata, target_sum=10)
+
+    assert cudata.X.dtype == cp.float32
+    cp.testing.assert_allclose(
+        cudata.X.sum(axis=1), cp.full(cudata.n_obs, 10, dtype=cp.float32)
+    )
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_normalize_total_layers(dtype):
     cudata = AnnData(csr_matrix(X_total, dtype=dtype))
@@ -90,30 +102,104 @@ def test_normalize_pearson_residuals_values(sparsity_func, dtype, theta, clip):
         assert np.min(output_X) >= -clip
 
 
+@pytest.mark.parametrize(
+    "sparsity_func", [csr_matrix, csc_matrix], ids=lambda x: x.__name__
+)
+@pytest.mark.parametrize("theta", [100.0, np.inf])
+def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
+    """Regression test: float64 precision of the sparse Pearson-residual kernels.
+
+    ``sparse_norm_res_csr_kernel`` / ``sparse_norm_res_csc_kernel`` (in
+    ``_cuda/pr/kernels_pr.cuh``) previously divided by the single-precision
+    intrinsic ``sqrtf``. Because the kernels are templated on the element
+    type, a ``float64`` instantiation silently narrowed the variance term
+    to ``float32``, capping accuracy at ~7 significant digits regardless of
+    the requested dtype. The ``rtol``/``atol`` of 1e-9 below is tight enough
+    to fail on a single-precision result and pass on a genuine float64 one.
+    """
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(0.3, size=(300, 200)).astype(np.float64)
+    # ensure every gene and cell has a nonzero total so mu > 0 everywhere
+    counts[0, :] += 1
+    counts[:, 0] += 1
+    X = cp.asarray(counts)
+
+    # analytic float64 reference residuals (no clipping)
+    ns = cp.sum(X, axis=1)
+    ps = cp.sum(X, axis=0) / cp.sum(X)
+    mu = cp.outer(ns, ps)
+    if np.isinf(theta):
+        reference = (X - mu) / cp.sqrt(mu)
+    else:
+        reference = (X - mu) / cp.sqrt(mu + mu**2 / theta)
+
+    cudata = AnnData(X=sparsity_func(X, dtype=np.float64))
+    output = rsc.pp.normalize_pearson_residuals(
+        cudata, theta=theta, clip=np.inf, inplace=False
+    )
+
+    # the buggy `sqrtf` path is only ~1e-7 accurate; 1e-9 cleanly separates it
+    cp.testing.assert_allclose(output, reference, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("use_array", [False, True])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.parametrize("base", [None, 2, 10])
-def test_log1p_base(dtype, sparse, base):
+def test_log1p_base(use_array, dtype, sparse, base):
     X = cp.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype)
     if sparse:
         X = csr_matrix(X)
     cudata = AnnData(X.copy())
 
-    rsc.pp.log1p(cudata, base=base)
-
-    # Compute reference
-    X_ref = cp.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype)
-    X_ref = cp.log1p(X_ref)
-    if base is not None:
-        X_ref /= cp.log(base)
-
-    if sparse:
-        result = cudata.X.toarray()
+    if use_array:
+        # feeding the matrix directly should match feeding the AnnData
+        out = rsc.pp.log1p(X.copy(), base=base)
+        result = out.toarray() if hasattr(out, "toarray") else out
     else:
-        result = cudata.X
+        rsc.pp.log1p(cudata, base=base)
+        result = cudata.X.toarray() if sparse else cudata.X
+
+    # Compute reference on the host (CPU) to validate the GPU result
+    X_ref = np.log1p(np.array([[1.0, 2.0], [3.0, 4.0], [0.0, 5.0]], dtype=dtype))
+    if base is not None:
+        X_ref /= np.log(base)
 
     cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
-    assert cudata.uns["log1p"]["base"] == base
+    if not use_array:
+        assert cudata.uns["log1p"]["base"] == base
+
+
+def test_log1p_inplace_false_does_not_write_metadata():
+    X = cp.array([[1.0, 2.0], [3.0, 4.0]], dtype=cp.float32)
+    adata = AnnData(X.copy())
+
+    result = rsc.pp.log1p(adata, inplace=False)
+
+    cp.testing.assert_array_equal(adata.X, X)
+    cp.testing.assert_allclose(result, cp.log1p(X))
+    assert "log1p" not in adata.uns
+
+
+@pytest.mark.parametrize("use_array", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("sparse", [True, False])
+def test_sqrt(use_array, dtype, sparse):
+    X = cp.array([[1.0, 4.0], [9.0, 16.0], [0.0, 25.0]], dtype=dtype)
+    if sparse:
+        X = csr_matrix(X)
+    cudata = AnnData(X.copy())
+
+    if use_array:
+        # feeding the matrix directly should match feeding the AnnData
+        out = rsc.pp.sqrt(X.copy())
+        result = out.toarray() if hasattr(out, "toarray") else out
+    else:
+        rsc.pp.sqrt(cudata)
+        result = cudata.X.toarray() if sparse else cudata.X
+
+    X_ref = np.sqrt(np.array([[1.0, 4.0], [9.0, 16.0], [0.0, 25.0]], dtype=dtype))
+    cp.testing.assert_allclose(result, X_ref, rtol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])

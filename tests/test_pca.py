@@ -62,22 +62,43 @@ def _pbmc3k_normalized() -> AnnData:
 # =============================================================================
 
 
+@pytest.mark.parametrize("use_array", [False, True])
 @pytest.mark.parametrize("use_sparse", [True, False])
-def test_pca_correctness_zero_center(use_sparse):
+def test_pca_correctness_zero_center(use_sparse, use_array):
     """Test PCA correctness against reference values (zero_center=True)."""
     A = np.array(A_list).astype("float64")
     if use_sparse:
         A = sparse.csr_matrix(A)
 
     adata = AnnData(A)
-    rsc.pp.pca(adata, n_comps=4, zero_center=True)
+    if use_array:
+        # feeding the matrix directly should return the embedding
+        X_pca = rsc.pp.pca(adata.X, n_comps=4, zero_center=True)
+    else:
+        rsc.pp.pca(adata, n_comps=4, zero_center=True)
+        X_pca = adata.obsm["X_pca"]
 
     # Compare absolute values (signs can flip)
     np.testing.assert_allclose(
-        np.abs(adata.obsm["X_pca"]),
+        np.abs(cp.asnumpy(X_pca)),
         np.abs(A_pca[:, :4]),
         rtol=1e-5,
         atol=1e-5,
+    )
+
+
+def test_pca_return_info_array():
+    """`return_info=True` returns the 4-tuple for matrix input (Scanpy parity)."""
+    A = np.array(A_list).astype("float64")
+    out = rsc.pp.pca(cp.asarray(A), n_comps=4, return_info=True)
+    assert isinstance(out, tuple) and len(out) == 4
+    X_pca, components, variance_ratio, variance = out
+    assert cp.asnumpy(X_pca).shape == (6, 4)
+    assert cp.asnumpy(components).shape == (4, 5)
+    assert cp.asnumpy(variance_ratio).shape == (4,)
+    assert cp.asnumpy(variance).shape == (4,)
+    np.testing.assert_allclose(
+        np.abs(cp.asnumpy(X_pca)), np.abs(A_pca[:, :4]), rtol=1e-5, atol=1e-5
     )
 
 
@@ -360,8 +381,15 @@ def test_mask_length_error():
     """Check error for mask length mismatch."""
     adata = AnnData(np.array(A_list).astype("float32"))
     mask_var = np.random.choice([True, False], adata.shape[1] + 1)
-    with pytest.raises(ValueError, match=r"The shape of the mask .* does not match"):
+    with pytest.raises(ValueError, match=r"shape of the mask do not match"):
         rsc.pp.pca(adata, mask_var=mask_var)
+
+
+def test_mask_var_non_boolean_error():
+    """Non-boolean mask_var is rejected (Scanpy parity via `_check_mask`)."""
+    adata = AnnData(np.array(A_list).astype("float32"))
+    with pytest.raises(ValueError, match="boolean"):
+        rsc.pp.pca(adata, mask_var=np.arange(adata.shape[1]))
 
 
 @pytest.mark.parametrize("float_dtype", [np.float32, np.float64])

@@ -24,7 +24,7 @@ cluster = LocalCUDACluster(
     threads_per_worker=1,           # GPU-safe default
     rmm_pool_size="80%",            # per-worker pool; % of free VRAM at start
     rmm_managed_memory=False,       # avoid UM to maximize P2P
-    rmm_allocator_external_lib="cupy",  # auto-patch CuPy to use RMM
+    rmm_allocator_external_lib_list=["cupy"],  # auto-patch CuPy to use RMM
 )
 client = Client(cluster)
 ```
@@ -40,7 +40,7 @@ cluster = LocalCUDACluster(
     protocol="tcp",                 # TCP is often more predictable with UVM
     threads_per_worker=1,
     rmm_managed_memory=True,        # allow oversubscription (paging)
-    rmm_allocator_external_lib="cupy",
+    rmm_allocator_external_lib_list=["cupy"],
 )
 client = Client(cluster)
 ```
@@ -57,9 +57,10 @@ Load `AnnData` from a Zarr store with `X` as a Dask array, and `obs/var` read ea
 
 ```python
 import anndata as ad
+from importlib.metadata import version
 from packaging.version import parse as parse_version
 
-if parse_version(ad.__version__) < parse_version("0.12.0rc1"):
+if parse_version(version("anndata")) < parse_version("0.12.0rc1"):
     from anndata.experimental import read_elem_as_dask as read_dask
 else:
     from anndata.experimental import read_elem_lazy as read_dask
@@ -69,7 +70,7 @@ import zarr
 SPARSE_CHUNK_SIZE = 20_000
 data_pth = "zarr/cell_atlas.zarr"  # example zarr path
 
-f = zarr.open(data_pth)
+f = zarr.open(data_pth, mode="r")
 X = f["X"]
 shape = X.attrs["shape"]
 
@@ -134,17 +135,26 @@ Persisting loads data into GPU memory across workers. This can quickly cause OOM
 The functions below are implemented to run on Dask‑backed `AnnData` with GPU arrays. Most steps are lazy; reduction steps may synchronize internally. This covers the most common out‑of‑core workflows and will expand over time.
 
 - {func}`~.pp.calculate_qc_metrics`
+- {func}`~.pp.filter_cells`
+- {func}`~.pp.filter_genes`
 - {func}`~.pp.normalize_total`
 - {func}`~.pp.log1p`
-- {func}`~.pp.highly_variable_genes` (flavors: `seurat`, `cell_ranger`, `poisson_gene_selection`)
+- {func}`~.pp.sqrt`
+- {func}`~.pp.highly_variable_genes` (flavors: `seurat`, `cell_ranger`, `seurat_v3`, `seurat_v3_paper`, `poisson_gene_selection`)
 - {func}`~.pp.scale`
 - {func}`~.pp.regress_out`
 - {func}`~.pp.pca`
 - {func}`~.tl.score_genes`
+- {func}`~.tl.score_genes_cell_cycle`
 - {func}`~.tl.louvain`
 - {func}`~.tl.leiden`
-- {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`; NOT `wilcoxon`)
+- {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`
+
+For Dask inputs, {func}`~.pp.normalize_total` does not support
+`exclude_highly_expressed=True`. {func}`~.pp.pca` uses the
+`covariance_eigh` solver; `chunked=True`, `lanczos`, and `randomized` are not
+supported.
 
 ## Troubleshooting
 

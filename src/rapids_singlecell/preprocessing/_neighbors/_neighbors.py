@@ -144,7 +144,8 @@ def _get_connectivities_umap(
     """UMAP fuzzy simplicial set connectivities."""
     set_op_mix_ratio = 1.0
     local_connectivity = 1.0
-    X_conn = cp.empty((n_obs, 1), dtype=np.float32)
+
+    X_conn = cp.zeros((n_obs, 1), dtype=np.float32)
     logger_level = _get_logger_level(logger)
     connectivities = fuzzy_simplicial_set(
         X_conn,
@@ -230,25 +231,23 @@ def _get_connectivities_jaccard(
     -------
     Symmetric CSR connectivity matrix.
     """
-    k_no_self = n_neighbors - 1
+    from rapids_singlecell._cuda._jaccard_cuda import jaccard_shared_counts
 
-    # Binary adjacency (self excluded)
-    rows_adj = cp.repeat(cp.arange(n_obs, dtype=cp.int32), k_no_self)
-    cols_adj = knn_indices[:, 1:].ravel()
-    data_adj = cp.ones(n_obs * k_no_self, dtype=cp.float32)
-    adjacency = cp_sparse.csr_matrix(
-        (data_adj, (rows_adj, cols_adj)), shape=(n_obs, n_obs)
+    knn = cp.ascontiguousarray(knn_indices, dtype=cp.int32)
+
+    # Jaccard weight per KNN entry (i -> j), straight from the KNN lists
+    # (no replicated adjacency matrix, so no int32 nnz overflow).
+    jaccard_vals = cp.empty(n_obs * n_neighbors, dtype=cp.float32)
+    jaccard_shared_counts(
+        knn,
+        n_obs=n_obs,
+        k=n_neighbors,
+        jaccard_vals=jaccard_vals,
+        stream=cp.cuda.get_current_stream().ptr,
     )
 
-    # For each directed KNN edge (i->j), compute shared neighbor count
-    i_idx = rows_adj
-    j_idx = cols_adj
-    rows_i = adjacency[i_idx]
-    rows_j = adjacency[j_idx]
-    shared = cp.asarray(rows_i.multiply(rows_j).sum(axis=1)).ravel()
-
-    # Jaccard: |N(i) & N(j)| / (2*(k-1) - |N(i) & N(j)|)
-    jaccard_vals = shared / (2 * k_no_self - shared)
+    i_idx = cp.repeat(cp.arange(n_obs, dtype=cp.int32), n_neighbors)
+    j_idx = knn.ravel()
 
     # Filter zeros and build sparse matrix
     mask = jaccard_vals != 0

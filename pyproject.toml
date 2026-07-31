@@ -1,10 +1,11 @@
 [build-system]
 requires = [
-    "scikit-build-core>=0.10",
+    "hatchling",
+    "scikit-build-core[hatchling]>=1.0.1",
+    "hatch-vcs",
     "nanobind>=2.0.0",
-    "setuptools-scm>=8",
 ]
-build-backend = "scikit_build_core.build"
+build-backend = "hatchling.build"
 
 [project]
 name = "rapids-singlecell"
@@ -32,8 +33,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-rapids-cu13 = [ "cupy-cuda13x", "cudf-cu13>=25.10", "cuml-cu13>=25.10", "cugraph-cu13>=25.10", "cuvs-cu13>=25.10" ]
-rapids-cu12 = [ "cupy-cuda12x", "cudf-cu12>=25.10", "cuml-cu12>=25.10", "cugraph-cu12>=25.10", "cuvs-cu12>=25.10" ]
+rapids-cu13 = [
+    "cupy-cuda13x[ctk]",
+    "cudf-cu13>=25.12",
+    "cuml-cu13>=25.12",
+    "cugraph-cu13>=25.12",
+    "cuvs-cu13>=25.12",
+    "librmm-cu13>=25.12",
+]
+rapids-cu12 = [
+    "cupy-cuda12x[ctk]",
+    "cudf-cu12>=25.12",
+    "cuml-cu12>=25.12",
+    "cugraph-cu12>=25.12",
+    "cuvs-cu12>=25.12",
+    "librmm-cu12>=25.12",
+]
 
 doc = [
     "sphinx>=4.5.0",
@@ -72,10 +87,10 @@ dev = [
 ]
 
 [project.entry-points."scanpy.backends"]
-rapids_singlecell = "rapids_singlecell._backends.scanpy"
+rapids-singlecell = "rapids_singlecell._backends.scanpy"
 
 [project.entry-points."squidpy.backends"]
-rapids_singlecell = "rapids_singlecell._backends.squidpy"
+rapids-singlecell = "rapids_singlecell._backends.squidpy"
 
 [project.urls]
 Documentation = "https://rapids-singlecell.readthedocs.io"
@@ -129,34 +144,42 @@ addopts = [
 ]
 markers = [
     "gpu: tests that use a GPU (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
+    "array_api: array-API tests (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
 ]
 
-[tool.setuptools_scm]
-write_to = "src/rapids_singlecell/_version.py"
-# Optional but useful:
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
 version_scheme = "guess-next-dev"
 local_scheme = "node-and-date"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/rapids_singlecell/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = [ "src/rapids_singlecell", "src/testing" ]
+exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
+
+[tool.hatch.build.targets.wheel.hooks.scikit-build]
 
 [tool.scikit-build]
 # Use limited ABI wheels (one wheel for all Python minor versions on one platform)
 wheel.py-api = "cp312"
-wheel.packages = [ "src/rapids_singlecell", "src/testing" ]
-wheel.exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
 cmake.version = ">=3.24"
 cmake.build-type = "Release"
 ninja.version = ">=1.10"
-experimental = false
 # Default: use native arch for source builds (auto-detect user's GPU)
 # CI overrides via SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES env var
 cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
 build-dir = "build"
-metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
-sdist.include = [ "src/rapids_singlecell/_version.py" ]
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]
+# Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+# Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
 repair-wheel-command = [
-    "auditwheel repair --exclude libcublas.so.12 --exclude libcublas.so.13 --exclude libcublasLt.so.12 --exclude libcublasLt.so.13 --exclude libcudart.so.12 --exclude libcudart.so.13 -w {dest_dir} {wheel}",
+    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
     "pipx run abi3audit --strict --report {wheel}",
 ]
 [tool.cibuildwheel.macos]

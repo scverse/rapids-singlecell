@@ -152,6 +152,7 @@ def _split_pairs(
     # Load-balanced split based on work per pair
     # Off-diagonal (i != j): work = n_i * n_j
     # Diagonal (i == i): work = n_i * (n_i - 1) / 2  (within-group, no self-pairs)
+    group_sizes = group_sizes.astype(cp.int64, copy=False)
     sizes_left = group_sizes[pair_left]
     sizes_right = group_sizes[pair_right]
     is_diagonal = pair_left == pair_right
@@ -164,8 +165,8 @@ def _split_pairs(
     total_work = cumulative_work[-1]
 
     # Find split points at 1/n_devices, 2/n_devices, ... of total work
-    targets = total_work * cp.arange(1, n_devices) / n_devices
-    split_indices = cp.searchsorted(cumulative_work, targets).get()
+    targets = total_work * cp.arange(1, n_devices, dtype=cp.int64) // n_devices
+    split_indices = cp.searchsorted(cumulative_work, targets, side="right").get()
 
     # Split arrays at those indices
     left_splits = cp.split(pair_left, split_indices)

@@ -16,8 +16,8 @@ _sum_duplicates_diff = cp.ElementwiseKernel(
 )
 
 _sum_duplicates_assign = cp.ElementwiseKernel(
-    "int32 src_row, int32 src_col, int32 index",
-    "raw int32 rows, raw int32 indices",
+    "T src_row, T src_col, I index",
+    "raw T rows, raw T indices",
     """
     rows[index] = src_row;
     indices[index] = src_col;
@@ -26,7 +26,7 @@ _sum_duplicates_assign = cp.ElementwiseKernel(
 )
 
 _scatter_sum = cp.ElementwiseKernel(
-    "float64 src, int32 index",
+    "float64 src, I index",
     "raw float64 sums",
     """
     atomicAdd(&sums[index], src);
@@ -35,7 +35,7 @@ _scatter_sum = cp.ElementwiseKernel(
 )
 
 _scatter_mean_var = cp.ElementwiseKernel(
-    "float64 src, int32 index",
+    "float64 src, I index",
     "raw float64 means, raw float64 var",
     """
     atomicAdd(&means[index], src);
@@ -45,7 +45,7 @@ _scatter_mean_var = cp.ElementwiseKernel(
 )
 
 _scatter_count_nonzero = cp.ElementwiseKernel(
-    "float64 src, int32 index",
+    "float64 src, I index",
     "raw float32 counts",
     """
     if (src != 0){

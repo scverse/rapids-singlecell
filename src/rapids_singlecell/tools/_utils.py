@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import cupy as cp
+import scipy.sparse as cpu_sparse
 from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 
 from rapids_singlecell._compat import DaskArray
 
 from . import pca
+
+
+def _validate_init_pos(init_coords):
+    """Coerce a user-supplied `init_pos` array to a 2D cupy float32 array.
+
+    Replaces the previous use of ``cuml.thirdparty_adapters.check_array``, which was
+    removed in cuml 26.06.
+    """
+    if cpu_sparse.issparse(init_coords) or issparse(init_coords):
+        raise ValueError("Sparse `init_pos` is not supported.")
+    arr = cp.asarray(init_coords, dtype=cp.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D `init_pos`, got {arr.ndim}D array.")
+    return arr
 
 
 def _choose_representation(adata, use_rep=None, n_pcs=None):

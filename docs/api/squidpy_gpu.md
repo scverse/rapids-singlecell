@@ -5,7 +5,9 @@
 
 ## Squidpy backend
 
-With Squidpy versions that support computational backends, RAPIDS-singlecell is available as the `rapids_singlecell` backend with the aliases `cuda`, `rapids-singlecell`, and `rsc`.
+With Squidpy versions that support computational backends, RAPIDS-singlecell is
+available as the `rapids-singlecell` backend with the aliases `cuda`, `rapids`,
+and `rapids_singlecell`.
 
 ```python
 import squidpy as sq
@@ -25,4 +27,5 @@ The backend exposes RAPIDS-singlecell's {mod}`rapids_singlecell.gr` functions fo
     gr.spatial_autocorr
     gr.co_occurrence
     gr.ligrec
+    gr.calculate_niche
 ```

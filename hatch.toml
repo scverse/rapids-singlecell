@@ -38,23 +38,47 @@ overrides.matrix.deps.extra-dependencies = [
     { if = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
+    # numpy 2.5 removed `np.row_stack`, which numba-cuda still calls -> the whole
+    # suite fails at collection. Now that 2.5 is a stable release it hits every env,
+    # so `stable` needs it too. Remove once numba-cuda guards the call
+    # (NVIDIA/numba-cuda#907, fix in #916).
+    { if = [
+        "stable",
+        "dev",
+        "rapids_prerelease",
+    ], value = "numpy<2.5" },
+    # UV_PRERELEASE=allow otherwise drags in mutually-incompatible numba/numba-cuda
+    # prereleases (numba 0.63.0b1 -> removed np.trapz; numba 0.66.0rc2 + numba-cuda
+    # 0.30.2 -> missing numba.cuda.types.NPDatetime). Pin the known-good stable pair
+    # (numba 0.64.x + numba-cuda 0.28.x) so only RAPIDS uses nightlies.
+    # `stable` needs numba pinned too: uv reaches for 0.63.0b1 there (the only numba
+    # without a `numpy<2.5` cap) and the numpy pin alone doesn't walk it back.
+    { if = [
+        "stable",
+        "dev",
+        "rapids_prerelease",
+    ], value = "numba>=0.64,<0.65" },
+    { if = [
+        "dev",
+        "rapids_prerelease",
+    ], value = "numba-cuda<0.30" },
 ]
 overrides.matrix.cuda.extra-dependencies = [
-    { if = [ "13" ], value = "cuml-cu13<26.8" },
-    { if = [ "13" ], value = "cudf-cu13<26.8" },
-    { if = [ "13" ], value = "cugraph-cu13<26.8" },
-    { if = [ "13" ], value = "cuvs-cu13<26.8" },
-    { if = [ "12" ], value = "cuml-cu12<26.8" },
-    { if = [ "12" ], value = "cudf-cu12<26.8" },
-    { if = [ "12" ], value = "cugraph-cu12<26.8" },
-    { if = [ "12" ], value = "cuvs-cu12<26.8" },
+    { if = [ "13" ], value = "cuml-cu13<26.10" },
+    { if = [ "13" ], value = "cudf-cu13<26.10" },
+    { if = [ "13" ], value = "cugraph-cu13<26.10" },
+    { if = [ "13" ], value = "cuvs-cu13<26.10" },
+    { if = [ "12" ], value = "cuml-cu12<26.10" },
+    { if = [ "12" ], value = "cudf-cu12<26.10" },
+    { if = [ "12" ], value = "cugraph-cu12<26.10" },
+    { if = [ "12" ], value = "cuvs-cu12<26.10" },
 ]
 
 ## For prerelease we rely on UV_PRERELEASE + nightly index; features select cu12/cu13
 
 [envs.docs]
 features = [ "doc" ]
-scripts.build = "sphinx-build -M html docs docs/_build {args}"
+scripts.build = "sphinx-build -W --keep-going -b html docs docs/_build/html {args}"
 scripts.clean = "git clean -fXd docs"
 
 [envs.default.pip]

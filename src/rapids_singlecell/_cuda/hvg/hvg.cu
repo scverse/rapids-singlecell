@@ -32,33 +32,26 @@ static void launch_expected_zeros(const T* scaled_means, const T* total_counts,
     CUDA_CHECK_LAST_ERROR(expected_zeros_kernel);
 }
 
+template <typename T, typename Device>
+void def_expected_zeros(nb::module_& m) {
+    m.def(
+        "expected_zeros",
+        [](gpu_array_c<const T, Device> scaled_means,
+           gpu_array_c<const T, Device> total_counts,
+           gpu_array_c<T, Device> expected, int n_genes, int n_cells,
+           std::uintptr_t stream) {
+            launch_expected_zeros<T>(scaled_means.data(), total_counts.data(),
+                                     expected.data(), n_genes, n_cells,
+                                     reinterpret_cast<cudaStream_t>(stream));
+        },
+        "scaled_means"_a, "total_counts"_a, "expected"_a, "n_genes"_a,
+        "n_cells"_a, "stream"_a = 0);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
-    m.def(
-        "expected_zeros",
-        [](gpu_array_c<const double, Device> scaled_means,
-           gpu_array_c<const double, Device> total_counts,
-           gpu_array_c<double, Device> expected, int n_genes, int n_cells,
-           std::uintptr_t stream) {
-            launch_expected_zeros<double>(
-                scaled_means.data(), total_counts.data(), expected.data(),
-                n_genes, n_cells, reinterpret_cast<cudaStream_t>(stream));
-        },
-        "scaled_means"_a, "total_counts"_a, "expected"_a, "n_genes"_a,
-        "n_cells"_a, "stream"_a = 0);
-
-    m.def(
-        "expected_zeros",
-        [](gpu_array_c<const float, Device> scaled_means,
-           gpu_array_c<const float, Device> total_counts,
-           gpu_array_c<float, Device> expected, int n_genes, int n_cells,
-           std::uintptr_t stream) {
-            launch_expected_zeros<float>(
-                scaled_means.data(), total_counts.data(), expected.data(),
-                n_genes, n_cells, reinterpret_cast<cudaStream_t>(stream));
-        },
-        "scaled_means"_a, "total_counts"_a, "expected"_a, "n_genes"_a,
-        "n_cells"_a, "stream"_a = 0);
+    def_expected_zeros<float, Device>(m);
+    def_expected_zeros<double, Device>(m);
 }
 
 NB_MODULE(_hvg_cuda, m) {

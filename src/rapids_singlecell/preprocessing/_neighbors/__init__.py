@@ -407,8 +407,16 @@ def bbknn(
         knn_indices[:, col_range] = ind_to[sub_ind]
         knn_dist[:, col_range] = sub_dist
 
+    # Sort each row so neighbors are ordered closest-first across all batches.
+    # fuzzy_simplicial_set uses the first non-zero distance per row as the
+    # local-connectivity rho; unsorted input collapses sigma and weights.
+    order = cp.argsort(knn_dist, axis=1)
+    row_idx = cp.arange(n_obs)[:, None]
+    knn_dist = knn_dist[row_idx, order]
+    knn_indices = knn_indices[row_idx, order]
+
     if trim is None:
-        trim = 10 * neighbors_within_batch
+        trim = 10 * total_neighbors
 
     params = dict(
         n_neighbors=total_neighbors,

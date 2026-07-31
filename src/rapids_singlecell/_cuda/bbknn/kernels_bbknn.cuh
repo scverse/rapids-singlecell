@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cub/block/block_radix_sort.cuh>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 __global__ void find_top_k_per_row_kernel(const float* __restrict__ data,
                                           const int* __restrict__ indptr,
@@ -47,6 +49,59 @@ __global__ void find_top_k_per_row_kernel(const float* __restrict__ data,
     }
 
     vals[row] = top_k[min_index];
+}
+
+// Block-cooperative variant: one CUDA block per row, sorts the row with
+// BlockRadixSort, returns the `trim`-th largest as the cut value. Shared
+// memory is the CUB sort temp storage only, independent of `trim`, so it
+// scales to large `trim` values where the per-thread top-k kernel runs out
+// of shared memory. Requires every row to fit in BLOCK_THREADS *
+// ITEMS_PER_THREAD.
+template <int BLOCK_THREADS, int ITEMS_PER_THREAD>
+__global__ void find_top_k_per_row_sorted_kernel(const float* __restrict__ data,
+                                                 const int* __restrict__ indptr,
+                                                 const int n_rows,
+                                                 const int trim,
+                                                 float* __restrict__ vals) {
+    int row = blockIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+
+    int start = indptr[row];
+    int end = indptr[row + 1];
+    int length = end - start;
+
+    if (length <= trim) {
+        if (threadIdx.x == 0) {
+            vals[row] = 0.0f;  // insufficient elements
+        }
+        return;
+    }
+
+    using BlockRadixSort =
+        cub::BlockRadixSort<float, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    __shared__ typename BlockRadixSort::TempStorage temp_storage;
+
+    float thread_keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int idx = threadIdx.x * ITEMS_PER_THREAD + i;
+        // Pad out-of-range with -inf so they sort to the bottom of a
+        // descending sort and never appear among the trim largest.
+        thread_keys[i] = (idx < length) ? data[start + idx] : -CUDART_INF_F;
+    }
+
+    BlockRadixSort(temp_storage).SortDescending(thread_keys);
+
+    // After SortDescending with blocked arrangement, sorted index i lives at
+    // thread (i / ITEMS_PER_THREAD), local slot (i % ITEMS_PER_THREAD).
+    int target_idx = trim - 1;
+    int target_thread = target_idx / ITEMS_PER_THREAD;
+    int target_item = target_idx % ITEMS_PER_THREAD;
+    if (threadIdx.x == target_thread) {
+        vals[row] = thread_keys[target_item];
+    }
 }
 
 __global__ void cut_smaller_kernel(const int* __restrict__ indptr,

@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 import pandas as pd
-from scanpy.get import _get_obs_rep
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._cuda import _hvg_cuda as _hvg
+from rapids_singlecell.get import _get_obs_rep
 from rapids_singlecell.preprocessing._qc import _basic_qc
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,

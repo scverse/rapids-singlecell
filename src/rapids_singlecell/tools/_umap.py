@@ -7,7 +7,6 @@ import cuml.internals.logger as logger
 import cupy as cp
 import numpy as np
 from cuml.manifold.umap import UMAP, find_ab_params, simplicial_set_embedding
-from cuml.thirdparty_adapters import check_array as check_array_cuml
 from cupyx.scipy import sparse
 from packaging.version import parse as parse_version
 from scanpy._utils import NeighborsView
@@ -17,7 +16,7 @@ from sklearn.utils import check_random_state
 from rapids_singlecell._compat import _random_state_kwargs
 from rapids_singlecell._utils import _get_logger_level
 
-from ._utils import _choose_representation
+from ._utils import _choose_representation, _validate_init_pos
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -216,9 +215,12 @@ def umap(
                 init_coords = init_pos
 
         if hasattr(init_coords, "dtype"):
-            init_coords = check_array_cuml(
-                init_coords, dtype=np.float32, accept_sparse=False
-            )
+            init_coords = _validate_init_pos(init_coords)
+            if init_coords.shape[1] != n_components:
+                raise ValueError(
+                    f"Expected {n_components} columns but got "
+                    f"{init_coords.shape[1]} columns."
+                )
 
         random_state = check_random_state(random_state)
 

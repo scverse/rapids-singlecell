@@ -10,14 +10,20 @@ import scanpy as sc
 from scipy.stats import pearsonr
 
 import rapids_singlecell as rsc
+import rapids_singlecell.preprocessing._harmony as harmony_module
 from rapids_singlecell.preprocessing._harmony import (
     _SUPPRESS_PENALTY,
     _compute_lambda_kb,
+    _correction_multi,
+    _solve_spd_batched,
 )
 from rapids_singlecell.preprocessing._harmony._helper import (
     _choose_colsum_algo_benchmark,
     _choose_colsum_algo_heuristic,
     _colsum_heuristic,
+    _factorize_joint_codes,
+    _get_batch_codes,
+    _get_theta_array,
     _scatter_add_cp,
 )
 
@@ -32,7 +38,294 @@ def _get_measure(x, base, norm):
         return np.linalg.norm(x - base) / np.linalg.norm(base)
 
 
-_HARMONY_DATA_BASE = "https://exampledata.scverse.org/rapids-singlecell/harmony_data"
+_HARMONY_DATA_BASE = (
+    "https://scverse-exampledata.s3.amazonaws.com/rapids-singlecell/harmony_data"
+)
+_IRCOLITIS_HARMONYPY2_H5AD = (
+    "ircolitis_blood_cd8_2048_harmonypy2_2_0_0.h5ad",
+    "sha256:c52c4a916fc6b811134dbfb1dc105d83f53195ea3092f277f30c8dbb987d641a",
+)
+_HARMONYPY2_MULTIKEY_H5AD = (
+    "harmonypy2_two_covariates_2_0_0.h5ad",
+    "sha256:1ac1542ee31b0660175ed307c29077c5621225af062a0e14d251322abcc1ac46",
+)
+
+
+def test_harmony_multikey_marginal_codes_and_theta():
+    obs = pd.DataFrame(
+        {
+            "batch": pd.Categorical(
+                ["b0", "b1", "b2", "b3", "b4", "b0"],
+                categories=["b0", "b1", "b2", "b3", "b4"],
+            ),
+            "sex": pd.Categorical(
+                ["f", "m", "f", "m", "f", "m"], categories=["f", "m"]
+            ),
+        }
+    )
+
+    codes, n_levels = _get_batch_codes(obs, ["batch", "sex"])
+
+    np.testing.assert_array_equal(n_levels, np.array([5, 2], dtype=np.int32))
+    np.testing.assert_array_equal(codes[:, 0], np.array([0, 1, 2, 3, 4, 0]))
+    np.testing.assert_array_equal(codes[:, 1], np.array([5, 6, 5, 6, 5, 6]))
+    counts = np.bincount(codes.ravel(), minlength=int(n_levels.sum()))
+    assert counts[:5].sum() == len(obs)
+    assert counts[5:].sum() == len(obs)
+    cp.testing.assert_array_equal(
+        _get_theta_array([2.0, 0.1], n_levels, cp.float32),
+        cp.array([2, 2, 2, 2, 2, 0.1, 0.1], dtype=cp.float32),
+    )
+    cp.testing.assert_array_equal(
+        _get_theta_array(2.0, n_levels, cp.float32),
+        cp.full(7, 2.0, dtype=cp.float32),
+    )
+    expanded_theta = cp.arange(7, dtype=cp.float32)
+    cp.testing.assert_array_equal(
+        _get_theta_array(expanded_theta, n_levels, cp.float32), expanded_theta
+    )
+
+
+@pytest.mark.parametrize("size", [1, 6])
+def test_harmony_multikey_theta_rejects_invalid_length(size):
+    with pytest.raises(
+        ValueError,
+        match=r"batch variables \(2\) or categorical levels \(7\)",
+    ):
+        _get_theta_array([2.0] * size, np.array([5, 2]), cp.float32)
+
+
+def test_harmony_theta_rejects_unsupported_type():
+    with pytest.raises(ValueError, match="Theta must be a scalar or an array-like"):
+        _get_theta_array({"batch": 2.0}, np.array([5, 2]), cp.float32)
+
+
+def test_harmony_batch_keys_are_nonempty_and_complete():
+    obs = pd.DataFrame({"batch": ["a", None]})
+    with pytest.raises(ValueError, match="contains missing values"):
+        _get_batch_codes(obs, "batch")
+    with pytest.raises(ValueError, match="at least one column"):
+        _get_batch_codes(obs, [])
+
+
+def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
+    n_covariates = 64
+    batch_codes = np.stack(
+        (
+            np.zeros(n_covariates, dtype=np.int32),
+            np.ones(n_covariates, dtype=np.int32),
+            np.zeros(n_covariates, dtype=np.int32),
+        )
+    )
+
+    joint_cats, joint_codes = _factorize_joint_codes(
+        batch_codes, np.full(n_covariates, 2, dtype=np.int32)
+    )
+
+    assert joint_cats.shape == (2, n_covariates)
+    assert joint_codes.shape == (3,)
+    np.testing.assert_array_equal(joint_codes, np.array([0, 1, 0]))
+
+
+@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+def test_harmony_multikey_singular_gram_uses_least_squares(dtype):
+    gram = cp.asarray(
+        [
+            [[4.0, 1.0], [1.0, 3.0]],
+            [[1.0, 1.0], [1.0, 1.0]],
+        ],
+        dtype=dtype,
+    )
+    rhs = cp.asarray(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[2.0, 4.0], [2.0, 4.0]],
+        ],
+        dtype=dtype,
+    )
+
+    result = _solve_spd_batched(gram, rhs)
+    expected = cp.asarray(
+        [
+            [[0.0, 2.0 / 11.0], [1.0, 14.0 / 11.0]],
+            [[1.0, 2.0], [1.0, 2.0]],
+        ],
+        dtype=dtype,
+    )
+
+    assert bool(cp.isfinite(result).all())
+    atol = 1e-5 if dtype == cp.float32 else 1e-12
+    cp.testing.assert_allclose(result, expected, atol=atol, rtol=atol)
+
+
+@pytest.mark.parametrize("ridge_lambda", [0.0, -0.1, float("inf"), float("nan")])
+@pytest.mark.parametrize("multikey", [False, True])
+def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
+    rng = np.random.default_rng(734)
+    batch = np.resize(["a", "b", "c"], 60)
+    adata = ad.AnnData(
+        X=None,
+        obs=pd.DataFrame(
+            {"batch": batch, "duplicate_batch": batch},
+            index=[f"cell_{index}" for index in range(60)],
+        ),
+        obsm={"X_pca": rng.normal(size=(60, 6)).astype(np.float32)},
+    )
+    key = ["batch", "duplicate_batch"] if multikey else "batch"
+
+    with pytest.raises(ValueError, match="ridge_lambda must be a finite positive"):
+        rsc.pp.harmony_integrate(
+            adata,
+            key,
+            flavor="harmony1",
+            ridge_lambda=ridge_lambda,
+            n_clusters=3,
+            max_iter_harmony=1,
+            max_iter_clustering=2,
+            block_proportion=1.0,
+            random_state=734,
+            dtype=cp.float32,
+        )
+
+
+@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize("n_covariates", [2, 3, 4])
+def test_harmony_multikey_correction_matches_dense_design(
+    dtype, n_covariates, monkeypatch
+):
+    rng = np.random.default_rng(734)
+    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
+    offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
+    n_batches = int(levels.sum())
+    n_cells, n_pcs, n_clusters = 31, 5, 3
+    np_dtype = np.dtype(dtype)
+
+    local_codes = np.column_stack(
+        [rng.integers(0, level, size=n_cells) for level in levels]
+    ).astype(np.int32)
+    cats_np = local_codes + offsets
+    X_np = rng.normal(size=(n_cells, n_pcs)).astype(np_dtype)
+    R_np = rng.random(size=(n_cells, n_clusters)).astype(np_dtype)
+    R_np /= R_np.sum(axis=1, keepdims=True)
+
+    O_np = np.zeros((n_batches, n_clusters), dtype=np_dtype)
+    for covariate in range(n_covariates):
+        np.add.at(O_np, cats_np[:, covariate], R_np)
+    lambda_np = rng.uniform(0.2, 1.0, size=O_np.shape).astype(np_dtype)
+    lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
+
+    joint_cats_np, joint_codes_np = np.unique(cats_np, axis=0, return_inverse=True)
+    cats = cp.asarray(cats_np, dtype=cp.int32)
+
+    result = _correction_multi(
+        cp.asarray(X_np),
+        cp.asarray(R_np),
+        O=cp.asarray(O_np),
+        lambda_kb=cp.asarray(lambda_np),
+        cats=cats,
+        n_batches=n_batches,
+        n_covariates=n_covariates,
+        joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
+        joint_codes=cp.asarray(joint_codes_np, dtype=cp.int32),
+    )
+
+    design = np.zeros((n_cells, n_batches + 1), dtype=np_dtype)
+    design[:, 0] = 1
+    for covariate in range(n_covariates):
+        design[np.arange(n_cells), cats_np[:, covariate] + 1] = 1
+
+    expected = X_np.copy()
+    for cluster in range(n_clusters):
+        active = lambda_np[:, cluster] < np_dtype.type(_SUPPRESS_PENALTY)
+        retained = np.concatenate(([True], active))
+        weighted_design = R_np[:, cluster, None] * design
+        gram = design.T @ weighted_design
+        gram[1:, 1:] += np.diag(
+            np.where(active, lambda_np[:, cluster], np_dtype.type(0))
+        )
+        rhs = weighted_design.T @ X_np
+
+        W = np.zeros((n_batches + 1, n_pcs), dtype=np_dtype)
+        retained_indices = np.flatnonzero(retained)
+        W[retained] = np.linalg.solve(
+            gram[np.ix_(retained_indices, retained_indices)], rhs[retained]
+        )
+        W[0] = 0
+        expected -= R_np[:, cluster, None] * (design @ W)
+
+    atol = 2e-5 if dtype == cp.float32 else 1e-11
+    cp.testing.assert_allclose(result, cp.asarray(expected), atol=atol, rtol=atol)
+
+    monkeypatch.setattr(
+        harmony_module,
+        "_multi_correction_cluster_chunk_size",
+        lambda **_kwargs: 1,
+    )
+
+    chunked = _correction_multi(
+        cp.asarray(X_np),
+        cp.asarray(R_np),
+        O=cp.asarray(O_np),
+        lambda_kb=cp.asarray(lambda_np),
+        cats=cats,
+        n_batches=n_batches,
+        n_covariates=n_covariates,
+        joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
+        joint_codes=cp.asarray(joint_codes_np, dtype=cp.int32),
+    )
+    cp.testing.assert_allclose(chunked, cp.asarray(expected), atol=atol, rtol=atol)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize(
+    ("case", "theta", "n_clusters", "max_iter_harmony"),
+    [
+        ("nclust1", [2.0, 0.1], 1, 1),
+        ("nclust4", [2.0, 0.1], 4, 10),
+        ("nclust4_batch_only", [2.0, 0.0], 4, 10),
+        ("nclust4_sex_only", [0.0, 2.0], 4, 10),
+    ],
+)
+def test_harmony2_multikey_reference(
+    adata_harmonypy2_multikey,
+    case,
+    theta,
+    n_clusters,
+    max_iter_harmony,
+):
+    adata = adata_harmonypy2_multikey.copy()
+    reference = adata.obsm[f"harmony2_ref_{case}"].copy()
+
+    rsc.pp.harmony_integrate(
+        adata,
+        ["batch", "sex"],
+        theta=theta,
+        flavor="harmony2",
+        dtype=cp.float64,
+        sigma=0.1,
+        n_clusters=n_clusters,
+        max_iter_harmony=max_iter_harmony,
+        max_iter_clustering=4,
+        tol_clustering=1e-3,
+        tol_harmony=1e-2,
+        block_proportion=0.05,
+        random_state=734,
+        alpha=0.2,
+        batch_prune_threshold=1e-5,
+    )
+
+    result = adata.obsm["X_pca_harmony"]
+    assert _get_measure(reference, result, "r").min() > 0.95
+    assert _get_measure(reference, result, "L2").max() < 0.1
+
+
+@pytest.fixture(scope="module")
+def adata_harmonypy2_multikey():
+    filename, known_hash = _HARMONYPY2_MULTIKEY_H5AD
+    reference_file = pooch.retrieve(
+        f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash
+    )
+    return ad.read_h5ad(reference_file)
 
 
 @pytest.fixture(scope="module")
@@ -52,42 +345,21 @@ def adata_reference():
         known_hash="md5:8c7ca20e926513da7cf0def1211baecb",
     )
     meta = pd.read_csv(meta_file, delimiter="\t")
-    adata = ad.AnnData(
+    return ad.AnnData(
         X=None,
         obs=meta,
         obsm={"X_pca": X_pca.values, "harmony_org": X_pca_harmony.values},
     )
-    return adata
 
 
 @pytest.fixture(scope="module")
-def adata_ircolitis_harmony2():
-    """IRcolitis blood CD8 dataset (68k cells) with Harmony2 (R) reference output."""
-    pcs_file = pooch.retrieve(
-        f"{_HARMONY_DATA_BASE}/ircolitis_blood_cd8_pcs.tsv.gz",
-        known_hash="md5:9f28afa68ed4e1fd465d53d360b58a35",
+def adata_ircolitis_harmonypy2():
+    """Stratified 2,048-cell IRcolitis harmonypy 2.0.0 reference."""
+    filename, known_hash = _IRCOLITIS_HARMONYPY2_H5AD
+    reference_file = pooch.retrieve(
+        f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash
     )
-    pcs = pd.read_csv(pcs_file, delimiter="\t")
-    harmony2_file = pooch.retrieve(
-        f"{_HARMONY_DATA_BASE}/ircolitis_blood_cd8_pcs_harmonized.tsv.gz",
-        known_hash="md5:848f1e09016c633e044b7d93650505ba",
-    )
-    h2 = pd.read_csv(harmony2_file, delimiter="\t")
-    obs_file = pooch.retrieve(
-        f"{_HARMONY_DATA_BASE}/ircolitis_blood_cd8_obs.tsv.gz",
-        known_hash="md5:46efe419e59450504c3d3b343eff8022",
-    )
-    obs = pd.read_csv(obs_file, delimiter="\t", low_memory=False)
-
-    X_pca = pcs.drop(columns=["cell_barcode"]).values
-    X_harmony2 = h2.drop(columns=["cell_barcode"]).values
-
-    adata = ad.AnnData(
-        X=None,
-        obs=obs,
-        obsm={"X_pca": X_pca, "harmony2_ref": X_harmony2},
-    )
-    return adata
+    return ad.read_h5ad(reference_file)
 
 
 @pytest.mark.parametrize("bad_alpha", [-0.1, 0.0, float("inf"), float("nan")])
@@ -108,46 +380,56 @@ def test_harmony_integrate_bad_prune_threshold(bad_threshold):
         )
 
 
-@pytest.mark.parametrize("correction_method", ["fast", "original", "batched"])
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_harmony_integrate(correction_method, dtype):
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_integrate_warns_for_original_correction(monkeypatch):
+    adata = sc.datasets.pbmc68k_reduced()
+    correction_fast = harmony_module._correction_fast
+    calls = 0
+
+    def traced_correction_fast(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return correction_fast(*args, **kwargs)
+
+    monkeypatch.setattr(harmony_module, "_correction_fast", traced_correction_fast)
+    with pytest.warns(
+        FutureWarning,
+        match="correction_method='original' is deprecated",
+    ):
+        rsc.pp.harmony_integrate(
+            adata,
+            "bulk_labels",
+            correction_method="original",
+            dtype=cp.float32,
+            max_iter_harmony=1,
+        )
+    assert calls == 1
+    assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("correction_method", ["fast", "batched"])
+def test_harmony_integrate(correction_method):
     """
     Test that Harmony integrate works.
 
     This is a very simple test that just checks to see if the Harmony
     integrate wrapper successfully added a new field to ``adata.obsm``
     and makes sure it has the same dimensions as the original PCA table.
+
+    This is a pure shape/contract check: the output shape is independent of
+    dtype and iteration count, so we run float32 with a single harmony
+    iteration to exercise both correction-method paths cheaply.
     """
     adata = sc.datasets.pbmc68k_reduced()
     rsc.pp.harmony_integrate(
         adata,
         "bulk_labels",
         correction_method=correction_method,
-        dtype=dtype,
+        dtype=cp.float32,
+        max_iter_harmony=1,
     )
     assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
-
-
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_harmony_integrate_algos(dtype):
-    """
-    Test that Harmony integrate works.
-
-    This is a very simple test that just checks to see if the Harmony
-    integrate wrapper successfully added a new field to ``adata.obsm``
-    and makes sure it has the same dimensions as the original PCA table.
-    """
-    adata = sc.datasets.pbmc68k_reduced()
-    rsc.pp.harmony_integrate(
-        adata, "bulk_labels", correction_method="fast", dtype=dtype
-    )
-    fast = adata.obsm["X_pca_harmony"].copy()
-    rsc.pp.harmony_integrate(
-        adata, "bulk_labels", correction_method="original", dtype=dtype
-    )
-    slow = adata.obsm["X_pca_harmony"].copy()
-    assert _get_measure(fast, slow, "r").min() > 0.99
-    assert _get_measure(fast, slow, "L2").max() < 0.1
 
 
 @pytest.mark.parametrize("algo", ["columns", "atomics", "gemm"])
@@ -190,7 +472,7 @@ def test_benchmark_colsum_algorithms(dtype):
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("column", ["gemm", "columns", "atomics"])
-@pytest.mark.parametrize("correction_method", ["fast", "original", "batched"])
+@pytest.mark.parametrize("correction_method", ["fast", "batched"])
 def test_harmony_integrate_reference(
     adata_reference, *, dtype, column, correction_method
 ):
@@ -224,37 +506,6 @@ def test_harmony_integrate_reference(
         ).min()
         > 0.95
     )
-
-
-@pytest.mark.parametrize("correction_method", ["original", "batched"])
-@pytest.mark.parametrize("dtype", [cp.float64, cp.float32])
-def test_harmony2_correction_methods_agree(
-    adata_reference, *, dtype, correction_method
-):
-    """Harmony2 default path: correction methods produce consistent results."""
-    adata = adata_reference.copy()
-    rsc.pp.harmony_integrate(
-        adata,
-        "donor",
-        correction_method=correction_method,
-        dtype=dtype,
-        max_iter_harmony=20,
-    )
-    h2 = adata.obsm["X_pca_harmony"]
-
-    # Run the reference method (fast) for comparison
-    adata_ref = adata_reference.copy()
-    rsc.pp.harmony_integrate(
-        adata_ref,
-        "donor",
-        correction_method="fast",
-        dtype=dtype,
-        max_iter_harmony=20,
-    )
-    h2_ref = adata_ref.obsm["X_pca_harmony"]
-
-    assert _get_measure(h2, h2_ref, "r").min() > 0.99
-    assert _get_measure(h2, h2_ref, "L2").max() < 0.05
 
 
 @pytest.mark.parametrize("n_cells", [1000, 60000])
@@ -363,29 +614,6 @@ def test_compute_lambda_kb_dynamic_false(dtype):
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_compute_lambda_kb_fixed_ridge_zero(dtype):
-    """dynamic_lambda=False with ridge_lambda=0 still guards zero-denominator."""
-    sentinel = dtype(_SUPPRESS_PENALTY)
-    E = cp.array([[5.0, 0.0]], dtype=dtype)
-    O = cp.array([[10.0, 0.0]], dtype=dtype)
-    N_b = cp.array([100.0], dtype=dtype)
-
-    result = _compute_lambda_kb(
-        E,
-        O=O,
-        N_b=N_b,
-        alpha=0.2,
-        threshold=None,
-        ridge_lambda=0.0,
-        dynamic_lambda=False,
-    )
-    # (0,0): O=10 + lambda=0 = 10 → no guard, stays 0.0
-    assert result[0, 0] == dtype(0.0)
-    # (0,1): O=0 + lambda=0 = 0 → sentinel
-    assert result[0, 1] == sentinel
-
-
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 def test_compute_lambda_kb_zero_denom(dtype):
     """_compute_lambda_kb guards against O==0 and E==0 (zero-denominator)."""
     sentinel = dtype(_SUPPRESS_PENALTY)
@@ -409,19 +637,37 @@ def test_compute_lambda_kb_zero_denom(dtype):
     cp.testing.assert_allclose(result[0, 1], dtype(1.0))
 
 
-@pytest.mark.parametrize("correction_method", ["fast", "original", "batched"])
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize(
+    ("dtype", "correction_method"),
+    [
+        (cp.float32, "fast"),
+        (cp.float32, "batched"),
+        (cp.float64, "fast"),
+        (cp.float64, "batched"),
+    ],
+)
 def test_harmony2_ircolitis_reference(
-    adata_ircolitis_harmony2, correction_method, dtype
+    adata_ircolitis_harmonypy2, correction_method, dtype
 ):
-    """Harmony2 on IRcolitis (68k cells, 11 batches) matches R harmony2 reference."""
-    adata = adata_ircolitis_harmony2.copy()
+    """Harmony2 on a real 11-batch CI subset matches harmonypy 2.0.0."""
+    adata = adata_ircolitis_harmonypy2.copy()
     rsc.pp.harmony_integrate(
         adata,
         "batch",
+        theta=2.0,
+        flavor="harmony2",
         correction_method=correction_method,
         dtype=dtype,
+        sigma=0.1,
+        n_clusters=2,
         max_iter_harmony=10,
+        max_iter_clustering=4,
+        tol_clustering=1e-3,
+        tol_harmony=1e-2,
+        block_proportion=0.05,
+        random_state=734,
+        alpha=0.2,
+        batch_prune_threshold=1e-5,
     )
 
     ref = adata.obsm["harmony2_ref"]

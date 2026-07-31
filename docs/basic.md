@@ -1,6 +1,6 @@
 ```{include} ../README.md
 :start-line: 0
-:end-line: 17
+:end-line: 18
 ```
 
 [//]: # (numfocus-fiscal-sponsor-attribution)
@@ -47,7 +47,7 @@ the rapids-singlecell API.
 :::
 
 :::{grid-item-card} GitHub {octicon}`mark-github;1em;`
-:link: https://github.com/scverse/rapids_singlecell
+:link: https://github.com/scverse/rapids-singlecell
 
 Find a bug? Interested in improving rapids-singlecell? Checkout our GitHub for the latest developments.
 :::
