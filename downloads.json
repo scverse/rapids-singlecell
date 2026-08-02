@@ -1,22 +1,22 @@
 {
-  "data_date": "2026-07-31",
+  "data_date": "2026-08-01",
   "source": "https://clickpy.clickhouse.com",
   "packages": {
     "rapids-singlecell": {
-      "total": 282042,
-      "last_30_days": 5993
+      "total": 282143,
+      "last_30_days": 5949
     },
     "rapids-singlecell-cu12": {
-      "total": 11897,
-      "last_30_days": 2781
+      "total": 11928,
+      "last_30_days": 2762
     },
     "rapids-singlecell-cu13": {
-      "total": 10889,
-      "last_30_days": 2887
+      "total": 10907,
+      "last_30_days": 2857
     }
   },
   "combined": {
-    "total": 304828,
-    "last_30_days": 11661
+    "total": 304978,
+    "last_30_days": 11568
   }
 }
