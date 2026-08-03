@@ -20,7 +20,7 @@ references.md
 :maxdepth: 1
 
 memory_management.md
-multi_gpu.md
+gpu_configuration.md
 out_of_core.md
 ```
 
