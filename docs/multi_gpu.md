@@ -1,7 +1,7 @@
 # Using GPUs on a multi-GPU system
 
 You do not need to be a CUDA expert to run rapids-singlecell on a machine with
-several GPUs. Most analyses use one GPU. The main decision is whether you want
+several GPUs. Most analyses use a single GPU. The main decision is whether you want
 to run independent analyses on separate GPUs or use several GPUs for one
 supported operation.
 
