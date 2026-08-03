@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import scanpy as sc
 from anndata import AnnData
 from scipy.sparse import csc_array, csc_matrix, csr_array, csr_matrix
 
@@ -89,11 +88,8 @@ def test_set_obs_rep_conflicting_choices():
     "mtype", [csc_matrix, csr_matrix, csc_array, csr_array, "dense"]
 )
 def test_utils(mtype):
-    if mtype == "dense":
-        adata = sc.datasets.pbmc68k_reduced()
-    else:
-        adata = sc.datasets.pbmc3k()
-        adata.X = mtype(adata.X)
+    X = np.arange(12, dtype=np.float32).reshape(3, 4)
+    adata = AnnData(X if mtype == "dense" else mtype(X))
     # check X
     rsc.get.anndata_to_GPU(adata)
     rsc.preprocessing._utils._check_gpu_X(adata.X)
