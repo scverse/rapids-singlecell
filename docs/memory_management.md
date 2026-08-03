@@ -7,6 +7,9 @@ However, it's crucial to be aware that certain specific functions, like {func}`~
 Users can overwrite the default behavior with {func}`rmm.reinitialize`.
 Configure RMM before creating GPU arrays; reinitializing while earlier RMM
 allocations are still alive results in undefined behavior.
+The `devices` argument configures RMM memory resources; it does not restrict
+which GPUs a CUDA process can access. See {doc}`multi_gpu` for device
+selection and isolation.
 
 ## Quick start
 
