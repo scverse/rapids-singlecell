@@ -175,7 +175,7 @@ def _func_waggr(
     verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     r"""
-    Weighted Aggregate (WAGGR) :cite:`decoupler`.
+    Weighted Aggregate (WAGGR).
 
     This approach aggregates the molecular features :math:`x_i` from one observation :math:`i` with
     the feature weights :math:`w` of a given feature set :math:`j` into an enrichment score :math:`ES`.

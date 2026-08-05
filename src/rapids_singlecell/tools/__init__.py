@@ -6,8 +6,11 @@ from ._clustering import kmeans, leiden, louvain
 from ._diffmap import diffmap
 from ._draw_graph import draw_graph
 from ._embedding_density import embedding_density
-from ._pymde import mde
-from ._rank_gene_groups import rank_genes_groups_logreg
+from ._ingest import ingest
+from ._rank_genes_groups import (
+    rank_genes_groups,
+    rank_genes_groups_logreg,
+)
 from ._score_genes import score_genes, score_genes_cell_cycle
 from ._tsne import tsne
 from ._umap import umap

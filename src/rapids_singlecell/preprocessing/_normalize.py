@@ -2,23 +2,24 @@ from __future__ import annotations
 
 import math
 import warnings
+from functools import partial
 from typing import TYPE_CHECKING, Union
 
 import cupy as cp
+from anndata import AnnData
 from cupyx.scipy import sparse
 from cupyx.scipy.sparse import csr_matrix
-from scanpy.get import _get_obs_rep, _set_obs_rep
 
 from rapids_singlecell._compat import (
     DaskArray,
     _meta_dense,
     _meta_sparse,
 )
+from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 
 from ._utils import _check_gpu_X, _check_nonnegative_integers
 
 if TYPE_CHECKING:
-    from anndata import AnnData
     from cupyx.scipy.sparse import spmatrix
 
     from rapids_singlecell._utils import ArrayTypesDask
@@ -27,8 +28,10 @@ if TYPE_CHECKING:
 def normalize_total(
     adata: AnnData,
     *,
-    target_sum: int | None = None,
-    layer: int | str = None,
+    target_sum: float | None = None,
+    exclude_highly_expressed: bool = False,
+    max_fraction: float = 0.05,
+    layer: str | None = None,
     inplace: bool = True,
     copy: bool = False,
 ) -> Union[AnnData, csr_matrix, cp.ndarray, None]:  # noqa: UP007
@@ -43,6 +46,18 @@ def normalize_total(
         target_sum
             If `None`, after normalization, each observation (cell) has a total count
             equal to the median of total counts for observations (cells) before normalization.
+
+        exclude_highly_expressed
+            Exclude (very) highly expressed genes for the computation of the
+            normalization factor (size factor) for each cell. A gene is considered
+            highly expressed, if it has more than `max_fraction` of the total counts
+            in at least one cell. The not-excluded genes will sum up to
+            `target_sum`.
+
+        max_fraction
+            If `exclude_highly_expressed=True`, consider cells as highly expressed
+            that have more counts than `max_fraction` of the original total counts
+            in at least one cell.
 
         layer
             Layer to normalize instead of `X`. If `None`, `X` is normalized.
@@ -65,15 +80,42 @@ def normalize_total(
 
     _check_gpu_X(X, allow_dask=True)
 
-    if not inplace:
+    if X.dtype.kind in "iu":
+        X = X.astype(cp.float32)
+    elif not inplace:
         X = X.copy()
 
     if sparse.isspmatrix_csc(X):
         X = X.tocsr()
-    if not target_sum:
-        target_sum = _get_target_sum(X)
 
-    X = _normalize_total(X, target_sum)
+    if exclude_highly_expressed:
+        if isinstance(X, DaskArray):
+            raise NotImplementedError(
+                "`exclude_highly_expressed` is not supported for Dask arrays."
+            )
+        if not 0 < max_fraction < 1:
+            raise ValueError(
+                f"`max_fraction` must be between 0 and 1, got {max_fraction}."
+            )
+
+    if isinstance(X, DaskArray):
+        X = _normalize_total_dask(X, target_sum)
+    elif isinstance(X, sparse.csr_matrix):
+        X = _normalize_total_csr(
+            X,
+            target_sum,
+            exclude_highly_expressed=exclude_highly_expressed,
+            max_fraction=max_fraction,
+        )
+    elif isinstance(X, cp.ndarray):
+        X = _normalize_total_dense(
+            X,
+            target_sum,
+            exclude_highly_expressed=exclude_highly_expressed,
+            max_fraction=max_fraction,
+        )
+    else:
+        raise ValueError(f"Cannot normalize {type(X)}")
 
     if inplace:
         _set_obs_rep(adata, X, layer=layer)
@@ -84,68 +126,178 @@ def normalize_total(
         return X
 
 
-def _normalize_total(X: ArrayTypesDask, target_sum: int):
-    if isinstance(X, sparse.csr_matrix):
-        return _normalize_total_csr(X, target_sum)
-    elif isinstance(X, DaskArray):
-        return _normalize_total_dask(X, target_sum)
-    elif isinstance(X, cp.ndarray):
-        from ._kernels._norm_kernel import _mul_dense
-
-        if not X.flags.c_contiguous:
-            X = cp.asarray(X, order="C")
-        mul_kernel = _mul_dense(X.dtype)
-        mul_kernel(
-            (math.ceil(X.shape[0] / 128),),
-            (128,),
-            (X, X.shape[0], X.shape[1], int(target_sum)),
-        )
-        return X
-    else:
-        raise ValueError(f"Cannot normalize {type(X)}")
-
-
-def _normalize_total_csr(X: sparse.csr_matrix, target_sum: int) -> sparse.csr_matrix:
-    from ._kernels._norm_kernel import _mul_csr
-
-    mul_kernel = _mul_csr(X.dtype)
-    mul_kernel(
-        (math.ceil(X.shape[0] / 128),),
-        (128,),
-        (X.indptr, X.data, X.shape[0], int(target_sum)),
+def _counts_to_scales(
+    counts_per_cell: cp.ndarray, target_sum: float | None = None
+) -> cp.ndarray:
+    """Compute per-cell scale factors. Uses median of nonzero counts if target_sum is None."""
+    nonzero = counts_per_cell > 0
+    if target_sum is None:
+        target_sum = cp.median(counts_per_cell[nonzero])
+    scales = cp.zeros_like(counts_per_cell)
+    scales[nonzero] = (
+        cp.array(target_sum, dtype=counts_per_cell.dtype) / counts_per_cell[nonzero]
     )
+    return scales
+
+
+def _normalize_total_csr(
+    X: sparse.csr_matrix,
+    target_sum: float | None,
+    *,
+    exclude_highly_expressed: bool,
+    max_fraction: float,
+) -> sparse.csr_matrix:
+    n_cells, n_genes = X.shape
+    gene_is_hi = None
+
+    if exclude_highly_expressed:
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        gene_is_hi = cp.zeros(n_genes, dtype=cp.bool_)
+        _nc.find_hi_genes_csr(
+            X.indptr,
+            X.indices,
+            X.data,
+            gene_is_hi=gene_is_hi,
+            max_fraction=float(max_fraction),
+            nrows=n_cells,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+
+    if target_sum is not None and gene_is_hi is None:
+        # Fused: row sum + scale in one pass
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        _nc.mul_csr(
+            X.indptr,
+            X.data,
+            nrows=n_cells,
+            target_sum=float(target_sum),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    elif target_sum is not None:
+        # Fused: masked row sum + scale in one pass
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        _nc.masked_mul_csr(
+            X.indptr,
+            X.indices,
+            X.data,
+            gene_mask=gene_is_hi,
+            nrows=n_cells,
+            tsum=float(target_sum),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    else:
+        # Two-pass: compute counts → median → prescaled multiply
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        if gene_is_hi is None:
+            counts = cp.zeros(n_cells, dtype=X.dtype)
+            _nc.sum_major(
+                X.indptr,
+                X.data,
+                sums=counts,
+                major=n_cells,
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+        else:
+            counts = cp.zeros(n_cells, dtype=X.dtype)
+            _nc.masked_sum_major(
+                X.indptr,
+                X.indices,
+                X.data,
+                gene_mask=gene_is_hi,
+                sums=counts,
+                major=n_cells,
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+
+        scales = _counts_to_scales(counts)
+        _nc.prescaled_mul_csr(
+            X.indptr,
+            X.data,
+            scales=scales,
+            nrows=n_cells,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+
     return X
 
 
-def _normalize_total_dask(X: DaskArray, target_sum: int) -> DaskArray:
-    if isinstance(X._meta, sparse.csr_matrix):
-        from ._kernels._norm_kernel import _mul_csr
+def _normalize_total_dense(
+    X: cp.ndarray,
+    target_sum: float | None,
+    *,
+    exclude_highly_expressed: bool,
+    max_fraction: float,
+) -> cp.ndarray:
+    if not X.flags.c_contiguous:
+        X = cp.asarray(X, order="C")
 
-        mul_kernel = _mul_csr(X.dtype)
-        mul_kernel.compile()
+    n_cells, n_cols = X.shape
+
+    if target_sum is not None and not exclude_highly_expressed:
+        # Fused: row sum + scale in one pass
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        _nc.mul_dense(
+            X,
+            nrows=n_cells,
+            ncols=n_cols,
+            target_sum=float(target_sum),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    else:
+        # Compute per-cell counts, then prescaled multiply
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        counts_per_cell = X.sum(axis=1)
+        if exclude_highly_expressed:
+            hi_exp = X > max_fraction * counts_per_cell.reshape(-1, 1)
+            gene_subset = ~hi_exp.any(axis=0)
+            counts_per_cell = X[:, gene_subset].sum(axis=1)
+
+        scales = _counts_to_scales(counts_per_cell, target_sum)
+        _nc.prescaled_mul_dense(
+            X,
+            scales=scales,
+            nrows=n_cells,
+            ncols=n_cols,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+
+    return X
+
+
+def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
+    if target_sum is None:
+        target_sum = _get_target_sum_dask(X)
+
+    if isinstance(X._meta, sparse.csr_matrix):
+        from rapids_singlecell._cuda import _norm_cuda as _nc
 
         def __mul(X_part):
-            X_part = X_part.copy()
-            mul_kernel(
-                (math.ceil(X_part.shape[0] / 32),),
-                (32,),
-                (X_part.indptr, X_part.data, X_part.shape[0], int(target_sum)),
+            _nc.mul_csr(
+                X_part.indptr,
+                X_part.data,
+                nrows=X_part.shape[0],
+                target_sum=float(target_sum),
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return X_part
 
         X = X.map_blocks(__mul, meta=_meta_sparse(X.dtype))
     elif isinstance(X._meta, cp.ndarray):
-        from ._kernels._norm_kernel import _mul_dense
-
-        mul_kernel = _mul_dense(X.dtype)
-        mul_kernel.compile()
+        from rapids_singlecell._cuda import _norm_cuda as _nc
 
         def __mul(X_part):
-            X_part = X_part.copy()
-            mul_kernel(
-                (math.ceil(X_part.shape[0] / 128),),
-                (128,),
-                (X_part, X_part.shape[0], X_part.shape[1], int(target_sum)),
+            _nc.mul_dense(
+                X_part,
+                nrows=X_part.shape[0],
+                ncols=X_part.shape[1],
+                target_sum=float(target_sum),
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return X_part
 
@@ -155,43 +307,18 @@ def _normalize_total_dask(X: DaskArray, target_sum: int) -> DaskArray:
     return X
 
 
-def _get_target_sum(X: ArrayTypesDask) -> int:
-    if isinstance(X, sparse.csr_matrix):
-        return _get_target_sum_csr(X)
-    elif isinstance(X, DaskArray):
-        return _get_target_sum_dask(X)
-    else:
-        return cp.median(X.sum(axis=1))
-
-
-def _get_target_sum_csr(X: sparse.csr_matrix) -> int:
-    from ._kernels._norm_kernel import _get_sparse_sum_major
-
-    counts_per_cell = cp.zeros(X.shape[0], dtype=X.dtype)
-    sum_kernel = _get_sparse_sum_major(X.dtype)
-    sum_kernel(
-        (X.shape[0],),
-        (64,),
-        (X.indptr, X.data, counts_per_cell, X.shape[0]),
-    )
-    counts_per_cell = counts_per_cell[counts_per_cell > 0]
-    target_sum = cp.median(counts_per_cell)
-    return target_sum
-
-
 def _get_target_sum_dask(X: DaskArray) -> int:
     if isinstance(X._meta, sparse.csr_matrix):
-        from ._kernels._norm_kernel import _get_sparse_sum_major
-
-        sum_kernel = _get_sparse_sum_major(X.dtype)
-        sum_kernel.compile()
+        from rapids_singlecell._cuda import _norm_cuda as _nc
 
         def __sum(X_part):
             counts_per_cell = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
-            sum_kernel(
-                (X.shape[0],),
-                (64,),
-                (X_part.indptr, X_part.data, counts_per_cell, X_part.shape[0]),
+            _nc.sum_major(
+                X_part.indptr,
+                X_part.data,
+                sums=counts_per_cell,
+                major=X_part.shape[0],
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return counts_per_cell
 
@@ -214,51 +341,75 @@ def _get_target_sum_dask(X: DaskArray) -> int:
     return target_sum
 
 
-def _calc_log1p(X: ArrayTypesDask) -> ArrayTypesDask:
+def _calc_log1p(X: ArrayTypesDask, base: float | None = None) -> ArrayTypesDask:
     if isinstance(X, DaskArray):
         meta = _meta_sparse if isinstance(X._meta, csr_matrix) else _meta_dense
-        X = X.map_blocks(_calc_log1p, meta=meta(X.dtype))
+        X = X.map_blocks(partial(_calc_log1p, base=base), meta=meta(X.dtype))
     else:
         X = X.copy()
         if sparse.issparse(X):
             X = X.log1p()
+            if base is not None:
+                X.data /= cp.log(base)
         else:
             X = cp.log1p(X)
+            if base is not None:
+                X /= cp.log(base)
     return X
 
 
 def log1p(
-    adata: AnnData,
+    data: AnnData | ArrayTypesDask,
     *,
+    base: float | None = None,
     layer: str | None = None,
     obsm: str | None = None,
     inplace: bool = True,
     copy: bool = False,
 ) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
     """\
-    Calculated the natural logarithm of one plus the sparse matrix.
+    Logarithmize the data matrix.
 
+    Computes :math:`X = \\log(X + 1)`, where :math:`log` denotes the natural logarithm
+    unless a different `base` is given.
 
     Parameters
     ----------
-        adata
-            AnnData object
+        data
+            The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
+            to cells and columns to genes. If a matrix is passed instead of an
+            :class:`~anndata.AnnData` object, the transformed matrix is returned.
+        base
+            Base of the logarithm. Natural logarithm is used by default.
         layer
             Layer to normalize instead of `X`. If `None`, `X` is normalized.
         obsm
             Entry of `.obsm` to transform.
         inplace
-            Whether to update `adata` or return the matrix.
+            Whether to update `data` or return the matrix. Only applies to
+            :class:`~anndata.AnnData` input.
         copy
-            Whether to return a copy or update `adata`. Not compatible with `inplace=False`.
+            Whether to return a copy or update `data`. Not compatible with `inplace=False`.
+            Only applies to :class:`~anndata.AnnData` input.
 
     Returns
     -------
-    The resulting sparse matrix after applying the natural logarithm of one plus the input matrix. \
-    If `copy` is set to True, returns the new sparse matrix. Otherwise, updates the `adata` object \
-    in-place and returns None.
+    The resulting matrix after applying the logarithm of one plus the input matrix. \
+    If a matrix is passed, the transformed matrix is returned. If an AnnData object is \
+    passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the \
+    `data` object in-place and returns None.
 
     """
+    if not isinstance(data, AnnData):
+        if layer is not None or obsm is not None:
+            raise ValueError(
+                "`layer` and `obsm` can only be used with an AnnData object."
+            )
+        X = data
+        _check_gpu_X(X, allow_dask=True)
+        return _calc_log1p(X, base=base)
+
+    adata = data
     if copy:
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
@@ -270,8 +421,90 @@ def log1p(
     if not inplace:
         X = X.copy()
 
-    X = _calc_log1p(X)
-    adata.uns["log1p"] = {"base": None}
+    X = _calc_log1p(X, base=base)
+    if inplace:
+        _set_obs_rep(adata, X, layer=layer, obsm=obsm)
+        adata.uns["log1p"] = {"base": base}
+
+    if copy:
+        return adata
+    elif not inplace:
+        return X
+
+
+def _calc_sqrt(X: ArrayTypesDask) -> ArrayTypesDask:
+    if isinstance(X, DaskArray):
+        meta = _meta_sparse if isinstance(X._meta, csr_matrix) else _meta_dense
+        X = X.map_blocks(_calc_sqrt, meta=meta(X.dtype))
+    else:
+        X = X.copy()
+        if sparse.issparse(X):
+            X = X.sqrt()
+        else:
+            X = cp.sqrt(X)
+    return X
+
+
+def sqrt(
+    data: AnnData | ArrayTypesDask,
+    *,
+    layer: str | None = None,
+    obsm: str | None = None,
+    inplace: bool = True,
+    copy: bool = False,
+) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
+    """\
+    Take the square root of the data matrix.
+
+    Computes :math:`X = \\sqrt{X}`.
+
+    Parameters
+    ----------
+        data
+            The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
+            to cells and columns to genes. If a matrix is passed instead of an
+            :class:`~anndata.AnnData` object, the transformed matrix is returned.
+        layer
+            Layer to transform instead of `X`. If `None`, `X` is transformed.
+        obsm
+            Entry of `.obsm` to transform.
+        inplace
+            Whether to update `data` or return the matrix. Only applies to
+            :class:`~anndata.AnnData` input.
+        copy
+            Whether to return a copy or update `data`. Not compatible with `inplace=False`.
+            Only applies to :class:`~anndata.AnnData` input.
+
+    Returns
+    -------
+    The resulting matrix after applying the square root to the input matrix. \
+    If a matrix is passed, the transformed matrix is returned. If an AnnData object is \
+    passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the \
+    `data` object in-place and returns None.
+
+    """
+    if not isinstance(data, AnnData):
+        if layer is not None or obsm is not None:
+            raise ValueError(
+                "`layer` and `obsm` can only be used with an AnnData object."
+            )
+        X = data
+        _check_gpu_X(X, allow_dask=True)
+        return _calc_sqrt(X)
+
+    adata = data
+    if copy:
+        if not inplace:
+            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
+        adata = adata.copy()
+    X = _get_obs_rep(adata, layer=layer, obsm=obsm)
+
+    _check_gpu_X(X, allow_dask=True)
+
+    if not inplace:
+        X = X.copy()
+
+    X = _calc_sqrt(X)
     if inplace:
         _set_obs_rep(adata, X, layer=layer, obsm=obsm)
 
@@ -291,7 +524,7 @@ def normalize_pearson_residuals(
     inplace: bool = True,
 ) -> Union[cp.ndarray, None]:  # noqa: UP007
     """\
-    Applies analytic Pearson residual normalization, based on Lause21.
+    Applies analytic Pearson residual normalization :cite:p:`Lause2021`.
     The residuals are based on a negative binomial offset model with overdispersion
     `theta` shared across genes. By default, residuals are clipped to `sqrt(n_obs)`
     and overdispersion `theta=100` is used.
@@ -302,11 +535,11 @@ def normalize_pearson_residuals(
             AnnData object
         theta
             The negative binomial overdispersion parameter theta for Pearson residuals.
-            Higher values correspond to less overdispersion `(var = mean + mean^2/theta)`, and `theta=np.Inf` corresponds to a Poisson model.
+            Higher values correspond to less overdispersion `(var = mean + mean^2/theta)`, and `theta=np.inf` corresponds to a Poisson model.
         clip
             Determines if and how residuals are clipped:
             If None, residuals are clipped to the interval [-sqrt(n_obs), sqrt(n_obs)], where n_obs is the number of cells in the dataset (default behavior).
-            If any scalar c, residuals are clipped to the interval `[-c, c]`. Set `clip=np.Inf` for no clipping.
+            If any scalar c, residuals are clipped to the interval `[-c, c]`. Set `clip=np.inf` for no clipping.
         check_values
             If True, checks if counts in selected layer are integers as expected by this function,
             and return a warning if non-integers are found. Otherwise, proceed without checking. Setting this to False can speed up code for large datasets.
@@ -335,112 +568,83 @@ def normalize_pearson_residuals(
     if theta <= 0:
         raise ValueError("Pearson residuals require theta > 0")
     if clip is None:
-        n = X.shape[0]
-        clip = cp.sqrt(n, dtype=X.dtype)
+        clip = math.sqrt(X.shape[0])
     if clip < 0:
         raise ValueError("Pearson residuals require `clip>=0` or `clip=None`.")
-    theta = cp.array([1 / theta], dtype=X.dtype)
-    clip = cp.array([clip], dtype=X.dtype)
-    sums_cells = cp.zeros(X.shape[0], dtype=X.dtype)
-    sums_genes = cp.zeros(X.shape[1], dtype=X.dtype)
+
+    from rapids_singlecell._cuda import _pr_cuda as _pr
+
+    inv_theta = 1.0 / theta
+    n_cells, n_genes = X.shape
+    stream = cp.cuda.get_current_stream().ptr
 
     if sparse.issparse(X):
         residuals = cp.zeros(X.shape, dtype=X.dtype)
         if sparse.isspmatrix_csc(X):
-            from ._kernels._pr_kernels import _sparse_norm_res_csc, _sparse_sum_csc
-
-            block = (8,)
-            grid = (int(math.ceil(X.shape[1] / block[0])),)
-            sum_csc = _sparse_sum_csc(X.dtype)
-            sum_csc(
-                grid,
-                block,
-                (X.indptr, X.indices, X.data, sums_genes, sums_cells, X.shape[1]),
+            sums_genes = cp.zeros(n_genes, dtype=X.dtype)
+            sums_cells = cp.zeros(n_cells, dtype=X.dtype)
+            _pr.sparse_sum_csc(
+                X.indptr,
+                X.indices,
+                X.data,
+                sums_genes=sums_genes,
+                sums_cells=sums_cells,
+                n_genes=n_genes,
+                stream=stream,
             )
-            sum_total = 1 / sums_genes.sum().squeeze()
-            norm_res = _sparse_norm_res_csc(X.dtype)
-            norm_res(
-                grid,
-                block,
-                (
-                    X.indptr,
-                    X.indices,
-                    X.data,
-                    sums_cells,
-                    sums_genes,
-                    residuals,
-                    sum_total,
-                    clip,
-                    theta,
-                    X.shape[0],
-                    X.shape[1],
-                ),
+            inv_sum_total = float(1.0 / sums_genes.sum())
+            _pr.sparse_norm_res_csc(
+                X.indptr,
+                X.indices,
+                X.data,
+                sums_cells=sums_cells,
+                sums_genes=sums_genes,
+                residuals=residuals,
+                inv_sum_total=inv_sum_total,
+                clip=float(clip),
+                inv_theta=inv_theta,
+                n_cells=n_cells,
+                n_genes=n_genes,
+                stream=stream,
             )
         elif sparse.isspmatrix_csr(X):
-            from ._kernels._pr_kernels import _sparse_norm_res_csr, _sparse_sum_csr
-
-            block = (8,)
-            grid = (int(math.ceil(X.shape[0] / block[0])),)
-            sum_csr = _sparse_sum_csr(X.dtype)
-            sum_csr(
-                grid,
-                block,
-                (X.indptr, X.indices, X.data, sums_genes, sums_cells, X.shape[0]),
-            )
-            sum_total = 1 / sums_genes.sum().squeeze()
-            norm_res = _sparse_norm_res_csr(X.dtype)
-            norm_res(
-                grid,
-                block,
-                (
-                    X.indptr,
-                    X.indices,
-                    X.data,
-                    sums_cells,
-                    sums_genes,
-                    residuals,
-                    sum_total,
-                    clip,
-                    theta,
-                    X.shape[0],
-                    X.shape[1],
-                ),
+            sums_cells = cp.array(X.sum(axis=1), dtype=X.dtype).ravel()
+            sums_genes = cp.array(X.sum(axis=0), dtype=X.dtype).ravel()
+            inv_sum_total = float(1.0 / sums_genes.sum())
+            _pr.sparse_norm_res_csr(
+                X.indptr,
+                X.indices,
+                X.data,
+                sums_cells=sums_cells,
+                sums_genes=sums_genes,
+                residuals=residuals,
+                inv_sum_total=inv_sum_total,
+                clip=float(clip),
+                inv_theta=inv_theta,
+                n_cells=n_cells,
+                n_genes=n_genes,
+                stream=stream,
             )
         else:
             raise ValueError(
                 "Please transform you sparse matrix into CSR or CSC format."
             )
     else:
-        from ._kernels._pr_kernels import _norm_res_dense, _sum_dense
-
         residuals = cp.zeros(X.shape, dtype=X.dtype)
-        block = (8, 8)
-        grid = (
-            math.ceil(residuals.shape[0] / block[0]),
-            math.ceil(residuals.shape[1] / block[1]),
-        )
-        sum_dense = _sum_dense(X.dtype)
-        sum_dense(
-            grid,
-            block,
-            (X, sums_cells, sums_genes, residuals.shape[0], residuals.shape[1]),
-        )
-        sum_total = 1 / sums_genes.sum().squeeze()
-        norm_res = _norm_res_dense(X.dtype)
-        norm_res(
-            grid,
-            block,
-            (
-                X,
-                residuals,
-                sums_cells,
-                sums_genes,
-                sum_total,
-                clip,
-                theta,
-                residuals.shape[0],
-                residuals.shape[1],
-            ),
+        sums_cells = X.sum(axis=1).astype(X.dtype)
+        sums_genes = X.sum(axis=0).astype(X.dtype)
+        inv_sum_total = float(1.0 / sums_genes.sum())
+        _pr.dense_norm_res(
+            X,
+            residuals=residuals,
+            sums_cells=sums_cells,
+            sums_genes=sums_genes,
+            inv_sum_total=inv_sum_total,
+            clip=float(clip),
+            inv_theta=inv_theta,
+            n_cells=n_cells,
+            n_genes=n_genes,
+            stream=stream,
         )
 
     if inplace is True:

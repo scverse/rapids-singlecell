@@ -17,81 +17,200 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: flying-sheep/check@v1
-        with:
-          success: ${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+      - name: Require push to main or 'run-gpu-ci' label
+        if: ${{ !(github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-gpu-ci')) }}
+        run: |
+          echo "::error::GPU CI requires a push to main or the 'run-gpu-ci' label on the PR."
+          exit 1
 
   get-envs:
     runs-on: ubuntu-latest
     needs: check
     outputs:
-      envs: ${{ steps.get-envs.outputs.envs }}
+      stable-dev: ${{ steps.get-envs.outputs.stable-dev }}
+      prerelease: ${{ steps.get-envs.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           filter: blob:none
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: false
       - id: get-envs
         run: |
-          ENVS_JSON=$(uvx hatch env show --json | jq -c '
+          # Stable + dev, all cu13 (stable -> T4, dev -> A10)
+          STABLE_DEV_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
-              select(.key | startswith("hatch-test") and endswith("12"))
+              select(.key | startswith("hatch-test"))
+              | select(
+                ((.key | contains("stable")) and (.key | endswith("13")))
+                or ((.key | contains("dev")) and (.key | endswith("13")))
+              )
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
+                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4" else "cirun-aws-gpu-a10" end),
               }
             )')
-          echo "envs=${ENVS_JSON}" | tee $GITHUB_OUTPUT
+          echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
 
-  test:
+          # Prerelease environments (cu13 -> T4; only dev runs on A10)
+          PRERELEASE_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
+            to_entries
+            | map(
+              select(.key | startswith("hatch-test") and endswith("13") and contains("prerelease"))
+              | {
+                name: .key,
+                python: .value.python | sub("3[.]13"; "3.13.3"),
+                runner: "cirun-aws-gpu-t4",
+              }
+            )')
+          echo "prerelease=${PRERELEASE_JSON}" | tee -a $GITHUB_OUTPUT
+
+  test-stable-dev:
+    name: Test (${{ matrix.env.name }})
     needs: get-envs
-    runs-on: cirun-aws-gpu
+    runs-on: ${{ matrix.env.runner }}
     timeout-minutes: 30
     strategy:
+      fail-fast: false
+      max-parallel: 2
       matrix:
-        env: ${{ fromJson(needs.get-envs.outputs.envs) }}
+        env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           filter: blob:none
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           python-version: ${{ matrix.env.python }}
 
+      - name: Add CUDA to PATH
+        run: |
+          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> $GITHUB_ENV
+
       - name: Install dependencies
-        run: uvx hatch -v env create ${{ matrix.env.name }}
+        run: uvx --from "hatch==1.16.5" hatch -v env create ${{ matrix.env.name }}
 
       - name: Run tests
-        run: uvx hatch run ${{ matrix.env.name }}:run
+        run: |
+          mkdir -p test-data
+          if [[ "${{ matrix.env.name }}" == *"stable"* ]]; then
+            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run-cov -v --color=yes
+            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:coverage xml
+            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:cov-report
+
+          else
+            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run -v --color=yes
+          fi
+
+      - name: Upload test results
+        if: ${{ !cancelled() && contains(matrix.env.name, 'stable') }}
+        uses: codecov/codecov-action@v6
+        with:
+          report_type: test_results
+          files: test-data/test-results.xml
+          use_oidc: false
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage data
+        if: contains(matrix.env.name, 'stable')
+        uses: codecov/codecov-action@v6
+        with:
+          files: test-data/coverage.xml
+          use_oidc: false
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  test-prerelease:
+    name: Test (${{ matrix.env.name }})
+    needs: get-envs
+    runs-on: ${{ matrix.env.runner }}
+    timeout-minutes: 30
+    continue-on-error: true  # Prerelease failures don't fail the workflow
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
+    env:
+      ENV_NAME: ${{ matrix.env.name }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: ${{ matrix.env.python }}
+
+      - name: Add CUDA to PATH
+        run: |
+          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> $GITHUB_ENV
+
+      - name: Check CUDA version
+        run: nvcc --version
+
+      - name: Check NVIDIA SMI
+        run: nvidia-smi
+
+      - name: Install dependencies
+        run: uvx --from "hatch==1.16.5" hatch -v env create ${{ matrix.env.name }}
+
+      - name: Run tests
+        run: uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run -v --color=yes
 
   remove-label:
     name: Remove 'run-gpu-ci' Label
     runs-on: ubuntu-latest
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: ${{ always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+    permissions:
+      pull-requests: write
     steps:
-      - uses: actions-ecosystem/action-remove-labels@v1
-        if: contains(github.event.pull_request.labels.*.name, 'run-gpu-ci')
-        with:
-          labels: 'run-gpu-ci'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Remove 'run-gpu-ci' label
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-gpu-ci" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  stable-dev-green:
+    name: CI-Pass
+    if: always()
+    needs:
+      - get-envs
+      - test-stable-dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs succeeded
+        run: |
+          if [[ "${{ needs.get-envs.result }}" != "success" || "${{ needs.test-stable-dev.result }}" != "success" ]]; then
+            echo "::error::Required jobs did not succeed (get-envs=${{ needs.get-envs.result }}, test-stable-dev=${{ needs.test-stable-dev.result }})."
+            exit 1
+          fi
 
   all-green:
     name: All Tests Green
     if: always()
     needs:
       - get-envs
-      - test
+      - test-stable-dev
+      - test-prerelease
     runs-on: ubuntu-latest
     steps:
-      - uses: re-actors/alls-green@release/v1
-        with:
-          jobs: ${{ toJSON(needs) }}
+      - name: Check required jobs succeeded (test-prerelease allowed to fail)
+        run: |
+          if [[ "${{ needs.get-envs.result }}" != "success" || "${{ needs.test-stable-dev.result }}" != "success" ]]; then
+            echo "::error::Required jobs did not succeed (get-envs=${{ needs.get-envs.result }}, test-stable-dev=${{ needs.test-stable-dev.result }})."
+            exit 1
+          fi

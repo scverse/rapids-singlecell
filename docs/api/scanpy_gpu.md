@@ -1,11 +1,12 @@
 # scanpy-GPU
 
-These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html).
+These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html) {cite}`Wolf2018`.
 
 ## Preprocessing `pp`
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
 
-Any transformation of the data matrix that is not a tool. Other than `tools`, preprocessing steps usually don’t return an easily interpretable annotation, but perform a basic transformation on the data matrix.
+Any transformation of the data matrix that is not a tool.
+Other than `tools`, preprocessing steps usually don’t return an easily interpretable annotation, but perform a basic transformation on the data matrix.
 
 ### Basic Preprocessing
 ```{eval-rst}
@@ -19,14 +20,14 @@ Any transformation of the data matrix that is not a tool. Other than `tools`, pr
    pp.filter_genes
    pp.normalize_total
    pp.log1p
+   pp.sqrt
    pp.highly_variable_genes
    pp.regress_out
    pp.scale
    pp.pca
    pp.normalize_pearson_residuals
-   pp.flag_gene_family
-   pp.filter_highly_variable
 ```
+
 ### Batch effect correction
 
 ```{eval-rst}
@@ -44,7 +45,6 @@ Any transformation of the data matrix that is not a tool. Other than `tools`, pr
    pp.scrublet
    pp.scrublet_simulate_doublets
 ```
-
 
 ### Neighbors
 ```{eval-rst}
@@ -76,8 +76,16 @@ Any transformation of the data matrix that is not a tool. Other than `tools`, pr
     tl.tsne
     tl.diffmap
     tl.draw_graph
-    tl.mde
     tl.embedding_density
+```
+
+### Data integration
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+
+    tl.ingest
 ```
 
 ### Clustering
@@ -88,7 +96,6 @@ Any transformation of the data matrix that is not a tool. Other than `tools`, pr
 
     tl.louvain
     tl.leiden
-    tl.kmeans
 ```
 
 ### Gene scores, Cell cycle
@@ -107,7 +114,7 @@ Any transformation of the data matrix that is not a tool. Other than `tools`, pr
 .. autosummary::
    :toctree: generated/
 
-    tl.rank_genes_groups_logreg
+    tl.rank_genes_groups
 ```
 
 ## Plotting

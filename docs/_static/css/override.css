@@ -18,3 +18,15 @@ dl.citation > dt {
 .pr {
 	font-size: 70% !important;
 }
+
+/* RSC colors are
+#7400ff - violet
+#76b900 - green
+#4169e1 - blue
+*/
+
+p.caption .caption-text {
+    color: #7400ff;
+    font-weight: 600;
+    text-transform: uppercase;
+}

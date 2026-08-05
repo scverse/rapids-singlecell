@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
@@ -18,54 +19,178 @@ def harmony_integrate(
     basis: str = "X_pca",
     adjusted_basis: str = "X_pca_harmony",
     dtype: type = np.float64,
-    correction_method: Literal["fast", "original"] = "original",
-    use_gemm: bool = False,
+    flavor: Literal["harmony2", "harmony1"] = "harmony2",
+    n_clusters: int | None = None,
+    max_iter_harmony: int = 10,
+    max_iter_clustering: int = 200,
+    tol_harmony: float = 1e-4,
+    tol_clustering: float = 1e-5,
+    sigma: float = 0.1,
+    theta: float | int | list[float] | np.ndarray | cp.ndarray = 2.0,
+    tau: int = 0,
+    ridge_lambda: float = 1.0,
+    alpha: float = 0.2,
+    batch_prune_threshold: float | None = 1e-5,
+    correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
-    **kwargs,
+    block_proportion: float = 0.05,
+    random_state: int = 0,
+    verbose: bool = False,
 ) -> None:
-    """
-    Integrate different experiments using the Harmony algorithm.
+    """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
 
-    This GPU-accelerated implementation is based on the `harmony-pytorch` package.
-    As Harmony works by adjusting the
-    principal components, this function should be run after performing
-    PCA but before computing the neighbor graph.
+    This GPU-accelerated implementation was originally based on the
+    harmony-pytorch package. Multiple batch variables now follow the
+    per-covariate formulation described in the Harmony papers: each key is
+    modeled separately instead of combining all keys into one joint category.
+    As Harmony works by adjusting the principal components,
+    this function should be run after performing PCA but before computing the neighbor graph.
+
+    By default, the Harmony2 algorithm is used,
+    which includes a stabilized diversity penalty,
+    dynamic per-cluster-per-batch ridge regularization,
+    and automatic batch pruning.
+    To revert to the original Harmony behavior::
+
+        rsc.pp.harmony_integrate(adata, key, flavor="harmony1")
 
     Parameters
     ----------
-        adata
-            The annotated data matrix.
-        key
-            The key(s) of the column(s) in ``adata.obs`` that differentiates among experiments/batches.
-        basis
-            The name of the field in ``adata.obsm`` where the PCA table is
-            stored. Defaults to ``'X_pca'``, which is the default for
-            ``sc.tl.pca()``.
-        adjusted_basis
-            The name of the field in ``adata.obsm`` where the adjusted PCA
-            table will be stored after running this function. Defaults to
-            ``X_pca_harmony``.
-        dtype
-            The data type to use for the Harmony. If you use 32-bit you may experience
-            numerical instability.
-        correction_method
-            Choose which method for the correction step: ``original`` for original method, ``fast`` for improved method.
-        use_gemm
-            If True, use a One-Hot-Encoding Matrix and GEMM to compute Harmony. If False use a label vector. A label vector is more memory efficient and faster for large datasets with a large number of batches.
-        colsum_algo
-            Choose which algorithm to use for column sums. If `None`, choose the algorithm based on the number of rows and columns. If `'benchmark'`, benchmark all algorithms and choose the best one.
-        kwargs
-            Any additional arguments will be passed to
-            ``_harmony.harmonize``.
+    adata
+        The annotated data matrix.
+    key
+        The key(s) of the column(s) in ``adata.obs`` that differentiate(s) among experiments/batches.
+        Multiple keys are modeled as separate batch variables, with one active
+        categorical level per variable and cell.
+        To retain the joint-combination behavior of earlier releases, combine
+        the desired columns into one categorical column and pass that single key.
+    basis
+        The name of the field in ``adata.obsm`` where the PCA table is stored.
+    adjusted_basis
+        The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
+    dtype
+        The data type to use for Harmony computation.
+        If you use 32-bit you may experience numerical instability.
+    flavor
+        Which version of the Harmony algorithm to use.
+        ``"harmony2"`` (default) enables the stabilized diversity penalty,
+        dynamic per-cluster-per-batch ridge regularization,
+        and automatic batch pruning from :cite:p:`Patikas2026`.
+        ``"harmony1"`` uses the original algorithm from :cite:p:`Korsunsky2019`.
+    n_clusters
+        Number of clusters used for soft k-means in the Harmony algorithm.
+        If ``None``, uses ``min(100, N / 30)``.
+        More clusters capture finer-grained structure but increase computation time.
+    max_iter_harmony
+        Maximum number of outer Harmony iterations
+        (each consisting of a clustering step followed by a correction step).
+    max_iter_clustering
+        Maximum iterations for the clustering step within each Harmony iteration.
+    tol_harmony
+        Convergence tolerance for the Harmony objective function.
+        The algorithm stops when the relative change in objective falls below this value.
+    tol_clustering
+        Convergence tolerance for the clustering step within each
+        Harmony iteration.
+    sigma
+        Width of the soft-clustering kernel.
+        Controls the entropy of cluster assignments:
+        smaller values produce harder assignments (cells assigned to fewer clusters),
+        while larger values produce softer assignments (cells spread across more clusters).
+    theta
+        Diversity penalty weight per batch variable.
+        Controls how strongly Harmony encourages each cluster
+        to contain a balanced representation of all batches.
+        Higher values (e.g. ``4``) produce more aggressive mixing;
+        lower values (e.g. ``0.5``) allow more batch-specific clusters.
+        Set to ``0`` to disable the diversity penalty for a batch variable.
+        A scalar is applied to every key. A sequence may contain one value per
+        key, expanded over that key's categorical levels, or one value per
+        categorical level across all keys.
+    tau
+        Discounting factor on ``theta``.
+        When ``tau > 0``,
+        the diversity penalty is down-weighted for batches with fewer cells,
+        preventing over-correction of small batches.
+        By default (``0``), there is no discounting.
+    ridge_lambda
+        Ridge regression regularization for the correction step.
+        Larger values produce more conservative (smaller) corrections,
+        preventing over-fitting.
+        Must be finite and greater than zero.
+        Only used with ``flavor="harmony1"``.
+    alpha
+        Scaling factor for the dynamic per-cluster-per-batch ridge regularization.
+        The effective regularization for each cluster-batch pair is ``alpha * E_kb``
+        where ``E_kb`` is the expected number of cells.
+        Larger values produce more conservative corrections.
+        Only used with ``flavor="harmony2"``.
+    batch_prune_threshold
+        Fraction threshold below which a batch-cluster pair is pruned (correction suppressed).
+        When the fraction of a batch's cells assigned to a cluster (``O_kb / N_b``) falls below this threshold,
+        that batch-cluster pair receives no correction, preventing spurious adjustments.
+        Only used with ``flavor="harmony2"``.
+        Set to ``None`` to disable pruning.
+    correction_method
+        Method for the correction step.
+        ``"fast"`` uses a precomputed factorization that avoids the full inversion,
+        which can be faster for datasets with many batches.
+        ``"batched"`` processes all clusters simultaneously (fastest but requires more memory).
+        With one key, ``None`` automatically selects ``"batched"`` unless its
+        workspace would exceed 1 GiB, in which case ``"fast"`` is used.
+        Multiple keys always use the exact general-design solve because the
+        arrowhead optimization applies only to one batch variable; clusters are
+        processed in workspace-bounded chunks when needed. For multiple keys,
+        use ``None`` or ``"batched"``; passing ``"fast"`` emits a warning and
+        uses the exact solve.
+    colsum_algo
+        Algorithm for column sums.
+        If ``None``, chosen automatically.
+        If ``"benchmark"``, benchmarks all algorithms.
+    block_proportion
+        Proportion of cells updated per clustering sub-iteration.
+        Smaller values produce more stochastic updates.
+        Larger values are faster but may converge to different solutions.
+    random_state
+        Random seed for reproducibility.
+    verbose
+        Whether to print benchmarking and convergence information.
 
     Returns
     -------
-        Updates adata with the field ``adata.obsm[adjusted_basis]``, \
-        containing principal components adjusted by Harmony such that \
-        different experiments are integrated.
-
+    Updates adata with the field ``adata.obsm[adjusted_basis]``,
+    containing principal components adjusted by Harmony
+    such that different experiments are integrated.
     """
     from ._harmony import harmonize
+
+    # Resolve flavor into internal flags
+    if flavor not in {"harmony1", "harmony2"}:
+        raise ValueError(f"flavor must be 'harmony1' or 'harmony2', got {flavor!r}.")
+    stabilized_penalty = flavor == "harmony2"
+    dynamic_lambda = flavor == "harmony2"
+
+    # Warn when flavor-incompatible parameters are explicitly set
+    if flavor == "harmony2" and ridge_lambda != 1.0:
+        warnings.warn(
+            "ridge_lambda is ignored when flavor='harmony2'; "
+            "use alpha to control regularization strength.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if flavor == "harmony1":
+        if alpha != 0.2:
+            warnings.warn(
+                "alpha is ignored when flavor='harmony1'; use ridge_lambda instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if batch_prune_threshold != 1e-5:
+            warnings.warn(
+                "batch_prune_threshold is ignored when flavor='harmony1'.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:
@@ -115,10 +240,24 @@ def harmony_integrate(
         X,
         adata.obs,
         key,
+        n_clusters=n_clusters,
+        max_iter_harmony=max_iter_harmony,
+        max_iter_clustering=max_iter_clustering,
+        tol_harmony=tol_harmony,
+        tol_clustering=tol_clustering,
+        ridge_lambda=ridge_lambda,
+        sigma=sigma,
+        block_proportion=block_proportion,
+        theta=theta,
+        tau=tau,
         correction_method=correction_method,
-        use_gemm=use_gemm,
         colsum_algo=colsum_algo,
-        **kwargs,
+        random_state=random_state,
+        stabilized_penalty=stabilized_penalty,
+        dynamic_lambda=dynamic_lambda,
+        alpha=alpha,
+        batch_prune_threshold=batch_prune_threshold,
+        verbose=verbose,
     )
 
     adata.obsm[adjusted_basis] = harmony_out.get()

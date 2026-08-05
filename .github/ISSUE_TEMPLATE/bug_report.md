@@ -2,7 +2,7 @@
 name: Bug report
 about: Create a report to help us improve rapids-singlecell
 title: "[BUG]"
-labels: bug
+type: Bug
 assignees: ''
 
 ---

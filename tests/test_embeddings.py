@@ -6,7 +6,7 @@ import pytest
 import scanpy as sc
 from scanpy.datasets import pbmc68k_reduced
 
-from rapids_singlecell.tools import tsne, umap
+from rapids_singlecell.tools import draw_graph, tsne, umap
 from testing.rapids_singlecell._pytest import needs
 
 
@@ -32,17 +32,23 @@ def test_umap_init_paga():
 
 
 @pytest.mark.parametrize("init_pos", ["X_pca", "X_tsne", "numpy", "cupy"])
-def test_umap_init_pos(init_pos):
+@pytest.mark.parametrize("func", [umap, draw_graph])
+def test_umap_init_pos(init_pos, func):
     pbmc = pbmc68k_reduced()[:100, :].copy()
     if init_pos == "X_pca":
         with pytest.raises(ValueError, match="Expected 2 columns but got 50 columns."):
-            umap(pbmc, init_pos=init_pos)
+            func(pbmc, init_pos=init_pos)
     elif init_pos == "X_tsne":
         tsne(pbmc)
-        umap(pbmc, init_pos=init_pos)
+        func(pbmc, init_pos=init_pos)
     else:
         if init_pos == "numpy":
             init_pos = np.random.random((100, 2))
         else:
             init_pos = cp.random.random((100, 2))
-        umap(pbmc, init_pos=init_pos)
+        func(pbmc, init_pos=init_pos)
+
+
+def test_draw_graph():
+    pbmc = pbmc68k_reduced()[:100, :].copy()
+    draw_graph(pbmc)

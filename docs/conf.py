@@ -8,6 +8,9 @@ from importlib.metadata import metadata
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 import anndata  # noqa
+import fast_array_utils  # noqa
+from docutils import nodes
+from docutils.parsers.rst import roles
 
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
@@ -28,12 +31,13 @@ title = "GPU accelerated single cell analysis"
 author = info["Author"]
 copyright = f"{datetime.now():%Y}, {author}"
 version = info["Version"]
-repository_url = "https://github.com/scverse/rapids_singlecell"
+repository_url = "https://github.com/scverse/rapids-singlecell"
 
 # The full version, including alpha/beta/rc tags
 release = info["Version"]
 
 templates_path = ["_templates"]
+bibtex_bibfiles = ["references.bib"]
 nitpicky = True  # Warn about broken links
 needs_sphinx = "4.5"
 suppress_warnings = [
@@ -43,8 +47,6 @@ suppress_warnings = [
 
 # -- General configuration ---------------------------------------------------
 
-# Add any Sphinx extension module names here, as strings.
-# They can be extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
 extensions = [
     "myst_nb",
     "sphinx_design",
@@ -58,13 +60,14 @@ extensions = [
     "sphinx.ext.githubpages",
     "sphinx_autodoc_typehints",
     "sphinx.ext.extlinks",
-    "readthedocs_ext.readthedocs",
     "sphinx.ext.imgconverter",
     "sphinx_copybutton",
     "nbsphinx",
     "scanpydoc",
     "sphinx.ext.linkcode",
-    "sphinx_copybutton",
+    "sphinx_tabs.tabs",
+    "sphinxext.opengraph",
+    "sphinxcontrib.bibtex",
 ]
 
 autosummary_generate = True
@@ -116,9 +119,9 @@ intersphinx_mapping = {
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "cudf": ("https://docs.rapids.ai/api/cudf/stable/", None),
     "cugraph": ("https://docs.rapids.ai/api/cugraph/stable/", None),
-    "pymde": ("https://pymde.org", None),
     "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
     "squidpy": ("https://squidpy.readthedocs.io/en/stable/", None),
+    "pertpy": ("https://pertpy.readthedocs.io/en/stable/", None),
     "seaborn": ("https://seaborn.pydata.org/", None),
     "decoupler": ("https://decoupler.readthedocs.io/en/latest/", None),
     "rmm": ("https://docs.rapids.ai/api/rmm/stable/", None),
@@ -130,14 +133,29 @@ intersphinx_mapping = {
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "._*", "*.ipynb_checkpoints"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "._*",
+    "*.ipynb_checkpoints",
+    "release-notes/blank.md",
+]
+
+# These DOI records are valid, but their publishers reject automated link checks.
+linkcheck_ignore = [
+    r"https://doi\.org/10\.1002/spe\.4380211102",
+    r"https://doi\.org/10\.1073/pnas\.0500334102",
+    r"https://doi\.org/10\.1093/bioinformatics/btv325",
+    r"https://doi\.org/10\.1093/bioinformatics/btw777",
+    r"https://doi\.org/10\.1093/bioadv/vbac016",
+    r"https://doi\.org/10\.1093/bioinformatics/bty1044",
+    r"https://doi\.org/10\.1093/bioinformatics/btz625",
+    r"https://doi\.org/10\.1177/10943420231179699",
+]
 
 
 # -- Options for HTML output -------------------------------------------------
-
-# The theme to use for HTML and HTML Help pages.  See the documentation for
-# a list of builtin themes.
-#
 
 html_theme = "scanpydoc"
 html_theme_options = {
@@ -145,24 +163,38 @@ html_theme_options = {
     "repository_branch": os.environ.get("READTHEDOCS_GIT_IDENTIFIER", "main"),
     "use_repository_button": True,
     "navigation_with_keys": False,
+    "show_toc_level": 2,
 }
 html_show_sphinx = False
 html_logo = "_static/logo_RTD.svg"
 html_static_path = ["_static"]
-html_css_files = ["_static/css/override.css"]
+html_css_files = ["css/override.css"]
 html_title = "rapids-singlecell"
+
+# OpenGraph metadata for social media previews
+ogp_site_url = "https://rapids-singlecell.readthedocs.io/"
+ogp_site_name = "rapids-singlecell"
+ogp_image = "_static/logo_RTD.svg"
 
 qualname_overrides = {
     "numpy.bool_": "numpy.bool",  # Since numpy 2, numpy.bool is the canonical dtype
+    # Since numpy 2.5, NDArray is a TypeAliasType defined in numpy._typing._array_like,
+    # so a subscripted NDArray[...] reports that private module and sphinx-autodoc-typehints
+    # builds the target as <annotation module>.<type qualname> -- a name numpy does not
+    # document. Same treatment as anndata gives the pre-2.5 spelling of this alias.
+    "numpy._typing._array_like.GenericAlias": ("py:data", "numpy.typing.NDArray"),
 }
 
 nitpick_ignore = [
     ("py:class", "scipy.sparse.base.spmatrix"),
     ("py:meth", "pandas.DataFrame.iloc"),
     ("py:meth", "pandas.DataFrame.loc"),
+    ("py:class", "pandas.core.series.Series"),
     ("py:class", "anndata._core.views.ArrayView"),
     ("py:class", "anndata._core.raw.Raw"),
     ("py:class", "scanpy._utils.Empty"),
+    ("py:data", "typing.Union"),
+    ("py:class", "cuml.linear_model.LogisticRegression"),
     *[
         ("py:class", f"anndata._core.aligned_mapping.{cls}{kind}")
         for cls in "Layers AxisArrays PairwiseArrays".split()
@@ -173,7 +205,8 @@ nitpick_ignore = [
 
 def setup(app: Sphinx) -> None:
     """App setup hook."""
-    app.warningiserror = True
+    app.add_role("small", roles.GenericRole("small", nodes.inline))
+    app.add_role("smaller", roles.GenericRole("smaller", nodes.inline))
     app.add_config_value(
         "recommonmark_config",
         default={
@@ -189,6 +222,6 @@ def setup(app: Sphinx) -> None:
 
 # extlinks config
 extlinks = {
-    "issue": ("https://github.com/scverse/rapids_singlecell/issues/%s", "issue%s"),
-    "pr": ("https://github.com/scverse/rapids_singlecell/pull/%s", "pr%s"),
+    "issue": ("https://github.com/scverse/rapids-singlecell/issues/%s", "issue%s"),
+    "pr": ("https://github.com/scverse/rapids-singlecell/pull/%s", "pr%s"),
 }

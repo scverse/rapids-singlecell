@@ -1,31 +1,43 @@
-```{eval-rst}
-.. role:: small
-```
-
-```{eval-rst}
-.. role:: smaller
-```
-
-[![Stars](https://img.shields.io/github/stars/scverse/rapids_singlecell?style=flat&logo=GitHub&color=blue)](https://github.com/scverse/rapids_singlecell/stargazers)
-[![PyPI](https://img.shields.io/pypi/v/rapids-singlecell?logo=PyPI)](https://pypi.org/project/rapids-singlecell)
-[![Downloads](https://static.pepy.tech/badge/rapids-singlecell)](https://pepy.tech/project/rapids-singlecell)
-[![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.readthedocs.io/en/latest/?badge=latest)
-[![Build and Test](https://github.com/scverse/rapids_singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids_singlecell/actions/workflows/test-gpu.yml)
-[![Chat](https://img.shields.io/badge/zulip-join_chat-%2367b08f.svg)](https://scverse.zulipchat.com)
 ```{include} basic.md
 ```
 
 ```{toctree}
+:caption: 'General'
 :hidden: true
 :maxdepth: 1
 
-Installation.md
-Usage_Principles.md
+installation.md
+usage_principles.md
 api/index.md
-MM.md
-Out_of_core.md
+tutorials.md
 release-notes/index.md
 references.md
-notebooks.rst
+```
+
+```{toctree}
+:caption: 'Advanced Usage'
+:hidden: true
+:maxdepth: 1
+
+memory_management.md
+gpu_configuration.md
+out_of_core.md
+```
+
+```{toctree}
+:caption: 'Development'
+:hidden: true
+:maxdepth: 1
+
+contributing.md
+```
+
+```{toctree}
+:caption: 'About'
+:hidden: true
+:maxdepth: 1
+
 acknowledgements.md
+GitHub <https://github.com/scverse/rapids-singlecell>
+Discourse <https://discourse.scverse.org/c/help/rsc/48>
 ```

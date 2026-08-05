@@ -3,19 +3,14 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-import cuml.internals.logger as logger
 import cupy as cp
 import cuvs
 import numpy as np
-from cuml.manifold.umap import fuzzy_simplicial_set
 from cupyx.scipy import sparse as cp_sparse
 from packaging.version import parse as parse_version
 from scipy import sparse as sc_sparse
 
-from rapids_singlecell._utils import _get_logger_level
-
 if TYPE_CHECKING:
-    from rapids_singlecell._utils import AnyRandom
     from rapids_singlecell.preprocessing._neighbors import _Algorithms, _Metrics
 
 
@@ -135,55 +130,63 @@ def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:
     return knn_dist
 
 
-def _get_connectivities(
-    n_neighbors: int,
+# Empirically, the block-cooperative CUB sort kernel is faster for trim >= 100;
+# below this threshold the per-thread top-k kernel has less launch overhead.
+_TRIM_SORT_THRESHOLD = 100
+
+
+def _trimming(
+    cnts: cp_sparse.csr_matrix,
+    trim: int,
     *,
-    n_obs: int,
-    random_state: AnyRandom,
-    metric: _Metrics,
-    knn_indices: cp.ndarray,
-    knn_dist: cp.ndarray,
-) -> cp_sparse.coo_matrix:
-    set_op_mix_ratio = 1.0
-    local_connectivity = 1.0
-    X_conn = cp.empty((n_obs, 1), dtype=np.float32)
-    logger_level = _get_logger_level(logger)
-    connectivities = fuzzy_simplicial_set(
-        X_conn,
-        n_neighbors,
-        random_state,
-        metric=metric,
-        knn_indices=knn_indices,
-        knn_dists=knn_dist,
-        set_op_mix_ratio=set_op_mix_ratio,
-        local_connectivity=local_connectivity,
+    kernel: str = "auto",
+) -> cp_sparse.csr_matrix:
+    from rapids_singlecell._cuda._bbknn_cuda import (
+        cut_smaller,
+        find_top_k_per_row,
+        find_top_k_per_row_sorted,
+        sort_tile_size,
     )
-    logger.set_level(logger_level)
-    return connectivities
-
-
-def _trimming(cnts: cp_sparse.csr_matrix, trim: int) -> cp_sparse.csr_matrix:
-    from ._kernels._bbknn import cut_smaller_func, find_top_k_per_row_kernel
 
     n_rows = cnts.shape[0]
     vals_gpu = cp.zeros(n_rows, dtype=cp.float32)
+    stream = cp.cuda.get_current_stream().ptr
 
-    threads_per_block = 64
-    blocks_per_grid = (n_rows + threads_per_block - 1) // threads_per_block
+    if kernel == "auto":
+        if trim >= _TRIM_SORT_THRESHOLD:
+            max_row_nnz = int(cp.diff(cnts.indptr).max().get())
+            kernel = "sorted" if max_row_nnz <= sort_tile_size() else "thread"
+        else:
+            kernel = "thread"
 
-    shared_mem_per_thread = trim * cp.dtype(cp.float32).itemsize
-    shared_mem_size = threads_per_block * shared_mem_per_thread
+    if kernel == "sorted":
+        find_top_k_per_row_sorted(
+            cnts.data,
+            cnts.indptr,
+            n_rows=n_rows,
+            trim=trim,
+            vals=vals_gpu,
+            stream=stream,
+        )
+    elif kernel == "thread":
+        find_top_k_per_row(
+            cnts.data,
+            cnts.indptr,
+            n_rows=n_rows,
+            trim=trim,
+            vals=vals_gpu,
+            stream=stream,
+        )
+    else:
+        raise ValueError(f"Unknown trim kernel: {kernel!r}")
 
-    find_top_k_per_row_kernel(
-        (blocks_per_grid,),
-        (threads_per_block,),
-        (cnts.data, cnts.indptr, cnts.shape[0], trim, vals_gpu),
-        shared_mem=shared_mem_size,
-    )
-    cut_smaller_func(
-        (cnts.shape[0],),
-        (64,),
-        (cnts.indptr, cnts.indices, cnts.data, vals_gpu, cnts.shape[0]),
+    cut_smaller(
+        cnts.indptr,
+        cnts.indices,
+        cnts.data,
+        vals=vals_gpu,
+        n_rows=n_rows,
+        stream=stream,
     )
     cnts.eliminate_zeros()
     return cnts

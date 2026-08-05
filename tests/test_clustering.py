@@ -78,8 +78,13 @@ def test_clustering_resolution(adata_neighbors, clustering_function, resolution)
     if isinstance(resolution, list):
         for r in resolution:
             assert f"test_clustering_{r}" in adata.obs.columns
+        assert isinstance(adata.uns["test_clustering"]["modularity"], list)
+        assert len(adata.uns["test_clustering"]["modularity"]) == len(resolution)
+        assert adata.uns["test_clustering"]["params"]["resolution"] == resolution
     else:
         assert "test_clustering" in adata.obs.columns
+        assert isinstance(adata.uns["test_clustering"]["modularity"], float)
+        assert adata.uns["test_clustering"]["params"]["resolution"] == resolution
 
 
 def test_kmeans_basic(adata_neighbors):

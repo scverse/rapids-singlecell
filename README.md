@@ -1,32 +1,32 @@
-[![Stars](https://img.shields.io/github/stars/scverse/rapids_singlecell?style=flat&logo=GitHub&color=blue)](https://github.com/scverse/rapids_singlecell/stargazers)
+[![Stars](https://img.shields.io/github/stars/scverse/rapids-singlecell?style=flat&logo=GitHub&color=blue)](https://github.com/scverse/rapids-singlecell)
 [![PyPI](https://img.shields.io/pypi/v/rapids-singlecell?logo=PyPI)](https://pypi.org/project/rapids-singlecell)
-[![Downloads](https://static.pepy.tech/badge/rapids-singlecell)](https://pepy.tech/project/rapids-singlecell)
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-total.json)](https://pypi.org/project/rapids-singlecell)
+[![Downloads/month](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-month.json)](https://pypi.org/project/rapids-singlecell)
 [![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.readthedocs.io/en/latest/?badge=latest)
-[![Build and Test](https://github.com/scverse/rapids_singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids_singlecell/actions/workflows/test-gpu.yml)
+[![CI-Pass](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml)
+[![codecov](https://codecov.io/gh/scverse/rapids-singlecell/graph/badge.svg?token=PFHJEQD94X)](https://codecov.io/gh/scverse/rapids-singlecell)
 [![Chat](https://img.shields.io/badge/zulip-join_chat-%2367b08f.svg)](https://scverse.zulipchat.com)
+
 
 # rapids-singlecell: GPU-Accelerated Single-Cell Analysis within scverse®
 
-rapids-singlecell provides GPU-accelerated single-cell analysis with an AnnData-first API. It is largely compatible with Scanpy and includes selected functionality from Squidpy and decoupler. Computations use CuPy and NVIDIA RAPIDS for performance on large datasets.
+rapids-singlecell provides GPU-accelerated single-cell analysis with an AnnData-first API.
+It is largely compatible with Scanpy and includes selected functionality from Squidpy, decoupler, and pertpy.
+Computations use CuPy and NVIDIA RAPIDS for performance on large datasets.
 
 - **GPU acceleration**: Common single-cell workflows on `AnnData` run on the GPU.
-- **Ecosystem compatibility**: Works with Scanpy APIs; includes pieces from Squidpy and decoupler.
+- **Ecosystem compatibility**: Works with Scanpy APIs; includes pieces from Squidpy, decoupler, and pertpy.
 - **Simple installation**: Available via Conda and PyPI.
 
 ## Documentation
 
 For more information please have a look through the [documentation](https://rapids-singlecell.readthedocs.io/en/latest/)
 
-
 ## Citation
 
-If you use this code, please cite: [![DOI](https://zenodo.org/badge/364573913.svg)](https://zenodo.org/badge/latestdoi/364573913)
+If you use this tool, please cite: [![arXiv](https://img.shields.io/badge/arXiv-2603.02402-b31b1b.svg)](https://doi.org/10.48550/arXiv.2603.02402)
 
-Please also consider citing: [rapids-single-cell-examples](https://zenodo.org/badge/latestdoi/265649968) and  [scanpy](https://doi.org/10.1186/s13059-017-1382-0)
-
-In addition to that please cite the methods' original research articles in the [scanpy documentation](https://scanpy.readthedocs.io/en/latest/references.html)
-
-If you use the accelerated decoupler functions please cite [decoupler](https://doi.org/10.1093/bioadv/vbac016)
+Please cite the relevant tools if used: [decoupler](https://doi.org/10.1093/bioadv/vbac016) for decoupler functions, [squidpy](https://doi.org/10.1038/s41592-021-01358-2) for spatial analysis, and [pertpy](https://doi.org/10.1038/s41592-024-02233-6) for perturbation analysis.
 
 [//]: # (numfocus-fiscal-sponsor-attribution)
 

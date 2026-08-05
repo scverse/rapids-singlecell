@@ -8,7 +8,6 @@ import numpy as np
 from cupyx.scipy.sparse import csc_matrix as csc_matrix_gpu
 from cupyx.scipy.sparse import csr_matrix as csr_matrix_gpu
 from dask.array import Array as DaskArray
-from scanpy.get import _get_obs_rep, _set_obs_rep
 from scipy.sparse import csc_array as csc_array_cpu
 from scipy.sparse import csc_matrix as csc_matrix_cpu
 from scipy.sparse import csr_array as csr_array_cpu
@@ -21,6 +20,8 @@ from rapids_singlecell._compat import (
     _meta_sparse_csc_cpu,
     _meta_sparse_csr_cpu,
 )
+
+from ._utils import _get_obs_rep, _set_obs_rep
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -63,12 +64,12 @@ def anndata_to_GPU(
 
     if convert_all:
         anndata_to_GPU(adata)
-        if adata.layers:
-            for key in adata.layers.keys():
+        if adata.layers is not None:
+            for key in adata.layers:
                 anndata_to_GPU(adata, layer=key)
     else:
         X = _get_obs_rep(adata, layer=layer)
-        error = layer if layer else "X"
+        error = layer if layer is not None else "X"
         X = X_to_GPU(X, warning=error)
         _set_obs_rep(adata, X, layer=layer)
 
@@ -150,8 +151,8 @@ def anndata_to_CPU(
 
     if convert_all:
         anndata_to_CPU(adata)
-        if adata.layers:
-            for key in adata.layers.keys():
+        if adata.layers is not None:
+            for key in adata.layers:
                 anndata_to_CPU(adata, layer=key)
     else:
         X = _get_obs_rep(adata, layer=layer)

@@ -45,18 +45,28 @@ def _nn_descent_knn(
     )
     neighbors = cp.array(idx.graph).astype(cp.uint32)
     if metric == "euclidean" or metric == "sqeuclidean":
-        from ._kernels._nn_descent import calc_distance_kernel as dist_func
+        from rapids_singlecell._cuda._nn_descent_cuda import (
+            sqeuclidean as dist_func,
+        )
     elif metric == "cosine":
-        from ._kernels._nn_descent import calc_distance_kernel_cos as dist_func
+        from rapids_singlecell._cuda._nn_descent_cuda import (
+            cosine as dist_func,
+        )
     elif metric == "inner_product":
-        from ._kernels._nn_descent import calc_distance_kernel_inner as dist_func
-    grid_size = (X.shape[0] + 32 - 1) // 32
+        from rapids_singlecell._cuda._nn_descent_cuda import (
+            inner as dist_func,
+        )
+    # grid_size = (X.shape[0] + 32 - 1) // 32
     distances = cp.zeros((X.shape[0], neighbors.shape[1]), dtype=cp.float32)
 
     dist_func(
-        (grid_size,),
-        (32,),
-        (X, distances, neighbors, X.shape[0], X.shape[1], neighbors.shape[1]),
+        X,
+        out=distances,
+        pairs=neighbors,
+        n_samples=X.shape[0],
+        n_features=X.shape[1],
+        n_neighbors=neighbors.shape[1],
+        stream=cp.cuda.get_current_stream().ptr,
     )
     if metric == "euclidean":
         distances = cp.sqrt(distances)

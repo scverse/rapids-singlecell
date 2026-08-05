@@ -1,13 +1,26 @@
 from __future__ import annotations
 
-import math
-
 import cupy as cp
+import scipy.sparse as cpu_sparse
 from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 
 from rapids_singlecell._compat import DaskArray
 
 from . import pca
+
+
+def _validate_init_pos(init_coords):
+    """Coerce a user-supplied `init_pos` array to a 2D cupy float32 array.
+
+    Replaces the previous use of ``cuml.thirdparty_adapters.check_array``, which was
+    removed in cuml 26.06.
+    """
+    if cpu_sparse.issparse(init_coords) or issparse(init_coords):
+        raise ValueError("Sparse `init_pos` is not supported.")
+    arr = cp.asarray(init_coords, dtype=cp.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D `init_pos`, got {arr.ndim}D array.")
+    return arr
 
 
 def _choose_representation(adata, use_rep=None, n_pcs=None):
@@ -50,18 +63,20 @@ def _choose_representation(adata, use_rep=None, n_pcs=None):
 
 
 def _nan_mean_minor_dask_sparse(X, major, minor, *, mask=None, n_features=None):
-    from ._kernels._nan_mean_kernels import _get_nan_mean_minor
-
-    kernel = _get_nan_mean_minor(X.dtype)
-    kernel.compile()
+    from rapids_singlecell._cuda import _nanmean_cuda as _nm
 
     def __nan_mean_minor(X_part):
         mean = cp.zeros(minor, dtype=cp.float64)
         nans = cp.zeros(minor, dtype=cp.int32)
-        tpb = (32,)
-        bpg_x = math.ceil(X_part.nnz / 32)
-        bpg = (bpg_x,)
-        kernel(bpg, tpb, (X_part.indices, X_part.data, mean, nans, mask, X_part.nnz))
+        _nm.nan_mean_minor(
+            X_part.indices,
+            X_part.data,
+            means=mean,
+            nans=nans,
+            mask=mask,
+            nnz=X_part.nnz,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
         return cp.vstack([mean, nans.astype(cp.float64)])[None, ...]
 
     n_blocks = X.blocks.size
@@ -77,30 +92,22 @@ def _nan_mean_minor_dask_sparse(X, major, minor, *, mask=None, n_features=None):
 
 
 def _nan_mean_major_dask_sparse(X, major, minor, *, mask=None, n_features=None):
-    from ._kernels._nan_mean_kernels import _get_nan_mean_major
-
-    kernel = _get_nan_mean_major(X.dtype)
-    kernel.compile()
+    from rapids_singlecell._cuda import _nanmean_cuda as _nm
 
     def __nan_mean_major(X_part):
         major_part = X_part.shape[0]
         mean = cp.zeros(major_part, dtype=cp.float64)
         nans = cp.zeros(major_part, dtype=cp.int32)
-        block = (64,)
-        grid = (major_part,)
-        kernel(
-            grid,
-            block,
-            (
-                X_part.indptr,
-                X_part.indices,
-                X_part.data,
-                mean,
-                nans,
-                mask,
-                major_part,
-                minor,
-            ),
+        _nm.nan_mean_major(
+            X_part.indptr,
+            X_part.indices,
+            X_part.data,
+            means=mean,
+            nans=nans,
+            mask=mask,
+            major=major_part,
+            minor=minor,
+            stream=cp.cuda.get_current_stream().ptr,
         )
         return cp.stack([mean, nans.astype(cp.float64)], axis=1)
 
@@ -144,30 +151,38 @@ def _nan_mean_dense_dask(X, axis, *, mask, n_features):
 
 
 def _nan_mean_minor(X, major, minor, *, mask=None, n_features=None):
-    from ._kernels._nan_mean_kernels import _get_nan_mean_minor
+    from rapids_singlecell._cuda import _nanmean_cuda as _nm
 
     mean = cp.zeros(minor, dtype=cp.float64)
     nans = cp.zeros(minor, dtype=cp.int32)
-    tpb = (32,)
-    bpg_x = math.ceil(X.nnz / 32)
-
-    bpg = (bpg_x,)
-    get_mean_var_minor = _get_nan_mean_minor(X.data.dtype)
-    get_mean_var_minor(bpg, tpb, (X.indices, X.data, mean, nans, mask, X.nnz))
+    _nm.nan_mean_minor(
+        X.indices,
+        X.data,
+        means=mean,
+        nans=nans,
+        mask=mask,
+        nnz=X.nnz,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
     mean /= n_features - nans
     return mean
 
 
 def _nan_mean_major(X, major, minor, *, mask=None, n_features=None):
-    from ._kernels._nan_mean_kernels import _get_nan_mean_major
+    from rapids_singlecell._cuda import _nanmean_cuda as _nm
 
     mean = cp.zeros(major, dtype=cp.float64)
     nans = cp.zeros(major, dtype=cp.int32)
-    block = (64,)
-    grid = (major,)
-    get_mean_var_major = _get_nan_mean_major(X.data.dtype)
-    get_mean_var_major(
-        grid, block, (X.indptr, X.indices, X.data, mean, nans, mask, major, minor)
+    _nm.nan_mean_major(
+        X.indptr,
+        X.indices,
+        X.data,
+        means=mean,
+        nans=nans,
+        mask=mask,
+        major=major,
+        minor=minor,
+        stream=cp.cuda.get_current_stream().ptr,
     )
     mean /= n_features - nans
 

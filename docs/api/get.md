@@ -1,6 +1,6 @@
 # Get object from `AnnData`: `get`
 
-These functions offer convineant ways to move arrays and matrices from and to the GPU.
+These functions offer convenient ways to move arrays and matrices from and to the GPU.
 
 ```{eval-rst}
 .. module:: rapids_singlecell.get

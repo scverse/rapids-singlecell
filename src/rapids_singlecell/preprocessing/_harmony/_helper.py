@@ -5,24 +5,29 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from ._kernels._kmeans import _get_kmeans_err_kernel
-from ._kernels._normalize import _get_normalize_kernel_optimized
-from ._kernels._outer import (
-    _get_colsum_atomic_kernel,
-    _get_colsum_kernel,
-    _get_harmony_correction_kernel,
-    _get_outer_kernel,
-)
-from ._kernels._pen import _get_pen_kernel
-from ._kernels._scatter_add import (
-    _get_aggregated_matrix_kernel,
-    _get_scatter_add_kernel_optimized,
-    _get_scatter_add_kernel_with_bias_block,
-    _get_scatter_add_kernel_with_bias_cat0,
-)
+from rapids_singlecell._cuda import _harmony_colsum_cuda as _hc_cs
+from rapids_singlecell._cuda import _harmony_normalize_cuda as _hc_norm
+from rapids_singlecell._cuda import _harmony_outer_cuda as _hc_out
+from rapids_singlecell._cuda import _harmony_scatter_cuda as _hc_sc
 
 if TYPE_CHECKING:
     import pandas as pd
+
+# Shared-memory scatter_add heuristics
+MIN_CELLS_FOR_SHARED = 50_000
+MIN_CELLS_PER_BATCH_SHARED = 10_000
+MAX_SHARED_MEM_BYTES = 48 * 1024  # 48 KB shared memory budget
+MIN_CELLS_PER_BLOCK = 64
+
+# Column-sum heuristic thresholds (rows x cols regions)
+_COLSUM_COLS_SMALL = 200
+_COLSUM_COLS_MEDIUM = 800
+_COLSUM_COLS_LARGE = 1024
+_COLSUM_COLS_XLARGE = 2000
+_COLSUM_ROWS_TINY = 5_000
+_COLSUM_ROWS_SMALL = 10_000
+_COLSUM_ROWS_MEDIUM = 20_000
+_COLSUM_ROWS_LARGE = 100_000
 
 
 def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
@@ -42,13 +47,12 @@ def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
 
     rows, cols = X.shape
 
-    # Fixed block size of 32
-    block_dim = 32
-    grid_dim = rows  # One block per row
-
-    normalize_p1 = _get_normalize_kernel_optimized(X.dtype)
-    # Launch the kernel
-    normalize_p1((grid_dim,), (block_dim,), (X, rows, cols))
+    _hc_norm.normalize(
+        X,
+        rows=rows,
+        cols=cols,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
     return X
 
 
@@ -57,37 +61,85 @@ def _scatter_add_cp(
     out: cp.ndarray,
     cats: cp.ndarray,
     switcher: int,
+    n_batches: int | None = None,
+    *,
+    use_shared: bool | None = None,
 ) -> None:
     """
     Scatter add operation for Harmony algorithm.
+
+    Uses shared memory kernel when n_batches is provided and output fits
+    in shared memory (< 48KB). This reduces global atomic contention.
+
+    The shared memory kernel is only beneficial when atomic contention is high,
+    which occurs when n_cells / n_batches is large (many cells per batch bucket).
+    With many batches, contention is naturally low and the original kernel is faster.
+
+    Parameters
+    ----------
+    X
+        Input array of shape (n_cells, n_pcs)
+    out
+        Output array of shape (n_batches, n_pcs)
+    cats
+        Category indices for each cell
+    switcher
+        0 for subtraction, 1 for addition
+    n_batches
+        Number of batch categories
+    use_shared
+        Force shared memory kernel (True), force optimized kernel (False),
+        or auto-select based on heuristics (None, default)
     """
     n_cells = X.shape[0]
     n_pcs = X.shape[1]
-    N = n_cells * n_pcs
-    threads_per_block = 256
-    blocks = (N + threads_per_block - 1) // threads_per_block
+    n_covariates = cats.shape[1] if cats.ndim == 2 else 1
 
-    scatter_add_kernel = _get_scatter_add_kernel_optimized(X.dtype)
-    scatter_add_kernel((blocks,), (256,), (X, cats, n_cells, n_pcs, switcher, out))
+    # Determine whether to use shared memory kernel
+    if use_shared is None:
+        use_shared = False
+        if n_batches is not None and n_cells >= MIN_CELLS_FOR_SHARED:
+            cells_per_batch = n_cells * n_covariates // n_batches
+            shared_mem_needed = n_batches * n_pcs * X.dtype.itemsize
+            if (
+                shared_mem_needed <= MAX_SHARED_MEM_BYTES
+                and cells_per_batch >= MIN_CELLS_PER_BATCH_SHARED
+            ):
+                use_shared = True
 
+    if use_shared:
+        if n_batches is None:
+            raise ValueError("n_batches must be provided when use_shared=True")
+        dev = cp.cuda.Device()
+        n_sm = dev.attributes["MultiProcessorCount"]
+        max_blocks_by_cells = max(
+            1, (n_cells + MIN_CELLS_PER_BLOCK - 1) // MIN_CELLS_PER_BLOCK
+        )
+        n_blocks = min(n_sm * 4, max_blocks_by_cells)
 
-def _Z_correction(
-    Z: cp.ndarray,
-    W: cp.ndarray,
-    cats: cp.ndarray,
-    R: cp.ndarray,
-) -> None:
-    """
-    Scatter add operation for Harmony algorithm.
-    """
-    n_cells = Z.shape[0]
-    n_pcs = Z.shape[1]
-    N = n_cells * n_pcs
-    threads_per_block = 256
-    blocks = (N + threads_per_block - 1) // threads_per_block
-
-    scatter_add_kernel = _get_harmony_correction_kernel(Z.dtype)
-    scatter_add_kernel((blocks,), (256,), (Z, W, cats, R, n_cells, n_pcs))
+        _hc_sc.scatter_add_shared(
+            X,
+            cats=cats,
+            n_cells=n_cells,
+            n_pcs=n_pcs,
+            n_batches=n_batches,
+            n_covariates=n_covariates,
+            switcher=switcher,
+            a=out,
+            n_blocks=n_blocks,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    else:
+        _hc_sc.scatter_add(
+            X,
+            cats=cats,
+            n_cells=n_cells,
+            n_pcs=n_pcs,
+            n_covariates=n_covariates,
+            switcher=switcher,
+            a=out,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
 
 
 def _outer_cp(
@@ -95,172 +147,153 @@ def _outer_cp(
 ) -> None:
     n_cats, n_pcs = E.shape
 
-    # Determine the total number of elements to process and configure the grid.
-    N = n_cats * n_pcs
-    threads_per_block = 256
-    blocks = (N + threads_per_block - 1) // threads_per_block
-    outer_kernel = _get_outer_kernel(E.dtype)
-    outer_kernel(
-        (blocks,), (threads_per_block,), (E, Pr_b, R_sum, n_cats, n_pcs, switcher)
+    _hc_out.outer(
+        E,
+        Pr_b=Pr_b,
+        R_sum=R_sum,
+        n_cats=n_cats,
+        n_pcs=n_pcs,
+        switcher=switcher,
+        stream=cp.cuda.get_current_stream().ptr,
     )
 
 
-def _normalize_cp(X: cp.ndarray, p: int = 2) -> cp.ndarray:
+def _validate_output_buffer(
+    X: cp.ndarray,
+    out: cp.ndarray,
+    *,
+    operation: str,
+) -> None:
+    """Validate a caller-provided output buffer."""
+    if out.shape != X.shape or out.dtype != X.dtype:
+        raise ValueError(f"{operation} output must match the input shape and dtype")
+    if not out.flags.c_contiguous:
+        raise ValueError(f"{operation} output must be C-contiguous")
+
+
+def _normalize_cp(
+    X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None
+) -> cp.ndarray:
     """
     Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`.
     """
     if p == 2:
-        return X / cp.linalg.norm(X, ord=2, axis=1, keepdims=True).clip(min=1e-12)
+        X = cp.ascontiguousarray(X)
+        if out is None:
+            out = cp.empty_like(X)
+        else:
+            _validate_output_buffer(X, out, operation="Normalization")
+        rows, cols = X.shape
+        _hc_norm.l2_row_normalize(
+            X,
+            dst=out,
+            n_rows=rows,
+            n_cols=cols,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+        return out
 
     else:
+        if out is not None and out is not X:
+            raise ValueError("An output buffer is only supported for L2 normalization")
         return _normalize_cp_p1(X)
 
 
-def _get_aggregated_matrix(
-    aggregated_matrix: cp.ndarray, sum: cp.ndarray, n_batches: int
-) -> None:
-    """
-    Get the aggregated matrix for the correction step.
-    """
-    aggregated_matrix_kernel = _get_aggregated_matrix_kernel(aggregated_matrix.dtype)
+def _get_batch_codes(
+    batch_mat: pd.DataFrame, batch_key: str | list[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Encode each batch variable into a disjoint range of marginal codes."""
+    keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
+    if not keys:
+        raise ValueError("batch_key must contain at least one column name")
 
-    threads_per_block = 32
-    blocks = (n_batches + 1 + threads_per_block - 1) // threads_per_block
-    aggregated_matrix_kernel(
-        (blocks,), (threads_per_block,), (aggregated_matrix, sum, sum.sum(), n_batches)
-    )
+    codes = np.empty((len(batch_mat), len(keys)), dtype=np.int32)
+    n_levels = np.empty(len(keys), dtype=np.int32)
+    offset = 0
 
+    for covariate, key in enumerate(keys):
+        batch_vec = batch_mat[key].astype("category")
+        local_codes = batch_vec.cat.codes.to_numpy(dtype=np.int32, copy=False)
+        if np.any(local_codes < 0):
+            raise ValueError(f"Batch variable {key!r} contains missing values")
 
-def _get_batch_codes(batch_mat: pd.DataFrame, batch_key: str | list[str]) -> pd.Series:
-    if type(batch_key) is str:
-        batch_vec = batch_mat[batch_key]
+        n_categories = batch_vec.cat.categories.size
+        n_levels[covariate] = n_categories
+        codes[:, covariate] = local_codes + offset
+        offset += n_categories
 
-    elif len(batch_key) == 1:
-        batch_key = batch_key[0]
-
-        batch_vec = batch_mat[batch_key]
-
-    else:
-        df = batch_mat[batch_key].astype("str")
-        batch_vec = df.apply(lambda row: ",".join(row), axis=1)
-
-    return batch_vec.astype("category")
+    return codes, n_levels
 
 
-def _one_hot_tensor_cp(X: pd.Series) -> cp.array:
-    """
-    One-hot encode a categorical series.
+def _factorize_joint_codes(
+    batch_codes: np.ndarray, n_levels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Factorize marginal category tuples in lexicographic order."""
+    levels = np.asarray(n_levels, dtype=np.int64)
+    if batch_codes.ndim != 2 or batch_codes.shape[1] != levels.size:
+        raise ValueError("Batch codes and category levels have incompatible shapes")
 
-    Parameters
-    ----------
-    X
-        Input categorical series.
-    Returns
-    -------
-    One-hot encoded array.
-    """
-    ids = cp.array(X.cat.codes.values.copy(), dtype=cp.int32).reshape(-1)
-    n_col = X.cat.categories.size
-    Phi = cp.eye(n_col)[ids]
+    joint_cardinality = 1
+    for level in levels:
+        joint_cardinality *= int(level)
+        if joint_cardinality > np.iinfo(np.int64).max:
+            joint_cats, joint_codes = np.unique(
+                batch_codes, axis=0, return_inverse=True
+            )
+            return joint_cats, np.asarray(joint_codes).reshape(-1)
 
-    return Phi
+    offsets = np.empty(levels.size, dtype=np.int64)
+    offsets[0] = 0
+    if levels.size > 1:
+        np.cumsum(levels[:-1], out=offsets[1:])
 
+    linear_codes = batch_codes[:, 0].astype(np.int64) - offsets[0]
+    for covariate in range(1, levels.size):
+        linear_codes *= levels[covariate]
+        linear_codes += batch_codes[:, covariate] - offsets[covariate]
 
-def _create_category_index_mapping(
-    cats: cp.ndarray, n_batches: int
-) -> tuple[cp.ndarray, cp.ndarray]:
-    """
-    Create a CSR-like data structure mapping categories to cell indices using lexicographical sort.
-    """
-    cat_counts = cp.zeros(n_batches, dtype=cp.int32)
-    cp.add.at(cat_counts, cats, 1)
-    cat_offsets = cp.zeros(n_batches + 1, dtype=cp.int32)
-    cp.cumsum(cat_counts, out=cat_offsets[1:])
-
-    n_cells = cats.shape[0]
-    indices = cp.arange(n_cells, dtype=cp.int32)
-
-    cell_indices = cp.lexsort(cp.stack((indices, cats))).astype(cp.int32)
-    return cat_offsets, cell_indices
-
-
-def _scatter_add_cp_bias_csr(
-    X: cp.ndarray,
-    out: cp.ndarray,
-    *,
-    cat_offsets: cp.ndarray,
-    cell_indices: cp.ndarray,
-    bias: cp.ndarray,
-    n_batches: int,
-) -> None:
-    n_cells = X.shape[0]
-    n_pcs = X.shape[1]
-
-    threads_per_block = 1024
-    if n_cells < 300_000:
-        blocks = int((n_pcs + 1) / 2)
-        scatter_kernel0 = _get_scatter_add_kernel_with_bias_cat0(X.dtype)
-        scatter_kernel0(
-            (blocks, 8), (threads_per_block,), (X, n_cells, n_pcs, out, bias)
-        )
-    else:
-        out[0] = X.T @ bias
-    blocks = int((n_batches) * (n_pcs + 1) / 2)
-    scatter_kernel = _get_scatter_add_kernel_with_bias_block(X.dtype)
-    scatter_kernel(
-        (blocks,),
-        (threads_per_block,),
-        (X, cat_offsets, cell_indices, n_cells, n_pcs, n_batches, out, bias),
-    )
-
-
-def _kmeans_error(R: cp.ndarray, dot: cp.ndarray) -> float:
-    """Optimized raw CUDA implementation of kmeans error calculation"""
-    assert R.size == dot.size and R.dtype == dot.dtype
-
-    out = cp.zeros(1, dtype=R.dtype)
-    threads = 256
-    blocks = min(
-        (R.size + threads - 1) // threads,
-        cp.cuda.Device().attributes["MultiProcessorCount"] * 8,
-    )
-    kernel = _get_kmeans_err_kernel(R.dtype.name)
-    kernel((blocks,), (threads,), (R, dot, R.size, out))
-
-    return out[0]
+    observed_codes, joint_codes = np.unique(linear_codes, return_inverse=True)
+    joint_cats = np.empty((observed_codes.size, levels.size), dtype=np.int32)
+    remainder = observed_codes.copy()
+    for covariate in range(levels.size - 1, -1, -1):
+        joint_cats[:, covariate] = remainder % levels[covariate]
+        remainder //= levels[covariate]
+    joint_cats += offsets.astype(np.int32)
+    return joint_cats, joint_codes
 
 
 def _get_theta_array(
     theta: float | int | list[float | int] | np.ndarray | cp.ndarray,
-    n_batches: int,
+    n_levels: int | np.ndarray,
     dtype: cp.dtype,
 ) -> cp.ndarray:
     """
-    Convert theta parameter to a CuPy array of appropriate shape.
+    Normalize scalar, per-variable, or per-category theta values.
     """
-    # Handle scalar inputs (float, int)
-    if isinstance(theta, float | int):
-        return cp.ones(n_batches, dtype=dtype) * float(theta)
+    levels = np.atleast_1d(n_levels).astype(np.int64, copy=False)
+    n_covariates = levels.size
+    n_categories = int(levels.sum())
 
-    # Handle array-like inputs (list, numpy array, cupy array)
-    if isinstance(theta, list):
-        theta_array = cp.array(theta, dtype=dtype)
-    elif isinstance(theta, np.ndarray):
-        theta_array = cp.array(theta, dtype=dtype)
-    elif isinstance(theta, cp.ndarray):
-        theta_array = theta.astype(dtype)
-    else:
+    try:
+        theta_array = cp.asarray(theta, dtype=dtype)
+    except (TypeError, ValueError) as e:
         raise ValueError(
-            f"Theta must be float, int, list, numpy array, or cupy array, got {type(theta)}"
-        )
+            "Theta must be a scalar or an array-like collection of numeric values, "
+            f"got {type(theta).__name__}"
+        ) from e
+    if theta_array.ndim == 0:
+        return cp.full(n_categories, theta_array, dtype=dtype)
 
-    # Verify dimensions
-    if theta_array.size != n_batches:
-        raise ValueError(
-            f"Theta array size ({theta_array.size}) must match number of batches ({n_batches})"
-        )
+    theta_array = theta_array.ravel()
+    if theta_array.size == n_covariates:
+        return cp.repeat(theta_array, cp.asarray(levels))
+    if theta_array.size == n_categories:
+        return theta_array
 
-    return theta_array.ravel()
+    raise ValueError(
+        f"Theta array size ({theta_array.size}) must match the number of batch "
+        f"variables ({n_covariates}) or categorical levels ({n_categories})"
+    )
 
 
 def _column_sum(X: cp.ndarray) -> cp.ndarray:
@@ -274,20 +307,23 @@ def _column_sum(X: cp.ndarray) -> cp.ndarray:
 
     out = cp.zeros(cols, dtype=X.dtype)
 
-    dev = cp.cuda.Device()
-    nSM = dev.attributes["MultiProcessorCount"]
-    max_blocks = nSM * 8
-    threads = max(int(round(1 / 32) * 32), 32)
-    blocks = min(cols, max_blocks)
-    _colsum = _get_colsum_kernel(X.dtype)
-    _colsum((blocks,), (threads,), (X, out, rows, cols))
+    _hc_cs.colsum(
+        X,
+        out=out,
+        rows=rows,
+        cols=cols,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+
     return out
 
 
 def _column_sum_atomic(X: cp.ndarray) -> cp.ndarray:
     """
-    Sum each column of the 2D, C-contiguous array A
-    using 32×32 tiles + one atomic per tile-column.
+    Sum each column of the 2D, C-contiguous array A.
+
+    Uses 2D grid: blockIdx.x = column tile, blockIdx.y = row tile.
+    Each thread processes multiple rows to reduce atomic contention.
     """
     assert X.ndim == 2
     rows, cols = X.shape
@@ -295,13 +331,15 @@ def _column_sum_atomic(X: cp.ndarray) -> cp.ndarray:
         return X.sum(axis=0)
 
     out = cp.zeros(cols, dtype=X.dtype)
-    tile_rows = (rows + 31) // 32
-    tile_cols = (cols + 31) // 32
-    blocks = tile_rows * tile_cols
-    threads = (32, 32)
 
-    kernel = _get_colsum_atomic_kernel(X.dtype)
-    kernel((blocks,), threads, (X, out, rows, cols))
+    _hc_cs.colsum_atomic(
+        X,
+        out=out,
+        rows=rows,
+        cols=cols,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+
     return out
 
 
@@ -315,45 +353,37 @@ def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
 def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> callable:
     """
     Returns one of:
-    - _colsum_columns
-    - _colsum_atomics
+    - _column_sum
+    - _column_sum_atomic
     - _gemm_colsum
-    - cp.sum (with axis=0)
     """
     # first pick the strategy string
     if algo is None:
         cc = cp.cuda.Device().compute_capability
         algo = _colsum_heuristic(rows, cols, cc)
-    if algo == "cupy":
-        return lambda X: X.sum(axis=0)
     if algo == "columns":
         return _column_sum
     if algo == "atomics":
         return _column_sum_atomic
-    if algo == "gemm":
-        return _gemm_colsum
-    # fallback: global CuPy reduction
-    return lambda X: X.sum(axis=0)
+    return _gemm_colsum
 
 
 # TODO: Make this more robust
 def _colsum_heuristic(rows: int, cols: int, compute_capability: str) -> str:
     is_data_center = compute_capability in ["100", "90"]
-    if cols < 200 and rows < 20000:
+    if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_MEDIUM:
         return "columns"
-    if cols < 200 and rows < 100000 and is_data_center:
+    if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_LARGE and is_data_center:
         return "columns"
-    if cols < 800 and rows < 10000:
+    if cols < _COLSUM_COLS_MEDIUM and rows < _COLSUM_ROWS_SMALL:
         return "atomics"
-    if cols < 1024 and rows < 5000:
+    if cols < _COLSUM_COLS_LARGE and rows < _COLSUM_ROWS_TINY:
         return "atomics"
-    if cols < 800 and rows < 20000 and is_data_center:
+    if cols < _COLSUM_COLS_MEDIUM and rows < _COLSUM_ROWS_MEDIUM and is_data_center:
         return "atomics"
-    if cols < 2000 and rows < 10000 and is_data_center:
+    if cols < _COLSUM_COLS_XLARGE and rows < _COLSUM_ROWS_SMALL and is_data_center:
         return "atomics"
-    if rows >= 5000:
-        return "gemm"
-    return "cupy"
+    return "gemm"
 
 
 # TODO: Make this more robust
@@ -377,7 +407,7 @@ def _benchmark_colsum_algorithms(
         Number of benchmark trials
     Returns
     -------
-    Name of the fastest algorithm: 'cupy', 'columns', 'atomics', or 'gemm'
+    Name of the fastest algorithm: 'columns', 'atomics', or 'gemm'
     """
     rows, cols = shape
 
@@ -389,7 +419,6 @@ def _benchmark_colsum_algorithms(
         X = cp.ascontiguousarray(X)
 
     algorithms = {
-        "cupy": lambda x: x.sum(axis=0),
         "columns": _column_sum,
         "atomics": _column_sum_atomic,
         "gemm": _gemm_colsum,
@@ -462,16 +491,3 @@ def _choose_colsum_algo_benchmark(
     if verbose:
         print(f"Using {algo} for column sum")
     return func
-
-
-def _penalty_term(R: cp.ndarray, penalty: cp.ndarray, cats: cp.ndarray) -> cp.ndarray:
-    """
-    Calculate the penalty term for the Harmony algorithm.
-    """
-    n_cats, n_pcs = R.shape
-    N = n_cats * n_pcs
-    threads_per_block = 256
-    blocks = (N + threads_per_block - 1) // threads_per_block
-    pen_kernel = _get_pen_kernel(R.dtype)
-    pen_kernel((blocks,), (threads_per_block,), (R, penalty, cats, n_cats, n_pcs))
-    return R

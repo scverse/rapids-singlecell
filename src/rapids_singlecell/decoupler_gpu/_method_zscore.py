@@ -18,7 +18,7 @@ def _func_zscore(
     verbose: bool = False,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     r"""
-    Z-score (ZSCORE) :cite:`zscore`.
+    Z-score (ZSCORE).
 
     This approach computes the mean value of the molecular features for known targets,
     optionally subtracts the overall mean of all measured features,

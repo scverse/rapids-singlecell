@@ -5,11 +5,44 @@ from typing import (
     Any,
 )
 
+import cupy as cp
 import numpy as np
 import pandas as pd
-from pandas.api.types import infer_dtype, is_categorical_dtype
+from pandas.api.types import infer_dtype
 from scipy import stats
 from scipy.sparse import issparse, spmatrix
+
+
+def _check_precision_issues(score: cp.ndarray, dtype: np.dtype) -> None:
+    """Check for numerical issues in autocorrelation scores.
+
+    Parameters
+    ----------
+    score
+        The computed autocorrelation scores.
+    dtype
+        The data type used for computation.
+
+    Raises
+    ------
+    ValueError
+        If nan/inf values are detected.
+    """
+    if cp.any(cp.isnan(score) | cp.isinf(score)):
+        if dtype == np.float32:
+            raise ValueError(
+                "Detected nan/inf values in results with float32 precision. "
+                "This can occur with genes that have low variance or are constant. "
+                "Please use `dtype=np.float64` for better numerical stability."
+            )
+        else:
+            raise ValueError(
+                "Detected nan/inf values in results with float64 precision. "
+                "This can occur with genes that have zero variance (constant expression). "
+                "Consider filtering out such genes before running spatial autocorrelation. "
+                "If this is unexpected, please file a bug report at "
+                "https://github.com/scverse/rapids_singlecell/issues"
+            )
 
 
 ### Taken from squidpy: https://github.com/scverse/squidpy/blob/main/squidpy/gr/_ppatterns.py
@@ -62,7 +95,7 @@ def _p_value_calc(
     z_sim = (score - e_score_sim) / se_score_sim
     p_z_sim = np.empty(z_sim.shape)
 
-    p_z_sim[z_sim > 0] = 1 - stats.norm.cdf(z_sim[z_sim > 0])
+    p_z_sim[z_sim > 0] = stats.norm.sf(z_sim[z_sim > 0])
     p_z_sim[z_sim <= 0] = stats.norm.cdf(z_sim[z_sim <= 0])
 
     var_sim = np.var(sims, axis=0)
@@ -92,7 +125,7 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
 
     z_norm = (score - params["expected"]) / seScore_norm
     p_norm = np.empty(score.shape)
-    p_norm[z_norm > 0] = 1 - stats.norm.cdf(z_norm[z_norm > 0])
+    p_norm[z_norm > 0] = stats.norm.sf(z_norm[z_norm > 0])
     p_norm[z_norm <= 0] = stats.norm.cdf(z_norm[z_norm <= 0])
 
     if params["two_tailed"]:
@@ -211,7 +244,7 @@ def _assert_categorical_obs(adata, key):
     if key not in adata.obs:
         raise KeyError(f"Cluster key `{key}` not found in `adata.obs`.")
 
-    if not is_categorical_dtype(adata.obs[key]):
+    if not isinstance(adata.obs[key].dtype, pd.CategoricalDtype):
         raise TypeError(
             f"Expected `adata.obs[{key!r}]` to be `categorical`, found `{infer_dtype(adata.obs[key])}`."
         )

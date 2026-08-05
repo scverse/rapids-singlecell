@@ -68,6 +68,35 @@ def test_regress_out_layer(dtype, batchsize):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("sparse_format", ["csr", "csc", "dense"])
+def test_regress_out_categorical(dtype, sparse_format):
+    import pandas as pd
+    from scipy.sparse import random as sp_random
+
+    if sparse_format == "dense":
+        adata = AnnData(sp_random(1000, 100, density=0.6, format="csr").toarray())
+    else:
+        adata = AnnData(sp_random(1000, 100, density=0.6, format=sparse_format))
+    adata.X = adata.X.astype(dtype)
+    adata.obs["batch"] = pd.Categorical(
+        np.random.choice(["a", "b", "c"], size=adata.n_obs)
+    )
+
+    # scanpy reference
+    adata_sc = adata.copy()
+    sc.pp.regress_out(adata_sc, keys=["batch"])
+
+    # rapids
+    rsc.get.anndata_to_GPU(adata)
+    rsc.pp.regress_out(adata, keys=["batch"])
+
+    if dtype == "float32":
+        cp.testing.assert_allclose(adata.X, cp.array(adata_sc.X), atol=1e-5)
+    else:
+        cp.testing.assert_allclose(adata.X, cp.array(adata_sc.X), atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("batchsize", ["all", 100])
 def test_regress_out_reproducible(dtype, batchsize):
     adata = sc.datasets.pbmc68k_reduced()

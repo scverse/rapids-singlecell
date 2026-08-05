@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import cupy as cp
 from cupyx.scipy import sparse
-from scanpy.get import _get_obs_rep
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell.get import _get_obs_rep
 
 from ._utils import _check_gpu_X
 
@@ -27,8 +26,10 @@ def calculate_qc_metrics(
     layer: str = None,
 ) -> None:
     """\
-    Calculates basic qc Parameters. Calculates number of genes per cell (n_genes) and number of counts per cell (n_counts).
-    Loosely based on calculate_qc_metrics from scanpy [Wolf et al. 2018]. Updates :attr:`~anndata.AnnData.obs` and :attr:`~anndata.AnnData.var`  with columns with qc data.
+    Calculates basic qc Parameters :cite:p:`McCarthy2017`.
+
+    Calculates number of genes per cell (n_genes) and number of counts per cell (n_counts).
+    Loosely based on calculate_qc_metrics from scanpy :cite:p:`Wolf2018`. Updates :attr:`~anndata.AnnData.obs` and :attr:`~anndata.AnnData.var`  with columns with qc data.
 
     Parameters
     ----------
@@ -40,7 +41,7 @@ def calculate_qc_metrics(
             The kind of thing the variables are.
         qc_vars
             Keys for boolean columns of :attr:`~anndata.AnnData.var` which identify variables you could want to control for (e.g. Mito).
-            Run flag_gene_family first
+            Create these boolean columns before calculating QC metrics.
         log1p
             Set to `False` to skip computing `log1p` transformed annotations.
         layer
@@ -124,61 +125,42 @@ def _basic_qc(
     genes_per_cell = cp.zeros(X.shape[0], dtype=cp.int32)
     cells_per_gene = cp.zeros(X.shape[1], dtype=cp.int32)
     if sparse.issparse(X):
+        from rapids_singlecell._cuda import _qc_cuda as _qc
+
         if sparse.isspmatrix_csr(X):
-            from ._kernels._qc_kernels import _sparse_qc_csr
-
-            block = (32,)
-            grid = (int(math.ceil(X.shape[0] / block[0])),)
-            call_shape = X.shape[0]
-            sparse_qc_kernel = _sparse_qc_csr(X.data.dtype)
-
+            sparse_qc = _qc.sparse_qc_csr
+            is_csr = True
         elif sparse.isspmatrix_csc(X):
-            from ._kernels._qc_kernels import _sparse_qc_csc
-
-            block = (32,)
-            grid = (int(math.ceil(X.shape[1] / block[0])),)
-            call_shape = X.shape[1]
-            sparse_qc_kernel = _sparse_qc_csc(X.data.dtype)
-
+            sparse_qc = _qc.sparse_qc_csc
+            is_csr = False
         else:
             raise ValueError("Please use a csr or csc matrix")
-        sparse_qc_kernel(
-            grid,
-            block,
-            (
-                X.indptr,
-                X.indices,
-                X.data,
-                sums_cells,
-                sums_genes,
-                genes_per_cell,
-                cells_per_gene,
-                call_shape,
-            ),
+
+        sparse_qc(
+            X.indptr,
+            X.indices,
+            X.data,
+            sums_cells=sums_cells,
+            sums_genes=sums_genes,
+            cell_ex=genes_per_cell,
+            gene_ex=cells_per_gene,
+            **({"n_cells": X.shape[0]} if is_csr else {"n_genes": X.shape[1]}),
+            stream=cp.cuda.get_current_stream().ptr,
         )
     else:
-        from ._kernels._qc_kernels import _sparse_qc_dense
+        from rapids_singlecell._cuda import _qc_cuda as _qc
 
         if not X.flags.c_contiguous:
             X = cp.asarray(X, order="C")
-        block = (16, 16)
-        grid = (
-            int(math.ceil(X.shape[0] / block[0])),
-            int(math.ceil(X.shape[1] / block[1])),
-        )
-        sparse_qc_dense = _sparse_qc_dense(X.dtype)
-        sparse_qc_dense(
-            grid,
-            block,
-            (
-                X,
-                sums_cells,
-                sums_genes,
-                genes_per_cell,
-                cells_per_gene,
-                X.shape[0],
-                X.shape[1],
-            ),
+        _qc.sparse_qc_dense(
+            X,
+            sums_cells=sums_cells,
+            sums_genes=sums_genes,
+            cell_ex=genes_per_cell,
+            gene_ex=cells_per_gene,
+            n_cells=X.shape[0],
+            n_genes=X.shape[1],
+            stream=cp.cuda.get_current_stream().ptr,
         )
     return sums_cells, sums_genes, genes_per_cell, cells_per_gene
 
@@ -189,112 +171,67 @@ def _basic_qc_dask(
     import dask
 
     if isinstance(X._meta, sparse.csr_matrix):
-        from ._kernels._qc_kernels_dask import (
-            _sparse_qc_csr_dask_cells,
-            _sparse_qc_csr_dask_genes,
-        )
-
-        sparse_qc_csr_cells = _sparse_qc_csr_dask_cells(X.dtype)
-        sparse_qc_csr_cells.compile()
+        from rapids_singlecell._cuda import _qc_dask_cuda as _qcd
 
         def __qc_calc_1(X_part):
             sums_cells = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
             genes_per_cell = cp.zeros(X_part.shape[0], dtype=cp.int32)
-            block = (32,)
-            grid = (int(math.ceil(X_part.shape[0] / block[0])),)
-
-            sparse_qc_csr_cells(
-                grid,
-                block,
-                (
-                    X_part.indptr,
-                    X_part.indices,
-                    X_part.data,
-                    sums_cells,
-                    genes_per_cell,
-                    X_part.shape[0],
-                ),
+            _qcd.sparse_qc_csr_cells(
+                X_part.indptr,
+                X_part.indices,
+                X_part.data,
+                sums_cells=sums_cells,
+                cell_ex=genes_per_cell,
+                n_cells=X_part.shape[0],
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return cp.stack([sums_cells, genes_per_cell.astype(X_part.dtype)], axis=1)
-
-        sparse_qc_csr_genes = _sparse_qc_csr_dask_genes(X.dtype)
-        sparse_qc_csr_genes.compile()
 
         def __qc_calc_2(X_part):
             sums_genes = cp.zeros(X_part.shape[1], dtype=X_part.dtype)
             cells_per_gene = cp.zeros(X_part.shape[1], dtype=cp.int32)
-            block = (32,)
-            grid = (int(math.ceil(X_part.nnz / block[0])),)
-            sparse_qc_csr_genes(
-                grid,
-                block,
-                (
-                    X_part.indices,
-                    X_part.data,
-                    sums_genes,
-                    cells_per_gene,
-                    X_part.nnz,
-                ),
+            _qcd.sparse_qc_csr_genes(
+                X_part.indices,
+                X_part.data,
+                sums_genes=sums_genes,
+                gene_ex=cells_per_gene,
+                nnz=X_part.nnz,
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[
                 None, ...
             ]
 
     elif isinstance(X._meta, cp.ndarray):
-        from ._kernels._qc_kernels_dask import (
-            _sparse_qc_dense_cells,
-            _sparse_qc_dense_genes,
-        )
-
-        sparse_qc_dense_cells = _sparse_qc_dense_cells(X.dtype)
-        sparse_qc_dense_cells.compile()
+        from rapids_singlecell._cuda import _qc_dask_cuda as _qcd
 
         def __qc_calc_1(X_part):
             sums_cells = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
             genes_per_cell = cp.zeros(X_part.shape[0], dtype=cp.int32)
             if not X_part.flags.c_contiguous:
                 X_part = cp.asarray(X_part, order="C")
-            block = (16, 16)
-            grid = (
-                int(math.ceil(X_part.shape[0] / block[0])),
-                int(math.ceil(X_part.shape[1] / block[1])),
-            )
-            sparse_qc_dense_cells(
-                grid,
-                block,
-                (
-                    X_part,
-                    sums_cells,
-                    genes_per_cell,
-                    X_part.shape[0],
-                    X_part.shape[1],
-                ),
+            _qcd.sparse_qc_dense_cells(
+                X_part,
+                sums_cells=sums_cells,
+                cell_ex=genes_per_cell,
+                n_cells=X_part.shape[0],
+                n_genes=X_part.shape[1],
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return cp.stack([sums_cells, genes_per_cell.astype(X_part.dtype)], axis=1)
-
-        sparse_qc_dense_genes = _sparse_qc_dense_genes(X.dtype)
-        sparse_qc_dense_genes.compile()
 
         def __qc_calc_2(X_part):
             sums_genes = cp.zeros((X_part.shape[1]), dtype=X_part.dtype)
             cells_per_gene = cp.zeros((X_part.shape[1]), dtype=cp.int32)
             if not X_part.flags.c_contiguous:
                 X_part = cp.asarray(X_part, order="C")
-            block = (16, 16)
-            grid = (
-                int(math.ceil(X_part.shape[0] / block[0])),
-                int(math.ceil(X_part.shape[1] / block[1])),
-            )
-            sparse_qc_dense_genes(
-                grid,
-                block,
-                (
-                    X_part,
-                    sums_genes,
-                    cells_per_gene,
-                    X_part.shape[0],
-                    X_part.shape[1],
-                ),
+            _qcd.sparse_qc_dense_genes(
+                X_part,
+                sums_genes=sums_genes,
+                gene_ex=cells_per_gene,
+                n_cells=X_part.shape[0],
+                n_genes=X_part.shape[1],
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[
                 None, ...
@@ -338,87 +275,76 @@ def _geneset_qc(X: ArrayTypesDask, mask: cp.ndarray) -> cp.ndarray:
     if isinstance(X, DaskArray):
         return _geneset_qc_dask(X, mask)
     sums_cells_sub = cp.zeros(X.shape[0], dtype=X.dtype)
+    from rapids_singlecell._cuda import _qc_cuda as _qc
+
     if sparse.issparse(X):
         if sparse.isspmatrix_csr(X):
-            from ._kernels._qc_kernels import _sparse_qc_csr_sub
-
-            block = (32,)
-            grid = (int(math.ceil(X.shape[0] / block[0])),)
-            call_shape = X.shape[0]
-            sparse_qc_sub = _sparse_qc_csr_sub(X.data.dtype)
-
+            _qc.sparse_qc_csr_sub(
+                X.indptr,
+                X.indices,
+                X.data,
+                sums_cells=sums_cells_sub,
+                mask=mask,
+                n_cells=X.shape[0],
+                stream=cp.cuda.get_current_stream().ptr,
+            )
         elif sparse.isspmatrix_csc(X):
-            from ._kernels._qc_kernels import _sparse_qc_csc_sub
-
-            block = (32,)
-            grid = (int(math.ceil(X.shape[1] / block[0])),)
-            call_shape = X.shape[1]
-            sparse_qc_sub = _sparse_qc_csc_sub(X.data.dtype)
-
-        sparse_qc_sub(
-            grid,
-            block,
-            (X.indptr, X.indices, X.data, sums_cells_sub, mask, call_shape),
-        )
+            _qc.sparse_qc_csc_sub(
+                X.indptr,
+                X.indices,
+                X.data,
+                sums_cells=sums_cells_sub,
+                mask=mask,
+                n_genes=X.shape[1],
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+        else:
+            raise ValueError("Please use a csr or csc matrix")
     else:
-        from ._kernels._qc_kernels import _sparse_qc_dense_sub
-
-        block = (16, 16)
-        grid = (
-            int(math.ceil(X.shape[0] / block[0])),
-            int(math.ceil(X.shape[1] / block[1])),
-        )
-        sparse_qc_dense_sub = _sparse_qc_dense_sub(X.dtype)
-        sparse_qc_dense_sub(
-            grid, block, (X, sums_cells_sub, mask, X.shape[0], X.shape[1])
+        if not X.flags.c_contiguous:
+            X = cp.asarray(X, order="C")
+        _qc.sparse_qc_dense_sub(
+            X,
+            sums_cells=sums_cells_sub,
+            mask=mask,
+            n_cells=X.shape[0],
+            n_genes=X.shape[1],
+            stream=cp.cuda.get_current_stream().ptr,
         )
     return sums_cells_sub
 
 
 def _geneset_qc_dask(X: DaskArray, mask: cp.ndarray) -> cp.ndarray:
     if isinstance(X._meta, sparse.csr_matrix):
-        from ._kernels._qc_kernels import _sparse_qc_csr_sub
-
-        sparse_qc_csr = _sparse_qc_csr_sub(X.dtype)
-        sparse_qc_csr.compile()
+        from rapids_singlecell._cuda import _qc_cuda as _qc
 
         def __qc_calc(X_part):
             sums_cells_sub = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
-            block = (32,)
-            grid = (int(math.ceil(X_part.shape[0] / block[0])),)
-            sparse_qc_csr(
-                grid,
-                block,
-                (
-                    X_part.indptr,
-                    X_part.indices,
-                    X_part.data,
-                    sums_cells_sub,
-                    mask,
-                    X_part.shape[0],
-                ),
+            _qc.sparse_qc_csr_sub(
+                X_part.indptr,
+                X_part.indices,
+                X_part.data,
+                sums_cells=sums_cells_sub,
+                mask=mask,
+                n_cells=X_part.shape[0],
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return sums_cells_sub
 
     elif isinstance(X._meta, cp.ndarray):
-        from ._kernels._qc_kernels import _sparse_qc_dense_sub
-
-        sparse_qc_dense = _sparse_qc_dense_sub(X.dtype)
-        sparse_qc_dense.compile()
+        from rapids_singlecell._cuda import _qc_cuda as _qc
 
         def __qc_calc(X_part):
             sums_cells_sub = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
             if not X_part.flags.c_contiguous:
                 X_part = cp.asarray(X_part, order="C")
-            block = (16, 16)
-            grid = (
-                int(math.ceil(X_part.shape[0] / block[0])),
-                int(math.ceil(X_part.shape[1] / block[1])),
-            )
-            sparse_qc_dense(
-                grid,
-                block,
-                (X_part, sums_cells_sub, mask, X_part.shape[0], X_part.shape[1]),
+            _qc.sparse_qc_dense_sub(
+                X_part,
+                sums_cells=sums_cells_sub,
+                mask=mask,
+                n_cells=X_part.shape[0],
+                n_genes=X_part.shape[1],
+                stream=cp.cuda.get_current_stream().ptr,
             )
             return sums_cells_sub
 

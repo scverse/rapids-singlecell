@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  poem: false
+  request_changes_workflow: false
+  review_status: false
+  auto_review:
+    enabled: false
+    drafts: false
+    base_branches:
+      - "^main$"
+  tools:
+    markdownlint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    gitleaks:
+      enabled: true
+  path_instructions:
+    - path: "src/rapids_singlecell/_cuda/**"
+      instructions: "Nanobind CUDA C++ kernels. See knowledge base for detailed review guidelines."
+    - path: "src/rapids_singlecell/**"
+      instructions: "GPU-accelerated Python. See knowledge base for detailed review guidelines."
+    - path: "tests/**"
+      instructions: "GPU tests — do not suggest tolerance changes without strong justification."
+    - path: "docs/**"
+      instructions: "Check accuracy of code examples and consistency with current code."
+    - path: ".github/**"
+      instructions: "CI workflows — watch for semicolon issues in CMAKE_CUDA_ARCHITECTURES."
+knowledge_base:
+  opt_out: false
+  code_guidelines:
+    filePatterns:
+      - ".coderabbit/python_agents.md"
+      - ".coderabbit/cuda_agents.md"
+      - "docs/contributing.md"
+chat:
+  auto_reply: false

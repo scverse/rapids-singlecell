@@ -12,6 +12,8 @@ from cupyx.scipy import sparse as sparse_gpu
 from scipy import sparse
 from statsmodels.stats.multitest import multipletests
 
+from rapids_singlecell.preprocessing._utils import _sparse_to_dense
+
 from ._gearysc import _gearys_C_cupy
 from ._moransi import _morans_I_cupy
 from ._utils import _p_value_calc
@@ -20,6 +22,30 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+
+
+def _to_cupy(vals, *, use_sparse: bool, dtype):
+    """Convert input data to CuPy array with specified dtype.
+
+    Note: `use_sparse` is only relevant for sparse input data.
+    Dense input is always returned as a dense CuPy array.
+    """
+    is_sparse = sparse.issparse(vals) or sparse_gpu.isspmatrix(vals)
+
+    # Dense input - use_sparse is ignored
+    if not is_sparse:
+        return cp.array(vals, dtype=dtype, order="C")
+
+    # Sparse input - respect use_sparse parameter
+    if use_sparse:
+        if sparse_gpu.isspmatrix(vals):
+            return vals.tocsr().astype(dtype)
+        return sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
+
+    # Sparse input but use_sparse=False - convert to dense
+    if not sparse_gpu.isspmatrix(vals):
+        vals = sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
+    return _sparse_to_dense(vals, order="C")
 
 
 def spatial_autocorr(
@@ -35,6 +61,8 @@ def spatial_autocorr(
     layer: str | None = None,
     use_raw: bool = False,
     use_sparse: bool = True,
+    dtype: np.dtype | None = None,
+    multi_gpu: bool | list[int] | str | None = None,
     copy: bool = False,
 ) -> pd.DataFrame | None:
     """
@@ -44,11 +72,9 @@ def spatial_autocorr(
     The function also calculates p-values and corrected p-values for multiple testing.
 
     Note:
-        This implementation uses single-precision (float32) for calculations, which may result in decreased accuracy for weak
-        correlations when compared to double-precision (float64) calculations. For strongly correlated data, the difference in p-values
-        should be minimal. However, for weakly correlated data with I or C values close to their expected values, the lack of precision
-        may lead to larger discrepancies in p-values.
-
+        The precision (float32 or float64) is determined by the input data dtype.
+        For best numerical stability, especially with genes having low variance,
+        use float64 input data.
 
     Parameters
     ----------
@@ -74,6 +100,16 @@ def spatial_autocorr(
             If True, use the raw data in the AnnData object, by default False.
         use_sparse
             If True, use a sparse representation for the input matrix `vals` when it is a sparse matrix, by default True.
+        dtype
+            Data type for computation. If None, uses input data dtype.
+            For best numerical stability, especially with genes having low variance, use `np.float64`.
+        multi_gpu
+            GPU selection for permutation tests:
+            - None: Use all GPUs if available (default)
+            - True: Use all available GPUs
+            - False: Use only GPU 0
+            - list[int]: Use specific GPU IDs (e.g., [0, 2])
+            - str: Comma-separated GPU IDs (e.g., "0,2")
         copy
             If True, return the results as a DataFrame instead of storing them in `adata.uns`, by default False.
 
@@ -97,13 +133,19 @@ def spatial_autocorr(
         genes = list(set(genes) & set(adata.raw.var_names))
         vals = adata.raw[:, genes].X
     else:
-        if layer:
+        if layer is not None:
             vals = adata[:, genes].layers[layer]
         else:
             vals = adata[:, genes].X
+
+    # Determine dtype from parameter or input data
+    compute_dtype = np.dtype(dtype) if dtype is not None else vals.dtype
+    if compute_dtype not in (np.float32, np.float64):
+        compute_dtype = np.float32
+
     # create Adj-Matrix
     adj_matrix = adata.obsp[connectivity_key]
-    adj_matrix_cupy = sparse_gpu.csr_matrix(adj_matrix, dtype=cp.float32)
+    adj_matrix_cupy = sparse_gpu.csr_matrix(adj_matrix, dtype=compute_dtype)
 
     if transformation:  # row-normalize
         row_sums = adj_matrix_cupy.sum(axis=1).reshape(-1, 1)
@@ -113,44 +155,36 @@ def spatial_autocorr(
 
     params = {"two_tailed": two_tailed}
 
-    def process_input_data(vals, use_sparse):
-        # Check if input is already a sparse matrix
-        is_sparse_input = sparse.issparse(vals) or sparse_gpu.isspmatrix(vals)
-        if use_sparse and is_sparse_input:
-            # Convert to CuPy CSR format if not already in sparse GPU format
-            data = (
-                sparse_gpu.csr_matrix(vals.tocsr(), dtype=cp.float32)
-                if not sparse_gpu.isspmatrix(vals)
-                else vals.tocsr().astype(cp.float32)
+    def _run_autocorr(data, adj_matrix_cupy, mode, n_perms, multi_gpu):
+        """Run spatial autocorrelation computation."""
+        if mode == "moran":
+            return _morans_I_cupy(
+                data, adj_matrix_cupy, n_permutations=n_perms, multi_gpu=multi_gpu
             )
-        elif is_sparse_input:
-            # Convert sparse input to dense format
-            data = cp.array(vals.toarray(), dtype=cp.float32)
+        elif mode == "geary":
+            return _gearys_C_cupy(
+                data, adj_matrix_cupy, n_permutations=n_perms, multi_gpu=multi_gpu
+            )
         else:
-            # Keep dense input as is
-            data = cp.array(vals, dtype=cp.float32)
-        return data
+            raise ValueError(f"Invalid mode: {mode}")
 
-    data = process_input_data(vals, use_sparse)
-    # Run Spartial Autocorr
+    data = _to_cupy(vals, use_sparse=use_sparse, dtype=compute_dtype)
+
+    # Run full computation
+    score, score_perms = _run_autocorr(data, adj_matrix_cupy, mode, n_perms, multi_gpu)
+
+    # Set mode-specific params
     if mode == "moran":
-        score, score_perms = _morans_I_cupy(
-            data, adj_matrix_cupy, n_permutations=n_perms
-        )
         params["stat"] = "I"
-        params["expected"] = -1.0 / (adata.shape[0] - 1)  # expected score
+        params["expected"] = -1.0 / (adata.shape[0] - 1)
         params["ascending"] = False
         params["mode"] = "moranI"
-    elif mode == "geary":
-        score, score_perms = _gearys_C_cupy(
-            data, adj_matrix_cupy, n_permutations=n_perms
-        )
+    else:  # geary
         params["stat"] = "C"
         params["expected"] = 1.0
         params["ascending"] = True
         params["mode"] = "gearyC"
-    else:
-        raise NotImplementedError(f"Mode `{mode}` is not yet implemented.")
+
     g = sparse.csr_matrix(adj_matrix_cupy.get())
     score = score.get()
     if n_perms is not None:

@@ -56,8 +56,8 @@ def test_wsum_wmean(mat, adjmat):
 @pytest.mark.parametrize(
     "fun,times,seed",
     [
-        ["wmean", 10, 42],
-        ["wsum", 5, 23],
+        ["wmean", 0, 42],
+        ["wsum", 0, 23],
     ],
 )
 def test_func_waggr(
@@ -70,9 +70,100 @@ def test_func_waggr(
     X, obs, var = mat
     X = cp.array(X)
     adjmat = cp.array(adjmat)
-    times = 0
     es, pv = dc._method_waggr._func_waggr(
         mat=X, adj=adjmat, fun=fun, times=times, seed=seed
     )
     assert np.isfinite(es).all()
     assert ((0 <= pv) & (pv <= 1)).all()
+
+
+@pytest.mark.parametrize("fun", ["wmean", "wsum"])
+def test_func_waggr_permutation(mat, adjmat, fun):
+    """Test waggr with permutation testing (times > 1)."""
+    X, obs, var = mat
+    X = cp.array(X)
+    adjmat = cp.array(adjmat)
+    times = 100
+    seed = 42
+    es, pv = dc._method_waggr._func_waggr(
+        mat=X, adj=adjmat, fun=fun, times=times, seed=seed
+    )
+    assert np.isfinite(es).all()
+    assert ((0 <= pv) & (pv <= 1)).all()
+    # With permutation, es becomes NES (normalized enrichment score)
+    # and pv are empirical p-values
+
+
+def test_ridx():
+    """Test _ridx random index generation."""
+    times = 10
+    nvar = 20
+    seed = 42
+    idx = dc._method_waggr._ridx(times=times, nvar=nvar, seed=seed)
+    assert idx.shape == (times, nvar)
+    # Check that each row contains all indices (is a permutation)
+    for i in range(times):
+        assert set(idx[i].get().tolist()) == set(range(nvar))
+
+
+def test_ridx_reproducible():
+    """Test that _ridx is reproducible with same seed."""
+    idx1 = dc._method_waggr._ridx(times=5, nvar=10, seed=42)
+    idx2 = dc._method_waggr._ridx(times=5, nvar=10, seed=42)
+    assert cp.array_equal(idx1, idx2)
+
+
+def test_custom_callable(mat, adjmat):
+    """Test waggr with a custom callable function."""
+
+    def custom_weighted_sum(x, w):
+        return x @ w
+
+    X, obs, var = mat
+    X = cp.array(X, dtype=cp.float32)
+    adjmat = cp.array(adjmat, dtype=cp.float32)
+    es, pv = dc._method_waggr._func_waggr(
+        mat=X, adj=adjmat, fun=custom_weighted_sum, times=0, seed=42
+    )
+    assert np.isfinite(es).all()
+    assert ((0 <= pv) & (pv <= 1)).all()
+
+
+def test_custom_callable_with_permutation(mat, adjmat):
+    """Test waggr with a custom callable and permutation testing."""
+
+    def custom_wmean(x, w):
+        agg = x @ w
+        div = cp.sum(cp.abs(w), axis=0)
+        return agg / div
+
+    X, obs, var = mat
+    X = cp.array(X, dtype=cp.float32)
+    adjmat = cp.array(adjmat, dtype=cp.float32)
+    es, pv = dc._method_waggr._func_waggr(
+        mat=X, adj=adjmat, fun=custom_wmean, times=50, seed=42
+    )
+    assert np.isfinite(es).all()
+    assert ((0 <= pv) & (pv <= 1)).all()
+
+
+def test_perm_function(mat, adjmat):
+    """Test _perm function directly."""
+    X, obs, var = mat
+    X = cp.array(X, dtype=cp.float32)
+    adjmat = cp.array(adjmat, dtype=cp.float32)
+
+    # Compute initial ES
+    es = dc._method_waggr._wmean(X, adjmat)
+
+    # Generate permutation indices
+    times = 50
+    nvar = X.shape[1]
+    idx = dc._method_waggr._ridx(times=times, nvar=nvar, seed=42)
+
+    # Run permutation
+    nes, pv = dc._method_waggr._perm(
+        fun=dc._method_waggr._wmean, es=es, mat=X, adj=adjmat, idx=idx
+    )
+    assert np.isfinite(nes.get()).all()
+    assert ((0 <= pv.get()) & (pv.get() <= 1)).all()

@@ -1,6 +1,7 @@
 # decoupler-GPU: `dcg`
 
-{mod}`decoupler.mt` contains different statistical methods to extract biological activities. {mod}`rapids_singlecell.dcg` accelerates some of these methods.
+{mod}`decoupler.mt` contains different statistical methods to extract biological activities {cite}`Badia2022`.
+{mod}`rapids_singlecell.dcg` accelerates some of these methods.
 
 ```{eval-rst}
 .. module:: rapids_singlecell.dcg

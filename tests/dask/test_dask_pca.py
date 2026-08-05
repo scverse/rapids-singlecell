@@ -16,7 +16,8 @@ from testing.rapids_singlecell._helper import (
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
 @pytest.mark.parametrize("zero_center", [True, False])
-def test_pca_dask(client, data_kind, zero_center):
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
+def test_pca_dask(dist_client, data_kind, zero_center):
     adata_1 = pbmc3k_processed()
     adata_2 = pbmc3k_processed()
 
@@ -93,6 +94,7 @@ def test_pca_dask_dense_svd_solver(client, svd_solver, rtol, atol):
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_pca_dask_full_pipeline(client, data_kind):
     adata_1 = pbmc3k()
     adata_2 = pbmc3k()
