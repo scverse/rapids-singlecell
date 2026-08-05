@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal, assert_never
 
 import cupy as cp
+import cupyx.scipy.sparse as cpsp
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -22,6 +23,21 @@ from ._utils import (
 
 _RANK_SORT_MIN_ELEMENTS = 1_000_000
 _RANK_SORT_MAX_WORKERS = 64
+
+
+def _apply_expm1_preserving_sparsity(X, scale: float):
+    """Apply the inverse log1p transform without densifying sparse arrays."""
+    if isinstance(X, DaskArray):
+        dtype = np.result_type(X.dtype, np.float32)
+        return X.map_blocks(_apply_expm1_preserving_sparsity, scale, dtype=dtype)
+    if sp.issparse(X) or cpsp.issparse(X):
+        result = X.copy()
+        xp = np if sp.issparse(result) else cp
+        result.data = xp.expm1(result.data * scale)
+        return result
+    xp = np if isinstance(X, np.ndarray) else cp
+    return xp.expm1(X * scale)
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -125,6 +141,7 @@ class _RankGenes:
         self._sparse_negative_fallback = False
         self._score_dtype = np.dtype(np.float32)
         self._multi_gpu: bool | list[int] | str | None = None
+        self.mean_in_log_space = True
 
     def _accumulate_planes(
         self,
@@ -173,7 +190,14 @@ class _RankGenes:
 
     def _basic_stats(self) -> None:
         """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
-        sums_all, sq_sums_all, nnz_all = self._accumulate_planes()
+        original_X = self.X
+        if not self.mean_in_log_space:
+            scale = np.log(self._log1p_base) if self._log1p_base is not None else 1.0
+            self.X = _apply_expm1_preserving_sparsity(original_X, scale)
+        try:
+            sums_all, sq_sums_all, nnz_all = self._accumulate_planes()
+        finally:
+            self.X = original_X
 
         # Map category order → selected groups order.
         cat_names = list(self.labels.cat.categories)
@@ -263,6 +287,7 @@ class _RankGenes:
         corr_method: _CorrMethod = "benjamini-hochberg",
         n_genes_user: int | None = None,
         rankby_abs: bool = False,
+        mean_in_log_space: bool = True,
         tie_correct: bool = False,
         use_continuity: bool = False,
         chunk_size: int | None = None,
@@ -273,6 +298,7 @@ class _RankGenes:
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
+        self.mean_in_log_space = mean_in_log_space
         # Devices for the host-streaming t-test / binned shards.
         self._multi_gpu = multi_gpu
         # Exact OVR inserts implicit zeros between negative and positive stored
@@ -315,6 +341,9 @@ class _RankGenes:
                 multi_gpu=multi_gpu,
                 return_u_values=return_u_values,
             )
+            if wilcoxon_result is not None and not mean_in_log_space:
+                self._basic_stats()
+                wilcoxon_result = (*wilcoxon_result[:3], None)
             test_results = []
         elif method == "wilcoxon_binned":
             test_results = self.wilcoxon_binned(
@@ -324,6 +353,8 @@ class _RankGenes:
                 chunk_size=chunk_size,
                 bin_range=bin_range,
             )
+            if not mean_in_log_space:
+                self._basic_stats()
         elif method == "logreg":
             test_results = self.logreg(**kwds)
         else:
@@ -433,8 +464,10 @@ class _RankGenes:
             mean_rest = self.means_rest[group_indices]
         else:
             mean_rest = self.means[self.ireference][None, :]
-        foldchanges = (self.expm1_func(mean_group) + EPS) / (
-            self.expm1_func(mean_rest) + EPS
+        foldchanges = (
+            (self.expm1_func(mean_group) + EPS) / (self.expm1_func(mean_rest) + EPS)
+            if self.mean_in_log_space
+            else (mean_group + EPS) / (mean_rest + EPS)
         )
         logfoldchanges = np.log2(foldchanges)
         arrays["logfoldchanges"] = np.take_along_axis(

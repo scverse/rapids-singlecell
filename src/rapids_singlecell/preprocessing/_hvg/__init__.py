@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 from ._cutoffs import _Cutoffs
@@ -37,7 +38,7 @@ def highly_variable_genes(
     min_disp: float = 0.5,
     max_disp: float = np.inf,
     n_top_genes: int = None,
-    flavor: flavors = "seurat",
+    flavor: flavors | Default = Default(("highly_variable_genes", "flavor")),
     n_bins: int = 20,
     span: float = 0.3,
     check_values: bool = True,
@@ -145,6 +146,8 @@ def highly_variable_genes(
             `highly_variable_intersection` : bool
                 If batch_key is given, this denotes the genes that are highly variable in all batches
     """
+    flavor = resolve_default(flavor)
+
     if batch_key is not None:
         _sanitize_column(adata, batch_key)
 

@@ -15,6 +15,7 @@ from rapids_singlecell._compat import (
     _meta_dense,
     _meta_sparse,
 )
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell.get import _check_mask, _get_obs_rep, _set_obs_rep
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 def scale(
     data: AnnData | ArrayTypesDask,
     *,
-    zero_center: bool = True,
+    zero_center: bool | Default = Default(("scale", "zero_center")),
     max_value: float | None = None,
     copy: bool = False,
     layer: str | None = None,
@@ -80,6 +81,10 @@ def scale(
     depending on `inplace`. If a matrix is passed, the scaled matrix is returned.
 
     """
+    zero_center = resolve_default(zero_center)
+    if zero_center is None:
+        raise TypeError("scale() missing 1 required keyword argument: 'zero_center'")
+
     if not isinstance(data, AnnData):
         if layer is not None or obsm is not None:
             raise ValueError(

@@ -14,6 +14,7 @@ from scanpy.get._aggregated import _combine_categories
 
 from rapids_singlecell._compat import DaskArray, _meta_dense
 from rapids_singlecell._cuda import _aggr_cuda
+from rapids_singlecell._settings import Preset, settings
 from rapids_singlecell.get import _check_mask
 from rapids_singlecell.preprocessing._utils import _check_gpu_X
 
@@ -574,6 +575,14 @@ def aggregate(
 
     Note that this filters out any combination of groups that wasn't present in the original data.
     """
+    if settings.preset is Preset.ScanpyV2Preview and any(
+        value is not None for value in (axis, layer, obsm, varm)
+    ):
+        msg = "`acc` will replace `layer`, `obsm`, and `varm` arguments in Scanpy 2."
+        if axis is not None:
+            msg += " `axis` is no longer necessary because it is inferred from `by`."
+        warnings.warn(msg, FutureWarning, stacklevel=2)
+
     if axis is None:
         axis = 1 if varm else 0
     axis, axis_name = _resolve_axis(axis)

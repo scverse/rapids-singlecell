@@ -7,6 +7,8 @@ from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import linalg
 from scipy.sparse import issparse
 
+from rapids_singlecell._settings import Default, resolve_default
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
@@ -142,6 +144,7 @@ def diffmap(
     n_comps: int = 15,
     *,
     neighbors_key: str | None = None,
+    key_added: str | Default | None = Default(("diffmap", "key_added")),
     sort: Literal["decrease", "increase"] = "decrease",
     density_normalize: bool = True,
 ) -> None:
@@ -168,6 +171,8 @@ def diffmap(
         Leave as is for the same behavior as :func:`scanpy.tl.diffmap`.
     density_normalize
         Leave as is for the same behavior as :func:`scanpy.tl.diffmap`.
+    key_added
+        Control where the embedding and eigenvalues are stored.
 
     Returns
     -------
@@ -186,5 +191,10 @@ def diffmap(
     )
     evals, evecs = _compute_eigen(transitions_sym, n_comps=n_comps, sort=sort)
 
-    adata.uns["diffmap_evals"] = evals.get()
-    adata.obsm["X_diffmap"] = evecs.get()
+    key_added = resolve_default(key_added)
+    if key_added is None:
+        adata.uns["diffmap_evals"] = evals.get()
+        adata.obsm["X_diffmap"] = evecs.get()
+    else:
+        adata.uns[key_added] = {"evals": evals.get()}
+        adata.obsm[key_added] = evecs.get()

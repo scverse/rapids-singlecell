@@ -108,13 +108,17 @@ def _logfoldchanges_from_means(
     mean_group: cp.ndarray,
     mean_reference: cp.ndarray,
 ) -> cp.ndarray:
-    scale = (
-        cp.float64(np.log(rg._log1p_base))
-        if rg._log1p_base is not None
-        else cp.float64(1.0)
-    )
-    group_expr = cp.expm1(mean_group * scale)
-    reference_expr = cp.expm1(mean_reference * scale)
+    if rg.mean_in_log_space:
+        scale = (
+            cp.float64(np.log(rg._log1p_base))
+            if rg._log1p_base is not None
+            else cp.float64(1.0)
+        )
+        group_expr = cp.expm1(mean_group * scale)
+        reference_expr = cp.expm1(mean_reference * scale)
+    else:
+        group_expr = mean_group
+        reference_expr = mean_reference
     return cp.log2((group_expr + EPS) / (reference_expr + EPS))
 
 

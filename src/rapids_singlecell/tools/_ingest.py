@@ -330,9 +330,10 @@ def _resolve_pca_feature_mask(
         mask = "highly_variable"
 
     if isinstance(mask, str):
-        if mask not in adata_ref.var:
-            raise ValueError(f"Did not find `adata_ref.var[{mask!r}]`.")
-        mask = adata_ref.var[mask].to_numpy()
+        mask_key = mask.removeprefix("var.") if mask.startswith("var.") else mask
+        if mask_key not in adata_ref.var:
+            raise ValueError(f"Did not find `adata_ref.var[{mask_key!r}]`.")
+        mask = adata_ref.var[mask_key].to_numpy()
     elif mask is None:
         components_host = (
             cp.asnumpy(components) if isinstance(components, cp.ndarray) else components

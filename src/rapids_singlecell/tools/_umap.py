@@ -14,6 +14,7 @@ from scanpy.tools._utils import get_init_pos_from_paga
 from sklearn.utils import check_random_state
 
 from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
 
 from ._utils import _choose_representation, _validate_init_pos
@@ -37,7 +38,7 @@ def umap(
     random_state: int = 0,
     a: float | None = None,
     b: float | None = None,
-    key_added: str | None = None,
+    key_added: str | Default | None = Default(("umap", "key_added")),
     neighbors_key: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
@@ -127,6 +128,7 @@ def umap(
     """
 
     adata = adata.copy() if copy else adata
+    key_added = resolve_default(key_added)
 
     if neighbors_key is None:
         neighbors_key = "neighbors"

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import cuml.internals.logger as logger
 from cuml.manifold import TSNE
 
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
 
 from ._utils import _choose_representation
@@ -23,7 +24,7 @@ def tsne(
     learning_rate: int = 200,
     method: str = "barnes_hut",
     metric: str = "euclidean",
-    key_added: str | None = None,
+    key_added: str | Default | None = Default(("tsne", "key_added")),
     copy: bool = False,
 ) -> AnnData | None:
     """
@@ -86,6 +87,7 @@ def tsne(
     """
 
     adata = adata.copy() if copy else adata
+    key_added = resolve_default(key_added)
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     logger_level = _get_logger_level(logger)
