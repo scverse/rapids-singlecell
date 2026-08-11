@@ -48,10 +48,117 @@ def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
     return _matrix_to_records(values, arrays["group_names"], np.dtype(object))
 
 
+def _split_obs_indices(
+    labels: pd.Series,
+) -> tuple[list[object], list[NDArray[np.int32]]]:
+    """Partition observations by label while preserving value and row order."""
+    if labels.size > np.iinfo(np.int32).max:
+        msg = "split_by requires adata.n_obs to fit in int32."
+        raise ValueError(msg)
+
+    if isinstance(labels.dtype, pd.CategoricalDtype):
+        codes = labels.cat.codes.to_numpy()
+        categories = labels.cat.categories
+        counts = np.bincount(codes[codes >= 0], minlength=len(categories))
+        observed_codes = np.flatnonzero(counts)
+        values = [categories[code] for code in observed_codes]
+    else:
+        codes, unique_values = pd.factorize(labels, sort=False)
+        counts = np.bincount(codes[codes >= 0], minlength=len(unique_values))
+        observed_codes = np.arange(len(unique_values), dtype=np.intp)
+        values = list(unique_values)
+
+    valid_rows = np.flatnonzero(codes >= 0).astype(np.int32, copy=False)
+    order = np.argsort(codes[codes >= 0], kind="stable")
+    sorted_rows = valid_rows[order]
+    offsets = np.empty(counts.size + 1, dtype=np.intp)
+    offsets[0] = 0
+    np.cumsum(counts, dtype=np.intp, out=offsets[1:])
+    row_indices = [
+        sorted_rows[offsets[code] : offsets[code + 1]] for code in observed_codes
+    ]
+    return values, row_indices
+
+
+def _compute_rank_genes_groups_result(
+    test_obj: _RankGenes,
+    *,
+    groupby: str,
+    reference: str,
+    n_genes: int | None,
+    rankby_abs: bool,
+    method: _Method,
+    corr_method: _CorrMethod,
+    tie_correct: bool,
+    use_continuity: bool,
+    return_u_values: bool,
+    use_raw: bool | None,
+    layer: str | None,
+    chunk_size: int | None,
+    multi_gpu: bool | list[int] | str | None,
+    n_bins: int | None,
+    bin_range: Literal["log1p", "auto"] | None,
+    kwds: dict[str, object],
+) -> dict[str, object]:
+    n_genes_user = n_genes
+    if n_genes_user is None or n_genes_user > test_obj.X.shape[1]:
+        n_genes_user = test_obj.X.shape[1]
+
+    test_obj.compute_statistics(
+        method,
+        corr_method=corr_method,
+        n_genes_user=n_genes_user,
+        rankby_abs=rankby_abs,
+        tie_correct=tie_correct,
+        use_continuity=use_continuity,
+        return_u_values=return_u_values,
+        chunk_size=chunk_size,
+        multi_gpu=multi_gpu,
+        n_bins=n_bins,
+        bin_range=bin_range,
+        **kwds,
+    )
+
+    params = {
+        "groupby": groupby,
+        "reference": reference,
+        "method": method,
+        "use_raw": use_raw,
+        "layer": layer,
+        "corr_method": corr_method,
+    }
+    if method == "wilcoxon":
+        params["tie_correct"] = tie_correct
+        params["return_u_values"] = return_u_values
+
+    arrays = test_obj.stats_arrays or {}
+    result: dict[str, object] = {"params": params}
+    if arrays and len(arrays.get("group_names", ())) > 0:
+        result["names"] = _array_result_to_names(arrays)
+        for col in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+            if col in arrays:
+                values = arrays[col]
+                result[col] = _array_result_to_records(
+                    arrays, col, np.asarray(values).dtype
+                )
+
+    groups_names = [str(name) for name in test_obj.groups_order]
+    if test_obj.pts is not None:
+        result["pts"] = pd.DataFrame(
+            test_obj.pts.T, index=test_obj.var_names, columns=groups_names
+        )
+    if test_obj.pts_rest is not None:
+        result["pts_rest"] = pd.DataFrame(
+            test_obj.pts_rest.T, index=test_obj.var_names, columns=groups_names
+        )
+    return result
+
+
 def rank_genes_groups(
     adata: AnnData,
     groupby: str,
     *,
+    split_by: str | None = None,
     mask_var: NDArray[np.bool_] | str | None = None,
     use_raw: bool | None = None,
     groups: Literal["all"] | Iterable[str] = "all",
@@ -110,6 +217,11 @@ def rank_genes_groups(
         Annotated data matrix.
     groupby
         The key of the observations grouping to consider.
+    split_by
+        Optional key in ``adata.obs``. Runs an independent comparison within
+        each observed value by selectively streaming indexed rows. Currently
+        supported for exact ``'wilcoxon'`` with an explicit reference and host
+        CSR or dense input, without ``mask_var``.
     mask_var
         Select subset of genes to use in statistical tests.
         Can be a boolean array of shape `(n_vars,)` or a key in `adata.var`.
@@ -186,16 +298,17 @@ def rank_genes_groups(
         expression data outside the fixed log1p range.
     skip_empty_groups
         Skip selected groups with fewer than two observations after filtering.
-        This is useful for perturbation workflows where a per-cell-type slice
-        keeps categories that are empty or singleton in that slice.
+        This is useful for perturbation workflows where a per-cell-type split
+        keeps categories that are empty or singleton in that split.
     **kwds
         Additional arguments passed to the method. For `'logreg'`, these are
         passed to :class:`cuml.linear_model.LogisticRegression`.
 
     Returns
     -------
-    Updates `adata` with the following fields. Rank result fields are
-    Scanpy-compatible structured arrays.
+    Without ``split_by``, updates `adata` with the fields below. With
+    ``split_by``, stores each standard result under ``['results'][split_id]``
+    and the corresponding values in ``['split_values']``.
 
     `adata.uns['rank_genes_groups' | key_added]['names']`
         Structured array to be indexed by group id storing the gene
@@ -279,8 +392,83 @@ def rank_genes_groups(
         else:
             mask_var_array = np.asarray(mask_var, dtype=bool)
             if mask_var_array.shape[0] != adata.n_vars:
-                msg = f"mask_var has wrong shape: {mask_var_array.shape[0]} != {adata.n_vars}"
+                msg = (
+                    f"mask_var has wrong shape: {mask_var_array.shape[0]} "
+                    f"!= {adata.n_vars}"
+                )
                 raise ValueError(msg)
+
+    if split_by is not None:
+        if not isinstance(split_by, str):
+            msg = "split_by must be a single adata.obs column name."
+            raise TypeError(msg)
+        if split_by == groupby:
+            msg = "split_by must be different from groupby."
+            raise ValueError(msg)
+        if split_by not in adata.obs:
+            msg = f"Column {split_by!r} not found in adata.obs."
+            raise KeyError(msg)
+
+        split_labels = adata.obs[split_by]
+        split_values, split_indices = _split_obs_indices(split_labels)
+        if not split_values:
+            msg = f"adata.obs[{split_by!r}] has no observed values."
+            raise ValueError(msg)
+
+        split_groups = groups if isinstance(groups, str) else tuple(groups)
+        results: dict[str, dict[str, object]] = {}
+        wilcoxon_host_plan = None
+        for split_index, obs_indices in enumerate(split_indices):
+            split_id = str(split_index)
+            test_obj = _RankGenes(
+                adata,
+                split_groups,
+                groupby,
+                obs_indices=obs_indices,
+                _wilcoxon_host_plan=wilcoxon_host_plan,
+                mask_var=mask_var_array,
+                reference=reference,
+                use_raw=use_raw,
+                layer=layer,
+                comp_pts=pts,
+                skip_empty_groups=skip_empty_groups,
+            )
+            results[split_id] = _compute_rank_genes_groups_result(
+                test_obj,
+                groupby=groupby,
+                reference=reference,
+                n_genes=n_genes,
+                rankby_abs=rankby_abs,
+                method=method,
+                corr_method=corr_method,
+                tie_correct=tie_correct,
+                use_continuity=use_continuity,
+                return_u_values=return_u_values,
+                use_raw=use_raw,
+                layer=layer,
+                chunk_size=chunk_size,
+                multi_gpu=multi_gpu,
+                n_bins=n_bins,
+                bin_range=bin_range,
+                kwds=kwds,
+            )
+            wilcoxon_host_plan = test_obj._wilcoxon_host_plan
+
+        values = pd.Series(split_values, dtype=split_labels.dtype, name=split_by)
+        split_value_frame = values.to_frame()
+        split_value_frame.index = pd.Index(results, name="split_id")
+        first_params = next(iter(results.values()))["params"]
+        if not isinstance(first_params, dict):
+            msg = "Internal rank_genes_groups result has invalid params."
+            raise RuntimeError(msg)
+        params = dict(first_params)
+        params["split_by"] = split_by
+        adata.uns[key_added] = {
+            "params": params,
+            "split_values": split_value_frame,
+            "results": results,
+        }
+        return None
 
     test_obj = _RankGenes(
         adata,
@@ -293,57 +481,25 @@ def rank_genes_groups(
         comp_pts=pts,
         skip_empty_groups=skip_empty_groups,
     )
-
-    n_genes_user = n_genes
-    if n_genes_user is None or n_genes_user > test_obj.X.shape[1]:
-        n_genes_user = test_obj.X.shape[1]
-
-    test_obj.compute_statistics(
-        method,
-        corr_method=corr_method,
-        n_genes_user=n_genes_user,
+    adata.uns[key_added] = _compute_rank_genes_groups_result(
+        test_obj,
+        groupby=groupby,
+        reference=reference,
+        n_genes=n_genes,
         rankby_abs=rankby_abs,
+        method=method,
+        corr_method=corr_method,
         tie_correct=tie_correct,
         use_continuity=use_continuity,
         return_u_values=return_u_values,
+        use_raw=use_raw,
+        layer=layer,
         chunk_size=chunk_size,
         multi_gpu=multi_gpu,
         n_bins=n_bins,
         bin_range=bin_range,
-        **kwds,
+        kwds=kwds,
     )
-
-    params = {
-        "groupby": groupby,
-        "reference": reference,
-        "method": method,
-        "use_raw": use_raw,
-        "layer": layer,
-        "corr_method": corr_method,
-    }
-    if method == "wilcoxon":
-        params["tie_correct"] = tie_correct
-        params["return_u_values"] = return_u_values
-
-    arrays = test_obj.stats_arrays or {}
-    adata.uns[key_added] = {"params": params}
-    if arrays and len(arrays.get("group_names", ())) > 0:
-        adata.uns[key_added]["names"] = _array_result_to_names(arrays)
-        for col in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
-            if col in arrays:
-                values = arrays[col]
-                dtype = values.dtype
-                adata.uns[key_added][col] = _array_result_to_records(arrays, col, dtype)
-
-    groups_names = [str(name) for name in test_obj.groups_order]
-    if test_obj.pts is not None:
-        adata.uns[key_added]["pts"] = pd.DataFrame(
-            test_obj.pts.T, index=test_obj.var_names, columns=groups_names
-        )
-    if test_obj.pts_rest is not None:
-        adata.uns[key_added]["pts_rest"] = pd.DataFrame(
-            test_obj.pts_rest.T, index=test_obj.var_names, columns=groups_names
-        )
 
     return None
 

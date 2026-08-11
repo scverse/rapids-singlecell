@@ -44,6 +44,18 @@ class _OvoHostContext:
     n_test: int
 
 
+@dataclass(frozen=True)
+class _WilcoxonHostCsrPlan:
+    """Reusable full-CSR metadata for indexed-row Wilcoxon runs."""
+
+    matrix: object
+    sparse_source: object
+    device_ids: tuple[int, ...]
+    ranges: tuple[tuple[int, int], ...]
+    row_spans: tuple[tuple[np.ndarray, np.ndarray], ...]
+    sparse_negative_fallback: bool
+
+
 _WilcoxonResult = tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None]
 
 
@@ -99,16 +111,27 @@ def _shared_dense_host_registration(
 def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
     group_sizes = rg.group_sizes
     codes = rg.group_codes
+    source_rows = rg.obs_indices
     n_groups = len(rg.groups_order)
     ireference = int(rg.ireference)
     n_ref = int(group_sizes[ireference])
     test_group_indices = [i for i in range(n_groups) if i != ireference]
 
     if n_groups < OVO_STABLE_GROUPING_MIN_GROUPS:
-        ref_row_ids = np.flatnonzero(codes == ireference).astype(np.int32, copy=False)
+        ref_positions = np.flatnonzero(codes == ireference)
+        ref_row_ids = (
+            ref_positions.astype(np.int32, copy=False)
+            if source_rows is None
+            else source_rows[ref_positions]
+        )
         row_id_parts = [
-            np.flatnonzero(codes == group_index).astype(np.int32, copy=False)
+            (
+                positions.astype(np.int32, copy=False)
+                if source_rows is None
+                else source_rows[positions]
+            )
             for group_index in test_group_indices
+            for positions in (np.flatnonzero(codes == group_index),)
         ]
         all_grp_row_ids = (
             np.concatenate(row_id_parts)
@@ -119,7 +142,12 @@ def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
         # One stable grouping pass replaces a full-cell boolean scan per group.
         # Selected codes are [0, n_groups); the unselected-cell sentinel sorts
         # after them and is excluded by selected_total.
-        grouped_rows = np.argsort(codes, kind="stable").astype(np.int32, copy=False)
+        grouped_positions = np.argsort(codes, kind="stable")
+        grouped_rows = (
+            grouped_positions.astype(np.int32, copy=False)
+            if source_rows is None
+            else source_rows[grouped_positions]
+        )
         group_starts = np.empty(n_groups + 1, dtype=np.intp)
         group_starts[0] = 0
         np.cumsum(group_sizes, dtype=np.intp, out=group_starts[1:])
@@ -437,18 +465,42 @@ def _run_sharded_wilcoxon(
     else:
         device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
         device_ids.sort(key=lambda device_id: device_id != source_device)
-    ranges = _split_gene_ranges(
-        X,
-        n_devices=len(device_ids),
-        dense_fallback=rg._sparse_negative_fallback,
-    )
-    device_ids = device_ids[: len(ranges)]
+    requested_device_ids = tuple(device_ids)
+    host_csr_plan = rg._wilcoxon_host_plan
+    if host_csr_plan is not None:
+        if not isinstance(host_csr_plan, _WilcoxonHostCsrPlan):
+            msg = "Invalid Wilcoxon host plan."
+            raise TypeError(msg)
+        if host_csr_plan.matrix is not X:
+            msg = "Wilcoxon host plan was prepared for a different matrix."
+            raise ValueError(msg)
+        if (
+            host_csr_plan.device_ids
+            != requested_device_ids[: len(host_csr_plan.ranges)]
+        ):
+            msg = "Wilcoxon host plan was prepared for different GPU devices."
+            raise ValueError(msg)
+        if host_csr_plan.sparse_negative_fallback != rg._sparse_negative_fallback:
+            msg = "Wilcoxon host plan has incompatible sparse sign handling."
+            raise ValueError(msg)
+        ranges = list(host_csr_plan.ranges)
+        device_ids = list(host_csr_plan.device_ids)
+    else:
+        ranges = _split_gene_ranges(
+            X,
+            n_devices=len(device_ids),
+            dense_fallback=rg._sparse_negative_fallback,
+        )
+        device_ids = device_ids[: len(ranges)]
     ovo_host_context = (
         _build_ovo_host_context(rg) if rg.ireference is not None else None
     )
     dense_source = _host_dense_matrix(X) if isinstance(X, np.ndarray) else None
     csr_row_spans = [None] * len(ranges)
-    if is_device_input:
+    if host_csr_plan is not None:
+        kernel_inputs = [host_csr_plan.sparse_source] * len(ranges)
+        csr_row_spans = list(host_csr_plan.row_spans)
+    elif is_device_input:
         kernel_inputs = _prepare_device_column_shards(X, ranges, device_ids)
     elif dense_source is not None:
         kernel_inputs = [dense_source] * len(ranges)
@@ -483,6 +535,16 @@ def _run_sharded_wilcoxon(
                     )
                     for shard_index in range(len(ranges))
                 ]
+            if rg.obs_indices is not None:
+                host_csr_plan = _WilcoxonHostCsrPlan(
+                    matrix=X,
+                    sparse_source=sparse_source,
+                    device_ids=tuple(device_ids),
+                    ranges=tuple(ranges),
+                    row_spans=tuple(csr_row_spans),
+                    sparse_negative_fallback=rg._sparse_negative_fallback,
+                )
+                rg._wilcoxon_host_plan = host_csr_plan
         else:
             kernel_inputs = [
                 _host_csc_column_shard(sparse_source, start, stop)

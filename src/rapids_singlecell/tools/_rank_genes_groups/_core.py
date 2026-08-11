@@ -41,6 +41,8 @@ class _RankGenes:
         groups: Iterable[str] | Literal["all"],
         groupby: str,
         *,
+        obs_indices: NDArray[np.int_] | None = None,
+        _wilcoxon_host_plan: object | None = None,
         mask_var: NDArray[np.bool_] | None = None,
         reference: Literal["rest"] | str = "rest",
         use_raw: bool | None = None,
@@ -60,7 +62,26 @@ class _RankGenes:
             if reference != "rest" and reference not in set(selected):
                 selected.append(reference)
 
-        self.labels = pd.Series(adata.obs[groupby]).reset_index(drop=True)
+        labels = pd.Series(adata.obs[groupby])
+        if obs_indices is None:
+            self.obs_indices: NDArray[np.int32] | None = None
+        else:
+            indices = np.asarray(obs_indices)
+            if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+                msg = "obs_indices must be a one-dimensional integer array."
+                raise TypeError(msg)
+            if indices.size and (
+                int(indices.min()) < 0 or int(indices.max()) >= adata.n_obs
+            ):
+                msg = "obs_indices contains an index outside adata.obs."
+                raise IndexError(msg)
+            if adata.n_obs > np.iinfo(np.int32).max:
+                msg = "obs_indices requires adata.n_obs to fit in int32."
+                raise ValueError(msg)
+            self.obs_indices = indices.astype(np.int32, copy=False)
+            labels = labels.iloc[self.obs_indices]
+
+        self.labels = labels.reset_index(drop=True)
         all_categories = self.labels.cat.categories
 
         if reference != "rest" and str(reference) not in {
@@ -96,6 +117,9 @@ class _RankGenes:
             self.X = adata.X
             self.var_names = adata.var_names
 
+        if self.obs_indices is not None and mask_var is not None:
+            msg = "obs_indices does not yet support mask_var without copying X."
+            raise NotImplementedError(msg)
         if mask_var is not None:
             self.X = self.X[:, mask_var]
             self.var_names = self.var_names[mask_var]
@@ -125,6 +149,7 @@ class _RankGenes:
         self._sparse_negative_fallback = False
         self._score_dtype = np.dtype(np.float32)
         self._multi_gpu: bool | list[int] | str | None = None
+        self._wilcoxon_host_plan = _wilcoxon_host_plan
 
     def _accumulate_planes(
         self,
@@ -273,6 +298,17 @@ class _RankGenes:
         **kwds,
     ) -> None:
         """Compute statistics for all groups."""
+        if self.obs_indices is not None:
+            supports_indexed_rows = method == "wilcoxon" and self.ireference is not None
+            supports_host_input = isinstance(self.X, np.ndarray) or (
+                sp.issparse(self.X) and self.X.format == "csr"
+            )
+            if not supports_indexed_rows or not supports_host_input:
+                msg = (
+                    "obs_indices is only supported for exact Wilcoxon with an "
+                    "explicit reference and host dense or CSR input."
+                )
+                raise NotImplementedError(msg)
         # Devices for the host-streaming t-test / binned shards.
         self._multi_gpu = multi_gpu
         # Exact OVR inserts implicit zeros between negative and positive stored
@@ -287,7 +323,16 @@ class _RankGenes:
                 self.ireference is not None and sp.issparse(self.X)
             )
             if needs_signed_fallback:
-                self._sparse_negative_fallback = _sparse_has_negative(self.X)
+                host_plan = self._wilcoxon_host_plan
+                if host_plan is not None:
+                    if getattr(host_plan, "matrix", None) is not self.X:
+                        msg = "Wilcoxon host plan was prepared for a different matrix."
+                        raise ValueError(msg)
+                    self._sparse_negative_fallback = bool(
+                        getattr(host_plan, "sparse_negative_fallback")
+                    )
+                else:
+                    self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
             # Host input streams (no full copy); device / Dask move to the GPU.
             if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
