@@ -1021,3 +1021,148 @@ class TestSVDSolvers:
             Vt_np = Vt.get()
             np.testing.assert_allclose(U_np.T @ U_np, np.eye(k), atol=1e-6)
             np.testing.assert_allclose(Vt_np @ Vt_np.T, np.eye(k), atol=1e-6)
+
+
+# =============================================================================
+# Multi-vector locking restart path
+# =============================================================================
+
+
+def _rotated_block_matrix(m, n, spectrum):
+    """Block-diagonal matrix of 2x2 rotated blocks with an exact prescribed spectrum.
+
+    Block ``b`` is ``U(theta_b) diag(s_2b, s_2b+1) V(phi_b)^T`` with ``U``/``V`` plane
+    rotations, so the singular values are exactly ``spectrum`` and the right singular
+    vectors are exactly the columns of ``V(phi_b)`` -- an analytic reference, no dense
+    solve needed. Kept deliberately simple so the identical construction can be used by
+    the C++ test in RAFT (``LanczosHardening*.MultiLockRestart``).
+    """
+    rows, cols, vals = [], [], []
+    for b in range(n // 2):
+        s0, s1 = spectrum[2 * b], spectrum[2 * b + 1]
+        theta, phi = 0.17 + 0.11 * b, 0.31 + 0.07 * b
+        cu, su = np.cos(theta), np.sin(theta)
+        cv, sv = np.cos(phi), np.sin(phi)
+        for r, c, v in [
+            (2 * b, 2 * b, cu * s0 * cv + su * s1 * sv),
+            (2 * b, 2 * b + 1, cu * s0 * sv - su * s1 * cv),
+            (2 * b + 1, 2 * b, su * s0 * cv - cu * s1 * sv),
+            (2 * b + 1, 2 * b + 1, su * s0 * sv + cu * s1 * cv),
+        ]:
+            rows.append(r)
+            cols.append(c)
+            vals.append(v)
+    return sparse.csr_matrix((vals, (rows, cols)), shape=(m, n))
+
+
+def _rotated_block_reference_V(n, k):
+    """Analytic right singular vectors of :func:`_rotated_block_matrix`, shape (n, k)."""
+    V = np.zeros((n, k))
+    for b in range(n // 2):
+        phi = 0.31 + 0.07 * b
+        cv, sv = np.cos(phi), np.sin(phi)
+        if 2 * b < k:
+            V[2 * b, 2 * b], V[2 * b + 1, 2 * b] = cv, sv
+        if 2 * b + 1 < k:
+            V[2 * b, 2 * b + 1], V[2 * b + 1, 2 * b + 1] = -sv, cv
+    return V
+
+
+def _largest_principal_angle(V_ref, V):
+    """Largest principal angle between two orthonormal column blocks, in radians.
+
+    Used instead of a column-wise comparison because with clustered singular values the
+    individual singular vectors are not unique, but their span is.
+    """
+    k = min(V_ref.shape[1], V.shape[1])
+    s = np.linalg.svd(V_ref[:, :k].T @ V[:, :k], compute_uv=False)
+    return float(np.arccos(np.clip(s.min(), -1.0, 1.0)))
+
+
+@pytest.mark.parametrize(
+    "dtype,tol,sv_rtol,angle_tol,resid_tol,orth_tol",
+    [
+        (np.float64, 1e-10, 1e-12, 1e-6, 1e-9, 1e-8),
+        (np.float32, 1e-5, 1e-4, 1e-2, 1e-4, 1e-3),
+    ],
+    ids=["float64", "float32"],
+)
+def test_lanczos_multilock_restart(
+    dtype, tol, sv_rtol, angle_tol, resid_tol, orth_tol, monkeypatch
+):
+    """Exercise the restart path when more than one Ritz pair is locked per sweep.
+
+    ``lanczos_svd`` builds its restart vector from ``V_full[:, n_locked:]`` *after*
+    ``n_locked`` has already been advanced by the number of newly locked vectors ``d``,
+    so when ``d >= 2`` the read is both reindexed and runs ``d - 1`` columns past the
+    bidiagonalization write frontier (which ``cp.zeros`` makes deterministically zero).
+    This test pins that path so it stays covered.
+
+    The spectrum is a slowly decaying geometric one rather than a plateau-then-gap with a
+    tight cluster: neighbouring wanted values differ by only 3%, which forces the wanted
+    block to be locked in groups over several restarts, without the float32 breakdown
+    that tightly clustered spectra provoke here (measured: with a tight cluster, float32
+    either converges in one sweep, exercising nothing, or restarts and returns a wrong
+    spectrum).
+
+    Mirrors ``LanczosHardening{F,D}.MultiLockRestart`` in RAFT
+    (cpp/tests/sparse/solver/lanczos_svds.cu).
+    """
+    from rapids_singlecell.preprocessing._sparse_pca import _svd_lanczos
+
+    m, n, k = 96, 64, 20
+    ncv = k + 10  # explicit, and well below min(m, n) so restarts are required
+    assert ncv < min(m, n)
+
+    spectrum = 20.0 * 0.97 ** np.arange(n)
+    A_host = _rotated_block_matrix(m, n, spectrum)
+    A_gpu = cusparse.csr_matrix(A_host.astype(dtype))
+
+    # `_lanczos_bidiag` is called once per sweep with the *pre-lock* n_locked, so the
+    # diffs of that sequence are exactly the per-restart d (num_found).
+    n_locked_seq = []
+    original = _svd_lanczos._lanczos_bidiag
+
+    def recording_bidiag(*args, **kwargs):
+        n_locked_seq.append(kwargs["n_locked"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_svd_lanczos, "_lanczos_bidiag", recording_bidiag)
+
+    U, s, Vt = _svd_lanczos.lanczos_svd(
+        A_gpu, k=k, ncv=ncv, tol=tol, max_iter=300, random_state=0
+    )
+
+    # --- guard: the test must actually exercise multi-vector locking ------------
+    d_per_restart = np.diff(np.asarray(n_locked_seq))
+    assert len(n_locked_seq) >= 3, (
+        f"expected at least 2 restarts, saw {len(n_locked_seq)} sweep(s); "
+        "this configuration no longer exercises the restart path"
+    )
+    assert d_per_restart.max() >= 2, (
+        f"expected at least one restart with d >= 2, saw d={d_per_restart.tolist()}; "
+        "this configuration no longer exercises multi-vector locking"
+    )
+
+    U_h = cp.asnumpy(U).astype(np.float64)
+    s_h = cp.asnumpy(s).astype(np.float64)
+    V_h = cp.asnumpy(Vt).astype(np.float64).T
+
+    # --- singular values against the known spectrum -----------------------------
+    np.testing.assert_allclose(s_h, spectrum[:k], rtol=sv_rtol)
+
+    # --- largest principal angle against the analytic reference V block ---------
+    angle = _largest_principal_angle(_rotated_block_reference_V(n, k), V_h)
+    assert angle < angle_tol, f"largest principal angle {angle:.3e} >= {angle_tol:.0e}"
+
+    # --- right residual ||A^T u_i - s_i v_i|| / s_0 ------------------------------
+    # The left residual ||A v_i - s_i u_i|| is identically zero after the refinement
+    # step (U = A V; S = colnorms; U /= S) and carries no information, so it is not
+    # asserted here.
+    A_dense = A_host.toarray()
+    resid = np.linalg.norm(A_dense.T @ U_h - V_h * s_h[None, :], axis=0) / spectrum[0]
+    assert resid.max() < resid_tol, f"max right residual {resid.max():.3e}"
+
+    # --- orthonormality ----------------------------------------------------------
+    np.testing.assert_allclose(U_h.T @ U_h, np.eye(k), atol=orth_tol)
+    np.testing.assert_allclose(V_h.T @ V_h, np.eye(k), atol=orth_tol)
