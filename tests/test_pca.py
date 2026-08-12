@@ -1088,7 +1088,7 @@ def _largest_principal_angle(V_ref, V):
     ids=["float64", "float32"],
 )
 def test_lanczos_multilock_restart(
-    dtype, tol, sv_rtol, angle_tol, resid_tol, orth_tol, monkeypatch
+    dtype, *, tol, sv_rtol, angle_tol, resid_tol, orth_tol, monkeypatch
 ):
     """Exercise the restart path when more than one Ritz pair is locked per sweep.
 
