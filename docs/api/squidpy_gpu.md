@@ -14,4 +14,7 @@
     gr.co_occurrence
     gr.ligrec
     gr.calculate_niche
+    gr.calculate_niche_neighborhood
+    gr.calculate_niche_utag
+    gr.calculate_niche_cellcharter
 ```

@@ -18,13 +18,13 @@ def harmony_integrate(
     *,
     basis: str = "X_pca",
     adjusted_basis: str = "X_pca_harmony",
-    dtype: type = np.float64,
+    dtype: type = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
     max_iter_harmony: int = 10,
-    max_iter_clustering: int = 200,
-    tol_harmony: float = 1e-4,
-    tol_clustering: float = 1e-5,
+    max_iter_clustering: int | None = None,
+    tol_harmony: float | None = None,
+    tol_clustering: float | None = None,
     sigma: float = 0.1,
     theta: float | int | list[float] | np.ndarray | cp.ndarray = 2.0,
     tau: int = 0,
@@ -69,8 +69,11 @@ def harmony_integrate(
     adjusted_basis
         The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
     dtype
-        The data type to use for Harmony computation.
-        If you use 32-bit you may experience numerical instability.
+        The data type to use for Harmony computation. Defaults to 32-bit, which
+        agrees with the 64-bit result to a Pearson correlation of >0.999 per
+        principal component while being substantially faster on GPUs with
+        reduced double-precision throughput. Pass ``numpy.float64`` for the
+        previous behavior.
     flavor
         Which version of the Harmony algorithm to use.
         ``"harmony2"`` (default) enables the stabilized diversity penalty,
@@ -86,12 +89,16 @@ def harmony_integrate(
         (each consisting of a clustering step followed by a correction step).
     max_iter_clustering
         Maximum iterations for the clustering step within each Harmony iteration.
+        If ``None``, uses the value of the reference implementation for the chosen
+        ``flavor``: ``4`` for ``"harmony2"``, ``200`` for ``"harmony1"``.
     tol_harmony
         Convergence tolerance for the Harmony objective function.
         The algorithm stops when the relative change in objective falls below this value.
+        If ``None``, ``1e-2`` for ``"harmony2"`` and ``1e-4`` for ``"harmony1"``.
     tol_clustering
         Convergence tolerance for the clustering step within each
         Harmony iteration.
+        If ``None``, ``1e-3`` for ``"harmony2"`` and ``1e-5`` for ``"harmony1"``.
     sigma
         Width of the soft-clustering kernel.
         Controls the entropy of cluster assignments:
