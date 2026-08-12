@@ -11,7 +11,12 @@ from anndata import read_h5ad
 from cupyx.scipy import sparse as sparse_gpu
 from scipy import sparse
 
-from rapids_singlecell.gr import calculate_niche
+from rapids_singlecell.gr import (
+    calculate_niche,
+    calculate_niche_cellcharter,
+    calculate_niche_neighborhood,
+    calculate_niche_utag,
+)
 from rapids_singlecell.squidpy_gpu._niche import (
     _neighborhood_profile,
     _utag_features,
@@ -143,7 +148,7 @@ def test_copy_returns_new_object(adata):
         groups=GROUPS,
         n_neighbors=10,
         resolutions=0.5,
-        copy=True,
+        inplace=False,
     )
     assert out is not None
     assert "nhood_niche_res=0.5" in out.obs.columns
@@ -290,13 +295,18 @@ def test_cellcharter_basic(adata):
     assert col.nunique() <= 4
 
 
-def test_calculate_niche_exposes_only_gmm_init_extension():
-    params = inspect.signature(calculate_niche).parameters
-    assert "init" not in params
-    assert "kmeans_n_init" not in params
-    assert "gmm_init" in params
-    assert params["gmm_init"].default == "random_from_data"
-    assert params["random_state"].default == 42
+def test_public_api_matches_squidpy_surface():
+    """GMM internals stay private and the seed lives where squidpy puts it."""
+    for func in (calculate_niche, calculate_niche_cellcharter):
+        params = inspect.signature(func).parameters
+        assert not {"init", "kmeans_n_init", "gmm_init"} & set(params)
+        assert params["random_state"].default == 42
+    # leiden flavors take their seed from the rsc defaults, as squidpy takes scanpy's
+    for func in (calculate_niche_neighborhood, calculate_niche_utag):
+        params = inspect.signature(func).parameters
+        assert "random_state" not in params
+        assert params["resolutions"].default is inspect.Parameter.empty
+        assert params["inplace"].default is True
 
 
 def test_cellcharter_distance_zero(adata):
@@ -310,21 +320,6 @@ def test_cellcharter_use_rep(adata):
     rng = np.random.default_rng(0)
     adata.obsm["X_test"] = rng.standard_normal((adata.n_obs, 10)).astype(np.float32)
     calculate_niche(adata, flavor="cellcharter", n_components=4, use_rep="X_test")
-    assert "cellcharter_niche" in adata.obs.columns
-
-
-@pytest.mark.parametrize("gmm_init", ["random_from_data", "kmeans", "sklearn_kmeans"])
-def test_cellcharter_gmm_init_options(adata, gmm_init):
-    rng = np.random.default_rng(0)
-    adata.obsm["X_test"] = rng.standard_normal((adata.n_obs, 10)).astype(np.float32)
-    calculate_niche(
-        adata,
-        flavor="cellcharter",
-        n_components=4,
-        use_rep="X_test",
-        gmm_init=gmm_init,
-        random_state=0,
-    )
     assert "cellcharter_niche" in adata.obs.columns
 
 
@@ -351,11 +346,6 @@ def test_cellcharter_invalid_aggregation(adata):
         calculate_niche(
             adata, flavor="cellcharter", n_components=4, aggregation="bogus"
         )
-
-
-def test_cellcharter_invalid_gmm_init(adata):
-    with pytest.raises(ValueError, match="gmm_init"):
-        calculate_niche(adata, flavor="cellcharter", n_components=4, gmm_init="bogus")
 
 
 def test_cellcharter_bad_n_components(adata):
@@ -393,3 +383,104 @@ def test_cellcharter_handles_zero_columns_after_shell_aggregation(adata):
     calculate_niche(adata, flavor="cellcharter", n_components=4, distance=2)
     assert "cellcharter_niche" in adata.obs.columns
     assert adata.obs["cellcharter_niche"].isna().sum() == 0
+
+
+# -- flavor-specific public functions --
+
+
+FLAVOR_CASES = [
+    pytest.param(
+        "neighborhood",
+        calculate_niche_neighborhood,
+        {"groups": GROUPS, "n_neighbors": 10, "resolutions": [0.1, 0.5]},
+        ["nhood_niche_res=0.1", "nhood_niche_res=0.5"],
+        id="neighborhood",
+    ),
+    pytest.param(
+        "utag",
+        calculate_niche_utag,
+        {"n_neighbors": 10, "resolutions": [0.1, 1.0]},
+        ["utag_niche_res=0.1", "utag_niche_res=1.0"],
+        id="utag",
+    ),
+    pytest.param(
+        "cellcharter",
+        calculate_niche_cellcharter,
+        {"n_components": 4, "aggregation": "variance"},
+        ["cellcharter_niche"],
+        id="cellcharter",
+    ),
+]
+
+
+@pytest.mark.parametrize(("flavor", "func", "kwargs", "cols"), FLAVOR_CASES)
+def test_flavor_function_matches_dispatcher(adata, flavor, func, kwargs, cols):
+    """The per-flavor functions are the implementation; `calculate_niche` only dispatches."""
+    a1, a2 = adata.copy(), adata.copy()
+    func(a1, **kwargs)
+    calculate_niche(a2, flavor=flavor, **kwargs)
+    for col in cols:
+        np.testing.assert_array_equal(
+            a1.obs[col].astype(str).values, a2.obs[col].astype(str).values
+        )
+
+
+def test_calculate_niche_is_deprecated(adata):
+    with pytest.warns(FutureWarning, match="calculate_niche_neighborhood"):
+        calculate_niche(adata, flavor="utag", n_neighbors=10, resolutions=0.5)
+
+
+def test_mask_excludes_cells(adata):
+    mask = pd.Series(np.arange(adata.n_obs) % 3 != 0, index=adata.obs_names)
+    calculate_niche_neighborhood(
+        adata, groups=GROUPS, n_neighbors=10, resolutions=0.5, mask=mask
+    )
+    labels = adata.obs["nhood_niche_res=0.5"].astype(str)
+    assert (labels[~mask.values] == "not_a_niche").all()
+    assert (labels[mask.values] != "not_a_niche").any()
+
+
+@pytest.mark.parametrize(
+    ("func", "kwargs", "col"),
+    [
+        pytest.param(
+            calculate_niche_utag,
+            {"n_neighbors": 10, "resolutions": 1.0},
+            "utag_niche_res=1.0",
+            id="utag",
+        ),
+        pytest.param(
+            calculate_niche_cellcharter,
+            {"n_components": 4},
+            "cellcharter_niche",
+            id="cellcharter",
+        ),
+    ],
+)
+def test_min_niche_size_applies_to_all_flavors(adata, func, kwargs, col):
+    """Squidpy applies `min_niche_size` to every flavor, not just 'neighborhood'."""
+    func(adata, min_niche_size=adata.n_obs + 1, **kwargs)
+    assert (adata.obs[col].astype(str) == "not_a_niche").all()
+
+
+def test_library_key_stratifies(adata):
+    adata.obs["sample"] = pd.Categorical(
+        np.where(np.arange(adata.n_obs) < adata.n_obs // 2, "s1", "s2")
+    )
+    calculate_niche_neighborhood(
+        adata, groups=GROUPS, n_neighbors=10, resolutions=0.5, library_key="sample"
+    )
+    labels = adata.obs["nhood_niche_res=0.5"].astype(str)
+    assert isinstance(adata.obs["nhood_niche_res=0.5"].dtype, pd.CategoricalDtype)
+    assert labels.str.startswith(("lib=s1_", "lib=s2_")).all()
+    # each library gets its own label space
+    assert not set(labels[adata.obs["sample"] == "s1"]) & set(
+        labels[adata.obs["sample"] == "s2"]
+    )
+
+
+def test_library_key_not_in_obs_raises(adata):
+    with pytest.raises(KeyError, match="missing_lib"):
+        calculate_niche_utag(
+            adata, n_neighbors=10, resolutions=0.5, library_key="missing_lib"
+        )
