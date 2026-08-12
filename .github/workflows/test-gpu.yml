@@ -39,7 +39,7 @@ jobs:
           enable-cache: false
       - id: get-envs
         run: |
-          # Stable + dev, all cu13 (stable -> T4, dev -> A10)
+          # Stable + dev, all cu13 (all T4; no other GPU capacity is available)
           STABLE_DEV_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
@@ -51,12 +51,12 @@ jobs:
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
-                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4" else "cirun-aws-gpu-l4" end),
+                runner: "cirun-aws-gpu-t4",
               }
             )')
           echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
 
-          # Prerelease environments (cu13 -> T4; only dev runs on A10)
+          # Prerelease environments (cu13 -> T4)
           PRERELEASE_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(

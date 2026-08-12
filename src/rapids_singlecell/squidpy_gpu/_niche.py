@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Literal
 
@@ -9,6 +8,7 @@ import numpy as np
 import pandas as pd
 from anndata import AnnData
 from cupyx.scipy import sparse as sparse_gpu
+from scverse_misc import Deprecation, deprecated
 
 import rapids_singlecell as rsc
 
@@ -268,6 +268,13 @@ def calculate_niche_cellcharter(
     )
 
 
+@deprecated(
+    Deprecation(
+        "0.17.0",
+        "Use `calculate_niche_neighborhood`, `calculate_niche_utag`, or "
+        "`calculate_niche_cellcharter` instead.",
+    )
+)
 def calculate_niche(
     adata: AnnData,
     *,
@@ -354,13 +361,6 @@ def calculate_niche(
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
     """
-    warnings.warn(
-        "`calculate_niche` is deprecated and will be removed in a future release. "
-        "Use `calculate_niche_neighborhood`, `calculate_niche_utag`, or "
-        "`calculate_niche_cellcharter` instead.",
-        FutureWarning,
-        stacklevel=2,
-    )
     if flavor not in FLAVORS:
         raise ValueError(
             f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'."
