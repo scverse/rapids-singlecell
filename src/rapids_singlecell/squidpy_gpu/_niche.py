@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Literal
 
@@ -365,6 +367,22 @@ def calculate_niche(
         raise ValueError(
             f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'."
         )
+    _check_unnecessary_args(
+        flavor,
+        {
+            "groups": groups,
+            "n_neighbors": n_neighbors,
+            "resolutions": resolutions,
+            "distance": distance,
+            "n_hop_weights": n_hop_weights,
+            "abs_nhood": abs_nhood,
+            "scale": scale,
+            "aggregation": aggregation,
+            "n_components": n_components,
+            "use_rep": use_rep,
+            "random_state": random_state,
+        },
+    )
     if distance is None:
         distance = 3 if flavor == "cellcharter" else 1
     if resolutions is None:
@@ -407,6 +425,46 @@ def calculate_niche(
     )
 
 
+UNUSED_ARGS = {
+    "neighborhood": ("aggregation", "n_components", "use_rep", "random_state"),
+    "utag": (
+        "groups",
+        "distance",
+        "n_hop_weights",
+        "abs_nhood",
+        "scale",
+        "aggregation",
+        "n_components",
+        "use_rep",
+        "random_state",
+    ),
+    "cellcharter": (
+        "groups",
+        "n_neighbors",
+        "resolutions",
+        "n_hop_weights",
+        "abs_nhood",
+        "scale",
+    ),
+}
+
+
+def _check_unnecessary_args(flavor: str, params: dict[str, object]) -> None:
+    """Warn about arguments the chosen flavor ignores, following :mod:`squidpy`."""
+    defaults = inspect.signature(calculate_niche).parameters
+    unnecessary = [
+        name
+        for name in UNUSED_ARGS[flavor]
+        if params[name] is not None and params[name] != defaults[name].default
+    ]
+    if unnecessary:
+        warnings.warn(
+            f"Parameters {', '.join(unnecessary)} are not used for flavor '{flavor}'.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _check_key(adata: AnnData, key: str) -> None:
     if key not in adata.obsp:
         raise KeyError(
@@ -443,6 +501,11 @@ def _calculate_niche_custom(
     for lib_id in adata.obs[library_key].unique():
         lib_mask = (adata.obs[library_key] == lib_id).to_numpy()
         if not lib_mask.any():
+            warnings.warn(
+                f"Library '{lib_id}' contains no cells, skipping.",
+                UserWarning,
+                stacklevel=2,
+            )
             continue
         lib_adata = adata[lib_mask].copy()
         cols = cluster(lib_adata, embed(lib_adata))
