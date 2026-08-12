@@ -56,6 +56,26 @@ def _cgs2_orth(
     return target
 
 
+def _breakdown_threshold(scale: float, dtype) -> float:
+    """
+    Scale- and precision-aware breakdown criterion.
+
+    A candidate Lanczos vector counts as numerically zero when its norm is negligible
+    relative to ``scale``, the largest bidiagonal entry produced so far (a running lower
+    bound on ``||A||_2``). Until scale information exists, only norms below the smallest
+    normal number are treated as zero, so the solver behaves identically for ``A`` and
+    ``c * A`` for any ``c > 0``.
+
+    This replaces a hardcoded ``1e-9``, which was effectively dead in float32: the
+    smallest genuine Lanczos vector norms sit around ``sqrt(eps_f32) ~= 3.4e-4``, five
+    orders of magnitude above the old threshold, so breakdown was never detected and the
+    random-restart path that recovers repeated singular values never engaged. Matches
+    ``breakdown_threshold`` in RAFT's ``lanczos_svds.cuh``.
+    """
+    finfo = cp.finfo(dtype)
+    return max(float(finfo.eps) * float(scale), float(finfo.tiny))
+
+
 def _lanczos_bidiag(
     A,
     *,
@@ -100,14 +120,19 @@ def _lanczos_bidiag(
     alphas = cp.zeros(ncv, dtype=dtype)
     betas = cp.zeros(ncv + 1, dtype=dtype)
 
+    # Running estimate of ||A||_2 used to scale the breakdown checks below.
+    scale = 0.0
+
     # Initialize v_start
     v = v_start
 
     # Ortho against locked V vectors
     v = _cgs2_orth(v, V_full, n_locked, ortho_buf)
 
+    # v_start is unit-scale by construction (a normalized restart vector or a standard
+    # normal vector), so its breakdown check is relative to unit scale.
     beta_val = cp.linalg.norm(v)
-    if beta_val < 1e-9:
+    if float(beta_val) < _breakdown_threshold(1.0, dtype):
         v = rng.standard_normal(n).astype(dtype)
         v = _cgs2_orth(v, V_full, n_locked, ortho_buf)
         beta_val = cp.linalg.norm(v)
@@ -131,13 +156,14 @@ def _lanczos_bidiag(
         u = _cgs2_orth(u, U_full, idx_u, ortho_buf)
 
         alpha_val = cp.linalg.norm(u)
-        if alpha_val < 1e-9:
+        if float(alpha_val) < _breakdown_threshold(scale, dtype):
             u = rng.standard_normal(m).astype(dtype)
             u = _cgs2_orth(u, U_full, idx_u, ortho_buf)
             alpha_val = cp.linalg.norm(u)
             alphas[i] = 0.0
         else:
             alphas[i] = alpha_val
+            scale = max(scale, float(alpha_val))
         u /= alpha_val
         U_full[:, idx_u] = u
 
@@ -150,13 +176,14 @@ def _lanczos_bidiag(
             v = _cgs2_orth(v, V_full, idx_v + 1, ortho_buf)
 
             beta_val = cp.linalg.norm(v)
-            if beta_val < 1e-9:
+            if float(beta_val) < _breakdown_threshold(scale, dtype):
                 v = rng.standard_normal(n).astype(dtype)
                 v = _cgs2_orth(v, V_full, idx_v + 1, ortho_buf)
                 beta_val = cp.linalg.norm(v)
                 betas[i + 1] = 0.0
             else:
                 betas[i + 1] = beta_val
+                scale = max(scale, float(beta_val))
             v /= beta_val
             V_full[:, idx_v + 1] = v
 
