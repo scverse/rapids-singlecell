@@ -297,6 +297,8 @@ def calculate_niche(
     spatial_connectivities_key: str = "spatial_connectivities",
     random_state: int = 42,
     inplace: bool = True,
+    copy: bool | None = None,
+    **kwargs,
 ) -> AnnData | None:
     """\
     Compute spatial niches on the GPU.
@@ -362,11 +364,34 @@ def calculate_niche(
         Random seed for the GMM (``flavor="cellcharter"`` only).
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
+    copy
+        Deprecated alias for ``inplace``; ``copy=True`` is ``inplace=False``.
+    kwargs
+        Accepts the removed ``gmm_init`` argument, which is ignored with a warning.
     """
     if flavor not in FLAVORS:
         raise ValueError(
             f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'."
         )
+    if kwargs.pop("gmm_init", None) is not None:
+        warnings.warn(
+            f"`gmm_init` is no longer supported and is ignored; the CellCharter GMM "
+            f"always uses {GMM_INIT!r}.",
+            FutureWarning,
+            stacklevel=3,
+        )
+    if kwargs:
+        raise TypeError(
+            f"calculate_niche() got an unexpected keyword argument "
+            f"{next(iter(kwargs))!r}."
+        )
+    if copy is not None:
+        warnings.warn(
+            "`copy` is deprecated, use `inplace` instead.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        inplace = not copy
     _check_unnecessary_args(
         flavor,
         {
@@ -426,7 +451,12 @@ def calculate_niche(
 
 
 UNUSED_ARGS = {
-    "neighborhood": ("aggregation", "n_components", "use_rep", "random_state"),
+    "neighborhood": (
+        "aggregation",
+        "n_components",
+        "use_rep",
+        "random_state",
+    ),
     "utag": (
         "groups",
         "distance",
