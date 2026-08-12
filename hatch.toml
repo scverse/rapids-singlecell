@@ -19,12 +19,11 @@ overrides.matrix.deps.python = [
     { if = [ "rapids_prerelease" ], value = "3.14" },
 ]
 
-# Allow prereleases and use RAPIDS nightly index only for prerelease
+# `explicit` honours only the `>=0a0` markers below; `dev` needs none (git refs)
 overrides.matrix.deps.env-vars = [
     { if = [
-        "dev",
         "rapids_prerelease",
-    ], key = "UV_PRERELEASE", value = "allow" },
+    ], key = "UV_PRERELEASE", value = "explicit" },
     { if = [
         "rapids_prerelease",
     ], key = "UV_EXTRA_INDEX_URL", value = "https://pypi.anaconda.org/rapidsai-wheels-nightly/simple" },
@@ -38,21 +37,13 @@ overrides.matrix.deps.extra-dependencies = [
     { if = [
         "dev",
     ], value = "scanpy @ git+https://github.com/scverse/scanpy.git" },
-    # numpy 2.5 removed `np.row_stack`, which numba-cuda still calls -> the whole
-    # suite fails at collection. Now that 2.5 is a stable release it hits every env,
-    # so `stable` needs it too. Remove once numba-cuda guards the call
-    # (NVIDIA/numba-cuda#907, fix in #916).
+    # numpy 2.5 dropped `np.row_stack`, which numba-cuda calls (NVIDIA/numba-cuda#907)
     { if = [
         "stable",
         "dev",
         "rapids_prerelease",
     ], value = "numpy<2.5" },
-    # UV_PRERELEASE=allow otherwise drags in mutually-incompatible numba/numba-cuda
-    # prereleases (numba 0.63.0b1 -> removed np.trapz; numba 0.66.0rc2 + numba-cuda
-    # 0.30.2 -> missing numba.cuda.types.NPDatetime). Pin the known-good stable pair
-    # (numba 0.64.x + numba-cuda 0.28.x) so only RAPIDS uses nightlies.
-    # `stable` needs numba pinned too: uv reaches for 0.63.0b1 there (the only numba
-    # without a `numpy<2.5` cap) and the numpy pin alone doesn't walk it back.
+    # newer numba/numba-cuda pairs are mutually incompatible; pin the known-good one
     { if = [
         "stable",
         "dev",
@@ -63,15 +54,76 @@ overrides.matrix.deps.extra-dependencies = [
         "rapids_prerelease",
     ], value = "numba-cuda<0.30" },
 ]
-overrides.matrix.cuda.extra-dependencies = [
-    { if = [ "13" ], value = "cuml-cu13<26.10" },
-    { if = [ "13" ], value = "cudf-cu13<26.10" },
-    { if = [ "13" ], value = "cugraph-cu13<26.10" },
-    { if = [ "13" ], value = "cuvs-cu13<26.10" },
-    { if = [ "12" ], value = "cuml-cu12<26.10" },
-    { if = [ "12" ], value = "cudf-cu12<26.10" },
-    { if = [ "12" ], value = "cugraph-cu12<26.10" },
-    { if = [ "12" ], value = "cuvs-cu12<26.10" },
+# RAPIDS pins depend on both `deps` and `cuda`, so they key off the env name
+overrides.name."(stable|dev)-12$".extra-dependencies = [
+    "cuml-cu12<26.12",
+    "cudf-cu12<26.12",
+    "cugraph-cu12<26.12",
+    "cuvs-cu12<26.12",
+]
+overrides.name."(stable|dev)-13$".extra-dependencies = [
+    "cuml-cu13<26.12",
+    "cudf-cu13<26.12",
+    "cugraph-cu13<26.12",
+    "cuvs-cu13<26.12",
+]
+
+# uv honours `>=0a0` only on direct requirements, so list the whole RAPIDS closure
+overrides.name."rapids_prerelease-12$".extra-dependencies = [
+    "cudf-cu12>=0a0",
+    "cugraph-cu12>=0a0",
+    "cuml-cu12>=0a0",
+    "cuvs-cu12>=0a0",
+    "dask-cudf-cu12>=0a0",
+    "distributed-ucxx-cu12>=0a0",
+    "libcudf-cu12>=0a0",
+    "libcugraph-cu12>=0a0",
+    "libcuml-cu12>=0a0",
+    "libcuvs-cu12>=0a0",
+    "libkvikio-cu12>=0a0",
+    "libnvforest-cu12>=0a0",
+    "libraft-cu12>=0a0",
+    "librmm-cu12>=0a0",
+    "libucxx-cu12>=0a0",
+    "nvforest-cu12>=0a0",
+    "pylibcudf-cu12>=0a0",
+    "pylibcugraph-cu12>=0a0",
+    "pylibraft-cu12>=0a0",
+    "raft-dask-cu12>=0a0",
+    "rmm-cu12>=0a0",
+    "ucxx-cu12>=0a0",
+    "dask-cuda>=0a0",
+    "rapids-dask-dependency>=0a0",
+    "anndata>=0a0",
+    "scanpy>=0a0",
+]
+overrides.name."rapids_prerelease-13$".extra-dependencies = [
+    "cudf-cu13>=0a0",
+    "cugraph-cu13>=0a0",
+    "cuml-cu13>=0a0",
+    "cuvs-cu13>=0a0",
+    "dask-cudf-cu13>=0a0",
+    "distributed-ucxx-cu13>=0a0",
+    "libcudf-cu13>=0a0",
+    "libcugraph-cu13>=0a0",
+    "libcuml-cu13>=0a0",
+    "libcuvs-cu13>=0a0",
+    "libkvikio-cu13>=0a0",
+    "libnvforest-cu13>=0a0",
+    "libraft-cu13>=0a0",
+    "librmm-cu13>=0a0",
+    "libucxx-cu13>=0a0",
+    "nvforest-cu13>=0a0",
+    "pylibcudf-cu13>=0a0",
+    "pylibcugraph-cu13>=0a0",
+    "pylibraft-cu13>=0a0",
+    "raft-dask-cu13>=0a0",
+    "rmm-cu13>=0a0",
+    "ucxx-cu13>=0a0",
+    "dask-cuda>=0a0",
+    "rapids-dask-dependency>=0a0",
+    "anndata>=0a0",
+    "scanpy>=0a0",
 ]
 
 ## For prerelease we rely on UV_PRERELEASE + nightly index; features select cu12/cu13

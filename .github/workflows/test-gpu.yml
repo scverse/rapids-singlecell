@@ -51,7 +51,7 @@ jobs:
               | {
                 name: .key,
                 python: .value.python | sub("3[.]13"; "3.13.3"),
-                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4" else "cirun-aws-gpu-a10" end),
+                runner: (if (.key | contains("stable")) then "cirun-aws-gpu-t4" else "cirun-aws-gpu-l4" end),
               }
             )')
           echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
