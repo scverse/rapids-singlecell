@@ -262,6 +262,43 @@ def _factorize_joint_codes(
     return joint_cats, joint_codes
 
 
+def _stratified_sample_indices(
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
+    n_target: int,
+    random_state: int,
+) -> cp.ndarray:
+    """
+    Draw a proportional random sample of cells from within every category.
+
+    Each category contributes ``ceil(size * n_target / n_cells)`` cells, so no
+    batch can be under-represented by an unlucky draw. Cells are taken at a
+    random offset and a fixed step within the category, which avoids duplicates
+    without a per-category sort.
+    """
+    offsets = cat_offsets.astype(cp.int64, copy=False)
+    sizes = cp.diff(offsets)
+    n_cells = int(cell_indices.shape[0])
+    frac = n_target / n_cells
+
+    k = cp.ceil(sizes * frac).astype(cp.int64)
+    k = cp.clip(k, 1, None)
+    k = cp.minimum(k, cp.clip(sizes, 1, None))
+    k = cp.where(sizes > 0, k, 0)
+
+    total = int(k.sum())
+    group = cp.repeat(cp.arange(k.shape[0], dtype=cp.int64), k)
+    within = cp.arange(total, dtype=cp.int64) - (cp.cumsum(k) - k)[group]
+    step = cp.maximum(sizes // cp.clip(k, 1, None), 1)
+    slack = cp.clip(sizes - step * (k - 1), 1, None)
+    start = (
+        cp.random.RandomState(random_state).random_sample(k.shape[0]) * slack
+    ).astype(cp.int64)
+
+    pos = offsets[:-1][group] + start[group] + within * step[group]
+    return cell_indices[pos]
+
+
 def _get_theta_array(
     theta: float | int | list[float | int] | np.ndarray | cp.ndarray,
     n_levels: int | np.ndarray,

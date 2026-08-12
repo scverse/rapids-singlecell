@@ -27,6 +27,7 @@ from ._helper import (
     _normalize_cp,
     _outer_cp,
     _scatter_add_cp,
+    _stratified_sample_indices,
     _validate_output_buffer,
 )
 
@@ -36,6 +37,14 @@ if TYPE_CHECKING:
 COLSUM_ALGO = Literal["columns", "atomics", "gemm", "benchmark"]
 _SUPPRESS_PENALTY = 1e30
 _CORRECTION_WORKSPACE_LIMIT_BYTES = 1 << 30
+_KMEANS_MAX_ITER = 25
+_KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
+
+# Each flavor inherits the stopping rules of the implementation it reproduces:
+# harmony2 follows harmonypy 2.0.0 / harmony 2.0.5 (R), harmony1 follows
+# harmony-pytorch. Keys are (max_iter_clustering, tol_clustering, tol_harmony).
+_STOPPING_HARMONY2 = (4, 1e-3, 1e-2)
+_STOPPING_HARMONY1 = (200, 1e-5, 1e-4)
 
 
 def harmonize(
@@ -45,9 +54,9 @@ def harmonize(
     *,
     n_clusters: int | None = None,
     max_iter_harmony: int = 10,
-    max_iter_clustering: int = 200,
-    tol_harmony: float = 1e-4,
-    tol_clustering: float = 1e-5,
+    max_iter_clustering: int | None = None,
+    tol_harmony: float | None = None,
+    tol_clustering: float | None = None,
     ridge_lambda: float = 1.0,
     sigma: float = 0.1,
     block_proportion: float = 0.05,
@@ -84,12 +93,16 @@ def harmonize(
 
     max_iter_clustering
         Within each Harmony iteration, maximum iterations on the clustering step if not converged.
+        If ``None``, use the value of the reference implementation for the chosen
+        algorithm: ``4`` for Harmony2, ``200`` for Harmony1.
 
     tol_harmony
         Tolerance on justifying convergence of Harmony over objective function values.
+        If ``None``, ``1e-2`` for Harmony2 and ``1e-4`` for Harmony1.
 
     tol_clustering
         Tolerance on justifying convergence of the clustering step over objective function values within each Harmony iteration.
+        If ``None``, ``1e-3`` for Harmony2 and ``1e-5`` for Harmony1.
 
     ridge_lambda
         Hyperparameter of ridge regression on the correction step.
@@ -148,6 +161,18 @@ def harmonize(
     The integrated embedding by Harmony, of the same shape as the input embedding.
     """
 
+    stopping = (
+        _STOPPING_HARMONY2
+        if stabilized_penalty and dynamic_lambda
+        else _STOPPING_HARMONY1
+    )
+    if max_iter_clustering is None:
+        max_iter_clustering = stopping[0]
+    if tol_clustering is None:
+        tol_clustering = stopping[1]
+    if tol_harmony is None:
+        tol_harmony = stopping[2]
+
     Z_norm = _normalize_cp(Z)
     n_cells = Z.shape[0]
 
@@ -186,10 +211,13 @@ def harmonize(
         marginal_joint_indices = (flat_joint_indices // n_covariates).astype(
             cp.int32, copy=False
         )
+        # The centroid init stratifies over the joint categories.
+        init_offsets, init_indices = joint_offsets, joint_cell_indices
     else:
         n_joint_categories = 0
         cat_offsets, cell_indices = _create_category_index_mapping(cats, n_batches)
         max_batch_cells = int(batch_counts.max())
+        init_offsets, init_indices = cat_offsets, cell_indices
 
     # Set up parameters
     if max_iter_harmony < 1:
@@ -288,6 +316,8 @@ def harmonize(
         n_batches=n_batches,
         colsum_func=colsum_func_big,
         stabilized_penalty=stabilized_penalty,
+        cat_offsets=init_offsets,
+        cell_indices=init_indices,
     )
 
     block_size = int(n_cells * block_proportion)
@@ -435,6 +465,8 @@ def _initialize_centroids(
     n_batches: int,
     colsum_func: callable = None,
     stabilized_penalty: bool = True,
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list]:
     """
     Initialize cluster centroids and related matrices for Harmony algorithm.
@@ -445,15 +477,27 @@ def _initialize_centroids(
         O: Observed cluster assignment by batch
         objectives_harmony: List to store objective function values
     """
-    # Run k-means to get initial cluster centers
+    # cuML's k-means is not reproducible in float32 -- repeated calls with the
+    # same seed move centroids by ~0.3 in L2 and stop at different iterations.
+    # Seeding only needs K centroids, so fit it in float64 on a bounded sample
+    # drawn proportionally from every batch: reproducible, cheaper than fitting
+    # every cell, and no batch can be missed by an unlucky draw.
+    n_init_cells = min(Z_norm.shape[0], _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
+    Z_init = Z_norm
+    if n_init_cells < Z_norm.shape[0]:
+        Z_init = Z_norm[
+            _stratified_sample_indices(
+                cat_offsets, cell_indices, n_init_cells, random_state
+            )
+        ]
     kmeans = CumlKMeans(
         n_clusters=n_clusters,
         init="k-means||",
         n_init=1,
-        max_iter=25,
+        max_iter=_KMEANS_MAX_ITER,
         random_state=random_state,
     )
-    kmeans.fit(Z_norm)
+    kmeans.fit(cp.ascontiguousarray(Z_init, dtype=cp.float64))
     Y = kmeans.cluster_centers_.astype(Z_norm.dtype)
     Y_norm = _normalize_cp(Y, p=2)
 
