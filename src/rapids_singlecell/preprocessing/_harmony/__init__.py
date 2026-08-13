@@ -211,7 +211,6 @@ def harmonize(
         marginal_joint_indices = (flat_joint_indices // n_covariates).astype(
             cp.int32, copy=False
         )
-        # The centroid init stratifies over the joint categories.
         init_offsets, init_indices = joint_offsets, joint_cell_indices
     else:
         n_joint_categories = 0
@@ -480,16 +479,18 @@ def _initialize_centroids(
     # cuML's k-means is not reproducible in float32 -- repeated calls with the
     # same seed move centroids by ~0.3 in L2 and stop at different iterations.
     # Seeding only needs K centroids, so fit it in float64 on a bounded sample
-    # drawn proportionally from every batch: reproducible, cheaper than fitting
-    # every cell, and no batch can be missed by an unlucky draw.
+    # that contains every observed batch stratum: reproducible and cheaper than
+    # fitting every cell.
     n_init_cells = min(Z_norm.shape[0], _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
     Z_init = Z_norm
     if n_init_cells < Z_norm.shape[0]:
-        Z_init = Z_norm[
-            _stratified_sample_indices(
-                cat_offsets, cell_indices, n_init_cells, random_state
-            )
-        ]
+        sample_indices = _stratified_sample_indices(
+            cat_offsets,
+            cell_indices,
+            n_init_cells,
+            random_state,
+        )
+        Z_init = Z_norm[sample_indices]
     kmeans = CumlKMeans(
         n_clusters=n_clusters,
         init="k-means||",

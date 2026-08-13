@@ -268,35 +268,47 @@ def _stratified_sample_indices(
     n_target: int,
     random_state: int,
 ) -> cp.ndarray:
-    """
-    Draw a proportional random sample of cells from within every category.
+    """Draw exactly ``n_target`` cells while representing every observed stratum."""
 
-    Each category contributes ``ceil(size * n_target / n_cells)`` cells, so no
-    batch can be under-represented by an unlucky draw. Cells are taken at a
-    random offset and a fixed step within the category, which avoids duplicates
-    without a per-category sort.
-    """
-    offsets = cat_offsets.astype(cp.int64, copy=False)
-    sizes = cp.diff(offsets)
-    n_cells = int(cell_indices.shape[0])
-    frac = n_target / n_cells
+    sizes = cp.diff(cat_offsets).astype(np.int64, copy=False)
+    nonempty = cp.flatnonzero(sizes)
+    sizes = cp.asnumpy(sizes)
+    nonempty = cp.asnumpy(nonempty)
+    n_cells = int(cell_indices.size)
+    if not nonempty.size <= n_target <= n_cells:
+        raise ValueError(
+            "n_target must cover every nonempty stratum without exceeding n_cells"
+        )
 
-    k = cp.ceil(sizes * frac).astype(cp.int64)
-    k = cp.clip(k, 1, None)
-    k = cp.minimum(k, cp.clip(sizes, 1, None))
-    k = cp.where(sizes > 0, k, 0)
+    quotas = np.zeros_like(sizes)
+    quotas[nonempty] = 1
+    remaining = n_target - nonempty.size
+    if remaining:
+        capacities = sizes - quotas
+        total_capacity = int(capacities.sum())
+        numerators = capacities * remaining
+        additional, remainders = np.divmod(numerators, total_capacity)
+        quotas += additional
 
-    total = int(k.sum())
-    group = cp.repeat(cp.arange(k.shape[0], dtype=cp.int64), k)
-    within = cp.arange(total, dtype=cp.int64) - (cp.cumsum(k) - k)[group]
-    step = cp.maximum(sizes // cp.clip(k, 1, None), 1)
-    slack = cp.clip(sizes - step * (k - 1), 1, None)
-    start = (
-        cp.random.RandomState(random_state).random_sample(k.shape[0]) * slack
-    ).astype(cp.int64)
+        leftover = n_target - int(quotas.sum())
+        if leftover:
+            eligible = np.flatnonzero(remainders)
+            tie_break = np.random.default_rng(random_state).random(eligible.size)
+            order = np.lexsort((tie_break, -remainders[eligible]))
+            quotas[eligible[order[:leftover]]] += 1
 
-    pos = offsets[:-1][group] + start[group] + within * step[group]
-    return cell_indices[pos]
+    rng = cp.random.RandomState(random_state)
+    parts = []
+    for start, size, quota in zip(offsets[:-1], sizes, quotas, strict=True):
+        start, size, quota = int(start), int(size), int(quota)
+        if quota == 0:
+            continue
+        local = rng.choice(size, quota, replace=False)
+        parts.append(cell_indices[start + local])
+
+    selected = cp.concatenate(parts)
+    order = rng.choice(n_target, n_target, replace=False)
+    return selected[order]
 
 
 def _get_theta_array(
