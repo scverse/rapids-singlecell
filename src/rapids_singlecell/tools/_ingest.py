@@ -146,7 +146,7 @@ def ingest(
     If ``inplace=False``, returns an updated :class:`~anndata.AnnData`.
     Otherwise updates ``adata`` and returns ``None``. Requested labels are
     stored in ``adata.obs`` and embeddings under the PCA and/or UMAP keys
-    selected by :attr:`rapids_singlecell.settings.preset`.
+    selected by ``rapids_singlecell.settings.preset``.
 
     Notes
     -----

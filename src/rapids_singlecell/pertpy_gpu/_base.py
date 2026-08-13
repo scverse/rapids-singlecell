@@ -80,7 +80,7 @@ class PerturbationEfficacyAnalyzer:
             Representation to use for neighbor selection. ``"X"`` or any
             ``.obsm`` key. If ``None``, ``.X`` is used when ``n_vars`` is below
             50, otherwise the PCA key selected by
-            :attr:`rapids_singlecell.settings.preset` (computed if absent).
+            ``rapids_singlecell.settings.preset`` (computed if absent).
         n_dims
             Number of dimensions of the representation to use. ``None`` uses all.
         n_pcs

@@ -353,12 +353,14 @@ def _check_mask(
             else:
                 message = f"Did not find `adata.{dim}[{mask!r}]`."
             raise ValueError(message) from None
+        if isinstance(mask_array, pd.Series):
+            mask_array = mask_array.to_numpy()
     else:
         mask_array = mask
 
     expected = data.shape[0 if dim == "obs" else 1]
     if mask_array.shape != (expected,):
-        raise ValueError(f"The shape of the {description} does not match the data.")
+        raise ValueError(f"The shape of the {description} do not match the data.")
 
     is_bool = pd.api.types.is_bool_dtype(mask_array.dtype)
     if not allow_probabilities and not is_bool:

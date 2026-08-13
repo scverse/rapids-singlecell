@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from scipy import sparse
 
 
-def _check_dtype(dtype: str | np.dtype | cp.dtype) -> str | np.dtype | cp.dtype:
+def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
     if isinstance(dtype, str):
         if dtype not in ["float32", "float64"]:
             raise ValueError("dtype must be one of ['float32', 'float64']")
@@ -146,7 +146,7 @@ def leiden(
     use_weights: bool = True,
     neighbors_key: str | None = None,
     obsp: str | None = None,
-    dtype: str | np.dtype | cp.dtype = np.float32,
+    dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
     copy: bool = False,
 ) -> AnnData | None:
@@ -316,7 +316,7 @@ def louvain(
     use_weights: bool = True,
     neighbors_key: int | None = None,
     obsp: str | None = None,
-    dtype: str | np.dtype | cp.dtype = np.float32,
+    dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
     copy: bool = False,
 ) -> AnnData | None:
