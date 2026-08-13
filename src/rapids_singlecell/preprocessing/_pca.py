@@ -10,7 +10,6 @@ from cupyx.scipy.sparse import issparse as cpissparse
 from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
-from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._keys import _embedding_keys
@@ -27,62 +26,6 @@ if TYPE_CHECKING:
 _empty = Default(repr="adata.var.get('highly_variable')")
 
 
-def _resolve_mask_var(
-    adata: AnnData,
-    mask_var: NDArray[np.bool] | str | Default | None,
-    *,
-    use_highly_variable: bool | None,
-    warn: bool = True,
-) -> tuple[str | None, np.ndarray | None]:
-    """Resolve mask_var and use_highly_variable into a mask parameter and array."""
-    if use_highly_variable is not None:
-        if warn:
-            import warnings
-
-            warnings.warn(
-                "Argument `use_highly_variable` is deprecated, use `mask_var` instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-        if not isinstance(mask_var, Default):
-            raise ValueError(
-                "Cannot specify both `mask_var` and `use_highly_variable`."
-            )
-
-    if use_highly_variable is not None:
-        mask_var = "highly_variable" if use_highly_variable else None
-    elif isinstance(mask_var, Default):
-        if "highly_variable" not in adata.var.columns:
-            return None, None
-        mask_var_param = (
-            "var.highly_variable"
-            if settings.preset is Preset.ScanpyV2Preview
-            else "highly_variable"
-        )
-        return mask_var_param, _check_mask(adata, "highly_variable", "var")
-
-    if mask_var is None:
-        return None, None
-
-    # `_check_mask` validates boolean dtype + shape (and resolves a column name),
-    # matching scanpy. Keep the param as the column name for strings, else None.
-    mask_var_param = mask_var if isinstance(mask_var, str) else None
-    mask_var_lookup = (
-        mask_var.removeprefix("var.")
-        if isinstance(mask_var, str) and mask_var.startswith("var.")
-        else mask_var
-    )
-    return mask_var_param, _check_mask(adata, mask_var_lookup, "var")
-
-
-@deprecated_arg(
-    "use_highly_variable",
-    Deprecation(
-        "0.16.2",
-        "Use `mask_var='highly_variable'` instead of `use_highly_variable=True` "
-        "and `mask_var=None` instead of `use_highly_variable=False`.",
-    ),
-)
 def pca(
     data: AnnData | ArrayTypesDask,
     n_comps: int | None = None,
@@ -92,7 +35,6 @@ def pca(
     svd_solver: str | None = None,
     random_state: int | None = 0,
     mask_var: NDArray[np.bool] | str | Default | None = _empty,
-    use_highly_variable: bool | None = None,
     dtype: str = "float32",
     chunked: bool = False,
     chunk_size: int = None,
@@ -175,11 +117,6 @@ def pca(
         If `np.ndarray`, use the provided mask.
         If `str`, use the mask stored in `adata.var[mask_var]`.
 
-    use_highly_variable
-        Whether to use highly variable genes only, stored in
-        `.var['highly_variable']`.
-        By default uses them if they have been determined beforehand.
-
     dtype
         Numpy data type string to which to convert the result.
 
@@ -240,10 +177,6 @@ def pca(
     if not isinstance(data, AnnData):
         if layer is not None:
             raise ValueError("`layer` can only be used with an AnnData object.")
-        if use_highly_variable is not None:
-            raise ValueError(
-                "`use_highly_variable` can only be used with an AnnData object."
-            )
         X = data
         mask_var = (
             None if isinstance(mask_var, Default) else _check_mask(X, mask_var, "var")
@@ -271,21 +204,26 @@ def pca(
 
     adata = data
     key_added = resolve_default(key_added)
-    if use_highly_variable is True and "highly_variable" not in adata.var.keys():
-        raise ValueError(
-            "Did not find adata.var['highly_variable']. "
-            "Either your data already only consists of highly-variable genes "
-            "or consider running `highly_variable_genes` first."
-        )
     if copy:
         adata = adata.copy()
 
     X = _get_obs_rep(adata, layer=layer)
 
-    mask_var_param, mask_var = _resolve_mask_var(
-        adata, mask_var, use_highly_variable=use_highly_variable, warn=False
+    if isinstance(mask_var, Default):
+        if "highly_variable" not in adata.var.columns:
+            mask_var = None
+        elif settings.preset is Preset.ScanpyV2Preview:
+            mask_var = "var.highly_variable"
+        else:
+            mask_var = "highly_variable"
+
+    # Keep the recorded param as the column name for strings, else None.
+    mask_var_param = mask_var if isinstance(mask_var, str) else None
+    mask_var = _check_mask(
+        adata,
+        mask_var.removeprefix("var.") if isinstance(mask_var, str) else mask_var,
+        "var",
     )
-    del use_highly_variable
     X = X[:, mask_var] if mask_var is not None else X
 
     pca_func, X_pca, n_comps = _pca_compute(

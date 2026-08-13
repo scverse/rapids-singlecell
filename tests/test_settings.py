@@ -300,7 +300,6 @@ def test_scanpy_v2_scale_requires_zero_center():
 
 
 def test_scverse_misc_deprecation_metadata():
-    assert rsc.pp.pca.__scverse_misc_deprecated_arg__[0].arg == "use_highly_variable"
     assert "rank_genes_groups_logreg" in rsc.tl.rank_genes_groups_logreg.__deprecated__
 
 
