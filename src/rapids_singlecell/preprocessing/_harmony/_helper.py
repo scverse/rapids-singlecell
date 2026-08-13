@@ -269,11 +269,9 @@ def _stratified_sample_indices(
     random_state: int,
 ) -> cp.ndarray:
     """Draw exactly ``n_target`` cells while representing every observed stratum."""
-
-    sizes = cp.diff(cat_offsets).astype(np.int64, copy=False)
-    nonempty = cp.flatnonzero(sizes)
-    sizes = cp.asnumpy(sizes)
-    nonempty = cp.asnumpy(nonempty)
+    offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
+    sizes = np.diff(offsets)
+    nonempty = np.flatnonzero(sizes)
     n_cells = int(cell_indices.size)
     if not nonempty.size <= n_target <= n_cells:
         raise ValueError(
