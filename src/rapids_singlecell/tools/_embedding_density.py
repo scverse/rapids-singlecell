@@ -5,12 +5,27 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._keys import _EMBEDDINGS, _existing_preset_keys
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+
+
+def _basis_obsm_key(adata: AnnData, basis: str) -> str | None:
+    """The `.obsm` key holding `basis`, under either preset's naming."""
+    embedding, layout = (
+        ("draw_graph", basis.removeprefix("draw_graph_"))
+        if basis.startswith("draw_graph_")
+        else (basis, "")
+    )
+    if embedding in _EMBEDDINGS:
+        keys = _existing_preset_keys(adata, embedding, layout=layout)
+        if keys is not None:
+            return keys.obsm
+    return next((key for key in (basis, f"X_{basis}") if key in adata.obsm), None)
 
 
 def embedding_density(
@@ -70,11 +85,8 @@ def embedding_density(
     if basis == "fa":
         basis = "draw_graph_fa"
 
-    if basis in adata.obsm:
-        basis_key = basis
-    elif f"X_{basis}" in adata.obsm:
-        basis_key = f"X_{basis}"
-    else:
+    basis_key = _basis_obsm_key(adata, basis)
+    if basis_key is None:
         raise ValueError(
             "Cannot find the embedded representation "
             f"`adata.obsm[{basis!r}]` or `adata.obsm['X_{basis}']`. "

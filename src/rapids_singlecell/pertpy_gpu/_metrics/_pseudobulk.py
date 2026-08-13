@@ -100,7 +100,7 @@ class PseudobulkMetric(BaseMetric):
             return adata.X
         if self.layer_key is not None:
             return adata.layers[self.layer_key]
-        return adata.obsm[self._resolve_obsm_key(adata)]
+        return adata.obsm[self._resolve_embedding_key(adata)]
 
     def _aggregate_means(
         self,

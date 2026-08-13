@@ -68,7 +68,9 @@ def harmony_integrate(
         the desired columns into one categorical column and pass that single key.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
-        The default falls back to ``"pca"`` when ``"X_pca"`` is absent.
+        Either spelling of the PCA key resolves to whichever one the data
+        actually uses, so the default works under any
+        :attr:`rapids_singlecell.settings.preset`.
     adjusted_basis
         The name of the field in ``adata.obsm`` where the adjusted PCA table will be
         stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows

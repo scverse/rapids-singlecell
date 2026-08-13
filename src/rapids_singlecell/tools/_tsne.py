@@ -42,8 +42,9 @@ def tsne(
         use_rep
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
             If None, the representation is chosen automatically: For .n_vars < 50, .X
-            is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-            computed with default parameters or `n_pcs` if present.
+            is used, otherwise the PCA embedding, under whichever key the active
+            :attr:`rapids_singlecell.settings.preset` uses. If no PCA embedding is
+            present, it's computed with default parameters or `n_pcs` if present.
         perplexity
             The perplexity is related to the number of nearest neighbors that is used
             in other manifold learning algorithms. Larger datasets usually require a larger

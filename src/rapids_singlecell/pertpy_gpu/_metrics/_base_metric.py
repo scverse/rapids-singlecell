@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from rapids_singlecell._keys import _existing_preset_keys
+from rapids_singlecell._keys import _preset_obsm_names, _resolve_obsm_key
 from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
@@ -39,8 +39,9 @@ class BaseMetric(ABC):
     layer_key
         Key in adata.layers for cell data. Mutually exclusive with obsm_key.
     obsm_key
-        Key in adata.obsm for embeddings (default: 'X_pca'). ``None`` selects
-        ``'X_pca'`` when present, otherwise ``'pca'``.
+        Key in adata.obsm for embeddings (default: 'X_pca'). Either spelling of
+        the PCA key resolves to whichever one the data actually uses, so the
+        default works under any :attr:`rapids_singlecell.settings.preset`.
 
     Attributes
     ----------
@@ -78,7 +79,7 @@ class BaseMetric(ABC):
         elif self.layer_key is not None:
             data = adata.layers[self.layer_key]
         else:
-            data = adata.obsm[self._resolve_obsm_key(adata)]
+            data = adata.obsm[self._resolve_embedding_key(adata)]
 
         if isinstance(data, (cp.ndarray, np.ndarray)):
             return data
@@ -86,14 +87,15 @@ class BaseMetric(ABC):
             return data
         return np.asarray(data)
 
-    def _resolve_obsm_key(self, adata: AnnData) -> str:
-        """Resolve automatic PCA storage while preserving explicit keys."""
-        if self.obsm_key is not None:
-            return self.obsm_key
-        keys = _existing_preset_keys(adata, "pca")
-        if keys is None:
-            raise KeyError("Neither 'X_pca' nor 'pca' was found in adata.obsm.")
-        return keys.obsm
+    def _resolve_embedding_key(self, adata: AnnData) -> str:
+        """Resolve `obsm_key`, accepting either preset's spelling of the PCA key."""
+        key = _resolve_obsm_key(adata, self.obsm_key)
+        if key in adata.obsm:
+            return key
+        if key is not None and key not in _preset_obsm_names("pca"):
+            return key  # explicit non-PCA key: let the `.obsm` lookup report it
+        names = " nor ".join(repr(name) for name in sorted(_preset_obsm_names("pca")))
+        raise KeyError(f"Neither {names} was found in adata.obsm.")
 
     def _subset_to_groups(
         self,

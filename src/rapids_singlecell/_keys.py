@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, assert_never, cast, overload
+from typing import TYPE_CHECKING, Literal, assert_never, cast, get_args, overload
 
 from ._settings import BasicEmbeddingPreset, Default, Preset, settings
 
@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 __all__ = [
+    "_EMBEDDINGS",
     "_Embedding",
     "_EmbeddingKeys",
     "_PcaKeys",
@@ -23,6 +24,9 @@ __all__ = [
 ]
 
 type _Embedding = Literal["pca", "tsne", "umap", "draw_graph", "diffmap"]
+
+_EMBEDDINGS: tuple[_Embedding, ...] = get_args(_Embedding.__value__)
+"""Every embedding whose keys follow the preset."""
 
 
 @dataclass(frozen=True)

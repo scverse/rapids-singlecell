@@ -3,6 +3,8 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
+from rapids_singlecell._keys import _embedding_keys
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -82,8 +84,9 @@ class Distance:
         Mutually exclusive with ``obsm_key``.
     obsm_key
         Key in adata.obsm for embeddings. Mutually exclusive with ``layer_key``.
-        If neither key is specified, ``"X_pca"`` is preferred and ``"pca"``
-        is used as a fallback.
+        If neither key is specified, the PCA key of the active
+        :attr:`rapids_singlecell.settings.preset` is used. Either spelling
+        resolves to whichever one the data actually uses.
 
     Notes
     -----
@@ -129,21 +132,19 @@ class Distance:
                 "Cannot use 'layer_key' and 'obsm_key' at the same time.\n"
                 "Please provide only one of the two keys."
             )
-        auto_obsm_key = layer_key is None and obsm_key is None
-        if auto_obsm_key:
-            obsm_key = "X_pca"
+        if layer_key is None and obsm_key is None:
+            obsm_key = _embedding_keys("pca").obsm
 
         self.metric = metric
         self.layer_key = layer_key
         self.obsm_key = obsm_key
         self._metric_kwargs = kwargs
         self._metric_impl = None
-        self._auto_obsm_key = auto_obsm_key
         self._initialize_metric()
 
     def _initialize_metric(self):
         """Initialize the metric implementation based on the metric type."""
-        obsm_key = None if self._auto_obsm_key else self.obsm_key
+        obsm_key = self.obsm_key
         if self.metric == "edistance":
             from rapids_singlecell.pertpy_gpu._metrics._edistance import (
                 EDistanceMetric,
