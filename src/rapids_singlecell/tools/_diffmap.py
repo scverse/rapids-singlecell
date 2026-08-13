@@ -7,6 +7,7 @@ from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import linalg
 from scipy.sparse import issparse
 
+from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, resolve_default
 
 if TYPE_CHECKING:
@@ -192,9 +193,7 @@ def diffmap(
     evals, evecs = _compute_eigen(transitions_sym, n_comps=n_comps, sort=sort)
 
     key_added = resolve_default(key_added)
-    if key_added is None:
-        adata.uns["diffmap_evals"] = evals.get()
-        adata.obsm["X_diffmap"] = evecs.get()
-    else:
-        adata.uns[key_added] = {"evals": evals.get()}
-        adata.obsm[key_added] = evecs.get()
+    keys = _embedding_keys("diffmap", key_added)
+    # the scanpy 1 key holds the bare evals, `key_added` holds a dict
+    adata.uns[keys.uns] = evals.get() if key_added is None else {"evals": evals.get()}
+    adata.obsm[keys.obsm] = evecs.get()

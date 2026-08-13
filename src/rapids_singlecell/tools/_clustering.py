@@ -12,6 +12,8 @@ from natsort import natsorted
 from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 
+from rapids_singlecell._keys import _resolve_obsm_key
+
 from ._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -31,12 +33,6 @@ def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
         return dtype
     else:
         raise ValueError("dtype must be one of ['float32', 'float64']")
-
-
-def _resolve_pca_key(adata: AnnData, key: str | None) -> str | None:
-    if key == "X_pca" and key not in adata.obsm and "pca" in adata.obsm:
-        return "pca"
-    return key
 
 
 def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
@@ -510,7 +506,7 @@ def kmeans(
     from cuml.cluster import KMeans
 
     adata = adata.copy() if copy else adata
-    use_rep = _resolve_pca_key(adata, use_rep)
+    use_rep = _resolve_obsm_key(adata, use_rep)
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
 
     kmeans_out = KMeans(

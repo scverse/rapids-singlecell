@@ -13,6 +13,7 @@ from cupyx.scipy import sparse as sparse_gpu
 from scverse_misc import Deprecation, deprecated
 
 import rapids_singlecell as rsc
+from rapids_singlecell._keys import _embedding_keys
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -756,7 +757,7 @@ def _utag_embedding(adata: AnnData, *, key: str) -> cp.ndarray:
         X=_utag_features(adata, key), obs=pd.DataFrame(index=adata.obs_names.copy())
     )
     rsc.pp.pca(inner, key_added=None)
-    return cp.asarray(inner.obsm["X_pca"])
+    return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
 
 
 def _cellcharter_embedding(
@@ -790,7 +791,7 @@ def _cellcharter_embedding(
     inner = AnnData(X=feat, obs=pd.DataFrame(index=adata.obs_names.copy()))
     rsc.get.anndata_to_GPU(inner)
     rsc.pp.pca(inner, key_added=None)
-    return cp.asarray(inner.obsm["X_pca"], dtype=cp.float32)
+    return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm], dtype=cp.float32)
 
 
 def _neighborhood_profile(

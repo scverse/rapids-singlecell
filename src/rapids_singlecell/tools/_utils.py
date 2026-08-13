@@ -5,6 +5,7 @@ import scipy.sparse as cpu_sparse
 from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
 from rapids_singlecell._settings import settings
 
 from . import pca
@@ -29,8 +30,9 @@ def _choose_representation(adata, use_rep=None, n_pcs=None):
         use_rep = "X"
     if use_rep is None:
         if adata.n_vars > settings.N_PCS or adata.X is None:
-            pca_key = next((key for key in ("X_pca", "pca") if key in adata.obsm), None)
-            if pca_key is not None:
+            pca_keys = _existing_preset_keys(adata, "pca")
+            if pca_keys is not None:
+                pca_key = pca_keys.obsm
                 if n_pcs is not None and n_pcs > adata.obsm[pca_key].shape[1]:
                     raise ValueError(
                         f"`{pca_key}` does not have enough PCs. Rerun `rsc.pp.pca` "
@@ -41,8 +43,7 @@ def _choose_representation(adata, use_rep=None, n_pcs=None):
                 n_pcs_pca = n_pcs if n_pcs is not None else settings.N_PCS
 
                 pca(adata, n_comps=n_pcs_pca)
-                pca_key = "X_pca" if settings.preset.pca.key_added is None else "pca"
-                X = adata.obsm[pca_key][:, :n_pcs]
+                X = adata.obsm[_embedding_keys("pca").obsm][:, :n_pcs]
         else:
             X = adata.X
     else:

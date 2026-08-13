@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import cuml.internals.logger as logger
 from cuml.manifold import TSNE
 
+from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
 
@@ -91,8 +92,8 @@ def tsne(
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     logger_level = _get_logger_level(logger)
-    key_uns, key_obsm = ("tsne", "X_tsne") if key_added is None else [key_added] * 2
-    adata.obsm[key_obsm] = TSNE(
+    keys = _embedding_keys("tsne", key_added)
+    adata.obsm[keys.obsm] = TSNE(
         perplexity=perplexity,
         early_exaggeration=early_exaggeration,
         learning_rate=learning_rate,
@@ -100,7 +101,7 @@ def tsne(
         metric=metric,
     ).fit_transform(X)
     logger.set_level(logger_level)
-    adata.uns[key_uns] = {
+    adata.uns[keys.uns] = {
         "params": {
             k: v
             for k, v in {

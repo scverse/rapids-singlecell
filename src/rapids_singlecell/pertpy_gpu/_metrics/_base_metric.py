@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._keys import _existing_preset_keys
 from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
@@ -89,10 +90,10 @@ class BaseMetric(ABC):
         """Resolve automatic PCA storage while preserving explicit keys."""
         if self.obsm_key is not None:
             return self.obsm_key
-        for key in ("X_pca", "pca"):
-            if key in adata.obsm:
-                return key
-        raise KeyError("Neither 'X_pca' nor 'pca' was found in adata.obsm.")
+        keys = _existing_preset_keys(adata, "pca")
+        if keys is None:
+            raise KeyError("Neither 'X_pca' nor 'pca' was found in adata.obsm.")
+        return keys.obsm
 
     def _subset_to_groups(
         self,

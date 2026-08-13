@@ -13,6 +13,7 @@ from scipy.sparse import issparse
 from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, Preset, resolve_default, settings
 from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
@@ -299,11 +300,9 @@ def pca(
         kwargs=kwargs,
     )
 
-    key_obsm, key_varm, key_uns = (
-        ("X_pca", "PCs", "pca") if key_added is None else [key_added] * 3
-    )
-    adata.obsm[key_obsm] = X_pca
-    adata.uns[key_uns] = {
+    keys = _embedding_keys("pca", key_added)
+    adata.obsm[keys.obsm] = X_pca
+    adata.uns[keys.uns] = {
         "params": {
             "zero_center": zero_center,
             "mask_var": mask_var_param,
@@ -313,10 +312,10 @@ def pca(
         "variance_ratio": _as_numpy(pca_func.explained_variance_ratio_),
     }
     if mask_var is not None:
-        adata.varm[key_varm] = np.zeros(shape=(adata.n_vars, n_comps))
-        adata.varm[key_varm][mask_var] = _as_numpy(pca_func.components_.T)
+        adata.varm[keys.varm] = np.zeros(shape=(adata.n_vars, n_comps))
+        adata.varm[keys.varm][mask_var] = _as_numpy(pca_func.components_.T)
     else:
-        adata.varm[key_varm] = _as_numpy(pca_func.components_.T)
+        adata.varm[keys.varm] = _as_numpy(pca_func.components_.T)
 
     if copy:
         return adata

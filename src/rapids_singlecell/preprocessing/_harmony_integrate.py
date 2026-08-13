@@ -6,16 +6,12 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._keys import _harmony_obsm_key, _resolve_obsm_key
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
     from ._harmony import COLSUM_ALGO
-
-
-def _resolve_pca_key(adata: AnnData, key: str) -> str:
-    if key == "X_pca" and key not in adata.obsm and "pca" in adata.obsm:
-        return "pca"
-    return key
 
 
 def harmony_integrate(
@@ -23,7 +19,7 @@ def harmony_integrate(
     key: str | list[str],
     *,
     basis: str = "X_pca",
-    adjusted_basis: str = "X_pca_harmony",
+    adjusted_basis: str | None = None,
     dtype: type = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
@@ -74,7 +70,10 @@ def harmony_integrate(
         The name of the field in ``adata.obsm`` where the PCA table is stored.
         The default falls back to ``"pca"`` when ``"X_pca"`` is absent.
     adjusted_basis
-        The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
+        The name of the field in ``adata.obsm`` where the adjusted PCA table will be
+        stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows
+        the naming of the basis it corrected (``"X_pca"`` gives
+        ``"X_pca_harmony"``, ``"pca"`` gives ``"pca_harmony"``).
     dtype
         The data type to use for Harmony computation. Defaults to 32-bit, which
         agrees with the 64-bit result to a Pearson correlation of >0.999 per
@@ -206,7 +205,9 @@ def harmony_integrate(
                 stacklevel=2,
             )
 
-    basis = _resolve_pca_key(adata, basis)
+    basis = _resolve_obsm_key(adata, basis)
+    if adjusted_basis is None:
+        adjusted_basis = _harmony_obsm_key(basis)
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:

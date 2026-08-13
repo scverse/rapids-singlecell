@@ -8,6 +8,7 @@ import numpy as np
 from scanpy.tools._utils import get_init_pos_from_paga
 
 from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, resolve_default
 
 from ._clustering import _create_graph
@@ -115,10 +116,6 @@ def draw_graph(
     positions = cp.vstack((positions["x"].to_cupy(), positions["y"].to_cupy())).T
     layout = "fa"
     key_added = resolve_default(key_added)
-    key_uns, key_obsm = (
-        ("draw_graph", f"X_draw_graph_{layout}")
-        if key_added is None
-        else [key_added.format(layout=layout)] * 2
-    )
-    adata.uns[key_uns] = {"params": {"layout": layout, "random_state": random_state}}
-    adata.obsm[key_obsm] = positions.get()  # Format output
+    keys = _embedding_keys("draw_graph", key_added, layout=layout)
+    adata.uns[keys.uns] = {"params": {"layout": layout, "random_state": random_state}}
+    adata.obsm[keys.obsm] = positions.get()  # Format output

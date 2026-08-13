@@ -9,6 +9,14 @@ import pandas as pd
 from cupyx.scipy import sparse as cp_sparse
 from scipy import sparse as sc_sparse
 
+from rapids_singlecell._keys import (
+    _embedding_keys,
+    _EmbeddingKeys,
+    _keys_for_obsm,
+    _PcaKeys,
+    _preset_keys,
+    _preset_obsm_names,
+)
 from rapids_singlecell._settings import settings
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep
 from rapids_singlecell.preprocessing._neighbors._helper import (
@@ -34,43 +42,31 @@ _IngestAlgorithm = Literal[
 ]
 
 _MAX_VOTE_COMPARISONS = 16_000_000
-_PCA_REPRESENTATION_KEYS = ("X_pca", "pca")
-_PCA_STORAGE_KEYS = (("X_pca", "PCs", "pca"), ("pca", "pca", "pca"))
-_UMAP_STORAGE_KEYS = (("X_umap", "umap"), ("umap", "umap"))
-
-
-def _embedding_output_key(method: _EmbeddingMethod) -> str:
-    key_added = getattr(settings.preset, method).key_added
-    return f"X_{method}" if key_added is None else key_added
-
-
-def _pca_storage_keys(pca_key: str) -> tuple[str, str, str]:
-    if pca_key == "X_pca":
-        return "X_pca", "PCs", "pca"
-    return pca_key, pca_key, pca_key
 
 
 def _find_reference_pca_storage_keys(
     adata_ref: AnnData, *, pca_key: str | None = None
-) -> tuple[str, str, str] | None:
+) -> _PcaKeys | None:
     candidates = (
-        (_pca_storage_keys(pca_key),) if pca_key is not None else _PCA_STORAGE_KEYS
+        [_keys_for_obsm("pca", pca_key) or _embedding_keys("pca", pca_key)]
+        if pca_key is not None
+        else _preset_keys("pca")
     )
-    for key_obsm, key_varm, key_uns in candidates:
-        if key_obsm not in adata_ref.obsm or key_uns not in adata_ref.uns:
+    for keys in candidates:
+        if keys.obsm not in adata_ref.obsm or keys.uns not in adata_ref.uns:
             continue
-        pca_info = adata_ref.uns[key_uns]
+        pca_info = adata_ref.uns[keys.uns]
         source_obsm = pca_info.get("params", {}).get("obsm")
         if (source_obsm is not None and "components" in pca_info) or (
-            source_obsm is None and key_varm in adata_ref.varm
+            source_obsm is None and keys.varm in adata_ref.varm
         ):
-            return key_obsm, key_varm, key_uns
+            return keys
     return None
 
 
 def _reference_pca_storage_keys(
     adata_ref: AnnData, *, pca_key: str | None = None
-) -> tuple[str, str, str]:
+) -> _PcaKeys:
     storage_keys = _find_reference_pca_storage_keys(adata_ref, pca_key=pca_key)
     if storage_keys is not None:
         return storage_keys
@@ -79,10 +75,10 @@ def _reference_pca_storage_keys(
     )
 
 
-def _reference_umap_storage_keys(adata_ref: AnnData) -> tuple[str, str]:
-    for key_obsm, key_uns in _UMAP_STORAGE_KEYS:
-        if key_obsm in adata_ref.obsm and key_uns in adata_ref.uns:
-            return key_obsm, key_uns
+def _reference_umap_storage_keys(adata_ref: AnnData) -> _EmbeddingKeys:
+    for keys in _preset_keys("umap"):
+        if keys.obsm in adata_ref.obsm and keys.uns in adata_ref.uns:
+            return keys
     raise ValueError(
         "`adata_ref` is missing UMAP results. Run `rsc.tl.umap(adata_ref)` first."
     )
@@ -183,18 +179,18 @@ def ingest(
             "neighbor parameters."
         )
 
-    pca_output_key = _embedding_output_key("pca")
-    umap_output_key = _embedding_output_key("umap")
+    pca_output_key = _embedding_keys("pca").obsm
+    umap_output_key = _embedding_keys("umap").obsm
     rep_key, n_rep_dims = _resolve_representation(adata_ref, neighbor_params)
     need_representation = "umap" in embedding_methods or bool(obs_keys)
     need_pca = "pca" in embedding_methods or (
-        need_representation and rep_key in _PCA_REPRESENTATION_KEYS
+        need_representation and rep_key in _preset_obsm_names("pca")
     )
     query_pca = None
     if need_pca:
         pca_storage_keys = _reference_pca_storage_keys(
             adata_ref,
-            pca_key=rep_key if rep_key in _PCA_REPRESENTATION_KEYS else None,
+            pca_key=rep_key if rep_key in _preset_obsm_names("pca") else None,
         )
         query_pca = _project_query_pca(adata, adata_ref, storage_keys=pca_storage_keys)
 
@@ -311,7 +307,11 @@ def _resolve_representation(
     if n_pcs == 0 or (adata_ref.n_vars <= settings.N_PCS and adata_ref.X is not None):
         return "X", None
     pca_storage_keys = _find_reference_pca_storage_keys(adata_ref)
-    pca_key = "X_pca" if pca_storage_keys is None else pca_storage_keys[0]
+    pca_key = (
+        _embedding_keys("pca", None).obsm
+        if pca_storage_keys is None
+        else pca_storage_keys.obsm
+    )
     if n_pcs is not None:
         return pca_key, int(n_pcs)
     return pca_key, None
@@ -321,11 +321,9 @@ def _project_query_pca(
     adata: AnnData,
     adata_ref: AnnData,
     *,
-    storage_keys: tuple[str, str, str],
+    storage_keys: _PcaKeys,
 ) -> cp.ndarray:
-    key_obsm, key_varm, key_uns = storage_keys
-
-    pca_info = adata_ref.uns[key_uns]
+    pca_info = adata_ref.uns[storage_keys.uns]
     pca_params = pca_info.get("params", {})
     source_obsm = pca_params.get("obsm")
 
@@ -341,12 +339,12 @@ def _project_query_pca(
         X_query = adata.obsm[source_obsm]
         components = pca_info["components"]
     else:
-        if key_varm not in adata_ref.varm:
-            raise ValueError(f"`adata_ref.varm[{key_varm!r}]` is missing.")
+        if storage_keys.varm not in adata_ref.varm:
+            raise ValueError(f"`adata_ref.varm[{storage_keys.varm!r}]` is missing.")
         layer = pca_params.get("layer")
         X_ref = _get_obs_rep(adata_ref, layer=layer)
         X_query = _get_obs_rep(adata, layer=layer)
-        components = adata_ref.varm[key_varm]
+        components = adata_ref.varm[storage_keys.varm]
 
     if X_ref.shape[1] != X_query.shape[1]:
         raise ValueError(
@@ -368,7 +366,7 @@ def _project_query_pca(
     compute_dtype = (
         cp.float64 if np.dtype(components.dtype).itemsize > 4 else cp.float32
     )
-    output_source = adata_ref.obsm.get(key_obsm, components)
+    output_source = adata_ref.obsm.get(storage_keys.obsm, components)
     output_dtype = (
         cp.float64 if np.dtype(output_source.dtype).itemsize > 4 else cp.float32
     )
@@ -435,7 +433,7 @@ def _get_representations(
     if rep_key == "X":
         ref_rep = adata_ref.X
         query_rep = adata.X
-    elif rep_key in _PCA_REPRESENTATION_KEYS:
+    elif rep_key in _preset_obsm_names("pca"):
         if rep_key not in adata_ref.obsm or query_pca is None:
             raise ValueError("Reference neighbor metadata requires PCA results.")
         ref_rep = adata_ref.obsm[rep_key]
@@ -554,10 +552,11 @@ def _map_umap(
     ref_rep,
     query_rep,
     neighbor_params: Mapping[str, Any],
-    storage_keys: tuple[str, str],
+    storage_keys: _EmbeddingKeys,
 ) -> cp.ndarray:
-    key_obsm, key_uns = storage_keys
-    ref_embedding = cp.asarray(adata_ref.obsm[key_obsm], dtype=cp.float32, order="C")
+    ref_embedding = cp.asarray(
+        adata_ref.obsm[storage_keys.obsm], dtype=cp.float32, order="C"
+    )
     if ref_rep.shape[0] == 0:
         raise ValueError("`adata_ref` must contain at least one observation.")
     if ref_embedding.ndim != 2 or ref_embedding.shape[0] != ref_rep.shape[0]:
@@ -565,7 +564,7 @@ def _map_umap(
     if query_rep.shape[0] == 0:
         return cp.empty((0, ref_embedding.shape[1]), dtype=cp.float32)
 
-    umap_params = adata_ref.uns[key_uns].get("params", {})
+    umap_params = adata_ref.uns[storage_keys.uns].get("params", {})
     if "a" not in umap_params or "b" not in umap_params:
         raise ValueError("Reference UMAP metadata does not contain `a` and `b`.")
 
