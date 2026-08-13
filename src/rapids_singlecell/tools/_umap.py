@@ -15,6 +15,13 @@ from sklearn.utils import check_random_state
 
 from rapids_singlecell._compat import _random_state_kwargs
 from rapids_singlecell._utils import _get_logger_level
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _legacy_random_state,
+    _LegacyRng,
+)
 
 from ._utils import _choose_representation, _validate_init_pos
 
@@ -24,6 +31,7 @@ if TYPE_CHECKING:
 _InitPos = Literal["auto", "spectral", "random", "paga"]
 
 
+@_accepts_legacy_random_state(0)
 def umap(
     adata: AnnData,
     *,
@@ -34,7 +42,7 @@ def umap(
     alpha: float = 1.0,
     negative_sample_rate: int = 5,
     init_pos: _InitPos | np.ndarray | cp.ndarray | str | None = "auto",
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     a: float | None = None,
     b: float | None = None,
     key_added: str | None = None,
@@ -90,8 +98,10 @@ def umap(
         .. note::
             If your embedding looks odd it's recommended setting `init_pos` to 'random'.
 
-    random_state
-        `int`, `random_state` is the seed used by the random number generator
+    rng
+        Random seed or :class:`~numpy.random.Generator` used by the random
+        number generator.
+        The superseded `random_state` argument is still accepted.
     a
         More specific parameters controlling the embedding. If `None` these
         values are set automatically as determined by `min_dist` and
@@ -126,6 +136,8 @@ def umap(
             UMAP parameters `a`, `b`, and `random_state` (if specified).
     """
 
+    random_state = _legacy_random_state(rng)
+
     adata = adata.copy() if copy else adata
 
     if neighbors_key is None:
@@ -144,7 +156,11 @@ def umap(
     stored_params = {
         "a": a,
         "b": b,
-        **({"random_state": random_state} if random_state != 0 else {}),
+        **(
+            {"random_state": rng.arg}
+            if isinstance(rng, _LegacyRng) and rng.arg != 0
+            else {}
+        ),
     }
 
     neigh_params = neighbors["params"]

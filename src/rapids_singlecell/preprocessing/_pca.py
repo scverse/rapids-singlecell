@@ -12,6 +12,12 @@ from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _seed_from_rng,
+)
 from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
 from ._utils import _check_gpu_X
@@ -62,6 +68,7 @@ def _resolve_mask_var(
     return mask_var_param, _check_mask(adata, mask_var, "var")
 
 
+@_accepts_legacy_random_state(0)
 def pca(
     data: AnnData | ArrayTypesDask,
     n_comps: int | None = None,
@@ -69,7 +76,7 @@ def pca(
     layer: str = None,
     zero_center: bool = True,
     svd_solver: str | None = None,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     mask_var: NDArray[np.bool] | str | None = _empty,
     use_highly_variable: bool | None = None,
     dtype: str = "float32",
@@ -145,8 +152,9 @@ def pca(
         `'jacobi'`
             cuML: Jacobi iterative solver. Faster but less accurate. For dense arrays only.
 
-    random_state
-        Random state for initialization.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for initialization.
+        The superseded `random_state` argument is still accepted.
 
     mask_var
         Mask to use for the PCA computation.
@@ -216,6 +224,8 @@ def pca(
                 Explained variance, equivalent to the eigenvalues of the \
                 covariance matrix.
     """
+    random_state = _seed_from_rng(rng)
+
     if not isinstance(data, AnnData):
         if layer is not None:
             raise ValueError("`layer` can only be used with an AnnData object.")

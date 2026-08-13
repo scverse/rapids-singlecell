@@ -12,6 +12,13 @@ from natsort import natsorted
 from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _seed_from_rng,
+)
+
 from ._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -127,11 +134,12 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
     return g
 
 
+@_accepts_legacy_random_state(0)
 def leiden(
     adata: AnnData,
     resolution: float | list[float] = 1.0,
     *,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     theta: float = 1.0,
     restrict_to: tuple[str, Sequence[str]] | None = None,
     key_added: str = "leiden",
@@ -160,8 +168,10 @@ def leiden(
             (called gamma in the modularity formula). Higher values lead to
             more clusters. If a list of values is provided, the Leiden algorithm will be run for each value in the list.
 
-        random_state
-            Change the initialization of the optimization. Defaults to 0.
+        rng
+            Random seed or :class:`~numpy.random.Generator` changing the
+            initialization of the optimization. Defaults to 0.
+            The superseded `random_state` argument is still accepted.
 
         theta
             Called theta in the Leiden algorithm, this is used to scale modularity
@@ -210,6 +220,8 @@ def leiden(
             Whether to copy `adata` or modify it in place.
     """
     # Adjacency graph
+
+    random_state = _seed_from_rng(rng)
 
     adata = adata.copy() if copy else adata
 
@@ -462,6 +474,7 @@ def louvain(
     return adata if copy else None
 
 
+@_accepts_legacy_random_state(42)
 def kmeans(
     adata: AnnData,
     n_clusters: int = 8,
@@ -469,7 +482,7 @@ def kmeans(
     *,
     use_rep: str = "X_pca",
     n_init: int = 1,
-    random_state: float = 42,
+    rng: SeedLike | RNGLike | None = None,
     key_added: str = "kmeans",
     copy: bool = False,
     **kwargs,
@@ -492,9 +505,10 @@ def kmeans(
             computed with default parameters or `n_pcs` if present.
         n_init
             Number of initializations to run the KMeans algorithm
-        random_state
-            if you want results to be the same when you restart Python, select a
-            state. Default is 42.
+        rng
+            Random seed or :class:`~numpy.random.Generator`; fix it if you want
+            results to be the same when you restart Python. Default is 42.
+            The superseded `random_state` argument is still accepted.
         key_added
             `adata.obs` key under which to add the cluster labels.
         copy
@@ -503,6 +517,8 @@ def kmeans(
             Additional keyword arguments for KMeans.
 
     """
+    random_state = _seed_from_rng(rng)
+
     from cuml.cluster import KMeans
 
     adata = adata.copy() if copy else adata

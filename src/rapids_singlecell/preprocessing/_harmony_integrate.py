@@ -6,12 +6,20 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _seed_from_rng,
+)
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
     from ._harmony import COLSUM_ALGO
 
 
+@_accepts_legacy_random_state(0)
 def harmony_integrate(
     adata: AnnData,
     key: str | list[str],
@@ -34,7 +42,7 @@ def harmony_integrate(
     correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     block_proportion: float = 0.05,
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     verbose: bool = False,
 ) -> None:
     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
@@ -158,8 +166,9 @@ def harmony_integrate(
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
-    random_state
-        Random seed for reproducibility.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
     verbose
         Whether to print benchmarking and convergence information.
 
@@ -169,6 +178,8 @@ def harmony_integrate(
     containing principal components adjusted by Harmony
     such that different experiments are integrated.
     """
+    random_state = _seed_from_rng(rng)
+
     from ._harmony import harmonize
 
     # Resolve flavor into internal flags

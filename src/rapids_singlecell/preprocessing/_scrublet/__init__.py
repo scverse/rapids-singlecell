@@ -10,6 +10,12 @@ from cupyx.scipy import sparse
 from scanpy import logging as logg
 
 from rapids_singlecell import preprocessing as pp
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _seed_from_rng,
+)
 from rapids_singlecell.get import _get_obs_rep
 
 from . import pipeline
@@ -20,6 +26,7 @@ if TYPE_CHECKING:
     from rapids_singlecell.preprocessing._neighbors import _Metrics
 
 
+@_accepts_legacy_random_state(0)
 def scrublet(
     adata: AnnData,
     adata_sim: AnnData | None = None,
@@ -40,7 +47,7 @@ def scrublet(
     threshold: float | None = None,
     verbose: bool = True,
     copy: bool = False,
-    random_state: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
 ) -> AnnData | None:
     """\
     Predict doublets using Scrublet :cite:p:`Wolock2019`.
@@ -124,8 +131,10 @@ def scrublet(
     copy
         If :data:`True`, return a copy of the input ``adata`` with Scrublet results
         added. Otherwise, Scrublet results are added in place.
-    random_state
-        Initial state for doublet simulation and nearest neighbors.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for doublet simulation
+        and nearest neighbors.
+        The superseded `random_state` argument is still accepted.
 
     Returns
     -------
@@ -154,6 +163,8 @@ def scrublet(
     :func:`~scanpy.pl.scrublet_score_distribution`: Plot histogram of doublet
         scores for observed transcriptomes and simulated doublets.
     """
+
+    random_state = _seed_from_rng(rng)
 
     if copy:
         adata = adata.copy()
@@ -192,7 +203,7 @@ def scrublet(
                 layer="raw",
                 sim_doublet_ratio=sim_doublet_ratio,
                 synthetic_doublet_umi_subsampling=synthetic_doublet_umi_subsampling,
-                random_seed=random_state,
+                random_state=random_state,
             )
 
             if log_transform:
@@ -468,13 +479,14 @@ def _scrublet_call_doublets(
     return adata_obs
 
 
+@_accepts_legacy_random_state(0)
 def scrublet_simulate_doublets(
     adata: AnnData,
     *,
     layer: str | None = None,
     sim_doublet_ratio: float = 2.0,
     synthetic_doublet_umi_subsampling: float = 1.0,
-    random_seed: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
 ) -> AnnData:
     """
     Simulate doublets by adding the counts of random observed transcriptome pairs.
@@ -517,8 +529,10 @@ def scrublet_simulate_doublets(
         scores for observed transcriptomes and simulated doublets.
     """
 
+    random_state = _seed_from_rng(rng)
+
     X = _get_obs_rep(adata, layer=layer)
-    scrub = Scrublet(X, random_state=random_seed)
+    scrub = Scrublet(X, random_state=random_state)
 
     scrub.simulate_doublets(
         sim_doublet_ratio=sim_doublet_ratio,

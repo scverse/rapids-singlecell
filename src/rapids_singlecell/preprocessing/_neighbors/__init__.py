@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _seed_from_rng,
+)
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
@@ -32,13 +38,14 @@ _Algorithms_bbknn = Literal[
 ]
 
 
+@_accepts_legacy_random_state(0)
 def neighbors(
     adata: AnnData,
     n_neighbors: int = 15,
     n_pcs: int | None = None,
     *,
     use_rep: str | None = None,
-    random_state: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
     algorithm: _Algorithms = "brute",
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
@@ -70,8 +77,9 @@ def neighbors(
         If None, the representation is chosen automatically: For .n_vars < 50, .X
         is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
         computed with default parameters or `n_pcs` if present.
-    random_state
-        A numpy random seed.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
     algorithm
         The query algorithm to use. Valid options are:
             `'brute'`
@@ -174,6 +182,8 @@ def neighbors(
             neighbors.
 
     """
+    random_state = _seed_from_rng(rng)
+
     adata = adata.copy() if copy else adata
 
     if adata.is_view:
@@ -246,6 +256,7 @@ def neighbors(
     return adata if copy else None
 
 
+@_accepts_legacy_random_state(0)
 def bbknn(
     adata: AnnData,
     neighbors_within_batch: int = 3,
@@ -253,7 +264,7 @@ def bbknn(
     *,
     batch_key: str | None = None,
     use_rep: str | None = None,
-    random_state: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
     algorithm: _Algorithms_bbknn = "brute",
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
@@ -284,8 +295,9 @@ def bbknn(
         If `None`, the representation is chosen automatically: For `.n_vars < 50`, `.X`
         is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
         computed with default parameters or `n_pcs` if present.
-    random_state
-        A numpy random seed.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
     algorithm
         The query algorithm to use. Valid options are:
 
@@ -358,6 +370,8 @@ def bbknn(
     See `key_added` parameter description for the storage path of
     connectivities and distances.
     """
+
+    random_state = _seed_from_rng(rng)
 
     if batch_key is None:
         raise ValueError("Please provide a batch key to perform batch-balanced KNN.")

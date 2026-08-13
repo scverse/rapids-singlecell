@@ -8,6 +8,12 @@ import numpy as np
 from scanpy.tools._utils import get_init_pos_from_paga
 
 from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _seed_from_rng,
+)
 
 from ._clustering import _create_graph
 from ._utils import _validate_init_pos
@@ -16,12 +22,13 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 
+@_accepts_legacy_random_state(0)
 def draw_graph(
     adata: AnnData,
     *,
     init_pos: str | bool | None = None,
     max_iter: int = 500,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
 ) -> None:
     """
     Force-directed graph drawing :cite:p:`Fruchterman1991,Jacomy2014`.
@@ -45,10 +52,12 @@ def draw_graph(
             No error occurs when the algorithm terminates in this manner.
             Good short-term quality can be achieved with 50-100 iterations.
             Above 1000 iterations is discouraged.
-        random_state
-            Random state to use when initializing layout and generating
-            samples. Defaults to 0. If `None` is passed, a hash of process id,
-            time, and hostname is used by `cugraph`.
+        rng
+            Random seed or :class:`~numpy.random.Generator` used when
+            initializing layout and generating samples. Defaults to 0. If
+            `None` is passed, a hash of process id, time, and hostname is
+            used by `cugraph`.
+            The superseded `random_state` argument is still accepted.
 
     Returns
     -------
@@ -57,6 +66,8 @@ def draw_graph(
             X_draw_graph_layout_fa : `adata.obsm`
                 Coordinates of graph layout.
     """
+    random_state = _seed_from_rng(rng)
+
     from cugraph.layout import force_atlas2
 
     # Adjacency graph
