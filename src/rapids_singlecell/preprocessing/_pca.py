@@ -48,8 +48,8 @@ def _resolve_mask_var(
                 "Cannot specify both `mask_var` and `use_highly_variable`."
             )
 
-    if use_highly_variable:
-        mask_var = "highly_variable"
+    if use_highly_variable is not None:
+        mask_var = "highly_variable" if use_highly_variable else None
     elif isinstance(mask_var, Default):
         if "highly_variable" not in adata.var.columns:
             return None, None

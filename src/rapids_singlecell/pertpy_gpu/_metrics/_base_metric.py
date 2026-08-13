@@ -38,7 +38,8 @@ class BaseMetric(ABC):
     layer_key
         Key in adata.layers for cell data. Mutually exclusive with obsm_key.
     obsm_key
-        Key in adata.obsm for embeddings (default: 'X_pca')
+        Key in adata.obsm for embeddings (default: 'X_pca'). ``None`` selects
+        ``'X_pca'`` when present, otherwise ``'pca'``.
 
     Attributes
     ----------
@@ -76,13 +77,22 @@ class BaseMetric(ABC):
         elif self.layer_key is not None:
             data = adata.layers[self.layer_key]
         else:
-            data = adata.obsm[self.obsm_key]
+            data = adata.obsm[self._resolve_obsm_key(adata)]
 
         if isinstance(data, (cp.ndarray, np.ndarray)):
             return data
         if _is_sparse(data):
             return data
         return np.asarray(data)
+
+    def _resolve_obsm_key(self, adata: AnnData) -> str:
+        """Resolve automatic PCA storage while preserving explicit keys."""
+        if self.obsm_key is not None:
+            return self.obsm_key
+        for key in ("X_pca", "pca"):
+            if key in adata.obsm:
+                return key
+        raise KeyError("Neither 'X_pca' nor 'pca' was found in adata.obsm.")
 
     def _subset_to_groups(
         self,

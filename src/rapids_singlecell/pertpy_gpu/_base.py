@@ -10,13 +10,11 @@ from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
 
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
+from rapids_singlecell.tools._utils import _choose_representation
 
 if TYPE_CHECKING:
     from anndata import AnnData
 
-# Below this many variables ``perturbation_signature`` uses ``.X`` rather than a
-# PCA representation when ``use_rep`` is not given (mirrors scanpy).
-_NN_REPRESENTATION_AUTO_MAX_VARS = 50
 # Sentinel groupby label for cells outside the current split during differential
 # expression, so they are excluded without copying/subsetting the matrix.
 _DE_IGNORE_LABEL = "__mixscape_other__"
@@ -81,7 +79,8 @@ class PerturbationEfficacyAnalyzer:
         use_rep
             Representation to use for neighbor selection. ``"X"`` or any
             ``.obsm`` key. If ``None``, ``.X`` is used when ``n_vars`` is below
-            50, otherwise ``"X_pca"`` (computed if absent).
+            50, otherwise the PCA key selected by
+            :attr:`rapids_singlecell.settings.preset` (computed if absent).
         n_dims
             Number of dimensions of the representation to use. ``None`` uses all.
         n_pcs
@@ -286,27 +285,13 @@ def _to_dense_gpu(X) -> cp.ndarray:
 def _choose_representation_gpu(
     adata: AnnData, *, use_rep: str | None, n_pcs: int | None
 ) -> cp.ndarray:
-    """GPU analogue of scanpy's ``_choose_representation`` for neighbor search.
+    """Select a representation and return it as a dense GPU array.
 
     Always returns a float32 representation: neighbor selection does not need
     float64 precision, and the cuVS backends (ivfflat/cagra) only accept float32.
     """
-    if use_rep is None:
-        if adata.n_vars < _NN_REPRESENTATION_AUTO_MAX_VARS:
-            rep = _to_dense_gpu(_get_obs_rep(adata))
-        else:
-            if "X_pca" not in adata.obsm or (
-                n_pcs is not None and adata.obsm["X_pca"].shape[1] < n_pcs
-            ):
-                from rapids_singlecell.preprocessing import pca
-
-                pca(adata, n_comps=n_pcs)
-            rep = X_to_GPU(adata.obsm["X_pca"])
-    elif use_rep == "X":
-        rep = _to_dense_gpu(_get_obs_rep(adata))
-    else:
-        rep = X_to_GPU(adata.obsm[use_rep])
-
+    rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+    rep = _to_dense_gpu(rep)
     rep = cp.asarray(rep, dtype=cp.float32)
     if n_pcs is not None and n_pcs < rep.shape[1]:
         rep = rep[:, :n_pcs]

@@ -12,6 +12,12 @@ if TYPE_CHECKING:
     from ._harmony import COLSUM_ALGO
 
 
+def _resolve_pca_key(adata: AnnData, key: str) -> str:
+    if key == "X_pca" and key not in adata.obsm and "pca" in adata.obsm:
+        return "pca"
+    return key
+
+
 def harmony_integrate(
     adata: AnnData,
     key: str | list[str],
@@ -66,6 +72,7 @@ def harmony_integrate(
         the desired columns into one categorical column and pass that single key.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
+        The default falls back to ``"pca"`` when ``"X_pca"`` is absent.
     adjusted_basis
         The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
     dtype
@@ -198,6 +205,8 @@ def harmony_integrate(
                 UserWarning,
                 stacklevel=2,
             )
+
+    basis = _resolve_pca_key(adata, basis)
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:

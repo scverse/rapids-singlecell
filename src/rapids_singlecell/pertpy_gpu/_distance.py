@@ -82,7 +82,8 @@ class Distance:
         Mutually exclusive with ``obsm_key``.
     obsm_key
         Key in adata.obsm for embeddings. Mutually exclusive with ``layer_key``.
-        Defaults to ``"X_pca"`` if neither is specified.
+        If neither key is specified, ``"X_pca"`` is preferred and ``"pca"``
+        is used as a fallback.
 
     Notes
     -----
@@ -128,7 +129,8 @@ class Distance:
                 "Cannot use 'layer_key' and 'obsm_key' at the same time.\n"
                 "Please provide only one of the two keys."
             )
-        if layer_key is None and obsm_key is None:
+        auto_obsm_key = layer_key is None and obsm_key is None
+        if auto_obsm_key:
             obsm_key = "X_pca"
 
         self.metric = metric
@@ -136,10 +138,12 @@ class Distance:
         self.obsm_key = obsm_key
         self._metric_kwargs = kwargs
         self._metric_impl = None
+        self._auto_obsm_key = auto_obsm_key
         self._initialize_metric()
 
     def _initialize_metric(self):
         """Initialize the metric implementation based on the metric type."""
+        obsm_key = None if self._auto_obsm_key else self.obsm_key
         if self.metric == "edistance":
             from rapids_singlecell.pertpy_gpu._metrics._edistance import (
                 EDistanceMetric,
@@ -147,7 +151,7 @@ class Distance:
 
             self._metric_impl = EDistanceMetric(
                 layer_key=self.layer_key,
-                obsm_key=self.obsm_key,
+                obsm_key=obsm_key,
                 **self._metric_kwargs,
             )
         elif self.metric == "wasserstein":
@@ -157,7 +161,7 @@ class Distance:
 
             self._metric_impl = WassersteinMetric(
                 layer_key=self.layer_key,
-                obsm_key=self.obsm_key,
+                obsm_key=obsm_key,
                 **self._metric_kwargs,
             )
         elif self.metric in SUPPORTED_METRICS:
@@ -168,7 +172,7 @@ class Distance:
             self._metric_impl = PSEUDOBULK_METRICS[self.metric](
                 metric_name=self.metric,
                 layer_key=self.layer_key,
-                obsm_key=self.obsm_key,
+                obsm_key=obsm_key,
                 **self._metric_kwargs,
             )
         else:

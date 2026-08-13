@@ -33,6 +33,12 @@ def _check_dtype(dtype: str | np.dtype | cp.dtype) -> str | np.dtype | cp.dtype:
         raise ValueError("dtype must be one of ['float32', 'float64']")
 
 
+def _resolve_pca_key(adata: AnnData, key: str | None) -> str | None:
+    if key == "X_pca" and key not in adata.obsm and "pca" in adata.obsm:
+        return "pca"
+    return key
+
+
 def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
     from cugraph import Graph
 
@@ -487,9 +493,7 @@ def kmeans(
             Use this many PCs. If `n_pcs==0` use `.X` if `use_rep is None`.
         use_rep
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
-            If None, the representation is chosen automatically: For .n_vars < 50, .X
-            is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-            computed with default parameters or `n_pcs` if present.
+            The default falls back to ``"pca"`` when ``"X_pca"`` is absent.
         n_init
             Number of initializations to run the KMeans algorithm
         random_state
@@ -506,6 +510,7 @@ def kmeans(
     from cuml.cluster import KMeans
 
     adata = adata.copy() if copy else adata
+    use_rep = _resolve_pca_key(adata, use_rep)
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
 
     kmeans_out = KMeans(

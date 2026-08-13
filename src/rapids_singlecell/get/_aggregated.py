@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal, Union, get_args
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
@@ -15,13 +16,27 @@ from scanpy.get._aggregated import _combine_categories
 from rapids_singlecell._compat import DaskArray, _meta_dense
 from rapids_singlecell._cuda import _aggr_cuda
 from rapids_singlecell._settings import Preset, settings
-from rapids_singlecell.get import _check_mask
 from rapids_singlecell.preprocessing._utils import _check_gpu_X
+
+from ._utils import (
+    AdRef,
+    GraphAcc,
+    Idx2D,
+    LayerAcc,
+    MultiAcc,
+    _check_mask,
+    _get_arr,
+    _get_vec,
+    _refs_dim,
+    _require_anndata_acc,
+    _resolve_matrix_acc,
+    _resolve_ref,
+    _to_numpy_1d,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
 
-    import pandas as pd
     from numpy.typing import NDArray
 
 Array = Union[cp.ndarray, cp_sparse.csc_matrix, cp_sparse.csr_matrix]  # noqa: UP007
@@ -65,21 +80,20 @@ class Aggregate:
         *,
         mask: NDArray[np.bool_] | None = None,
     ) -> None:
-        self.mask = mask
-        self.groupby = cp.array(groupby.codes, dtype=cp.int32)
-        weights = None
+        codes = np.asarray(groupby.codes)
+        selected = codes >= 0
         if mask is not None:
-            weights = cp.asarray(mask, dtype=cp.float64)
-        self.n_cells = (
-            cp.bincount(
-                self.groupby, weights=weights, minlength=len(groupby.categories)
-            )
-            .astype(cp.float64, copy=False)
-            .reshape(
-                -1,
-                1,
-            )
+            selected &= np.asarray(mask)
+        self.mask = None if selected.all() else selected
+        self.groupby = cp.asarray(codes, dtype=cp.int32)
+        selected_gpu = cp.asarray(selected)
+        selected_codes = self.groupby[selected_gpu]
+        counts = (
+            cp.bincount(selected_codes, minlength=len(groupby.categories))
+            if selected_codes.size
+            else cp.zeros(len(groupby.categories), dtype=cp.int64)
         )
+        self.n_cells = counts.astype(cp.float64, copy=False).reshape(-1, 1)
         if data.dtype.kind != "f" and not isinstance(data, DaskArray):
             data = data.astype(cp.float32, copy=False)
         self.data = data
@@ -490,13 +504,59 @@ class Aggregate:
         )
 
 
+def _normalize_by(
+    by: str | Collection[str | AdRef[Idx2D | int, AnnData]] | AdRef,
+    axis: Literal["obs", 0, "var", 1] | None,
+    *,
+    obsm: str | None,
+    varm: str | None,
+) -> tuple[list[str] | list[AdRef], Literal["obs", "var"]]:
+    """Normalize grouping references and infer their aligned dimension."""
+    by_list = [by] if isinstance(by, str | AdRef) else list(by)
+    if not by_list:
+        raise ValueError("`by` must contain at least one grouping reference.")
+    resolved = _resolve_ref(by_list)
+
+    if isinstance(resolved[0], AdRef):
+        if axis is not None:
+            raise TypeError(
+                "`axis` cannot be used when `by` is given as AdRef(s); "
+                "the axis is inferred from `by`."
+            )
+        return resolved, _refs_dim(resolved)
+
+    if axis is not None:
+        dim = _resolve_axis(axis)[1]
+    elif varm is not None:
+        dim = "var"
+    else:
+        dim = "obs"
+    return resolved, dim
+
+
+def _group_counts_host(
+    categorical: pd.Categorical, mask: NDArray[np.bool_] | None
+) -> NDArray[np.int64]:
+    """Count selected observations in every categorical group."""
+    codes = np.asarray(categorical.codes)
+    selected = codes >= 0
+    if mask is not None:
+        selected &= mask
+    return np.bincount(codes[selected], minlength=len(categorical.categories))
+
+
 def aggregate(
     adata: AnnData,
-    by: str | Collection[str],
+    by: (
+        str
+        | Collection[str | AdRef[Idx2D | int, AnnData]]
+        | AdRef[Idx2D | int, AnnData]
+    ),
     func: AggType | Iterable[AggType],
     *,
+    acc: LayerAcc | MultiAcc | GraphAcc | str | None = None,
     axis: Literal["obs", 0, "var", 1] | None = None,
-    mask: NDArray[np.bool_] | str | None = None,
+    mask: NDArray[np.bool_] | AdRef[Idx2D | int, AnnData] | str | None = None,
     dof: int = 1,
     layer: str | None = None,
     obsm: str | None = None,
@@ -522,11 +582,18 @@ def aggregate(
     adata
         :class:`~anndata.AnnData` to be aggregated.
     by
-        Key of the column to be grouped-by.
+        References to the vectors to be grouped by. Bare strings retain the
+        legacy column-name behavior; accessor strings such as ``"obs.group"``
+        and :mod:`anndata.acc` references are also supported.
     func
         How to aggregate.
+    acc
+        Accessor for the matrix to aggregate, such as ``A.X``,
+        ``A.layers["counts"]``, ``A.obsm["pca"]``, or an observation/variable
+        graph. Replaces ``layer``, ``obsm``, and ``varm``.
     axis
-        Axis on which to find group by column.
+        Axis on which to find the grouping column. Inferred from ``by`` when
+        accessor references are used.
     mask
         Boolean mask (or key to column containing mask) to apply along the axis.
     dof
@@ -583,30 +650,22 @@ def aggregate(
             msg += " `axis` is no longer necessary because it is inferred from `by`."
         warnings.warn(msg, FutureWarning, stacklevel=2)
 
-    if axis is None:
-        axis = 1 if varm else 0
-    axis, axis_name = _resolve_axis(axis)
-    if mask is not None:
-        mask = _check_mask(adata, mask, axis_name)
-    data = adata.X
-    if sum(p is not None for p in [varm, obsm, layer]) > 1:
-        raise TypeError("Please only provide one (or none) of varm, obsm, or layer")
-
-    if varm is not None:
-        if axis != 1:
-            raise ValueError("varm can only be used when axis is 1")
-        data = adata.varm[varm]
-    elif obsm is not None:
-        if axis != 0:
-            raise ValueError("obsm can only be used when axis is 0")
-        data = adata.obsm[obsm]
-    elif layer is not None:
-        data = adata.layers[layer]
-        if axis == 1:
-            data = data.T
-    elif axis == 1:
-        # i.e., all of `varm`, `obsm`, `layers` are None so we use `X` which must be transposed
-        data = data.T
+    by_refs, axis_name = _normalize_by(by, axis, obsm=obsm, varm=varm)
+    if isinstance(by_refs[0], AdRef) and acc is None:
+        acc = _require_anndata_acc().X
+    elif isinstance(acc, str):
+        acc = _resolve_matrix_acc(acc)
+    data = _get_arr(
+        adata,
+        acc,
+        dim=axis_name,
+        layer=layer,
+        obsm=obsm,
+        varm=varm,
+    )
+    data_columns = data.columns if isinstance(data, pd.DataFrame) else None
+    if data_columns is not None:
+        data = data.to_numpy()
     # In-memory host input streams to the GPU (no full copy); ``return_sparse``
     # still needs the device path, so copy that case to the GPU.
     is_host = isinstance(data, np.ndarray) or sp.issparse(data)
@@ -617,12 +676,33 @@ def aggregate(
         is_host = False
     if not is_host:
         _check_gpu_X(data, allow_dask=True)
-    dim_df = getattr(adata, axis_name)
+
+    values = _get_vec(adata, by_refs, dim=axis_name)
+    dim_df = pd.DataFrame(
+        {
+            (
+                ref
+                if isinstance(ref, str)
+                else ref.idx
+                if isinstance(ref.idx, str)
+                else str(ref)
+            ): _to_numpy_1d(value)
+            for ref, value in zip(by_refs, values, strict=True)
+        }
+    )
+    mask = _check_mask(adata, mask, axis_name)
+    if mask is not None:
+        mask = np.asarray(_to_numpy_1d(mask))
     if len(signature(_combine_categories).parameters) == 1:
-        cols = [by] if isinstance(by, str) else list(by)
-        categorical, new_label_df = _combine_categories(dim_df[cols])
+        categorical, new_label_df = _combine_categories(dim_df)
     else:
-        categorical, new_label_df = _combine_categories(dim_df, by)
+        categorical, new_label_df = _combine_categories(dim_df, list(dim_df.columns))
+    # Scanpy 2 adds this metadata unconditionally. Keep the legacy preset's
+    # result schema stable for existing rapids-singlecell callers.
+    if settings.preset is Preset.ScanpyV2Preview:
+        new_label_df["n_obs_aggregated"] = pd.Series(
+            _group_counts_host(categorical, mask), index=categorical.categories
+        ).reindex(new_label_df.index)
     groupby = Aggregate(groupby=categorical, data=data, mask=mask)
 
     funcs = set([func] if isinstance(func, str) else func)
@@ -649,12 +729,22 @@ def aggregate(
     if "sq_sum" in funcs:
         layers["sq_sum"] = result["sq_sum"]
 
+    if obsm is not None or varm is not None or isinstance(acc, MultiAcc):
+        var = pd.DataFrame(
+            index=(
+                data_columns
+                if data_columns is not None
+                else pd.RangeIndex(data.shape[1]).astype(str)
+            )
+        )
+    elif isinstance(acc, GraphAcc):
+        var = getattr(adata, axis_name)
+    else:
+        var = getattr(adata, "var" if axis_name == "obs" else "obs")
+
     result = AnnData(
         layers=layers,
         obs=new_label_df,
-        var=getattr(adata, "var" if axis == 0 else "obs"),
+        var=var,
     )
-    if axis == 1:
-        return result.T
-    else:
-        return result
+    return result.T if axis_name == "var" else result

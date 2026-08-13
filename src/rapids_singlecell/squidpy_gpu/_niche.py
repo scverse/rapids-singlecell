@@ -30,6 +30,21 @@ GMM_INIT = "random_from_data"
 NOT_A_NICHE = "not_a_niche"
 
 
+def _normalize_resolutions(
+    resolutions: float | Sequence[float],
+) -> tuple[float, ...]:
+    values = (
+        (float(resolutions),)
+        if isinstance(resolutions, (int, float))
+        else tuple(float(resolution) for resolution in resolutions)
+    )
+    if not values:
+        raise ValueError("`resolutions` must contain at least one value.")
+    if pd.Index(values).has_duplicates:
+        raise ValueError("`resolutions` must contain unique values.")
+    return values
+
+
 def calculate_niche_neighborhood(
     adata: AnnData,
     *,
@@ -86,11 +101,14 @@ def calculate_niche_neighborhood(
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
     """
+    resolutions = _normalize_resolutions(resolutions)
     _check_key(adata, spatial_connectivities_key)
     if groups is None:
         raise ValueError("`groups` is required for flavor='neighborhood'.")
     if groups not in adata.obs.columns:
         raise KeyError(f"'{groups}' not found in `adata.obs`.")
+    if n_neighbors < 1:
+        raise ValueError(f"`n_neighbors` must be >= 1, got {n_neighbors}.")
     if distance < 1:
         raise ValueError(f"`distance` must be >= 1, got {distance}.")
 
@@ -159,7 +177,10 @@ def calculate_niche_utag(
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
     """
+    resolutions = _normalize_resolutions(resolutions)
     _check_key(adata, spatial_connectivities_key)
+    if n_neighbors < 1:
+        raise ValueError(f"`n_neighbors` must be >= 1, got {n_neighbors}.")
 
     return _calculate_niche_custom(
         adata,
@@ -211,7 +232,8 @@ def calculate_niche_cellcharter(
     random_state
         Random seed for the GMM.
     spatial_connectivities_key
-        Key in ``adata.obsp`` with the spatial connectivity matrix.
+        Key in ``adata.obsp`` with the spatial connectivity matrix. Not used when
+        ``use_rep`` is provided.
     n_components
         Number of mixture components.
     use_rep
@@ -229,7 +251,8 @@ def calculate_niche_cellcharter(
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
     """
-    _check_key(adata, spatial_connectivities_key)
+    if use_rep is None:
+        _check_key(adata, spatial_connectivities_key)
     if distance < 0:
         raise ValueError(f"`distance` must be >= 0, got {distance}.")
     if aggregation not in ("mean", "variance"):
@@ -312,7 +335,8 @@ def calculate_niche(
         - :func:`~rapids_singlecell.gr.calculate_niche_cellcharter`
 
     The spatial graph in ``adata.obsp[spatial_connectivities_key]`` must be
-    precomputed (e.g. via :func:`squidpy.gr.spatial_neighbors`).
+    precomputed (e.g. via :func:`squidpy.gr.spatial_neighbors`), except for
+    ``flavor="cellcharter"`` when ``use_rep`` is provided.
 
     Parameters
     ----------
@@ -359,7 +383,8 @@ def calculate_niche(
         if provided, the first ``n_components`` columns are used and the shell-aggregation
         + PCA step is skipped.
     spatial_connectivities_key
-        Key in ``adata.obsp`` with the spatial connectivity matrix.
+        Key in ``adata.obsp`` with the spatial connectivity matrix. Not used for
+        ``flavor="cellcharter"`` when ``use_rep`` is provided.
     random_state
         Random seed for the GMM (``flavor="cellcharter"`` only).
     inplace
@@ -506,7 +531,7 @@ def _check_key(adata: AnnData, key: str) -> None:
 def _calculate_niche_custom(
     adata: AnnData,
     embed: Callable[[AnnData], cp.ndarray],
-    cluster: Callable[[AnnData, cp.ndarray], list[str]],
+    cluster: Callable[..., list[str]],
     *,
     min_niche_size: int | None,
     mask: pd.Series | None,
@@ -514,31 +539,38 @@ def _calculate_niche_custom(
     inplace: bool,
 ) -> AnnData | None:
     """Run embed → cluster → postprocess, optionally stratified by ``library_key``."""
+    if adata.n_obs == 0:
+        raise ValueError(
+            "Cannot calculate niches on an AnnData object with no observations."
+        )
+
+    if library_key is not None:
+        if library_key not in adata.obs.columns:
+            raise KeyError(f"'{library_key}' not found in `adata.obs`.")
+        n_missing = int(adata.obs[library_key].isna().sum())
+        if n_missing:
+            raise ValueError(
+                f"`adata.obs[{library_key!r}]` contains {n_missing} missing "
+                "library value(s)."
+            )
+
     adata = adata if inplace else adata.copy()
 
     if library_key is None:
-        cols = cluster(adata, embed(adata))
+        embedding = None if adata.n_obs == 1 else embed(adata)
+        cols = cluster(adata, embedding, library_id=None)
         _postprocess_niche_results(
             adata, cols, mask=mask, min_niche_size=min_niche_size, prefix=None
         )
         return None if inplace else adata
 
-    if library_key not in adata.obs.columns:
-        raise KeyError(f"'{library_key}' not found in `adata.obs`.")
-
     columns: list[str] = []
     results: list[tuple[np.ndarray, pd.DataFrame]] = []
     for lib_id in adata.obs[library_key].unique():
         lib_mask = (adata.obs[library_key] == lib_id).to_numpy()
-        if not lib_mask.any():
-            warnings.warn(
-                f"Library '{lib_id}' contains no cells, skipping.",
-                UserWarning,
-                stacklevel=2,
-            )
-            continue
         lib_adata = adata[lib_mask].copy()
-        cols = cluster(lib_adata, embed(lib_adata))
+        embedding = None if lib_adata.n_obs == 1 else embed(lib_adata)
+        cols = cluster(lib_adata, embedding, library_id=lib_id)
         _postprocess_niche_results(
             lib_adata,
             cols,
@@ -589,21 +621,43 @@ def _postprocess_niche_results(
 
 def _leiden_cluster(
     adata: AnnData,
-    embedding: cp.ndarray,
+    embedding: cp.ndarray | None,
     *,
     n_neighbors: int,
-    resolutions: float | Sequence[float],
+    resolutions: Sequence[float],
     base_colname: str,
+    library_id: object | None,
 ) -> list[str]:
     """kNN graph + leiden over the embedding; one ``<base_colname>_res=<res>`` per resolution."""
-    inner = AnnData(X=embedding, obs=pd.DataFrame(index=adata.obs_names.copy()))
-    rsc.pp.neighbors(inner, n_neighbors=n_neighbors, use_rep="X")
+    res_list = list(resolutions)
+    result_columns = [f"{base_colname}_res={res}" for res in res_list]
+    if adata.n_obs == 1:
+        if n_neighbors > 1:
+            _warn_size_adaptation(
+                parameter="n_neighbors",
+                requested=n_neighbors,
+                effective=1,
+                n_obs=adata.n_obs,
+                library_id=library_id,
+            )
+        for out_key in result_columns:
+            adata.obs[out_key] = pd.Categorical(["0"])
+        return result_columns
 
-    res_list = (
-        [float(resolutions)]
-        if isinstance(resolutions, (int, float))
-        else [float(r) for r in resolutions]
-    )
+    effective_n_neighbors = n_neighbors
+    if n_neighbors > adata.n_obs:
+        effective_n_neighbors = 1 + int(0.5 * adata.n_obs)
+        _warn_size_adaptation(
+            parameter="n_neighbors",
+            requested=n_neighbors,
+            effective=effective_n_neighbors,
+            n_obs=adata.n_obs,
+            library_id=library_id,
+        )
+
+    inner = AnnData(X=embedding, obs=pd.DataFrame(index=adata.obs_names.copy()))
+    rsc.pp.neighbors(inner, n_neighbors=effective_n_neighbors, use_rep="X")
+
     base = "_niche_leiden"
     rsc.tl.leiden(
         inner,
@@ -612,34 +666,62 @@ def _leiden_cluster(
         dtype=np.float64,
     )
 
-    result_columns = []
-    for res in res_list:
+    for res, out_key in zip(res_list, result_columns, strict=True):
         src = f"{base}_{res}" if len(res_list) > 1 else base
-        out_key = f"{base_colname}_res={res}"
         adata.obs[out_key] = pd.Categorical(inner.obs[src].astype(str).values)
-        result_columns.append(out_key)
     return result_columns
 
 
 def _gmm_cluster(
     adata: AnnData,
-    embedding: cp.ndarray,
+    embedding: cp.ndarray | None,
     *,
     n_components: int,
     random_state: int,
     base_colname: str,
+    library_id: object | None,
 ) -> list[str]:
     """Gaussian-mixture clustering of the embedding, seeded like squidpy's CellCharter."""
+    effective_n_components = min(n_components, adata.n_obs)
+    if effective_n_components != n_components:
+        _warn_size_adaptation(
+            parameter="n_components",
+            requested=n_components,
+            effective=effective_n_components,
+            n_obs=adata.n_obs,
+            library_id=library_id,
+        )
+    if adata.n_obs == 1:
+        adata.obs[base_colname] = pd.Categorical(["0"])
+        return [base_colname]
+
     from ._gmm import gmm_fit_predict
 
     labels = gmm_fit_predict(
         embedding,
-        n_components=n_components,
+        n_components=effective_n_components,
         random_state=random_state,
         init=GMM_INIT,
     )
     adata.obs[base_colname] = pd.Categorical(cp.asnumpy(labels).astype(str))
     return [base_colname]
+
+
+def _warn_size_adaptation(
+    *,
+    parameter: str,
+    requested: int,
+    effective: int,
+    n_obs: int,
+    library_id: object | None,
+) -> None:
+    scope = "the dataset" if library_id is None else f"library {library_id!r}"
+    warnings.warn(
+        f"`{parameter}={requested}` exceeds the {n_obs} observation(s) in {scope}; "
+        f"using `{parameter}={effective}`.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _nhood_embedding(
@@ -673,7 +755,7 @@ def _utag_embedding(adata: AnnData, *, key: str) -> cp.ndarray:
     inner = AnnData(
         X=_utag_features(adata, key), obs=pd.DataFrame(index=adata.obs_names.copy())
     )
-    rsc.pp.pca(inner)
+    rsc.pp.pca(inner, key_added=None)
     return cp.asarray(inner.obsm["X_pca"])
 
 
@@ -696,18 +778,18 @@ def _cellcharter_embedding(
     # rejects zero columns; drop them so the embedding still uses the
     # informative dimensions.
     if sparse_gpu.issparse(feat):
-        col_sum = cp.asarray(feat.sum(axis=0)).ravel()
-        nonzero = cp.where(col_sum != 0)[0]
+        feat_nonzero = feat.tocsc(copy=True)
+        feat_nonzero.eliminate_zeros()
+        nonzero = cp.flatnonzero(cp.diff(feat_nonzero.indptr))
         if int(nonzero.size) < feat.shape[1]:
             feat = feat[:, nonzero]
     else:
-        col_sum = feat.sum(axis=0)
-        nonzero = col_sum != 0
+        nonzero = cp.any(feat != 0, axis=0)
         if int(nonzero.sum()) < feat.shape[1]:
             feat = feat[:, nonzero]
     inner = AnnData(X=feat, obs=pd.DataFrame(index=adata.obs_names.copy()))
     rsc.get.anndata_to_GPU(inner)
-    rsc.pp.pca(inner)
+    rsc.pp.pca(inner, key_added=None)
     return cp.asarray(inner.obsm["X_pca"], dtype=cp.float32)
 
 
@@ -726,15 +808,17 @@ def _neighborhood_profile(
     n_obs = adata.n_obs
 
     one_hot = cp.zeros((n_obs, n_cats), dtype=cp.float32)
-    one_hot[cp.arange(n_obs), cp.asarray(cats.codes, dtype=cp.int64)] = 1.0
+    codes = cp.asarray(cats.codes, dtype=cp.int64)
+    valid = codes >= 0
+    rows = cp.arange(n_obs, dtype=cp.int64)[valid]
+    one_hot[rows, codes[valid]] = 1.0
 
-    adj = rsc.get.X_to_GPU(adata.obsp[key]).astype(cp.float32)
+    adj = rsc.get.X_to_GPU(adata.obsp[key]).copy()
+    if adj.dtype != cp.float32:
+        adj = adj.astype(cp.float32)
     adj.eliminate_zeros()
-    # Binarize so adj.data == 1: each existing edge contributes one neighbor count.
-    adj_bin = adj.copy()
-    adj_bin.data[:] = 1.0
 
-    if weights is None:
+    if distance == 1 or weights is None:
         weights = [1.0] * distance
     elif len(weights) < distance:
         weights = list(weights) + [weights[-1]] * (distance - len(weights))
@@ -742,17 +826,13 @@ def _neighborhood_profile(
         raise ValueError("`n_hop_weights` must not sum to zero.")
 
     profile = cp.zeros((n_obs, n_cats), dtype=cp.float32)
-    adj_k = adj_bin
+    adj_k = adj
     for hop in range(distance):
-        if hop == 0:
-            adj_hop = adj_bin
-        else:
-            adj_k = adj_k @ adj_bin
-            adj_hop = adj_k.copy()
-            adj_hop.data[:] = 1.0
-        counts = adj_hop @ one_hot  # (n_obs, n_cats) dense
+        if hop > 0:
+            adj_k = adj_k @ adj
+        counts = adj_k @ one_hot  # (n_obs, n_cats) dense
         if not abs_nhood:
-            row_sum = adj_hop.sum(axis=1).reshape(-1, 1)
+            row_sum = counts.sum(axis=1, keepdims=True)
             row_sum = cp.where(row_sum == 0, cp.float32(1.0), row_sum)
             counts = counts / row_sum
         profile += cp.float32(weights[hop]) * counts
@@ -767,7 +847,7 @@ def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matr
     """L1-row-normalize the spatial adjacency and propagate expression: D^-1 A @ X."""
     from rapids_singlecell._cuda import _norm_cuda as _nc
 
-    adj = rsc.get.X_to_GPU(adata.obsp[key])
+    adj = rsc.get.X_to_GPU(adata.obsp[key]).copy()
     if adj.dtype != cp.float32:
         adj = adj.astype(cp.float32)
     _nc.mul_csr(

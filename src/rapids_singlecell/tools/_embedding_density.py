@@ -39,7 +39,8 @@ def embedding_density(
         The annotated data matrix.
     basis
         The embedding over which the density will be calculated. This embedded
-        representation should be found in `adata.obsm['X_[basis]']`.
+        representation should be found in ``adata.obsm[basis]`` or
+        ``adata.obsm[f"X_{basis}"]``.
     groupby
         Key for categorical observation/cell annotation for which densities
         are calculated per category.
@@ -69,10 +70,15 @@ def embedding_density(
     if basis == "fa":
         basis = "draw_graph_fa"
 
-    if f"X_{basis}" not in adata.obsm:
+    if basis in adata.obsm:
+        basis_key = basis
+    elif f"X_{basis}" in adata.obsm:
+        basis_key = f"X_{basis}"
+    else:
         raise ValueError(
             "Cannot find the embedded representation "
-            f"`adata.obsm['X_{basis}']`. Compute the embedding first."
+            f"`adata.obsm[{basis!r}]` or `adata.obsm['X_{basis}']`. "
+            "Compute the embedding first."
         )
 
     if components is None:
@@ -107,8 +113,8 @@ def embedding_density(
 
         for cat in categories:
             cat_mask = adata.obs[groupby] == cat
-            embed_x = adata.obsm[f"X_{basis}"][cat_mask, components[0]]
-            embed_y = adata.obsm[f"X_{basis}"][cat_mask, components[1]]
+            embed_x = adata.obsm[basis_key][cat_mask, components[0]]
+            embed_y = adata.obsm[basis_key][cat_mask, components[1]]
 
             dens_embed = _calc_density(cp.array(embed_x), cp.array(embed_y))
             density_values[cat_mask] = dens_embed
@@ -116,8 +122,8 @@ def embedding_density(
         adata.obs[density_covariate] = density_values
     else:  # if groupby is None
         # Calculate the density over the whole embedding without subsetting
-        embed_x = cp.asarray(adata.obsm[f"X_{basis}"][:, components[0]])
-        embed_y = cp.asarray(adata.obsm[f"X_{basis}"][:, components[1]])
+        embed_x = cp.asarray(adata.obsm[basis_key][:, components[0]])
+        embed_y = cp.asarray(adata.obsm[basis_key][:, components[1]])
 
         adata.obs[density_covariate] = _calc_density(embed_x, embed_y)
 
