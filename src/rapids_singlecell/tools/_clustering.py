@@ -491,7 +491,7 @@ def kmeans(
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
             Either spelling of the PCA key resolves to whichever one the data
             actually uses, so the default works under any
-            :attr:`rapids_singlecell.settings.preset`.
+            ``rapids_singlecell.settings.preset``.
         n_init
             Number of initializations to run the KMeans algorithm
         random_state

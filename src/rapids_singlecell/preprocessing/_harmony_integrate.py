@@ -70,7 +70,7 @@ def harmony_integrate(
         The name of the field in ``adata.obsm`` where the PCA table is stored.
         Either spelling of the PCA key resolves to whichever one the data
         actually uses, so the default works under any
-        :attr:`rapids_singlecell.settings.preset`.
+        ``rapids_singlecell.settings.preset``.
     adjusted_basis
         The name of the field in ``adata.obsm`` where the adjusted PCA table will be
         stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows

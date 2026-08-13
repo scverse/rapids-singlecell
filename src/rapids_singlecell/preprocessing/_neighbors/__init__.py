@@ -69,7 +69,7 @@ def neighbors(
         Use the indicated representation. `'X'` or any key for `.obsm` is valid.
         If None, the representation is chosen automatically: For .n_vars < 50, .X
         is used, otherwise the PCA embedding, under whichever key the active
-        :attr:`rapids_singlecell.settings.preset` uses. If no PCA embedding is
+        ``rapids_singlecell.settings.preset`` uses. If no PCA embedding is
         present, it's computed with default parameters or `n_pcs` if present.
     random_state
         A numpy random seed.

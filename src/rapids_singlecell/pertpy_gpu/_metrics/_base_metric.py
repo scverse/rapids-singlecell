@@ -41,7 +41,7 @@ class BaseMetric(ABC):
     obsm_key
         Key in adata.obsm for embeddings (default: 'X_pca'). Either spelling of
         the PCA key resolves to whichever one the data actually uses, so the
-        default works under any :attr:`rapids_singlecell.settings.preset`.
+        default works under any ``rapids_singlecell.settings.preset``.
 
     Attributes
     ----------

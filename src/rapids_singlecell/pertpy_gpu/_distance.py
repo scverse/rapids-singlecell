@@ -85,7 +85,7 @@ class Distance:
     obsm_key
         Key in adata.obsm for embeddings. Mutually exclusive with ``layer_key``.
         If neither key is specified, the PCA key of the active
-        :attr:`rapids_singlecell.settings.preset` is used. Either spelling
+        ``rapids_singlecell.settings.preset`` is used. Either spelling
         resolves to whichever one the data actually uses.
 
     Notes
