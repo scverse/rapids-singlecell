@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 def _basis_obsm_key(adata: AnnData, basis: str) -> str | None:
     """The `.obsm` key holding `basis`, under either preset's naming."""
+    if basis in adata.obsm:
+        return basis
     embedding, layout = (
         ("draw_graph", basis.removeprefix("draw_graph_"))
         if basis.startswith("draw_graph_")

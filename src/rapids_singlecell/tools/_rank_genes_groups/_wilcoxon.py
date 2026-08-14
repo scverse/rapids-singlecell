@@ -63,13 +63,10 @@ def _choose_wilcoxon_chunk_size(requested: int | None, n_genes: int) -> int:
 
 def _device_wilcoxon_sums(rg: _RankGenes) -> tuple[cp.ndarray, cp.ndarray | None]:
     """Compute only the device sums needed for Wilcoxon log-fold changes."""
-    agg = Aggregate(groupby=rg.labels.cat, data=rg.X)
+    agg = Aggregate(groupby=rg._aggregation_groupby, data=rg.X)
     sums_all = agg.count_mean_var({"sum"}, dof=1)["sum"]
 
-    cat_names = list(rg.labels.cat.categories)
-    cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
-    order = [cat_to_idx[str(name)] for name in rg.groups_order]
-    group_sums = sums_all[order]
+    group_sums = sums_all[: len(rg.groups_order)]
     total_sums = sums_all.sum(axis=0, keepdims=True) if rg.ireference is None else None
     return group_sums, total_sums
 

@@ -162,7 +162,9 @@ def _resolve_obsm_key(
     explicit keys such as `'X_scVI'` always win. A preset name that is absent falls
     back to the other preset's spelling, and `key=None` auto-detects.
     """
-    if key is not None and key not in _preset_obsm_names(embedding, layout=layout):
+    if key is not None and (
+        key in adata.obsm or key not in _preset_obsm_names(embedding, layout=layout)
+    ):
         return key
     existing = _existing_preset_keys(adata, embedding, layout=layout)
     return key if existing is None else existing.obsm

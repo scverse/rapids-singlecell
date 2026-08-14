@@ -92,6 +92,10 @@ class _RankGenes:
             reference=reference,
             skip_empty_groups=skip_empty_groups,
         )
+        # Scanpy groups omitted categories and missing labels into one remainder.
+        self._aggregation_groupby = pd.Categorical(
+            self.group_codes, categories=range(len(self.groups_order) + 1)
+        )
 
         if layer is not None:
             if use_raw is True:
@@ -146,7 +150,7 @@ class _RankGenes:
     def _accumulate_planes(
         self,
     ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
-        """Sum / sq_sum / (count_nonzero) over ALL categories → (n_cats, n_genes).
+        """Sum / sq_sum / (count_nonzero) over groups plus the remainder.
 
         Host input (numpy / scipy) streams blocks to the GPU (no full copy);
         device / Dask uses the device ``Aggregate``. ``count_nonzero`` only when
@@ -155,7 +159,7 @@ class _RankGenes:
         X = self.X
         if isinstance(X, np.ndarray) or sp.issparse(X):
             return self._stream_planes()
-        agg = Aggregate(groupby=self.labels.cat, data=X)
+        agg = Aggregate(groupby=self._aggregation_groupby, data=X)
         funcs = {"sum", "sq_sum"}
         if self.comp_pts:
             funcs.add("count_nonzero")
@@ -174,15 +178,9 @@ class _RankGenes:
             stream_planes_multi,
         )
 
-        codes = self.labels.cat.codes.to_numpy()
-        if codes.size and int(codes.min()) < 0:
-            # The streaming kernels index out[group, gene] directly; a missing
-            # (NaN) category (code -1) would corrupt memory, so refuse it — the
-            # device Aggregate path rejects it too.
-            msg = "groupby contains unassigned (NaN) categories; drop them first."
-            raise ValueError(msg)
+        codes = self.group_codes
         device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
-        n_cats = len(self.labels.cat.categories)
+        n_cats = len(self.groups_order) + 1
         if len(device_ids) > 1:
             return stream_planes_multi(self, device_ids)
         cats = cp.asarray(codes, dtype=cp.int32)
@@ -199,21 +197,17 @@ class _RankGenes:
         finally:
             self.X = original_X
 
-        # Map category order → selected groups order.
-        cat_names = list(self.labels.cat.categories)
-        cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
-        order = [cat_to_idx[str(name)] for name in self.groups_order]
-
+        n_groups = len(self.groups_order)
         n = cp.asarray(self.group_sizes, dtype=cp.float64)[:, None]
-        sums = sums_all[order]
-        sq_sums = sq_sums_all[order]
+        sums = sums_all[:n_groups]
+        sq_sums = sq_sums_all[:n_groups]
 
         means = sums / n
         group_ss = sq_sums - n * means**2
         vars_ = cp.maximum(group_ss / cp.maximum(n - 1, 1), 0)
 
         if self.comp_pts:
-            pts = nnz_all[order].astype(cp.float64) / n
+            pts = nnz_all[:n_groups].astype(cp.float64) / n
         else:
             pts = None
 
@@ -232,7 +226,7 @@ class _RankGenes:
             if self.comp_pts:
                 nnz_total = nnz_all.sum(axis=0)
                 self.pts_rest = cp.asnumpy(
-                    (nnz_total - nnz_all[order]).astype(cp.float64) / n_rest
+                    (nnz_total - nnz_all[:n_groups]).astype(cp.float64) / n_rest
                 )
             else:
                 self.pts_rest = None

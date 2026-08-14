@@ -174,6 +174,11 @@ def pca(
                 Explained variance, equivalent to the eigenvalues of the \
                 covariance matrix.
     """
+    if "use_highly_variable" in kwargs:
+        raise TypeError(
+            "pca() got an unexpected keyword argument 'use_highly_variable'"
+        )
+
     if not isinstance(data, AnnData):
         if layer is not None:
             raise ValueError("`layer` can only be used with an AnnData object.")
@@ -219,11 +224,7 @@ def pca(
 
     # Keep the recorded param as the column name for strings, else None.
     mask_var_param = mask_var if isinstance(mask_var, str) else None
-    mask_var = _check_mask(
-        adata,
-        mask_var.removeprefix("var.") if isinstance(mask_var, str) else mask_var,
-        "var",
-    )
+    mask_var = _check_mask(adata, mask_var, "var")
     X = X[:, mask_var] if mask_var is not None else X
 
     pca_func, X_pca, n_comps = _pca_compute(
