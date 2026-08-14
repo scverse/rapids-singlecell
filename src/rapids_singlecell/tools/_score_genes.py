@@ -188,7 +188,10 @@ def _score_genes_bins(
     keep_ctrl_in_obs_cut = False if ctrl_as_ref else obs_cut.index.isin(gene_list)
 
     # now pick `ctrl_size` genes from every cut
-    for cut in np.unique(obs_cut.loc[gene_list]):
+    cuts = np.unique(obs_cut.loc[gene_list])
+    # spawn a sub-rng per cut, like scanpy, so this stays parallelizable
+    sub_rngs = [None] * len(cuts) if sample_rng is None else sample_rng.spawn(len(cuts))
+    for cut, sub_rng in zip(cuts, sub_rngs, strict=True):
         r_genes: pd.Index[str] = obs_cut[(obs_cut == cut) & ~keep_ctrl_in_obs_cut].index
         if len(r_genes) == 0:
             msg = (
@@ -197,9 +200,7 @@ def _score_genes_bins(
             )
             warnings.warn(msg)
         if ctrl_size < len(r_genes):
-            r_genes = (
-                r_genes.to_series().sample(ctrl_size, random_state=sample_rng).index
-            )
+            r_genes = r_genes.to_series().sample(ctrl_size, random_state=sub_rng).index
         if ctrl_as_ref:  # otherwise `r_genes` is already filtered
             r_genes = r_genes.difference(gene_list)
         yield r_genes
