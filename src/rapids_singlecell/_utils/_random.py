@@ -30,11 +30,10 @@ _SEED_BOUND = 2**32
 class _LegacyRng:
     """Marks a seed that arrived through the superseded `random_state` argument.
 
-    Unlike scanpy's class of the same name, this one does not emulate
-    :class:`~numpy.random.RandomState`'s number stream: every consumer we hand a
-    seed to (cuML, cuGraph, CuPy, our own kernels) takes a plain integer. All we
-    need is to remember that a value came from `random_state` so it can be
-    forwarded unchanged, keeping results identical to earlier releases.
+    Unlike scanpy's class of the same name, this is only a marker. Integer-only
+    GPU consumers use it to recover the legacy seed, while host-side consumers
+    can recover the original :class:`~numpy.random.RandomState` object and
+    continue its exact stream.
     """
 
     __slots__ = ("arg",)

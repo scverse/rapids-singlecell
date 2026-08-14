@@ -16,7 +16,7 @@ from rapids_singlecell.preprocessing._utils import get_random_state
 from .sparse_utils import subsample_counts
 
 if TYPE_CHECKING:
-    from numpy.random import RandomState
+    from numpy.random import Generator, RandomState
     from numpy.typing import NDArray
 
     from rapids_singlecell._utils import AnyRandom
@@ -70,12 +70,12 @@ class Scrublet:
     n_neighbors: InitVar[int | None] = None
     expected_doublet_rate: float = 0.1
     stdev_doublet_rate: float = 0.02
-    random_state: InitVar[AnyRandom] = 0
+    random_state: InitVar[AnyRandom | Generator] = 0
 
     # private fields
 
     _n_neighbors: int = field(init=False, repr=False)
-    _random_state: RandomState = field(init=False, repr=False)
+    _random_state: RandomState | Generator = field(init=False, repr=False)
 
     _counts_obs: sparse.csc_matrix = field(init=False, repr=False)
     _total_counts_obs: NDArray[np.integer] = field(init=False, repr=False)
@@ -171,7 +171,7 @@ class Scrublet:
         counts_obs: sparse.csr_matrix | sparse.csc_matrix | NDArray[np.integer],
         total_counts_obs: NDArray[np.integer] | None,
         n_neighbors: int | None,
-        random_state: AnyRandom,
+        random_state: AnyRandom | Generator,
     ) -> None:
         self._counts_obs = sparse.csc_matrix(counts_obs)
         self._total_counts_obs = (
@@ -184,7 +184,11 @@ class Scrublet:
             if n_neighbors is None
             else n_neighbors
         )
-        self._random_state = get_random_state(random_state)
+        self._random_state = (
+            random_state
+            if isinstance(random_state, np.random.Generator)
+            else get_random_state(random_state)
+        )
 
     def simulate_doublets(
         self,
@@ -220,11 +224,15 @@ class Scrublet:
         n_obs = self._counts_obs.shape[0]
         n_sim = int(n_obs * sim_doublet_ratio)
 
-        pair_ix = sample_comb(
-            (n_obs, n_obs),
-            n_sim,
-            **_random_state_kwargs(sample_comb, self._random_state),
-        )
+        if isinstance(self._random_state, np.random.Generator):
+            flat_ix = self._random_state.choice(n_obs**2, size=n_sim, replace=False)
+            pair_ix = np.vstack(np.unravel_index(flat_ix, (n_obs, n_obs))).T
+        else:
+            pair_ix = sample_comb(
+                (n_obs, n_obs),
+                n_sim,
+                **_random_state_kwargs(sample_comb, self._random_state),
+            )
 
         E1 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 0], :])
         E2 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 1], :])
