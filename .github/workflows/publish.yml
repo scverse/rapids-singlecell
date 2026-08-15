@@ -200,6 +200,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history + tags so hatch-vcs resolves the real version.
+          # Without this, non-tag runs produce a bogus 0.1.dev1 sdist.
+          fetch-depth: 0
       - name: Build sdist
         run: pipx run build --sdist
       - uses: actions/upload-artifact@v7
