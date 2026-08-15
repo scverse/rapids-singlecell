@@ -39,7 +39,6 @@ rapids-cu13 = [
     "cuml-cu13>=25.12",
     "cugraph-cu13>=25.12",
     "cuvs-cu13>=25.12",
-    "librmm-cu13>=25.12",
 ]
 rapids-cu12 = [
     "cupy-cuda12x[ctk]",
@@ -47,7 +46,6 @@ rapids-cu12 = [
     "cuml-cu12>=25.12",
     "cugraph-cu12>=25.12",
     "cuvs-cu12>=25.12",
-    "librmm-cu12>=25.12",
 ]
 
 doc = [

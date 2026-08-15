@@ -61,7 +61,7 @@ jobs:
       - name: Set package name, extras, and CUDA archs for CUDA ${{ matrix.cuda_major }}
         run: |
           python3 - ${{ matrix.cuda_major }} "${{ matrix.cuda_archs }}" "${{ steps.version.outputs.version }}" <<'SCRIPT'
-          import sys, pathlib
+          import re, sys, pathlib
 
           cuda = sys.argv[1]
           cuda_archs = sys.argv[2]
@@ -95,6 +95,19 @@ jobs:
               'dynamic = [ "version" ]',
               f'version = "{version}"',
           )
+          # Rewrite self-referential extras (e.g. "rapids_singlecell[test-minimal]")
+          # to the renamed distribution, so `pip install rapids-singlecell-cuXX[test]`
+          # composes extras within this wheel instead of pulling the plain
+          # rapids-singlecell package from PyPI alongside it.
+          text, n_self = re.subn(
+              r'"rapids[-_]singlecell\[',
+              f'"rapids-singlecell-cu{cuda}[',
+              text,
+          )
+          print(f"rewrote {n_self} self-referential extra(s)")
+          if n_self == 0:
+              raise SystemExit("expected at least one self-referential extra to rewrite")
+
           # Rename matching extra to "rapids", remove the other
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
           text = remove_toml_array(text, f"rapids-cu{other}")
