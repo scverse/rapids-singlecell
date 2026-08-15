@@ -39,7 +39,6 @@ rapids-cu13 = [
     "cuml-cu13>=25.12",
     "cugraph-cu13>=25.12",
     "cuvs-cu13>=25.12",
-    "librmm-cu13>=25.12",
 ]
 rapids-cu12 = [
     "cupy-cuda12x[ctk]",
@@ -47,7 +46,6 @@ rapids-cu12 = [
     "cuml-cu12>=25.12",
     "cugraph-cu12>=25.12",
     "cuvs-cu12>=25.12",
-    "librmm-cu12>=25.12",
 ]
 
 doc = [
@@ -170,10 +168,10 @@ build-dir = "build"
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]
-# Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+# Exclude CUDA runtime libs provided by dependency wheels.
 # Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
 repair-wheel-command = [
-    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
+    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}",
     "pipx run abi3audit --strict --report {wheel}",
 ]
 [tool.cibuildwheel.macos]
