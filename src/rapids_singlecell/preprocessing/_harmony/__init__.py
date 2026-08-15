@@ -350,7 +350,7 @@ def harmonize(
             n_batches=n_joint_categories,
         )
 
-    empty_int = cp.empty(0, dtype=cp.int32)
+    empty_int = cats[:0]
 
     # Main harmony iterations
     is_converged = False
