@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 import cuml.internals.logger as logger
 from cuml.manifold import TSNE
 
+from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
 
 from ._utils import _choose_representation
@@ -23,7 +25,7 @@ def tsne(
     learning_rate: int = 200,
     method: str = "barnes_hut",
     metric: str = "euclidean",
-    key_added: str | None = None,
+    key_added: str | Default | None = Default(("tsne", "key_added")),
     copy: bool = False,
 ) -> AnnData | None:
     """
@@ -40,8 +42,9 @@ def tsne(
         use_rep
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
             If None, the representation is chosen automatically: For .n_vars < 50, .X
-            is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-            computed with default parameters or `n_pcs` if present.
+            is used, otherwise the PCA embedding, under whichever key the active
+            ``rapids_singlecell.settings.preset`` uses. If no PCA embedding is
+            present, it's computed with default parameters or `n_pcs` if present.
         perplexity
             The perplexity is related to the number of nearest neighbors that is used
             in other manifold learning algorithms. Larger datasets usually require a larger
@@ -86,11 +89,12 @@ def tsne(
     """
 
     adata = adata.copy() if copy else adata
+    key_added = resolve_default(key_added)
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     logger_level = _get_logger_level(logger)
-    key_uns, key_obsm = ("tsne", "X_tsne") if key_added is None else [key_added] * 2
-    adata.obsm[key_obsm] = TSNE(
+    keys = _embedding_keys("tsne", key_added)
+    adata.obsm[keys.obsm] = TSNE(
         perplexity=perplexity,
         early_exaggeration=early_exaggeration,
         learning_rate=learning_rate,
@@ -98,7 +102,7 @@ def tsne(
         metric=metric,
     ).fit_transform(X)
     logger.set_level(logger_level)
-    adata.uns[key_uns] = {
+    adata.uns[keys.uns] = {
         "params": {
             k: v
             for k, v in {

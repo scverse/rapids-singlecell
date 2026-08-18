@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
@@ -31,7 +32,7 @@ def score_genes(
     adata: AnnData,
     gene_list: Sequence[str] | pd.Index,
     *,
-    ctrl_as_ref: bool = True,
+    ctrl_as_ref: bool | Default = Default(("score_genes", "ctrl_as_ref")),
     ctrl_size: int = 50,
     gene_pool: Sequence[str] | pd.Index | None = None,
     n_bins: int = 25,
@@ -83,6 +84,7 @@ def score_genes(
     `adata.obs[score_name]` : :class:`numpy.ndarray` (dtype `float`)
         Scores of each cell.
     """
+    ctrl_as_ref = resolve_default(ctrl_as_ref)
     adata = adata.copy() if copy else adata
     use_raw = _check_use_raw(adata, layer, use_raw=use_raw)
     X = _get_obs_rep(adata, layer=layer, use_raw=use_raw)

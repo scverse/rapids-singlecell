@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import sys
-from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
+from scverse_misc import Deprecation, deprecated
+
+from rapids_singlecell._settings import Default, resolve_default, settings
 
 from ._core import _RankGenes
 
@@ -60,12 +61,15 @@ def rank_genes_groups(
     rankby_abs: bool = False,
     pts: bool = False,
     key_added: str | None = None,
-    method: _Method | None = None,
+    method: _Method | Default | None = Default(("rank_genes_groups", "method")),
     corr_method: _CorrMethod = "benjamini-hochberg",
     tie_correct: bool = False,
     use_continuity: bool = False,
     return_u_values: bool = False,
     layer: str | None = None,
+    mean_in_log_space: bool | Default = Default(
+        ("rank_genes_groups", "mean_in_log_space")
+    ),
     chunk_size: int | None = None,
     multi_gpu: bool | list[int] | str | None = None,
     n_bins: int | None = None,
@@ -157,6 +161,11 @@ def rank_genes_groups(
         approximation using the selected tie and continuity settings.
     layer
         Key from `adata.layers` whose value will be used to perform tests on.
+    mean_in_log_space
+        Whether to calculate statistics from mean-log values (`True`) or from
+        the mean after applying the inverse log1p transform (`False`). The
+        latter is more accurate in the presence of outliers. The Scanpy 1
+        preset defaults to `True`; the Scanpy 2 preview defaults to `False`.
     chunk_size
         Number of genes to process at once for `'wilcoxon'` and
         `'wilcoxon_binned'`. Default is 512 for `'wilcoxon'`. For
@@ -219,6 +228,9 @@ def rank_genes_groups(
     `adata.uns['rank_genes_groups' | key_added]['pts_rest']`
         Fraction of cells expressing genes in rest. Only if `pts=True` and `reference='rest'`.
     """
+    method = resolve_default(method)
+    mean_in_log_space = resolve_default(mean_in_log_space)
+
     if corr_method not in {"benjamini-hochberg", "bonferroni"}:
         msg = "corr_method must be either 'benjamini-hochberg' or 'bonferroni'."
         raise ValueError(msg)
@@ -231,7 +243,7 @@ def rank_genes_groups(
         raise TypeError(msg)
 
     if method is None:
-        method = "t-test"
+        method = settings.preset.rank_genes_groups.method
 
     if method not in {
         "logreg",
@@ -303,6 +315,7 @@ def rank_genes_groups(
         corr_method=corr_method,
         n_genes_user=n_genes_user,
         rankby_abs=rankby_abs,
+        mean_in_log_space=mean_in_log_space,
         tie_correct=tie_correct,
         use_continuity=use_continuity,
         return_u_values=return_u_values,
@@ -320,6 +333,7 @@ def rank_genes_groups(
         "use_raw": use_raw,
         "layer": layer,
         "corr_method": corr_method,
+        "mean_in_log_space": mean_in_log_space,
     }
     if method == "wilcoxon":
         params["tie_correct"] = tie_correct
@@ -348,20 +362,7 @@ def rank_genes_groups(
     return None
 
 
-if TYPE_CHECKING:
-    from warnings import deprecated
-else:
-    if sys.version_info >= (3, 13):
-        from warnings import deprecated as _deprecated
-    else:
-        from typing_extensions import deprecated as _deprecated
-    deprecated = partial(_deprecated, category=FutureWarning)
-
-
-@deprecated(
-    "rank_genes_groups_logreg is deprecated. "
-    "Use rank_genes_groups(method='logreg') instead."
-)
+@deprecated(Deprecation("0.14.1", "Use `rank_genes_groups(method='logreg')` instead."))
 def rank_genes_groups_logreg(
     adata: AnnData,
     groupby: str,

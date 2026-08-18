@@ -10,7 +10,6 @@ from scanpy.datasets import pbmc3k, pbmc3k_processed
 from scipy import sparse
 
 import rapids_singlecell as rsc
-from rapids_singlecell.preprocessing._pca import _empty, _resolve_mask_var
 from rapids_singlecell.preprocessing._sparse_pca._block_lanczos import randomized_svd
 from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import lanczos_svd
 
@@ -493,31 +492,26 @@ def test_mask_defaults(float_dtype):
     assert np.array_equal(without_var.obsm["X_pca"], with_no_mask.obsm["X_pca"])
 
 
-def test_resolve_mask_var_deprecation_warning():
-    """use_highly_variable triggers FutureWarning."""
-    adata = AnnData(np.zeros((3, 5)))
+def _mask_var_adata() -> AnnData:
+    adata = AnnData(np.random.default_rng(0).normal(size=(20, 5)).astype(np.float32))
     adata.var["highly_variable"] = [True, True, False, False, True]
-
-    with pytest.warns(FutureWarning, match="use_highly_variable.*deprecated"):
-        name, arr = _resolve_mask_var(adata, mask_var=_empty, use_highly_variable=True)
-    assert name == "highly_variable"
-    assert arr is not None
+    return adata
 
 
-def test_resolve_mask_var_conflict():
-    """Passing both mask_var and use_highly_variable raises ValueError."""
-    adata = AnnData(np.zeros((3, 5)))
-    with pytest.raises(ValueError, match="Cannot specify both"):
-        _resolve_mask_var(adata, mask_var="highly_variable", use_highly_variable=True)
+def test_mask_var_default_uses_highly_variable():
+    """The default picks up `.var['highly_variable']` when it exists."""
+    adata = _mask_var_adata()
+    rsc.pp.pca(adata, n_comps=2)
+    assert adata.uns["pca"]["params"]["mask_var"] == "highly_variable"
 
 
-def test_resolve_mask_var_ndarray():
-    """Passing an ndarray mask_var returns None name and the array."""
-    adata = AnnData(np.zeros((3, 5)))
+def test_mask_var_ndarray():
+    """Passing an ndarray mask_var records no name and masks the loadings."""
+    adata = _mask_var_adata()
     mask = np.array([True, False, True, False, True])
-    name, arr = _resolve_mask_var(adata, mask_var=mask, use_highly_variable=None)
-    assert name is None
-    assert arr is mask
+    rsc.pp.pca(adata, n_comps=2, mask_var=mask)
+    assert adata.uns["pca"]["params"]["mask_var"] is None
+    assert np.array_equal(adata.varm["PCs"][~mask], np.zeros((2, 2)))
 
 
 # =============================================================================

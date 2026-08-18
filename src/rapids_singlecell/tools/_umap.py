@@ -13,6 +13,8 @@ from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
 
 from rapids_singlecell._compat import _rng_kwargs
+from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
 from rapids_singlecell._utils._random import (
     RNGLike,
@@ -44,7 +46,7 @@ def umap(
     rng: SeedLike | RNGLike | None = None,
     a: float | None = None,
     b: float | None = None,
-    key_added: str | None = None,
+    key_added: str | Default | None = Default(("umap", "key_added")),
     neighbors_key: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
@@ -138,6 +140,7 @@ def umap(
     rng = np.random.default_rng(rng)
 
     adata = adata.copy() if copy else adata
+    key_added = resolve_default(key_added)
 
     if neighbors_key is None:
         neighbors_key = "neighbors"
@@ -246,8 +249,8 @@ def umap(
         logger.set_level(logger_level)
         X_umap = cp.asarray(X_umap).get()
 
-    key_obsm, key_uns = ("X_umap", "umap") if key_added is None else [key_added] * 2
-    adata.obsm[key_obsm] = X_umap
+    keys = _embedding_keys("umap", key_added)
+    adata.obsm[keys.obsm] = X_umap
 
-    adata.uns[key_uns] = {"params": stored_params}
+    adata.uns[keys.uns] = {"params": stored_params}
     return adata if copy else None

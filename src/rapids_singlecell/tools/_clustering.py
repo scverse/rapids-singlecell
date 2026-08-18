@@ -12,6 +12,7 @@ from natsort import natsorted
 from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 
+from rapids_singlecell._keys import _resolve_obsm_key
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
@@ -503,9 +504,9 @@ def kmeans(
             Use this many PCs. If `n_pcs==0` use `.X` if `use_rep is None`.
         use_rep
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
-            If None, the representation is chosen automatically: For .n_vars < 50, .X
-            is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-            computed with default parameters or `n_pcs` if present.
+            Either spelling of the PCA key resolves to whichever one the data
+            actually uses, so the default works under any
+            ``rapids_singlecell.settings.preset``.
         n_init
             Number of initializations to run the KMeans algorithm
         rng
@@ -525,6 +526,7 @@ def kmeans(
     from cuml.cluster import KMeans
 
     adata = adata.copy() if copy else adata
+    use_rep = _resolve_obsm_key(adata, use_rep)
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
 
     kmeans_out = KMeans(
