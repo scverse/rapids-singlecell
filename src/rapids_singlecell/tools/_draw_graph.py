@@ -8,6 +8,8 @@ import numpy as np
 from scanpy.tools._utils import get_init_pos_from_paga
 
 from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell._settings import Default, resolve_default
 
 from ._clustering import _create_graph
 from ._utils import _validate_init_pos
@@ -22,6 +24,7 @@ def draw_graph(
     init_pos: str | bool | None = None,
     max_iter: int = 500,
     random_state: int | None = 0,
+    key_added: str | Default | None = Default(("draw_graph", "key_added")),
 ) -> None:
     """
     Force-directed graph drawing :cite:p:`Fruchterman1991,Jacomy2014`.
@@ -49,6 +52,8 @@ def draw_graph(
             Random state to use when initializing layout and generating
             samples. Defaults to 0. If `None` is passed, a hash of process id,
             time, and hostname is used by `cugraph`.
+        key_added
+            Template controlling where coordinates and parameters are stored.
 
     Returns
     -------
@@ -110,7 +115,7 @@ def draw_graph(
     positions = positions.sort_values("vertex").reset_index(drop=True)
     positions = cp.vstack((positions["x"].to_cupy(), positions["y"].to_cupy())).T
     layout = "fa"
-    adata.uns["draw_graph"] = {}
-    adata.uns["draw_graph"]["params"] = {"layout": layout, "random_state": random_state}
-    key_added = f"X_draw_graph_{layout}"
-    adata.obsm[key_added] = positions.get()  # Format output
+    key_added = resolve_default(key_added)
+    keys = _embedding_keys("draw_graph", key_added, layout=layout)
+    adata.uns[keys.uns] = {"params": {"layout": layout, "random_state": random_state}}
+    adata.obsm[keys.obsm] = positions.get()  # Format output
