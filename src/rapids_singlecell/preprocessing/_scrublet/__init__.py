@@ -180,7 +180,7 @@ def scrublet(
             # HVG process needs log'd data.
 
             ad_obs.layers["logged"] = pp.log1p(ad_obs, inplace=False)
-            pp.highly_variable_genes(ad_obs, layer="logged")
+            pp.highly_variable_genes(ad_obs, layer="logged", flavor="seurat")
             del ad_obs.layers["logged"]
             ad_obs = ad_obs[:, ad_obs.var["highly_variable"]].copy()
 

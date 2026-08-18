@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._keys import _harmony_obsm_key, _resolve_obsm_key
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
@@ -17,7 +19,7 @@ def harmony_integrate(
     key: str | list[str],
     *,
     basis: str = "X_pca",
-    adjusted_basis: str = "X_pca_harmony",
+    adjusted_basis: str | None = None,
     dtype: type = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
@@ -66,8 +68,14 @@ def harmony_integrate(
         the desired columns into one categorical column and pass that single key.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
+        Either spelling of the PCA key resolves to whichever one the data
+        actually uses, so the default works under any
+        ``rapids_singlecell.settings.preset``.
     adjusted_basis
-        The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
+        The name of the field in ``adata.obsm`` where the adjusted PCA table will be
+        stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows
+        the naming of the basis it corrected (``"X_pca"`` gives
+        ``"X_pca_harmony"``, ``"pca"`` gives ``"pca_harmony"``).
     dtype
         The data type to use for Harmony computation. Defaults to 32-bit, which
         agrees with the 64-bit result to a Pearson correlation of >0.999 per
@@ -198,6 +206,10 @@ def harmony_integrate(
                 UserWarning,
                 stacklevel=2,
             )
+
+    basis = _resolve_obsm_key(adata, basis)
+    if adjusted_basis is None:
+        adjusted_basis = _harmony_obsm_key(basis)
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:

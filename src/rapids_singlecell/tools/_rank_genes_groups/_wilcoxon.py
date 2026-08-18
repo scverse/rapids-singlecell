@@ -63,13 +63,10 @@ def _choose_wilcoxon_chunk_size(requested: int | None, n_genes: int) -> int:
 
 def _device_wilcoxon_sums(rg: _RankGenes) -> tuple[cp.ndarray, cp.ndarray | None]:
     """Compute only the device sums needed for Wilcoxon log-fold changes."""
-    agg = Aggregate(groupby=rg.labels.cat, data=rg.X)
+    agg = Aggregate(groupby=rg._aggregation_groupby, data=rg.X)
     sums_all = agg.count_mean_var({"sum"}, dof=1)["sum"]
 
-    cat_names = list(rg.labels.cat.categories)
-    cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
-    order = [cat_to_idx[str(name)] for name in rg.groups_order]
-    group_sums = sums_all[order]
+    group_sums = sums_all[: len(rg.groups_order)]
     total_sums = sums_all.sum(axis=0, keepdims=True) if rg.ireference is None else None
     return group_sums, total_sums
 
@@ -108,13 +105,17 @@ def _logfoldchanges_from_means(
     mean_group: cp.ndarray,
     mean_reference: cp.ndarray,
 ) -> cp.ndarray:
-    scale = (
-        cp.float64(np.log(rg._log1p_base))
-        if rg._log1p_base is not None
-        else cp.float64(1.0)
-    )
-    group_expr = cp.expm1(mean_group * scale)
-    reference_expr = cp.expm1(mean_reference * scale)
+    if rg.mean_in_log_space:
+        scale = (
+            cp.float64(np.log(rg._log1p_base))
+            if rg._log1p_base is not None
+            else cp.float64(1.0)
+        )
+        group_expr = cp.expm1(mean_group * scale)
+        reference_expr = cp.expm1(mean_reference * scale)
+    else:
+        group_expr = mean_group
+        reference_expr = mean_reference
     return cp.log2((group_expr + EPS) / (reference_expr + EPS))
 
 
