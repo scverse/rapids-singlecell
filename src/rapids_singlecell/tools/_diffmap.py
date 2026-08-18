@@ -3,12 +3,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
+import numpy as np
 from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import linalg
 from scipy.sparse import issparse
 
 from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+)
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -107,6 +113,7 @@ def _compute_eigen(
     *,
     n_comps: int = 15,
     sort: Literal["decrease", "increase"] = "decrease",
+    rng: np.random.Generator,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Eigendecomposition of the transition matrix.
 
@@ -119,6 +126,8 @@ def _compute_eigen(
     sort
         Sort eigenvalues in ``"decrease"`` (default) or ``"increase"``
         order.
+    rng
+        Random generator seeding the Lanczos start vector.
 
     Returns
     -------
@@ -130,7 +139,9 @@ def _compute_eigen(
         n_comps = min(transitions_sym.shape[0] - 1, n_comps)
         which = "LM" if sort == "decrease" else "SM"
         matrix = transitions_sym.astype(cp.float64)
-        evals, evecs = linalg.eigsh(matrix, k=n_comps, which=which)
+        # Setting the random initial vector, like scanpy
+        v0 = cp.asarray(rng.standard_normal(matrix.shape[0]), dtype=cp.float64)
+        evals, evecs = linalg.eigsh(matrix, k=n_comps, which=which, v0=v0)
         evals, evecs = evals.astype(cp.float32), evecs.astype(cp.float32)
 
     if sort == "decrease":
@@ -140,6 +151,7 @@ def _compute_eigen(
     return evals, evecs
 
 
+@_accepts_legacy_random_state(0)
 def diffmap(
     adata: AnnData,
     n_comps: int = 15,
@@ -148,6 +160,7 @@ def diffmap(
     key_added: str | Default | None = Default(("diffmap", "key_added")),
     sort: Literal["decrease", "increase"] = "decrease",
     density_normalize: bool = True,
+    rng: SeedLike | RNGLike | None = None,
 ) -> None:
     """
     Diffusion Maps :cite:p:`Coifman2005,Haghverdi2015`.
@@ -174,6 +187,9 @@ def diffmap(
         Leave as is for the same behavior as :func:`scanpy.tl.diffmap`.
     key_added
         Control where the embedding and eigenvalues are stored.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
 
     Returns
     -------
@@ -186,11 +202,12 @@ def diffmap(
         Array of size (number of eigen vectors).
         Eigenvalues of transition matrix.
     """
+    rng = np.random.default_rng(rng)
     connectivities = _load_connectivities(adata, neighbors_key)
     transitions_sym, _Z = _compute_transitions(
         connectivities, density_normalize=density_normalize
     )
-    evals, evecs = _compute_eigen(transitions_sym, n_comps=n_comps, sort=sort)
+    evals, evecs = _compute_eigen(transitions_sym, n_comps=n_comps, sort=sort, rng=rng)
 
     key_added = resolve_default(key_added)
     keys = _embedding_keys("diffmap", key_added)
