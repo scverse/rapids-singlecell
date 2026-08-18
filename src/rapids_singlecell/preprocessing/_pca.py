@@ -16,7 +16,6 @@ from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
-    _seed_from_rng,
 )
 from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
@@ -173,7 +172,7 @@ def pca(
     chunked
         If `True`, perform an incremental PCA on segments of `chunk_size`.
         The incremental PCA automatically zero centers and ignores settings of
-        `random_seed` and `svd_solver`. If `False`, perform a full PCA.
+        `rng` and `svd_solver`. If `False`, perform a full PCA.
 
     chunk_size
         Number of observations to include in each chunk.
@@ -224,7 +223,7 @@ def pca(
                 Explained variance, equivalent to the eigenvalues of the \
                 covariance matrix.
     """
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
 
     if not isinstance(data, AnnData):
         if layer is not None:
@@ -241,7 +240,7 @@ def pca(
             n_comps,
             zero_center=zero_center,
             svd_solver=svd_solver,
-            random_state=random_state,
+            rng=rng,
             chunked=chunked,
             chunk_size=chunk_size,
             dtype=dtype,
@@ -279,7 +278,7 @@ def pca(
         n_comps,
         zero_center=zero_center,
         svd_solver=svd_solver,
-        random_state=random_state,
+        rng=rng,
         chunked=chunked,
         chunk_size=chunk_size,
         dtype=dtype,
@@ -316,7 +315,7 @@ def _pca_compute(
     *,
     zero_center: bool,
     svd_solver: str | None,
-    random_state: int | None,
+    rng: np.random.Generator,
     chunked: bool,
     chunk_size: int | None,
     dtype: str,
@@ -371,7 +370,7 @@ def _pca_compute(
                     n_comps,
                     svd_solver,
                     zero_center=zero_center,
-                    random_state=random_state,
+                    rng=rng,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
                 )
@@ -388,7 +387,7 @@ def _pca_compute(
                     n_comps,
                     svd_solver,
                     zero_center=zero_center,
-                    random_state=random_state,
+                    rng=rng,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
                 )
@@ -432,7 +431,7 @@ def _run_sparse_svd_pca(
     svd_solver,
     *,
     zero_center: bool = True,
-    random_state: int = 0,
+    rng: np.random.Generator,
     n_oversamples: int | None = None,
     n_iter: int | None = None,
 ):
@@ -451,7 +450,7 @@ def _run_sparse_svd_pca(
         "n_components": n_comps,
         "svd_solver": svd_solver,
         "zero_center": zero_center,
-        "random_state": random_state,
+        "rng": rng,
     }
     if n_oversamples is not None:
         kwargs["n_oversamples"] = n_oversamples

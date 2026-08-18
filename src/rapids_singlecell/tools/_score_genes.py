@@ -13,8 +13,7 @@ from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
-    _LegacyRng,
-    _seed_from_rng,
+    _if_legacy_apply_global,
 )
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep
 from rapids_singlecell.preprocessing._utils import _check_gpu_X, _check_use_raw
@@ -89,12 +88,8 @@ def score_genes(
     X = _get_obs_rep(adata, layer=layer, use_raw=use_raw)
     X = X_to_GPU(X)
     _check_gpu_X(X, allow_dask=True)
-    sample_rng = None
-    if isinstance(rng, _LegacyRng):
-        if rng.arg is not None:
-            np.random.seed(_seed_from_rng(rng))
-    else:
-        sample_rng = np.random.default_rng(rng)
+    rng = np.random.default_rng(rng)
+    rng = _if_legacy_apply_global(rng)
 
     var_names = adata.raw.var_names if use_raw else adata.var_names
     gene_list, gene_pool = _check_score_genes_args(var_names, gene_list, gene_pool)
@@ -108,7 +103,7 @@ def score_genes(
         ctrl_as_ref=ctrl_as_ref,
         ctrl_size=ctrl_size,
         n_bins=n_bins,
-        sample_rng=sample_rng,
+        rng=rng,
     ):
         control_genes = control_genes.union(r_genes)
 
@@ -171,7 +166,7 @@ def _score_genes_bins(
     ctrl_as_ref: bool,
     ctrl_size: int,
     n_bins: int,
-    sample_rng: np.random.Generator | None = None,
+    rng: np.random.Generator,
 ) -> Generator[pd.Index[str], None, None]:
     # average expression of genes
     idx = cp.array(var_names.isin(gene_pool), dtype=cp.bool_)
@@ -189,9 +184,9 @@ def _score_genes_bins(
 
     # now pick `ctrl_size` genes from every cut
     cuts = np.unique(obs_cut.loc[gene_list])
-    # spawn a sub-rng per cut, like scanpy, so this stays parallelizable
-    sub_rngs = [None] * len(cuts) if sample_rng is None else sample_rng.spawn(len(cuts))
-    for cut, sub_rng in zip(cuts, sub_rngs, strict=True):
+    # spawn sub-rngs so this can maybe be parallelized without changing random
+    # number generation
+    for cut, sub_rng in zip(cuts, rng.spawn(len(cuts)), strict=True):
         r_genes: pd.Index[str] = obs_cut[(obs_cut == cut) & ~keep_ctrl_in_obs_cut].index
         if len(r_genes) == 0:
             msg = (

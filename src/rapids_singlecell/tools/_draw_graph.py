@@ -7,11 +7,12 @@ import cupy as cp
 import numpy as np
 from scanpy.tools._utils import get_init_pos_from_paga
 
-from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._compat import _rng_kwargs
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
+    _LegacyRng,
     _seed_from_rng,
 )
 
@@ -66,7 +67,8 @@ def draw_graph(
             X_draw_graph_layout_fa : `adata.obsm`
                 Coordinates of graph layout.
     """
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
     from cugraph.layout import force_atlas2
 
@@ -78,12 +80,9 @@ def draw_graph(
         case str() if init_pos in adata.obsm:
             init_coords = adata.obsm[init_pos]
         case str() if init_pos == "paga":
-            if random_state is None:
-                random_state = np.random.default_rng()
             init_coords = get_init_pos_from_paga(
                 adata,
-                **_random_state_kwargs(get_init_pos_from_paga, random_state),
-                neighbors_key="connectivities",
+                **_rng_kwargs(get_init_pos_from_paga, rng),
             )
         case _:
             init_coords = init_pos
@@ -116,12 +115,13 @@ def draw_graph(
         scaling_ratio=2.0,
         strong_gravity_mode=False,
         gravity=1.0,
-        random_state=random_state,
+        # cuGraph's force atlas is seeded, so draw the seed right here
+        random_state=_seed_from_rng(rng),
     )
     positions = positions.sort_values("vertex").reset_index(drop=True)
     positions = cp.vstack((positions["x"].to_cupy(), positions["y"].to_cupy())).T
     layout = "fa"
     adata.uns["draw_graph"] = {}
-    adata.uns["draw_graph"]["params"] = {"layout": layout, "random_state": random_state}
+    adata.uns["draw_graph"]["params"] = {"layout": layout, **meta_random_state}
     key_added = f"X_draw_graph_{layout}"
     adata.obsm[key_added] = positions.get()  # Format output

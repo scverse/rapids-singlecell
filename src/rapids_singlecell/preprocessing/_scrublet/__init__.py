@@ -22,19 +22,7 @@ from . import pipeline
 from .core import Scrublet
 
 if TYPE_CHECKING:
-    from rapids_singlecell._utils import AnyRandom
     from rapids_singlecell.preprocessing._neighbors import _Metrics
-
-
-type _ScrubletRandom = int | np.random.RandomState | np.random.Generator | None
-
-
-def _normalize_scrublet_rng(
-    rng: SeedLike | RNGLike | _LegacyRng | None, /
-) -> _ScrubletRandom:
-    if isinstance(rng, _LegacyRng):
-        return rng.arg
-    return np.random.default_rng(rng)
 
 
 @_accepts_legacy_random_state(0)
@@ -175,7 +163,7 @@ def scrublet(
         scores for observed transcriptomes and simulated doublets.
     """
 
-    rng = _normalize_scrublet_rng(rng)
+    rng = np.random.default_rng(rng)
 
     if copy:
         adata = adata.copy()
@@ -188,7 +176,7 @@ def scrublet(
         ad_obs: AnnData,
         ad_sim: AnnData | None = None,
         *,
-        rng: _ScrubletRandom,
+        rng: np.random.Generator,
     ):
         # With no adata_sim we assume the regular use case, starting with raw
         # counts and simulating doublets
@@ -214,17 +202,12 @@ def scrublet(
             # Simulate the doublets based on the raw expressions from the normalised
             # and filtered object.
 
-            simulation_rng = (
-                {"rng": rng}
-                if isinstance(rng, np.random.Generator)
-                else {"random_state": rng}
-            )
             ad_sim = scrublet_simulate_doublets(
                 ad_obs,
                 layer="raw",
                 sim_doublet_ratio=sim_doublet_ratio,
                 synthetic_doublet_umi_subsampling=synthetic_doublet_umi_subsampling,
-                **simulation_rng,
+                rng=rng,
             )
 
             if log_transform:
@@ -249,7 +232,7 @@ def scrublet(
             knn_dist_metric=knn_dist_metric,
             get_doublet_neighbor_parents=get_doublet_neighbor_parents,
             threshold=threshold,
-            random_state=rng,
+            rng=rng,
             verbose=verbose,
         )
 
@@ -265,11 +248,9 @@ def scrublet(
         # scrublet-relevant parts of the objects to add to the input object
 
         batches = np.unique(adata.obs[batch_key])
-        sub_rngs = (
-            rng.spawn(len(batches))
-            if isinstance(rng, np.random.Generator)
-            else [rng] * len(batches)
-        )
+        # spawn sub-rngs so this can maybe be parallelized without changing
+        # random number generation
+        sub_rngs = rng.spawn(len(batches))
         scrubbed = [
             _run_scrublet(
                 adata_obs[adata_obs.obs[batch_key] == batch].copy(),
@@ -324,7 +305,7 @@ def _scrublet_call_doublets(
     knn_dist_metric: _Metrics = "euclidean",
     get_doublet_neighbor_parents: bool = False,
     threshold: float | None = None,
-    random_state: AnyRandom | np.random.Generator = 0,
+    rng: np.random.Generator,
     verbose: bool = True,
 ) -> AnnData:
     """\
@@ -381,8 +362,8 @@ def _scrublet_call_doublets(
         practice to check the threshold visually using the
         `doublet_scores_sim_` histogram and/or based on co-localization of
         predicted doublets in a 2-D embedding.
-    random_state
-        Initial state for doublet simulation and nearest neighbors.
+    rng
+        Random generator for doublet simulation and nearest neighbors.
     verbose
         If :data:`True`, log progress updates.
 
@@ -406,11 +387,7 @@ def _scrublet_call_doublets(
         Dictionary of Scrublet parameters
     """
 
-    meta_random_state = (
-        {}
-        if isinstance(random_state, np.random.Generator)
-        else {"random_state": random_state}
-    )
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
     # Estimate n_neighbors if not provided, and create scrublet object.
 
@@ -425,7 +402,7 @@ def _scrublet_call_doublets(
         n_neighbors=n_neighbors,
         expected_doublet_rate=expected_doublet_rate,
         stdev_doublet_rate=stdev_doublet_rate,
-        random_state=random_state,
+        rng=rng,
     )
     del scrub._counts_obs
     # Ensure normalised matrix sparseness as Scrublet does
@@ -451,12 +428,10 @@ def _scrublet_call_doublets(
 
     if mean_center:
         logg.info("Embedding transcriptomes using PCA...")
-        pipeline.pca(scrub, n_prin_comps=n_prin_comps, random_state=scrub._random_state)
+        pipeline.pca(scrub, n_prin_comps=n_prin_comps)
     else:
         logg.info("Embedding transcriptomes using Truncated SVD...")
-        pipeline.truncated_svd(
-            scrub, n_prin_comps=n_prin_comps, random_state=scrub._random_state
-        )
+        pipeline.truncated_svd(scrub, n_prin_comps=n_prin_comps)
 
     # Score the doublets
 
@@ -542,6 +517,9 @@ def scrublet_simulate_doublets(
         sampled observed transcriptomes. For values less than 1, the
         UMI counts are added and then randomly sampled at the specified
         rate.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for doublet simulation.
+        The superseded `random_state` argument is still accepted.
 
     Returns
     -------
@@ -562,10 +540,10 @@ def scrublet_simulate_doublets(
         scores for observed transcriptomes and simulated doublets.
     """
 
-    rng = _normalize_scrublet_rng(rng)
+    rng = np.random.default_rng(rng)
 
     X = _get_obs_rep(adata, layer=layer)
-    scrub = Scrublet(X, random_state=rng)
+    scrub = Scrublet(X, rng=rng)
 
     scrub.simulate_doublets(
         sim_doublet_ratio=sim_doublet_ratio,

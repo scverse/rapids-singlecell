@@ -28,27 +28,31 @@ def _meta_sparse_csc_cpu(dtype):
     return csc_matrix_cpu(np.array((1.0,), dtype=dtype))
 
 
-def _random_state_kwargs(
-    func: object,
-    seed: int | np.random.RandomState,
+def _rng_kwargs(
+    func: object, rng: np.random.Generator, *, always_state: bool = False
 ) -> dict:
-    """Build ``random_state=`` or ``rng=`` kwargs depending on the scanpy version.
+    """Build ``rng=`` or ``random_state=`` kwargs for the Scanpy version.
 
-    Scanpy >= 1.13 replaced the ``random_state`` parameter with ``rng``
-    (a ``numpy.random.Generator``) on several internal helpers.  This function
-    inspects the target callable and returns the right keyword dict so that
-    rapids_singlecell works with both old and new scanpy.
-
-    When the new API is detected we wrap the seed in scanpy's ``_LegacyRng``
-    so that functions like ``sample_comb`` fall back to sklearn's
-    ``sample_without_replacement``, preserving the same random stream as the
-    old ``random_state`` code path.
+    Stateful legacy consumers such as ``sample_comb`` opt into sharing the
+    wrapped ``RandomState``. Seed-based consumers use a scalar fallback.
     """
     import inspect
 
-    sig = inspect.signature(func)
-    if "rng" in sig.parameters:
-        from scanpy._utils.random import _LegacyRng
+    from rapids_singlecell._utils._random import (
+        _legacy_random_state,
+        _LegacyRng,
+        _seed_from_rng,
+    )
 
-        return {"rng": _LegacyRng(seed)}
-    return {"random_state": seed}
+    if "rng" not in inspect.signature(func).parameters:
+        random_state = (
+            _legacy_random_state(rng, always_state=True)
+            if always_state
+            else _seed_from_rng(rng)
+        )
+        return {"random_state": random_state}
+    if not always_state or not isinstance(rng, _LegacyRng):
+        return {"rng": rng}
+    from scanpy._utils.random import _LegacyRng as _ScanpyLegacyRng
+
+    return {"rng": _ScanpyLegacyRng(rng.state)}

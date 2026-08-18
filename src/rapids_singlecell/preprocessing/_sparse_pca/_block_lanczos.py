@@ -13,9 +13,16 @@ Key optimizations:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import cupy as cp
 import cupyx.scipy.linalg as cpla
 import cupyx.scipy.sparse as cpsparse
+
+from rapids_singlecell._utils._random import _seed_from_rng
+
+if TYPE_CHECKING:
+    from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 
 def _matvec(A, V):
@@ -106,7 +113,7 @@ def randomized_svd(
     *,
     n_oversamples: int = 10,
     n_iter: int = 2,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """
     Compute truncated SVD using randomized algorithm with GPU optimizations.
@@ -127,8 +134,8 @@ def randomized_svd(
     n_iter
         Number of power iterations. More iterations improve accuracy
         for matrices with slowly decaying singular values.
-    random_state
-        Random seed for reproducibility.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
 
     Returns
     -------
@@ -149,7 +156,9 @@ def randomized_svd(
     """
     m, n = A.shape
     dtype = A.dtype
-    rng = cp.random.RandomState(random_state if random_state is not None else 0)
+    # CuPy generators are seeded, so this is where the host generator
+    # collapses into an integer.
+    rng = cp.random.default_rng(_seed_from_rng(rng, allow_none=False))
 
     # Block size = k + oversamples, but cannot exceed matrix dimensions
     block_size = min(k + n_oversamples, m, n)

@@ -10,7 +10,6 @@ from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
-    _seed_from_rng,
 )
 
 if TYPE_CHECKING:
@@ -178,7 +177,7 @@ def harmony_integrate(
     containing principal components adjusted by Harmony
     such that different experiments are integrated.
     """
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
 
     from ._harmony import harmonize
 
@@ -270,7 +269,7 @@ def harmony_integrate(
         tau=tau,
         correction_method=correction_method,
         colsum_algo=colsum_algo,
-        random_state=random_state,
+        rng=rng,
         stabilized_penalty=stabilized_penalty,
         dynamic_lambda=dynamic_lambda,
         alpha=alpha,

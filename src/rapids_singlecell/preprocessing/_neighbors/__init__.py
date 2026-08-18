@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, get_args
+from warnings import warn
 
 import cupy as cp
 import numpy as np
@@ -10,7 +11,7 @@ from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
-    _seed_from_rng,
+    _LegacyRng,
 )
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
@@ -20,7 +21,6 @@ from rapids_singlecell.preprocessing._neighbors._helper import (
 )
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     KNN_ALGORITHMS,
-    AnyRandom,
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
@@ -37,8 +37,10 @@ _Algorithms_bbknn = Literal[
     "brute", "cagra", "ivfflat", "ivfpq", "mg_ivfflat", "mg_ivfpq"
 ]
 
+_DEFAULT_SEED = 0
 
-@_accepts_legacy_random_state(0)
+
+@_accepts_legacy_random_state(_DEFAULT_SEED)
 def neighbors(
     adata: AnnData,
     n_neighbors: int = 15,
@@ -182,7 +184,16 @@ def neighbors(
             neighbors.
 
     """
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+    if method != "umap" and meta_random_state.get("random_state") != _DEFAULT_SEED:
+        # `random_state` different from default (or any `rng`) was passed, but
+        # only the UMAP connectivities are randomized.
+        warn(
+            f"Parameter `rng`/`random_state` ignored if `method={method!r}`.",
+            UserWarning,
+        )
+        meta_random_state.pop("random_state", None)
 
     adata = adata.copy() if copy else adata
 
@@ -212,7 +223,7 @@ def neighbors(
     params = dict(
         n_neighbors=n_neighbors,
         method="rapids",
-        random_state=random_state,
+        **meta_random_state,
         metric=metric,
         **({"metric_kwds": metric_kwds} if metric_kwds else {}),
         **({"algorithm_kwds": algorithm_kwds} if algorithm_kwds else {}),
@@ -227,7 +238,7 @@ def neighbors(
         knn_dist,
         n_obs=n_obs,
         n_neighbors=n_neighbors,
-        random_state=random_state,
+        rng=rng,
         metric=metric,
         method=method,
     )
@@ -256,7 +267,7 @@ def neighbors(
     return adata if copy else None
 
 
-@_accepts_legacy_random_state(0)
+@_accepts_legacy_random_state(_DEFAULT_SEED)
 def bbknn(
     adata: AnnData,
     neighbors_within_batch: int = 3,
@@ -371,7 +382,8 @@ def bbknn(
     connectivities and distances.
     """
 
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
     if batch_key is None:
         raise ValueError("Please provide a batch key to perform batch-balanced KNN.")
@@ -435,7 +447,7 @@ def bbknn(
     params = dict(
         n_neighbors=total_neighbors,
         method="rapids",
-        random_state=random_state,
+        **meta_random_state,
         metric=metric,
         trim=trim,
         **({"metric_kwds": metric_kwds} if metric_kwds else {}),
@@ -450,7 +462,7 @@ def bbknn(
         knn_dist,
         n_obs=n_obs,
         n_neighbors=total_neighbors,
-        random_state=random_state,
+        rng=rng,
         metric=metric,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:

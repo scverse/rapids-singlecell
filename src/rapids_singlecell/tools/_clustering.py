@@ -16,6 +16,7 @@ from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
+    _LegacyRng,
     _seed_from_rng,
 )
 
@@ -221,7 +222,8 @@ def leiden(
     """
     # Adjacency graph
 
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
     adata = adata.copy() if copy else adata
 
@@ -256,7 +258,8 @@ def leiden(
             leiden_parts, modularity = culeiden(
                 g,
                 resolution=resolution,
-                random_state=random_state,
+                # cuGraph's leiden is seeded, so draw the seed right here
+                random_state=_seed_from_rng(rng),
                 theta=theta,
                 max_iter=n_iterations,
             )
@@ -301,7 +304,7 @@ def leiden(
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
         "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
-        "random_state": random_state,
+        **meta_random_state,
         "n_iterations": n_iterations,
     }
     adata.uns[key_added]["modularity"] = (
@@ -517,7 +520,7 @@ def kmeans(
             Additional keyword arguments for KMeans.
 
     """
-    random_state = _seed_from_rng(rng)
+    rng = np.random.default_rng(rng)
 
     from cuml.cluster import KMeans
 
@@ -525,7 +528,11 @@ def kmeans(
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
 
     kmeans_out = KMeans(
-        n_clusters=n_clusters, n_init=n_init, random_state=random_state, **kwargs
+        # cuML's KMeans is seeded, so draw the seed right here
+        n_clusters=n_clusters,
+        n_init=n_init,
+        random_state=_seed_from_rng(rng),
+        **kwargs,
     ).fit(X)
     groups = kmeans_out.labels_
 

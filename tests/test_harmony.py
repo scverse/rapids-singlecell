@@ -129,11 +129,16 @@ def test_harmony_stratified_sample_random_offsets_and_groups(layout_seed):
 
     targets = [nonempty.size, max(nonempty.size, n_cells // 3), n_cells]
     for n_target in targets:
+        # a fresh generator per call: same seed, same sample
         sampled = cp.asnumpy(
-            _stratified_sample_indices(gpu_offsets, gpu_indices, n_target, 17)
+            _stratified_sample_indices(
+                gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)
+            )
         )
         repeated = cp.asnumpy(
-            _stratified_sample_indices(gpu_offsets, gpu_indices, n_target, 17)
+            _stratified_sample_indices(
+                gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)
+            )
         )
 
         assert sampled.size == n_target
@@ -157,7 +162,9 @@ def test_harmony_stratified_sample_known_quotas():
     cell_indices = cp.asarray([12, 7, 15, 1, 10, 4, 13, 2, 14, 9, 0, 11, 5, 8, 3, 6])
     cell_groups = np.array([5, 3, 3, 5, 3, 5, 5, 2, 5, 5, 3, 5, 1, 3, 5, 2])
 
-    sampled = cp.asnumpy(_stratified_sample_indices(offsets, cell_indices, 9, 0))
+    sampled = cp.asnumpy(
+        _stratified_sample_indices(offsets, cell_indices, 9, np.random.default_rng(0))
+    )
     counts = np.bincount(cell_groups[sampled], minlength=6)
 
     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
@@ -730,3 +737,22 @@ def test_harmony2_ircolitis_reference(
 
     assert _get_measure(ref, result, "r").min() > 0.95
     assert _get_measure(ref, result, "L2").max() < 0.1
+
+
+def test_harmony_unseeded_random_state():
+    """``random_state=None`` means unseeded, not a crash."""
+    rng = np.random.default_rng(734)
+    batch = np.resize(["a", "b", "c"], 60)
+    adata = ad.AnnData(
+        X=None,
+        obs=pd.DataFrame(
+            {"batch": batch}, index=[f"cell_{index}" for index in range(60)]
+        ),
+        obsm={"X_pca": rng.normal(size=(60, 6)).astype(np.float32)},
+    )
+
+    rsc.pp.harmony_integrate(
+        adata, "batch", n_clusters=3, max_iter_harmony=1, random_state=None
+    )
+
+    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()

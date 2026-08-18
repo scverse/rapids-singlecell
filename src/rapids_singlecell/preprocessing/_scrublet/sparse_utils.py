@@ -6,10 +6,9 @@ import cupy as cp
 import numpy as np
 from cupyx.scipy import sparse
 
-from rapids_singlecell.preprocessing._utils import _get_mean_var, get_random_state
+from rapids_singlecell.preprocessing._utils import _get_mean_var
 
 if TYPE_CHECKING:
-    from numpy.random import Generator, RandomState
     from numpy.typing import NDArray
 
 
@@ -46,31 +45,19 @@ def subsample_counts(
     *,
     rate: float,
     original_totals,
-    random_seed: int | RandomState | Generator | None = 0,
+    rng: np.random.Generator,
 ) -> tuple[sparse.csr_matrix | sparse.csc_matrix, NDArray[np.int64]]:
     if rate < 1:
-        is_generator = isinstance(random_seed, np.random.Generator)
-        if not is_generator:
-            random_seed = get_random_state(random_seed)
         dtype = E.dtype
-        E.data = cp.array(
-            random_seed.binomial(np.round(E.data.get()).astype(int), rate), dtype=dtype
+        E.data = cp.asarray(
+            rng.binomial(np.round(E.data.get()).astype(int), rate), dtype=dtype
         )
         current_totals = E.sum(1).ravel()
         unsampled_orig_totals = original_totals - current_totals
-        if is_generator:
-            unsampled_downsamp_totals = cp.asarray(
-                random_seed.binomial(
-                    np.round(unsampled_orig_totals.get()).astype(int), rate
-                ),
-                dtype=dtype,
-            )
-        else:
-            unsampled_downsamp_totals = cp.random.binomial(
-                cp.round(unsampled_orig_totals).astype(int),
-                rate,
-                dtype=dtype,
-            )
+        unsampled_downsamp_totals = cp.asarray(
+            rng.binomial(np.round(unsampled_orig_totals.get()).astype(int), rate),
+            dtype=dtype,
+        )
         final_downsamp_totals = current_totals + unsampled_downsamp_totals
     else:
         final_downsamp_totals = original_totals
