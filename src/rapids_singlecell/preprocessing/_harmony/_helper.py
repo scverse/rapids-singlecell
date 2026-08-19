@@ -266,7 +266,7 @@ def _stratified_sample_indices(
     cat_offsets: cp.ndarray,
     cell_indices: cp.ndarray,
     n_target: int,
-    random_state: int,
+    rng: np.random.Generator,
 ) -> cp.ndarray:
     """Draw exactly ``n_target`` cells while representing every observed stratum."""
     offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
@@ -291,22 +291,19 @@ def _stratified_sample_indices(
         leftover = n_target - int(quotas.sum())
         if leftover:
             eligible = np.flatnonzero(remainders)
-            tie_break = np.random.default_rng(random_state).random(eligible.size)
+            tie_break = rng.random(eligible.size)
             order = np.lexsort((tie_break, -remainders[eligible]))
             quotas[eligible[order[:leftover]]] += 1
 
-    rng = cp.random.RandomState(random_state)
-    parts = []
+    picks = []
     for start, size, quota in zip(offsets[:-1], sizes, quotas, strict=True):
         start, size, quota = int(start), int(size), int(quota)
         if quota == 0:
             continue
-        local = rng.choice(size, quota, replace=False)
-        parts.append(cell_indices[start + local])
+        picks.append(start + rng.choice(size, quota, replace=False))
 
-    selected = cp.concatenate(parts)
-    order = rng.choice(n_target, n_target, replace=False)
-    return selected[order]
+    selected = cell_indices[cp.asarray(np.concatenate(picks))]
+    return selected[cp.asarray(rng.permutation(n_target))]
 
 
 def _get_theta_array(
@@ -458,8 +455,9 @@ def _benchmark_colsum_algorithms(
     """
     rows, cols = shape
 
-    # Create test data
-    X = cp.random.random(shape, dtype=dtype)
+    # Create test data. The values only need to be plausible, not reproducible,
+    # but the generator is local so the global CuPy state stays untouched.
+    X = cp.random.default_rng(0).random(shape, dtype=dtype)
 
     # Ensure it's C-contiguous for fair comparison
     if not X.flags.c_contiguous:

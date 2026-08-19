@@ -11,6 +11,7 @@ from rapids_singlecell._cuda import _harmony_clustering_cuda as _hc_cl
 from rapids_singlecell._cuda import _harmony_correction_batched_cuda as _hc_corr_b
 from rapids_singlecell._cuda import _harmony_correction_cuda as _hc_corr
 from rapids_singlecell._utils import _create_category_index_mapping
+from rapids_singlecell._utils._random import _seed_from_rng
 
 from ._fuses import (
     _calc_R,
@@ -33,6 +34,8 @@ from ._helper import (
 
 if TYPE_CHECKING:
     import pandas as pd
+
+    from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 COLSUM_ALGO = Literal["columns", "atomics", "gemm", "benchmark"]
 _SUPPRESS_PENALTY = 1e30
@@ -64,7 +67,7 @@ def harmonize(
     tau: int = 0,
     correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     stabilized_penalty: bool = True,
     dynamic_lambda: bool = True,
     alpha: float = 0.2,
@@ -134,8 +137,8 @@ def harmonize(
     colsum_algo
         Choose which algorithm to use for column sum. If `None`, choose the algorithm based on the number of rows and columns. If `'benchmark'`, benchmark all algorithms and choose the best one.
 
-    random_state
-        Random seed for reproducing results.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducing results.
 
     stabilized_penalty
         If ``True`` (default), use the Harmony2 stabilized diversity penalty
@@ -300,8 +303,11 @@ def harmonize(
             "batched" if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
         )
 
-    # Set random seed
-    cp.random.seed(random_state)
+    rng = np.random.default_rng(rng)
+    # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
+    # generator collapses into an integer here; the per-iteration offset keeps
+    # successive kernel launches decorrelated.
+    kernel_seed = _seed_from_rng(rng, allow_none=False)
 
     # Initialize algorithm
     R, E, O, objectives_harmony = _initialize_centroids(
@@ -310,7 +316,7 @@ def harmonize(
         sigma=sigma,
         Pr_b=Pr_b,
         theta=theta_array,
-        random_state=random_state,
+        rng=rng,
         cats=cats,
         n_batches=n_batches,
         colsum_func=colsum_func_big,
@@ -386,7 +392,7 @@ def harmonize(
             ),
             n_joint_categories=n_joint_categories,
             use_joint_scatter=use_joint_scatter,
-            random_state=random_state + i * 1000003,
+            kernel_seed=kernel_seed + i * 1000003,
             stabilized_penalty=stabilized_penalty,
             cpp_workspace=cpp_workspace,
         )
@@ -459,7 +465,7 @@ def _initialize_centroids(
     sigma: float,
     Pr_b: cp.ndarray,
     theta: cp.ndarray,
-    random_state: int = 0,
+    rng: np.random.Generator,
     cats: cp.ndarray,
     n_batches: int,
     colsum_func: callable = None,
@@ -488,7 +494,7 @@ def _initialize_centroids(
             cat_offsets,
             cell_indices,
             n_init_cells,
-            random_state,
+            rng,
         )
         Z_init = Z_norm[sample_indices]
     kmeans = CumlKMeans(
@@ -496,7 +502,8 @@ def _initialize_centroids(
         init="k-means||",
         n_init=1,
         max_iter=_KMEANS_MAX_ITER,
-        random_state=random_state,
+        # cuML's KMeans is seeded, so draw the seed right here
+        random_state=_seed_from_rng(rng),
     )
     kmeans.fit(cp.ascontiguousarray(Z_init, dtype=cp.float64))
     Y = kmeans.cluster_centers_.astype(Z_norm.dtype)
@@ -602,7 +609,7 @@ def _clustering(
     marginal_joint_indices: cp.ndarray,
     n_joint_categories: int,
     use_joint_scatter: bool,
-    random_state: int = 0,
+    kernel_seed: int,
     stabilized_penalty: bool = True,
     cpp_workspace: dict = None,
 ) -> None:
@@ -643,7 +650,7 @@ def _clustering(
         sigma=float(sigma),
         tol=float(tol),
         max_iter=max_iter,
-        seed=random_state & 0xFFFFFFFF,
+        seed=kernel_seed & 0xFFFFFFFF,
         stabilized=stabilized_penalty,
         stream=cp.cuda.get_current_stream().ptr,
         handle=cp.cuda.device.get_cublas_handle(),

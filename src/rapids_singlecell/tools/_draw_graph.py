@@ -7,9 +7,16 @@ import cupy as cp
 import numpy as np
 from scanpy.tools._utils import get_init_pos_from_paga
 
-from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._compat import _rng_kwargs
 from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _LegacyRng,
+    _seed_from_rng,
+)
 
 from ._clustering import _create_graph
 from ._utils import _validate_init_pos
@@ -18,12 +25,13 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 
+@_accepts_legacy_random_state(0)
 def draw_graph(
     adata: AnnData,
     *,
     init_pos: str | bool | None = None,
     max_iter: int = 500,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     key_added: str | Default | None = Default(("draw_graph", "key_added")),
 ) -> None:
     """
@@ -48,10 +56,12 @@ def draw_graph(
             No error occurs when the algorithm terminates in this manner.
             Good short-term quality can be achieved with 50-100 iterations.
             Above 1000 iterations is discouraged.
-        random_state
-            Random state to use when initializing layout and generating
-            samples. Defaults to 0. If `None` is passed, a hash of process id,
-            time, and hostname is used by `cugraph`.
+        rng
+            Random seed or :class:`~numpy.random.Generator` used when
+            initializing layout and generating samples. Defaults to 0. If
+            `None` is passed, a hash of process id, time, and hostname is
+            used by `cugraph`.
+            The superseded `random_state` argument is still accepted.
         key_added
             Template controlling where coordinates and parameters are stored.
 
@@ -62,6 +72,9 @@ def draw_graph(
             X_draw_graph_layout_fa : `adata.obsm`
                 Coordinates of graph layout.
     """
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+
     from cugraph.layout import force_atlas2
 
     # Adjacency graph
@@ -72,12 +85,9 @@ def draw_graph(
         case str() if init_pos in adata.obsm:
             init_coords = adata.obsm[init_pos]
         case str() if init_pos == "paga":
-            if random_state is None:
-                random_state = np.random.default_rng()
             init_coords = get_init_pos_from_paga(
                 adata,
-                **_random_state_kwargs(get_init_pos_from_paga, random_state),
-                neighbors_key="connectivities",
+                **_rng_kwargs(get_init_pos_from_paga, rng),
             )
         case _:
             init_coords = init_pos
@@ -110,12 +120,13 @@ def draw_graph(
         scaling_ratio=2.0,
         strong_gravity_mode=False,
         gravity=1.0,
-        random_state=random_state,
+        # cuGraph's force atlas is seeded, so draw the seed right here
+        random_state=_seed_from_rng(rng),
     )
     positions = positions.sort_values("vertex").reset_index(drop=True)
     positions = cp.vstack((positions["x"].to_cupy(), positions["y"].to_cupy())).T
     layout = "fa"
     key_added = resolve_default(key_added)
     keys = _embedding_keys("draw_graph", key_added, layout=layout)
-    adata.uns[keys.uns] = {"params": {"layout": layout, "random_state": random_state}}
+    adata.uns[keys.uns] = {"params": {"layout": layout, **meta_random_state}}
     adata.obsm[keys.obsm] = positions.get()  # Format output

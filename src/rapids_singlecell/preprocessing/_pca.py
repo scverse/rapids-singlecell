@@ -14,6 +14,11 @@ from scipy.sparse import issparse
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._keys import _embedding_keys
 from rapids_singlecell._settings import Default, Preset, resolve_default, settings
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+)
 from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
 from ._utils import _check_gpu_X
@@ -26,6 +31,7 @@ if TYPE_CHECKING:
 _empty = Default(repr="adata.var.get('highly_variable')")
 
 
+@_accepts_legacy_random_state(0)
 def pca(
     data: AnnData | ArrayTypesDask,
     n_comps: int | None = None,
@@ -33,7 +39,7 @@ def pca(
     layer: str = None,
     zero_center: bool = True,
     svd_solver: str | None = None,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     mask_var: NDArray[np.bool] | str | Default | None = _empty,
     dtype: str = "float32",
     chunked: bool = False,
@@ -108,8 +114,9 @@ def pca(
         `'jacobi'`
             cuML: Jacobi iterative solver. Faster but less accurate. For dense arrays only.
 
-    random_state
-        Random state for initialization.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for initialization.
+        The superseded `random_state` argument is still accepted.
 
     mask_var
         Mask to use for the PCA computation.
@@ -123,7 +130,7 @@ def pca(
     chunked
         If `True`, perform an incremental PCA on segments of `chunk_size`.
         The incremental PCA automatically zero centers and ignores settings of
-        `random_seed` and `svd_solver`. If `False`, perform a full PCA.
+        `rng` and `svd_solver`. If `False`, perform a full PCA.
 
     chunk_size
         Number of observations to include in each chunk.
@@ -179,6 +186,8 @@ def pca(
             "pca() got an unexpected keyword argument 'use_highly_variable'"
         )
 
+    rng = np.random.default_rng(rng)
+
     if not isinstance(data, AnnData):
         if layer is not None:
             raise ValueError("`layer` can only be used with an AnnData object.")
@@ -192,7 +201,7 @@ def pca(
             n_comps,
             zero_center=zero_center,
             svd_solver=svd_solver,
-            random_state=random_state,
+            rng=rng,
             chunked=chunked,
             chunk_size=chunk_size,
             dtype=dtype,
@@ -232,7 +241,7 @@ def pca(
         n_comps,
         zero_center=zero_center,
         svd_solver=svd_solver,
-        random_state=random_state,
+        rng=rng,
         chunked=chunked,
         chunk_size=chunk_size,
         dtype=dtype,
@@ -266,7 +275,7 @@ def _pca_compute(
     *,
     zero_center: bool,
     svd_solver: str | None,
-    random_state: int | None,
+    rng: np.random.Generator,
     chunked: bool,
     chunk_size: int | None,
     dtype: str,
@@ -321,7 +330,7 @@ def _pca_compute(
                     n_comps,
                     svd_solver,
                     zero_center=zero_center,
-                    random_state=random_state,
+                    rng=rng,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
                 )
@@ -338,7 +347,7 @@ def _pca_compute(
                     n_comps,
                     svd_solver,
                     zero_center=zero_center,
-                    random_state=random_state,
+                    rng=rng,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
                 )
@@ -382,7 +391,7 @@ def _run_sparse_svd_pca(
     svd_solver,
     *,
     zero_center: bool = True,
-    random_state: int = 0,
+    rng: np.random.Generator,
     n_oversamples: int | None = None,
     n_iter: int | None = None,
 ):
@@ -401,7 +410,7 @@ def _run_sparse_svd_pca(
         "n_components": n_comps,
         "svd_solver": svd_solver,
         "zero_center": zero_center,
-        "random_state": random_state,
+        "rng": rng,
     }
     if n_oversamples is not None:
         kwargs["n_oversamples"] = n_oversamples

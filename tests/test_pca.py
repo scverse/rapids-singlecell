@@ -707,7 +707,7 @@ class TestSVDSolvers:
 
         k = 10
         pca = PCA_sparse_svd(
-            n_components=k, svd_solver=svd_solver, zero_center=True, random_state=0
+            n_components=k, svd_solver=svd_solver, zero_center=True, rng=0
         )
         pca.fit(X)
 
@@ -738,7 +738,7 @@ class TestSVDSolvers:
         A_gpu = cp.asarray(A)
 
         k = 5
-        U, s, Vt = svd_func(A_gpu, k=k, random_state=0)
+        U, s, Vt = svd_func(A_gpu, k=k, rng=0)
 
         U = U.get()
         s = s.get()
@@ -767,7 +767,7 @@ class TestSVDSolvers:
         X_dense = X.toarray()
 
         k = 10
-        U, s, Vt = lanczos_svd(X_gpu, k=k, random_state=0)
+        U, s, Vt = lanczos_svd(X_gpu, k=k, rng=0)
 
         U = U.get()
         s = s.get()
@@ -812,7 +812,7 @@ class TestSVDSolvers:
         X_gpu = cusparse.csr_matrix(X.astype(np.float64))
 
         k = 20
-        U, s, Vt = svd_func(X_gpu, k=k, random_state=0)
+        U, s, Vt = svd_func(X_gpu, k=k, rng=0)
 
         U = U.get()
         s = s.get()
@@ -841,7 +841,7 @@ class TestSVDSolvers:
         U_np, s_np, Vt_np = np.linalg.svd(A, full_matrices=False)
 
         k = 10
-        U, s, Vt = svd_func(A_gpu, k=k, random_state=0)
+        U, s, Vt = svd_func(A_gpu, k=k, rng=0)
 
         U = U.get()
         s = s.get()
@@ -889,11 +889,11 @@ class TestSVDSolvers:
         k = 5
 
         # With few iterations, accuracy is worse
-        _, s_few, _ = randomized_svd(A_gpu, k=k, n_iter=0, random_state=0)
+        _, s_few, _ = randomized_svd(A_gpu, k=k, n_iter=0, rng=0)
         s_few = s_few.get()
 
         # With more iterations, accuracy improves
-        _, s_many, _ = randomized_svd(A_gpu, k=k, n_iter=5, random_state=0)
+        _, s_many, _ = randomized_svd(A_gpu, k=k, n_iter=5, rng=0)
         s_many = s_many.get()
 
         # Reference
@@ -920,8 +920,8 @@ class TestSVDSolvers:
         k = 10
 
         # Run twice with same random state
-        U1, s1, Vt1 = svd_func(X_gpu, k=k, random_state=0)
-        U2, s2, Vt2 = svd_func(X_gpu, k=k, random_state=0)
+        U1, s1, Vt1 = svd_func(X_gpu, k=k, rng=0)
+        U2, s2, Vt2 = svd_func(X_gpu, k=k, rng=0)
 
         # Results should be identical (atol for GPU floating-point rounding variations)
         np.testing.assert_allclose(U1.get(), U2.get(), rtol=1e-10, atol=1e-14)
@@ -972,7 +972,7 @@ class TestSVDSolvers:
         X_gpu = cusparse.csr_matrix(X.astype(dtype))
 
         k = 10
-        U, s, Vt = svd_func(X_gpu, k=k, random_state=0)
+        U, s, Vt = svd_func(X_gpu, k=k, rng=0)
 
         assert U.dtype == dtype
         assert s.dtype == dtype
@@ -988,7 +988,7 @@ class TestSVDSolvers:
         # Memory for dense would be ~4GB, sparse is ~80MB
         # This should complete quickly without OOM
         k = 10
-        U, s, Vt = lanczos_svd(X_gpu, k=k, random_state=0)
+        U, s, Vt = lanczos_svd(X_gpu, k=k, rng=0)
 
         assert U.shape == (1000, k)
         assert s.shape == (k,)
@@ -1004,7 +1004,7 @@ class TestSVDSolvers:
         X_gpu = cusparse.csr_matrix(X.astype(np.float64))
 
         for k in [1, 2, 3]:
-            U, s, Vt = svd_func(X_gpu, k=k, random_state=0)
+            U, s, Vt = svd_func(X_gpu, k=k, rng=0)
 
             assert U.shape == (100, k)
             assert s.shape == (k,)
@@ -1124,7 +1124,7 @@ def test_lanczos_multilock_restart(
     monkeypatch.setattr(_svd_lanczos, "_lanczos_bidiag", recording_bidiag)
 
     U, s, Vt = _svd_lanczos.lanczos_svd(
-        A_gpu, k=k, ncv=ncv, tol=tol, max_iter=300, random_state=0
+        A_gpu, k=k, ncv=ncv, tol=tol, max_iter=300, rng=0
     )
 
     # --- guard: the test must actually exercise multi-vector locking ------------

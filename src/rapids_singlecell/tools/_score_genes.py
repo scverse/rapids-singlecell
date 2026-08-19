@@ -10,6 +10,12 @@ import pandas as pd
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _if_legacy_apply_global,
+)
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep
 from rapids_singlecell.preprocessing._utils import _check_gpu_X, _check_use_raw
 
@@ -21,6 +27,7 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 
+@_accepts_legacy_random_state(0)
 def score_genes(
     adata: AnnData,
     gene_list: Sequence[str] | pd.Index,
@@ -30,7 +37,7 @@ def score_genes(
     gene_pool: Sequence[str] | pd.Index | None = None,
     n_bins: int = 25,
     score_name: str = "score",
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     copy: bool = False,
     use_raw: bool | None = None,
     layer: str | None = None,
@@ -60,8 +67,9 @@ def score_genes(
         Number of expression level bins for sampling.
     score_name
         Name of the field to be added in `.obs`.
-    random_state
-        The random seed for sampling.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for sampling.
+        The superseded `random_state` argument is still accepted.
     copy
         Copy `adata` or modify it inplace.
     use_raw
@@ -82,8 +90,8 @@ def score_genes(
     X = _get_obs_rep(adata, layer=layer, use_raw=use_raw)
     X = X_to_GPU(X)
     _check_gpu_X(X, allow_dask=True)
-    if random_state is not None:
-        np.random.seed(random_state)
+    rng = np.random.default_rng(rng)
+    rng = _if_legacy_apply_global(rng)
 
     var_names = adata.raw.var_names if use_raw else adata.var_names
     gene_list, gene_pool = _check_score_genes_args(var_names, gene_list, gene_pool)
@@ -97,6 +105,7 @@ def score_genes(
         ctrl_as_ref=ctrl_as_ref,
         ctrl_size=ctrl_size,
         n_bins=n_bins,
+        rng=rng,
     ):
         control_genes = control_genes.union(r_genes)
 
@@ -159,6 +168,7 @@ def _score_genes_bins(
     ctrl_as_ref: bool,
     ctrl_size: int,
     n_bins: int,
+    rng: np.random.Generator,
 ) -> Generator[pd.Index[str], None, None]:
     # average expression of genes
     idx = cp.array(var_names.isin(gene_pool), dtype=cp.bool_)
@@ -175,7 +185,10 @@ def _score_genes_bins(
     keep_ctrl_in_obs_cut = False if ctrl_as_ref else obs_cut.index.isin(gene_list)
 
     # now pick `ctrl_size` genes from every cut
-    for cut in np.unique(obs_cut.loc[gene_list]):
+    cuts = np.unique(obs_cut.loc[gene_list])
+    # spawn sub-rngs so this can maybe be parallelized without changing random
+    # number generation
+    for cut, sub_rng in zip(cuts, rng.spawn(len(cuts)), strict=True):
         r_genes: pd.Index[str] = obs_cut[(obs_cut == cut) & ~keep_ctrl_in_obs_cut].index
         if len(r_genes) == 0:
             msg = (
@@ -184,7 +197,7 @@ def _score_genes_bins(
             )
             warnings.warn(msg)
         if ctrl_size < len(r_genes):
-            r_genes = r_genes.to_series().sample(ctrl_size).index
+            r_genes = r_genes.to_series().sample(ctrl_size, random_state=sub_rng).index
         if ctrl_as_ref:  # otherwise `r_genes` is already filtered
             r_genes = r_genes.difference(gene_list)
         yield r_genes

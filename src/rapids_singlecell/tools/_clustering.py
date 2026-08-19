@@ -13,6 +13,13 @@ from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 
 from rapids_singlecell._keys import _resolve_obsm_key
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _LegacyRng,
+    _seed_from_rng,
+)
 
 from ._utils import _choose_representation
 
@@ -129,11 +136,12 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
     return g
 
 
+@_accepts_legacy_random_state(0)
 def leiden(
     adata: AnnData,
     resolution: float | list[float] = 1.0,
     *,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     theta: float = 1.0,
     restrict_to: tuple[str, Sequence[str]] | None = None,
     key_added: str = "leiden",
@@ -162,8 +170,10 @@ def leiden(
             (called gamma in the modularity formula). Higher values lead to
             more clusters. If a list of values is provided, the Leiden algorithm will be run for each value in the list.
 
-        random_state
-            Change the initialization of the optimization. Defaults to 0.
+        rng
+            Random seed or :class:`~numpy.random.Generator` changing the
+            initialization of the optimization. Defaults to 0.
+            The superseded `random_state` argument is still accepted.
 
         theta
             Called theta in the Leiden algorithm, this is used to scale modularity
@@ -213,6 +223,9 @@ def leiden(
     """
     # Adjacency graph
 
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+
     adata = adata.copy() if copy else adata
 
     dtype = _check_dtype(dtype)
@@ -246,7 +259,8 @@ def leiden(
             leiden_parts, modularity = culeiden(
                 g,
                 resolution=resolution,
-                random_state=random_state,
+                # cuGraph's leiden is seeded, so draw the seed right here
+                random_state=_seed_from_rng(rng),
                 theta=theta,
                 max_iter=n_iterations,
             )
@@ -291,7 +305,7 @@ def leiden(
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
         "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
-        "random_state": random_state,
+        **meta_random_state,
         "n_iterations": n_iterations,
     }
     adata.uns[key_added]["modularity"] = (
@@ -464,6 +478,7 @@ def louvain(
     return adata if copy else None
 
 
+@_accepts_legacy_random_state(42)
 def kmeans(
     adata: AnnData,
     n_clusters: int = 8,
@@ -471,7 +486,7 @@ def kmeans(
     *,
     use_rep: str = "X_pca",
     n_init: int = 1,
-    random_state: float = 42,
+    rng: SeedLike | RNGLike | None = None,
     key_added: str = "kmeans",
     copy: bool = False,
     **kwargs,
@@ -494,9 +509,10 @@ def kmeans(
             ``rapids_singlecell.settings.preset``.
         n_init
             Number of initializations to run the KMeans algorithm
-        random_state
-            if you want results to be the same when you restart Python, select a
-            state. Default is 42.
+        rng
+            Random seed or :class:`~numpy.random.Generator`; fix it if you want
+            results to be the same when you restart Python. Default is 42.
+            The superseded `random_state` argument is still accepted.
         key_added
             `adata.obs` key under which to add the cluster labels.
         copy
@@ -505,6 +521,8 @@ def kmeans(
             Additional keyword arguments for KMeans.
 
     """
+    rng = np.random.default_rng(rng)
+
     from cuml.cluster import KMeans
 
     adata = adata.copy() if copy else adata
@@ -512,7 +530,11 @@ def kmeans(
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
 
     kmeans_out = KMeans(
-        n_clusters=n_clusters, n_init=n_init, random_state=random_state, **kwargs
+        # cuML's KMeans is seeded, so draw the seed right here
+        n_clusters=n_clusters,
+        n_init=n_init,
+        random_state=_seed_from_rng(rng),
+        **kwargs,
     ).fit(X)
     groups = kmeans_out.labels_
 

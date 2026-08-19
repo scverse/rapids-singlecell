@@ -7,7 +7,14 @@ using Lanczos bidiagonalization with Classical Gram-Schmidt (CGS2) orthogonaliza
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import cupy as cp
+
+from rapids_singlecell._utils._random import _seed_from_rng
+
+if TYPE_CHECKING:
+    from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 # Simple fused AXPY kernel - faster than function call overhead
 _kernel_axpy = cp.ElementwiseKernel(
@@ -84,7 +91,7 @@ def _lanczos_bidiag(
     U_full: cp.ndarray,
     V_full: cp.ndarray,
     n_locked: int,
-    rng: cp.random.RandomState,
+    rng: cp.random.Generator,
     ortho_buf: cp.ndarray,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """
@@ -197,7 +204,7 @@ def lanczos_svd(
     ncv: int | None = None,
     tol: float = 1e-4,
     max_iter: int = 100,
-    random_state: int | None = None,
+    rng: SeedLike | RNGLike | None = None,
     refine_results: bool = True,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """
@@ -220,8 +227,8 @@ def lanczos_svd(
         Tolerance for convergence.
     max_iter
         Maximum number of restart iterations.
-    random_state
-        Seed for the random number generator.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
     refine_results
         If True, refine the singular vectors after convergence.
 
@@ -253,7 +260,9 @@ def lanczos_svd(
 
     ncv = max(ncv, k + 10)
 
-    rng = cp.random.RandomState(random_state if random_state is not None else 0)
+    # CuPy generators are seeded, so this is where the host generator
+    # collapses into an integer.
+    rng = cp.random.default_rng(_seed_from_rng(rng, allow_none=False))
 
     # Pre-allocate buffers
     total_capacity = k + ncv + 2
