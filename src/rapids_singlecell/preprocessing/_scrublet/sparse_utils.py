@@ -49,15 +49,15 @@ def subsample_counts(
 ) -> tuple[sparse.csr_matrix | sparse.csc_matrix, NDArray[np.int64]]:
     if rate < 1:
         dtype = E.dtype
-        E.data = cp.asarray(
-            rng.binomial(np.round(E.data.get()).astype(int), rate), dtype=dtype
+        gpu_rng = cp.random.default_rng(int(rng.integers(0, 2**32)))
+        E.data = gpu_rng.binomial(cp.round(E.data).astype(np.int64), rate).astype(
+            dtype, copy=False
         )
         current_totals = E.sum(1).ravel()
         unsampled_orig_totals = original_totals - current_totals
-        unsampled_downsamp_totals = cp.asarray(
-            rng.binomial(np.round(unsampled_orig_totals.get()).astype(int), rate),
-            dtype=dtype,
-        )
+        unsampled_downsamp_totals = gpu_rng.binomial(
+            cp.round(unsampled_orig_totals).astype(np.int64), rate
+        ).astype(dtype, copy=False)
         final_downsamp_totals = current_totals + unsampled_downsamp_totals
     else:
         final_downsamp_totals = original_totals
