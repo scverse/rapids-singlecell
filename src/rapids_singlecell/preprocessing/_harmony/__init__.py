@@ -350,8 +350,6 @@ def harmonize(
             n_batches=n_joint_categories,
         )
 
-    empty_int = cats[:0]
-
     # Main harmony iterations
     is_converged = False
 
@@ -373,17 +371,9 @@ def harmonize(
             colsum_func=colsum_func_small,
             n_batches=n_batches,
             n_covariates=n_covariates,
-            joint_codes=joint_codes if joint_codes is not None else empty_int,
-            marginal_joint_offsets=(
-                marginal_joint_offsets
-                if marginal_joint_offsets is not None
-                else empty_int
-            ),
-            marginal_joint_indices=(
-                marginal_joint_indices
-                if marginal_joint_indices is not None
-                else empty_int
-            ),
+            joint_codes=joint_codes,
+            marginal_joint_offsets=marginal_joint_offsets,
+            marginal_joint_indices=marginal_joint_indices,
             n_joint_categories=n_joint_categories,
             use_joint_scatter=use_joint_scatter,
             random_state=random_state + i * 1000003,
@@ -546,7 +536,7 @@ def _allocate_clustering_workspace(
 ) -> dict:
     """Pre-allocate workspace buffers for the C++ clustering loop."""
     cub_temp_bytes = _hc_cl.get_cub_sort_temp_bytes(n_cells=n_cells)
-    return {
+    workspace = {
         "Y": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "similarities": cp.empty((n_cells, n_clusters), dtype=dtype),
@@ -557,12 +547,6 @@ def _allocate_clustering_workspace(
         "cub_temp": cp.empty(cub_temp_bytes, dtype=cp.uint8),
         "R_out_buffer": cp.empty((block_size, n_clusters), dtype=dtype),
         "cats_in": cp.empty(block_size * n_covariates, dtype=cp.int32),
-        "O_joint": cp.zeros(
-            (n_joint_categories if use_joint_scatter else 1, n_clusters), dtype=dtype
-        ),
-        "joint_codes_in": cp.empty(
-            max(1, block_size) if use_joint_scatter else 1, dtype=cp.int32
-        ),
         "R_in_sum": cp.empty(n_clusters, dtype=dtype),
         "R_out_sum": cp.empty(n_clusters, dtype=dtype),
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
@@ -570,6 +554,14 @@ def _allocate_clustering_workspace(
         "ones_vec": cp.ones(block_size, dtype=dtype),
         "last_obj": cp.zeros(1, dtype=dtype),
     }
+    if use_joint_scatter:
+        workspace.update(
+            {
+                "O_joint": cp.zeros((n_joint_categories, n_clusters), dtype=dtype),
+                "joint_codes_in": cp.empty(block_size, dtype=cp.int32),
+            }
+        )
+    return workspace
 
 
 # Map colsum function to C++ enum: 0=columns, 1=atomics, 2=gemm
@@ -597,9 +589,9 @@ def _clustering(
     colsum_func: callable = None,
     n_batches: int = 0,
     n_covariates: int = 1,
-    joint_codes: cp.ndarray,
-    marginal_joint_offsets: cp.ndarray,
-    marginal_joint_indices: cp.ndarray,
+    joint_codes: cp.ndarray | None,
+    marginal_joint_offsets: cp.ndarray | None,
+    marginal_joint_indices: cp.ndarray | None,
     n_joint_categories: int,
     use_joint_scatter: bool,
     random_state: int = 0,
@@ -619,6 +611,20 @@ def _clustering(
     block_size = int(n_cells * block_proportion)
     colsum_algo_int = _COLSUM_MAP.get(colsum_func, 2)
 
+    joint_args = {}
+    if use_joint_scatter:
+        if (
+            joint_codes is None
+            or marginal_joint_offsets is None
+            or marginal_joint_indices is None
+        ):
+            raise ValueError("Joint scatter requires all joint category arrays.")
+        joint_args = {
+            "joint_codes": joint_codes,
+            "marginal_joint_offsets": marginal_joint_offsets,
+            "marginal_joint_indices": marginal_joint_indices,
+        }
+
     _hc_cl.clustering_loop(
         Z_norm,
         R=R,
@@ -626,10 +632,8 @@ def _clustering(
         O=O,
         Pr_b=Pr_b.ravel(),
         cats=cats,
-        joint_codes=joint_codes,
-        marginal_joint_offsets=marginal_joint_offsets,
-        marginal_joint_indices=marginal_joint_indices,
         theta=theta,
+        **joint_args,
         **cpp_workspace,
         n_cells=n_cells,
         n_pcs=Z_norm.shape[1],

@@ -79,10 +79,11 @@ def test_qc_metrics(managed_memory):
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_harmony_integrate(managed_memory, dtype):
-    """Regression test for GH-763: harmony_integrate with managed memory"""
+    """Regression test for GH-763: harmony_integrate with managed memory."""
     rng = np.random.default_rng(0)
-    adata = AnnData(rng.standard_normal((300, 5)).astype(np.float32))
+    adata = AnnData(rng.standard_normal((300, 5)).astype(dtype))
     adata.obs["batch"] = pd.Categorical(rng.choice(["a", "b"], 300))
-    adata.obsm["X_pca"] = rng.standard_normal((300, 10))
-    rsc.pp.harmony_integrate(adata, key="batch")
+    adata.obsm["X_pca"] = rng.standard_normal((300, 10)).astype(dtype)
+    rsc.pp.harmony_integrate(adata, key="batch", dtype=dtype)
     assert adata.obsm["X_pca_harmony"].shape == (300, 10)
+    assert adata.obsm["X_pca_harmony"].dtype == dtype
