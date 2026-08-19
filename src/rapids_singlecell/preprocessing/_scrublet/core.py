@@ -8,9 +8,8 @@ import pandas as pd
 from anndata import AnnData, concat
 from cuml.neighbors import NearestNeighbors
 from cupyx.scipy import sparse
-from scanpy.preprocessing._utils import sample_comb
 
-from rapids_singlecell._compat import _rng_kwargs
+from rapids_singlecell._utils._random import _LegacyRng
 
 from .sparse_utils import subsample_counts
 
@@ -20,6 +19,19 @@ if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 __all__ = ["Scrublet"]
+
+
+def _sample_comb(
+    dims: tuple[int, ...], nsamp: int, *, rng: np.random.Generator
+) -> NDArray[np.int64]:
+    """Randomly sample indices from a grid without repeating a tuple."""
+    if isinstance(rng, _LegacyRng):
+        from sklearn.random_projection import sample_without_replacement
+
+        idx = sample_without_replacement(np.prod(dims), nsamp, random_state=rng.arg)
+    else:
+        idx = rng.choice(np.prod(dims), size=nsamp, replace=False)
+    return np.vstack(np.unravel_index(idx, dims)).T
 
 
 @dataclass(kw_only=True)
@@ -218,11 +230,7 @@ class Scrublet:
         n_obs = self._counts_obs.shape[0]
         n_sim = int(n_obs * sim_doublet_ratio)
 
-        pair_ix = sample_comb(
-            (n_obs, n_obs),
-            n_sim,
-            **_rng_kwargs(sample_comb, self._rng),
-        )
+        pair_ix = _sample_comb((n_obs, n_obs), n_sim, rng=self._rng)
 
         E1 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 0], :])
         E2 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 1], :])

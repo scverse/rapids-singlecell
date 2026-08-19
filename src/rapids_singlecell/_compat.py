@@ -28,31 +28,16 @@ def _meta_sparse_csc_cpu(dtype):
     return csc_matrix_cpu(np.array((1.0,), dtype=dtype))
 
 
-def _rng_kwargs(
-    func: object, rng: np.random.Generator, *, always_state: bool = False
-) -> dict:
+def _rng_kwargs(func: object, rng: np.random.Generator) -> dict:
     """Build ``rng=`` or ``random_state=`` kwargs for the Scanpy version.
 
-    Stateful legacy consumers such as ``sample_comb`` opt into sharing the
-    wrapped ``RandomState``. Seed-based consumers use a scalar fallback.
+    Scanpy's legacy PAGA helper takes a scalar seed, while the current helper
+    takes a generator.
     """
     import inspect
 
-    from rapids_singlecell._utils._random import (
-        _legacy_random_state,
-        _LegacyRng,
-        _seed_from_rng,
-    )
+    from rapids_singlecell._utils._random import _seed_from_rng
 
     if "rng" not in inspect.signature(func).parameters:
-        random_state = (
-            _legacy_random_state(rng, always_state=True)
-            if always_state
-            else _seed_from_rng(rng)
-        )
-        return {"random_state": random_state}
-    if not always_state or not isinstance(rng, _LegacyRng):
-        return {"rng": rng}
-    from scanpy._utils.random import _LegacyRng as _ScanpyLegacyRng
-
-    return {"rng": _ScanpyLegacyRng(rng.state)}
+        return {"random_state": _seed_from_rng(rng)}
+    return {"rng": rng}
