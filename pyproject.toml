@@ -26,7 +26,6 @@ dependencies = [
     "natsort",
     "scikit-misc>=0.1.3",
     "scikit-learn",
-    "matplotlib>=3.4",
     "tqdm",
     "statsmodels>=0.12.0",
     "scikit-image",
