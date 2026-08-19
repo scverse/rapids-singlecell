@@ -144,11 +144,11 @@ def aggr_host_planes(
 def stream_planes_multi(
     rg: _RankGenes, device_ids: list[int]
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
-    """Sharded sum / sq_sum / (count) over ALL categories → (n_cats, n_genes)."""
+    """Sharded sum / sq_sum / (count) over groups plus the remainder."""
     X = rg.X
     n_cells, n_genes = X.shape
-    n_cats = len(rg.labels.cat.categories)
-    codes = rg.labels.cat.codes.to_numpy().astype(np.int32, copy=False)
+    n_cats = len(rg.groups_order) + 1
+    codes = rg.group_codes.astype(np.int32, copy=False)
     comp_pts = rg.comp_pts
     col_shard = _is_col_shard(X)
     axis_len = n_genes if col_shard else n_cells

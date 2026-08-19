@@ -10,6 +10,7 @@ from cupyx.scipy import sparse as cp_sparse
 from scipy import sparse as sc_sparse
 
 from rapids_singlecell._utils import _get_logger_level
+from rapids_singlecell._utils._random import _seed_from_rng
 from rapids_singlecell.preprocessing._neighbors._algorithms._all_neighbors import (
     _all_neighbors_knn,
 )
@@ -28,8 +29,6 @@ from rapids_singlecell.preprocessing._neighbors._algorithms._mg_ivfpq import (
 from rapids_singlecell.preprocessing._neighbors._algorithms._nn_descent import (
     _nn_descent_knn,
 )
-
-AnyRandom = None | int | np.random.RandomState
 
 _Algorithms = Literal[
     "brute",
@@ -138,7 +137,7 @@ def _get_connectivities_umap(
     *,
     n_obs: int,
     n_neighbors: int,
-    random_state: AnyRandom,
+    rng: np.random.Generator,
     metric: str,
 ) -> cp_sparse.coo_matrix:
     """UMAP fuzzy simplicial set connectivities."""
@@ -150,7 +149,8 @@ def _get_connectivities_umap(
     connectivities = fuzzy_simplicial_set(
         X_conn,
         n_neighbors,
-        random_state,
+        # cuML seeds its fuzzy simplicial set, so draw the seed right here
+        _seed_from_rng(rng),
         metric=metric,
         knn_indices=knn_indices,
         knn_dists=knn_dist,
@@ -267,7 +267,7 @@ def _calc_connectivities(
     *,
     n_obs: int,
     n_neighbors: int,
-    random_state: AnyRandom,
+    rng: np.random.Generator,
     metric: str,
     method: Literal["umap", "gauss", "jaccard"] = "umap",
 ) -> cp_sparse.spmatrix:
@@ -283,8 +283,8 @@ def _calc_connectivities(
         Number of observations.
     n_neighbors
         Number of nearest neighbors.
-    random_state
-        Random seed (passed through to UMAP fuzzy simplicial set).
+    rng
+        Random generator (a seed is drawn for the UMAP fuzzy simplicial set).
     metric
         Distance metric name.
     method
@@ -311,6 +311,6 @@ def _calc_connectivities(
         knn_dist,
         n_obs=n_obs,
         n_neighbors=n_neighbors,
-        random_state=random_state,
+        rng=rng,
         metric=metric,
     )

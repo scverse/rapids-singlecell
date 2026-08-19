@@ -266,37 +266,44 @@ def _stratified_sample_indices(
     cat_offsets: cp.ndarray,
     cell_indices: cp.ndarray,
     n_target: int,
-    random_state: int,
+    rng: np.random.Generator,
 ) -> cp.ndarray:
-    """
-    Draw a proportional random sample of cells from within every category.
+    """Draw exactly ``n_target`` cells while representing every observed stratum."""
+    offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
+    sizes = np.diff(offsets)
+    nonempty = np.flatnonzero(sizes)
+    n_cells = int(cell_indices.size)
+    if not nonempty.size <= n_target <= n_cells:
+        raise ValueError(
+            "n_target must cover every nonempty stratum without exceeding n_cells"
+        )
 
-    Each category contributes ``ceil(size * n_target / n_cells)`` cells, so no
-    batch can be under-represented by an unlucky draw. Cells are taken at a
-    random offset and a fixed step within the category, which avoids duplicates
-    without a per-category sort.
-    """
-    offsets = cat_offsets.astype(cp.int64, copy=False)
-    sizes = cp.diff(offsets)
-    n_cells = int(cell_indices.shape[0])
-    frac = n_target / n_cells
+    quotas = np.zeros_like(sizes)
+    quotas[nonempty] = 1
+    remaining = n_target - nonempty.size
+    if remaining:
+        capacities = sizes - quotas
+        total_capacity = int(capacities.sum())
+        numerators = capacities * remaining
+        additional, remainders = np.divmod(numerators, total_capacity)
+        quotas += additional
 
-    k = cp.ceil(sizes * frac).astype(cp.int64)
-    k = cp.clip(k, 1, None)
-    k = cp.minimum(k, cp.clip(sizes, 1, None))
-    k = cp.where(sizes > 0, k, 0)
+        leftover = n_target - int(quotas.sum())
+        if leftover:
+            eligible = np.flatnonzero(remainders)
+            tie_break = rng.random(eligible.size)
+            order = np.lexsort((tie_break, -remainders[eligible]))
+            quotas[eligible[order[:leftover]]] += 1
 
-    total = int(k.sum())
-    group = cp.repeat(cp.arange(k.shape[0], dtype=cp.int64), k)
-    within = cp.arange(total, dtype=cp.int64) - (cp.cumsum(k) - k)[group]
-    step = cp.maximum(sizes // cp.clip(k, 1, None), 1)
-    slack = cp.clip(sizes - step * (k - 1), 1, None)
-    start = (
-        cp.random.RandomState(random_state).random_sample(k.shape[0]) * slack
-    ).astype(cp.int64)
+    picks = []
+    for start, size, quota in zip(offsets[:-1], sizes, quotas, strict=True):
+        start, size, quota = int(start), int(size), int(quota)
+        if quota == 0:
+            continue
+        picks.append(start + rng.choice(size, quota, replace=False))
 
-    pos = offsets[:-1][group] + start[group] + within * step[group]
-    return cell_indices[pos]
+    selected = cell_indices[cp.asarray(np.concatenate(picks))]
+    return selected[cp.asarray(rng.permutation(n_target))]
 
 
 def _get_theta_array(
@@ -448,8 +455,9 @@ def _benchmark_colsum_algorithms(
     """
     rows, cols = shape
 
-    # Create test data
-    X = cp.random.random(shape, dtype=dtype)
+    # Create test data. The values only need to be plausible, not reproducible,
+    # but the generator is local so the global CuPy state stays untouched.
+    X = cp.random.default_rng(0).random(shape, dtype=dtype)
 
     # Ensure it's C-contiguous for fair comparison
     if not X.flags.c_contiguous:

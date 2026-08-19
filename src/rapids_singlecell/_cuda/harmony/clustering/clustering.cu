@@ -1,9 +1,11 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
+#include <nanobind/stl/optional.h>
 
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -325,9 +327,15 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
     if (a.n_covariates < 1)
         throw std::invalid_argument(
             "clustering_loop requires at least one covariate");
-    if (a.use_joint_scatter && a.n_joint_categories < 1)
-        throw std::invalid_argument(
-            "joint scatter requires at least one joint category");
+    if (a.use_joint_scatter) {
+        if (a.n_joint_categories < 1)
+            throw std::invalid_argument(
+                "joint scatter requires at least one joint category");
+        if (!a.joint_codes || !a.marginal_joint_offsets ||
+            !a.marginal_joint_indices || !a.O_joint || !a.joint_codes_in)
+            throw std::invalid_argument(
+                "joint scatter requires all joint input and workspace arrays");
+    }
 
     size_t cub_temp_bytes = get_cub_sort_temp_bytes(a.n_cells);
 
@@ -538,11 +546,12 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<const T, Device> Pr_b,
            gpu_array_c<const int, Device> cats,
            gpu_array_c<const T, Device> theta,
-           gpu_array_c<const int, Device> joint_codes,
-           gpu_array_c<const int, Device> marginal_joint_offsets,
-           gpu_array_c<const int, Device> marginal_joint_indices,
-           gpu_array_c<T, Device> O_joint, gpu_array_c<T, Device> Y,
-           gpu_array_c<T, Device> Y_norm, gpu_array_c<T, Device> similarities,
+           std::optional<gpu_array_c<const int, Device>> joint_codes,
+           std::optional<gpu_array_c<const int, Device>> marginal_joint_offsets,
+           std::optional<gpu_array_c<const int, Device>> marginal_joint_indices,
+           std::optional<gpu_array_c<T, Device>> O_joint,
+           gpu_array_c<T, Device> Y, gpu_array_c<T, Device> Y_norm,
+           gpu_array_c<T, Device> similarities,
            gpu_array_c<int, Device> idx_list,
            gpu_array_c<int, Device> idx_list_alt,
            gpu_array_c<unsigned int, Device> sort_keys,
@@ -550,7 +559,7 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<uint8_t, Device> cub_temp,
            gpu_array_c<T, Device> R_out_buffer,
            gpu_array_c<int, Device> cats_in,
-           gpu_array_c<int, Device> joint_codes_in,
+           std::optional<gpu_array_c<int, Device>> joint_codes_in,
            gpu_array_c<T, Device> R_in_sum, gpu_array_c<T, Device> R_out_sum,
            gpu_array_c<T, Device> penalty_buf,
            gpu_array_c<T, Device> obj_scalar,
@@ -569,10 +578,12 @@ static void register_clustering_loop(nb::module_& m) {
                 Pr_b.data(),
                 cats.data(),
                 theta.data(),
-                joint_codes.data(),
-                marginal_joint_offsets.data(),
-                marginal_joint_indices.data(),
-                O_joint.data(),
+                joint_codes ? joint_codes->data() : nullptr,
+                marginal_joint_offsets ? marginal_joint_offsets->data()
+                                       : nullptr,
+                marginal_joint_indices ? marginal_joint_indices->data()
+                                       : nullptr,
+                O_joint ? O_joint->data() : nullptr,
                 Y.data(),
                 Y_norm.data(),
                 similarities.data(),
@@ -583,7 +594,7 @@ static void register_clustering_loop(nb::module_& m) {
                 cub_temp.data(),
                 R_out_buffer.data(),
                 cats_in.data(),
-                joint_codes_in.data(),
+                joint_codes_in ? joint_codes_in->data() : nullptr,
                 R_in_sum.data(),
                 R_out_sum.data(),
                 penalty_buf.data(),
@@ -610,16 +621,17 @@ static void register_clustering_loop(nb::module_& m) {
             clustering_loop_impl(a);
         },
         "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "cats"_a,
-        "theta"_a, "joint_codes"_a, "marginal_joint_offsets"_a,
-        "marginal_joint_indices"_a, "O_joint"_a, "Y"_a, "Y_norm"_a,
-        "similarities"_a, "idx_list"_a, "idx_list_alt"_a, "sort_keys"_a,
-        "sort_keys_alt"_a, "cub_temp"_a, "R_out_buffer"_a, "cats_in"_a,
-        "joint_codes_in"_a, "R_in_sum"_a, "R_out_sum"_a, "penalty"_a,
-        "obj_scalar"_a, "ones_vec"_a, "last_obj"_a, "n_cells"_a, "n_pcs"_a,
-        "n_clusters"_a, "n_batches"_a, "n_covariates"_a, "n_joint_categories"_a,
-        "block_size"_a, "colsum_algo"_a, "sigma"_a, "tol"_a, "max_iter"_a,
-        "seed"_a, "stabilized"_a, "use_joint_scatter"_a, "stream"_a = 0,
-        "handle"_a);
+        "theta"_a, "joint_codes"_a = nb::none(),
+        "marginal_joint_offsets"_a = nb::none(),
+        "marginal_joint_indices"_a = nb::none(), "O_joint"_a = nb::none(),
+        "Y"_a, "Y_norm"_a, "similarities"_a, "idx_list"_a, "idx_list_alt"_a,
+        "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a, "R_out_buffer"_a,
+        "cats_in"_a, "joint_codes_in"_a = nb::none(), "R_in_sum"_a,
+        "R_out_sum"_a, "penalty"_a, "obj_scalar"_a, "ones_vec"_a, "last_obj"_a,
+        "n_cells"_a, "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a,
+        "n_joint_categories"_a, "block_size"_a, "colsum_algo"_a, "sigma"_a,
+        "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a, "use_joint_scatter"_a,
+        "stream"_a = 0, "handle"_a);
 }
 
 template <typename T, typename Device>

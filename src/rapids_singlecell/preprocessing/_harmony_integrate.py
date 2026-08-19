@@ -6,18 +6,26 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._keys import _harmony_obsm_key, _resolve_obsm_key
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+)
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
     from ._harmony import COLSUM_ALGO
 
 
+@_accepts_legacy_random_state(0)
 def harmony_integrate(
     adata: AnnData,
     key: str | list[str],
     *,
     basis: str = "X_pca",
-    adjusted_basis: str = "X_pca_harmony",
+    adjusted_basis: str | None = None,
     dtype: type = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
@@ -34,7 +42,7 @@ def harmony_integrate(
     correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     block_proportion: float = 0.05,
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     verbose: bool = False,
 ) -> None:
     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
@@ -66,8 +74,14 @@ def harmony_integrate(
         the desired columns into one categorical column and pass that single key.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
+        Either spelling of the PCA key resolves to whichever one the data
+        actually uses, so the default works under any
+        ``rapids_singlecell.settings.preset``.
     adjusted_basis
-        The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
+        The name of the field in ``adata.obsm`` where the adjusted PCA table will be
+        stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows
+        the naming of the basis it corrected (``"X_pca"`` gives
+        ``"X_pca_harmony"``, ``"pca"`` gives ``"pca_harmony"``).
     dtype
         The data type to use for Harmony computation. Defaults to 32-bit, which
         agrees with the 64-bit result to a Pearson correlation of >0.999 per
@@ -158,8 +172,9 @@ def harmony_integrate(
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
-    random_state
-        Random seed for reproducibility.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
     verbose
         Whether to print benchmarking and convergence information.
 
@@ -169,6 +184,8 @@ def harmony_integrate(
     containing principal components adjusted by Harmony
     such that different experiments are integrated.
     """
+    rng = np.random.default_rng(rng)
+
     from ._harmony import harmonize
 
     # Resolve flavor into internal flags
@@ -198,6 +215,10 @@ def harmony_integrate(
                 UserWarning,
                 stacklevel=2,
             )
+
+    basis = _resolve_obsm_key(adata, basis)
+    if adjusted_basis is None:
+        adjusted_basis = _harmony_obsm_key(basis)
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:
@@ -259,7 +280,7 @@ def harmony_integrate(
         tau=tau,
         correction_method=correction_method,
         colsum_algo=colsum_algo,
-        random_state=random_state,
+        rng=rng,
         stabilized_penalty=stabilized_penalty,
         dynamic_lambda=dynamic_lambda,
         alpha=alpha,

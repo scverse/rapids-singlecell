@@ -11,6 +11,7 @@ from rapids_singlecell._cuda import _harmony_clustering_cuda as _hc_cl
 from rapids_singlecell._cuda import _harmony_correction_batched_cuda as _hc_corr_b
 from rapids_singlecell._cuda import _harmony_correction_cuda as _hc_corr
 from rapids_singlecell._utils import _create_category_index_mapping
+from rapids_singlecell._utils._random import _seed_from_rng
 
 from ._fuses import (
     _calc_R,
@@ -33,6 +34,8 @@ from ._helper import (
 
 if TYPE_CHECKING:
     import pandas as pd
+
+    from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 COLSUM_ALGO = Literal["columns", "atomics", "gemm", "benchmark"]
 _SUPPRESS_PENALTY = 1e30
@@ -64,7 +67,7 @@ def harmonize(
     tau: int = 0,
     correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     stabilized_penalty: bool = True,
     dynamic_lambda: bool = True,
     alpha: float = 0.2,
@@ -134,8 +137,8 @@ def harmonize(
     colsum_algo
         Choose which algorithm to use for column sum. If `None`, choose the algorithm based on the number of rows and columns. If `'benchmark'`, benchmark all algorithms and choose the best one.
 
-    random_state
-        Random seed for reproducing results.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducing results.
 
     stabilized_penalty
         If ``True`` (default), use the Harmony2 stabilized diversity penalty
@@ -211,7 +214,6 @@ def harmonize(
         marginal_joint_indices = (flat_joint_indices // n_covariates).astype(
             cp.int32, copy=False
         )
-        # The centroid init stratifies over the joint categories.
         init_offsets, init_indices = joint_offsets, joint_cell_indices
     else:
         n_joint_categories = 0
@@ -301,8 +303,11 @@ def harmonize(
             "batched" if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
         )
 
-    # Set random seed
-    cp.random.seed(random_state)
+    rng = np.random.default_rng(rng)
+    # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
+    # generator collapses into an integer here; the per-iteration offset keeps
+    # successive kernel launches decorrelated.
+    kernel_seed = _seed_from_rng(rng, allow_none=False)
 
     # Initialize algorithm
     R, E, O, objectives_harmony = _initialize_centroids(
@@ -311,7 +316,7 @@ def harmonize(
         sigma=sigma,
         Pr_b=Pr_b,
         theta=theta_array,
-        random_state=random_state,
+        rng=rng,
         cats=cats,
         n_batches=n_batches,
         colsum_func=colsum_func_big,
@@ -351,8 +356,6 @@ def harmonize(
             n_batches=n_joint_categories,
         )
 
-    empty_int = cp.empty(0, dtype=cp.int32)
-
     # Main harmony iterations
     is_converged = False
 
@@ -374,20 +377,12 @@ def harmonize(
             colsum_func=colsum_func_small,
             n_batches=n_batches,
             n_covariates=n_covariates,
-            joint_codes=joint_codes if joint_codes is not None else empty_int,
-            marginal_joint_offsets=(
-                marginal_joint_offsets
-                if marginal_joint_offsets is not None
-                else empty_int
-            ),
-            marginal_joint_indices=(
-                marginal_joint_indices
-                if marginal_joint_indices is not None
-                else empty_int
-            ),
+            joint_codes=joint_codes,
+            marginal_joint_offsets=marginal_joint_offsets,
+            marginal_joint_indices=marginal_joint_indices,
             n_joint_categories=n_joint_categories,
             use_joint_scatter=use_joint_scatter,
-            random_state=random_state + i * 1000003,
+            kernel_seed=kernel_seed + i * 1000003,
             stabilized_penalty=stabilized_penalty,
             cpp_workspace=cpp_workspace,
         )
@@ -460,7 +455,7 @@ def _initialize_centroids(
     sigma: float,
     Pr_b: cp.ndarray,
     theta: cp.ndarray,
-    random_state: int = 0,
+    rng: np.random.Generator,
     cats: cp.ndarray,
     n_batches: int,
     colsum_func: callable = None,
@@ -480,22 +475,25 @@ def _initialize_centroids(
     # cuML's k-means is not reproducible in float32 -- repeated calls with the
     # same seed move centroids by ~0.3 in L2 and stop at different iterations.
     # Seeding only needs K centroids, so fit it in float64 on a bounded sample
-    # drawn proportionally from every batch: reproducible, cheaper than fitting
-    # every cell, and no batch can be missed by an unlucky draw.
+    # that contains every observed batch stratum: reproducible and cheaper than
+    # fitting every cell.
     n_init_cells = min(Z_norm.shape[0], _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
     Z_init = Z_norm
     if n_init_cells < Z_norm.shape[0]:
-        Z_init = Z_norm[
-            _stratified_sample_indices(
-                cat_offsets, cell_indices, n_init_cells, random_state
-            )
-        ]
+        sample_indices = _stratified_sample_indices(
+            cat_offsets,
+            cell_indices,
+            n_init_cells,
+            rng,
+        )
+        Z_init = Z_norm[sample_indices]
     kmeans = CumlKMeans(
         n_clusters=n_clusters,
         init="k-means||",
         n_init=1,
         max_iter=_KMEANS_MAX_ITER,
-        random_state=random_state,
+        # cuML's KMeans is seeded, so draw the seed right here
+        random_state=_seed_from_rng(rng),
     )
     kmeans.fit(cp.ascontiguousarray(Z_init, dtype=cp.float64))
     Y = kmeans.cluster_centers_.astype(Z_norm.dtype)
@@ -545,7 +543,7 @@ def _allocate_clustering_workspace(
 ) -> dict:
     """Pre-allocate workspace buffers for the C++ clustering loop."""
     cub_temp_bytes = _hc_cl.get_cub_sort_temp_bytes(n_cells=n_cells)
-    return {
+    workspace = {
         "Y": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "similarities": cp.empty((n_cells, n_clusters), dtype=dtype),
@@ -556,12 +554,6 @@ def _allocate_clustering_workspace(
         "cub_temp": cp.empty(cub_temp_bytes, dtype=cp.uint8),
         "R_out_buffer": cp.empty((block_size, n_clusters), dtype=dtype),
         "cats_in": cp.empty(block_size * n_covariates, dtype=cp.int32),
-        "O_joint": cp.zeros(
-            (n_joint_categories if use_joint_scatter else 1, n_clusters), dtype=dtype
-        ),
-        "joint_codes_in": cp.empty(
-            max(1, block_size) if use_joint_scatter else 1, dtype=cp.int32
-        ),
         "R_in_sum": cp.empty(n_clusters, dtype=dtype),
         "R_out_sum": cp.empty(n_clusters, dtype=dtype),
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
@@ -569,6 +561,14 @@ def _allocate_clustering_workspace(
         "ones_vec": cp.ones(block_size, dtype=dtype),
         "last_obj": cp.zeros(1, dtype=dtype),
     }
+    if use_joint_scatter:
+        workspace.update(
+            {
+                "O_joint": cp.zeros((n_joint_categories, n_clusters), dtype=dtype),
+                "joint_codes_in": cp.empty(block_size, dtype=cp.int32),
+            }
+        )
+    return workspace
 
 
 # Map colsum function to C++ enum: 0=columns, 1=atomics, 2=gemm
@@ -596,12 +596,12 @@ def _clustering(
     colsum_func: callable = None,
     n_batches: int = 0,
     n_covariates: int = 1,
-    joint_codes: cp.ndarray,
-    marginal_joint_offsets: cp.ndarray,
-    marginal_joint_indices: cp.ndarray,
+    joint_codes: cp.ndarray | None,
+    marginal_joint_offsets: cp.ndarray | None,
+    marginal_joint_indices: cp.ndarray | None,
     n_joint_categories: int,
     use_joint_scatter: bool,
-    random_state: int = 0,
+    kernel_seed: int,
     stabilized_penalty: bool = True,
     cpp_workspace: dict = None,
 ) -> None:
@@ -618,6 +618,20 @@ def _clustering(
     block_size = int(n_cells * block_proportion)
     colsum_algo_int = _COLSUM_MAP.get(colsum_func, 2)
 
+    joint_args = {}
+    if use_joint_scatter:
+        if (
+            joint_codes is None
+            or marginal_joint_offsets is None
+            or marginal_joint_indices is None
+        ):
+            raise ValueError("Joint scatter requires all joint category arrays.")
+        joint_args = {
+            "joint_codes": joint_codes,
+            "marginal_joint_offsets": marginal_joint_offsets,
+            "marginal_joint_indices": marginal_joint_indices,
+        }
+
     _hc_cl.clustering_loop(
         Z_norm,
         R=R,
@@ -625,10 +639,8 @@ def _clustering(
         O=O,
         Pr_b=Pr_b.ravel(),
         cats=cats,
-        joint_codes=joint_codes,
-        marginal_joint_offsets=marginal_joint_offsets,
-        marginal_joint_indices=marginal_joint_indices,
         theta=theta,
+        **joint_args,
         **cpp_workspace,
         n_cells=n_cells,
         n_pcs=Z_norm.shape[1],
@@ -642,7 +654,7 @@ def _clustering(
         sigma=float(sigma),
         tol=float(tol),
         max_iter=max_iter,
-        seed=random_state & 0xFFFFFFFF,
+        seed=kernel_seed & 0xFFFFFFFF,
         stabilized=stabilized_penalty,
         stream=cp.cuda.get_current_stream().ptr,
         handle=cp.cuda.device.get_cublas_handle(),

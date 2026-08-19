@@ -1,19 +1,6 @@
 runners:
-  # L4 for dev only (cu13). scverse-standard AMI, eu-west-1.
-  # g5 (A10G) is the capacity fallback: it runs dry in eu-west-1 for hours.
-  - name: aws-gpu-runner-g6
-    cloud: aws
-    instance_type:
-      - g6.xlarge
-      - g5.xlarge
-    machine_image: ami-0756bd122da9b2618
-    region: eu-west-1
-    preemptible:
-      - true
-      - false
-    labels:
-      - cirun-aws-gpu-l4
-  # T4 for stable + prerelease (cu13). scverse-standard AMI, eu-west-1.
+  # T4 for stable, dev and prerelease (cu13). scverse-standard AMI, eu-west-1.
+  # Only T4 capacity is available; g5 (A10G) and g6 (L4) are not.
   - name: aws-gpu-runner-g4dn
     cloud: aws
     instance_type: g4dn.xlarge

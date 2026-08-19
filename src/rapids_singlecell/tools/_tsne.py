@@ -3,9 +3,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cuml.internals.logger as logger
+import numpy as np
 from cuml.manifold import TSNE
 
+from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _LegacyRng,
+    _seed_from_rng,
+)
 
 from ._utils import _choose_representation
 
@@ -13,6 +23,7 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 
+@_accepts_legacy_random_state(0)
 def tsne(
     adata: AnnData,
     n_pcs: int = None,
@@ -23,7 +34,8 @@ def tsne(
     learning_rate: int = 200,
     method: str = "barnes_hut",
     metric: str = "euclidean",
-    key_added: str | None = None,
+    rng: SeedLike | RNGLike | None = None,
+    key_added: str | Default | None = Default(("tsne", "key_added")),
     copy: bool = False,
 ) -> AnnData | None:
     """
@@ -40,8 +52,9 @@ def tsne(
         use_rep
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
             If None, the representation is chosen automatically: For .n_vars < 50, .X
-            is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-            computed with default parameters or `n_pcs` if present.
+            is used, otherwise the PCA embedding, under whichever key the active
+            ``rapids_singlecell.settings.preset`` uses. If no PCA embedding is
+            present, it's computed with default parameters or `n_pcs` if present.
         perplexity
             The perplexity is related to the number of nearest neighbors that is used
             in other manifold learning algorithms. Larger datasets usually require a larger
@@ -64,6 +77,11 @@ def tsne(
         metric
             Distance metric to use. Supported distances are ['l1, 'cityblock', 'manhattan', 'euclidean',
             'l2', 'sqeuclidean', 'minkowski', 'chebyshev', 'cosine', 'correlation']
+        rng
+            Random seed or :class:`~numpy.random.Generator` seeding cuML's t-SNE.
+            Note that cuML's t-SNE is not fully deterministic, so a fixed seed
+            narrows but does not eliminate run-to-run variation.
+            The superseded `random_state` argument is still accepted.
         key_added
             If not specified, the embedding is stored as
             :attr:`~anndata.AnnData.obsm`\\ `['X_tsne']` and the the parameters in
@@ -86,19 +104,24 @@ def tsne(
     """
 
     adata = adata.copy() if copy else adata
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+    key_added = resolve_default(key_added)
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     logger_level = _get_logger_level(logger)
-    key_uns, key_obsm = ("tsne", "X_tsne") if key_added is None else [key_added] * 2
-    adata.obsm[key_obsm] = TSNE(
+    keys = _embedding_keys("tsne", key_added)
+    adata.obsm[keys.obsm] = TSNE(
         perplexity=perplexity,
         early_exaggeration=early_exaggeration,
         learning_rate=learning_rate,
         method=method,
         metric=metric,
+        # cuML's TSNE is seeded, so draw the seed right here
+        random_state=_seed_from_rng(rng),
     ).fit_transform(X)
     logger.set_level(logger_level)
-    adata.uns[key_uns] = {
+    adata.uns[keys.uns] = {
         "params": {
             k: v
             for k, v in {
@@ -111,6 +134,7 @@ def tsne(
             }.items()
             if v is not None
         }
+        | meta_random_state
     }
 
     return adata if copy else None

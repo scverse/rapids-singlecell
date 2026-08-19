@@ -10,8 +10,6 @@ from rapids_singlecell.preprocessing._utils import _get_mean_var, _sparse_to_den
 from .sparse_utils import sparse_multiply, sparse_zscore
 
 if TYPE_CHECKING:
-    from rapids_singlecell._utils import AnyRandom
-
     from .core import Scrublet
 
 
@@ -49,7 +47,6 @@ def truncated_svd(
     self: Scrublet,
     n_prin_comps: int = 30,
     *,
-    random_state: AnyRandom = 0,
     algorithm: Literal["arpack", "randomized"] = "arpack",
 ) -> None:
     if self._counts_sim_norm is None:
@@ -69,7 +66,6 @@ def pca(
     self: Scrublet,
     n_prin_comps: int = 50,
     *,
-    random_state: AnyRandom = 0,
     svd_solver: Literal["auto", "full", "arpack", "randomized"] = "arpack",
 ) -> None:
     if self._counts_sim_norm is None:

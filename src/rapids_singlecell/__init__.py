@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import cuml.internals.logger as logger
 
+# Import settings before the public modules which consume them.
+from ._settings import Preset, settings  # isort: skip
+
 from . import dcg, get, gr, pp, ptg, tl
 from ._version import __version__
 
