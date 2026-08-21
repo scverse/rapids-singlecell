@@ -61,7 +61,7 @@ jobs:
       - name: Set package name, extras, and CUDA archs for CUDA ${{ matrix.cuda_major }}
         run: |
           python3 - ${{ matrix.cuda_major }} "${{ matrix.cuda_archs }}" "${{ steps.version.outputs.version }}" <<'SCRIPT'
-          import sys, pathlib
+          import re, sys, pathlib
 
           cuda = sys.argv[1]
           cuda_archs = sys.argv[2]
@@ -95,33 +95,22 @@ jobs:
               'dynamic = [ "version" ]',
               f'version = "{version}"',
           )
+          # Rewrite self-referential extras (e.g. "rapids_singlecell[test-minimal]")
+          # to the renamed distribution, so `pip install rapids-singlecell-cuXX[test]`
+          # composes extras within this wheel instead of pulling the plain
+          # rapids-singlecell package from PyPI alongside it.
+          text, n_self = re.subn(
+              r'"rapids[-_]singlecell\[',
+              f'"rapids-singlecell-cu{cuda}[',
+              text,
+          )
+          print(f"rewrote {n_self} self-referential extra(s)")
+          if n_self == 0:
+              raise SystemExit("expected at least one self-referential extra to rewrite")
+
           # Rename matching extra to "rapids", remove the other
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
           text = remove_toml_array(text, f"rapids-cu{other}")
-
-          # CMake links CUDA extensions against librmm.
-          # Build against the oldest supported RMM ABI so the wheel can run
-          # with any supported runtime RMM version.
-          build_system_text, project_text = text.split("[project]", 1)
-          for dep in (
-              f'    "librmm-cu{other}>=25.12",\n',
-              f'    "librmm-cu{other}>=25.12,<25.13",\n',
-              f'    "rmm-cu{other}>=25.12",\n',
-              f'    "rmm-cu{other}>=25.12,<25.13",\n',
-              f'    "librmm-cu{cuda}>=25.12",\n',
-              f'    "librmm-cu{cuda}>=25.12,<25.13",\n',
-              f'    "rmm-cu{cuda}>=25.12",\n',
-              f'    "rmm-cu{cuda}>=25.12,<25.13",\n',
-          ):
-              build_system_text = build_system_text.replace(dep, "")
-          rmm_build_req = f'    "librmm-cu{cuda}>=25.12,<25.13",\n'
-          if f'"librmm-cu{cuda}>=25.12"' not in build_system_text:
-              build_system_text = build_system_text.replace(
-                  ']\nbuild-backend =',
-                  f'{rmm_build_req}]\nbuild-backend =',
-                  1,
-              )
-          text = build_system_text + "[project]" + project_text
 
           # Set CUDA architectures (replace "native" with CI target archs)
           text = text.replace(
@@ -159,28 +148,16 @@ jobs:
             libcusparse-devel-${{ matrix.cuda_major }}-${{ matrix.cuda_minor }}
             libnvjitlink-${{ matrix.cuda_major }}-${{ matrix.cuda_minor }}
           CIBW_BEFORE_BUILD: >
-            rm -f build/.librmm_dir &&
-            mkdir -p build &&
             python -m pip install -U pip
             scikit-build-core cmake ninja nanobind
-            "librmm-cu${{ matrix.cuda_major }}>=25.12,<25.13" &&
-            RMM_ROOT=$(python -c "import librmm; print(librmm.__path__[0])") &&
-            LOG_ROOT=$(python -c "import rapids_logger; print(rapids_logger.__path__[0])") &&
-            echo "[rsc-build] librmm=$RMM_ROOT" &&
-            echo "[rsc-build] rapids_logger=$LOG_ROOT" &&
-            ln -sf "$RMM_ROOT/lib64/librmm.so" /usr/local/lib/librmm.so &&
-            ln -sf "$LOG_ROOT/lib64/librapids_logger.so" /usr/local/lib/librapids_logger.so &&
-            ldconfig &&
-            python -c "import librmm; print(librmm.__path__[0])" > build/.librmm_dir &&
-            echo "[rsc-build] marker=$(cat build/.librmm_dir)"
           CIBW_TEST_SKIP: "*"
           CIBW_TEST_COMMAND: ""
-          # Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+          # Exclude CUDA runtime libs provided by dependency wheels.
           # Use SONAME globs so CUDA 12/13 suffix changes do not bundle them.
-          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 
-      - name: Check RMM ABI compatibility
+      - name: Check wheels link no RAPIDS C++ libs
         run: |
           python3 - <<'SCRIPT'
           import pathlib
@@ -190,10 +167,13 @@ jobs:
           import tempfile
           import zipfile
 
-          nm = shutil.which("nm")
-          if nm is None:
-              raise SystemExit("nm is required for the RMM ABI compatibility check")
+          readelf = shutil.which("readelf")
+          if readelf is None:
+              raise SystemExit("readelf is required for the RAPIDS linkage check")
 
+          # Kernels use a CuPy-backed scratch allocator and the CUDA toolkit's
+          # bundled CCCL, so no extension may pull in librmm/librapids_logger.
+          banned = ("librmm", "librapids_logger")
           failures = []
           for wheel in sorted(pathlib.Path("wheelhouse").glob("*.whl")):
               with tempfile.TemporaryDirectory() as tmp:
@@ -204,19 +184,19 @@ jobs:
                               zf.extract(name, tmp_path)
                   for ext in sorted((tmp_path / "rapids_singlecell" / "_cuda").glob("*.so")):
                       result = subprocess.run(
-                          [nm, "-D", str(ext)],
+                          [readelf, "-d", str(ext)],
                           check=True,
                           capture_output=True,
                           text=True,
                       )
                       for line in result.stdout.splitlines():
-                          if " U _ZN3rmm6detail" in line:
+                          if "(NEEDED)" in line and any(b in line for b in banned):
                               failures.append(f"{wheel.name}:{ext.name}: {line.strip()}")
 
           if failures:
               print(
-                  "Wheel links against private RMM detail symbols; build against the "
-                  "oldest supported RMM ABI instead.",
+                  "Wheel links against RAPIDS C++ libs, which are no longer a "
+                  "build or runtime dependency.",
                   file=sys.stderr,
               )
               print("\n".join(failures), file=sys.stderr)
@@ -233,6 +213,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history + tags so hatch-vcs resolves the real version.
+          # Without this, non-tag runs produce a bogus 0.1.dev1 sdist.
+          fetch-depth: 0
       - name: Build sdist
         run: pipx run build --sdist
       - uses: actions/upload-artifact@v7

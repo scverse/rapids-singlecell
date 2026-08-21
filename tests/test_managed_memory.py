@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import pytest
 import rmm
 from anndata import AnnData
@@ -74,3 +75,15 @@ def test_qc_metrics(managed_memory):
     rsc.pp.calculate_qc_metrics(adata, log1p=False)
     assert "total_counts" in adata.obs.columns
     assert "n_genes_by_counts" in adata.obs.columns
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_harmony_integrate(managed_memory, dtype):
+    """Regression test for GH-763: harmony_integrate with managed memory."""
+    rng = np.random.default_rng(0)
+    adata = AnnData(rng.standard_normal((300, 5)).astype(dtype))
+    adata.obs["batch"] = pd.Categorical(rng.choice(["a", "b"], 300))
+    adata.obsm["X_pca"] = rng.standard_normal((300, 10)).astype(dtype)
+    rsc.pp.harmony_integrate(adata, key="batch", dtype=dtype)
+    assert adata.obsm["X_pca_harmony"].shape == (300, 10)
+    assert adata.obsm["X_pca_harmony"].dtype == dtype

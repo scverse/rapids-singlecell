@@ -12,6 +12,13 @@ from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell._settings import Default, Preset, resolve_default, settings
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+)
 from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
 
 from ._utils import _check_gpu_X
@@ -21,47 +28,10 @@ if TYPE_CHECKING:
 
     from rapids_singlecell._utils import ArrayTypesDask
 
-_empty = object()
+_empty = Default(repr="adata.var.get('highly_variable')")
 
 
-def _resolve_mask_var(
-    adata: AnnData,
-    mask_var: NDArray[np.bool] | str | None,
-    *,
-    use_highly_variable: bool | None,
-) -> tuple[str | None, np.ndarray | None]:
-    """Resolve mask_var and use_highly_variable into a mask parameter and array."""
-    import warnings
-
-    if use_highly_variable is not None:
-        warnings.warn(
-            "Argument `use_highly_variable` is deprecated, use `mask_var` instead. "
-            'Use mask_var="highly_variable" instead of use_highly_variable=True, '
-            "and mask_var=None instead of use_highly_variable=False.",
-            FutureWarning,
-            stacklevel=3,
-        )
-        if mask_var is not _empty:
-            raise ValueError(
-                "Cannot specify both `mask_var` and `use_highly_variable`."
-            )
-
-    if use_highly_variable or (
-        use_highly_variable is None
-        and mask_var is _empty
-        and "highly_variable" in adata.var.columns
-    ):
-        mask_var = "highly_variable"
-
-    if mask_var is _empty or mask_var is None:
-        return None, None
-
-    # `_check_mask` validates boolean dtype + shape (and resolves a column name),
-    # matching scanpy. Keep the param as the column name for strings, else None.
-    mask_var_param = mask_var if isinstance(mask_var, str) else None
-    return mask_var_param, _check_mask(adata, mask_var, "var")
-
-
+@_accepts_legacy_random_state(0)
 def pca(
     data: AnnData | ArrayTypesDask,
     n_comps: int | None = None,
@@ -69,13 +39,12 @@ def pca(
     layer: str = None,
     zero_center: bool = True,
     svd_solver: str | None = None,
-    random_state: int | None = 0,
-    mask_var: NDArray[np.bool] | str | None = _empty,
-    use_highly_variable: bool | None = None,
+    rng: SeedLike | RNGLike | None = None,
+    mask_var: NDArray[np.bool] | str | Default | None = _empty,
     dtype: str = "float32",
     chunked: bool = False,
     chunk_size: int = None,
-    key_added: str | None = None,
+    key_added: str | Default | None = Default(("pca", "key_added")),
     return_info: bool = False,
     copy: bool = False,
     **kwargs,
@@ -145,8 +114,9 @@ def pca(
         `'jacobi'`
             cuML: Jacobi iterative solver. Faster but less accurate. For dense arrays only.
 
-    random_state
-        Random state for initialization.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for initialization.
+        The superseded `random_state` argument is still accepted.
 
     mask_var
         Mask to use for the PCA computation.
@@ -154,18 +124,13 @@ def pca(
         If `np.ndarray`, use the provided mask.
         If `str`, use the mask stored in `adata.var[mask_var]`.
 
-    use_highly_variable
-        Whether to use highly variable genes only, stored in
-        `.var['highly_variable']`.
-        By default uses them if they have been determined beforehand.
-
     dtype
         Numpy data type string to which to convert the result.
 
     chunked
         If `True`, perform an incremental PCA on segments of `chunk_size`.
         The incremental PCA automatically zero centers and ignores settings of
-        `random_seed` and `svd_solver`. If `False`, perform a full PCA.
+        `rng` and `svd_solver`. If `False`, perform a full PCA.
 
     chunk_size
         Number of observations to include in each chunk.
@@ -216,22 +181,27 @@ def pca(
                 Explained variance, equivalent to the eigenvalues of the \
                 covariance matrix.
     """
+    if "use_highly_variable" in kwargs:
+        raise TypeError(
+            "pca() got an unexpected keyword argument 'use_highly_variable'"
+        )
+
+    rng = np.random.default_rng(rng)
+
     if not isinstance(data, AnnData):
         if layer is not None:
             raise ValueError("`layer` can only be used with an AnnData object.")
-        if use_highly_variable is not None:
-            raise ValueError(
-                "`use_highly_variable` can only be used with an AnnData object."
-            )
         X = data
-        mask_var = None if mask_var is _empty else _check_mask(X, mask_var, "var")
+        mask_var = (
+            None if isinstance(mask_var, Default) else _check_mask(X, mask_var, "var")
+        )
         X = X[:, mask_var] if mask_var is not None else X
         pca_func, X_pca, _ = _pca_compute(
             X,
             n_comps,
             zero_center=zero_center,
             svd_solver=svd_solver,
-            random_state=random_state,
+            rng=rng,
             chunked=chunked,
             chunk_size=chunk_size,
             dtype=dtype,
@@ -247,21 +217,23 @@ def pca(
         return X_pca
 
     adata = data
-    if use_highly_variable is True and "highly_variable" not in adata.var.keys():
-        raise ValueError(
-            "Did not find adata.var['highly_variable']. "
-            "Either your data already only consists of highly-variable genes "
-            "or consider running `highly_variable_genes` first."
-        )
+    key_added = resolve_default(key_added)
     if copy:
         adata = adata.copy()
 
     X = _get_obs_rep(adata, layer=layer)
 
-    mask_var_param, mask_var = _resolve_mask_var(
-        adata, mask_var, use_highly_variable=use_highly_variable
-    )
-    del use_highly_variable
+    if isinstance(mask_var, Default):
+        if "highly_variable" not in adata.var.columns:
+            mask_var = None
+        elif settings.preset is Preset.ScanpyV2Preview:
+            mask_var = "var.highly_variable"
+        else:
+            mask_var = "highly_variable"
+
+    # Keep the recorded param as the column name for strings, else None.
+    mask_var_param = mask_var if isinstance(mask_var, str) else None
+    mask_var = _check_mask(adata, mask_var, "var")
     X = X[:, mask_var] if mask_var is not None else X
 
     pca_func, X_pca, n_comps = _pca_compute(
@@ -269,21 +241,18 @@ def pca(
         n_comps,
         zero_center=zero_center,
         svd_solver=svd_solver,
-        random_state=random_state,
+        rng=rng,
         chunked=chunked,
         chunk_size=chunk_size,
         dtype=dtype,
         kwargs=kwargs,
     )
 
-    key_obsm, key_varm, key_uns = (
-        ("X_pca", "PCs", "pca") if key_added is None else [key_added] * 3
-    )
-    adata.obsm[key_obsm] = X_pca
-    adata.uns[key_uns] = {
+    keys = _embedding_keys("pca", key_added)
+    adata.obsm[keys.obsm] = X_pca
+    adata.uns[keys.uns] = {
         "params": {
             "zero_center": zero_center,
-            "use_highly_variable": mask_var_param == "highly_variable",
             "mask_var": mask_var_param,
             **({"layer": layer} if layer is not None else {}),
         },
@@ -291,10 +260,10 @@ def pca(
         "variance_ratio": _as_numpy(pca_func.explained_variance_ratio_),
     }
     if mask_var is not None:
-        adata.varm[key_varm] = np.zeros(shape=(adata.n_vars, n_comps))
-        adata.varm[key_varm][mask_var] = _as_numpy(pca_func.components_.T)
+        adata.varm[keys.varm] = np.zeros(shape=(adata.n_vars, n_comps))
+        adata.varm[keys.varm][mask_var] = _as_numpy(pca_func.components_.T)
     else:
-        adata.varm[key_varm] = _as_numpy(pca_func.components_.T)
+        adata.varm[keys.varm] = _as_numpy(pca_func.components_.T)
 
     if copy:
         return adata
@@ -306,7 +275,7 @@ def _pca_compute(
     *,
     zero_center: bool,
     svd_solver: str | None,
-    random_state: int | None,
+    rng: np.random.Generator,
     chunked: bool,
     chunk_size: int | None,
     dtype: str,
@@ -314,10 +283,10 @@ def _pca_compute(
 ):
     if n_comps is None:
         min_dim = min(X.shape[0], X.shape[1])
-        if 50 >= min_dim:
+        if settings.N_PCS >= min_dim:
             n_comps = min_dim - 1
         else:
-            n_comps = 50
+            n_comps = settings.N_PCS
 
     # Auto-select sparse solver based on matrix dimensions
     # Lanczos is faster for large feature counts (>8000)
@@ -361,7 +330,7 @@ def _pca_compute(
                     n_comps,
                     svd_solver,
                     zero_center=zero_center,
-                    random_state=random_state,
+                    rng=rng,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
                 )
@@ -378,7 +347,7 @@ def _pca_compute(
                     n_comps,
                     svd_solver,
                     zero_center=zero_center,
-                    random_state=random_state,
+                    rng=rng,
                     n_oversamples=kwargs.get("n_oversamples"),
                     n_iter=kwargs.get("n_iter"),
                 )
@@ -422,7 +391,7 @@ def _run_sparse_svd_pca(
     svd_solver,
     *,
     zero_center: bool = True,
-    random_state: int = 0,
+    rng: np.random.Generator,
     n_oversamples: int | None = None,
     n_iter: int | None = None,
 ):
@@ -441,7 +410,7 @@ def _run_sparse_svd_pca(
         "n_components": n_comps,
         "svd_solver": svd_solver,
         "zero_center": zero_center,
-        "random_state": random_state,
+        "rng": rng,
     }
     if n_oversamples is not None:
         kwargs["n_oversamples"] = n_oversamples

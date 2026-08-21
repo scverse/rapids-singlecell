@@ -52,7 +52,10 @@ def _compare_top_genes(result1, result2, top_n=10, min_overlap=9):
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
-def test_rank_genes_groups_ttest_dask(client, data_kind, dtype, method):
+@pytest.mark.parametrize("mean_in_log_space", [True, False])
+def test_rank_genes_groups_ttest_dask(
+    client, data_kind, dtype, method, mean_in_log_space
+):
     """Test t-test methods with dask arrays."""
     if data_kind == "dense":
         adata = pbmc68k_reduced()
@@ -72,8 +75,20 @@ def test_rank_genes_groups_ttest_dask(client, data_kind, dtype, method):
         rsc.get.anndata_to_GPU(adata)
         groupby = "louvain"
 
-    rsc.tl.rank_genes_groups(adata, groupby=groupby, method=method, use_raw=False)
-    rsc.tl.rank_genes_groups(dask_data, groupby=groupby, method=method, use_raw=False)
+    rsc.tl.rank_genes_groups(
+        adata,
+        groupby=groupby,
+        method=method,
+        use_raw=False,
+        mean_in_log_space=mean_in_log_space,
+    )
+    rsc.tl.rank_genes_groups(
+        dask_data,
+        groupby=groupby,
+        method=method,
+        use_raw=False,
+        mean_in_log_space=mean_in_log_space,
+    )
 
     # Compare top genes overlap
     assert _compare_top_genes(
@@ -130,7 +145,8 @@ def test_rank_genes_groups_wilcoxon_dask_errors(client, data_kind):
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
-def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method):
+@pytest.mark.parametrize("mean_in_log_space", [True, False])
+def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log_space):
     """Test t-test methods with CPU dask arrays (auto-converted to GPU).
 
     Compares CPU dask arrays against GPU cupy arrays to ensure conversion works.
@@ -160,10 +176,22 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method):
         groupby = "louvain"
 
     # Run rsc on GPU cupy array for reference
-    rsc.tl.rank_genes_groups(adata, groupby=groupby, method=method, use_raw=False)
+    rsc.tl.rank_genes_groups(
+        adata,
+        groupby=groupby,
+        method=method,
+        use_raw=False,
+        mean_in_log_space=mean_in_log_space,
+    )
 
     # Run rsc on CPU dask array (gets converted to GPU internally)
-    rsc.tl.rank_genes_groups(cpu_dask, groupby=groupby, method=method, use_raw=False)
+    rsc.tl.rank_genes_groups(
+        cpu_dask,
+        groupby=groupby,
+        method=method,
+        use_raw=False,
+        mean_in_log_space=mean_in_log_space,
+    )
 
     # Compare top genes overlap
     assert _compare_top_genes(

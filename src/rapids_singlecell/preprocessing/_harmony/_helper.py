@@ -262,6 +262,50 @@ def _factorize_joint_codes(
     return joint_cats, joint_codes
 
 
+def _stratified_sample_indices(
+    cat_offsets: cp.ndarray,
+    cell_indices: cp.ndarray,
+    n_target: int,
+    rng: np.random.Generator,
+) -> cp.ndarray:
+    """Draw exactly ``n_target`` cells while representing every observed stratum."""
+    offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
+    sizes = np.diff(offsets)
+    nonempty = np.flatnonzero(sizes)
+    n_cells = int(cell_indices.size)
+    if not nonempty.size <= n_target <= n_cells:
+        raise ValueError(
+            "n_target must cover every nonempty stratum without exceeding n_cells"
+        )
+
+    quotas = np.zeros_like(sizes)
+    quotas[nonempty] = 1
+    remaining = n_target - nonempty.size
+    if remaining:
+        capacities = sizes - quotas
+        total_capacity = int(capacities.sum())
+        numerators = capacities * remaining
+        additional, remainders = np.divmod(numerators, total_capacity)
+        quotas += additional
+
+        leftover = n_target - int(quotas.sum())
+        if leftover:
+            eligible = np.flatnonzero(remainders)
+            tie_break = rng.random(eligible.size)
+            order = np.lexsort((tie_break, -remainders[eligible]))
+            quotas[eligible[order[:leftover]]] += 1
+
+    picks = []
+    for start, size, quota in zip(offsets[:-1], sizes, quotas, strict=True):
+        start, size, quota = int(start), int(size), int(quota)
+        if quota == 0:
+            continue
+        picks.append(start + rng.choice(size, quota, replace=False))
+
+    selected = cell_indices[cp.asarray(np.concatenate(picks))]
+    return selected[cp.asarray(rng.permutation(n_target))]
+
+
 def _get_theta_array(
     theta: float | int | list[float | int] | np.ndarray | cp.ndarray,
     n_levels: int | np.ndarray,
@@ -411,8 +455,9 @@ def _benchmark_colsum_algorithms(
     """
     rows, cols = shape
 
-    # Create test data
-    X = cp.random.random(shape, dtype=dtype)
+    # Create test data. The values only need to be plausible, not reproducible,
+    # but the generator is local so the global CuPy state stays untouched.
+    X = cp.random.default_rng(0).random(shape, dtype=dtype)
 
     # Ensure it's C-contiguous for fair comparison
     if not X.flags.c_contiguous:

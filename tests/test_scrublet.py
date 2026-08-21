@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import cupy as cp
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sparse
 from anndata import AnnData, concat
 from anndata.tests.helpers import assert_equal
+from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import coo_matrix
 from numpy.testing import assert_allclose, assert_array_equal
 
 import rapids_singlecell as rsc
+from rapids_singlecell.preprocessing._scrublet.sparse_utils import subsample_counts
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -227,3 +230,36 @@ def test_scrublet_simulate_doublets():
         adata_sim.obsm["doublet_parents"],
         np.array([[13, 132], [106, 43], [152, 3], [160, 103]]),
     )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_subsample_counts_uses_seeded_gpu_rng(dtype):
+    rate = 0.6
+    counts = cp.asarray([[4, 0, 2, 1], [0, 3, 0, 5], [1, 1, 6, 0]], dtype=dtype)
+    matrix = cp_sparse.csr_matrix(counts)
+    original_totals = matrix.sum(axis=1).ravel()
+
+    expected_host_rng = np.random.default_rng(17)
+    seed = int(expected_host_rng.integers(0, 2**32))
+    expected_gpu_rng = cp.random.default_rng(seed)
+    expected = matrix.copy()
+    expected.data = expected_gpu_rng.binomial(
+        cp.round(expected.data).astype(np.int64), rate
+    ).astype(dtype, copy=False)
+    expected_current_totals = expected.sum(axis=1).ravel()
+    expected_unsampled_totals = expected_gpu_rng.binomial(
+        cp.round(original_totals - expected_current_totals).astype(np.int64), rate
+    ).astype(dtype, copy=False)
+
+    rng = np.random.default_rng(17)
+    actual, actual_totals = subsample_counts(
+        matrix.copy(), rate=rate, original_totals=original_totals, rng=rng
+    )
+
+    cp.testing.assert_array_equal(actual.toarray(), expected.toarray())
+    cp.testing.assert_array_equal(
+        actual_totals, expected_current_totals + expected_unsampled_totals
+    )
+    assert actual.dtype == dtype
+    assert actual_totals.dtype == dtype
+    assert rng.integers(0, 2**32) == expected_host_rng.integers(0, 2**32)

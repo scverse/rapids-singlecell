@@ -15,8 +15,6 @@ from ._multi_gpu import (
     parse_device_ids,
 )
 
-AnyRandom = Union[int, np.random.RandomState, None]  # noqa: UP007
-
 __all__ = [
     "_calculate_blocks_per_pair",
     "_create_category_index_mapping",

@@ -24,11 +24,12 @@ def test_tsne():
 
 
 @needs.igraph
-def test_umap_init_paga():
+@pytest.mark.parametrize("func", [umap, draw_graph])
+def test_init_paga(func):
     pbmc = pbmc68k_reduced()[:100, :].copy()
     sc.tl.paga(pbmc)
     sc.pl.paga(pbmc, show=False)
-    umap(pbmc, init_pos="paga")
+    func(pbmc, init_pos="paga")
 
 
 @pytest.mark.parametrize("init_pos", ["X_pca", "X_tsne", "numpy", "cupy"])

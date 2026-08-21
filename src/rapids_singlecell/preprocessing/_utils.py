@@ -14,8 +14,6 @@ from rapids_singlecell._compat import DaskArray
 if TYPE_CHECKING:
     from anndata import AnnData
 
-    from rapids_singlecell._utils import AnyRandom
-
 
 def _sparse_to_dense(X: spmatrix, order: Literal["C", "F"] | None = None) -> cp.ndarray:
     if order is None:
@@ -335,9 +333,3 @@ def _check_use_raw(adata: AnnData, layer: str | None, *, use_raw: None | bool) -
     if layer is not None:
         return False
     return adata.raw is not None
-
-
-def get_random_state(seed: AnyRandom) -> np.random.RandomState:
-    if isinstance(seed, np.random.RandomState):
-        return seed
-    return np.random.RandomState(seed)

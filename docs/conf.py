@@ -195,6 +195,7 @@ nitpick_ignore = [
     ("py:class", "anndata._core.views.ArrayView"),
     ("py:class", "anndata._core.raw.Raw"),
     ("py:class", "scanpy._utils.Empty"),
+    ("py:class", "rapids_singlecell._settings.Default"),
     ("py:data", "typing.Union"),
     ("py:class", "cuml.linear_model.LogisticRegression"),
     *[

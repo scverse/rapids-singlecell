@@ -25,6 +25,7 @@ from rapids_singlecell.preprocessing._harmony._helper import (
     _get_batch_codes,
     _get_theta_array,
     _scatter_add_cp,
+    _stratified_sample_indices,
 )
 
 
@@ -106,6 +107,67 @@ def test_harmony_batch_keys_are_nonempty_and_complete():
         _get_batch_codes(obs, "batch")
     with pytest.raises(ValueError, match="at least one column"):
         _get_batch_codes(obs, [])
+
+
+@pytest.mark.parametrize("layout_seed", [0, 42, 734])
+def test_harmony_stratified_sample_random_offsets_and_groups(layout_seed):
+    rng = np.random.default_rng(layout_seed)
+    n_groups = 128
+    group_sizes = rng.integers(0, 257, size=n_groups, dtype=np.int64)
+    group_sizes[::11] = 0
+    group_sizes[1:3] = [1, 256]
+    offsets = np.concatenate(([0], np.cumsum(group_sizes)))
+    n_cells = int(offsets[-1])
+
+    group_by_cell = np.repeat(np.arange(n_groups, dtype=np.int32), group_sizes)
+    rng.shuffle(group_by_cell)
+    cell_indices = np.argsort(group_by_cell, kind="stable").astype(np.int32)
+
+    nonempty = np.flatnonzero(group_sizes)
+    gpu_offsets = cp.asarray(offsets, dtype=cp.int32)
+    gpu_indices = cp.asarray(cell_indices)
+
+    targets = [nonempty.size, max(nonempty.size, n_cells // 3), n_cells]
+    for n_target in targets:
+        # a fresh generator per call: same seed, same sample
+        sampled = cp.asnumpy(
+            _stratified_sample_indices(
+                gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)
+            )
+        )
+        repeated = cp.asnumpy(
+            _stratified_sample_indices(
+                gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)
+            )
+        )
+
+        assert sampled.size == n_target
+        assert np.unique(sampled).size == n_target
+        assert np.all((0 <= sampled) & (sampled < n_cells))
+        np.testing.assert_array_equal(sampled, repeated)
+
+        counts = np.bincount(group_by_cell[sampled], minlength=n_groups)
+        np.testing.assert_array_equal(np.flatnonzero(counts), nonempty)
+        assert np.all(counts <= group_sizes)
+
+        if n_target == nonempty.size:
+            np.testing.assert_array_equal(counts[nonempty], 1)
+        elif n_target == n_cells:
+            np.testing.assert_array_equal(counts, group_sizes)
+            np.testing.assert_array_equal(np.sort(sampled), np.sort(cell_indices))
+
+
+def test_harmony_stratified_sample_known_quotas():
+    offsets = cp.asarray([0, 0, 1, 3, 8, 8, 16], dtype=cp.int32)
+    cell_indices = cp.asarray([12, 7, 15, 1, 10, 4, 13, 2, 14, 9, 0, 11, 5, 8, 3, 6])
+    cell_groups = np.array([5, 3, 3, 5, 3, 5, 5, 2, 5, 5, 3, 5, 1, 3, 5, 2])
+
+    sampled = cp.asnumpy(
+        _stratified_sample_indices(offsets, cell_indices, 9, np.random.default_rng(0))
+    )
+    counts = np.bincount(cell_groups[sampled], minlength=6)
+
+    np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
 
 
 def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
@@ -675,3 +737,22 @@ def test_harmony2_ircolitis_reference(
 
     assert _get_measure(ref, result, "r").min() > 0.95
     assert _get_measure(ref, result, "L2").max() < 0.1
+
+
+def test_harmony_unseeded_random_state():
+    """``random_state=None`` means unseeded, not a crash."""
+    rng = np.random.default_rng(734)
+    batch = np.resize(["a", "b", "c"], 60)
+    adata = ad.AnnData(
+        X=None,
+        obs=pd.DataFrame(
+            {"batch": batch}, index=[f"cell_{index}" for index in range(60)]
+        ),
+        obsm={"X_pca": rng.normal(size=(60, 6)).astype(np.float32)},
+    )
+
+    rsc.pp.harmony_integrate(
+        adata, "batch", n_clusters=3, max_iter_harmony=1, random_state=None
+    )
+
+    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()

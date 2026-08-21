@@ -11,10 +11,18 @@ from cupyx.scipy import sparse
 from packaging.version import parse as parse_version
 from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
-from sklearn.utils import check_random_state
 
-from rapids_singlecell._compat import _random_state_kwargs
+from rapids_singlecell._compat import _rng_kwargs
+from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell._utils import _get_logger_level
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _legacy_random_state,
+    _LegacyRng,
+)
 
 from ._utils import _choose_representation, _validate_init_pos
 
@@ -24,6 +32,7 @@ if TYPE_CHECKING:
 _InitPos = Literal["auto", "spectral", "random", "paga"]
 
 
+@_accepts_legacy_random_state(0)
 def umap(
     adata: AnnData,
     *,
@@ -34,10 +43,10 @@ def umap(
     alpha: float = 1.0,
     negative_sample_rate: int = 5,
     init_pos: _InitPos | np.ndarray | cp.ndarray | str | None = "auto",
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     a: float | None = None,
     b: float | None = None,
-    key_added: str | None = None,
+    key_added: str | Default | None = Default(("umap", "key_added")),
     neighbors_key: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
@@ -90,8 +99,10 @@ def umap(
         .. note::
             If your embedding looks odd it's recommended setting `init_pos` to 'random'.
 
-    random_state
-        `int`, `random_state` is the seed used by the random number generator
+    rng
+        Random seed or :class:`~numpy.random.Generator` used by the random
+        number generator.
+        The superseded `random_state` argument is still accepted.
     a
         More specific parameters controlling the embedding. If `None` these
         values are set automatically as determined by `min_dist` and
@@ -126,7 +137,10 @@ def umap(
             UMAP parameters `a`, `b`, and `random_state` (if specified).
     """
 
+    rng = np.random.default_rng(rng)
+
     adata = adata.copy() if copy else adata
+    key_added = resolve_default(key_added)
 
     if neighbors_key is None:
         neighbors_key = "neighbors"
@@ -141,11 +155,8 @@ def umap(
         a, b = find_ab_params(spread, min_dist)
 
     # store params for adata.uns
-    stored_params = {
-        "a": a,
-        "b": b,
-        **({"random_state": random_state} if random_state != 0 else {}),
-    }
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+    stored_params = {"a": a, "b": b, **meta_random_state}
 
     neigh_params = neighbors["params"]
     X = _choose_representation(
@@ -172,8 +183,6 @@ def umap(
                 "Valid options are: auto, spectral, random, paga for RAPIDS < 24.10",
             )
 
-        random_state = check_random_state(random_state)
-
         if init_pos == "auto":
             init_pos = "spectral" if n_obs < 1000000 else "random"
         pre_knn = neighbors["connectivities"]
@@ -191,7 +200,7 @@ def umap(
             negative_sample_rate=negative_sample_rate,
             a=a,
             b=b,
-            random_state=random_state,
+            random_state=_legacy_random_state(rng, always_state=True),
             output_type="numpy",
             precomputed_knn=pre_knn,
         )
@@ -206,7 +215,7 @@ def umap(
             case str() if init_pos == "paga":
                 init_coords = get_init_pos_from_paga(
                     adata,
-                    **_random_state_kwargs(get_init_pos_from_paga, random_state),
+                    **_rng_kwargs(get_init_pos_from_paga, rng),
                     neighbors_key=neighbors_key,
                 )
             case str() if init_pos == "auto":
@@ -222,8 +231,6 @@ def umap(
                     f"{init_coords.shape[1]} columns."
                 )
 
-        random_state = check_random_state(random_state)
-
         logger_level = _get_logger_level(logger)
         X_umap = simplicial_set_embedding(
             data=cp.array(X),
@@ -235,15 +242,15 @@ def umap(
             negative_sample_rate=negative_sample_rate,
             n_epochs=n_epochs,
             init=init_coords,
-            random_state=random_state,
+            random_state=_legacy_random_state(rng, always_state=True),
             metric=neigh_params.get("metric", "euclidean"),
             metric_kwds=neigh_params.get("metric_kwds", None),
         )
         logger.set_level(logger_level)
         X_umap = cp.asarray(X_umap).get()
 
-    key_obsm, key_uns = ("X_umap", "umap") if key_added is None else [key_added] * 2
-    adata.obsm[key_obsm] = X_umap
+    keys = _embedding_keys("umap", key_added)
+    adata.obsm[keys.obsm] = X_umap
 
-    adata.uns[key_uns] = {"params": stored_params}
+    adata.uns[keys.uns] = {"params": stored_params}
     return adata if copy else None

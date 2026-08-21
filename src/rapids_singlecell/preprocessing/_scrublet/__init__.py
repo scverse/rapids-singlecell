@@ -10,16 +10,22 @@ from cupyx.scipy import sparse
 from scanpy import logging as logg
 
 from rapids_singlecell import preprocessing as pp
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _LegacyRng,
+)
 from rapids_singlecell.get import _get_obs_rep
 
 from . import pipeline
 from .core import Scrublet
 
 if TYPE_CHECKING:
-    from rapids_singlecell._utils import AnyRandom
     from rapids_singlecell.preprocessing._neighbors import _Metrics
 
 
+@_accepts_legacy_random_state(0)
 def scrublet(
     adata: AnnData,
     adata_sim: AnnData | None = None,
@@ -40,7 +46,7 @@ def scrublet(
     threshold: float | None = None,
     verbose: bool = True,
     copy: bool = False,
-    random_state: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
 ) -> AnnData | None:
     """\
     Predict doublets using Scrublet :cite:p:`Wolock2019`.
@@ -124,8 +130,10 @@ def scrublet(
     copy
         If :data:`True`, return a copy of the input ``adata`` with Scrublet results
         added. Otherwise, Scrublet results are added in place.
-    random_state
-        Initial state for doublet simulation and nearest neighbors.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for doublet simulation
+        and nearest neighbors.
+        The superseded `random_state` argument is still accepted.
 
     Returns
     -------
@@ -155,6 +163,8 @@ def scrublet(
         scores for observed transcriptomes and simulated doublets.
     """
 
+    rng = np.random.default_rng(rng)
+
     if copy:
         adata = adata.copy()
 
@@ -162,7 +172,12 @@ def scrublet(
 
     adata_obs = adata.copy()
 
-    def _run_scrublet(ad_obs: AnnData, ad_sim: AnnData | None = None):
+    def _run_scrublet(
+        ad_obs: AnnData,
+        ad_sim: AnnData | None = None,
+        *,
+        rng: np.random.Generator,
+    ):
         # With no adata_sim we assume the regular use case, starting with raw
         # counts and simulating doublets
 
@@ -180,7 +195,7 @@ def scrublet(
             # HVG process needs log'd data.
 
             ad_obs.layers["logged"] = pp.log1p(ad_obs, inplace=False)
-            pp.highly_variable_genes(ad_obs, layer="logged")
+            pp.highly_variable_genes(ad_obs, layer="logged", flavor="seurat")
             del ad_obs.layers["logged"]
             ad_obs = ad_obs[:, ad_obs.var["highly_variable"]].copy()
 
@@ -192,7 +207,7 @@ def scrublet(
                 layer="raw",
                 sim_doublet_ratio=sim_doublet_ratio,
                 synthetic_doublet_umi_subsampling=synthetic_doublet_umi_subsampling,
-                random_seed=random_state,
+                rng=rng,
             )
 
             if log_transform:
@@ -217,7 +232,7 @@ def scrublet(
             knn_dist_metric=knn_dist_metric,
             get_doublet_neighbor_parents=get_doublet_neighbor_parents,
             threshold=threshold,
-            random_state=random_state,
+            rng=rng,
             verbose=verbose,
         )
 
@@ -233,12 +248,16 @@ def scrublet(
         # scrublet-relevant parts of the objects to add to the input object
 
         batches = np.unique(adata.obs[batch_key])
+        # spawn sub-rngs so this can maybe be parallelized without changing
+        # random number generation
+        sub_rngs = rng.spawn(len(batches))
         scrubbed = [
             _run_scrublet(
                 adata_obs[adata_obs.obs[batch_key] == batch].copy(),
                 adata_sim,
+                rng=sub_rng,
             )
-            for batch in batches
+            for batch, sub_rng in zip(batches, sub_rngs, strict=True)
         ]
         scrubbed_obs = pd.concat([scrub["obs"] for scrub in scrubbed])
 
@@ -259,7 +278,7 @@ def scrublet(
         adata.uns["scrublet"]["batched_by"] = batch_key
 
     else:
-        scrubbed = _run_scrublet(adata_obs, adata_sim)
+        scrubbed = _run_scrublet(adata_obs, adata_sim, rng=rng)
 
         # Copy outcomes to input object from our processed version
 
@@ -286,7 +305,7 @@ def _scrublet_call_doublets(
     knn_dist_metric: _Metrics = "euclidean",
     get_doublet_neighbor_parents: bool = False,
     threshold: float | None = None,
-    random_state: AnyRandom = 0,
+    rng: np.random.Generator,
     verbose: bool = True,
 ) -> AnnData:
     """\
@@ -343,8 +362,8 @@ def _scrublet_call_doublets(
         practice to check the threshold visually using the
         `doublet_scores_sim_` histogram and/or based on co-localization of
         predicted doublets in a 2-D embedding.
-    random_state
-        Initial state for doublet simulation and nearest neighbors.
+    rng
+        Random generator for doublet simulation and nearest neighbors.
     verbose
         If :data:`True`, log progress updates.
 
@@ -368,6 +387,8 @@ def _scrublet_call_doublets(
         Dictionary of Scrublet parameters
     """
 
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+
     # Estimate n_neighbors if not provided, and create scrublet object.
 
     if n_neighbors is None:
@@ -381,7 +402,7 @@ def _scrublet_call_doublets(
         n_neighbors=n_neighbors,
         expected_doublet_rate=expected_doublet_rate,
         stdev_doublet_rate=stdev_doublet_rate,
-        random_state=random_state,
+        rng=rng,
     )
     del scrub._counts_obs
     # Ensure normalised matrix sparseness as Scrublet does
@@ -407,12 +428,10 @@ def _scrublet_call_doublets(
 
     if mean_center:
         logg.info("Embedding transcriptomes using PCA...")
-        pipeline.pca(scrub, n_prin_comps=n_prin_comps, random_state=scrub._random_state)
+        pipeline.pca(scrub, n_prin_comps=n_prin_comps)
     else:
         logg.info("Embedding transcriptomes using Truncated SVD...")
-        pipeline.truncated_svd(
-            scrub, n_prin_comps=n_prin_comps, random_state=scrub._random_state
-        )
+        pipeline.truncated_svd(scrub, n_prin_comps=n_prin_comps)
 
     # Score the doublets
 
@@ -443,7 +462,7 @@ def _scrublet_call_doublets(
                 .get("sim_doublet_ratio", None)
             ),
             "n_neighbors": n_neighbors,
-            "random_state": random_state,
+            **meta_random_state,
         },
     }
 
@@ -468,13 +487,14 @@ def _scrublet_call_doublets(
     return adata_obs
 
 
+@_accepts_legacy_random_state(0)
 def scrublet_simulate_doublets(
     adata: AnnData,
     *,
     layer: str | None = None,
     sim_doublet_ratio: float = 2.0,
     synthetic_doublet_umi_subsampling: float = 1.0,
-    random_seed: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
 ) -> AnnData:
     """
     Simulate doublets by adding the counts of random observed transcriptome pairs.
@@ -497,6 +517,9 @@ def scrublet_simulate_doublets(
         sampled observed transcriptomes. For values less than 1, the
         UMI counts are added and then randomly sampled at the specified
         rate.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for doublet simulation.
+        The superseded `random_state` argument is still accepted.
 
     Returns
     -------
@@ -517,8 +540,10 @@ def scrublet_simulate_doublets(
         scores for observed transcriptomes and simulated doublets.
     """
 
+    rng = np.random.default_rng(rng)
+
     X = _get_obs_rep(adata, layer=layer)
-    scrub = Scrublet(X, random_state=random_seed)
+    scrub = Scrublet(X, rng=rng)
 
     scrub.simulate_doublets(
         sim_doublet_ratio=sim_doublet_ratio,
