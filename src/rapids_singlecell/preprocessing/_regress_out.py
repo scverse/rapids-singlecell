@@ -5,6 +5,7 @@ from typing import Literal, Union
 
 import cupy as cp
 import dask.array as da
+import numpy as np
 from anndata import AnnData
 from cuml.linear_model import LinearRegression
 from cupyx.scipy import sparse
@@ -123,15 +124,33 @@ def _regress_out_categorical(X, categorical_series):
     return X
 
 
+def _prepare_regressors(adata, keys, *, n_obs, dtype, order):
+    """Build the design matrix ``[1, *keys]`` and its Gram matrix.
+
+    Centring the columns and scaling them to unit length leaves the column
+    space -- and so the result -- unchanged, but keeps ``cond(R.T @ R)`` at
+    O(1) rather than the ~1e11 that covariates on very different scales give,
+    which float32 cannot carry. The Gram matrix is accumulated in float64 too.
+    """
+    dim_regressor = len(keys) + 1
+    regressors = cp.ones((n_obs, dim_regressor), dtype=cp.float64, order=order)
+    for i, key in enumerate(keys):
+        regressors[:, i + 1] = cp.array(adata.obs[key]).ravel()
+    regressors[:, 1:] -= regressors[:, 1:].mean(axis=0)
+    norms = cp.linalg.norm(regressors, axis=0)
+    regressors /= cp.where(norms > 0, norms, 1.0)  # a constant covariate stays 0
+
+    # k gemv calls: cuBLAS is ~20x slower on the (k, n_obs) @ (n_obs, k) gemm
+    cols = [regressors.T @ regressors[:, j] for j in range(dim_regressor)]
+    gram = cp.stack(cols, axis=1)
+    return regressors.astype(dtype, order=order, copy=False), gram
+
+
 def _regress_out_continuous(X, adata, keys, batchsize):
     """Regress out continuous variables using linear regression."""
-    dim_regressor = len(keys) + 1
-
-    regressors = cp.ones(X.shape[0] * dim_regressor, dtype=X.dtype).reshape(
-        (X.shape[0], dim_regressor), order="F"
+    regressors, gram = _prepare_regressors(
+        adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="F"
     )
-    for i in range(len(keys)):
-        regressors[:, i + 1] = cp.array(adata.obs[keys[i]], dtype=X.dtype).ravel()
 
     # Set default batch size based on the number of samples in X
     DEFAULT_GENE_BATCH = 100
@@ -141,7 +160,7 @@ def _regress_out_continuous(X, adata, keys, batchsize):
 
     # Validate the choice of "all" batch size
     if batchsize == "all":
-        if cp.linalg.det(regressors.T @ regressors) == 0:
+        if np.linalg.det(cp.asnumpy(gram)) == 0:
             batchsize = DEFAULT_GENE_BATCH
 
     # Do regression
@@ -150,8 +169,9 @@ def _regress_out_continuous(X, adata, keys, batchsize):
             X = _sparse_to_dense(X, order="C")
         else:
             X = cp.ascontiguousarray(X)
-        inv_gram_matrix = cp.linalg.inv(regressors.T @ regressors)
-        coeff = inv_gram_matrix @ (regressors.T @ X)
+        # gram is float64, so the solve is too: it is what keeps near-collinear
+        # covariates from losing the coefficients to float32 rounding
+        coeff = cp.linalg.solve(gram, regressors.T @ X).astype(X.dtype, copy=False)
         cp.cublas.gemm("N", "N", regressors, coeff, alpha=-1, beta=1, out=X)
 
     else:
@@ -237,27 +257,25 @@ def _regress_out_continuous_dask(X, adata, keys):
     dim_regressor = len(keys) + 1
     n_genes = X.shape[1]
 
-    # Build full regressors array on GPU (use X.dtype, matching non-dask path)
-    regressors = cp.ones((X.shape[0], dim_regressor), dtype=X.dtype)
-    for i, key in enumerate(keys):
-        regressors[:, i + 1] = cp.array(adata.obs[key], dtype=X.dtype).ravel()
+    # Build full regressors array on GPU (matching the non-dask path)
+    regressors, gram = _prepare_regressors(
+        adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="C"
+    )
 
     # Check Gram matrix is invertible
-    gram = regressors.T @ regressors
-    if cp.linalg.det(gram) == 0:
+    if np.linalg.det(cp.asnumpy(gram)) == 0:
         raise ValueError(
             "The Gram matrix (R^T R) is singular. "
             "The regressor variables are linearly dependent."
         )
 
-    inv_gram = cp.linalg.inv(gram)
-
     # Build a dask array of regressors aligned with X's row chunks
     regressors_dask = da.from_array(regressors, chunks=(X.chunks[0], (dim_regressor,)))
 
-    # Phase 1: Compute partial R^T @ X per chunk
+    # Phase 1: Compute partial R^T @ X per chunk, widened so that summing the
+    # blocks does not make the result depend on how X is chunked
     def _partial_rtx(X_part, R_part):
-        return (R_part.T @ X_part)[None, ...]  # (1, dim_regressor, n_genes)
+        return (R_part.T @ X_part).astype(cp.float64)[None, ...]
 
     n_blocks = len(X.chunks[0])
     partial_rtx = da.map_blocks(
@@ -266,13 +284,13 @@ def _regress_out_continuous_dask(X, adata, keys):
         regressors_dask,
         new_axis=(1,),
         chunks=((1,) * n_blocks, (dim_regressor,), (n_genes,)),
-        dtype=X.dtype,
+        dtype=cp.float64,
         meta=cp.array([]),
     )
     global_rtx = partial_rtx.sum(axis=0).compute()
 
-    # Solve for coefficients: coeff = inv(R^T R) @ R^T X
-    coeff = inv_gram @ global_rtx
+    # Solve the normal equations for the coefficients
+    coeff = cp.linalg.solve(gram, global_rtx).astype(X.dtype, copy=False)
 
     # Phase 2: Subtract R @ coeff per chunk
     def _subtract_fit(X_part, R_part):
