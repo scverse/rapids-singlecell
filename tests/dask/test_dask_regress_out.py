@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import cupy as cp
 import numpy as np
 import pandas as pd
@@ -77,6 +79,41 @@ def test_regress_out_continuous_dask(client, data_kind, dtype):
 
     atol = 5e-5 if dtype == "float32" else 1e-7
     cp.testing.assert_allclose(dask_X, ref.X, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+def test_regress_out_reproducible_dask(client, data_kind, dtype):
+    import scanpy as sc
+
+    adata = sc.datasets.pbmc68k_reduced()
+    adata = adata.raw.to_adata()[:200, :200].copy()
+    adata.X = adata.X.astype(dtype)
+    if data_kind == "sparse":
+        adata.X = as_sparse_cupy_dask_array(adata.X)
+    else:
+        adata.X = as_dense_cupy_dask_array(adata.X)
+
+    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"])
+
+    # This file was generated for scanpy version 1.10.3
+    tester = np.load(Path(__file__).parent.parent / "_data/regress_test_small.npy")
+    atol = 1e-5 if dtype == "float32" else 1e-7
+    cp.testing.assert_allclose(adata.X.compute(), tester, atol=atol)
+
+
+@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+def test_regress_out_singular_dask(client, data_kind):
+    """Linearly dependent regressors have to be reported, not inverted anyway."""
+    adata = _make_adata()
+    adata.obs["n_counts_copy"] = adata.obs["n_counts"].to_numpy()
+    if data_kind == "sparse":
+        adata.X = as_sparse_cupy_dask_array(adata.X)
+    else:
+        adata.X = as_dense_cupy_dask_array(adata.X)
+
+    with pytest.raises(ValueError, match="singular"):
+        rsc.pp.regress_out(adata, keys=["n_counts", "n_counts_copy"])
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
