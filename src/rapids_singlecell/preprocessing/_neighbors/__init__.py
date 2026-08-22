@@ -143,13 +143,15 @@ def neighbors(
 
         * 'algo': The algorithm to use. Valid options are: 'ivf_pq' and 'nn_descent'. Default is 'nn_descent'.
 
-        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is number of GPUs.
+        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 on a single GPU and the smallest multiple of the device count greater than `overlap_factor` otherwise.
 
-        * 'overlap_factor': Number of clusters each point is assigned to (must be < n_clusters). Default is 1.
+        * 'overlap_factor': Number of clusters each point is assigned to (must be < n_clusters). Default is `max(2, ceil(log2(n_clusters)))`. Lower values are faster but lose neighbors at cluster boundaries.
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)). Only available for `ivf_pq` algorithm.
 
-        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is None. It is recommended to set it to `>= 1.5 * n_neighbors`. Only available for `nn_descent` algorithm.
+        * 'graph_degree': The degree of the graph nn-descent builds before selecting the final `n_neighbors`. Default is 64, raised to `n_neighbors` if larger. Only available for `nn_descent` algorithm.
+
+        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is 128, raised to `graph_degree` if larger. It is recommended to set it to `>= 1.5 * graph_degree`. Only available for `nn_descent` algorithm.
 
         For `mg_ivfflat` and `mg_ivfpq` algorithms, the following parameters can be specified:
 
@@ -208,7 +210,7 @@ def neighbors(
         )
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-    X_contiguous = _check_neighbors_X(X, algorithm)
+    X_contiguous = _check_neighbors_X(X, algorithm, algorithm_kwds)
     _check_metrics(algorithm, metric)
 
     knn_indices, knn_dist = KNN_ALGORITHMS[algorithm](
@@ -402,7 +404,7 @@ def bbknn(
         adata._init_as_actual(adata.copy())
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-    X_contiguous = _check_neighbors_X(X, algorithm)
+    X_contiguous = _check_neighbors_X(X, algorithm, algorithm_kwds)
     _check_metrics(algorithm, metric)
 
     n_obs = adata.shape[0]
