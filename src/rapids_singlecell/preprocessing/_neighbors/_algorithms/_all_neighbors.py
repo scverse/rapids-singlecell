@@ -40,6 +40,8 @@ def _all_neighbors_batching(algorithm_kwds: Mapping) -> tuple[int, int]:
             n_clusters += n_devices
     if overlap_factor is None:
         overlap_factor = _default_overlap_factor(n_clusters)
+        if n_clusters > 1:
+            overlap_factor = min(overlap_factor, n_clusters - 1)
     if n_clusters > 1 and overlap_factor >= n_clusters:
         raise ValueError(
             f"'n_clusters' ({n_clusters}) must be greater than 'overlap_factor' "
@@ -63,8 +65,8 @@ def _all_neighbors_knn(
             "Please update your cuvs installation."
         )
     algo = algorithm_kwds.get("algo", "nn_descent")
-    n_devices = cp.cuda.runtime.getDeviceCount()
-    if n_devices == 1:
+    n_clusters, overlap_factor = _all_neighbors_batching(algorithm_kwds)
+    if n_clusters == 1:
         from cuvs.common import Resources
 
         res = Resources()
@@ -72,7 +74,6 @@ def _all_neighbors_knn(
         from cuvs.common import MultiGpuResources
 
         res = MultiGpuResources()
-    n_clusters, overlap_factor = _all_neighbors_batching(algorithm_kwds)
     cuvs_metric = "sqeuclidean" if metric == "euclidean" else metric
     if algo == "ivf_pq" or algo == "ivfpq":
         from cuvs.neighbors import ivf_pq
