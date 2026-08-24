@@ -266,16 +266,23 @@ def test_compute_distance_matches_reference_default_config() -> None:
 
 # ---------------------------------------------------------------------------
 # True upstream parity: rapids_singlecell == pertpy (OTT-JAX) across the whole
-# public API (pairwise, onesided, single call). Gated on pertpy (heavy jax/ott
-# dependency); skipped where it is not installed. Both use a squared-Euclidean
-# cost and the same auto-epsilon (0.05 * std(C) is exactly OTT's PointCloud
-# default), so values agree to ~1e-6. rtol=1e-4 leaves ~25x margin and still
-# catches a divergent cost or epsilon (which differ by orders of magnitude).
+# public API (pairwise, onesided, single call). Needs pertpy *and* its OTT-JAX
+# backend, a separate extra since pertpy 1.3.0; skipped without either. Both
+# use a squared-Euclidean cost and the same auto-epsilon (0.05 * std(C) is
+# exactly OTT's PointCloud default), so values agree to ~1e-6. rtol=1e-4 leaves
+# ~25x margin and still catches a divergent cost or epsilon (which differ by
+# orders of magnitude).
 # ---------------------------------------------------------------------------
 
 
 def test_matches_pertpy_ott_parity() -> None:
     pytest.importorskip("pertpy")
+    # pertpy alone is no longer enough. Since 1.3.0 the JAX stack sits behind
+    # the "jax", "scgen" and "tcoda" extras, so pertpy can be installed while
+    # its OTT backend is not -- and pertpy's wasserstein metric then raises
+    # ImportError at call time rather than being absent. Skip on the backend
+    # this parity actually needs.
+    pytest.importorskip("ott")
     from pertpy.tools import Distance as PertpyDistance
 
     adata = _make_grouped_adata(
