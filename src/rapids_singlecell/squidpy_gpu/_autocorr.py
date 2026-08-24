@@ -31,21 +31,28 @@ def _to_cupy(vals, *, use_sparse: bool, dtype):
     Dense input is always returned as a dense CuPy array.
     """
     is_sparse = sparse.issparse(vals) or sparse_gpu.isspmatrix(vals)
+    source_device = (
+        vals.device.id
+        if isinstance(vals, cp.ndarray)
+        else vals.data.device.id
+        if sparse_gpu.isspmatrix(vals)
+        else cp.cuda.Device().id
+    )
+    with cp.cuda.Device(source_device):
+        # Dense input - use_sparse is ignored
+        if not is_sparse:
+            return cp.array(vals, dtype=dtype, order="C")
 
-    # Dense input - use_sparse is ignored
-    if not is_sparse:
-        return cp.array(vals, dtype=dtype, order="C")
+        # Sparse input - respect use_sparse parameter
+        if use_sparse:
+            if sparse_gpu.isspmatrix(vals):
+                return vals.tocsr().astype(dtype)
+            return sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
 
-    # Sparse input - respect use_sparse parameter
-    if use_sparse:
-        if sparse_gpu.isspmatrix(vals):
-            return vals.tocsr().astype(dtype)
-        return sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
-
-    # Sparse input but use_sparse=False - convert to dense
-    if not sparse_gpu.isspmatrix(vals):
-        vals = sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
-    return _sparse_to_dense(vals, order="C")
+        # Sparse input but use_sparse=False - convert to dense
+        if not sparse_gpu.isspmatrix(vals):
+            vals = sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
+        return _sparse_to_dense(vals, order="C")
 
 
 def spatial_autocorr(
@@ -143,15 +150,23 @@ def spatial_autocorr(
     if compute_dtype not in (np.float32, np.float64):
         compute_dtype = np.float32
 
-    # create Adj-Matrix
-    adj_matrix = adata.obsp[connectivity_key]
-    adj_matrix_cupy = sparse_gpu.csr_matrix(adj_matrix, dtype=compute_dtype)
+    source_device = (
+        vals.device.id
+        if isinstance(vals, cp.ndarray)
+        else vals.data.device.id
+        if sparse_gpu.isspmatrix(vals)
+        else cp.cuda.Device().id
+    )
+    with cp.cuda.Device(source_device):
+        # create Adj-Matrix alongside the data
+        adj_matrix = adata.obsp[connectivity_key]
+        adj_matrix_cupy = sparse_gpu.csr_matrix(adj_matrix, dtype=compute_dtype)
 
-    if transformation:  # row-normalize
-        row_sums = adj_matrix_cupy.sum(axis=1).reshape(-1, 1)
-        non_zero_rows = row_sums != 0
-        row_sums[non_zero_rows] = 1.0 / row_sums[non_zero_rows]
-        adj_matrix_cupy = adj_matrix_cupy.multiply(sparse_gpu.csr_matrix(row_sums))
+        if transformation:  # row-normalize
+            row_sums = adj_matrix_cupy.sum(axis=1).reshape(-1, 1)
+            non_zero_rows = row_sums != 0
+            row_sums[non_zero_rows] = 1.0 / row_sums[non_zero_rows]
+            adj_matrix_cupy = adj_matrix_cupy.multiply(sparse_gpu.csr_matrix(row_sums))
 
     params = {"two_tailed": two_tailed}
 
@@ -168,10 +183,13 @@ def spatial_autocorr(
         else:
             raise ValueError(f"Invalid mode: {mode}")
 
-    data = _to_cupy(vals, use_sparse=use_sparse, dtype=compute_dtype)
+    with cp.cuda.Device(source_device):
+        data = _to_cupy(vals, use_sparse=use_sparse, dtype=compute_dtype)
 
-    # Run full computation
-    score, score_perms = _run_autocorr(data, adj_matrix_cupy, mode, n_perms, multi_gpu)
+        # Run full computation
+        score, score_perms = _run_autocorr(
+            data, adj_matrix_cupy, mode, n_perms, multi_gpu
+        )
 
     # Set mode-specific params
     if mode == "moran":
@@ -185,10 +203,11 @@ def spatial_autocorr(
         params["ascending"] = True
         params["mode"] = "gearyC"
 
-    g = sparse.csr_matrix(adj_matrix_cupy.get())
-    score = score.get()
-    if n_perms is not None:
-        score_perms = score_perms.get()
+    with cp.cuda.Device(source_device):
+        g = sparse.csr_matrix(adj_matrix_cupy.get())
+        score = score.get()
+        if n_perms is not None:
+            score_perms = score_perms.get()
     with np.errstate(divide="ignore"):
         pval_results = _p_value_calc(score, sims=score_perms, weights=g, params=params)
 

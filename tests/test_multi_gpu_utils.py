@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-import cupy as cp
+import warnings
+from contextlib import nullcontext
 
-from rapids_singlecell._utils import _split_pairs, parse_device_ids
+import cupy as cp
+import pytest
+
+from rapids_singlecell._utils import (
+    MultiGPUFallbackWarning,
+    _multi_gpu,
+    _split_pairs,
+    parse_device_ids,
+    validate_multi_gpu,
+)
 
 
 class TestSplitPairs:
@@ -274,3 +284,182 @@ class TestParseDeviceIds:
             assert parse_device_ids(multi_gpu=None) == [0]
             assert parse_device_ids(multi_gpu=True) == [0]
             assert parse_device_ids(multi_gpu=False) == [0]
+
+
+class TestValidateMultiGPU:
+    @pytest.fixture(autouse=True)
+    def _clear_validation_state(self):
+        cached_peer_copy_works = _multi_gpu.peer_copy_works
+        cached_peer_copy_works.cache_clear()
+        _multi_gpu._WARNED_P2P_FAILURES.clear()
+        yield
+        cached_peer_copy_works.cache_clear()
+        _multi_gpu._WARNED_P2P_FAILURES.clear()
+
+    def test_local_device_skips_peer_check(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 2)
+
+        def unexpected_peer_check(*_):
+            raise AssertionError("local execution must not run a P2P canary")
+
+        monkeypatch.setattr(_multi_gpu, "peer_copy_works", unexpected_peer_check)
+
+        assert validate_multi_gpu([1], source_device=1) == [1]
+
+    def test_invalid_device_fails_before_peer_check(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 2)
+
+        def unexpected_peer_check(*_):
+            raise AssertionError("invalid IDs must fail before P2P validation")
+
+        monkeypatch.setattr(_multi_gpu, "peer_copy_works", unexpected_peer_check)
+
+        with pytest.raises(ValueError, match=r"Invalid GPU device ID.*2"):
+            validate_multi_gpu([0, 2], source_device=0)
+
+    def test_validates_fanout_and_gather_directions(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 3)
+        checked = []
+
+        def peer_copy_works(destination, source):
+            checked.append((destination, source))
+            return True
+
+        monkeypatch.setattr(_multi_gpu, "peer_copy_works", peer_copy_works)
+
+        assert validate_multi_gpu([0, 1, 2], source_device=1) == [0, 1, 2]
+        assert set(checked) == {(0, 1), (0, 2), (2, 1)}
+
+    @pytest.mark.parametrize("failed_pair", [(0, 1), (1, 0)])
+    def test_failed_direction_warns_and_falls_back_once(self, monkeypatch, failed_pair):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 2)
+        monkeypatch.setattr(
+            _multi_gpu,
+            "peer_copy_works",
+            lambda destination, source: (destination, source) != failed_pair,
+        )
+
+        with pytest.warns(MultiGPUFallbackWarning, match="Falling back to GPU 0"):
+            assert validate_multi_gpu([0, 1], source_device=0) == [0]
+
+        with warnings.catch_warnings(record=True) as warnings_record:
+            warnings.simplefilter("always")
+            assert validate_multi_gpu([0, 1], source_device=0) == [0]
+        assert not warnings_record
+
+    def test_single_remote_target_is_not_assumed_safe(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 2)
+        monkeypatch.setattr(_multi_gpu, "peer_copy_works", lambda *_: False)
+
+        with pytest.warns(MultiGPUFallbackWarning):
+            assert validate_multi_gpu([1], source_device=0) == [0]
+
+    def test_stops_after_first_failed_pair(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 3)
+        checked = []
+
+        def fail_first(destination, source):
+            checked.append((destination, source))
+            return False
+
+        monkeypatch.setattr(_multi_gpu, "peer_copy_works", fail_first)
+
+        with pytest.warns(MultiGPUFallbackWarning):
+            assert validate_multi_gpu([0, 1, 2], source_device=0) == [0]
+        assert checked == [(0, 1)]
+
+    def test_unexpected_cuda_error_propagates(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 2)
+
+        def raise_illegal_address(*_):
+            raise cp.cuda.runtime.CUDARuntimeError(700)
+
+        monkeypatch.setattr(_multi_gpu, "peer_copy_works", raise_illegal_address)
+
+        with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
+            validate_multi_gpu([0, 1], source_device=0)
+        assert error.value.status == 700
+
+
+class TestPeerCopyWorks:
+    @pytest.fixture(autouse=True)
+    def _clear_peer_cache(self):
+        cached_peer_copy_works = _multi_gpu.peer_copy_works
+        cached_peer_copy_works.cache_clear()
+        yield
+        cached_peer_copy_works.cache_clear()
+
+    def test_canary_rejects_silent_success(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "memcpyPeer", lambda *_: None)
+
+        assert not _multi_gpu._run_peer_copy_canary(0, 0)
+
+    def test_capability_false_skips_enable_and_canary(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda, "Device", lambda *_: nullcontext())
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: False)
+
+        def unexpected(*_):
+            raise AssertionError("unsupported links must not be exercised")
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", unexpected)
+        monkeypatch.setattr(_multi_gpu, "_run_peer_copy_canary", unexpected)
+
+        assert not _multi_gpu.peer_copy_works(1, 0)
+
+    @pytest.mark.parametrize("status", [217, 705, 711])
+    def test_expected_enable_error_falls_back(self, monkeypatch, status):
+        monkeypatch.setattr(cp.cuda, "Device", lambda *_: nullcontext())
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+
+        def raise_expected(*_):
+            raise cp.cuda.runtime.CUDARuntimeError(status)
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", raise_expected)
+        monkeypatch.setattr(
+            _multi_gpu,
+            "_run_peer_copy_canary",
+            lambda *_: pytest.fail("safe enable failures must skip the canary"),
+        )
+
+        assert not _multi_gpu.peer_copy_works(1, 0)
+
+    def test_already_enabled_runs_canary_and_caches_result(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda, "Device", lambda *_: nullcontext())
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+
+        def raise_already_enabled(*_):
+            raise cp.cuda.runtime.CUDARuntimeError(704)
+
+        monkeypatch.setattr(
+            cp.cuda.runtime,
+            "deviceEnablePeerAccess",
+            raise_already_enabled,
+        )
+        canary_calls = []
+
+        def successful_canary(destination, source):
+            canary_calls.append((destination, source))
+            return True
+
+        monkeypatch.setattr(_multi_gpu, "_run_peer_copy_canary", successful_canary)
+
+        assert _multi_gpu.peer_copy_works(1, 0)
+        assert _multi_gpu.peer_copy_works(1, 0)
+        assert canary_calls == [(1, 0)]
+
+    def test_unexpected_enable_error_propagates(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda, "Device", lambda *_: nullcontext())
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+
+        def raise_illegal_address(*_):
+            raise cp.cuda.runtime.CUDARuntimeError(700)
+
+        monkeypatch.setattr(
+            cp.cuda.runtime,
+            "deviceEnablePeerAccess",
+            raise_illegal_address,
+        )
+
+        with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
+            _multi_gpu.peer_copy_works(1, 0)
+        assert error.value.status == 700

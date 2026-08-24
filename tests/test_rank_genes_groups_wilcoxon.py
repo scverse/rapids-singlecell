@@ -2387,6 +2387,56 @@ def test_wilcoxon_multi_gpu_routing_policy(monkeypatch, route_case):
     assert "scores" in adata.uns["rank_genes_groups"]
 
 
+def test_wilcoxon_failed_preflight_repartitions_and_stays_serial(monkeypatch):
+    source_device = cp.cuda.Device().id
+    fake_peer = source_device + 1
+    single = _make_multi_gpu_wilcoxon_adata("cupy_dense", source_device=source_device)
+    fallback = _make_multi_gpu_wilcoxon_adata("cupy_dense", source_device=source_device)
+    kwargs = {
+        "method": "wilcoxon",
+        "use_raw": False,
+        "reference": "rest",
+        "n_genes": single.n_vars,
+    }
+    rsc.tl.rank_genes_groups(single, "group", multi_gpu=False, **kwargs)
+
+    monkeypatch.setattr(
+        _wilcoxon_host,
+        "parse_device_ids",
+        lambda *, multi_gpu: [source_device, fake_peer],
+    )
+
+    def force_fallback(device_ids, *, source_device, gather_device):
+        assert device_ids == [source_device, fake_peer]
+        assert gather_device == source_device
+        return [source_device]
+
+    monkeypatch.setattr(_wilcoxon_host, "validate_multi_gpu", force_fallback)
+    real_split = _wilcoxon_host._split_gene_ranges
+    split_device_counts = []
+
+    def split_spy(X, *, n_devices, dense_fallback):
+        split_device_counts.append(n_devices)
+        return real_split(
+            X,
+            n_devices=n_devices,
+            dense_fallback=dense_fallback,
+        )
+
+    monkeypatch.setattr(_wilcoxon_host, "_split_gene_ranges", split_spy)
+
+    class UnexpectedExecutor:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("single-GPU fallback must not start a thread pool")
+
+    monkeypatch.setattr(_wilcoxon_host, "ThreadPoolExecutor", UnexpectedExecutor)
+
+    rsc.tl.rank_genes_groups(fallback, "group", multi_gpu=True, **kwargs)
+
+    assert split_device_counts == [2, 1]
+    _assert_multi_gpu_wilcoxon_equal(fallback, single)
+
+
 @pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
 @pytest.mark.parametrize("fmt", ["cupy_dense", "cupy_csr", "cupy_csc"])
 @pytest.mark.parametrize("reference", ["rest", "1"])

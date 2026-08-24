@@ -8,19 +8,29 @@ from cupyx.scipy.sparse import csc_matrix, csr_matrix
 from dask.array import Array as DaskArray
 
 from ._multi_gpu import (
+    MultiGPUFallbackWarning,
     _calculate_blocks_per_pair,
+    _copy_to_device_via_host,
     _create_category_index_mapping,
     _get_device_attrs,
     _split_pairs,
     parse_device_ids,
+    peer_copy_verified,
+    peer_copy_works,
+    validate_multi_gpu,
 )
 
 __all__ = [
+    "MultiGPUFallbackWarning",
     "_calculate_blocks_per_pair",
+    "_copy_to_device_via_host",
     "_create_category_index_mapping",
     "_get_device_attrs",
     "_split_pairs",
     "parse_device_ids",
+    "peer_copy_verified",
+    "peer_copy_works",
+    "validate_multi_gpu",
 ]
 
 

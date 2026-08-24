@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from rapids_singlecell._cuda import _sinkhorn_cuda as _sk
+from rapids_singlecell._utils import _copy_to_device_via_host, validate_multi_gpu
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 from ._base_metric import BaseMetric, parse_device_ids
@@ -327,14 +328,27 @@ class WassersteinMetric(BaseMetric):
             device_ids = [0]
         n_pairs = len(pair_left)
         if n_pairs == 0:
-            return cp.zeros(0, dtype=dtype)
+            with cp.cuda.Device(embedding.device.id):
+                return cp.zeros(0, dtype=dtype)
+
+        source_device = embedding.device.id
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        device_ids = list(dict.fromkeys(device_ids))
+        device_ids.sort(key=lambda device_id: device_id != source_device)
+        device_ids = validate_multi_gpu(
+            device_ids,
+            source_device=source_device,
+            gather_device=source_device,
+        )
 
         pl_host = np.asarray(pair_left, dtype=np.int32)
         pr_host = np.asarray(pair_right, dtype=np.int32)
-        group_sizes = (cat_offsets[1:] - cat_offsets[:-1]).astype(cp.int32)
-        # Group sizes to host (one sync) -> all batch planning is host-only.
-        n_left = group_sizes[cp.asarray(pl_host)].get()
-        n_right = group_sizes[cp.asarray(pr_host)].get()
+        with cp.cuda.Device(source_device):
+            group_sizes = (cat_offsets[1:] - cat_offsets[:-1]).astype(cp.int32)
+            # Group sizes to host (one sync) -> all batch planning is host-only.
+            n_left = group_sizes[cp.asarray(pl_host)].get()
+            n_right = group_sizes[cp.asarray(pr_host)].get()
         # Orient larger group as columns.
         swap = n_left > n_right
         rows = np.where(swap, pr_host, pl_host)
@@ -345,8 +359,10 @@ class WassersteinMetric(BaseMetric):
 
         plans = _plan_device_batches(n_row, n_col, itemsize, len(device_ids))
 
-        out = cp.empty(n_pairs, dtype=dtype)
-        home = device_ids[0]
+        home = source_device
+        with cp.cuda.Device(home):
+            cp.cuda.get_current_stream().synchronize()
+            out = cp.empty(n_pairs, dtype=dtype)
 
         # Move the shared inputs to each participating device once.
         streams: dict[int, cp.cuda.Stream] = {}
@@ -474,8 +490,19 @@ class WassersteinMetric(BaseMetric):
             raise ValueError(f"n_bootstrap must be >= 1, got {n_bootstrap}")
         n_pairs = len(pair_left)
         if n_pairs == 0:
-            empty = cp.zeros(0, dtype=dtype)
-            return empty, empty
+            with cp.cuda.Device(embedding.device.id):
+                empty = cp.zeros(0, dtype=dtype)
+                return empty, empty
+        source_device = embedding.device.id
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        device = validate_multi_gpu(
+            [device],
+            source_device=source_device,
+            gather_device=source_device,
+        )[0]
+        with cp.cuda.Device(source_device):
+            cp.cuda.get_current_stream().synchronize()
         with cp.cuda.Device(device):
             emb = cp.ascontiguousarray(cp.asarray(embedding))
             offs = cp.asarray(cat_offsets)
@@ -531,7 +558,12 @@ class WassersteinMetric(BaseMetric):
             if not converged:
                 self._warn_not_converged()
             reg = reg.reshape(n_pairs, n_bootstrap)
-            return reg.mean(axis=1), reg.var(axis=1)
+            mean = reg.mean(axis=1)
+            var = reg.var(axis=1)
+        return (
+            _copy_to_device_via_host(mean, source_device),
+            _copy_to_device_via_host(var, source_device),
+        )
 
     def bootstrap_arrays(
         self,
@@ -631,13 +663,15 @@ class WassersteinMetric(BaseMetric):
                 pair_right.append(j)
 
         def _to_matrix(flat: cp.ndarray, name: str) -> pd.DataFrame:
-            mat = cp.zeros((k, k), dtype=embedding.dtype)
-            if pair_left:
-                il = cp.asarray(pair_left, dtype=cp.intp)
-                jr = cp.asarray(pair_right, dtype=cp.intp)
-                mat[il, jr] = flat
-                mat[jr, il] = flat
-            df = pd.DataFrame(mat.get(), index=groups_list, columns=groups_list)
+            with cp.cuda.Device(embedding.device.id):
+                mat = cp.zeros((k, k), dtype=embedding.dtype)
+                if pair_left:
+                    il = cp.asarray(pair_left, dtype=cp.intp)
+                    jr = cp.asarray(pair_right, dtype=cp.intp)
+                    mat[il, jr] = flat
+                    mat[jr, il] = flat
+                mat_host = mat.get()
+            df = pd.DataFrame(mat_host, index=groups_list, columns=groups_list)
             df.index.name = groupby
             df.columns.name = groupby
             df.name = name
@@ -710,7 +744,8 @@ class WassersteinMetric(BaseMetric):
                 pair_right.append(j)
 
         def _to_df(flat: cp.ndarray) -> pd.DataFrame:
-            flat_cpu = flat.get()
+            with cp.cuda.Device(embedding.device.id):
+                flat_cpu = flat.get()
             ed_cols: dict[str, np.ndarray] = {}
             cursor = 0
             for ii, si in enumerate(selected_indices):
@@ -767,6 +802,11 @@ class WassersteinMetric(BaseMetric):
         device_ids = parse_device_ids(multi_gpu=multi_gpu)
         groupby, split_by = self._parse_contrasts(adata, contrasts)
         embedding_raw = self._get_embedding(adata)
+        source_device = (
+            embedding_raw.device.id
+            if isinstance(embedding_raw, cp.ndarray)
+            else cp.cuda.Device().id
+        )
 
         all_cols = [groupby, *split_by]
         grouped = adata.obs.groupby(all_cols, observed=True)
@@ -806,9 +846,10 @@ class WassersteinMetric(BaseMetric):
         flat_cell_idx = (
             np.concatenate(all_cells) if all_cells else np.array([], dtype=np.int64)
         )
-        cat_offsets = cp.asarray(offsets_host, dtype=cp.int32)
-        cell_indices = cp.asarray(flat_cell_idx, dtype=cp.int32)
-        embedding = cp.asarray(embedding_raw)
+        with cp.cuda.Device(source_device):
+            cat_offsets = cp.asarray(offsets_host, dtype=cp.int32)
+            cell_indices = cp.asarray(flat_cell_idx, dtype=cp.int32)
+            embedding = cp.asarray(embedding_raw)
         dtype = embedding.dtype
 
         # Deduplicate canonical pairs (i, j) with i < j
@@ -833,7 +874,8 @@ class WassersteinMetric(BaseMetric):
             dtype=dtype,
             device_ids=device_ids,
         )
-        flat_cpu = flat.get()
+        with cp.cuda.Device(embedding.device.id):
+            flat_cpu = flat.get()
 
         distances = np.empty(len(contrast_pairs), dtype=np.float64)
         for n, (idx_a, idx_b) in enumerate(contrast_pairs):

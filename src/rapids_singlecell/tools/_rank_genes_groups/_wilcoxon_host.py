@@ -13,7 +13,7 @@ import numpy as np
 
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
-from rapids_singlecell._utils import parse_device_ids
+from rapids_singlecell._utils import parse_device_ids, validate_multi_gpu
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -400,7 +400,7 @@ def _prepare_device_column_shards(X, ranges, device_ids):
 
 def _concat_gpu_shards(arrays: list[cp.ndarray], device_id: int) -> cp.ndarray:
     if len(arrays) == 1:
-        return arrays[0]
+        return _copy_gpu_array_to_device(arrays[0], device_id)
     local_arrays = [_copy_gpu_array_to_device(array, device_id) for array in arrays]
     result = cp.concatenate(local_arrays, axis=1)
     # Keep peer-copy buffers alive until concatenation finishes.
@@ -429,6 +429,9 @@ def _run_sharded_wilcoxon(
         if cpsp.issparse(X)
         else None
     )
+    transfer_source = (
+        source_device if source_device is not None else cp.cuda.Device().id
+    )
     auto_single_device = multi_gpu is None and is_device_input and rg.ireference is None
     if multi_gpu is False or auto_single_device:
         device_ids = [
@@ -436,13 +439,25 @@ def _run_sharded_wilcoxon(
         ]
     else:
         device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
-        device_ids.sort(key=lambda device_id: device_id != source_device)
+        device_ids.sort(key=lambda device_id: device_id != transfer_source)
     ranges = _split_gene_ranges(
         X,
         n_devices=len(device_ids),
         dense_fallback=rg._sparse_negative_fallback,
     )
     device_ids = device_ids[: len(ranges)]
+    validated_device_ids = validate_multi_gpu(
+        device_ids,
+        source_device=transfer_source,
+        gather_device=transfer_source,
+    )
+    if validated_device_ids != device_ids:
+        device_ids = validated_device_ids
+        ranges = _split_gene_ranges(
+            X,
+            n_devices=1,
+            dense_fallback=rg._sparse_negative_fallback,
+        )
     ovo_host_context = (
         _build_ovo_host_context(rg) if rg.ireference is not None else None
     )
@@ -548,7 +563,7 @@ def _run_sharded_wilcoxon(
     ):
         msg = "Inconsistent sharded Wilcoxon group ordering."
         raise RuntimeError(msg)
-    result_device = device_ids[0]
+    result_device = transfer_source
     with cp.cuda.Device(result_device):
         scores = _concat_gpu_shards(
             [result[1] for result in complete_gpu_results], result_device

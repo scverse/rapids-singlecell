@@ -6,7 +6,7 @@ import cupy as cp
 from cupyx.scipy import sparse
 
 from rapids_singlecell._cuda import _autocorr_cuda as _ac
-from rapids_singlecell._utils import parse_device_ids
+from rapids_singlecell._utils import parse_device_ids, validate_multi_gpu
 
 from ._utils import _check_precision_issues
 
@@ -80,6 +80,16 @@ def _run_permutations_dense(
     if device_ids is None:
         device_ids = [0]
 
+    source_device = data.device.id
+    device_ids = list(dict.fromkeys(device_ids))
+    device_ids.sort(key=lambda device_id: device_id != source_device)
+    device_ids = validate_multi_gpu(
+        device_ids,
+        source_device=source_device,
+        gather_device=source_device,
+    )
+    with cp.cuda.Device(source_device):
+        cp.cuda.get_current_stream().synchronize()
     n_devices = len(device_ids)
     streams: dict[int, cp.cuda.Stream] = {}
     device_data: list[dict] = []
@@ -94,7 +104,7 @@ def _run_permutations_dense(
 
             with streams[device_id]:
                 # Copy data to this device
-                if device_id == device_ids[0]:
+                if device_id == source_device:
                     dev_data = data
                     dev_adj = adj_matrix_cupy
                     dev_den = den
@@ -127,7 +137,7 @@ def _run_permutations_dense(
     for p in range(perms_per_device):
         for dd in device_data:
             device_id = dd["device_id"]
-            with cp.cuda.Device(device_id):
+            with cp.cuda.Device(device_id), streams[device_id]:
                 streams[device_id].synchronize()
 
                 num_permuted = cp.zeros(n_features, dtype=dtype)
@@ -151,8 +161,8 @@ def _run_permutations_dense(
             with cp.cuda.Device(dd["device_id"]):
                 streams[dd["device_id"]].synchronize()
 
-    # Phase 3: Gather results on first device and cut to exact size
-    with cp.cuda.Device(device_ids[0]):
+    # Phase 3: Gather results where the input lives and cut to exact size.
+    with cp.cuda.Device(source_device):
         all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
 
@@ -240,6 +250,16 @@ def _run_permutations_sparse(
     if device_ids is None:
         device_ids = [0]
 
+    source_device = data.data.device.id
+    device_ids = list(dict.fromkeys(device_ids))
+    device_ids.sort(key=lambda device_id: device_id != source_device)
+    device_ids = validate_multi_gpu(
+        device_ids,
+        source_device=source_device,
+        gather_device=source_device,
+    )
+    with cp.cuda.Device(source_device):
+        cp.cuda.get_current_stream().synchronize()
     n_devices = len(device_ids)
     streams: dict[int, cp.cuda.Stream] = {}
     device_data: list[dict] = []
@@ -254,7 +274,7 @@ def _run_permutations_sparse(
 
             with streams[device_id]:
                 # Copy data to this device
-                if device_id == device_ids[0]:
+                if device_id == source_device:
                     dev_data = data
                     dev_adj = adj_matrix_cupy
                     dev_den = den
@@ -294,7 +314,7 @@ def _run_permutations_sparse(
     for p in range(perms_per_device):
         for dd in device_data:
             device_id = dd["device_id"]
-            with cp.cuda.Device(device_id):
+            with cp.cuda.Device(device_id), streams[device_id]:
                 streams[device_id].synchronize()
 
                 num_permuted = cp.zeros(n_features, dtype=dtype)
@@ -320,8 +340,8 @@ def _run_permutations_sparse(
             with cp.cuda.Device(dd["device_id"]):
                 streams[dd["device_id"]].synchronize()
 
-    # Phase 3: Gather results on first device and cut to exact size
-    with cp.cuda.Device(device_ids[0]):
+    # Phase 3: Gather results where the input lives and cut to exact size.
+    with cp.cuda.Device(source_device):
         all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
 

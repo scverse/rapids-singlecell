@@ -14,7 +14,9 @@ import pandas as pd
 from rapids_singlecell._cuda import _edistance_cuda as _ed
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copy_to_device_via_host,
     _split_pairs,
+    validate_multi_gpu,
 )
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
@@ -105,11 +107,19 @@ def _materialize_source(embedding_raw, selector):
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``.
     """
-    if _is_sparse(embedding_raw):
-        return _build_csr_source(embedding_raw, selector)
-    if selector is None:
-        return cp.asarray(embedding_raw)
-    return cp.asarray(embedding_raw[selector])
+    source_device = (
+        embedding_raw.device.id
+        if isinstance(embedding_raw, cp.ndarray)
+        else embedding_raw.data.device.id
+        if cpsp.issparse(embedding_raw)
+        else cp.cuda.Device().id
+    )
+    with cp.cuda.Device(source_device):
+        if _is_sparse(embedding_raw):
+            return _build_csr_source(embedding_raw, selector)
+        if selector is None:
+            return cp.asarray(embedding_raw)
+        return cp.asarray(embedding_raw[selector])
 
 
 class EDistanceMetric(BaseMetric):
@@ -162,6 +172,11 @@ class EDistanceMetric(BaseMetric):
             adata, groupby, needed_groups
         )
         source = _materialize_source(embedding_raw, mask)
+        source_device = (
+            source.data.device.id if isinstance(source, _CSRData) else source.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
         return source, cat_offsets, cell_indices, groups_list
 
     def pairwise(
@@ -305,6 +320,11 @@ class EDistanceMetric(BaseMetric):
         embedding, cat_offsets, cell_indices, groups_list = self._load_source(
             adata, groupby, needed
         )
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
         k = len(groups_list)
         group_map = {v: i for i, v in enumerate(groups_list)}
         selected_indices = [group_map[sg] for sg in selected_groups]
@@ -327,14 +347,15 @@ class EDistanceMetric(BaseMetric):
             # e[s,b] = 2*d[s,b] - d[s,s] - d[b,b]
             ed_cols = {}
             var_cols = {}
-            for i, (sg, si) in enumerate(zip(selected_groups, selected_indices)):
-                ed_row = 2 * cross_mean[i, :] - diag_mean[si] - diag_mean
-                ed_row[si] = 0.0
-                ed_cols[sg] = ed_row.get()
+            with cp.cuda.Device(source_device):
+                for i, (sg, si) in enumerate(zip(selected_groups, selected_indices)):
+                    ed_row = 2 * cross_mean[i, :] - diag_mean[si] - diag_mean
+                    ed_row[si] = 0.0
+                    ed_cols[sg] = ed_row.get()
 
-                var_row = 4 * cross_var[i, :] + diag_var[si] + diag_var
-                var_row[si] = 0.0
-                var_cols[sg] = var_row.get()
+                    var_row = 4 * cross_var[i, :] + diag_var[si] + diag_var
+                    var_row[si] = 0.0
+                    var_cols[sg] = var_row.get()
 
             distances = pd.DataFrame(ed_cols, index=groups_list)
             distances.index.name = groupby
@@ -364,10 +385,11 @@ class EDistanceMetric(BaseMetric):
         # cross_means[i, j] = mean dist from selected[i] to group j
         # diag_means[j] = mean within-group dist for group j
         ed_cols = {}
-        for i, (sg, si) in enumerate(zip(selected_groups, selected_indices)):
-            ed_row = 2 * cross_means[i, :] - diag_means[si] - diag_means
-            ed_row[si] = 0.0
-            ed_cols[sg] = ed_row.get()
+        with cp.cuda.Device(source_device):
+            for i, (sg, si) in enumerate(zip(selected_groups, selected_indices)):
+                ed_row = 2 * cross_means[i, :] - diag_means[si] - diag_means
+                ed_row[si] = 0.0
+                ed_cols[sg] = ed_row.get()
 
         df = pd.DataFrame(ed_cols, index=groups_list)
         df.index.name = groupby
@@ -526,14 +548,22 @@ class EDistanceMetric(BaseMetric):
             embedding = _materialize_source(embedding_raw, original_indices)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         elif len(original_indices) < int(len(embedding_raw) * 0.7):
-            embedding = cp.asarray(embedding_raw[original_indices])
+            embedding = _materialize_source(embedding_raw, original_indices)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         else:
-            embedding = cp.asarray(embedding_raw)
+            embedding = _materialize_source(embedding_raw, None)
             cell_indices = cp.array(original_indices, dtype=cp.int32)
 
-        group_sizes = cp.diff(cat_offsets).astype(cp.int64)
-        group_sizes_cpu = group_sizes.get()
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        with cp.cuda.Device(source_device):
+            group_sizes = cp.diff(cat_offsets).astype(cp.int64)
+            group_sizes_cpu = group_sizes.get()
         # Build deduplicated pairs
         pair_to_flat: dict[tuple[int, int], int] = {}
         for idx_a, idx_b in contrast_pairs:
@@ -553,8 +583,9 @@ class EDistanceMetric(BaseMetric):
             return result
 
         pairs = sorted(pair_to_flat.keys(), key=lambda p: pair_to_flat[p])
-        pair_left = cp.array([p[0] for p in pairs], dtype=cp.int32)
-        pair_right = cp.array([p[1] for p in pairs], dtype=cp.int32)
+        with cp.cuda.Device(source_device):
+            pair_left = cp.array([p[0] for p in pairs], dtype=cp.int32)
+            pair_right = cp.array([p[1] for p in pairs], dtype=cp.int32)
 
         flat_sums = self._launch_distance_kernel(
             embedding,
@@ -565,17 +596,18 @@ class EDistanceMetric(BaseMetric):
             device_ids=device_ids,
         )
 
-        # Vectorized normalization
-        is_diag = pair_left == pair_right
-        sizes_l = group_sizes[pair_left.astype(cp.intp)]
-        sizes_r = group_sizes[pair_right.astype(cp.intp)]
-        flat_norms = cp.where(
-            is_diag,
-            cp.maximum(sizes_l * (sizes_l - 1) // 2, 1),
-            sizes_l * sizes_r,
-        ).astype(embedding.dtype)
-        flat_means = flat_sums / flat_norms
-        flat_means_cpu = flat_means.get()
+        with cp.cuda.Device(source_device):
+            # Vectorized normalization
+            is_diag = pair_left == pair_right
+            sizes_l = group_sizes[pair_left.astype(cp.intp)]
+            sizes_r = group_sizes[pair_right.astype(cp.intp)]
+            flat_norms = cp.where(
+                is_diag,
+                cp.maximum(sizes_l * (sizes_l - 1) // 2, 1),
+                sizes_l * sizes_r,
+            ).astype(embedding.dtype)
+            flat_means = flat_sums / flat_norms
+            flat_means_cpu = flat_means.get()
 
         # Extract edistances
         edistances = np.empty(len(contrast_pairs), dtype=np.float64)
@@ -740,6 +772,36 @@ class EDistanceMetric(BaseMetric):
         pair_right: cp.ndarray,
         device_ids: list[int],
     ) -> cp.ndarray:
+        """Run distribution, launch, and gather from the input's device."""
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        pair_left = _copy_to_device_via_host(pair_left, source_device)
+        pair_right = _copy_to_device_via_host(pair_right, source_device)
+        with cp.cuda.Device(source_device):
+            return self._launch_distance_kernel_on_source(
+                embedding,
+                cat_offsets,
+                cell_indices,
+                pair_left=pair_left,
+                pair_right=pair_right,
+                device_ids=device_ids,
+            )
+
+    def _launch_distance_kernel_on_source(
+        self,
+        embedding: cp.ndarray,
+        cat_offsets: cp.ndarray,
+        cell_indices: cp.ndarray,
+        *,
+        pair_left: cp.ndarray,
+        pair_right: cp.ndarray,
+        device_ids: list[int],
+    ) -> cp.ndarray:
         """Launch the edistance kernel across GPUs and return raw flat sums.
 
         This is the shared kernel launch logic used by all distance methods.
@@ -765,6 +827,27 @@ class EDistanceMetric(BaseMetric):
         cp.ndarray
             Raw distance sums of shape (n_pairs,), NOT normalized.
         """
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        # Control arrays may have been created on the caller's current device
+        # even when a device-resident embedding lives elsewhere. Stage these
+        # small arrays through host memory so fallback never depends on P2P.
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        pair_left = _copy_to_device_via_host(pair_left, source_device)
+        pair_right = _copy_to_device_via_host(pair_right, source_device)
+        device_ids = list(dict.fromkeys(device_ids))
+        device_ids.sort(key=lambda device_id: device_id != source_device)
+        device_ids = validate_multi_gpu(
+            device_ids,
+            source_device=source_device,
+            gather_device=source_device,
+        )
+        with cp.cuda.Device(source_device):
+            cp.cuda.get_current_stream().synchronize()
         n_devices = len(device_ids)
         n_total_pairs = len(pair_left)
         _, n_features = embedding.shape
@@ -852,7 +935,7 @@ class EDistanceMetric(BaseMetric):
                         feat_tile,
                         block_size,
                         shared_mem,
-                        cp.cuda.get_current_stream().ptr,
+                        streams[device_id].ptr,
                     )
                 else:
                     _ed.compute_distances(
@@ -869,17 +952,17 @@ class EDistanceMetric(BaseMetric):
                         feat_tile,
                         block_size,
                         shared_mem,
-                        cp.cuda.get_current_stream().ptr,
+                        streams[device_id].ptr,
                     )
 
         # Phase 3: Synchronize all devices
         for data in device_data:
             if data is not None:
                 with cp.cuda.Device(data["device_id"]):
-                    cp.cuda.Stream.null.synchronize()
+                    streams[data["device_id"]].synchronize()
 
-        # Phase 4: Aggregate on GPU 0
-        with cp.cuda.Device(device_ids[0]):
+        # Phase 4: Aggregate where the input lives.
+        with cp.cuda.Device(source_device):
             total_sums = cp.zeros(n_total_pairs, dtype=embedding.dtype)
             for i, data in enumerate(device_data):
                 if data is not None:
@@ -890,6 +973,27 @@ class EDistanceMetric(BaseMetric):
         return total_sums
 
     def _pairwise_means(
+        self,
+        embedding: cp.ndarray,
+        cat_offsets: cp.ndarray,
+        cell_indices: cp.ndarray,
+        k: int,
+        device_ids: list[int],
+    ) -> cp.ndarray:
+        """Run pairwise reconstruction on the embedding's owning device."""
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        with cp.cuda.Device(source_device):
+            return self._pairwise_means_on_source(
+                embedding, cat_offsets, cell_indices, k, device_ids
+            )
+
+    def _pairwise_means_on_source(
         self,
         embedding: cp.ndarray,
         cat_offsets: cp.ndarray,
@@ -961,6 +1065,34 @@ class EDistanceMetric(BaseMetric):
         return means
 
     def _onesided_means(
+        self,
+        embedding: cp.ndarray,
+        cat_offsets: cp.ndarray,
+        cell_indices: cp.ndarray,
+        k: int,
+        *,
+        selected_indices: list[int],
+        device_ids: list[int],
+    ) -> tuple[cp.ndarray, cp.ndarray]:
+        """Run one-sided reconstruction on the embedding's owning device."""
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        with cp.cuda.Device(source_device):
+            return self._onesided_means_on_source(
+                embedding,
+                cat_offsets,
+                cell_indices,
+                k,
+                selected_indices=selected_indices,
+                device_ids=device_ids,
+            )
+
+    def _onesided_means_on_source(
         self,
         embedding: cp.ndarray,
         cat_offsets: cp.ndarray,
@@ -1109,19 +1241,27 @@ class EDistanceMetric(BaseMetric):
         tuple
             (means, variances) matrices (k x k each)
         """
-        # Get group sizes for bootstrap sampling (on GPU 0)
-        group_sizes = cp.diff(cat_offsets)
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        with cp.cuda.Device(source_device):
+            group_sizes = cp.diff(cat_offsets)
 
         # Run bootstrap iterations - each uses all GPUs for pairwise computation
         all_results = []
         for i in range(n_bootstrap):
             # Generate bootstrap sample on GPU 0
-            boot_cat_offsets, boot_cell_indices = self._bootstrap_sample_cells(
-                cat_offsets=cat_offsets,
-                cell_indices=cell_indices,
-                group_sizes_gpu=group_sizes,
-                seed=random_state + i,
-            )
+            with cp.cuda.Device(source_device):
+                boot_cat_offsets, boot_cell_indices = self._bootstrap_sample_cells(
+                    cat_offsets=cat_offsets,
+                    cell_indices=cell_indices,
+                    group_sizes_gpu=group_sizes,
+                    seed=random_state + i,
+                )
 
             # Compute pairwise means using all GPUs
             pairwise_means = self._pairwise_means(
@@ -1133,8 +1273,8 @@ class EDistanceMetric(BaseMetric):
             )
             all_results.append(pairwise_means.get())
 
-        # Compute statistics on first GPU
-        with cp.cuda.Device(device_ids[0]):
+        # Keep the returned statistics with the embedding.
+        with cp.cuda.Device(source_device):
             bootstrap_stack = cp.array(all_results)  # [n_bootstrap, k, k]
             means = cp.mean(bootstrap_stack, axis=0)
             variances = cp.var(bootstrap_stack, axis=0)
@@ -1187,20 +1327,28 @@ class EDistanceMetric(BaseMetric):
         diag_var
             Variance of bootstrap diag_means, shape (k,)
         """
-        # Get group sizes for bootstrap sampling (on GPU 0)
-        group_sizes = cp.diff(cat_offsets)
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
+        )
+        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
+        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        with cp.cuda.Device(source_device):
+            group_sizes = cp.diff(cat_offsets)
 
         # Run bootstrap iterations - each uses all GPUs for onesided computation
         all_cross = []
         all_diag = []
         for i in range(n_bootstrap):
             # Generate bootstrap sample on GPU 0
-            boot_cat_offsets, boot_cell_indices = self._bootstrap_sample_cells(
-                cat_offsets=cat_offsets,
-                cell_indices=cell_indices,
-                group_sizes_gpu=group_sizes,
-                seed=random_state + i,
-            )
+            with cp.cuda.Device(source_device):
+                boot_cat_offsets, boot_cell_indices = self._bootstrap_sample_cells(
+                    cat_offsets=cat_offsets,
+                    cell_indices=cell_indices,
+                    group_sizes_gpu=group_sizes,
+                    seed=random_state + i,
+                )
 
             # Compute onesided means using all GPUs
             cross_means, diag_means = self._onesided_means(
@@ -1214,8 +1362,8 @@ class EDistanceMetric(BaseMetric):
             all_cross.append(cross_means.get())
             all_diag.append(diag_means.get())
 
-        # Compute statistics on first GPU
-        with cp.cuda.Device(device_ids[0]):
+        # Keep the returned statistics with the embedding.
+        with cp.cuda.Device(source_device):
             cross_stack = cp.array(all_cross)
             diag_stack = cp.array(all_diag)
             cross_mean = cp.mean(cross_stack, axis=0)
@@ -1306,32 +1454,36 @@ class EDistanceMetric(BaseMetric):
             random_state=random_state,
             device_ids=device_ids,
         )
-
-        # Vectorized edistance: e[a,b] = 2*d[a,b] - d[a,a] - d[b,b]
-        diag_means = cp.diag(pairwise_means_boot)
-        edistance_means = (
-            2 * pairwise_means_boot - diag_means[:, None] - diag_means[None, :]
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
         )
-        cp.fill_diagonal(edistance_means, 0)
 
-        # Vectorized variance computation (delta method approximation):
-        # var[a, b] = 4 * var[a, b] + var[a, a] + var[b, b]
-        diag_vars = cp.diag(pairwise_vars_boot)
-        edistance_vars = (
-            4 * pairwise_vars_boot + diag_vars[:, None] + diag_vars[None, :]
-        )
-        cp.fill_diagonal(edistance_vars, 0)
+        with cp.cuda.Device(source_device):
+            # Vectorized edistance: e[a,b] = 2*d[a,b] - d[a,a] - d[b,b]
+            diag_means = cp.diag(pairwise_means_boot)
+            edistance_means = (
+                2 * pairwise_means_boot - diag_means[:, None] - diag_means[None, :]
+            )
+            cp.fill_diagonal(edistance_means, 0)
 
-        df_mean = pd.DataFrame(
-            edistance_means.get(), index=groups_list, columns=groups_list
-        )
+            # Vectorized variance computation (delta method approximation):
+            # var[a, b] = 4 * var[a, b] + var[a, a] + var[b, b]
+            diag_vars = cp.diag(pairwise_vars_boot)
+            edistance_vars = (
+                4 * pairwise_vars_boot + diag_vars[:, None] + diag_vars[None, :]
+            )
+            cp.fill_diagonal(edistance_vars, 0)
+            means_host = edistance_means.get()
+            vars_host = edistance_vars.get()
+
+        df_mean = pd.DataFrame(means_host, index=groups_list, columns=groups_list)
         df_mean.index.name = groupby
         df_mean.columns.name = groupby
         df_mean.name = "pairwise edistance"
 
-        df_var = pd.DataFrame(
-            edistance_vars.get(), index=groups_list, columns=groups_list
-        )
+        df_var = pd.DataFrame(vars_host, index=groups_list, columns=groups_list)
         df_var.index.name = groupby
         df_var.columns.name = groupby
         df_var.name = "pairwise edistance variance"
@@ -1354,15 +1506,20 @@ class EDistanceMetric(BaseMetric):
         pairwise_means = self._pairwise_means(
             embedding, cat_offsets, cell_indices, k, device_ids
         )
-
-        # Vectorized edistance: e[a,b] = 2*d[a,b] - d[a,a] - d[b,b]
-        diag = cp.diag(pairwise_means)
-        edistance_matrix = 2 * pairwise_means - diag[:, None] - diag[None, :]
-        cp.fill_diagonal(edistance_matrix, 0)  # Self-distance is 0
-
-        df = pd.DataFrame(
-            edistance_matrix.get(), index=groups_list, columns=groups_list
+        source_device = (
+            embedding.data.device.id
+            if isinstance(embedding, _CSRData)
+            else embedding.device.id
         )
+
+        with cp.cuda.Device(source_device):
+            # Vectorized edistance: e[a,b] = 2*d[a,b] - d[a,a] - d[b,b]
+            diag = cp.diag(pairwise_means)
+            edistance_matrix = 2 * pairwise_means - diag[:, None] - diag[None, :]
+            cp.fill_diagonal(edistance_matrix, 0)  # Self-distance is 0
+            edistance_host = edistance_matrix.get()
+
+        df = pd.DataFrame(edistance_host, index=groups_list, columns=groups_list)
         df.index.name = groupby
         df.columns.name = groupby
         df.name = "pairwise edistance"
