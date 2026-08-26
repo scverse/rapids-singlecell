@@ -2,13 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-import cuml
 import cuml.internals.logger as logger
 import cupy as cp
 import numpy as np
-from cuml.manifold.umap import UMAP, find_ab_params, simplicial_set_embedding
+from cuml.manifold.umap import find_ab_params, simplicial_set_embedding
 from cupyx.scipy import sparse
-from packaging.version import parse as parse_version
 from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
 
@@ -24,7 +22,7 @@ from rapids_singlecell._utils._random import (
     _LegacyRng,
 )
 
-from ._utils import _choose_representation, _validate_init_pos
+from ._utils import _validate_init_pos
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -158,96 +156,51 @@ def umap(
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
     stored_params = {"a": a, "b": b, **meta_random_state}
 
-    neigh_params = neighbors["params"]
-    X = _choose_representation(
-        adata,
-        neigh_params.get("use_rep", None),
-        neigh_params.get("n_pcs", None),
-    )
-
     n_epochs = (
         500 if maxiter is None else maxiter
     )  # 0 is not a valid value for rapids, unlike original umap
-    use_umap = False
-    if neighbors["connectivities"].nnz > np.iinfo(np.int32).max and parse_version(
-        cuml.__version__
-    ) < parse_version("25.10"):
-        use_umap = True
     n_obs = adata.shape[0]
-    if parse_version(cuml.__version__) < parse_version("24.10") or use_umap:
-        # `simplicial_set_embedding` is bugged in cuml<24.10. This is why we use `UMAP` instead.
-        n_neighbors = neigh_params["n_neighbors"]
-        if init_pos not in ["auto", "spectral", "random"]:
+
+    match init_pos:
+        case str() if init_pos in adata.obsm:
+            init_coords = adata.obsm[init_pos]
+        case str() if init_pos == "paga":
+            init_coords = get_init_pos_from_paga(
+                adata,
+                **_rng_kwargs(get_init_pos_from_paga, rng),
+                neighbors_key=neighbors_key,
+            )
+        case str() if init_pos == "auto":
+            init_coords = "spectral" if n_obs < 1000000 else "random"
+        case _:
+            init_coords = init_pos
+
+    if hasattr(init_coords, "dtype"):
+        init_coords = _validate_init_pos(init_coords)
+        if init_coords.shape[1] != n_components:
             raise ValueError(
-                f"Invalid init_pos: {init_pos}",
-                "Valid options are: auto, spectral, random, paga for RAPIDS < 24.10",
+                f"Expected {n_components} columns but got "
+                f"{init_coords.shape[1]} columns."
             )
 
-        if init_pos == "auto":
-            init_pos = "spectral" if n_obs < 1000000 else "random"
-        pre_knn = neighbors["connectivities"]
-        pre_knn = sparse.coo_matrix(pre_knn)
-        umap = UMAP(
-            n_neighbors=n_neighbors,
-            n_components=n_components,
-            metric=neigh_params.get("metric", "euclidean"),
-            metric_kwds=neigh_params.get("metric_kwds", None),
-            n_epochs=n_epochs,
-            learning_rate=alpha,
-            init=init_pos,
-            min_dist=min_dist,
-            spread=spread,
-            negative_sample_rate=negative_sample_rate,
-            a=a,
-            b=b,
-            random_state=_legacy_random_state(rng, always_state=True),
-            output_type="numpy",
-            precomputed_knn=pre_knn,
-        )
-
-        X_umap = umap.fit_transform(X)
-    else:
-        pre_knn = neighbors["connectivities"]
-
-        match init_pos:
-            case str() if init_pos in adata.obsm:
-                init_coords = adata.obsm[init_pos]
-            case str() if init_pos == "paga":
-                init_coords = get_init_pos_from_paga(
-                    adata,
-                    **_rng_kwargs(get_init_pos_from_paga, rng),
-                    neighbors_key=neighbors_key,
-                )
-            case str() if init_pos == "auto":
-                init_coords = "spectral" if n_obs < 1000000 else "random"
-            case _:
-                init_coords = init_pos
-
-        if hasattr(init_coords, "dtype"):
-            init_coords = _validate_init_pos(init_coords)
-            if init_coords.shape[1] != n_components:
-                raise ValueError(
-                    f"Expected {n_components} columns but got "
-                    f"{init_coords.shape[1]} columns."
-                )
-
-        logger_level = _get_logger_level(logger)
-        X_umap = simplicial_set_embedding(
-            data=cp.array(X),
-            graph=sparse.coo_matrix(pre_knn),
-            n_components=n_components,
-            initial_alpha=alpha,
-            a=a,
-            b=b,
-            negative_sample_rate=negative_sample_rate,
-            n_epochs=n_epochs,
-            init=init_coords,
-            random_state=_legacy_random_state(rng, always_state=True),
-            metric=neigh_params.get("metric", "euclidean"),
-            metric_kwds=neigh_params.get("metric_kwds", None),
-        )
-        logger.set_level(logger_level)
-        X_umap = cp.asarray(X_umap).get()
+    logger_level = _get_logger_level(logger)
+    X_umap = simplicial_set_embedding(
+        # `data` is only used for its number of rows: the layout is optimized
+        # from `graph` alone, so we pass a placeholder instead of materializing
+        # the representation on the GPU.
+        data=cp.zeros((n_obs, 1), dtype=cp.float32),
+        graph=sparse.coo_matrix(neighbors["connectivities"]),
+        n_components=n_components,
+        initial_alpha=alpha,
+        a=a,
+        b=b,
+        negative_sample_rate=negative_sample_rate,
+        n_epochs=n_epochs,
+        init=init_coords,
+        random_state=_legacy_random_state(rng, always_state=True),
+    )
+    logger.set_level(logger_level)
+    X_umap = cp.asarray(X_umap).get()
 
     keys = _embedding_keys("umap", key_added)
     adata.obsm[keys.obsm] = X_umap

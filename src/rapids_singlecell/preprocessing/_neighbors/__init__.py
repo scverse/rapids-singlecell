@@ -141,15 +141,17 @@ def neighbors(
 
         For `all_neighbors` algorithm, the following parameters can be specified:
 
-        * 'algo': The algorithm to use. Valid options are: 'ivf_pq' and 'nn_descent'. Default is 'nn_descent'.
+        * 'algo': The algorithm to use. Valid options are: 'ivf_pq' and 'nn_descent'. Default is 'nn_descent'. `ivf_pq` is restricted to the `euclidean` and `sqeuclidean` metrics; use `nn_descent` for `cosine` and `inner_product`.
 
-        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is number of GPUs.
+        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 on a single GPU and the smallest multiple of the device count greater than `overlap_factor` otherwise.
 
-        * 'overlap_factor': Number of clusters each point is assigned to (must be < n_clusters). Default is 1.
+        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 for an unbatched build and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` otherwise. Lower values are faster but lose neighbors at cluster boundaries.
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)). Only available for `ivf_pq` algorithm.
 
-        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is None. It is recommended to set it to `>= 1.5 * n_neighbors`. Only available for `nn_descent` algorithm.
+        * 'graph_degree': The degree of the graph nn-descent builds before selecting the final `n_neighbors`. Default is 64, raised to `n_neighbors` if larger. Only available for `nn_descent` algorithm.
+
+        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is `max(128, int(1.5 * graph_degree))`, following the recommended `>= 1.5 * graph_degree`. A smaller user-supplied value is raised to `graph_degree`. Only available for `nn_descent` algorithm.
 
         For `mg_ivfflat` and `mg_ivfpq` algorithms, the following parameters can be specified:
 
@@ -208,7 +210,7 @@ def neighbors(
         )
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-    X_contiguous = _check_neighbors_X(X, algorithm)
+    X_contiguous = _check_neighbors_X(X, algorithm, algorithm_kwds)
     _check_metrics(algorithm, metric)
 
     knn_indices, knn_dist = KNN_ALGORITHMS[algorithm](
@@ -240,7 +242,6 @@ def neighbors(
         n_obs=n_obs,
         n_neighbors=n_neighbors,
         rng=rng,
-        metric=metric,
         method=method,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
@@ -402,7 +403,7 @@ def bbknn(
         adata._init_as_actual(adata.copy())
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-    X_contiguous = _check_neighbors_X(X, algorithm)
+    X_contiguous = _check_neighbors_X(X, algorithm, algorithm_kwds)
     _check_metrics(algorithm, metric)
 
     n_obs = adata.shape[0]
@@ -464,7 +465,6 @@ def bbknn(
         n_obs=n_obs,
         n_neighbors=total_neighbors,
         rng=rng,
-        metric=metric,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
         connectivities = connectivities.get().tocsr()
