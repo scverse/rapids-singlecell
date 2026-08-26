@@ -7,11 +7,7 @@ import cupy as cp
 import numpy as np
 
 from rapids_singlecell._keys import _preset_obsm_names, _resolve_obsm_key
-from rapids_singlecell._utils import (
-    _copy_to_device_via_host,
-    _create_category_index_mapping,
-    parse_device_ids,
-)
+from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 if TYPE_CHECKING:
@@ -123,21 +119,13 @@ class BaseMetric(ABC):
             Ordered group names matching the category indices.
         """
         embedding_raw = self._get_embedding(adata)
-        source_device = (
-            embedding_raw.device.id
-            if isinstance(embedding_raw, cp.ndarray)
-            else cp.cuda.Device().id
-        )
         mask, cat_offsets, cell_indices, groups_list = self._subset_indices(
             adata, groupby, needed_groups
         )
-        with cp.cuda.Device(source_device):
-            if mask is not None:
-                embedding = cp.asarray(embedding_raw[mask])
-            else:
-                embedding = cp.asarray(embedding_raw)
-        cat_offsets = _copy_to_device_via_host(cat_offsets, source_device)
-        cell_indices = _copy_to_device_via_host(cell_indices, source_device)
+        if mask is not None:
+            embedding = cp.asarray(embedding_raw[mask])
+        else:
+            embedding = cp.asarray(embedding_raw)
         return embedding, cat_offsets, cell_indices, groups_list
 
     def _subset_indices(

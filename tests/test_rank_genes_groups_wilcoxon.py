@@ -2279,72 +2279,6 @@ def _assert_multi_gpu_wilcoxon_equal(actual, expected):
 
 
 @pytest.mark.parametrize(
-    "peer_case",
-    [
-        pytest.param((False, None, False), id="inaccessible"),
-        pytest.param((True, None, True), id="enabled"),
-        pytest.param(
-            (True, _wilcoxon_host.CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED, True),
-            id="already_enabled",
-        ),
-        pytest.param(
-            (True, _wilcoxon_host.CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, False),
-            id="unsupported",
-        ),
-        pytest.param(
-            (True, _wilcoxon_host.CUDA_ERROR_TOO_MANY_PEERS, False),
-            id="too_many_peers",
-        ),
-    ],
-)
-def test_wilcoxon_enable_peer_access_expected_outcomes(monkeypatch, peer_case):
-    can_access, error_status, expected = peer_case
-    calls = {"can_access": 0, "enable": 0}
-
-    def device_can_access_peer(device_id, source_device):
-        calls["can_access"] += 1
-        return can_access
-
-    def device_enable_peer_access(source_device):
-        calls["enable"] += 1
-        if error_status is not None:
-            raise cp.cuda.runtime.CUDARuntimeError(error_status)
-
-    monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", device_can_access_peer)
-    monkeypatch.setattr(
-        cp.cuda.runtime, "deviceEnablePeerAccess", device_enable_peer_access
-    )
-    _wilcoxon_host._enable_peer_access.cache_clear()
-    try:
-        assert _wilcoxon_host._enable_peer_access(0, 0) is expected
-        assert _wilcoxon_host._enable_peer_access(0, 0) is expected
-    finally:
-        _wilcoxon_host._enable_peer_access.cache_clear()
-
-    assert calls["can_access"] == 1
-    assert calls["enable"] == int(can_access)
-
-
-def test_wilcoxon_enable_peer_access_reraises_unexpected_error(monkeypatch):
-    unexpected_status = 999
-
-    monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
-
-    def raise_unexpected(source_device):
-        raise cp.cuda.runtime.CUDARuntimeError(unexpected_status)
-
-    monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", raise_unexpected)
-    _wilcoxon_host._enable_peer_access.cache_clear()
-    try:
-        with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
-            _wilcoxon_host._enable_peer_access(0, 0)
-    finally:
-        _wilcoxon_host._enable_peer_access.cache_clear()
-
-    assert error.value.status == unexpected_status
-
-
-@pytest.mark.parametrize(
     "route_case",
     [
         pytest.param(
@@ -2385,56 +2319,6 @@ def test_wilcoxon_multi_gpu_routing_policy(monkeypatch, route_case):
 
     assert parse_calls == expected
     assert "scores" in adata.uns["rank_genes_groups"]
-
-
-def test_wilcoxon_failed_preflight_repartitions_and_stays_serial(monkeypatch):
-    source_device = cp.cuda.Device().id
-    fake_peer = source_device + 1
-    single = _make_multi_gpu_wilcoxon_adata("cupy_dense", source_device=source_device)
-    fallback = _make_multi_gpu_wilcoxon_adata("cupy_dense", source_device=source_device)
-    kwargs = {
-        "method": "wilcoxon",
-        "use_raw": False,
-        "reference": "rest",
-        "n_genes": single.n_vars,
-    }
-    rsc.tl.rank_genes_groups(single, "group", multi_gpu=False, **kwargs)
-
-    monkeypatch.setattr(
-        _wilcoxon_host,
-        "parse_device_ids",
-        lambda *, multi_gpu: [source_device, fake_peer],
-    )
-
-    def force_fallback(device_ids, *, source_device, gather_device):
-        assert device_ids == [source_device, fake_peer]
-        assert gather_device == source_device
-        return [source_device]
-
-    monkeypatch.setattr(_wilcoxon_host, "validate_multi_gpu", force_fallback)
-    real_split = _wilcoxon_host._split_gene_ranges
-    split_device_counts = []
-
-    def split_spy(X, *, n_devices, dense_fallback):
-        split_device_counts.append(n_devices)
-        return real_split(
-            X,
-            n_devices=n_devices,
-            dense_fallback=dense_fallback,
-        )
-
-    monkeypatch.setattr(_wilcoxon_host, "_split_gene_ranges", split_spy)
-
-    class UnexpectedExecutor:
-        def __init__(self, *_args, **_kwargs):
-            raise AssertionError("single-GPU fallback must not start a thread pool")
-
-    monkeypatch.setattr(_wilcoxon_host, "ThreadPoolExecutor", UnexpectedExecutor)
-
-    rsc.tl.rank_genes_groups(fallback, "group", multi_gpu=True, **kwargs)
-
-    assert split_device_counts == [2, 1]
-    _assert_multi_gpu_wilcoxon_equal(fallback, single)
 
 
 @pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")

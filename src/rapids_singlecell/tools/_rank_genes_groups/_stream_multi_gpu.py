@@ -17,9 +17,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from rapids_singlecell._cuda import _rank_stream_cuda as _rss
-from rapids_singlecell._utils import parse_device_ids, validate_multi_gpu
-
-from ._wilcoxon_host import _copy_gpu_array_to_device
+from rapids_singlecell._utils import _copy_to_device, parse_device_ids
 
 if TYPE_CHECKING:
     from ._core import _RankGenes
@@ -78,16 +76,16 @@ def _shard_view(X, b0: int, b1: int):
 
 def _sum_to_device(parts: list[cp.ndarray], device_id: int) -> cp.ndarray:
     with cp.cuda.Device(device_id):
-        total = _copy_gpu_array_to_device(parts[0], device_id).copy()
+        total = _copy_to_device(parts[0], device_id).copy()
         for part in parts[1:]:
-            total += _copy_gpu_array_to_device(part, device_id)
+            total += _copy_to_device(part, device_id)
         cp.cuda.runtime.deviceSynchronize()
     return total
 
 
 def _concat_to_device(parts: list[cp.ndarray], device_id: int, axis: int) -> cp.ndarray:
     with cp.cuda.Device(device_id):
-        local = [_copy_gpu_array_to_device(part, device_id) for part in parts]
+        local = [_copy_to_device(part, device_id) for part in parts]
         out = cp.concatenate(local, axis=axis)
         cp.cuda.runtime.deviceSynchronize()
     return out
@@ -152,10 +150,8 @@ def stream_planes_multi(
     comp_pts = rg.comp_pts
     col_shard = _is_col_shard(X)
     axis_len = n_genes if col_shard else n_cells
-    home = cp.cuda.Device().id
-    device_ids = device_ids[: min(len(device_ids), axis_len)]
-    device_ids = validate_multi_gpu(device_ids, source_device=home, gather_device=home)
     bands = _bands(axis_len, len(device_ids))
+    device_ids = device_ids[: len(bands)]
 
     def run_shard(index: int):
         device_id = device_ids[index]
@@ -170,14 +166,11 @@ def stream_planes_multi(
             cp.cuda.runtime.deviceSynchronize()
         return out
 
-    if len(device_ids) == 1:
-        shards = [run_shard(0)]
-    else:
-        with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
-            shards = list(executor.map(run_shard, range(len(device_ids))))
+    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+        shards = list(executor.map(run_shard, range(len(device_ids))))
 
     # Gather onto the caller's device so downstream stats math stays local.
-    dev0 = home
+    dev0 = cp.cuda.Device().id
     if col_shard:
         sums = _concat_to_device([s[0] for s in shards], dev0, axis=1)
         sqsums = _concat_to_device([s[1] for s in shards], dev0, axis=1)
@@ -225,10 +218,8 @@ def run_binned_hist_multi(
         raise ValueError("invalid multi-GPU histogram gene window")
     col_shard = _is_col_shard(X)
     axis_len = stop - start if col_shard else n_cells
-    home = cp.cuda.Device().id
-    device_ids = device_ids[: min(len(device_ids), axis_len)]
-    device_ids = validate_multi_gpu(device_ids, source_device=home, gather_device=home)
     bands = _bands(axis_len, len(device_ids))
+    device_ids = device_ids[: len(bands)]
 
     def run_shard(index: int):
         device_id = device_ids[index]
@@ -273,12 +264,10 @@ def run_binned_hist_multi(
             cp.cuda.runtime.deviceSynchronize()
         return hist, gsum, gnnz
 
-    if len(device_ids) == 1:
-        shards = [run_shard(0)]
-    else:
-        with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
-            shards = list(executor.map(run_shard, range(len(device_ids))))
+    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
+        shards = list(executor.map(run_shard, range(len(device_ids))))
 
+    home = cp.cuda.Device().id
     if col_shard:
         hist = _concat_to_device([s[0] for s in shards], home, axis=0)
         gsum = (

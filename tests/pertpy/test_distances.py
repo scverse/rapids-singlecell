@@ -7,7 +7,6 @@ import pytest
 from anndata import AnnData
 from scipy.spatial.distance import cdist
 
-from rapids_singlecell._utils import MultiGPUFallbackWarning, _multi_gpu
 from rapids_singlecell.pertpy_gpu import Distance, MeanVar
 
 
@@ -1908,53 +1907,6 @@ def test_multi_gpu_pairwise_matches_single_gpu() -> None:
         atol=1e-7,
         err_msg="Multi-GPU pairwise should match single-GPU",
     )
-
-
-@pytest.mark.skipif(not _has_multiple_gpus(), reason="Requires 2+ GPUs")
-def test_multi_gpu_failed_preflight_falls_back_on_input_device(monkeypatch) -> None:
-    caller_device = cp.cuda.Device().id
-    source_device = next(
-        device_id
-        for device_id in range(cp.cuda.runtime.getDeviceCount())
-        if device_id != caller_device
-    )
-    rng = np.random.default_rng(42)
-    cpu_embedding = rng.normal(size=(60, 8)).astype(np.float32)
-    obs = pd.DataFrame(
-        {
-            "group": pd.Categorical(
-                [f"g{index}" for index in range(3) for _ in range(20)]
-            )
-        }
-    )
-    adata = AnnData(cpu_embedding.copy(), obs=obs)
-    with cp.cuda.Device(source_device):
-        adata.obsm["X_pca"] = cp.asarray(cpu_embedding)
-
-    distance = Distance(metric="edistance")
-    expected = distance.pairwise(
-        adata,
-        groupby="group",
-        multi_gpu=[source_device],
-    )
-
-    monkeypatch.setattr(_multi_gpu, "peer_copy_works", lambda *_: False)
-    _multi_gpu._WARNED_P2P_FAILURES.clear()
-    try:
-        with pytest.warns(
-            MultiGPUFallbackWarning,
-            match=rf"Falling back to GPU {source_device}",
-        ):
-            actual = distance.pairwise(
-                adata,
-                groupby="group",
-                multi_gpu=[caller_device, source_device],
-            )
-    finally:
-        _multi_gpu._WARNED_P2P_FAILURES.clear()
-
-    assert cp.cuda.Device().id == caller_device
-    np.testing.assert_allclose(actual.values, expected.values, rtol=1e-7, atol=1e-7)
 
 
 @pytest.mark.skipif(not _has_multiple_gpus(), reason="Requires 2+ GPUs")

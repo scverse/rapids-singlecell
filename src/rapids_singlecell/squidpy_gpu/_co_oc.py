@@ -9,11 +9,10 @@ from cuml.metrics import pairwise_distances
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
-    _copy_to_device_via_host,
+    _copy_to_device,
     _create_category_index_mapping,
     _split_pairs,
     parse_device_ids,
-    validate_multi_gpu,
 )
 
 from ._utils import _assert_categorical_obs, _assert_spatial_basis
@@ -69,37 +68,26 @@ def co_occurrence(
 
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
-    spatial_input = adata.obsm[spatial_key]
-    source_device = (
-        spatial_input.device.id
-        if isinstance(spatial_input, cp.ndarray)
-        else cp.cuda.Device().id
-    )
-    with cp.cuda.Device(source_device):
-        spatial = cp.array(spatial_input).astype(np.float32)
-        original_clust = adata.obs[cluster_key]
-        clust_map = {v: i for i, v in enumerate(original_clust.cat.categories.values)}
-        labs = cp.array([clust_map[c] for c in original_clust], dtype=np.int32)
-        # create intervals thresholds
-        if isinstance(interval, int):
-            thresh_min, thresh_max = _find_min_max(spatial)
-            interval = cp.linspace(
-                thresh_min, thresh_max, num=interval, dtype=np.float32
-            )
-        else:
-            if isinstance(interval, cp.ndarray):
-                interval = _copy_to_device_via_host(interval, source_device)
-            interval = cp.array(sorted(interval), dtype=np.float32, copy=True)
-        if len(interval) <= 1:
-            raise ValueError(
-                f"Expected interval to be of length `>= 2`, found `{len(interval)}`."
-            )
-
-        device_ids = parse_device_ids(multi_gpu=multi_gpu)
-        out = _co_occurrence_helper(
-            spatial, interval, labs, fast=True, device_ids=device_ids
+    spatial = cp.array(adata.obsm[spatial_key]).astype(np.float32)
+    original_clust = adata.obs[cluster_key]
+    clust_map = {v: i for i, v in enumerate(original_clust.cat.categories.values)}
+    labs = cp.array([clust_map[c] for c in original_clust], dtype=np.int32)
+    # create intervals thresholds
+    if isinstance(interval, int):
+        thresh_min, thresh_max = _find_min_max(spatial)
+        interval = cp.linspace(thresh_min, thresh_max, num=interval, dtype=np.float32)
+    else:
+        interval = cp.array(sorted(interval), dtype=np.float32, copy=True)
+    if len(interval) <= 1:
+        raise ValueError(
+            f"Expected interval to be of length `>= 2`, found `{len(interval)}`."
         )
-        out, interval = out.get(), interval.get()
+
+    device_ids = parse_device_ids(multi_gpu=multi_gpu)
+    out = _co_occurrence_helper(
+        spatial, interval, labs, fast=True, device_ids=device_ids
+    )
+    out, interval = out.get(), interval.get()
     if copy:
         return out, interval
 
@@ -305,23 +293,9 @@ def _co_occurrence_gpu(
     if not valid_device_ids:
         return cp.zeros((k, k, l_val), dtype=cp.uint64), False
 
-    source_device_id = spatial.device.id
-    thresholds = _copy_to_device_via_host(thresholds, source_device_id)
-    cat_offsets = _copy_to_device_via_host(cat_offsets, source_device_id)
-    cell_indices = _copy_to_device_via_host(cell_indices, source_device_id)
-    pair_left = _copy_to_device_via_host(pair_left, source_device_id)
-    pair_right = _copy_to_device_via_host(pair_right, source_device_id)
-    valid_device_ids.sort(key=lambda device_id: device_id != source_device_id)
-    device_ids = validate_multi_gpu(
-        valid_device_ids,
-        source_device=source_device_id,
-        gather_device=source_device_id,
-    )
-    if any(device_id not in kernel_configs for device_id in device_ids):
-        return cp.zeros((k, k, l_val), dtype=cp.uint64), False
-    with cp.cuda.Device(source_device_id):
-        cp.cuda.get_current_stream().synchronize()
+    device_ids = valid_device_ids
     n_devices = len(device_ids)
+    source_device_id = spatial.device.id
 
     # Split pairs across devices with load balancing
     group_sizes = cp.diff(cat_offsets).astype(cp.int64)
@@ -349,14 +323,14 @@ def _co_occurrence_gpu(
                     dev_cat_offsets = cat_offsets
                     dev_cell_indices = cell_indices
                 else:
-                    dev_spatial = cp.asarray(spatial)
-                    dev_thresholds = cp.asarray(thresholds)
-                    dev_cat_offsets = cp.asarray(cat_offsets)
-                    dev_cell_indices = cp.asarray(cell_indices)
+                    dev_spatial = _copy_to_device(spatial, device_id)
+                    dev_thresholds = _copy_to_device(thresholds, device_id)
+                    dev_cat_offsets = _copy_to_device(cat_offsets, device_id)
+                    dev_cell_indices = _copy_to_device(cell_indices, device_id)
 
                 # Copy pair indices to this device
-                dev_pair_left = cp.asarray(chunk_left)
-                dev_pair_right = cp.asarray(chunk_right)
+                dev_pair_left = _copy_to_device(chunk_left, device_id)
+                dev_pair_right = _copy_to_device(chunk_right, device_id)
 
                 # Initialize local counts array
                 dev_counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
@@ -405,7 +379,7 @@ def _co_occurrence_gpu(
                 cell_tile=cell_tile,
                 block_size=block_size,
                 shared_mem=shared_mem,
-                stream=streams[device_id].ptr,
+                stream=cp.cuda.get_current_stream().ptr,
             )
 
     # Phase 3: Synchronize all devices (wait for kernels to complete)
@@ -414,12 +388,11 @@ def _co_occurrence_gpu(
             with cp.cuda.Device(data["device_id"]):
                 streams[data["device_id"]].synchronize()
 
-    # Phase 4: Aggregate counts where the input lives.
+    # Phase 4: Aggregate counts on the input device
     with cp.cuda.Device(source_device_id):
         counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
         for data in device_data:
             if data is not None:
-                dev0_counts = cp.asarray(data["counts"])
-                counts += dev0_counts
+                counts += _copy_to_device(data["counts"], source_device_id)
 
     return counts, True
