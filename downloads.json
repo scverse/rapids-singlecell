@@ -3,20 +3,20 @@
   "source": "https://clickpy.clickhouse.com",
   "packages": {
     "rapids-singlecell": {
-      "total": 288026,
-      "last_30_days": 6312
+      "total": 288378,
+      "last_30_days": 6661
     },
     "rapids-singlecell-cu12": {
-      "total": 13393,
-      "last_30_days": 1652
+      "total": 13484,
+      "last_30_days": 1743
     },
     "rapids-singlecell-cu13": {
-      "total": 12210,
-      "last_30_days": 1443
+      "total": 12253,
+      "last_30_days": 1486
     }
   },
   "combined": {
-    "total": 313629,
-    "last_30_days": 9407
+    "total": 314115,
+    "last_30_days": 9890
   }
 }
