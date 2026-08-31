@@ -21,9 +21,9 @@ from dask_cuda import LocalCUDACluster
 cluster = LocalCUDACluster(
     CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
     protocol="ucx",
-    threads_per_worker=1,           # GPU-safe default
-    rmm_pool_size="80%",            # per-worker pool; % of free VRAM at start
-    rmm_managed_memory=False,       # avoid UM to maximize P2P
+    threads_per_worker=1,  # GPU-safe default
+    rmm_pool_size="80%",  # per-worker pool; % of free VRAM at start
+    rmm_managed_memory=False,  # avoid UM to maximize P2P
     rmm_allocator_external_lib_list=["cupy"],  # auto-patch CuPy to use RMM
 )
 client = Client(cluster)
@@ -36,10 +36,10 @@ from dask.distributed import Client
 from dask_cuda import LocalCUDACluster
 
 cluster = LocalCUDACluster(
-    CUDA_VISIBLE_DEVICES="0,1",     # scale as needed
-    protocol="tcp",                 # TCP is often more predictable with UVM
+    CUDA_VISIBLE_DEVICES="0,1",  # scale as needed
+    protocol="tcp",  # TCP is often more predictable with UVM
     threads_per_worker=1,
-    rmm_managed_memory=True,        # allow oversubscription (paging)
+    rmm_managed_memory=True,  # allow oversubscription (paging)
     rmm_allocator_external_lib_list=["cupy"],
 )
 client = Client(cluster)
@@ -85,6 +85,7 @@ adata = ad.AnnData(
 
 ```python
 import rapids_singlecell as rsc
+
 rsc.get.anndata_to_GPU(adata)
 # Normalize and transform
 rsc.pp.normalize_total(adata)
@@ -106,7 +107,6 @@ Most functions operate lazily; use `.compute()` only when you need concrete valu
 ```python
 # Dense dask+cupy matrix → cupy
 X_gpu = adata.X.compute()
-
 ```
 
 ## Persist and chunk sizes
