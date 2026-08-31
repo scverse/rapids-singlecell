@@ -1,6 +1,6 @@
 repos:
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.4
+    rev: v0.16.5
     hooks:
     -   id: ruff-check
         args: ["--fix"]
@@ -33,7 +33,7 @@ repos:
               docs/references.bib|
           )
 -   repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v22.1.8
+    rev: v23.1.0
     hooks:
     -   id: clang-format
         args: [--style=file, -i]
