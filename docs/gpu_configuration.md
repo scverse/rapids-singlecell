@@ -175,7 +175,7 @@ AnnData stores {attr}`~anndata.AnnData.raw` in CPU memory, even when `.X` was al
 rsc.get.anndata_to_GPU(adata)
 adata.raw = adata.copy()
 
-print(type(adata.X))      # CuPy or cupyx: GPU
+print(type(adata.X))  # CuPy or cupyx: GPU
 print(type(adata.raw.X))  # NumPy or SciPy: CPU
 ```
 
