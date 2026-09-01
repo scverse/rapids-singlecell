@@ -14,6 +14,7 @@ import pandas as pd
 from rapids_singlecell._cuda import _edistance_cuda as _ed
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copy_to_device,
     _split_pairs,
 )
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
@@ -771,6 +772,7 @@ class EDistanceMetric(BaseMetric):
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
 
         is_sparse = isinstance(embedding, _CSRData)
+        result_device = cat_offsets.device.id
 
         # Split pairs across devices with load balancing
         pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
@@ -793,28 +795,26 @@ class EDistanceMetric(BaseMetric):
                 continue
 
             n_chunk_pairs = len(chunk_left)
-            # cp.asarray is a no-op when the array already lives on the current
-            # device (the source arrays are on the first device) and copies it
-            # across otherwise, so the same call handles every device.
+            # Reuse local arrays; route remote copies through P2P or host memory.
             with cp.cuda.Device(device_id):
                 streams[device_id] = cp.cuda.Stream(non_blocking=True)
 
                 with streams[device_id]:
                     data = {
-                        "off": cp.asarray(cat_offsets),
-                        "idx": cp.asarray(cell_indices),
-                        "pair_left": cp.asarray(chunk_left),
-                        "pair_right": cp.asarray(chunk_right),
+                        "off": _copy_to_device(cat_offsets, device_id),
+                        "idx": _copy_to_device(cell_indices, device_id),
+                        "pair_left": _copy_to_device(chunk_left, device_id),
+                        "pair_right": _copy_to_device(chunk_right, device_id),
                         "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
                         "n_pairs": n_chunk_pairs,
                         "device_id": device_id,
                     }
                     if is_sparse:
-                        data["data"] = cp.asarray(embedding.data)
-                        data["indices"] = cp.asarray(embedding.indices)
-                        data["indptr"] = cp.asarray(embedding.indptr)
+                        data["data"] = _copy_to_device(embedding.data, device_id)
+                        data["indices"] = _copy_to_device(embedding.indices, device_id)
+                        data["indptr"] = _copy_to_device(embedding.indptr, device_id)
                     else:
-                        data["emb"] = cp.asarray(embedding)
+                        data["emb"] = _copy_to_device(embedding, device_id)
                     device_data.append(data)
 
         # Phase 2: Synchronize data transfers, then launch kernels
@@ -878,12 +878,12 @@ class EDistanceMetric(BaseMetric):
                 with cp.cuda.Device(data["device_id"]):
                     cp.cuda.Stream.null.synchronize()
 
-        # Phase 4: Aggregate on GPU 0
-        with cp.cuda.Device(device_ids[0]):
+        # Phase 4: Aggregate on the input device
+        with cp.cuda.Device(result_device):
             total_sums = cp.zeros(n_total_pairs, dtype=embedding.dtype)
             for i, data in enumerate(device_data):
                 if data is not None:
-                    sums = cp.asarray(data["sums"])
+                    sums = _copy_to_device(data["sums"], result_device)
                     start = chunk_offsets[i]
                     total_sums[start : start + len(sums)] = sums
 
@@ -1133,8 +1133,8 @@ class EDistanceMetric(BaseMetric):
             )
             all_results.append(pairwise_means.get())
 
-        # Compute statistics on first GPU
-        with cp.cuda.Device(device_ids[0]):
+        # Compute statistics on the input device
+        with cp.cuda.Device(cat_offsets.device.id):
             bootstrap_stack = cp.array(all_results)  # [n_bootstrap, k, k]
             means = cp.mean(bootstrap_stack, axis=0)
             variances = cp.var(bootstrap_stack, axis=0)
@@ -1214,8 +1214,8 @@ class EDistanceMetric(BaseMetric):
             all_cross.append(cross_means.get())
             all_diag.append(diag_means.get())
 
-        # Compute statistics on first GPU
-        with cp.cuda.Device(device_ids[0]):
+        # Compute statistics on the input device
+        with cp.cuda.Device(cat_offsets.device.id):
             cross_stack = cp.array(all_cross)
             diag_stack = cp.array(all_diag)
             cross_mean = cp.mean(cross_stack, axis=0)

@@ -6,7 +6,7 @@ import cupy as cp
 from cupyx.scipy import sparse
 
 from rapids_singlecell._cuda import _autocorr_cuda as _ac
-from rapids_singlecell._utils import parse_device_ids
+from rapids_singlecell._utils import _copy_to_device, parse_device_ids
 
 from ._utils import _check_precision_issues
 
@@ -86,6 +86,7 @@ def _run_permutations_dense(
 
     # Each device runs perms_per_device iterations
     perms_per_device = (n_permutations + n_devices - 1) // n_devices
+    source_device = data.device.id
 
     # Phase 1: Create streams and transfer data to all devices
     for device_id in device_ids:
@@ -94,21 +95,21 @@ def _run_permutations_dense(
 
             with streams[device_id]:
                 # Copy data to this device
-                if device_id == device_ids[0]:
+                if device_id == source_device:
                     dev_data = data
                     dev_adj = adj_matrix_cupy
                     dev_den = den
                 else:
-                    dev_data = cp.asarray(data)
+                    dev_data = _copy_to_device(data, device_id)
                     dev_adj = sparse.csr_matrix(
                         (
-                            cp.asarray(adj_matrix_cupy.data),
-                            cp.asarray(adj_matrix_cupy.indices),
-                            cp.asarray(adj_matrix_cupy.indptr),
+                            _copy_to_device(adj_matrix_cupy.data, device_id),
+                            _copy_to_device(adj_matrix_cupy.indices, device_id),
+                            _copy_to_device(adj_matrix_cupy.indptr, device_id),
                         ),
                         shape=adj_matrix_cupy.shape,
                     )
-                    dev_den = cp.asarray(den)
+                    dev_den = _copy_to_device(den, device_id)
 
                 # Allocate output array for this device
                 dev_perms = cp.zeros((perms_per_device, n_features), dtype=dtype)
@@ -151,9 +152,9 @@ def _run_permutations_dense(
             with cp.cuda.Device(dd["device_id"]):
                 streams[dd["device_id"]].synchronize()
 
-    # Phase 3: Gather results on first device and cut to exact size
-    with cp.cuda.Device(device_ids[0]):
-        all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
+    # Phase 3: Gather results on the input device and cut to exact size
+    with cp.cuda.Device(source_device):
+        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
 
     return gearys_C_permutations
@@ -246,6 +247,7 @@ def _run_permutations_sparse(
 
     # Each device runs perms_per_device iterations
     perms_per_device = (n_permutations + n_devices - 1) // n_devices
+    source_device = data.data.device.id
 
     # Phase 1: Create streams and transfer data to all devices
     for device_id in device_ids:
@@ -254,28 +256,28 @@ def _run_permutations_sparse(
 
             with streams[device_id]:
                 # Copy data to this device
-                if device_id == device_ids[0]:
+                if device_id == source_device:
                     dev_data = data
                     dev_adj = adj_matrix_cupy
                     dev_den = den
                 else:
                     dev_data = sparse.csr_matrix(
                         (
-                            cp.asarray(data.data),
-                            cp.asarray(data.indices),
-                            cp.asarray(data.indptr),
+                            _copy_to_device(data.data, device_id),
+                            _copy_to_device(data.indices, device_id),
+                            _copy_to_device(data.indptr, device_id),
                         ),
                         shape=data.shape,
                     )
                     dev_adj = sparse.csr_matrix(
                         (
-                            cp.asarray(adj_matrix_cupy.data),
-                            cp.asarray(adj_matrix_cupy.indices),
-                            cp.asarray(adj_matrix_cupy.indptr),
+                            _copy_to_device(adj_matrix_cupy.data, device_id),
+                            _copy_to_device(adj_matrix_cupy.indices, device_id),
+                            _copy_to_device(adj_matrix_cupy.indptr, device_id),
                         ),
                         shape=adj_matrix_cupy.shape,
                     )
-                    dev_den = cp.asarray(den)
+                    dev_den = _copy_to_device(den, device_id)
 
                 # Allocate output array for this device
                 dev_perms = cp.zeros((perms_per_device, n_features), dtype=dtype)
@@ -320,9 +322,9 @@ def _run_permutations_sparse(
             with cp.cuda.Device(dd["device_id"]):
                 streams[dd["device_id"]].synchronize()
 
-    # Phase 3: Gather results on first device and cut to exact size
-    with cp.cuda.Device(device_ids[0]):
-        all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
+    # Phase 3: Gather results on the input device and cut to exact size
+    with cp.cuda.Device(source_device):
+        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
 
     return gearys_C_permutations

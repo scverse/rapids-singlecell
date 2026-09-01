@@ -17,9 +17,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from rapids_singlecell._cuda import _rank_stream_cuda as _rss
-from rapids_singlecell._utils import parse_device_ids
-
-from ._wilcoxon_host import _copy_gpu_array_to_device
+from rapids_singlecell._utils import _copy_to_device, parse_device_ids
 
 if TYPE_CHECKING:
     from ._core import _RankGenes
@@ -78,16 +76,16 @@ def _shard_view(X, b0: int, b1: int):
 
 def _sum_to_device(parts: list[cp.ndarray], device_id: int) -> cp.ndarray:
     with cp.cuda.Device(device_id):
-        total = _copy_gpu_array_to_device(parts[0], device_id).copy()
+        total = _copy_to_device(parts[0], device_id).copy()
         for part in parts[1:]:
-            total += _copy_gpu_array_to_device(part, device_id)
+            total += _copy_to_device(part, device_id)
         cp.cuda.runtime.deviceSynchronize()
     return total
 
 
 def _concat_to_device(parts: list[cp.ndarray], device_id: int, axis: int) -> cp.ndarray:
     with cp.cuda.Device(device_id):
-        local = [_copy_gpu_array_to_device(part, device_id) for part in parts]
+        local = [_copy_to_device(part, device_id) for part in parts]
         out = cp.concatenate(local, axis=axis)
         cp.cuda.runtime.deviceSynchronize()
     return out

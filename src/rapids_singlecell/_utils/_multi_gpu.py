@@ -12,10 +12,72 @@ Used by: co_occurrence, edistance, and future multi-GPU functions.
 
 from __future__ import annotations
 
+from functools import cache
+
 import cupy as cp
+import numpy as np
 
 # Cache for device attributes per device (lazy initialization)
 _DEVICE_ATTRS_CACHE: dict[int, dict] = {}
+
+_CANARY = np.arange(1, 9, dtype=np.float64)
+_CANARY_POISON = -_CANARY
+_CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217
+_CUDA_ERROR_PEER_ACCESS_NOT_ENABLED = 705
+_CUDA_ERROR_TOO_MANY_PEERS = 711
+_PEER_ERRORS = {
+    _CUDA_ERROR_PEER_ACCESS_UNSUPPORTED,
+    _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED,
+    _CUDA_ERROR_TOO_MANY_PEERS,
+}
+
+
+@cache
+def _peer_copy_works(destination: int, source: int) -> bool:
+    """Return whether a peer copy arrives intact."""
+    if destination == source:
+        return True
+    if not cp.cuda.runtime.deviceCanAccessPeer(destination, source):
+        return False
+
+    try:
+        with cp.cuda.Device(source):
+            expected = cp.asarray(_CANARY, blocking=True)
+        with cp.cuda.Device(destination):
+            actual = cp.asarray(_CANARY_POISON, blocking=True)
+            with cp.cuda.Stream(non_blocking=True) as stream:
+                cp.copyto(actual, expected)
+                stream.synchronize()
+            actual = cp.asnumpy(actual)
+    except cp.cuda.runtime.CUDARuntimeError as error:
+        if error.status in _PEER_ERRORS:
+            return False
+        raise
+    return bool(np.array_equal(actual, _CANARY))
+
+
+def _copy_to_device_p2p(array: cp.ndarray, destination: int) -> cp.ndarray:
+    """Copy an array directly to another GPU."""
+    with cp.cuda.Device(destination):
+        return cp.asarray(array)
+
+
+def _copy_to_device_via_host(array: cp.ndarray, destination: int) -> cp.ndarray:
+    """Copy an array to another GPU through host memory."""
+    with cp.cuda.Device(array.device.id):
+        host = array.get(order="A")
+    with cp.cuda.Device(destination):
+        return cp.asarray(host, blocking=True)
+
+
+def _copy_to_device(array: cp.ndarray, destination: int) -> cp.ndarray:
+    """Copy an array using P2P when it works, otherwise through the host."""
+    source = array.device.id
+    if source == destination:
+        return array
+    if _peer_copy_works(destination, source):
+        return _copy_to_device_p2p(array, destination)
+    return _copy_to_device_via_host(array, destination)
 
 
 def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
