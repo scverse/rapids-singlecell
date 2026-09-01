@@ -68,8 +68,12 @@ def test_rank_genes_groups_ttest_matches_scanpy(reference, method, sparse):
         for group in gpu_field.dtype.names:
             gpu_values = np.asarray(gpu_field[group], dtype=float)
             cpu_values = np.asarray(cpu_field[group], dtype=float)
+            # rtol=1e-12: group sums are accumulated with atomicAdd, whose
+            # nondeterministic ordering leaves ~1 ULP noise in mean/var that
+            # the t-CDF tail amplifies to ~1e-13 rel in pvals (measured);
+            # 1e-12 gives 10x margin over that noise floor.
             np.testing.assert_allclose(
-                gpu_values, cpu_values, rtol=1e-13, atol=1e-15, equal_nan=True
+                gpu_values, cpu_values, rtol=1e-12, atol=1e-15, equal_nan=True
             )
 
     params = gpu_result["params"]
@@ -286,10 +290,14 @@ def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
     # Pick a group that's not the reference for comparison
     test_group = "3" if reference != "3" else "0"
     for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+        # rtol=1e-12: the two runs are independent GPU aggregations; atomicAdd
+        # ordering noise amplified through the t-CDF tail reaches ~1e-13 rel
+        # in pvals (measured), so the old 1e-13 sat exactly on the failure
+        # line and 1e-12 gives 10x margin.
         np.testing.assert_allclose(
             np.asarray(adata.uns["rank_genes_groups"][field][test_group], dtype=float),
             np.asarray(bdata.uns["rank_genes_groups"][field][test_group], dtype=float),
-            rtol=1e-13,
+            rtol=1e-12,
             atol=1e-15,
             equal_nan=True,
         )
