@@ -4,7 +4,9 @@ import math
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import cuvs
 import numpy as np
+from packaging.version import parse as parse_version
 
 from rapids_singlecell.preprocessing._neighbors._helper import _compute_nlist
 
@@ -16,6 +18,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from rapids_singlecell.preprocessing._neighbors import _Metrics
+
+
+_CUVS_HOST_OUTPUT_MIN_VERSION = parse_version("26.08")
 
 
 def _default_overlap_factor(n_clusters: int) -> int:
@@ -66,14 +71,18 @@ def _all_neighbors_knn(
         )
     algo = algorithm_kwds.get("algo", "nn_descent")
     n_clusters, overlap_factor = _all_neighbors_batching(algorithm_kwds)
-    if n_clusters == 1:
-        from cuvs.common import Resources
-
-        res = Resources()
-    else:
+    use_host_output = (
+        n_clusters > 1
+        and parse_version(cuvs.__version__) >= _CUVS_HOST_OUTPUT_MIN_VERSION
+    )
+    if use_host_output:
         from cuvs.common import MultiGpuResources
 
         res = MultiGpuResources()
+    else:
+        from cuvs.common import Resources
+
+        res = Resources()
     cuvs_metric = "sqeuclidean" if metric == "euclidean" else metric
     if algo == "ivf_pq" or algo == "ivfpq":
         from cuvs.neighbors import ivf_pq
@@ -111,8 +120,11 @@ def _all_neighbors_knn(
         ivf_pq_params=ivf_pq_params,
         nn_descent_params=nn_descent_params,
     )
-    neighbors = cp.zeros([X.shape[0], k], dtype=np.int64)
-    distances = cp.zeros([X.shape[0], k], dtype=np.float32)
+    # Host outputs use cuVS's synchronized merge path. Older releases only accept
+    # device outputs, so keep batching on one GPU to avoid concurrent writes.
+    output_module = np if use_host_output else cp
+    neighbors = output_module.zeros([X.shape[0], k], dtype=np.int64)
+    distances = output_module.zeros([X.shape[0], k], dtype=np.float32)
 
     all_neighbors.build(
         dataset=X,
@@ -122,7 +134,8 @@ def _all_neighbors_knn(
         distances=distances,
         resources=res,
     )
-    neighbors = neighbors.astype(np.int32)
+    neighbors = cp.asarray(neighbors, dtype=np.int32)
+    distances = cp.asarray(distances)
     if metric == "euclidean":
         distances = cp.sqrt(distances)
     return neighbors, distances
