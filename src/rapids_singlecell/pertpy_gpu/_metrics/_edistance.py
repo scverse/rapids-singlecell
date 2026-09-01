@@ -795,9 +795,7 @@ class EDistanceMetric(BaseMetric):
                 continue
 
             n_chunk_pairs = len(chunk_left)
-            # cp.asarray is a no-op when the array already lives on the current
-            # device (the source arrays are on the first device) and copies it
-            # across otherwise, so the same call handles every device.
+            # Reuse local arrays; route remote copies through P2P or host memory.
             with cp.cuda.Device(device_id):
                 streams[device_id] = cp.cuda.Stream(non_blocking=True)
 
