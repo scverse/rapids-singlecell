@@ -84,11 +84,13 @@ def draw_graph(
     match init_pos:
         case str() if init_pos in adata.obsm:
             init_coords = adata.obsm[init_pos]
-        case str() if init_pos == "paga":
+        case str("paga") | True:
             init_coords = get_init_pos_from_paga(
                 adata,
                 **_rng_kwargs(get_init_pos_from_paga, rng),
             )
+        case False:
+            init_coords = None
         case _:
             init_coords = init_pos
     if hasattr(init_coords, "dtype"):
