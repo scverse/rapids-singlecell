@@ -23,6 +23,13 @@ class TestSplitPairs:
             assert len(left) == 0
             assert len(right) == 0
 
+    def test_zero_devices_is_rejected(self):
+        pair_left = cp.array([], dtype=cp.int32)
+        pair_right = cp.array([], dtype=cp.int32)
+
+        with pytest.raises(ValueError, match="n_devices must be at least 1"):
+            _split_pairs(pair_left, pair_right, n_devices=0)
+
     def test_single_device_returns_all_pairs(self):
         """Single device gets all pairs."""
         pair_left = cp.array([0, 0, 1], dtype=cp.int32)

@@ -188,6 +188,9 @@ def _split_pairs(
     list
         List of (pair_left, pair_right) tuples for each device
     """
+    if n_devices < 1:
+        raise ValueError("n_devices must be at least 1")
+
     n_pairs = len(pair_left)
 
     if n_pairs == 0:
