@@ -103,11 +103,13 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
         If any specified device ID is invalid or out of range
     """
     n_available = cp.cuda.runtime.getDeviceCount()
+    if n_available == 0:
+        raise ValueError("No CUDA devices are available")
 
     if multi_gpu is None or multi_gpu is True:
-        return list(range(n_available))
+        device_ids = list(range(n_available))
     elif multi_gpu is False:
-        return [0]
+        device_ids = [0]
     elif isinstance(multi_gpu, str):
         device_ids = [int(x.strip()) for x in multi_gpu.split(",")]
     elif isinstance(multi_gpu, list):
@@ -117,7 +119,9 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
             f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}"
         )
 
-    # Validate device IDs
+    if not all(isinstance(device_id, int) and not isinstance(device_id, bool) for device_id in device_ids):
+        raise ValueError("multi_gpu device IDs must be integers")
+
     invalid_ids = [d for d in device_ids if d < 0 or d >= n_available]
     if invalid_ids:
         raise ValueError(

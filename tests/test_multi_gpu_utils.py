@@ -267,6 +267,16 @@ class TestParseDeviceIds:
             result = parse_device_ids(multi_gpu="0,1")
             assert result == [0, 1]
 
+    def test_no_devices_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 0)
+        with pytest.raises(ValueError, match="No CUDA devices"):
+            parse_device_ids(multi_gpu=False)
+
+    def test_non_integer_list_id_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: 1)
+        with pytest.raises(ValueError, match="device IDs must be integers"):
+            parse_device_ids(multi_gpu=["0"])
+
     def test_single_gpu_always_device_0(self):
         """With only 1 GPU available, should always return [0]."""
         n_devices = cp.cuda.runtime.getDeviceCount()
