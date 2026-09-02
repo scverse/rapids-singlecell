@@ -205,7 +205,7 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
                     mask = cp.ones(X.shape[1], dtype=cp.bool_)
                 mean = _nan_mean_minor(
                     X, major, minor, mask=mask, n_features=n_features
-                )
+                )[mask]
             elif isspmatrix_csc(X):
                 if mask is not None:
                     X = X[:, mask]
@@ -245,7 +245,7 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
                 n_features = major
                 mean = _nan_mean_minor_dask_sparse(
                     X, major, minor, mask=mask, n_features=n_features
-                )
+                )[mask]
             elif axis == 1:
                 n_features = minor if n_features is None else n_features
                 mean = _nan_mean_major_dask_sparse(
@@ -256,7 +256,7 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
         elif isinstance(X._meta, cp.ndarray):
             if mask is None:
                 mask = cp.ones(X.shape[1], dtype=cp.bool_)
-            if n_features is None:
+            if axis == 0 or n_features is None:
                 n_features = X.shape[axis]
             mean = _nan_mean_dense_dask(X, axis, mask=mask, n_features=n_features)
             # raise NotImplementedError("Dask dense arrays are not supported yet")
