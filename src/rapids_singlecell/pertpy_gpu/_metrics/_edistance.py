@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -503,11 +504,19 @@ class EDistanceMetric(BaseMetric):
         k = len(cond_to_idx)
         # Look up cell indices from the groupby
         group_cells: list[np.ndarray] = [None] * k  # type: ignore[list-item]
+        missing: list[tuple] = []
         for key, idx in cond_to_idx.items():
             lookup_key = key[0] if len(key) == 1 else key
             cell_idx = group_indices.get(lookup_key)
+            if cell_idx is None:
+                missing.append(key)
             group_cells[idx] = (
                 cell_idx if cell_idx is not None else np.array([], dtype=np.intp)
+            )
+        if missing:
+            warnings.warn(
+                f"No cells found for {missing}; their contrasts are NaN.",
+                stacklevel=2,
             )
         # Build cat_offsets and cell_indices, subsetting the embedding
         # to only the referenced cells for memory efficiency
@@ -1261,8 +1270,10 @@ class EDistanceMetric(BaseMetric):
         if total_cells == 0:
             return cat_offsets, cell_indices
 
-        # Generate random floats for all cells at once
-        random_floats = rng.random(total_cells, dtype=cp.float32)
+        # Generate random integers for all cells at once
+        random_ints = rng.integers(
+            0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64
+        )
 
         # cp.repeat requires list for repeats - small transfer (k integers)
         group_sizes_list = group_sizes_gpu.get().tolist()
@@ -1270,8 +1281,8 @@ class EDistanceMetric(BaseMetric):
         # Expand group sizes to per-cell (each cell knows its group's size)
         cell_group_sizes = cp.repeat(group_sizes_gpu, group_sizes_list)
 
-        # Scale random floats to local indices within each group
-        bootstrap_local_idx = (random_floats * cell_group_sizes).astype(cp.int32)
+        # Reduce to local indices within each group
+        bootstrap_local_idx = random_ints % cell_group_sizes
 
         # Convert local indices to global indices by adding group offsets
         cell_group_offsets = cp.repeat(cat_offsets[:-1], group_sizes_list)

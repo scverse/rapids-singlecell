@@ -442,6 +442,7 @@ def bbknn(
     row_idx = cp.arange(n_obs)[:, None]
     knn_dist = knn_dist[row_idx, order]
     knn_indices = knn_indices[row_idx, order]
+    knn_dist = _fix_self_distances(knn_dist, metric)
 
     if trim is None:
         trim = 10 * total_neighbors
