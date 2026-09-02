@@ -117,12 +117,11 @@ def _build_ragged_layout(
         loc_c = cp.arange(total_cols, dtype=cp.int64) - g_off[col2pair]
     else:
         # Resample with replacement to each group's own size (bootstrap).
-        loc_r = (
-            rng.random(total_rows, dtype=dtype) * n[row2pair].astype(dtype)
-        ).astype(cp.int64)
-        loc_c = (
-            rng.random(total_cols, dtype=dtype) * m[col2pair].astype(dtype)
-        ).astype(cp.int64)
+        int_max = cp.iinfo(cp.int64).max
+        loc_r = rng.integers(0, int_max, size=total_rows, dtype=cp.int64)
+        loc_c = rng.integers(0, int_max, size=total_cols, dtype=cp.int64)
+        loc_r %= n[row2pair].astype(cp.int64)
+        loc_c %= m[col2pair].astype(cp.int64)
     gather_f = offs_row[row2pair] + loc_r
     gather_g = offs_col[col2pair] + loc_c
     cidx_l = cp.ascontiguousarray(cell_indices[gather_f].astype(cp.int32))
