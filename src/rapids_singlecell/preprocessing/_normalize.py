@@ -9,6 +9,7 @@ import cupy as cp
 from anndata import AnnData
 from cupyx.scipy import sparse
 from cupyx.scipy.sparse import csr_matrix
+from scanpy._utils import view_to_actual
 
 from rapids_singlecell._compat import (
     DaskArray,
@@ -76,6 +77,9 @@ def normalize_total(
         if not inplace:
             raise ValueError("`copy=True` cannot be used with `inplace=False`.")
         adata = adata.copy()
+
+    view_to_actual(adata)
+
     X = _get_obs_rep(adata, layer=layer)
 
     _check_gpu_X(X, allow_dask=True)
