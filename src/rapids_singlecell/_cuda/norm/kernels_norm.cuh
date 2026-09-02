@@ -9,7 +9,7 @@ __global__ void dense_row_scale_kernel(T* __restrict__ data, int nrows,
     int row = blockIdx.x;
     if (row >= nrows) return;
 
-    int row_offset = row * ncols;
+    long long row_offset = static_cast<long long>(row) * ncols;
 
     // Parallel row sum
     T val = (T)0;
@@ -296,7 +296,7 @@ __global__ void prescaled_mul_dense_kernel(T* __restrict__ data,
     if (row >= nrows) return;
 
     T scale = scales[row];
-    int row_offset = row * ncols;
+    long long row_offset = static_cast<long long>(row) * ncols;
     for (int i = threadIdx.x; i < ncols; i += blockDim.x)
         data[row_offset + i] *= scale;
 }
