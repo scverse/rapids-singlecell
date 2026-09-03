@@ -58,7 +58,13 @@ def _peer_copy_works(destination: int, source: int) -> bool:
 
 def _copy_to_device_p2p(array: cp.ndarray, destination: int) -> cp.ndarray:
     """Copy an array directly to another GPU."""
+    # The copy runs on the destination stream; make it wait for the work that
+    # produced ``array`` on the source stream (cudaMemcpyAsync does not).
+    with cp.cuda.Device(array.device.id):
+        ready = cp.cuda.Event(block=False, disable_timing=True)
+        ready.record()
     with cp.cuda.Device(destination):
+        cp.cuda.get_current_stream().wait_event(ready)
         return cp.asarray(array)
 
 
@@ -88,7 +94,7 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
     multi_gpu
         GPU selection:
         - None or True: Use all available GPUs
-        - False: Use only GPU 0
+        - False: Use only the current GPU
         - list[int]: Use specific GPU IDs (e.g., [0, 2])
         - str: Comma-separated GPU IDs (e.g., "0,2")
 
@@ -107,7 +113,7 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
     if multi_gpu is None or multi_gpu is True:
         return list(range(n_available))
     elif multi_gpu is False:
-        return [0]
+        return [cp.cuda.Device().id]
     elif isinstance(multi_gpu, str):
         device_ids = [int(x.strip()) for x in multi_gpu.split(",")]
     elif isinstance(multi_gpu, list):
@@ -128,7 +134,8 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
     if len(device_ids) == 0:
         raise ValueError("multi_gpu must specify at least one device")
 
-    return device_ids
+    # Streams are keyed by device; a duplicate would drop a sync barrier
+    return list(dict.fromkeys(device_ids))
 
 
 def _get_device_attrs(device_id: int | None = None) -> dict:
