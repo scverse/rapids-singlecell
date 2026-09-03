@@ -209,3 +209,205 @@ __global__ void pre_den_sparse_kernel(const IdxT* __restrict__ data_col_ind,
         atomicAdd(&den[geneidx], value * value);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused numerator kernels (Moran's I / Geary's C) with double accumulation.
+//
+// Both statistics share the cross term  cross_g = sum_i x_ig * sum_j w_ij x_jg.
+// With r_i = sum_j w_ij (row sum) and c_j = sum_i w_ij (column sum):
+//   Moran:  num_g = sum_i (x_ig - m_g)(acc_ig - m_g r_i)
+//                 = sum_i x_ig (acc_ig - m_g r_i) - m_g * sum_j c_j x_jg +
+//                 m_g^2 S0
+//   Geary:  num_g = sum_ij w_ij (x_ig - x_jg)^2
+//                 = sum_i x_ig (r_i x_ig - 2 acc_ig) + sum_j c_j x_jg^2
+// The kernels below produce the first (permutation-dependent) sum over the
+// stored nonzeros of row i only; the invariant tail terms come from
+// autocorr_sparse_stats_kernel and are added on the Python side. A row
+// permutation of W (permutation test) is applied via `perm` without
+// materialising the permuted matrix.
+// ---------------------------------------------------------------------------
+
+constexpr int AUTOCORR_MORAN = 0;
+constexpr int AUTOCORR_GEARY = 1;
+constexpr int AUTOCORR_SMEM_BYTES = 32768;
+
+template <typename IdxT>
+__device__ __forceinline__ IdxT autocorr_lower_bound(const IdxT* __restrict__ a,
+                                                     IdxT lo, IdxT hi,
+                                                     long long key) {
+    while (lo < hi) {
+        IdxT mid = lo + (hi - lo) / 2;
+        if (static_cast<long long>(a[mid]) < key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Narrow [*lo, *hi) to the entries whose sorted column lies in [b0, b1).
+// Rows fully inside the window (the common case) skip the binary searches.
+template <typename IdxT>
+__device__ __forceinline__ void autocorr_window(const IdxT* __restrict__ cols,
+                                                long long b0, long long b1,
+                                                IdxT* lo, IdxT* hi) {
+    if (*hi <= *lo) return;
+    const long long first = static_cast<long long>(cols[*lo]);
+    const long long last = static_cast<long long>(cols[*hi - 1]);
+    if (first < b0) *lo = autocorr_lower_bound(cols, *lo, *hi, b0);
+    if (last >= b1) *hi = autocorr_lower_bound(cols, *lo, *hi, b1);
+}
+
+// Dense: one thread per feature (coalesced row reads), grid.y slabs over
+// cells, register accumulation, one double atomic per (thread, slab).
+// `den` (optional) receives sum_i (x_ig - m_g)^2 for the un-permuted call.
+template <typename T, typename AdjIdxT, int MODE>
+__global__ void autocorr_dense_kernel(
+    const T* __restrict__ x, const double* __restrict__ means,
+    const AdjIdxT* __restrict__ adj_row_ptr,
+    const AdjIdxT* __restrict__ adj_col_ind, const T* __restrict__ adj_data,
+    const int* __restrict__ perm, double* __restrict__ num,
+    double* __restrict__ den, int n_samples, int n_features) {
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n_features) return;
+    // Per-cell math stays in T (the fp64 pipe is the bottleneck otherwise);
+    // only the cross-cell sums are fp64.
+    const T m = static_cast<T>(means[f]);
+    const size_t nf = static_cast<size_t>(n_features);
+    double out = 0.0;
+    double sq = 0.0;
+    for (int i = blockIdx.y; i < n_samples; i += gridDim.y) {
+        const int row = perm ? perm[i] : i;
+        const AdjIdxT k_start = adj_row_ptr[row];
+        const AdjIdxT k_end = adj_row_ptr[row + 1];
+        const T xi = x[static_cast<size_t>(i) * nf + f] - m;
+        if (den) sq += static_cast<double>(xi) * static_cast<double>(xi);
+        T acc = T(0);
+        for (AdjIdxT k = k_start; k < k_end; ++k) {
+            const AdjIdxT j = adj_col_ind[k];
+            if (j < 0 || j >= static_cast<AdjIdxT>(n_samples)) continue;
+            const T xj = x[static_cast<size_t>(j) * nf + f] - m;
+            if constexpr (MODE == AUTOCORR_MORAN) {
+                acc += adj_data[k] * xj;
+            } else {
+                const T d = xi - xj;
+                acc += adj_data[k] * d * d;
+            }
+        }
+        if constexpr (MODE == AUTOCORR_MORAN) {
+            out += static_cast<double>(xi) * static_cast<double>(acc);
+        } else {
+            out += static_cast<double>(acc);
+        }
+    }
+    atomicAdd(&num[f], out);
+    if (den) atomicAdd(&den[f], sq);
+}
+
+// Sparse (CSR data, sorted indices): one block per cell i. Neighbour rows are
+// scatter-added into a shared gene-window accumulator (warp per neighbour,
+// binary search to the window), then only the stored nonzeros of row i emit
+// one double atomic each. Work is O(deg * nnz), not O(deg * n * n_features).
+template <typename T, typename AdjIdxT, typename DataIdxT, int MODE>
+__global__ void autocorr_sparse_kernel(
+    const AdjIdxT* __restrict__ adj_row_ptr,
+    const AdjIdxT* __restrict__ adj_col_ind, const T* __restrict__ adj_data,
+    const int* __restrict__ perm, const DataIdxT* __restrict__ data_row_ptr,
+    const DataIdxT* __restrict__ data_col_ind,
+    const T* __restrict__ data_values, const double* __restrict__ means,
+    double* __restrict__ num, int n_samples, int n_features) {
+    constexpr int BATCH = AUTOCORR_SMEM_BYTES / static_cast<int>(sizeof(T));
+    __shared__ T acc[BATCH];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_warps = blockDim.x >> 5;
+
+    for (int i = blockIdx.x; i < n_samples; i += gridDim.x) {
+        const DataIdxT i_start = data_row_ptr[i];
+        const DataIdxT i_end = data_row_ptr[i + 1];
+        if (i_end <= i_start) continue;  // block-uniform
+        const int row = perm ? perm[i] : i;
+        const AdjIdxT k_start = adj_row_ptr[row];
+        const AdjIdxT k_end = adj_row_ptr[row + 1];
+        double r = 0.0;
+        for (AdjIdxT k = k_start; k < k_end; ++k) {
+            const AdjIdxT j = adj_col_ind[k];
+            if (j < 0 || j >= static_cast<AdjIdxT>(n_samples)) continue;
+            r += static_cast<double>(adj_data[k]);
+        }
+        const long long g_lo = static_cast<long long>(data_col_ind[i_start]);
+        const long long g_hi = static_cast<long long>(data_col_ind[i_end - 1]);
+        const int run_lo = static_cast<int>(g_lo / BATCH);
+        const int run_hi = static_cast<int>(g_hi / BATCH);
+        for (int run = run_lo; run <= run_hi; ++run) {
+            const long long b0 = static_cast<long long>(run) * BATCH;
+            const long long b1 =
+                min(b0 + BATCH, static_cast<long long>(n_features));
+            const int width = static_cast<int>(b1 - b0);
+            for (int t = tid; t < width; t += blockDim.x) acc[t] = T(0);
+            __syncthreads();
+            for (AdjIdxT k = k_start + warp; k < k_end; k += n_warps) {
+                const AdjIdxT j = adj_col_ind[k];
+                if (j < 0 || j >= static_cast<AdjIdxT>(n_samples)) continue;
+                const T w = adj_data[k];
+                const DataIdxT j_start = data_row_ptr[j];
+                const DataIdxT j_end = data_row_ptr[j + 1];
+                DataIdxT lo = j_start;
+                DataIdxT hi = j_end;
+                autocorr_window(data_col_ind, b0, b1, &lo, &hi);
+                for (DataIdxT a = lo + lane; a < hi; a += 32) {
+                    atomicAdd(&acc[static_cast<int>(data_col_ind[a] - b0)],
+                              w * data_values[a]);
+                }
+            }
+            __syncthreads();
+            DataIdxT lo = i_start;
+            DataIdxT hi = i_end;
+            autocorr_window(data_col_ind, b0, b1, &lo, &hi);
+            for (DataIdxT a = lo + tid; a < hi; a += blockDim.x) {
+                const long long g = static_cast<long long>(data_col_ind[a]);
+                const double xv = static_cast<double>(data_values[a]);
+                const double av =
+                    static_cast<double>(acc[static_cast<int>(g - b0)]);
+                double v;
+                if constexpr (MODE == AUTOCORR_MORAN) {
+                    v = xv * (av - means[g] * r);
+                } else {
+                    v = xv * (r * xv - 2.0 * av);
+                }
+                atomicAdd(&num[g], v);
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Per-gene invariants for the sparse path, one pass over nnz:
+// sum_x, sum_x2 (mean / denominator) and the W-column-sum weighted tail
+// t_g = sum_j c_j x_jg (Moran) or sum_j c_j x_jg^2 (Geary).
+template <typename T, typename DataIdxT, int MODE>
+__global__ void autocorr_sparse_stats_kernel(
+    const DataIdxT* __restrict__ data_row_ptr,
+    const DataIdxT* __restrict__ data_col_ind,
+    const T* __restrict__ data_values, const double* __restrict__ colsum_w,
+    double* __restrict__ sum_x, double* __restrict__ sum_x2,
+    double* __restrict__ tail, int n_samples) {
+    for (int i = blockIdx.x; i < n_samples; i += gridDim.x) {
+        const double c = colsum_w[i];
+        const DataIdxT start = data_row_ptr[i];
+        const DataIdxT end = data_row_ptr[i + 1];
+        for (DataIdxT a = start + threadIdx.x; a < end; a += blockDim.x) {
+            const DataIdxT g = data_col_ind[a];
+            const double xv = static_cast<double>(data_values[a]);
+            atomicAdd(&sum_x[g], xv);
+            atomicAdd(&sum_x2[g], xv * xv);
+            if constexpr (MODE == AUTOCORR_MORAN) {
+                atomicAdd(&tail[g], c * xv);
+            } else {
+                atomicAdd(&tail[g], c * xv * xv);
+            }
+        }
+    }
+}

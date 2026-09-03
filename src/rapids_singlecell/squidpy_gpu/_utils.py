@@ -8,6 +8,7 @@ from typing import (
 import cupy as cp
 import numpy as np
 import pandas as pd
+from cupyx.scipy import sparse as cupyx_sparse
 from pandas.api.types import infer_dtype
 from scipy import stats
 from scipy.sparse import issparse, spmatrix
@@ -139,6 +140,19 @@ def _g_moments(w: spmatrix | np.ndarray):
     Compute moments of adjacency matrix for analytic p-value calculation.
     See `pysal <https://pysal.org/libpysal/_modules/libpysal/weights/weights.html#W>`_ implementation.
     """
+    if isinstance(w, cupyx_sparse.spmatrix):
+        # Same moments on the device (avoids a D2H copy and host sparse ops).
+        w = w.tocsr()
+        s0 = float(w.data.sum(dtype=cp.float64))
+        t = w.transpose().tocsr() + w
+        s1 = float(cp.square(t.data.astype(cp.float64)).sum()) / 2.0
+        s2array = (
+            cp.asarray(w.sum(1), dtype=cp.float64).ravel()
+            + cp.asarray(w.sum(0), dtype=cp.float64).ravel()
+        )
+        s2 = float(cp.square(s2array).sum())
+        return s0, s1, s2
+
     # s0
     s0 = w.sum()
 

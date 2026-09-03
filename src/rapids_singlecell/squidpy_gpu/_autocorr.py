@@ -131,12 +131,15 @@ def spatial_autocorr(
                 "No `.raw` attribute found. Try specifying `use_raw=False`."
             )
         genes = list(set(genes) & set(adata.raw.var_names))
-        vals = adata.raw[:, genes].X
+        source = adata.raw
     else:
-        if layer is not None:
-            vals = adata[:, genes].layers[layer]
-        else:
-            vals = adata[:, genes].X
+        source = adata
+    # Column-subsetting a host CSR copies every nonzero; skip it for all genes.
+    if len(genes) != source.n_vars or not np.array_equal(
+        np.asarray(genes), source.var_names.values
+    ):
+        source = source[:, genes]
+    vals = source.X if layer is None else source.layers[layer]
 
     # Determine dtype from parameter or input data
     compute_dtype = np.dtype(dtype) if dtype is not None else vals.dtype
@@ -185,12 +188,13 @@ def spatial_autocorr(
         params["ascending"] = True
         params["mode"] = "gearyC"
 
-    g = sparse.csr_matrix(adj_matrix_cupy.get())
     score = score.get()
     if n_perms is not None:
         score_perms = score_perms.get()
     with np.errstate(divide="ignore"):
-        pval_results = _p_value_calc(score, sims=score_perms, weights=g, params=params)
+        pval_results = _p_value_calc(
+            score, sims=score_perms, weights=adj_matrix_cupy, params=params
+        )
 
     df = pd.DataFrame({params["stat"]: score, **pval_results}, index=genes)
 
