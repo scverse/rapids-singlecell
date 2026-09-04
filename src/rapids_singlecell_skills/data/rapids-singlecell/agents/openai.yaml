@@ -1,0 +1,4 @@
+interface:
+  display_name: "RAPIDS-singlecell"
+  short_description: "GPU single-cell and spatial analysis"
+  default_prompt: "Use $rapids-singlecell for a scientifically justified GPU analysis and return an executed notebook plus a Markdown findings report."
