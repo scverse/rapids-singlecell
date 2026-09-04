@@ -2,6 +2,20 @@
 
 These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html) {cite}`Wolf2018`.
 
+## Scanpy backend
+
+With Scanpy versions that support computational backends, RAPIDS-singlecell is
+available as the `rapids-singlecell` backend with the aliases `cuda`, `rapids`,
+and `rapids_singlecell`.
+
+```python
+import scanpy as sc
+
+sc.settings.backend = "cuda"
+```
+
+The backend exposes RAPIDS-singlecell's `pp` and `tl` functions, plus {func}`rapids_singlecell.get.aggregate`, for Scanpy's backend dispatcher.
+
 ## Preprocessing `pp`
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
 

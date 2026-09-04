@@ -7,6 +7,11 @@ from dask.array import Array as DaskArray  # noqa: F401
 from scipy.sparse import csc_matrix as csc_matrix_cpu
 from scipy.sparse import csr_matrix as csr_matrix_cpu
 
+try:
+    from spatialdata import SpatialData
+except ImportError:
+    SpatialData = None
+
 
 def _meta_dense(dtype):
     return cp.zeros([0], dtype=dtype)

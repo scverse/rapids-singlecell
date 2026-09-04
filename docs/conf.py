@@ -81,6 +81,7 @@ autodoc_mock_imports = [
     "pylibraft",
     "dask",
     "cuvs",
+    "spatialdata",
 ]
 default_role = "literal"
 napoleon_google_docstring = False
@@ -128,6 +129,7 @@ intersphinx_mapping = {
     "statsmodels": ("https://www.statsmodels.org/stable/", None),
     "omnipath": ("https://omnipath.readthedocs.io/en/latest/", None),
     "dask": ("https://docs.dask.org/en/stable/", None),
+    "spatialdata": ("https://spatialdata.scverse.org/en/stable/", None),
 }
 
 # List of patterns, relative to source directory, that match files and

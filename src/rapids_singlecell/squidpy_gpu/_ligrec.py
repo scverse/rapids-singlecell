@@ -14,6 +14,8 @@ from cupyx.scipy import sparse
 from cupyx.scipy.sparse import issparse as cpissparse
 from scipy.sparse import csc_matrix, issparse
 
+from rapids_singlecell._compat import SpatialData
+
 from ._utils import _assert_categorical_obs, _create_sparse_df
 
 SOURCE = "source"
@@ -118,7 +120,7 @@ def _check_tuple_needles(needles, haystack, *, msg: str, reraise: bool = True):
 
 
 def ligrec(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     cluster_key: str,
     *,
     clusters: list | None = None,
@@ -233,6 +235,8 @@ def ligrec(
     interacting components was 0 or it didn't pass the threshold percentage of \
     cells being expressed within a given cluster.
     """
+    if SpatialData is not None and isinstance(adata, SpatialData):
+        adata = adata.table
     # Get and Check interactions
     if interactions is None:
         interactions = _get_interactions(

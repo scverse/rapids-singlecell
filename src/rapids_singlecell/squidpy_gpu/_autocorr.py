@@ -12,6 +12,7 @@ from cupyx.scipy import sparse as sparse_gpu
 from scipy import sparse
 from statsmodels.stats.multitest import multipletests
 
+from rapids_singlecell._compat import SpatialData
 from rapids_singlecell.preprocessing._utils import _sparse_to_dense
 
 from ._gearysc import _gearys_C_cupy
@@ -49,7 +50,7 @@ def _to_cupy(vals, *, use_sparse: bool, dtype):
 
 
 def spatial_autocorr(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
     connectivity_key: str = "spatial_connectivities",
     genes: str | Sequence[str] | None = None,
@@ -118,6 +119,8 @@ def spatial_autocorr(
             DataFrame containing the autocorrelation scores, p-values, and corrected p-values for each gene. \
             If `copy` is False, the results are stored in `adata.uns` and None is returned.
     """
+    if SpatialData is not None and isinstance(adata, SpatialData):
+        adata = adata.table
     if genes is None:
         if "highly_variable" in adata.var:
             genes = adata[:, adata.var["highly_variable"]].var_names.values

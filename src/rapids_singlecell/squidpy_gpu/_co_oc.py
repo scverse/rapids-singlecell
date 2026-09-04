@@ -6,6 +6,7 @@ import cupy as cp
 import numpy as np
 from cuml.metrics import pairwise_distances
 
+from rapids_singlecell._compat import SpatialData
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
 
 
 def co_occurrence(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     cluster_key: str,
     *,
     spatial_key: str = "spatial",
@@ -66,6 +67,8 @@ def co_occurrence(
           computed at ``interval``.
     """
 
+    if SpatialData is not None and isinstance(adata, SpatialData):
+        adata = adata.table
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
     spatial = cp.array(adata.obsm[spatial_key]).astype(np.float32)

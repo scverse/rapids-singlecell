@@ -84,6 +84,12 @@ dev = [
     "pre-commit",
 ]
 
+[project.entry-points."scanpy.backends"]
+rapids-singlecell = "rapids_singlecell._backends.scanpy"
+
+[project.entry-points."squidpy.backends"]
+rapids-singlecell = "rapids_singlecell._backends.squidpy"
+
 [project.urls]
 Documentation = "https://rapids-singlecell.readthedocs.io"
 Source = "https://github.com/scverse/rapids_singlecell"
