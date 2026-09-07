@@ -73,11 +73,14 @@ struct AggrOp {
     void zero_outputs(int minor, int n_groups, cudaStream_t stream) const {
         const size_t bytes = (size_t)minor * n_groups * sizeof(double);
         if constexpr (MASK & AGGR_SUM)
-            cudaMemsetAsync(out_sum, 0, bytes, stream);
+            cuda_check(cudaMemsetAsync(out_sum, 0, bytes, stream),
+                       "cudaMemsetAsync(AggrOp outputs)");
         if constexpr (MASK & AGGR_COUNT)
-            cudaMemsetAsync(out_count, 0, bytes, stream);
+            cuda_check(cudaMemsetAsync(out_count, 0, bytes, stream),
+                       "cudaMemsetAsync(AggrOp outputs)");
         if constexpr (MASK & AGGR_SQSUM)
-            cudaMemsetAsync(out_sqsum, 0, bytes, stream);
+            cuda_check(cudaMemsetAsync(out_sqsum, 0, bytes, stream),
+                       "cudaMemsetAsync(AggrOp outputs)");
     }
 };
 

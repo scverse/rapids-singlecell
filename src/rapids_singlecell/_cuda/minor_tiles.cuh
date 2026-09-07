@@ -4,6 +4,8 @@
 #include <cub/device/device_radix_sort.cuh>
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "nb_types.h"
@@ -56,6 +58,29 @@
 // (doubles, then 4-byte types, then bytes). Grouped reductions (aggregate,
 // ligrec) first sort rows by group so a block only ever accumulates for one
 // group; see build_grouped_rows().
+
+// ---- argument validation ---------------------------------------------------
+
+/// Reject a malformed binding argument with a clear Python error instead of an
+/// out-of-bounds kernel read.
+inline void require_arg(bool cond, const char* what) {
+    if (!cond) throw std::invalid_argument(what);
+}
+
+/// The host-side shape checks every compressed-matrix binding can afford:
+/// a 1-D indptr and equally long indices/data. Offsets are not read back from
+/// the device here; cupyx guarantees their structure.
+template <typename IndptrArr, typename IdxArr, typename DataArr>
+inline void require_csr_arrays(const char* what, const IndptrArr& indptr,
+                               const IdxArr& indices, const DataArr& data) {
+    require_arg(
+        indptr.ndim() == 1 && indptr.shape(0) >= 1,
+        (std::string(what) + ": indptr must be 1-D and non-empty").c_str());
+    require_arg(
+        indices.shape(0) == data.shape(0),
+        (std::string(what) + ": indices and data must have equal length")
+            .c_str());
+}
 
 // ---- tunables --------------------------------------------------------------
 
@@ -610,7 +635,8 @@ struct MinorSumOp {
         atomicAdd(&out[col], data[nnz_pos]);
     }
     void zero_outputs(int n_cols, int, cudaStream_t stream) const {
-        cudaMemsetAsync(out, 0, (size_t)n_cols * sizeof(T), stream);
+        cuda_check(cudaMemsetAsync(out, 0, (size_t)n_cols * sizeof(T), stream),
+                   "cudaMemsetAsync(MinorSumOp outputs)");
     }
 };
 
@@ -639,6 +665,8 @@ struct MinorCountOp {
         if (col >= 0 && col < n_cols) atomicAdd(&out[col], 1);
     }
     void zero_outputs(int n_cols_, int, cudaStream_t stream) const {
-        cudaMemsetAsync(out, 0, (size_t)n_cols_ * sizeof(int), stream);
+        cuda_check(
+            cudaMemsetAsync(out, 0, (size_t)n_cols_ * sizeof(int), stream),
+            "cudaMemsetAsync(MinorCountOp outputs)");
     }
 };

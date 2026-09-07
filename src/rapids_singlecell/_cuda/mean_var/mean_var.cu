@@ -78,6 +78,10 @@ void def_tile_plan(nb::module_& m) {
     m.def(
         "tile_plan",
         [](long long nnz, int n_rows, int n_cols, size_t bytes_per_col) {
+            require_arg(
+                nnz >= 0 && n_rows > 0 && n_cols > 0 && bytes_per_col > 0,
+                "tile_plan: nnz must be >= 0 and n_rows, n_cols and "
+                "bytes_per_col must be positive");
             const TilePlan p = plan_tiles(nnz, n_rows, n_cols, bytes_per_col);
             nb::dict d;
             d["use_tiled"] = p.use_tiled;

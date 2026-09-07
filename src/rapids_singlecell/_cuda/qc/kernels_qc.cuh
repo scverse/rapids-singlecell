@@ -76,7 +76,10 @@ struct QcOp {
         atomicAdd(&counts[col], 1);
     }
     void zero_outputs(int minor, int, cudaStream_t stream) const {
-        cudaMemsetAsync(sums, 0, (size_t)minor * sizeof(T), stream);
-        cudaMemsetAsync(counts, 0, (size_t)minor * sizeof(int), stream);
+        cuda_check(cudaMemsetAsync(sums, 0, (size_t)minor * sizeof(T), stream),
+                   "cudaMemsetAsync(QcOp outputs)");
+        cuda_check(
+            cudaMemsetAsync(counts, 0, (size_t)minor * sizeof(int), stream),
+            "cudaMemsetAsync(QcOp outputs)");
     }
 };

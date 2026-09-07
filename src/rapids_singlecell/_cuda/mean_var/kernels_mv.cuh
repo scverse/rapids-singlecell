@@ -84,7 +84,11 @@ struct MeanVarOp {
         atomicAdd(&vars[col], v * v);
     }
     void zero_outputs(int minor, int, cudaStream_t stream) const {
-        cudaMemsetAsync(means, 0, (size_t)minor * sizeof(double), stream);
-        cudaMemsetAsync(vars, 0, (size_t)minor * sizeof(double), stream);
+        cuda_check(
+            cudaMemsetAsync(means, 0, (size_t)minor * sizeof(double), stream),
+            "cudaMemsetAsync(MeanVarOp outputs)");
+        cuda_check(
+            cudaMemsetAsync(vars, 0, (size_t)minor * sizeof(double), stream),
+            "cudaMemsetAsync(MeanVarOp outputs)");
     }
 };

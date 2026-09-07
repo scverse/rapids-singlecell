@@ -99,6 +99,15 @@ void def_check_zero_genes(nb::module_& m) {
            gpu_array_c<int, Device> out, long long nnz, int num_genes,
            std::optional<gpu_array_c<const IdxT, Device>> indptr,
            bool assume_unsorted, std::uintptr_t stream) {
+            require_arg(nnz >= 0 && (size_t)nnz <= indices.shape(0),
+                        "check_zero_genes: nnz exceeds the indices length");
+            require_arg((int)out.shape(0) == num_genes,
+                        "check_zero_genes: out must have num_genes entries");
+            if (indptr) {
+                require_arg(
+                    indptr->ndim() == 1 && indptr->shape(0) >= 1,
+                    "check_zero_genes: indptr must be 1-D and non-empty");
+            }
             MinorCountOp op{out.data(), num_genes, 0};
             if (!indptr) {
                 minor_reduce_flat<IdxT>(indices.data(), op, nnz,

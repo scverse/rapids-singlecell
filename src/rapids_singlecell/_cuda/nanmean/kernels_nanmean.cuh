@@ -108,7 +108,11 @@ struct NanMeanOp {
         }
     }
     void zero_outputs(int minor, int, cudaStream_t stream) const {
-        cudaMemsetAsync(means, 0, (size_t)minor * sizeof(double), stream);
-        cudaMemsetAsync(nans, 0, (size_t)minor * sizeof(int), stream);
+        cuda_check(
+            cudaMemsetAsync(means, 0, (size_t)minor * sizeof(double), stream),
+            "cudaMemsetAsync(NanMeanOp outputs)");
+        cuda_check(
+            cudaMemsetAsync(nans, 0, (size_t)minor * sizeof(int), stream),
+            "cudaMemsetAsync(NanMeanOp outputs)");
     }
 };

@@ -132,10 +132,23 @@ void def_sparse_aggr(nb::module_& m) {
             double* pq = out_sqsum ? out_sqsum->data() : nullptr;
             int active = (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) |
                          (pq ? AGGR_SQSUM : 0);
-            const int n_groups = out_sum     ? (int)out_sum->shape(0)
-                                 : out_count ? (int)out_count->shape(0)
-                                 : out_sqsum ? (int)out_sqsum->shape(0)
-                                             : 0;
+            // Every provided plane must be (n_groups, n_genes); n_groups is
+            // read off shape(0), so a flattened plane would over-size the
+            // memsets and the grouping.
+            int n_groups = 0;
+            for (const auto* plane : {&out_sum, &out_count, &out_sqsum}) {
+                if (!*plane) continue;
+                require_arg(
+                    (*plane)->ndim() == 2 && (*plane)->shape(1) == n_genes,
+                    "sparse_aggr: outputs must be (n_groups, n_genes)");
+                const int g = (int)(*plane)->shape(0);
+                require_arg(n_groups == 0 || g == n_groups,
+                            "sparse_aggr: outputs must have the same shape");
+                n_groups = g;
+            }
+            require_csr_arrays("sparse_aggr", indptr, index, data);
+            require_arg(cats.shape(0) == n_cells && mask.shape(0) == n_cells,
+                        "sparse_aggr: cats and mask must have n_cells entries");
             bool unsorted = false;
 #define LAUNCH(M)                                                     \
     unsorted = launch_sparse_aggr<T, IdxT, M>(                        \

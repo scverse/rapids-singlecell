@@ -33,6 +33,12 @@ static void launch_expected_zeros(const T* scaled_means, const T* total_counts,
     CUDA_CHECK_LAST_ERROR(expected_zeros_kernel);
 }
 
+/// min(value, clip) that propagates NaN like cupy.minimum on the dense path
+/// (fmin would return the finite operand).
+__device__ inline double clip_min(double value, double clip) {
+    return (isnan(value) || isnan(clip)) ? NAN : fmin(value, clip);
+}
+
 /// Per-column sum and sum-of-squares of min(value, clip[col]) for seurat_v3
 /// (see minor_tiles.cuh). Layout: double sq-sums, double sums, double clips.
 template <typename T>
@@ -56,7 +62,7 @@ struct ClipSumOp {
     __device__ void add(char* acc, long long q, int g) const {
         double* s = reinterpret_cast<double*>(acc);
         const double e =
-            fmin(static_cast<double>(data[q]), s[2 * tile_size + g]);
+            clip_min(static_cast<double>(data[q]), s[2 * tile_size + g]);
         atomicAdd(&s[g], e * e);
         atomicAdd(&s[tile_size + g], e);
     }
@@ -68,13 +74,17 @@ struct ClipSumOp {
         }
     }
     __device__ void add_global(long long q, int col, int) const {
-        const double e = fmin(static_cast<double>(data[q]), clip[col]);
+        const double e = clip_min(static_cast<double>(data[q]), clip[col]);
         atomicAdd(&sq_sum[col], e * e);
         atomicAdd(&sum[col], e);
     }
     void zero_outputs(int minor, int, cudaStream_t stream) const {
-        cudaMemsetAsync(sq_sum, 0, (size_t)minor * sizeof(double), stream);
-        cudaMemsetAsync(sum, 0, (size_t)minor * sizeof(double), stream);
+        cuda_check(
+            cudaMemsetAsync(sq_sum, 0, (size_t)minor * sizeof(double), stream),
+            "cudaMemsetAsync(ClipSumOp outputs)");
+        cuda_check(
+            cudaMemsetAsync(sum, 0, (size_t)minor * sizeof(double), stream),
+            "cudaMemsetAsync(ClipSumOp outputs)");
     }
 };
 
@@ -89,6 +99,11 @@ void def_clip_square_sum(nb::module_& m) {
            gpu_array_c<const double, Device> clip_val,
            gpu_array_c<double, Device> sq_sum, gpu_array_c<double, Device> sum,
            bool assume_unsorted, std::uintptr_t stream) {
+            require_csr_arrays("clip_square_sum", indptr, indices, data);
+            require_arg(clip_val.shape(0) == sum.shape(0) &&
+                            sq_sum.shape(0) == sum.shape(0),
+                        "clip_square_sum: clip_val, sq_sum and sum must have "
+                        "one entry per column");
             ClipSumOp<T> op{data.data(), clip_val.data(), sq_sum.data(),
                             sum.data(), 0};
             return minor_reduce<IdxT>(

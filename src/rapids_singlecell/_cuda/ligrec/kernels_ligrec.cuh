@@ -189,9 +189,13 @@ struct LigrecOp {
         }
     }
     void zero_outputs(int minor, int n_groups, cudaStream_t stream) const {
-        cudaMemsetAsync(sum, 0, (size_t)minor * n_groups * sizeof(T), stream);
+        cuda_check(cudaMemsetAsync(sum, 0, (size_t)minor * n_groups * sizeof(T),
+                                   stream),
+                   "cudaMemsetAsync(LigrecOp outputs)");
         if constexpr (WITH_COUNT)
-            cudaMemsetAsync(count, 0, (size_t)minor * n_groups * sizeof(int),
-                            stream);
+            cuda_check(
+                cudaMemsetAsync(count, 0,
+                                (size_t)minor * n_groups * sizeof(int), stream),
+                "cudaMemsetAsync(LigrecOp outputs)");
     }
 };
