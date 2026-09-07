@@ -16,6 +16,7 @@ from scanpy.get._aggregated import _combine_categories
 from rapids_singlecell._compat import DaskArray, _meta_dense
 from rapids_singlecell._cuda import _aggr_cuda
 from rapids_singlecell._settings import Preset, settings
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 from rapids_singlecell.preprocessing._utils import _check_gpu_X
 
 from ._utils import (
@@ -239,7 +240,9 @@ class Aggregate:
             out_sqsum = out[0, i_sqsum] if need_sqsum else None
 
             if is_sparse:
-                _aggr_cuda.sparse_aggr(
+                _minor_reduce(
+                    X_part,
+                    _aggr_cuda.sparse_aggr,
                     X_part.indptr,
                     X_part.indices,
                     X_part.data,
@@ -324,7 +327,9 @@ class Aggregate:
         )
         mask = self._get_mask()
 
-        _aggr_cuda.sparse_aggr(
+        _minor_reduce(
+            self.data,
+            _aggr_cuda.sparse_aggr,
             self.data.indptr,
             self.data.indices,
             self.data.data,

@@ -7,6 +7,7 @@ import cupy as cp
 if TYPE_CHECKING:
     from cupyx.scipy.sparse import spmatrix
 from rapids_singlecell._cuda import _spca_cuda as _spca
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 
 
 def _copy_gram(gram_matrix: cp.ndarray, n_cols: int) -> cp.ndarray:
@@ -35,11 +36,14 @@ def _compute_cov(
 def _check_matrix_for_zero_genes(X: spmatrix) -> None:
     gene_ex = cp.zeros(X.shape[1], dtype=cp.int32)
     if X.nnz > 0:
-        _spca.check_zero_genes(
+        _minor_reduce(
+            X,
+            _spca.check_zero_genes,
             X.indices,
             out=gene_ex,
             nnz=X.nnz,
             num_genes=X.shape[1],
+            indptr=X.indptr,
             stream=cp.cuda.get_current_stream().ptr,
         )
     if cp.any(gene_ex == 0):

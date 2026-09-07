@@ -1,29 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
-
-template <typename T, typename IdxT>
-__global__ void nan_mean_minor_kernel(const IdxT* __restrict__ index,
-                                      const T* __restrict__ data,
-                                      double* __restrict__ means,
-                                      int* __restrict__ nans,
-                                      const bool* __restrict__ mask,
-                                      long long nnz) {
-    const long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < nnz; idx += stride) {
-        IdxT minor_pos = index[idx];
-        if (mask[minor_pos] == false) {
-            continue;
-        }
-        T v = data[idx];
-        if (isnan((double)v)) {
-            atomicAdd(&nans[minor_pos], 1);
-        } else {
-            atomicAdd(&means[minor_pos], (double)v);
-        }
-    }
-}
+#include "../minor_tiles.cuh"
 
 template <typename T, typename IdxT>
 __global__ void nan_mean_major_kernel(const IdxT* __restrict__ indptr,
@@ -73,3 +51,64 @@ __global__ void nan_mean_major_kernel(const IdxT* __restrict__ indptr,
         nans[major_idx] = nan_place[0];
     }
 }
+
+/// Minor-axis NaN-aware sum and NaN count per masked column (see
+/// minor_tiles.cuh). Layout: double sums, int NaN counts, bool mask.
+template <typename T>
+struct NanMeanOp {
+    const T* data;
+    double* means;
+    int* nans;
+    const bool* mask;
+    int tile_size;
+    static constexpr size_t bytes_per_col =
+        sizeof(double) + sizeof(int) + sizeof(bool);
+    static constexpr bool needs_rows = false;
+    __device__ double* s_sum(char* acc) const {
+        return reinterpret_cast<double*>(acc);
+    }
+    __device__ int* s_nan(char* acc) const {
+        return reinterpret_cast<int*>(acc + (size_t)tile_size * sizeof(double));
+    }
+    __device__ bool* s_mask(char* acc) const {
+        return reinterpret_cast<bool*>(
+            acc + (size_t)tile_size * (sizeof(double) + sizeof(int)));
+    }
+    __device__ bool row_active(int) const {
+        return true;
+    }
+    __device__ void zero_col(char* acc, int g, int col) const {
+        s_sum(acc)[g] = 0.0;
+        s_nan(acc)[g] = 0;
+        s_mask(acc)[g] = mask[col];
+    }
+    __device__ void add(char* acc, long long q, int g) const {
+        if (!s_mask(acc)[g]) return;
+        const double v = static_cast<double>(data[q]);
+        if (isnan(v)) {
+            atomicAdd(&s_nan(acc)[g], 1);
+        } else {
+            atomicAdd(&s_sum(acc)[g], v);
+        }
+    }
+    __device__ void flush_col(const char* acc, int, int col, int g) const {
+        char* a = const_cast<char*>(acc);
+        const int n = s_nan(a)[g];
+        const double s = s_sum(a)[g];
+        if (n != 0) atomicAdd(&nans[col], n);
+        if (s != 0.0) atomicAdd(&means[col], s);
+    }
+    __device__ void add_global(long long q, int col, int) const {
+        if (!mask[col]) return;
+        const double v = static_cast<double>(data[q]);
+        if (isnan(v)) {
+            atomicAdd(&nans[col], 1);
+        } else {
+            atomicAdd(&means[col], v);
+        }
+    }
+    void zero_outputs(int minor, int, cudaStream_t stream) const {
+        cudaMemsetAsync(means, 0, (size_t)minor * sizeof(double), stream);
+        cudaMemsetAsync(nans, 0, (size_t)minor * sizeof(int), stream);
+    }
+};

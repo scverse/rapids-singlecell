@@ -9,6 +9,7 @@ import pandas as pd
 from cupyx.scipy.sparse import issparse
 
 from rapids_singlecell._cuda import _pr_cuda
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 from rapids_singlecell.get import _get_obs_rep
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
@@ -90,7 +91,9 @@ def _highly_variable_pearson_residuals(
             # Compute sums using custom kernel (single pass, no CSC->CSR conversion)
             sums_genes = cp.zeros(n_genes, dtype=dtype)
             sums_cells = cp.zeros(n_cells, dtype=dtype)
-            _pr_cuda.sparse_sum_csc(
+            _minor_reduce(
+                X_batch,
+                _pr_cuda.sparse_sum_csc,
                 X_batch.indptr,
                 X_batch.indices,
                 X_batch.data,

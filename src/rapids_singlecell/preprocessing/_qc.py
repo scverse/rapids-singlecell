@@ -6,6 +6,7 @@ import cupy as cp
 from cupyx.scipy import sparse
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 from rapids_singlecell.get import _get_obs_rep
 
 from ._utils import _check_gpu_X
@@ -136,7 +137,9 @@ def _basic_qc(
         else:
             raise ValueError("Please use a csr or csc matrix")
 
-        sparse_qc(
+        _minor_reduce(
+            X,
+            sparse_qc,
             X.indptr,
             X.indices,
             X.data,
@@ -188,14 +191,18 @@ def _basic_qc_dask(
             return cp.stack([sums_cells, genes_per_cell.astype(X_part.dtype)], axis=1)
 
         def __qc_calc_2(X_part):
+            from rapids_singlecell._cuda import _qc_cuda as _qc
+
             sums_genes = cp.zeros(X_part.shape[1], dtype=X_part.dtype)
             cells_per_gene = cp.zeros(X_part.shape[1], dtype=cp.int32)
-            _qcd.sparse_qc_csr_genes(
+            _minor_reduce(
+                X_part,
+                _qc.sparse_qc_genes,
+                X_part.indptr,
                 X_part.indices,
                 X_part.data,
                 sums_genes=sums_genes,
                 gene_ex=cells_per_gene,
-                nnz=X_part.nnz,
                 stream=cp.cuda.get_current_stream().ptr,
             )
             return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[
@@ -289,7 +296,9 @@ def _geneset_qc(X: ArrayTypesDask, mask: cp.ndarray) -> cp.ndarray:
                 stream=cp.cuda.get_current_stream().ptr,
             )
         elif sparse.isspmatrix_csc(X):
-            _qc.sparse_qc_csc_sub(
+            _minor_reduce(
+                X,
+                _qc.sparse_qc_csc_sub,
                 X.indptr,
                 X.indices,
                 X.data,

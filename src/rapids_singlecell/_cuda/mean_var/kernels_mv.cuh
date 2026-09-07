@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "../minor_tiles.cuh"
 
 constexpr int BLOCK_SIZE_MAJOR = 64;
 
@@ -45,18 +46,45 @@ __global__ void mean_var_major_kernel(const IdxT* __restrict__ indptr,
     }
 }
 
-template <typename T, typename IdxT>
-__global__ void mean_var_minor_kernel(const IdxT* __restrict__ indices,
-                                      const T* __restrict__ data,
-                                      double* __restrict__ means,
-                                      double* __restrict__ vars,
-                                      long long nnz) {
-    const long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
-         idx < nnz; idx += stride) {
-        double value = static_cast<double>(data[idx]);
-        IdxT minor_pos = indices[idx];
-        atomicAdd(&means[minor_pos], value);
-        atomicAdd(&vars[minor_pos], value * value);
+/// Minor-axis sum / sum-of-squares per column (see minor_tiles.cuh).
+template <typename T>
+struct MeanVarOp {
+    const T* data;
+    double* means;
+    double* vars;
+    int tile_size;
+    static constexpr size_t bytes_per_col = 2 * sizeof(double);
+    static constexpr bool needs_rows = false;
+    __device__ bool row_active(int) const {
+        return true;
     }
-}
+    __device__ void zero_col(char* acc, int g, int) const {
+        double* s = reinterpret_cast<double*>(acc);
+        s[g] = 0.0;
+        s[tile_size + g] = 0.0;
+    }
+    __device__ void add(char* acc, long long q, int g) const {
+        double* s = reinterpret_cast<double*>(acc);
+        const double v = static_cast<double>(data[q]);
+        atomicAdd(&s[g], v);
+        atomicAdd(&s[tile_size + g], v * v);
+    }
+    __device__ void flush_col(const char* acc, int, int col, int g) const {
+        const double* s = reinterpret_cast<const double*>(acc);
+        const double sq = s[tile_size + g];
+        // Zero only when no nonzero of this column landed in the block.
+        if (sq != 0.0) {
+            atomicAdd(&means[col], s[g]);
+            atomicAdd(&vars[col], sq);
+        }
+    }
+    __device__ void add_global(long long q, int col, int) const {
+        const double v = static_cast<double>(data[q]);
+        atomicAdd(&means[col], v);
+        atomicAdd(&vars[col], v * v);
+    }
+    void zero_outputs(int minor, int, cudaStream_t stream) const {
+        cudaMemsetAsync(means, 0, (size_t)minor * sizeof(double), stream);
+        cudaMemsetAsync(vars, 0, (size_t)minor * sizeof(double), stream);
+    }
+};

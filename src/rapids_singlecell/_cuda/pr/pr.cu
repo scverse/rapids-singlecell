@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include "../minor_tiles.cuh"
 #include "../nb_types.h"
 
 #include "kernels_pr.cuh"
@@ -51,16 +52,20 @@ static inline void launch_dense_norm_res(const T* X, T* residuals,
     CUDA_CHECK_LAST_ERROR(dense_norm_res_kernel);
 }
 
+// Gene sums along the compressed axis plus cell sums along the minor axis.
+// Returns whether unsorted rows were detected.
 template <typename T, typename IdxT>
-static inline void launch_sparse_sum_csc(const IdxT* indptr, const IdxT* index,
+static inline bool launch_sparse_sum_csc(const IdxT* indptr, const IdxT* index,
                                          const T* data, T* sums_genes,
                                          T* sums_cells, int n_genes,
+                                         int n_cells, long long nnz,
+                                         bool assume_unsorted,
                                          cudaStream_t stream) {
-    dim3 block(SPARSE_BLOCK_SIZE);
-    dim3 grid((n_genes + SPARSE_BLOCK_SIZE - 1) / SPARSE_BLOCK_SIZE);
-    sparse_sum_csc_kernel<T, IdxT><<<grid, block, 0, stream>>>(
-        indptr, index, data, sums_genes, sums_cells, n_genes);
-    CUDA_CHECK_LAST_ERROR(sparse_sum_csc_kernel);
+    row_reduce<T, IdxT>(indptr, index, data, nullptr, sums_genes, nullptr,
+                        n_genes, stream);
+    MinorSumOp<T> op{data, sums_cells, nullptr, 0};
+    return minor_reduce<IdxT>(indptr, index, op, n_genes, n_cells, nnz,
+                              assume_unsorted, stream);
 }
 
 template <typename T, typename IdxT>
@@ -163,14 +168,17 @@ void def_sparse_sum_csc(nb::module_& m) {
         [](gpu_array_c<const IdxT, Device> indptr,
            gpu_array_c<const IdxT, Device> index,
            gpu_array_c<const T, Device> data, gpu_array_c<T, Device> sums_genes,
-           gpu_array_c<T, Device> sums_cells, int n_genes,
+           gpu_array_c<T, Device> sums_cells, int n_genes, bool assume_unsorted,
            std::uintptr_t stream) {
-            launch_sparse_sum_csc<T, IdxT>(
+            return launch_sparse_sum_csc<T, IdxT>(
                 indptr.data(), index.data(), data.data(), sums_genes.data(),
-                sums_cells.data(), n_genes, (cudaStream_t)stream);
+                sums_cells.data(), n_genes, (int)sums_cells.shape(0),
+                (long long)data.shape(0), assume_unsorted,
+                (cudaStream_t)stream);
         },
         "indptr"_a, "index"_a, "data"_a, nb::kw_only(), "sums_genes"_a,
-        "sums_cells"_a, "n_genes"_a, "stream"_a = 0);
+        "sums_cells"_a, "n_genes"_a, "assume_unsorted"_a = false,
+        "stream"_a = 0);
 }
 
 // Helper to define csc_hvg_res for a given dtype and index type
@@ -252,4 +260,5 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_pr_cuda, m) {
     REGISTER_GPU_BINDINGS(register_bindings, m);
+    register_scratch_allocator(m);
 }

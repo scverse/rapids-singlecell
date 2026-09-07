@@ -1,4 +1,9 @@
 #include <cuda_runtime.h>
+#include <nanobind/stl/optional.h>
+
+#include <optional>
+
+#include "../minor_tiles.cuh"
 #include "../nb_types.h"
 
 #include "kernels_spca.cuh"
@@ -7,7 +12,6 @@ using namespace nb::literals;
 
 constexpr int GRAM_BLOCK_SIZE = 128;
 constexpr int MATRIX_BLOCK_DIM = 32;
-constexpr int ELEMENTWISE_BLOCK_SIZE = 32;
 
 template <typename T, typename IdxT>
 static inline void launch_gram_csr_upper(const IdxT* indptr, const IdxT* index,
@@ -41,19 +45,6 @@ static inline void launch_cov_from_gram(T* cov, const T* gram, const T* meanx,
     cov_from_gram_kernel<T>
         <<<grid, block, 0, stream>>>(cov, gram, meanx, meany, ncols);
     CUDA_CHECK_LAST_ERROR(cov_from_gram_kernel);
-}
-
-template <typename IdxT>
-static inline void launch_check_zero_genes(const IdxT* indices, int* genes,
-                                           long long nnz, int num_genes,
-                                           cudaStream_t stream) {
-    if (nnz > 0) {
-        dim3 block(ELEMENTWISE_BLOCK_SIZE);
-        dim3 grid(strided_grid(nnz, ELEMENTWISE_BLOCK_SIZE));
-        check_zero_genes_kernel<IdxT>
-            <<<grid, block, 0, stream>>>(indices, genes, nnz, num_genes);
-        CUDA_CHECK_LAST_ERROR(check_zero_genes_kernel);
-    }
 }
 
 template <typename T, typename IdxT, typename Device>
@@ -98,18 +89,28 @@ void def_cov_from_gram(nb::module_& m) {
         "stream"_a = 0);
 }
 
+// Stored entries per gene. With `indptr` the tile sweep is used; returns
+// whether unsorted rows were detected.
 template <typename IdxT, typename Device>
 void def_check_zero_genes(nb::module_& m) {
     m.def(
         "check_zero_genes",
         [](gpu_array_c<const IdxT, Device> indices,
            gpu_array_c<int, Device> out, long long nnz, int num_genes,
-           std::uintptr_t stream) {
-            launch_check_zero_genes<IdxT>(indices.data(), out.data(), nnz,
-                                          num_genes, (cudaStream_t)stream);
+           std::optional<gpu_array_c<const IdxT, Device>> indptr,
+           bool assume_unsorted, std::uintptr_t stream) {
+            MinorCountOp op{out.data(), num_genes, 0};
+            if (!indptr) {
+                minor_reduce_flat<IdxT>(indices.data(), op, nnz,
+                                        (cudaStream_t)stream);
+                return false;
+            }
+            return minor_reduce<IdxT>(indptr->data(), indices.data(), op,
+                                      (int)indptr->shape(0) - 1, num_genes, nnz,
+                                      assume_unsorted, (cudaStream_t)stream);
         },
         "indices"_a, nb::kw_only(), "out"_a, "nnz"_a, "num_genes"_a,
-        "stream"_a = 0);
+        "indptr"_a = nb::none(), "assume_unsorted"_a = false, "stream"_a = 0);
 }
 
 template <typename Device>
@@ -131,4 +132,5 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_spca_cuda, m) {
     REGISTER_GPU_BINDINGS(register_bindings, m);
+    register_scratch_allocator(m);
 }
