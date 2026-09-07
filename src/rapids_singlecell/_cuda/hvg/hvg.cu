@@ -34,9 +34,11 @@ static void launch_expected_zeros(const T* scaled_means, const T* total_counts,
 }
 
 /// min(value, clip) that propagates NaN like cupy.minimum on the dense path
-/// (fmin would return the finite operand).
+/// (fmin would return the finite operand). Branch-free: a NaN value fails
+/// `value < clip` but passes `value != value`; a NaN clip fails both and is
+/// selected as is.
 __device__ inline double clip_min(double value, double clip) {
-    return (isnan(value) || isnan(clip)) ? NAN : fmin(value, clip);
+    return (value < clip || value != value) ? value : clip;
 }
 
 /// Per-column sum and sum-of-squares of min(value, clip[col]) for seurat_v3
