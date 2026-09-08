@@ -133,6 +133,7 @@ void def_sum_count_sparse(nb::module_& m) {
            gpu_array_c<const int, Device> clusters, gpu_array_c<T, Device> sum,
            gpu_array_c<int, Device> count, int rows, int ncls,
            bool assume_unsorted, std::uintptr_t stream) {
+            if (ncls <= 0 || rows <= 0) return false;  // nothing to reduce
             // sum is (n_genes, ncls); derive n_genes from the element count so
             // any 2-D shape with the same size works.
             return launch_sum_count_sparse<T, IdxT>(
@@ -169,6 +170,7 @@ void def_mean_sparse(nb::module_& m) {
            gpu_array_c<const T, Device> data,
            gpu_array_c<const int, Device> clusters, gpu_array_c<T, Device> g,
            int rows, int ncls, bool assume_unsorted, std::uintptr_t stream) {
+            if (ncls <= 0 || rows <= 0) return false;  // nothing to reduce
             return launch_mean_sparse<T, IdxT>(
                 indptr.data(), index.data(), data.data(), clusters.data(),
                 g.data(), rows, ncls, (int)(g.size() / ncls),

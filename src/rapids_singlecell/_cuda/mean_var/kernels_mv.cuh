@@ -71,10 +71,13 @@ struct MeanVarOp {
     }
     __device__ void flush_col(const char* acc, int, int col, int g) const {
         const double* s = reinterpret_cast<const double*>(acc);
+        const double sum = s[g];
         const double sq = s[tile_size + g];
-        // Zero only when no nonzero of this column landed in the block.
-        if (sq != 0.0) {
-            atomicAdd(&means[col], s[g]);
+        // Both zero only when nothing landed in this column (or it cancelled
+        // exactly, where adding zero is a no-op). Testing the squares alone
+        // would drop tiny values whose squares underflow.
+        if (sum != 0.0 || sq != 0.0) {
+            atomicAdd(&means[col], sum);
             atomicAdd(&vars[col], sq);
         }
     }

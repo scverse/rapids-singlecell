@@ -138,13 +138,18 @@ inline TilePlan plan_tiles(long long nnz, int n_rows, int n_cols,
     rows_per_block = std::clamp(rows_per_block, SWEEP_MIN_ROWS_PER_BLOCK,
                                 SWEEP_MAX_ROWS_PER_BLOCK);
 
-    const size_t bookmark_bytes = (size_t)rows_per_block * sizeof(int);
+    const size_t bookmark_bytes = (size_t)rows_per_block * sizeof(long long);
     TilePlan plan{false, 0, 0, rows_per_block, 0};
-    if (budget < bookmark_bytes + bytes_per_col) return plan;
+    if (bytes_per_col == 0 || budget < bookmark_bytes ||
+        budget - bookmark_bytes < bytes_per_col) {
+        return plan;
+    }
 
     const size_t max_tile_cols = (budget - bookmark_bytes) / bytes_per_col;
     plan.tile_size = (int)std::min<size_t>(max_tile_cols, (size_t)n_cols);
-    plan.n_tiles = (n_cols + plan.tile_size - 1) / plan.tile_size;
+    if (plan.tile_size <= 0) return plan;
+    plan.n_tiles =
+        (int)(((long long)n_cols + plan.tile_size - 1) / plan.tile_size);
     const long long nnz_per_slice = nnz / ((long long)n_rows * plan.n_tiles);
     if (plan.n_tiles > 1 && nnz_per_slice < SWEEP_MIN_NNZ_PER_SLICE)
         return plan;
@@ -186,18 +191,20 @@ __device__ inline BlockRows block_rows(const BlockRows* __restrict__ per_block,
 /// next tile. Sets `out_of_order` when a column below `tile_begin` shows up:
 /// that column was skipped by an earlier tile, so the row is not sorted.
 template <typename IdxT, typename Op>
-__device__ inline int warp_sweep_slice(const IdxT* __restrict__ indices,
-                                       IdxT row_begin, IdxT row_end,
-                                       int bookmark, IdxT tile_begin,
-                                       IdxT tile_end, const Op& op, char* pad,
-                                       bool& out_of_order) {
+__device__ inline long long warp_sweep_slice(const IdxT* __restrict__ indices,
+                                             IdxT row_begin, IdxT row_end,
+                                             long long bookmark,
+                                             long long tile_begin,
+                                             long long tile_end, const Op& op,
+                                             char* pad, bool& out_of_order) {
     const int lane = threadIdx.x & (WARP - 1);
     IdxT pos = row_begin + bookmark;
     while (pos < row_end) {
         const IdxT nnz_pos = pos + lane;
         // Lanes past the row read a sentinel that ends the slice exactly like a
         // column past the tile would.
-        const IdxT col = (nnz_pos < row_end) ? indices[nnz_pos] : tile_end;
+        const long long col =
+            (nnz_pos < row_end) ? (long long)indices[nnz_pos] : tile_end;
         const bool in_tile = col < tile_end;
         if (in_tile) {
             if (col < tile_begin) {
@@ -210,22 +217,22 @@ __device__ inline int warp_sweep_slice(const IdxT* __restrict__ indices,
         const unsigned past_tile = __ballot_sync(0xffffffffu, !in_tile);
         if (past_tile) {
             // The slice ends at the first lane whose column is past the tile.
-            return static_cast<int>(pos + (__ffs(past_tile) - 1) - row_begin);
+            return (long long)(pos + (__ffs(past_tile) - 1) - row_begin);
         }
         pos += WARP;
     }
-    return static_cast<int>(row_end - row_begin);
+    return (long long)(row_end - row_begin);
 }
 
 /// Order-agnostic alternative: read the whole row, keep what falls in the tile.
 template <typename IdxT, typename Op>
 __device__ inline void warp_rescan_row(const IdxT* __restrict__ indices,
                                        IdxT row_begin, IdxT row_end,
-                                       IdxT tile_begin, IdxT tile_end,
+                                       long long tile_begin, long long tile_end,
                                        const Op& op, char* pad) {
     const int lane = threadIdx.x & (WARP - 1);
     for (IdxT nnz_pos = row_begin + lane; nnz_pos < row_end; nnz_pos += WARP) {
-        const IdxT col = indices[nnz_pos];
+        const long long col = (long long)indices[nnz_pos];
         if (col >= tile_begin && col < tile_end) {
             op.add(pad, (long long)nnz_pos, static_cast<int>(col - tile_begin));
         }
@@ -254,15 +261,15 @@ template <typename IdxT, typename Op>
 __device__ inline void sweep_tile(const IdxT* __restrict__ indptr,
                                   const IdxT* __restrict__ indices,
                                   const int* __restrict__ row_order,
-                                  int* bookmarks, BlockRows rows,
+                                  long long* bookmarks, BlockRows rows,
                                   int tile_begin, int tile_size, bool rescan,
                                   int* __restrict__ out_of_order_flag,
                                   const Op& op, char* pad) {
     const int lane = threadIdx.x & (WARP - 1);
     const int warp = threadIdx.x / WARP;
     const int warps_per_block = blockDim.x / WARP;
-    const IdxT tile_lo = static_cast<IdxT>(tile_begin);
-    const IdxT tile_hi = tile_lo + tile_size;
+    const long long tile_lo = tile_begin;
+    const long long tile_hi = tile_lo + tile_size;  // 64-bit: cannot overflow
     bool out_of_order = false;
 
     for (int i = rows.first + warp; i < rows.last; i += warps_per_block) {
@@ -275,7 +282,7 @@ __device__ inline void sweep_tile(const IdxT* __restrict__ indptr,
                             pad);
             continue;
         }
-        const int bookmark = warp_sweep_slice(
+        const long long bookmark = warp_sweep_slice(
             indices, row_begin, row_end, bookmarks[i - rows.first], tile_lo,
             tile_hi, op, pad, out_of_order);
         if (lane == 0) bookmarks[i - rows.first] = bookmark;
@@ -296,7 +303,7 @@ __global__ void __launch_bounds__(SWEEP_BLOCK_THREADS, SWEEP_BLOCKS_PER_SM)
                       bool rescan) {
     extern __shared__ __align__(16) char smem[];
     char* pad = smem;  // the Op's accumulators for the current tile
-    int* bookmarks = reinterpret_cast<int*>(
+    long long* bookmarks = reinterpret_cast<long long*>(
         smem + pad_bytes(op.tile_size, Op::bytes_per_col));
 
     const BlockRows rows = block_rows(per_block_rows, rows_per_block, n_rows);
@@ -466,7 +473,19 @@ bool minor_reduce(const IdxT* indptr, const IdxT* indices, Op op, int n_rows,
 
     // Which rows each block owns: contiguous chunks, or per-group chunks of the
     // sorted row order when grouped.
-    RmmScratchPool pool;  // flag + block table; released after the launches
+    // Scratch is stream-ordered device memory: neither the pool nor the
+    // caller's grouped row order may be released before every launch issued
+    // here has finished, so this guard drains the stream before the pool
+    // destructs (declared after the pool, hence destroyed before it).
+    RmmScratchPool pool;
+    bool needs_sync = groups != nullptr;
+    struct SyncOnExit {
+        cudaStream_t stream;
+        const bool* armed;
+        ~SyncOnExit() {
+            if (*armed) cudaStreamSynchronize(stream);
+        }
+    } sync_on_exit{stream, &needs_sync};
     const int* row_order = groups != nullptr ? groups->row_order : nullptr;
     const BlockRows* per_block_rows = nullptr;
     unsigned n_blocks =
@@ -525,6 +544,7 @@ bool minor_reduce(const IdxT* indptr, const IdxT* indices, Op op, int n_rows,
     }
     // 3. The bookmark sweep, with out-of-order detection.
     int* flag = pool.alloc<int>(1);
+    needs_sync = true;
     cuda_check(cudaMemsetAsync(flag, 0, sizeof(int), stream),
                "cudaMemsetAsync(out-of-order flag)");
     launch_tiled(false, flag);
