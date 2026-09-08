@@ -39,7 +39,7 @@ class PCA_sparse:
         if self.zero_center:
             covariance, self.mean_ = _cov_sparse(x)
         else:
-            # For truncated SVD (uncentered), operate on the Gram matrix (1/n * X^T X)
+            # For truncated SVD (uncentered), operate on the Gram matrix (X^T X)
             # We don't subtract the mean in this path
             covariance = _cov_sparse(x, return_gram=True)
             self.mean_ = None
@@ -63,6 +63,9 @@ class PCA_sparse:
         )
 
         self.explained_variance_ = self.explained_variance_[: self.n_components_]
+        if not self.zero_center:
+            # Gram eigenvalues are S**2; report S**2 / (n - 1) like PCA_sparse_svd
+            self.explained_variance_ = self.explained_variance_ / (x.shape[0] - 1)
 
         self.explained_variance_ratio_ = self.explained_variance_ratio_[
             : self.n_components_

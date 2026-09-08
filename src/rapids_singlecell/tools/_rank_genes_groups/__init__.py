@@ -294,6 +294,7 @@ def rank_genes_groups(
                 msg = f"mask_var has wrong shape: {mask_var_array.shape[0]} != {adata.n_vars}"
                 raise ValueError(msg)
 
+    adata.strings_to_categoricals()
     test_obj = _RankGenes(
         adata,
         groups,

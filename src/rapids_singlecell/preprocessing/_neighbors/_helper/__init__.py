@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -11,6 +12,8 @@ from packaging.version import parse as parse_version
 from scipy import sparse as sc_sparse
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from rapids_singlecell.preprocessing._neighbors import _Algorithms, _Metrics
 
 
@@ -27,6 +30,7 @@ def _cuvs_switch():
 def _check_neighbors_X(
     X: cp_sparse.spmatrix | sc_sparse.spmatrix | np.ndarray | cp.ndarray,
     algorithm: _Algorithms,
+    algorithm_kwds: Mapping = MappingProxyType({}),
 ) -> cp_sparse.spmatrix | cp.ndarray | np.ndarray:
     """Check and convert input X to the expected format based on algorithm.
 
@@ -41,13 +45,19 @@ def _check_neighbors_X(
     X_contiguous (cupy.ndarray or sparse.csr_matrix): Contiguous array or CSR matrix.
 
     """
+    from rapids_singlecell.preprocessing._neighbors._algorithms._all_neighbors import (
+        _all_neighbors_batching,
+    )
+
     if cp_sparse.issparse(X) or sc_sparse.issparse(X):
         if algorithm != "brute":
             raise ValueError(
                 f"Sparse input is not supported for {algorithm} algorithm. Use 'brute' instead."
             )
         X_contiguous = X.tocsr()
-    elif algorithm in ["all_neighbors", "mg_ivfflat", "mg_ivfpq"]:
+    elif algorithm in ["mg_ivfflat", "mg_ivfpq"] or (
+        algorithm == "all_neighbors" and _all_neighbors_batching(algorithm_kwds)[0] > 1
+    ):
         if isinstance(X, np.ndarray):
             X_contiguous = np.asarray(X, order="C", dtype=np.float32)
         elif isinstance(X, cp.ndarray):
@@ -101,9 +111,10 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
                 "nn_descent only supports 'euclidean', 'sqeuclidean', 'inner_product' and 'cosine' metrics."
             )
     elif algorithm == "all_neighbors":
-        if metric not in ["euclidean", "sqeuclidean"]:
+        if metric not in ["euclidean", "sqeuclidean", "cosine", "inner_product"]:
             raise ValueError(
-                "all_neighbors only supports 'euclidean' and 'sqeuclidean' metrics."
+                "all_neighbors only supports 'euclidean', 'sqeuclidean', "
+                "'inner_product' and 'cosine' metrics."
             )
     else:
         raise NotImplementedError(f"The {algorithm} algorithm is not implemented yet.")

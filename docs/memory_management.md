@@ -52,6 +52,7 @@ cp.cuda.set_allocator(rmm_cupy_allocator)
 import rmm
 import cupy as cp
 from rmm.allocators.cupy import rmm_cupy_allocator
+
 rmm.reinitialize(
     managed_memory=False,
     pool_allocator=True,

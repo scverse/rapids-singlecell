@@ -923,10 +923,13 @@ class TestSVDSolvers:
         U1, s1, Vt1 = svd_func(X_gpu, k=k, rng=0)
         U2, s2, Vt2 = svd_func(X_gpu, k=k, rng=0)
 
-        # Results should be identical (atol for GPU floating-point rounding variations)
-        np.testing.assert_allclose(U1.get(), U2.get(), rtol=1e-10, atol=1e-14)
-        np.testing.assert_allclose(s1.get(), s2.get(), rtol=1e-10, atol=1e-14)
-        np.testing.assert_allclose(Vt1.get(), Vt2.get(), rtol=1e-10, atol=1e-14)
+        # Results should be identical up to cuSPARSE noise: A.T @ u SpMV uses
+        # atomics with no bitwise-determinism guarantee, and Lanczos restarts
+        # amplify the ULP differences to ~1e-9 rel / ~5e-14 abs (measured on
+        # T4 and Blackwell), so tolerances sit 10-20x above that noise floor.
+        np.testing.assert_allclose(U1.get(), U2.get(), rtol=1e-8, atol=1e-12)
+        np.testing.assert_allclose(s1.get(), s2.get(), rtol=1e-8, atol=1e-12)
+        np.testing.assert_allclose(Vt1.get(), Vt2.get(), rtol=1e-8, atol=1e-12)
 
     def test_mean_centered_operator(self):
         """Test that the mean-centered operator works correctly."""

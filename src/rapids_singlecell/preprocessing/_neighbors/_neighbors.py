@@ -138,9 +138,13 @@ def _get_connectivities_umap(
     n_obs: int,
     n_neighbors: int,
     rng: np.random.Generator,
-    metric: str,
 ) -> cp_sparse.coo_matrix:
-    """UMAP fuzzy simplicial set connectivities."""
+    """UMAP fuzzy simplicial set connectivities.
+
+    The graph is built from the precomputed ``knn_indices``/``knn_dist``, so the
+    metric is never recomputed here. Forwarding it would only make cuML reject
+    the metrics it does not know itself, such as ``inner_product``.
+    """
     set_op_mix_ratio = 1.0
     local_connectivity = 1.0
 
@@ -151,7 +155,6 @@ def _get_connectivities_umap(
         n_neighbors,
         # cuML seeds its fuzzy simplicial set, so draw the seed right here
         _seed_from_rng(rng),
-        metric=metric,
         knn_indices=knn_indices,
         knn_dists=knn_dist,
         set_op_mix_ratio=set_op_mix_ratio,
@@ -268,7 +271,6 @@ def _calc_connectivities(
     n_obs: int,
     n_neighbors: int,
     rng: np.random.Generator,
-    metric: str,
     method: Literal["umap", "gauss", "jaccard"] = "umap",
 ) -> cp_sparse.spmatrix:
     """Compute connectivities from KNN arrays.
@@ -285,8 +287,6 @@ def _calc_connectivities(
         Number of nearest neighbors.
     rng
         Random generator (a seed is drawn for the UMAP fuzzy simplicial set).
-    metric
-        Distance metric name.
     method
         Method for computing connectivities.
 
@@ -312,5 +312,4 @@ def _calc_connectivities(
         n_obs=n_obs,
         n_neighbors=n_neighbors,
         rng=rng,
-        metric=metric,
     )

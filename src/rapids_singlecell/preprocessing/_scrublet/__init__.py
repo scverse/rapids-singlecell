@@ -410,7 +410,7 @@ def _scrublet_call_doublets(
 
     scrub._counts_obs_norm = sparse.csc_matrix(adata_obs.X)
     scrub._counts_sim_norm = sparse.csc_matrix(adata_sim.X)
-    del adata_obs.X, adata_sim.X
+    del adata_obs.X
     scrub.doublet_parents_ = adata_sim.obsm["doublet_parents"]
 
     # Call scrublet-specific preprocessing where specified

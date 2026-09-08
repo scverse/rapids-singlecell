@@ -155,6 +155,7 @@ The `add_nb_cuda_module` helper automatically handles:
   ```python
   from rapids_singlecell._cuda import _my_module_cuda as _my
 
+
   def my_function(adata):
       # _my is either the real module or None
       _my.kernel(...)

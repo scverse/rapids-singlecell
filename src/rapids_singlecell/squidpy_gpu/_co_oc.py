@@ -10,6 +10,7 @@ from rapids_singlecell._compat import SpatialData
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copy_to_device,
     _create_category_index_mapping,
     _split_pairs,
     parse_device_ids,
@@ -48,7 +49,7 @@ def co_occurrence(
         GPU selection:
         - None: Use all GPUs if available (default)
         - True: Use all available GPUs
-        - False: Use only GPU 0
+        - False: Use only the current GPU
         - list[int]: Use specific GPU IDs (e.g., [0, 2])
         - str: Comma-separated GPU IDs (e.g., "0,2")
     copy
@@ -325,14 +326,14 @@ def _co_occurrence_gpu(
                     dev_cat_offsets = cat_offsets
                     dev_cell_indices = cell_indices
                 else:
-                    dev_spatial = cp.asarray(spatial)
-                    dev_thresholds = cp.asarray(thresholds)
-                    dev_cat_offsets = cp.asarray(cat_offsets)
-                    dev_cell_indices = cp.asarray(cell_indices)
+                    dev_spatial = _copy_to_device(spatial, device_id)
+                    dev_thresholds = _copy_to_device(thresholds, device_id)
+                    dev_cat_offsets = _copy_to_device(cat_offsets, device_id)
+                    dev_cell_indices = _copy_to_device(cell_indices, device_id)
 
                 # Copy pair indices to this device
-                dev_pair_left = cp.asarray(chunk_left)
-                dev_pair_right = cp.asarray(chunk_right)
+                dev_pair_left = _copy_to_device(chunk_left, device_id)
+                dev_pair_right = _copy_to_device(chunk_right, device_id)
 
                 # Initialize local counts array
                 dev_counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
@@ -390,12 +391,11 @@ def _co_occurrence_gpu(
             with cp.cuda.Device(data["device_id"]):
                 streams[data["device_id"]].synchronize()
 
-    # Phase 4: Aggregate counts on first device
-    with cp.cuda.Device(device_ids[0]):
+    # Phase 4: Aggregate counts on the input device
+    with cp.cuda.Device(source_device_id):
         counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
         for data in device_data:
             if data is not None:
-                dev0_counts = cp.asarray(data["counts"])
-                counts += dev0_counts
+                counts += _copy_to_device(data["counts"], source_device_id)
 
     return counts, True

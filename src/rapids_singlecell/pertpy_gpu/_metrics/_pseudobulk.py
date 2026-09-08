@@ -136,7 +136,12 @@ class PseudobulkMetric(BaseMetric):
             mask = adata.obs[groupby].isin(groups).to_numpy()
 
         means, obs = self._aggregate_means(adata, groupby, mask=mask)
-        return means, list(obs[groupby])
+        group_names = list(obs[groupby])
+        if groups is not None:
+            missing = sorted(set(groups) - set(group_names))
+            if missing:
+                raise ValueError(f"No cells found for groups: {missing}")
+        return means, group_names
 
     def _array_mean(self, X) -> cp.ndarray:
         X_gpu = _as_gpu_data(X)
@@ -212,10 +217,12 @@ class PseudobulkMetric(BaseMetric):
         if total_cells == 0:
             return cell_indices
 
-        random_floats = rng.random(total_cells, dtype=cp.float32)
+        random_ints = rng.integers(
+            0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64
+        )
         group_sizes_list = group_sizes_gpu.get().tolist()
         cell_group_sizes = cp.repeat(group_sizes_gpu, group_sizes_list)
-        bootstrap_local_idx = (random_floats * cell_group_sizes).astype(cp.int32)
+        bootstrap_local_idx = random_ints % cell_group_sizes
         cell_group_offsets = cp.repeat(cat_offsets[:-1], group_sizes_list)
         bootstrap_global_idx = bootstrap_local_idx + cell_group_offsets
         return cell_indices[bootstrap_global_idx]
