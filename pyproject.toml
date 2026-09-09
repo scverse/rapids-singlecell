@@ -58,6 +58,7 @@ doc = [
     "sphinxext-opengraph",
     "sphinxcontrib.bibtex",
     "scanpydoc[typehints,theme]>=0.9.4",
+    "scverse-misc[sphinx]>=0.1.3",
     "dask",
     "pytest",
 ]

@@ -13,6 +13,19 @@ import scanpy as sc
 The workflow of *rapids-singlecell* is broadly the same as *scanpy's*.
 For more information, see the tutorials and API documentation.
 
+### Settings
+
+Function defaults follow Scanpy 1. Set {attr}`rsc.settings.preset <rapids_singlecell.settings.preset>` to {attr}`~rapids_singlecell.Preset.ScanpyV2Preview` to opt into the Scanpy 2 preview defaults, either globally or temporarily:
+
+```python
+rsc.settings.preset = "scanpy-v2-preview"
+
+with rsc.settings.override(preset="scanpy-v2-preview"):
+    rsc.pp.pca(adata)  # writes to `adata.obsm["pca"]`
+```
+
+See {ref}`settings` for the full list of presets and what they change.
+
 ### AnnData setup
 
 {class}`~anndata.AnnData` supports GPU-enabled cupy arrays and sparse matrices.
