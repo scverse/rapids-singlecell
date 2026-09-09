@@ -114,6 +114,8 @@ def neighbors(
         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
     metric
         A known metric's name or a callable that returns a distance.
+        For ``inner_product``, ``distances`` stores raw similarities; UMAP and
+        Gaussian weighting use positive score gaps, with self at distance zero.
     metric_kwds
         Options for the metric.
     method
@@ -243,6 +245,7 @@ def neighbors(
         n_neighbors=n_neighbors,
         rng=rng,
         method=method,
+        metric=metric,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
         connectivities = connectivities.get().tocsr()
@@ -332,6 +335,8 @@ def bbknn(
         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
     metric
         A known metric's name or a callable that returns a distance.
+        For ``inner_product``, ``distances`` stores raw similarities; graph
+        weighting uses positive score gaps, with self at distance zero.
     metric_kwds
         Options for the metric.
     algorithm_kwds
@@ -438,7 +443,8 @@ def bbknn(
     # Sort each row so neighbors are ordered closest-first across all batches.
     # fuzzy_simplicial_set uses the first non-zero distance per row as the
     # local-connectivity rho; unsorted input collapses sigma and weights.
-    order = cp.argsort(knn_dist, axis=1)
+    # ``inner_product`` stores similarities, so larger is closer.
+    order = cp.argsort(-knn_dist if metric == "inner_product" else knn_dist, axis=1)
     row_idx = cp.arange(n_obs)[:, None]
     knn_dist = knn_dist[row_idx, order]
     knn_indices = knn_indices[row_idx, order]
@@ -466,6 +472,10 @@ def bbknn(
         n_obs=n_obs,
         n_neighbors=total_neighbors,
         rng=rng,
+        metric=metric,
+        batch_codes=cp.asarray(np.searchsorted(unique_batches, batch_array))
+        if metric == "inner_product"
+        else None,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
         connectivities = connectivities.get().tocsr()
