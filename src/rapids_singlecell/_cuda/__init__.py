@@ -72,7 +72,21 @@ _preload_rapids_runtime_libs()
 # CuPy-backed allocator injected here, so temporaries land on the caller's
 # current device resource (RMM pool / UVM aware) without linking librmm.
 _SCRATCH_MODULES = frozenset(
-    {"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"}
+    {
+        "_wilcoxon_cuda",
+        "_wilcoxon_sparse_cuda",
+        "_rank_stream_cuda",
+        # minor-axis tile sweep (minor_tiles.cuh): flag, grouping, block ranges
+        "_mean_var_cuda",
+        "_nanmean_cuda",
+        "_qc_cuda",
+        "_qc_dask_cuda",
+        "_hvg_cuda",
+        "_pr_cuda",
+        "_spca_cuda",
+        "_aggr_cuda",
+        "_ligrec_cuda",
+    }
 )
 _scratch_allocator = None
 

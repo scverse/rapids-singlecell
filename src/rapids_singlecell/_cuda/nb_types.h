@@ -83,6 +83,43 @@ inline unsigned int strided_grid_y(long long nwork, int block_size) {
     return (unsigned int)(capped < 1 ? 1 : capped);
 }
 
+/// Per-device shared-memory limits and SM count, cached like `max_grid_dims()`.
+/// Kernels size dynamic smem from these instead of assuming the 48 KB default.
+struct DeviceSmemLimits {
+    size_t per_block_optin;     // cudaDevAttrMaxSharedMemoryPerBlockOptin
+    size_t per_sm;              // cudaDevAttrMaxSharedMemoryPerMultiprocessor
+    size_t reserved_per_block;  // cudaDevAttrReservedSharedMemoryPerBlock
+    int n_sms;
+};
+
+inline const DeviceSmemLimits& device_smem_limits() {
+    // Safe fallback: the universal 48 KB default and one block's reservation.
+    constexpr DeviceSmemLimits kFallback{48 * 1024, 48 * 1024, 1024, 1};
+    static thread_local int cached_dev = -1;
+    static thread_local DeviceSmemLimits cached = kFallback;
+    int device = 0;
+    cudaGetDevice(&device);
+    if (device != cached_dev) {
+        cached = kFallback;
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                   device) == cudaSuccess)
+            cached.per_block_optin = (size_t)v;
+        if (cudaDeviceGetAttribute(&v,
+                                   cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                                   device) == cudaSuccess)
+            cached.per_sm = (size_t)v;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrReservedSharedMemoryPerBlock,
+                                   device) == cudaSuccess)
+            cached.reserved_per_block = (size_t)v;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount,
+                                   device) == cudaSuccess)
+            cached.n_sms = v;
+        cached_dev = device;
+    }
+    return cached;
+}
+
 // GPU array aliases for nanobind bindings, parameterized on device type.
 // CUDA and managed-memory variants both preserve CPU/GPU type safety.
 

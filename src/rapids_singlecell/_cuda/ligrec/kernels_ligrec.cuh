@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "../minor_tiles.cuh"
 
 template <typename T>
 __global__ void sum_and_count_dense_kernel(const T* __restrict__ data,
@@ -27,30 +28,6 @@ __global__ void sum_and_count_dense_kernel(const T* __restrict__ data,
     }
 }
 
-template <typename T, typename IdxT>
-__global__ void sum_and_count_sparse_kernel(const IdxT* __restrict__ indptr,
-                                            const IdxT* __restrict__ index,
-                                            const T* __restrict__ data,
-                                            const int* __restrict__ clusters,
-                                            T* __restrict__ sum_gt0,
-                                            int* __restrict__ count_gt0,
-                                            int nrows, int n_cls) {
-    int cell = blockDim.x * blockIdx.x + threadIdx.x;
-    if (cell >= nrows) return;
-    IdxT start_idx = indptr[cell];
-    IdxT stop_idx = indptr[cell + 1];
-    int cluster = clusters[cell];
-    for (IdxT gene = start_idx; gene < stop_idx; gene++) {
-        T value = data[gene];
-        IdxT gene_number = index[gene];
-        if (value > (T)0) {
-            long long out_idx = (long long)gene_number * n_cls + cluster;
-            atomicAdd(&sum_gt0[out_idx], value);
-            atomicAdd(&count_gt0[out_idx], 1);
-        }
-    }
-}
-
 template <typename T>
 __global__ void mean_dense_kernel(const T* __restrict__ data,
                                   const int* __restrict__ clusters,
@@ -66,28 +43,6 @@ __global__ void mean_dense_kernel(const T* __restrict__ data,
              j < num_cols; j += col_stride) {
             const size_t out_idx = j * n_cls + static_cast<size_t>(cluster);
             atomicAdd(&g_cluster[out_idx], data[i * num_cols + j]);
-        }
-    }
-}
-
-template <typename T, typename IdxT>
-__global__ void mean_sparse_kernel(const IdxT* __restrict__ indptr,
-                                   const IdxT* __restrict__ index,
-                                   const T* __restrict__ data,
-                                   const int* __restrict__ clusters,
-                                   T* __restrict__ sum_gt0, int nrows,
-                                   int n_cls) {
-    int cell = blockDim.x * blockIdx.x + threadIdx.x;
-    if (cell >= nrows) return;
-    IdxT start_idx = indptr[cell];
-    IdxT stop_idx = indptr[cell + 1];
-    int cluster = clusters[cell];
-    for (IdxT gene = start_idx; gene < stop_idx; gene++) {
-        T value = data[gene];
-        IdxT gene_number = index[gene];
-        if (value > (T)0) {
-            long long out_idx = (long long)gene_number * n_cls + cluster;
-            atomicAdd(&sum_gt0[out_idx], value);
         }
     }
 }
@@ -180,3 +135,67 @@ __global__ void res_mean_kernel(const int* __restrict__ interactions,
         }
     }
 }
+
+/// Per (gene, cluster) sum and optionally count of positive values via the
+/// grouped tile sweep (see minor_tiles.cuh); output is gene-major with the
+/// cluster fastest. Layout: double sums, then int counts.
+template <typename T, bool WITH_COUNT>
+struct LigrecOp {
+    const T* data;
+    T* sum;
+    int* count;  // unused when !WITH_COUNT
+    int n_cls;
+    int tile_size;
+    static constexpr size_t bytes_per_col =
+        sizeof(double) + (WITH_COUNT ? sizeof(int) : 0);
+    static constexpr bool needs_rows = true;
+    __device__ double* s_sum(char* acc) const {
+        return reinterpret_cast<double*>(acc);
+    }
+    __device__ int* s_cnt(char* acc) const {
+        return reinterpret_cast<int*>(acc + (size_t)tile_size * sizeof(double));
+    }
+    __device__ bool row_active(int) const {
+        return true;
+    }
+    __device__ void zero_col(char* acc, int g, int) const {
+        s_sum(acc)[g] = 0.0;
+        if constexpr (WITH_COUNT) s_cnt(acc)[g] = 0;
+    }
+    __device__ void add(char* acc, long long q, int g) const {
+        const T v = data[q];
+        if (v > (T)0) {
+            atomicAdd(&s_sum(acc)[g], static_cast<double>(v));
+            if constexpr (WITH_COUNT) atomicAdd(&s_cnt(acc)[g], 1);
+        }
+    }
+    __device__ void flush_col(const char* acc, int group, int col,
+                              int g) const {
+        char* a = const_cast<char*>(acc);
+        const double s = s_sum(a)[g];
+        const long long idx = (long long)col * n_cls + group;
+        if (s != 0.0) atomicAdd(&sum[idx], static_cast<T>(s));
+        if constexpr (WITH_COUNT) {
+            const int c = s_cnt(a)[g];
+            if (c != 0) atomicAdd(&count[idx], c);
+        }
+    }
+    __device__ void add_global(long long q, int col, int group) const {
+        const T v = data[q];
+        if (v > (T)0) {
+            const long long idx = (long long)col * n_cls + group;
+            atomicAdd(&sum[idx], v);
+            if constexpr (WITH_COUNT) atomicAdd(&count[idx], 1);
+        }
+    }
+    void zero_outputs(int minor, int n_groups, cudaStream_t stream) const {
+        cuda_check(cudaMemsetAsync(sum, 0, (size_t)minor * n_groups * sizeof(T),
+                                   stream),
+                   "cudaMemsetAsync(LigrecOp outputs)");
+        if constexpr (WITH_COUNT)
+            cuda_check(
+                cudaMemsetAsync(count, 0,
+                                (size_t)minor * n_groups * sizeof(int), stream),
+                "cudaMemsetAsync(LigrecOp outputs)");
+    }
+};

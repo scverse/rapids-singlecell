@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "../minor_tiles.cuh"
 
 // Compile-time selector for which raw accumulators a kernel writes. Combined as
 // a bitmask so each kernel instantiation emits only the atomicAdds (and only
@@ -11,6 +12,82 @@ constexpr int AGGR_COUNT = 2;  // count of nonzero entries
 constexpr int AGGR_SQSUM = 4;  // sum of squared values
 
 // sparse -> dense aggregate (CSR by cells), mask per cell, cats per cell
+
+// Grouped CSR aggregate: per (group, gene) sum / count / sum of squares via the
+// tile sweep (see minor_tiles.cuh); rows are pre-sorted by group so a block
+// accumulates for one group. Layout: one double plane per requested MASK bit.
+template <typename T, int MASK>
+struct AggrOp {
+    const T* data;
+    double* out_sum;
+    double* out_count;
+    double* out_sqsum;
+    size_t n_genes;
+    int tile_size;
+    static constexpr int n_planes = ((MASK & AGGR_SUM) ? 1 : 0) +
+                                    ((MASK & AGGR_COUNT) ? 1 : 0) +
+                                    ((MASK & AGGR_SQSUM) ? 1 : 0);
+    static constexpr int i_sum = 0;
+    static constexpr int i_count = (MASK & AGGR_SUM) ? 1 : 0;
+    static constexpr int i_sqsum = i_count + ((MASK & AGGR_COUNT) ? 1 : 0);
+    static constexpr size_t bytes_per_col = n_planes * sizeof(double);
+    static constexpr bool needs_rows = true;
+    __device__ double* plane(char* acc, int i) const {
+        return reinterpret_cast<double*>(acc) + (size_t)i * tile_size;
+    }
+    __device__ bool row_active(int) const {
+        return true;
+    }
+    __device__ void zero_col(char* acc, int g, int) const {
+        for (int i = 0; i < n_planes; ++i) plane(acc, i)[g] = 0.0;
+    }
+    __device__ void add(char* acc, long long q, int g) const {
+        const double v = static_cast<double>(data[q]);
+        if constexpr (MASK & AGGR_SUM) atomicAdd(&plane(acc, i_sum)[g], v);
+        if constexpr (MASK & AGGR_COUNT)
+            atomicAdd(&plane(acc, i_count)[g], 1.0);
+        if constexpr (MASK & AGGR_SQSUM)
+            atomicAdd(&plane(acc, i_sqsum)[g], v * v);
+    }
+    __device__ void flush_col(const char* acc, int group, int col,
+                              int g) const {
+        char* a = const_cast<char*>(acc);
+        bool any = false;
+        for (int i = 0; i < n_planes; ++i) any |= plane(a, i)[g] != 0.0;
+        if (!any) return;
+        const size_t idx = (size_t)group * n_genes + (size_t)col;
+        if constexpr (MASK & AGGR_SUM)
+            atomicAdd(&out_sum[idx], plane(a, i_sum)[g]);
+        if constexpr (MASK & AGGR_COUNT)
+            atomicAdd(&out_count[idx], plane(a, i_count)[g]);
+        if constexpr (MASK & AGGR_SQSUM)
+            atomicAdd(&out_sqsum[idx], plane(a, i_sqsum)[g]);
+    }
+    __device__ void add_global(long long q, int col, int group) const {
+        const size_t idx = (size_t)group * n_genes + (size_t)col;
+        const double v = static_cast<double>(data[q]);
+        if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
+        if constexpr (MASK & AGGR_COUNT) atomicAdd(&out_count[idx], 1.0);
+        if constexpr (MASK & AGGR_SQSUM) atomicAdd(&out_sqsum[idx], v * v);
+    }
+    void zero_outputs(int minor, int n_groups, cudaStream_t stream) const {
+        const size_t bytes = (size_t)minor * n_groups * sizeof(double);
+        if constexpr (MASK & AGGR_SUM)
+            cuda_check(cudaMemsetAsync(out_sum, 0, bytes, stream),
+                       "cudaMemsetAsync(AggrOp outputs)");
+        if constexpr (MASK & AGGR_COUNT)
+            cuda_check(cudaMemsetAsync(out_count, 0, bytes, stream),
+                       "cudaMemsetAsync(AggrOp outputs)");
+        if constexpr (MASK & AGGR_SQSUM)
+            cuda_check(cudaMemsetAsync(out_sqsum, 0, bytes, stream),
+                       "cudaMemsetAsync(AggrOp outputs)");
+    }
+};
+
+// sparse -> dense aggregate (CSR by cells), mask per cell, cats per cell.
+// Kept for the host-streaming path (rank_stream.cu): it stages row blocks and
+// overlaps copies with compute, so the per-block sync of the tile sweep would
+// cost it more than the atomics do.
 template <typename T, typename IdxT, int MASK>
 __global__ void csr_aggr_kernel(
     const IdxT* __restrict__ indptr, const IdxT* __restrict__ index,

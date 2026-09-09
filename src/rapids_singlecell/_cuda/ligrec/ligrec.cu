@@ -5,7 +5,6 @@
 
 using namespace nb::literals;
 
-constexpr int SPARSE_BLOCK_SIZE = 32;
 constexpr int DENSE_BLOCK_DIM = 32;
 
 template <typename T>
@@ -21,17 +20,19 @@ static inline void launch_sum_count_dense(const T* data, const int* clusters,
     CUDA_CHECK_LAST_ERROR(sum_and_count_dense_kernel);
 }
 
+// Grouped tile sweep over cells sorted by cluster. Returns whether unsorted
+// rows were detected.
 template <typename T, typename IdxT>
-static inline void launch_sum_count_sparse(const IdxT* indptr,
-                                           const IdxT* index, const T* data,
-                                           const int* clusters, T* sum,
-                                           int* count, int rows, int ncls,
-                                           cudaStream_t stream) {
-    dim3 block(SPARSE_BLOCK_SIZE);
-    dim3 grid((rows + SPARSE_BLOCK_SIZE - 1) / SPARSE_BLOCK_SIZE);
-    sum_and_count_sparse_kernel<T, IdxT><<<grid, block, 0, stream>>>(
-        indptr, index, data, clusters, sum, count, rows, ncls);
-    CUDA_CHECK_LAST_ERROR(sum_and_count_sparse_kernel);
+static inline bool launch_sum_count_sparse(
+    const IdxT* indptr, const IdxT* index, const T* data, const int* clusters,
+    T* sum, int* count, int rows, int ncls, int n_genes, long long nnz,
+    bool assume_unsorted, cudaStream_t stream) {
+    RmmScratchPool pool;
+    const GroupedRows groups =
+        build_grouped_rows(pool, clusters, nullptr, rows, ncls, stream);
+    LigrecOp<T, true> op{data, sum, count, ncls, 0};
+    return minor_reduce<IdxT>(indptr, index, op, rows, n_genes, nnz,
+                              assume_unsorted, stream, &groups);
 }
 
 template <typename T>
@@ -47,14 +48,17 @@ static inline void launch_mean_dense(const T* data, const int* clusters, T* g,
 }
 
 template <typename T, typename IdxT>
-static inline void launch_mean_sparse(const IdxT* indptr, const IdxT* index,
+static inline bool launch_mean_sparse(const IdxT* indptr, const IdxT* index,
                                       const T* data, const int* clusters, T* g,
-                                      int rows, int ncls, cudaStream_t stream) {
-    dim3 block(SPARSE_BLOCK_SIZE);
-    dim3 grid((rows + SPARSE_BLOCK_SIZE - 1) / SPARSE_BLOCK_SIZE);
-    mean_sparse_kernel<T, IdxT><<<grid, block, 0, stream>>>(
-        indptr, index, data, clusters, g, rows, ncls);
-    CUDA_CHECK_LAST_ERROR(mean_sparse_kernel);
+                                      int rows, int ncls, int n_genes,
+                                      long long nnz, bool assume_unsorted,
+                                      cudaStream_t stream) {
+    RmmScratchPool pool;
+    const GroupedRows groups =
+        build_grouped_rows(pool, clusters, nullptr, rows, ncls, stream);
+    LigrecOp<T, false> op{data, g, nullptr, ncls, 0};
+    return minor_reduce<IdxT>(indptr, index, op, rows, n_genes, nnz,
+                              assume_unsorted, stream, &groups);
 }
 
 template <typename T>
@@ -128,13 +132,19 @@ void def_sum_count_sparse(nb::module_& m) {
            gpu_array_c<const T, Device> data,
            gpu_array_c<const int, Device> clusters, gpu_array_c<T, Device> sum,
            gpu_array_c<int, Device> count, int rows, int ncls,
-           std::uintptr_t stream) {
-            launch_sum_count_sparse<T, IdxT>(
+           bool assume_unsorted, std::uintptr_t stream) {
+            if (ncls <= 0 || rows <= 0) return false;  // nothing to reduce
+            // sum is (n_genes, ncls); derive n_genes from the element count so
+            // any 2-D shape with the same size works.
+            return launch_sum_count_sparse<T, IdxT>(
                 indptr.data(), index.data(), data.data(), clusters.data(),
-                sum.data(), count.data(), rows, ncls, (cudaStream_t)stream);
+                sum.data(), count.data(), rows, ncls, (int)(sum.size() / ncls),
+                (long long)data.shape(0), assume_unsorted,
+                (cudaStream_t)stream);
         },
         "indptr"_a, "index"_a, "data"_a, nb::kw_only(), "clusters"_a, "sum"_a,
-        "count"_a, "rows"_a, "ncls"_a, "stream"_a = 0);
+        "count"_a, "rows"_a, "ncls"_a, "assume_unsorted"_a = false,
+        "stream"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -159,13 +169,16 @@ void def_mean_sparse(nb::module_& m) {
            gpu_array_c<const IdxT, Device> index,
            gpu_array_c<const T, Device> data,
            gpu_array_c<const int, Device> clusters, gpu_array_c<T, Device> g,
-           int rows, int ncls, std::uintptr_t stream) {
-            launch_mean_sparse<T, IdxT>(indptr.data(), index.data(),
-                                        data.data(), clusters.data(), g.data(),
-                                        rows, ncls, (cudaStream_t)stream);
+           int rows, int ncls, bool assume_unsorted, std::uintptr_t stream) {
+            if (ncls <= 0 || rows <= 0) return false;  // nothing to reduce
+            return launch_mean_sparse<T, IdxT>(
+                indptr.data(), index.data(), data.data(), clusters.data(),
+                g.data(), rows, ncls, (int)(g.size() / ncls),
+                (long long)data.shape(0), assume_unsorted,
+                (cudaStream_t)stream);
         },
         "indptr"_a, "index"_a, "data"_a, nb::kw_only(), "clusters"_a, "g"_a,
-        "rows"_a, "ncls"_a, "stream"_a = 0);
+        "rows"_a, "ncls"_a, "assume_unsorted"_a = false, "stream"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -248,4 +261,5 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_ligrec_cuda, m) {
     REGISTER_GPU_BINDINGS(register_bindings, m);
+    register_scratch_allocator(m);
 }

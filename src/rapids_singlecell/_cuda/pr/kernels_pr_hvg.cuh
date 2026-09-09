@@ -2,29 +2,6 @@
 
 #include <cuda_runtime.h>
 
-// Compute column sums (sums_genes) and row sums (sums_cells) from CSC sparse
-// matrix One thread per column (gene), atomicAdd for row sums
-template <typename T, typename IdxT>
-__global__ void sparse_sum_csc_kernel(const IdxT* __restrict__ indptr,
-                                      const IdxT* __restrict__ index,
-                                      const T* __restrict__ data,
-                                      T* __restrict__ sums_genes,
-                                      T* __restrict__ sums_cells, int n_genes) {
-    int gene = blockDim.x * blockIdx.x + threadIdx.x;
-    if (gene >= n_genes) {
-        return;
-    }
-    IdxT start = indptr[gene];
-    IdxT stop = indptr[gene + 1];
-    T col_sum = (T)0;
-    for (IdxT i = start; i < stop; ++i) {
-        T val = data[i];
-        col_sum += val;
-        atomicAdd(&sums_cells[index[i]], val);
-    }
-    sums_genes[gene] = col_sum;
-}
-
 // Welford's single-pass algorithm for variance of clipped Pearson residuals
 // (CSC sparse)
 template <typename T, typename IdxT>

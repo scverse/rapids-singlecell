@@ -14,6 +14,8 @@ from cupyx.scipy import sparse
 from cupyx.scipy.sparse import issparse as cpissparse
 from scipy.sparse import csc_matrix, issparse
 
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
+
 from ._utils import _assert_categorical_obs, _create_sparse_df
 
 SOURCE = "source"
@@ -474,7 +476,9 @@ def ligrec(
     else:
         sum_gt0 = cp.zeros((data_cp.shape[1], n_clusters), dtype=cp.float32, order="C")
         count_gt0 = cp.zeros((data_cp.shape[1], n_clusters), dtype=cp.int32, order="C")
-        _lc.sum_count_sparse(
+        _minor_reduce(
+            data_cp,
+            _lc.sum_count_sparse,
             data_cp.indptr,
             data_cp.indices,
             data_cp.data,
@@ -505,7 +509,9 @@ def ligrec(
         for _i in range(n_perms):
             cp.random.shuffle(clustering_use)
             g = cp.zeros((data_cp.shape[1], n_cls), dtype=cp.float32, order="C")
-            _lc.mean_sparse(
+            _minor_reduce(
+                data_cp,
+                _lc.mean_sparse,
                 data_cp.indptr,
                 data_cp.indices,
                 data_cp.data,

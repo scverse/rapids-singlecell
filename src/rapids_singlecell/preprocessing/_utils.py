@@ -10,6 +10,7 @@ from natsort import natsorted
 from pandas.api.types import infer_dtype
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -83,19 +84,40 @@ def _mean_var_major(X, major, minor):
     return mean, var
 
 
-def _mean_var_minor(X, major, minor):
+def _mean_var_minor_sums(X, mean, var):
+    """
+    Accumulate the minor-axis sums and squared sums of a compressed matrix.
+
+    Parameters
+    ----------
+    X
+        CSR or CSC matrix
+    mean
+        Zero-initialised float64 output for the sums
+    var
+        Zero-initialised float64 output for the squared sums
+    """
     from rapids_singlecell._cuda import _mean_var_cuda as _mv
 
-    mean = cp.zeros(minor, dtype=cp.float64)
-    var = cp.zeros(minor, dtype=cp.float64)
-    _mv.mean_var_minor(
+    _minor_reduce(
+        X,
+        _mv.mean_var_minor_tiled,
+        X.indptr,
         X.indices,
         X.data,
         mean,
         var,
+        major=X.indptr.size - 1,
+        minor=mean.size,
         nnz=X.nnz,
         stream=cp.cuda.get_current_stream().ptr,
     )
+
+
+def _mean_var_minor(X, major, minor):
+    mean = cp.zeros(minor, dtype=cp.float64)
+    var = cp.zeros(minor, dtype=cp.float64)
+    _mean_var_minor_sums(X, mean, var)
     mean /= major
     var /= major
     var -= mean**2
@@ -108,19 +130,10 @@ def _mean_var_minor_dask(X, major, minor):
     Implements sum operation for dask array when the backend is cupy sparse csr matrix
     """
 
-    from rapids_singlecell._cuda import _mean_var_cuda as _mv
-
     def __mean_var(X_part):
         mean = cp.zeros(minor, dtype=cp.float64)
         var = cp.zeros(minor, dtype=cp.float64)
-        _mv.mean_var_minor(
-            X_part.indices,
-            X_part.data,
-            mean,
-            var,
-            nnz=X_part.nnz,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
+        _mean_var_minor_sums(X_part, mean, var)
         return cp.vstack([mean, var])[None, ...]  # new axis for summing
 
     n_blocks = X.blocks.size
