@@ -64,6 +64,7 @@ extensions = [
     "sphinx_copybutton",
     "nbsphinx",
     "scanpydoc",
+    "scverse_misc.sphinx_ext",
     "sphinx.ext.linkcode",
     "sphinx_tabs.tabs",
     "sphinxext.opengraph",
@@ -194,6 +195,10 @@ nitpick_ignore = [
     ("py:class", "anndata._core.raw.Raw"),
     ("py:class", "scanpy._utils.Empty"),
     ("py:class", "rapids_singlecell._settings.Default"),
+    *[
+        ("py:class", f"rapids_singlecell._settings.{cls}Preset")
+        for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes"]
+    ],
     ("py:data", "typing.Union"),
     ("py:class", "cuml.linear_model.LogisticRegression"),
     *[
