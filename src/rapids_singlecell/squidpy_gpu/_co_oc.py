@@ -6,7 +6,6 @@ import cupy as cp
 import numpy as np
 from cuml.metrics import pairwise_distances
 
-from rapids_singlecell._compat import SpatialData
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
@@ -16,10 +15,15 @@ from rapids_singlecell._utils import (
     parse_device_ids,
 )
 
-from ._utils import _assert_categorical_obs, _assert_spatial_basis
+from ._utils import (
+    _assert_categorical_obs,
+    _assert_spatial_basis,
+    _extract_adata_if_sdata,
+)
 
 if TYPE_CHECKING:
     from anndata import AnnData
+    from spatialdata import SpatialData
 
 
 def co_occurrence(
@@ -30,6 +34,7 @@ def co_occurrence(
     interval: int | np.ndarray | cp.ndarray = 50,
     multi_gpu: bool | list[int] | str | None = None,
     copy: bool = False,
+    table_key: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Compute co-occurrence probability of clusters.
@@ -37,7 +42,7 @@ def co_occurrence(
     Parameters
     ----------
     adata
-        Annotated data object.
+        Annotated data object or :class:`~spatialdata.SpatialData`.
     cluster_key
         Key for the cluster labels.
     spatial_key
@@ -54,6 +59,9 @@ def co_occurrence(
         - str: Comma-separated GPU IDs (e.g., "0,2")
     copy
         If ``True``, return the co-occurrence probability and the distance thresholds intervals.
+    table_key
+        Key in :attr:`spatialdata.SpatialData.tables` selecting the table to use.
+        Required if ``adata`` is a :class:`~spatialdata.SpatialData`.
 
     Returns
     -------
@@ -67,8 +75,7 @@ def co_occurrence(
           computed at ``interval``.
     """
 
-    if SpatialData is not None and isinstance(adata, SpatialData):
-        adata = adata.table
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
     spatial = cp.array(adata.obsm[spatial_key]).astype(np.float32)

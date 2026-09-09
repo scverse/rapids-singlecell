@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import product
 from typing import (
+    TYPE_CHECKING,
     Literal,
 )
 
@@ -14,9 +15,14 @@ from cupyx.scipy import sparse
 from cupyx.scipy.sparse import issparse as cpissparse
 from scipy.sparse import csc_matrix, issparse
 
-from rapids_singlecell._compat import SpatialData
+from ._utils import (
+    _assert_categorical_obs,
+    _create_sparse_df,
+    _extract_adata_if_sdata,
+)
 
-from ._utils import _assert_categorical_obs, _create_sparse_df
+if TYPE_CHECKING:
+    from spatialdata import SpatialData
 
 SOURCE = "source"
 TARGET = "target"
@@ -138,6 +144,7 @@ def ligrec(
     interactions_params: dict = {},
     transmitter_params: dict = {"categories": "ligand"},
     receiver_params: dict = {"categories": "receptor"},
+    table_key: str | None = None,
 ) -> pd.DataFrame | None:
     """\
     Perform the permutation test as described in [Efremova et al., 2020].
@@ -145,7 +152,7 @@ def ligrec(
     Parameters
     ----------
         adata
-            Annotated data object.
+            Annotated data object or :class:`~spatialdata.SpatialData`.
 
         cluster_key
             Key in :attr:`~anndata.AnnData.obs` where clustering is stored.
@@ -218,6 +225,10 @@ def ligrec(
             Keyword arguments for :func:`omnipath.interactions.import_intercell_network()` \
             defining the receiver side of intercellular connections.
 
+        table_key
+            Key in :attr:`spatialdata.SpatialData.tables` selecting the table to use. \
+            Required if ``adata`` is a :class:`~spatialdata.SpatialData`.
+
     Returns
     -------
     If `copy = True`, returns a dict with following keys:
@@ -235,8 +246,7 @@ def ligrec(
     interacting components was 0 or it didn't pass the threshold percentage of \
     cells being expressed within a given cluster.
     """
-    if SpatialData is not None and isinstance(adata, SpatialData):
-        adata = adata.table
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     # Get and Check interactions
     if interactions is None:
         interactions = _get_interactions(
@@ -420,7 +430,7 @@ def ligrec(
         mat = adata.raw[filter_obs, filter_var].X
     else:
         mat = adata[filter_obs, filter_var].X
-    cluster_obs = adata.obs.loc[filter_obs, cluster_key]
+    cluster_obs = filtered_data["clusters"][filter_obs]
 
     cluster_obs = cluster_obs.cat.remove_unused_categories()
     cat = cluster_obs.cat

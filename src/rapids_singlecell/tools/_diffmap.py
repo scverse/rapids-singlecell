@@ -161,7 +161,8 @@ def diffmap(
     sort: Literal["decrease", "increase"] = "decrease",
     density_normalize: bool = True,
     rng: SeedLike | RNGLike | None = None,
-) -> None:
+    copy: bool = False,
+) -> AnnData | None:
     """
     Diffusion Maps :cite:p:`Coifman2005,Haghverdi2015`.
 
@@ -190,6 +191,8 @@ def diffmap(
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
+    copy
+        Return an annotated copy instead of updating `adata`.
 
     Returns
     -------
@@ -202,6 +205,7 @@ def diffmap(
         Array of size (number of eigen vectors).
         Eigenvalues of transition matrix.
     """
+    adata = adata.copy() if copy else adata
     rng = np.random.default_rng(rng)
     connectivities = _load_connectivities(adata, neighbors_key)
     transitions_sym, _Z = _compute_transitions(
@@ -214,3 +218,4 @@ def diffmap(
     # the scanpy 1 key holds the bare evals, `key_added` holds a dict
     adata.uns[keys.uns] = evals.get() if key_added is None else {"evals": evals.get()}
     adata.obsm[keys.obsm] = evecs.get()
+    return adata if copy else None

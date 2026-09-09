@@ -55,6 +55,15 @@ def test_qc_metrics(dtype):
         assert np.allclose(cudata.obs[col], old_obs[col])
     for col in cudata.var:
         assert np.allclose(cudata.var[col], old_var[col])
+    # inplace=False returns the metrics and leaves adata untouched
+    plain = AnnData(X=cudata.X.copy(), var=cudata.var[["mito", "negative"]].copy())
+    obs_metrics, var_metrics = rsc.pp.calculate_qc_metrics(
+        plain, qc_vars=["mito", "negative"], inplace=False
+    )
+    assert list(plain.obs.columns) == []
+    assert list(plain.var.columns) == ["mito", "negative"]
+    pd.testing.assert_frame_equal(obs_metrics, cudata.obs[obs_metrics.columns])
+    pd.testing.assert_frame_equal(var_metrics, cudata.var[var_metrics.columns])
     # with log1p=False
     cudata = AnnData(
         X=sparse_gpu.csr_matrix(

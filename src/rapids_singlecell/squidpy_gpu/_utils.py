@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -11,6 +12,32 @@ import pandas as pd
 from pandas.api.types import infer_dtype
 from scipy import stats
 from scipy.sparse import issparse, spmatrix
+
+if TYPE_CHECKING:
+    from anndata import AnnData
+    from spatialdata import SpatialData
+
+
+def _extract_adata_if_sdata(
+    adata: AnnData | SpatialData, *, table_key: str | None = None
+) -> AnnData:
+    """\
+    Resolve a :class:`~spatialdata.SpatialData` to the table ``table_key``.
+
+    An :class:`~anndata.AnnData` is returned unchanged. ``spatialdata`` is only
+    looked up in :data:`sys.modules`, so it is never imported here.
+    """
+    spatialdata = sys.modules.get("spatialdata")
+    if spatialdata is None or not isinstance(adata, spatialdata.SpatialData):
+        return adata
+    if table_key is None:
+        raise TypeError("missing required keyword-only argument: 'table_key'")
+    if table_key not in adata.tables:
+        raise ValueError(
+            f"Table {table_key!r} not found in SpatialData. "
+            f"Available tables: {list(adata.tables)}"
+        )
+    return adata.tables[table_key]
 
 
 def _check_precision_issues(score: cp.ndarray, dtype: np.dtype) -> None:

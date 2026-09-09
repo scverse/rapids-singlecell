@@ -12,17 +12,17 @@ from cupyx.scipy import sparse as sparse_gpu
 from scipy import sparse
 from statsmodels.stats.multitest import multipletests
 
-from rapids_singlecell._compat import SpatialData
 from rapids_singlecell.preprocessing._utils import _sparse_to_dense
 
 from ._gearysc import _gearys_C_cupy
 from ._moransi import _morans_I_cupy
-from ._utils import _p_value_calc
+from ._utils import _extract_adata_if_sdata, _p_value_calc
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+    from spatialdata import SpatialData
 
 
 def _to_cupy(vals, *, use_sparse: bool, dtype):
@@ -65,6 +65,7 @@ def spatial_autocorr(
     dtype: np.dtype | None = None,
     multi_gpu: bool | list[int] | str | None = None,
     copy: bool = False,
+    table_key: str | None = None,
 ) -> pd.DataFrame | None:
     """
     Calculate spatial autocorrelation for genes in an AnnData object.
@@ -80,7 +81,7 @@ def spatial_autocorr(
     Parameters
     ----------
         adata
-            Annotated data matrix.
+            Annotated data matrix or :class:`~spatialdata.SpatialData`.
         connectivity_key
             Key of the connectivity matrix in `adata.obsp`, by default "spatial_connectivities".
         genes
@@ -113,14 +114,16 @@ def spatial_autocorr(
             - str: Comma-separated GPU IDs (e.g., "0,2")
         copy
             If True, return the results as a DataFrame instead of storing them in `adata.uns`, by default False.
+        table_key
+            Key in :attr:`spatialdata.SpatialData.tables` selecting the table to use.
+            Required if ``adata`` is a :class:`~spatialdata.SpatialData`.
 
     Returns
     -------
             DataFrame containing the autocorrelation scores, p-values, and corrected p-values for each gene. \
             If `copy` is False, the results are stored in `adata.uns` and None is returned.
     """
-    if SpatialData is not None and isinstance(adata, SpatialData):
-        adata = adata.table
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     if genes is None:
         if "highly_variable" in adata.var:
             genes = adata[:, adata.var["highly_variable"]].var_names.values

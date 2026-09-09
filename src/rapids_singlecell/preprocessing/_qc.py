@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import pandas as pd
 from cupyx.scipy import sparse
 
 from rapids_singlecell._compat import DaskArray
@@ -24,7 +25,8 @@ def calculate_qc_metrics(
     qc_vars: str | list = None,
     log1p: bool = True,
     layer: str = None,
-) -> None:
+    inplace: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """\
     Calculates basic qc Parameters :cite:p:`McCarthy2017`.
 
@@ -46,9 +48,13 @@ def calculate_qc_metrics(
             Set to `False` to skip computing `log1p` transformed annotations.
         layer
             If provided, use :attr:`~anndata.AnnData.layers` for expression values instead of :attr:`~anndata.AnnData.X`.
+        inplace
+            Whether to place the calculated metrics in :attr:`~anndata.AnnData.obs` and :attr:`~anndata.AnnData.var`.
+            If `False`, return them as two :class:`~pandas.DataFrame` instead, like :func:`scanpy.pp.calculate_qc_metrics`.
 
     Returns
     -------
+        If `inplace = False`, returns `(obs_metrics, var_metrics)`. Otherwise
         adds the following columns in :attr:`~anndata.AnnData.obs` :
             `total_{var_type}_by_{expr_type}`
                 E.g. 'total_genes_by_counts'. Number of genes with positive counts in a cell.
@@ -78,24 +84,26 @@ def calculate_qc_metrics(
 
     sums_cells, sums_genes, genes_per_cell, cells_per_gene = _basic_qc(X)
     # .var
-    adata.var[f"n_cells_by_{expr_type}"] = cp.asnumpy(cells_per_gene)
-    adata.var[f"total_{expr_type}"] = cp.asnumpy(sums_genes)
+    var_metrics = pd.DataFrame(index=adata.var_names)
+    var_metrics[f"n_cells_by_{expr_type}"] = cp.asnumpy(cells_per_gene)
+    var_metrics[f"total_{expr_type}"] = cp.asnumpy(sums_genes)
     mean_array = sums_genes / adata.n_obs
-    adata.var[f"mean_{expr_type}"] = cp.asnumpy(mean_array)
-    adata.var[f"pct_dropout_by_{expr_type}"] = cp.asnumpy(
+    var_metrics[f"mean_{expr_type}"] = cp.asnumpy(mean_array)
+    var_metrics[f"pct_dropout_by_{expr_type}"] = cp.asnumpy(
         (1 - cells_per_gene / adata.n_obs) * 100
     )
     if log1p:
-        adata.var[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_genes))
-        adata.var[f"log1p_mean_{expr_type}"] = cp.asnumpy(cp.log1p(mean_array))
+        var_metrics[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_genes))
+        var_metrics[f"log1p_mean_{expr_type}"] = cp.asnumpy(cp.log1p(mean_array))
     # .obs
-    adata.obs[f"n_{var_type}_by_{expr_type}"] = cp.asnumpy(genes_per_cell)
-    adata.obs[f"total_{expr_type}"] = cp.asnumpy(sums_cells)
+    obs_metrics = pd.DataFrame(index=adata.obs_names)
+    obs_metrics[f"n_{var_type}_by_{expr_type}"] = cp.asnumpy(genes_per_cell)
+    obs_metrics[f"total_{expr_type}"] = cp.asnumpy(sums_cells)
     if log1p:
-        adata.obs[f"log1p_n_{var_type}_by_{expr_type}"] = cp.asnumpy(
+        obs_metrics[f"log1p_n_{var_type}_by_{expr_type}"] = cp.asnumpy(
             cp.log1p(genes_per_cell)
         )
-        adata.obs[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_cells))
+        obs_metrics[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_cells))
 
     if qc_vars:
         if isinstance(qc_vars, str):
@@ -104,14 +112,20 @@ def calculate_qc_metrics(
             mask = cp.array(adata.var[qc_var], dtype=cp.bool_)
             sums_cells_sub = _geneset_qc(X, mask)
 
-            adata.obs[f"total_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub)
-            adata.obs[f"pct_{expr_type}_{qc_var}"] = cp.asnumpy(
+            obs_metrics[f"total_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub)
+            obs_metrics[f"pct_{expr_type}_{qc_var}"] = cp.asnumpy(
                 sums_cells_sub / sums_cells * 100
             )
             if log1p:
-                adata.obs[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(
+                obs_metrics[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(
                     cp.log1p(sums_cells_sub)
                 )
+
+    if not inplace:
+        return obs_metrics, var_metrics
+    adata.obs[obs_metrics.columns] = obs_metrics
+    adata.var[var_metrics.columns] = var_metrics
+    return None
 
 
 def _basic_qc(
