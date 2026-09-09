@@ -2,8 +2,8 @@
 
 Each test calls a single ``_cuda`` kernel with bit-identical inputs except for
 the indptr/indices dtype (int32 vs int64) and asserts the outputs match
-exactly. The purpose is to catch silent dispatch bugs in the int64 nanobind
-overloads.
+exactly. The purpose is to catch silent dispatch bugs in the int64 Rust
+kernel specializations.
 
 These tests build raw int64 indptr/indices arrays directly with
 ``cp.asarray(..., dtype=cp.int64)`` — they do *not* go through
@@ -1058,8 +1058,7 @@ def test_csc_hist(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_morans_sparse_mixed_indices(dtype):
-    """Exercise the cross-typed (AdjIdxT, DataIdxT) instantiations registered
-    in autocorr.cu — the same-dtype tests above don't reach them."""
+    """Exercise independent adjacency and data index widths in the Rust kernel."""
     mean_array = cp.full(N_COLS, 0.3, dtype=dtype)
 
     A32 = _make_csr(dtype, np.int32)
@@ -1101,8 +1100,7 @@ def test_morans_sparse_mixed_indices(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_gearys_sparse_mixed_indices(dtype):
-    """Exercise the cross-typed (AdjIdxT, DataIdxT) instantiations registered
-    in autocorr.cu — the same-dtype tests above don't reach them."""
+    """Exercise independent adjacency and data index widths in the Rust kernel."""
     A32 = _make_csr(dtype, np.int32)
     adj32 = _make_adjacency(dtype, np.int32)
     num_ref = cp.zeros(N_COLS, dtype=dtype)
@@ -1138,20 +1136,17 @@ def test_gearys_sparse_mixed_indices(dtype):
         _close(num_ref, num)
 
 
-# ---------- long-long parameter ABI smoke test ------------------------------
+# ---------- int64 parameter ABI smoke test ---------------------------------
 
 
 def test_sparse2dense_long_long_max_nnz_not_truncated():
-    """``sparse2dense`` binds ``max_nnz`` as ``long long``. Verify a value
-    above 2^32 is not silently truncated to int32 by the nanobind layer.
+    """Verify ``max_nnz`` values above 2^32 survive the PyO3 int64 binding.
 
     Mechanism: the kernel uses ``max_nnz`` only to size the y-grid via
-    ``strided_grid_y`` (which caps at the device limit); actual work is
-    bounded by indptr/indices. If the binding ever regresses to ``int``,
-    passing 2^33 from Python would raise OverflowError. With correct
-    ``long long`` passing the kernel runs (also exercising the
-    strided-grid cap path) and produces the same result as the canonical
-    small-``max_nnz`` call.
+    a capped grid dimension; actual work is bounded by indptr/indices.
+    If the binding regresses to int32, passing 2^33 from Python would raise
+    OverflowError. With int64 passing, the kernel exercises the grid cap
+    and produces the same result as the canonical small-``max_nnz`` call.
     """
     dtype = np.float32
     A = _make_csr(dtype, np.int32)

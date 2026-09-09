@@ -9,6 +9,7 @@ import pandas as pd
 from cupyx.scipy.sparse import issparse, isspmatrix_csc
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._cuda import _elementwise_cuda
 from rapids_singlecell.get import _get_obs_rep
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
@@ -20,17 +21,10 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 
-_seurat_v3_elementwise_kernel = cp.ElementwiseKernel(
-    "T data, S idx, raw D clip_val",
-    "raw D sq_sum, raw D sum",
-    """
-    D element = min((double)data, clip_val[idx]);
-    atomicAdd(&sq_sum[idx], element * element);
-    atomicAdd(&sum[idx], element);
-    """,
-    "seurat_v3_elementwise_kernel",
-    no_return=True,
-)
+def _seurat_v3_elementwise_kernel(data, indices, clip, squares, sums):
+    _elementwise_cuda.clip_sums(
+        data, indices, clip, squares, sums, stream=cp.cuda.get_current_stream().ptr
+    )
 
 
 def _clip_square_sum_sparse(X, clip_val):

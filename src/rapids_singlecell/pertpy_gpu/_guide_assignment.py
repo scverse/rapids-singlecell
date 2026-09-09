@@ -429,7 +429,7 @@ def _fit_assign_cuda(
     cp.ndarray,
     list[int],
 ]:
-    """Fit and assign all guides with the nanobind/CUDA EM kernel."""
+    """Fit and assign all guides with the Rust/CUDA EM kernel."""
     _validate_fit_args(
         max_iter=max_iter,
         tol=tol,

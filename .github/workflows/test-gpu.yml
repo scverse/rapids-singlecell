@@ -39,14 +39,13 @@ jobs:
           enable-cache: false
       - id: get-envs
         run: |
-          # Stable + dev, all cu13 (all T4; no other GPU capacity is available)
+          # Stable + dev, CUDA 12 and 13 dependencies on T4 (driver R580+).
           STABLE_DEV_JSON=$(uvx --from "hatch==1.16.5" hatch env show --json | jq -c '
             to_entries
             | map(
               select(.key | startswith("hatch-test"))
               | select(
-                ((.key | contains("stable")) and (.key | endswith("13")))
-                or ((.key | contains("dev")) and (.key | endswith("13")))
+                (.key | contains("stable")) or (.key | contains("dev"))
               )
               | {
                 name: .key,
@@ -73,7 +72,7 @@ jobs:
     name: Test (${{ matrix.env.name }})
     needs: get-envs
     runs-on: ${{ matrix.env.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -81,6 +80,8 @@ jobs:
         env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
+      CUDA_TOOLKIT_PATH: /usr/local/cuda
+      SKBUILD_CMAKE_DEFINE_RSC_RUST_CUDA_ARCH: sm_75
 
     steps:
       - uses: actions/checkout@v6
@@ -97,6 +98,14 @@ jobs:
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> $GITHUB_ENV
 
+      - uses: ./.github/actions/setup-cuda-oxide
+
+      - name: Check driver compatibility
+        run: |
+          nvidia-smi
+          DRIVER_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | cut -d. -f1)
+          test "${DRIVER_MAJOR}" -ge 580 || { echo "Rust CUDA backend requires NVIDIA driver R580+"; exit 1; }
+
       - name: Install dependencies
         run: uvx --from "hatch==1.16.5" hatch -v env create ${{ matrix.env.name }}
 
@@ -104,12 +113,12 @@ jobs:
         run: |
           mkdir -p test-data
           if [[ "${{ matrix.env.name }}" == *"stable"* ]]; then
-            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run-cov -v --color=yes
+            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run-cov -v --color=yes --require-rust-backend
             uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:coverage xml
             uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:cov-report
 
           else
-            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run -v --color=yes
+            uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run -v --color=yes --require-rust-backend
           fi
 
       - name: Upload test results
@@ -135,7 +144,7 @@ jobs:
     name: Test (${{ matrix.env.name }})
     needs: get-envs
     runs-on: ${{ matrix.env.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     continue-on-error: true  # Prerelease failures don't fail the workflow
     strategy:
       fail-fast: false
@@ -144,6 +153,8 @@ jobs:
         env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
+      CUDA_TOOLKIT_PATH: /usr/local/cuda
+      SKBUILD_CMAKE_DEFINE_RSC_RUST_CUDA_ARCH: sm_75
 
     steps:
       - uses: actions/checkout@v6
@@ -166,11 +177,19 @@ jobs:
       - name: Check NVIDIA SMI
         run: nvidia-smi
 
+      - uses: ./.github/actions/setup-cuda-oxide
+
+      - name: Check driver compatibility
+        run: |
+          nvidia-smi
+          DRIVER_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | cut -d. -f1)
+          test "${DRIVER_MAJOR}" -ge 580 || { echo "Rust CUDA backend requires NVIDIA driver R580+"; exit 1; }
+
       - name: Install dependencies
         run: uvx --from "hatch==1.16.5" hatch -v env create ${{ matrix.env.name }}
 
       - name: Run tests
-        run: uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run -v --color=yes
+        run: uvx --from "hatch==1.16.5" hatch run ${{ matrix.env.name }}:run -v --color=yes --require-rust-backend
 
   remove-label:
     name: Remove 'run-gpu-ci' Label

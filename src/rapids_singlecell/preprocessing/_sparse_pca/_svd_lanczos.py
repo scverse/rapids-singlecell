@@ -11,15 +11,17 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
+from rapids_singlecell._cuda import _elementwise_cuda
 from rapids_singlecell._utils._random import _seed_from_rng
 
 if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
-# Simple fused AXPY kernel - faster than function call overhead
-_kernel_axpy = cp.ElementwiseKernel(
-    "T alpha, T y", "T x", "x -= alpha * y", "lanczos_axpy"
-)
+
+# Fused native AXPY with a borrowed device scalar.
+def _kernel_axpy(alpha, y, x):
+    _elementwise_cuda.axpy(alpha, y, x, stream=cp.cuda.get_current_stream().ptr)
+    return x
 
 
 def _cgs2_orth(

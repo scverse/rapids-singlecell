@@ -1,4 +1,4 @@
-"""Tests that nanobind kernels work with RMM managed memory (kDLCUDAManaged=13).
+"""Tests that native Rust kernels work with RMM managed memory allocations.
 
 See https://github.com/scverse/rapids_singlecell/issues/591
 """

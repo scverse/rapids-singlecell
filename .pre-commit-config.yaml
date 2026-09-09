@@ -32,9 +32,11 @@ repos:
           (?x)(
               docs/references.bib|
           )
--   repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v23.1.0
+-   repo: local
     hooks:
-    -   id: clang-format
-        args: [--style=file, -i]
-        types_or: [c, c++, cuda]
+    -   id: rustfmt
+        name: Format Rust sources
+        entry: cargo +nightly-2026-08-28 fmt --manifest-path rust/Cargo.toml --all
+        language: system
+        files: \.rs$
+        pass_filenames: false

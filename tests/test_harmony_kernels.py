@@ -137,7 +137,7 @@ def test_fused_pen_norm_int(dtype, n_rows, n_cols):
     cats = rng.integers(0, n_batches, size=n_rows).astype(cp.int32)
     idx_in = cp.arange(n_rows, dtype=cp.int32)  # identity permutation
     R_out = cp.empty((n_rows, n_cols), dtype=dtype)
-    term = float(dtype(-2) / dtype(0.1))  # native Python float for nanobind
+    term = float(dtype(-2) / dtype(0.1))  # native Python float for PyO3
 
     _pen.fused_pen_norm_int(
         similarities,
@@ -435,8 +435,8 @@ def _compute_objective_reference(R, similarities, *, O, E, theta, sigma, stabili
     entropy = float(sigma * cp.sum(R_norm * cp.log(R_norm + 1e-12)))
 
     # Diversity
-    numer = (O + E + 1) if stabilized else (O + 1)
-    diversity = float(sigma * cp.sum(theta[:, None] * O * cp.log(numer / (E + 1))))
+    numerator = (O + E + 1) if stabilized else (O + 1)
+    diversity = float(sigma * cp.sum(theta[:, None] * O * cp.log(numerator / (E + 1))))
 
     return kmeans_err + entropy + diversity
 

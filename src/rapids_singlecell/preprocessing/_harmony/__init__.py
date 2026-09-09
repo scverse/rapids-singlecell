@@ -335,7 +335,7 @@ def harmonize(
         and joint_workspace_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES
     )
 
-    # Pre-allocate C++ workspace buffers (reused across harmony iterations).
+    # Pre-allocate native workspace buffers (reused across harmony iterations).
     cpp_workspace = _allocate_clustering_workspace(
         n_cells,
         n_pcs=Z.shape[1],
@@ -544,7 +544,7 @@ def _allocate_clustering_workspace(
     block_size: int,
     dtype: cp.dtype,
 ) -> dict:
-    """Pre-allocate workspace buffers for the C++ clustering loop."""
+    """Pre-allocate workspace buffers for the Rust clustering loop."""
     cub_temp_bytes = _hc_cl.get_cub_sort_temp_bytes(n_cells=n_cells)
     workspace = {
         "Y": cp.empty((n_clusters, n_pcs), dtype=dtype),
@@ -574,7 +574,7 @@ def _allocate_clustering_workspace(
     return workspace
 
 
-# Map colsum function to C++ enum: 0=columns, 1=atomics, 2=gemm
+# Map colsum function to native enum: 0=columns, 1=atomics, 2=gemm
 _COLSUM_MAP = {
     _column_sum: 0,
     _column_sum_atomic: 1,
@@ -1067,7 +1067,7 @@ def _correction_batched(
     """
     Batched correction method - process all clusters simultaneously.
 
-    Single C++ call that fuses all steps: inv_mats computation, Phi_t_diag_R_X
+    Single native call that fuses all steps: inv_mats computation, Phi_t_diag_R_X
     via cuBLAS GEMMs, W_all via strided batched GEMM, and correction kernel.
     """
     n_cells, n_pcs = X.shape
@@ -1083,7 +1083,7 @@ def _correction_batched(
     W_all = cp.empty((n_clusters, nb1, n_pcs), dtype=dtype)
     g_factor = cp.empty((n_clusters, n_batches), dtype=dtype)
     g_P_row0 = cp.empty((n_clusters, n_batches), dtype=dtype)
-    # A category containing every cell can use X and R directly in C++.
+    # A category containing every cell can use X and R directly in Rust.
     batch_chunk_size = 1 if max_batch_cells == n_cells else max_batch_cells
     X_batch = cp.empty((batch_chunk_size, n_pcs), dtype=dtype)
     R_batch = cp.empty((batch_chunk_size, n_clusters), dtype=dtype)
@@ -1129,7 +1129,7 @@ def _compute_objective(
     """
     Compute the objective function value for Harmony.
 
-    Uses a fused C++ implementation that computes all three terms
+    Uses a fused Rust implementation that computes all three terms
     (kmeans error, entropy, diversity) in a single pass with internal
     row-normalization of R.
     """

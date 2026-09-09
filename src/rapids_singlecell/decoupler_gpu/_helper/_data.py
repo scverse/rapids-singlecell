@@ -14,6 +14,7 @@ from scipy.sparse import csr_matrix, issparse
 from tqdm.auto import tqdm
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._cuda import _elementwise_cuda
 from rapids_singlecell.decoupler_gpu._helper._docs import docs
 from rapids_singlecell.decoupler_gpu._helper._log import _log
 from rapids_singlecell.preprocessing._utils import _check_use_raw
@@ -24,14 +25,12 @@ DataType = Union[  # noqa: UP007
 
 DataType_matrix = Union[np.ndarray, cp.ndarray, csr_matrix, cp_csr_matrix]  # noqa: UP007
 
-getnnz_0 = cp.ElementwiseKernel(
-    "int32 idx",
-    "raw int32 sum",
-    """
-    atomicAdd(&sum[idx], 1);
-    """,
-    "get_nnz_0",
-)
+
+def getnnz_0(indices, counts):
+    _elementwise_cuda.count_indices(
+        indices, counts, stream=cp.cuda.get_current_stream().ptr
+    )
+    return counts
 
 
 def _validate_mat(

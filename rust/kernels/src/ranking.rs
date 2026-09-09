@@ -1,0 +1,580 @@
+//! Ranking, group reductions, histograms and sparse window extraction.
+//!
+//! Every data-dependent sparse offset is checked on the device before use.
+#![allow(clippy::too_many_arguments)]
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF64, DeviceAtomicU32};
+use cuda_device::{kernel, thread};
+
+#[inline(always)]
+unsafe fn value(p: *const u8, i: u64, wide: u32) -> f64 {
+    unsafe {
+        if wide != 0 {
+            *p.cast::<f64>().add(i as usize)
+        } else {
+            *p.cast::<f32>().add(i as usize) as f64
+        }
+    }
+}
+#[inline(always)]
+unsafe fn index(p: *const u8, i: u64, wide: u32) -> i64 {
+    unsafe {
+        if wide != 0 {
+            *p.cast::<i64>().add(i as usize)
+        } else {
+            *p.cast::<i32>().add(i as usize) as i64
+        }
+    }
+}
+#[inline(always)]
+unsafe fn put_index(p: *mut u8, i: u64, v: i64, wide: u32) {
+    unsafe {
+        if wide != 0 {
+            *p.cast::<i64>().add(i as usize) = v;
+        } else {
+            *p.cast::<i32>().add(i as usize) = v as i32;
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn lower_column(
+    indices: *const u8,
+    mut low: u64,
+    mut high: u64,
+    column: i64,
+    wide: u32,
+) -> u64 {
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if unsafe { index(indices, middle, wide) } < column {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+#[inline(always)]
+unsafe fn add(p: *mut f64, v: f64) {
+    unsafe { DeviceAtomicF64::from_ptr(p) }.fetch_add(v, AtomicOrdering::Relaxed);
+}
+#[cuda_device::device]
+fn rank_stride() -> u64 {
+    thread::blockDim_x() as u64 * thread::gridDim_x() as u64
+}
+
+/// # Safety
+/// `values` contains rows*cols f64 elements and is exclusively writable.
+#[kernel]
+pub unsafe fn rank_bh(values: *mut f64, rows: u64, cols: u64) {
+    let mut row = thread::index_1d().get() as u64;
+    while row < rows {
+        let mut running = 1.0_f64;
+        let mut col = cols;
+        while col > 0 {
+            col -= 1;
+            let p = unsafe { values.add((row * cols + col) as usize) };
+            let v = unsafe { *p };
+            if v < running {
+                running = v;
+            }
+            unsafe { *p = running };
+        }
+        row += rank_stride();
+    }
+}
+
+/// # Safety
+/// All optional non-null outputs have groups*out_cols elements (totals out_cols).
+/// Input is contiguous with rows*cols elements and codes/mask have rows elements.
+#[kernel]
+pub unsafe fn rank_stats(
+    x: *const u8,
+    codes: *const i32,
+    mask: *const u8,
+    sums: *mut f64,
+    squares: *mut f64,
+    nnz: *mut f64,
+    total: *mut f64,
+    total_nnz: *mut f64,
+    rows: u64,
+    cols: u64,
+    groups: u64,
+    out_cols: u64,
+    col_offset: u64,
+    wide: u32,
+    c_order: u32,
+) {
+    let mut i = thread::index_1d().get() as u64;
+    while i < rows * cols {
+        let (row, col) = if c_order != 0 {
+            (i / cols, i % cols)
+        } else {
+            (i % rows, i / rows)
+        };
+        if mask.is_null() || unsafe { *mask.add(row as usize) } != 0 {
+            let v = unsafe { value(x, i, wide) };
+            let g = unsafe { *codes.add(row as usize) };
+            if g >= 0 && (g as u64) < groups {
+                let o = (g as u64 * out_cols + col_offset + col) as usize;
+                unsafe {
+                    if !sums.is_null() {
+                        add(sums.add(o), v);
+                    }
+                    if !squares.is_null() {
+                        add(squares.add(o), v * v);
+                    }
+                    if !nnz.is_null() && v != 0.0 {
+                        add(nnz.add(o), 1.0);
+                    }
+                }
+            }
+            let o = (col_offset + col) as usize;
+            unsafe {
+                if !total.is_null() {
+                    add(total.add(o), v);
+                }
+                if !total_nnz.is_null() && v != 0.0 {
+                    add(total_nnz.add(o), 1.0);
+                }
+            }
+        }
+        i += rank_stride();
+    }
+}
+
+/// # Safety
+/// Valid compressed sparse arrays; indptr has major+1 entries, index/data nnz.
+/// Out is pre-zeroed F-order rows*window. Type flags match pointer types.
+#[kernel]
+pub unsafe fn rank_tile(
+    indptr: *const u8,
+    indices: *const u8,
+    data: *const u8,
+    out: *mut f64,
+    rows: u64,
+    window: u64,
+    lb: u64,
+    major: u64,
+    nnz: u64,
+    pwide: u32,
+    iwide: u32,
+    wide: u32,
+    csc: u32,
+) {
+    let width = if csc != 0 { 128 } else { 1 };
+    let id = thread::index_1d().get() as u64;
+    let lane = id % width;
+    let mut seg = id / width;
+    let segments = if csc != 0 { window } else { rows };
+    while seg < segments {
+        let major_i = if csc != 0 { seg + lb } else { seg };
+        if major_i < major {
+            let a = unsafe { index(indptr, major_i, pwide) };
+            let b = unsafe { index(indptr, major_i + 1, pwide) };
+            if a >= 0 && b >= a && b as u64 <= nnz {
+                let mut p = a as u64 + lane;
+                while p < b as u64 {
+                    let ix = unsafe { index(indices, p, iwide) };
+                    let (row, col) = if csc != 0 {
+                        (ix, seg as i64)
+                    } else {
+                        (seg as i64, ix - lb as i64)
+                    };
+                    if row >= 0 && (row as u64) < rows && col >= 0 && (col as u64) < window {
+                        unsafe {
+                            add(
+                                out.add((col as u64 * rows + row as u64) as usize),
+                                value(data, p, wide),
+                            );
+                        }
+                    }
+                    p += width;
+                }
+            }
+        }
+        seg += rank_stride() / width;
+    }
+}
+
+/// # Safety
+/// F-order values and sorted row ids have rows*cols elements; codes has rows.
+/// Ranks has groups*out_cols elements, tie has out_cols if enabled. Outputs zeroed.
+#[kernel]
+pub unsafe fn rank_sorted(
+    x: *const f32,
+    order: *const i64,
+    codes: *const i32,
+    ranks: *mut f64,
+    tie: *mut f64,
+    rows: u64,
+    cols: u64,
+    groups: u64,
+    out_cols: u64,
+    col_offset: u64,
+) {
+    let mut i = thread::index_1d().get() as u64;
+    while i < rows * cols {
+        let col = i / rows;
+        let pos = i % rows;
+        let base = col * rows;
+        let row = unsafe { *order.add(i as usize) };
+        if row >= 0 && (row as u64) < rows {
+            let v = unsafe { *x.add((base + row as u64) as usize) };
+            let mut lo = 0;
+            let mut hi = pos;
+            while lo < hi {
+                let m = lo + (hi - lo) / 2;
+                let r = unsafe { *order.add((base + m) as usize) };
+                let w = if r >= 0 && (r as u64) < rows {
+                    unsafe { *x.add((base + r as u64) as usize) }
+                } else {
+                    f32::NAN
+                };
+                if w < v {
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            let first = lo;
+            lo = pos + 1;
+            hi = rows;
+            while lo < hi {
+                let m = lo + (hi - lo) / 2;
+                let r = unsafe { *order.add((base + m) as usize) };
+                let w = if r >= 0 && (r as u64) < rows {
+                    unsafe { *x.add((base + r as u64) as usize) }
+                } else {
+                    f32::NAN
+                };
+                if w == v {
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            let end = lo;
+            let g = unsafe { *codes.add(row as usize) };
+            if g >= 0 && (g as u64) < groups {
+                unsafe {
+                    add(
+                        ranks.add((g as u64 * out_cols + col_offset + col) as usize),
+                        (first + end + 1) as f64 * 0.5,
+                    );
+                }
+            }
+            if !tie.is_null() && pos == first {
+                let t = (end - first) as f64;
+                unsafe {
+                    add(tie.add((col_offset + col) as usize), t * t * t - t);
+                }
+            }
+        }
+        i += rank_stride();
+    }
+}
+
+/// # Safety
+/// tie contains cols initialized tie-sum values.
+#[kernel]
+pub unsafe fn rank_tie_finish(tie: *mut f64, rows: u64, cols: u64) {
+    let mut i = thread::index_1d().get() as u64;
+    let n = rows as f64;
+    let d = n * n * n - n;
+    while i < cols {
+        let p = unsafe { tie.add(i as usize) };
+        unsafe {
+            *p = if rows < 2 { 1.0 } else { 1.0 - *p / d };
+        }
+        i += rank_stride();
+    }
+}
+
+/// # Safety
+/// Dense F-order input rows*cols; histogram has cols*groups*(bins+1) entries.
+#[kernel]
+pub unsafe fn rank_hist_dense(
+    x: *const u8,
+    codes: *const i32,
+    hist: *mut u32,
+    rows: u64,
+    cols: u64,
+    groups: u64,
+    bins: u64,
+    low: f64,
+    inverse: f64,
+    wide: u32,
+    skip_zero: u32,
+) {
+    let mut i = thread::index_1d().get() as u64;
+    while i < rows * cols {
+        let row = i % rows;
+        let col = i / rows;
+        let g = unsafe { *codes.add(row as usize) };
+        let v = unsafe { value(x, i, wide) };
+        if g >= 0 && (g as u64) < groups && (skip_zero == 0 || v != 0.0) {
+            let bin = (((v - low) * inverse) as i64).max(0).min(bins as i64 - 1) as u64 + 1;
+            unsafe {
+                DeviceAtomicU32::from_ptr(
+                    hist.add(((col * groups + g as u64) * (bins + 1) + bin) as usize),
+                )
+            }
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        i += rank_stride();
+    }
+}
+
+/// # Safety
+/// Validated compressed arrays as rank_tile; histogram has cols*groups*(bins+1).
+#[kernel]
+pub unsafe fn rank_hist_sparse(
+    data: *const u8,
+    indices: *const u8,
+    indptr: *const u8,
+    codes: *const i32,
+    hist: *mut u32,
+    rows: u64,
+    cols: u64,
+    groups: u64,
+    bins: u64,
+    low: f64,
+    inverse: f64,
+    start: u64,
+    nnz: u64,
+    wide: u32,
+    iwide: u32,
+    csc: u32,
+) {
+    let id = thread::index_1d().get() as u64;
+    let lane = id % 32;
+    let mut seg = id / 32;
+    let major = if csc != 0 { cols } else { rows };
+    while seg < major {
+        let source = if csc != 0 { seg + start } else { seg };
+        let a = unsafe { index(indptr, source, iwide) };
+        let b = unsafe { index(indptr, source + 1, iwide) };
+        if a >= 0 && b >= a && b as u64 <= nnz {
+            let mut p = a as u64 + lane;
+            while p < b as u64 {
+                let ix = unsafe { index(indices, p, iwide) };
+                let (row, col) = if csc != 0 {
+                    (ix, seg as i64)
+                } else {
+                    (seg as i64, ix - start as i64)
+                };
+                if row >= 0 && (row as u64) < rows && col >= 0 && (col as u64) < cols {
+                    let g = unsafe { *codes.add(row as usize) };
+                    let v = unsafe { value(data, p, wide) };
+                    if g >= 0 && (g as u64) < groups && v != 0.0 {
+                        let bin =
+                            (((v - low) * inverse) as i64).max(0).min(bins as i64 - 1) as u64 + 1;
+                        unsafe {
+                            DeviceAtomicU32::from_ptr(hist.add(
+                                ((col as u64 * groups + g as u64) * (bins + 1) + bin) as usize,
+                            ))
+                        }
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+                p += 32;
+            }
+        }
+        seg += rank_stride() / 32;
+    }
+}
+
+/// # Safety
+/// indptr/local contain rows+1 indices; indices/data nnz; output capacity local_nnz.
+/// Counting mode writes row counts at local[row+1]; gather uses scanned offsets.
+/// Row indices must be sorted, as in the canonical CSR inputs of the public API.
+#[kernel]
+pub unsafe fn rank_csr_range(
+    indices: *const u8,
+    indptr: *const u8,
+    data: *const u8,
+    local: *mut u8,
+    out_data: *mut u8,
+    out_indices: *mut u8,
+    rows: u64,
+    nnz: u64,
+    local_nnz: u64,
+    start: u64,
+    stop: u64,
+    iwide: u32,
+    wide: u32,
+    gather: u32,
+) {
+    let id = thread::index_1d().get() as u64;
+    let width = if gather != 0 { 32 } else { 1 };
+    let lane = id % width;
+    let mut row = id / width;
+    if id == 0 && gather == 0 {
+        unsafe {
+            put_index(local, 0, 0, iwide);
+        }
+    }
+    while row < rows {
+        let a = unsafe { index(indptr, row, iwide) };
+        let b = unsafe { index(indptr, row + 1, iwide) };
+        let mut count = 0i64;
+        let offset = if gather != 0 {
+            unsafe { index(local, row, iwide) }
+        } else {
+            0
+        };
+        if a >= 0 && b >= a && b as u64 <= nnz {
+            let first = unsafe { lower_column(indices, a as u64, b as u64, start as i64, iwide) };
+            let last = unsafe { lower_column(indices, first, b as u64, stop as i64, iwide) };
+            count = (last - first) as i64;
+            if gather != 0 {
+                let mut p = first + lane;
+                while p < last {
+                    let col = unsafe { index(indices, p, iwide) };
+                    let dest = offset + (p - first) as i64;
+                    if gather != 0 && dest >= 0 && (dest as u64) < local_nnz {
+                        unsafe {
+                            put_index(out_indices, dest as u64, col - start as i64, iwide);
+                            if wide != 0 {
+                                *out_data.cast::<f64>().add(dest as usize) =
+                                    *data.cast::<f64>().add(p as usize);
+                            } else {
+                                *out_data.cast::<f32>().add(dest as usize) =
+                                    *data.cast::<f32>().add(p as usize);
+                            }
+                        }
+                    }
+                    p += width;
+                }
+            }
+        }
+        if gather == 0 {
+            unsafe {
+                put_index(local, row + 1, count, iwide);
+            }
+        }
+        row += rank_stride() / width;
+    }
+}
+
+#[inline(always)]
+unsafe fn bounds(x: *const f32, n: u64, v: f32) -> (u64, u64) {
+    let mut lo = 0;
+    let mut hi = n;
+    while lo < hi {
+        let m = lo + (hi - lo) / 2;
+        if unsafe { *x.add(m as usize) } < v {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    let first = lo;
+    hi = n;
+    while lo < hi {
+        let m = lo + (hi - lo) / 2;
+        if unsafe { *x.add(m as usize) } <= v {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    (first, lo)
+}
+
+/// # Safety
+/// Reference/group are independently sorted, F-order matrices, same cols.
+/// Rank/tie outputs have out_cols elements, zeroed at entry. Tie may be null.
+#[kernel]
+pub unsafe fn rank_ovo(
+    reference: *const f32,
+    group: *const f32,
+    ranks: *mut f64,
+    tie: *mut f64,
+    nref: u64,
+    ngrp: u64,
+    cols: u64,
+    out_cols: u64,
+    offset: u64,
+) {
+    let _ = out_cols;
+    // Every block owns one column and reduces its row tile before updating
+    // the output, avoiding a contended global atomic for every sample.
+    let col = thread::blockIdx_x() as u64 % cols;
+    let tile = thread::blockIdx_x() as u64 / cols;
+    let tiles = thread::gridDim_x() as u64 / cols;
+    let tid = thread::threadIdx_x() as usize;
+    let lane = tid % 32;
+    let wid = tid / 32;
+    let mut row = tile * 256 + tid as u64;
+    let n = nref + ngrp;
+    let r = unsafe { reference.add((col * nref) as usize) };
+    let g = unsafe { group.add((col * ngrp) as usize) };
+    let mut rank_sum = 0.0;
+    let mut tie_sum = 0.0;
+    while row < n {
+        if row < ngrp {
+            let v = unsafe { *g.add(row as usize) };
+            if row == 0 {
+                rank_sum += ngrp as f64 * (ngrp as f64 + 1.0) * 0.5;
+            }
+            // Equal group values have identical reference contributions.
+            // Compute them once per run; this also calculates its union tie.
+            if row == 0 || unsafe { *g.add((row - 1) as usize) } != v {
+                let (_, gu) = unsafe { bounds(g, ngrp, v) };
+                let (rl, ru) = unsafe { bounds(r, nref, v) };
+                rank_sum += (gu - row) as f64 * (rl as f64 + (ru - rl) as f64 * 0.5);
+                if !tie.is_null() {
+                    let t = (gu - row + ru - rl) as f64;
+                    tie_sum += t * t * t - t;
+                }
+            }
+        } else if !tie.is_null() {
+            let ref_row = row - ngrp;
+            let v = unsafe { *r.add(ref_row as usize) };
+            if ref_row == 0 || unsafe { *r.add((ref_row - 1) as usize) } != v {
+                let (gl, gu) = unsafe { bounds(g, ngrp, v) };
+                if gl == gu {
+                    let (_, ru) = unsafe { bounds(r, nref, v) };
+                    let t = (ru - ref_row) as f64;
+                    tie_sum += t * t * t - t;
+                }
+            }
+        }
+        row += tiles * 256;
+    }
+    rank_sum = crate::harmony::sum_f64(rank_sum);
+    tie_sum = crate::harmony::sum_f64(tie_sum);
+    static mut PARTIAL: cuda_device::SharedArray<f64, 16> = cuda_device::SharedArray::UNINIT;
+    let partial = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut PARTIAL) };
+    if lane == 0 {
+        unsafe {
+            *partial.add(wid) = rank_sum;
+            *partial.add(8 + wid) = tie_sum;
+        }
+    }
+    cuda_device::thread::sync_threads();
+    if wid == 0 {
+        let rank = if lane < 8 {
+            unsafe { *partial.add(lane) }
+        } else {
+            0.0
+        };
+        let ties = if lane < 8 {
+            unsafe { *partial.add(8 + lane) }
+        } else {
+            0.0
+        };
+        let rank = crate::harmony::sum_f64(rank);
+        let ties = crate::harmony::sum_f64(ties);
+        if lane == 0 {
+            unsafe {
+                add(ranks.add((offset + col) as usize), rank);
+                if !tie.is_null() {
+                    add(tie.add((offset + col) as usize), ties);
+                }
+            }
+        }
+    }
+}

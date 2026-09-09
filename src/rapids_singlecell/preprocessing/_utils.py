@@ -30,7 +30,7 @@ def _sparse_to_dense(X: spmatrix, order: Literal["C", "F"] | None = None) -> cp.
         raise ValueError("Input matrix must be a sparse `csc` or `csr` matrix")
 
     dense = cp.zeros(X.shape, order=order, dtype=X.dtype)
-    max_nnz = int(cp.diff(X.indptr).max())
+    max_nnz = int(cp.diff(X.indptr).max()) if major else 0
     _s2d.sparse2dense(
         X.indptr,
         X.indices,
@@ -40,6 +40,7 @@ def _sparse_to_dense(X: spmatrix, order: Literal["C", "F"] | None = None) -> cp.
         minor=minor,
         c_switch=switcher,
         max_nnz=max_nnz,
+        stream=cp.cuda.get_current_stream().ptr,
     )
     return dense
 

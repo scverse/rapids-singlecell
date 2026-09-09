@@ -1,19 +1,13 @@
-"""
-CUDA extensions for rapids-singlecell (built via scikit-build-core/nanobind).
+"""Native CUDA kernels provided by the Rust/cuda-oxide/PyO3 backend.
 
-These modules provide GPU-accelerated kernels for various single-cell analysis
-operations. Each module is compiled from CUDA source files and exposed through
-nanobind bindings.
-
-On systems without compiled extensions (e.g., docs builds), a genuinely absent
-module resolves to None so that module-level imports don't raise ImportError. A
-module that is present but fails to load (ABI/toolkit mismatch, missing shared
-library) is re-raised with context rather than silently swallowed.
+The extension loads without creating a CUDA context. Documentation builds may
+omit it; a present but incompatible extension always raises its import error.
 """
 
 from __future__ import annotations
 
 import importlib
+import sys
 
 __all__ = [
     "_aggr_cuda",
@@ -22,6 +16,7 @@ __all__ = [
     "_bbknn_cuda",
     "_cooc_cuda",
     "_edistance_cuda",
+    "_elementwise_cuda",
     "_guide_assignment_cuda",
     "_gmm_cuda",
     "_harmony_clustering_cuda",
@@ -43,12 +38,14 @@ __all__ = [
     "_nn_descent_cuda",
     "_norm_cuda",
     "_pr_cuda",
+    "_pseudobulk_cuda",
     "_pv_cuda",
     "_qc_cuda",
     "_qc_dask_cuda",
     "_rank_stats_cuda",
     "_rank_stream_cuda",
     "_scale_cuda",
+    "_sinkhorn_cuda",
     "_sparse2dense_cuda",
     "_spca_cuda",
     "_wilcoxon_binned_cuda",
@@ -57,63 +54,45 @@ __all__ = [
 ]
 
 
-def _preload_rapids_runtime_libs() -> None:
-    """Pre-load RAPIDS runtime libs so extension ``DT_NEEDED`` deps resolve."""
-    for mod in ("librmm", "rapids_logger"):
-        try:
-            importlib.import_module(mod).load_library()
-        except (ImportError, OSError, AttributeError, RuntimeError):
-            pass
+def _register_rust_backend() -> None:
+    fullname = f"{__name__}._rust_cuda"
+    try:
+        backend = importlib.import_module("._rust_cuda", __name__)
+    except ModuleNotFoundError as exc:
+        if exc.name != fullname:
+            raise ImportError(f"Failed to load the Rust CUDA backend: {exc}") from exc
+        # No native extension is intentional in documentation builds. Block
+        # stale legacy binaries left behind by an older editable installation.
+        for name in __all__:
+            globals()[name] = None
+            sys.modules[f"{__name__}.{name}"] = None
+        return
+    except ImportError as exc:
+        raise ImportError(f"Failed to load the Rust CUDA backend: {exc}") from exc
+
+    exported = set(backend.__all__)
+    expected = set(__all__)
+    if exported != expected:
+        missing = sorted(expected - exported)
+        unknown = sorted(exported - expected)
+        raise ImportError(
+            "Rust CUDA backend module mismatch: "
+            f"missing={missing}, unknown={unknown}. Rebuild or reinstall the package."
+        )
+
+    # Validate the complete backend before publishing any submodule. Both
+    # attribute and dotted imports must resolve to this exact native extension.
+    modules = {name: getattr(backend, name) for name in __all__}
+    if any(
+        getattr(module, "__backend__", None) != "rust" for module in modules.values()
+    ):
+        raise ImportError("Rust CUDA backend contains an invalid native submodule")
+    for name, module in modules.items():
+        module.__name__ = f"{__name__}.{name}"
+        module.__package__ = __name__
+        module.__file__ = backend.__file__
+        sys.modules[module.__name__] = module
+        globals()[name] = module
 
 
-_preload_rapids_runtime_libs()
-
-# Modules whose CUDA kernels use device scratch. They allocate through a
-# CuPy-backed allocator injected here, so temporaries land on the caller's
-# current device resource (RMM pool / UVM aware) without linking librmm.
-_SCRATCH_MODULES = frozenset(
-    {"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"}
-)
-_scratch_allocator = None
-
-
-def _get_scratch_allocator():
-    """(alloc, free) backed by CuPy's current allocator; shared process-wide."""
-    global _scratch_allocator
-    if _scratch_allocator is None:
-        import cupy as cp
-
-        live = {}
-
-        def _alloc(nbytes: int) -> int:
-            mem = cp.cuda.alloc(int(nbytes))
-            live[int(mem.ptr)] = mem
-            return int(mem.ptr)
-
-        def _free(ptr: int) -> None:
-            live.pop(int(ptr), None)
-
-        _scratch_allocator = (_alloc, _free)
-    return _scratch_allocator
-
-
-def __getattr__(name: str):
-    if name in __all__:
-        try:
-            mod = importlib.import_module(f".{name}", __name__)
-        except ModuleNotFoundError:
-            # Extension genuinely absent (docs/no-GPU): degrade to None.
-            return None
-        except ImportError as exc:
-            # Present but failed to load: surface ABI/toolkit/lib errors now.
-            # Returning None would cause a later cryptic attribute error.
-            msg = (
-                f"Failed to load compiled CUDA extension {name!r}: {exc}. "
-                "Ensure a matching rapids-singlecell-cuXX wheel (and librmm) is "
-                "installed for your CUDA version."
-            )
-            raise ImportError(msg) from exc
-        if name in _SCRATCH_MODULES:
-            mod._set_scratch_allocator(*_get_scratch_allocator())
-        return mod
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+_register_rust_backend()

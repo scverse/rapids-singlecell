@@ -5,7 +5,7 @@ flavor, mirroring :class:`sklearn.mixture.GaussianMixture` with
 ``covariance_type="full"``. ``spherical_gmm_fit_batched`` fits many independent
 two-component, fixed-control-component spherical mixtures in a single launch
 (the GMM behind :class:`~rapids_singlecell.ptg.Mixscape`). EM is CUDA-only --
-E-step, M-step and the precision-Cholesky all run in the nanobind/CUDA
+E-step, M-step and the precision-Cholesky all run in the Rust/CUDA
 extension; CuPy only handles array allocation and orchestration.
 """
 

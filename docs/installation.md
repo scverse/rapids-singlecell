@@ -28,22 +28,25 @@ RAPIDS currently doesn't support `channel_priority: strict`; use `channel_priori
 
 ## PyPI
 
-Starting with version 0.15.0, *rapids-singlecell* ships precompiled CUDA kernels via nanobind.
-Prebuilt wheels are available for **x86_64** and **aarch64** Linux for both CUDA 12 and CUDA 13.
+The native GPU backend uses Rust/cuda-oxide kernels and PyO3 bindings.
+Prebuilt wheels are available for **x86_64** and **aarch64** Linux, with matching
+CUDA 12 or CUDA 13 RAPIDS dependency extras.
 
 ### CUDA version compatibility
 
-The prebuilt wheels support the following CUDA runtime versions:
-
-| Wheel | Compiled with | Runtime support | GPU architectures |
+| Distribution | Native build toolkit | RAPIDS/CuPy dependencies | Minimum GPU/driver |
 |---|---|---|---|
-| `rapids-singlecell` | Source distribution | Any supported CUDA | Compiles for your local GPU architecture |
-| `rapids-singlecell-cu12` | CUDA 12.2 | CUDA 12.2–12.9+ | Turing through Hopper (native), Blackwell (via PTX JIT) |
-| `rapids-singlecell-cu13` | CUDA 13.0 | CUDA 13.0+ | Turing through Blackwell (precompiled cubins) |
+| `rapids-singlecell` | Source build with CUDA 13.0+ | CUDA 12 or CUDA 13 | Turing (`sm_75`), compatible driver |
+| `rapids-singlecell-cu12` | CUDA 13.0 | CUDA 12 | Turing or newer, NVIDIA R580+ |
+| `rapids-singlecell-cu13` | CUDA 13.0 | CUDA 13 | Turing or newer, NVIDIA R580+ |
 
-The CUDA 12 wheels are compiled with CUDA 12.2 to match the [RAPIDS 26.04 support matrix](https://docs.rapids.ai/platform-support/) (CUDA 12.2–12.9).
-Blackwell GPUs (CC 100, 103, and 120) are supported via PTX just-in-time compilation from the `sm_90` PTX included in the wheel.
-The CUDA 13 wheels include compatible Blackwell cubins, so no PTX JIT is needed.
+Both wheel variants contain portable PTX, compiled for Turing and JIT-compiled by
+the NVIDIA driver for the active GPU. The `cu12`/`cu13` suffix selects the Python
+GPU dependency family. CUDA 12 libraries work with newer drivers through
+[NVIDIA's backward compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
+The Rust backend requires **R580 or newer even when using CUDA 12 dependencies**.
+A source build using a toolkit newer than 13.0 may require a newer driver for its
+emitted PTX version.
 
 ### Prebuilt wheels (recommended)
 
@@ -93,73 +96,47 @@ pip install 'rapids-singlecell-cu12[rapids]' --extra-index-url=https://pypi.nvid
 ````
 `````
 
-### Source distribution (self-compile)
+### Source distribution and development installs
 
-The `rapids-singlecell` package on PyPI contains the source distribution.
-Building from source requires a CUDA toolkit and a C++ compiler:
+Source builds require CUDA Toolkit 13.0+, Clang/libclang, and the pinned Rust and
+cuda-oxide compiler. Install the compiler before building the package; the
+[Rust backend guide](rust_backend.md) contains the full setup and validation steps.
 
-```bash
-pip install rapids-singlecell
-```
-
-The CUDA kernels will be compiled during installation for your local GPU architecture.
-You can select RAPIDS dependencies with the `rapids-cu12` or `rapids-cu13` extras:
+From a checkout:
 
 ```bash
-pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
+git clone https://github.com/scverse/rapids-singlecell.git
+cd rapids-singlecell
+bash scripts/install_cuda_oxide.sh
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.0
+python -m pip install -e .
 ```
 
-```{note}
-Building from source requires the CUDA toolkit (nvcc) and CMake >= 3.24 to be available in your environment.
-The nvcc/CUDAToolkit found during the build should match the RAPIDS/CuPy CUDA major runtime version in or linked to the environment.
-
-No RAPIDS C++ package is needed at build time, so the default isolated build works
-on both CUDA 12 and CUDA 13 without `--no-build-isolation`.
-```
-
-### Install from GitHub
-
-To install the latest development version directly from GitHub:
+With the compiler installed, build the source distribution or a Git revision:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+python -m pip install rapids-singlecell
+python -m pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
 ```
 
-Or from a specific branch or tag:
+Select RAPIDS dependencies with `rapids-cu12` or `rapids-cu13`:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
+python -m pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
 ```
 
-This compiles the CUDA kernels during installation. By default, kernels are compiled for your local GPU architecture only (`native`).
-To compile for different or multiple architectures, set the scikit-build-core environment variable that overrides the CUDA architectures:
+Source builds default to portable `sm_75` PTX and do not need a GPU during
+compilation. To require a newer GPU capability:
 
 ```bash
-# Compile for a specific architecture (e.g., Ampere)
-SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES="80-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
-
-# Compile for multiple architectures
-SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES="80-real;86-real;89-real;90-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+SKBUILD_CMAKE_DEFINE_RSC_RUST_CUDA_ARCH=sm_80 python -m pip install -e .
 ```
 
-Common architecture codes:
-
-| Code | GPU Generation | Examples |
-|---|---|---|
-| `75` | Turing | T4, RTX 2080 |
-| `80` | Ampere | A100, A30 |
-| `86` | Ampere | A10, RTX 3090 |
-| `89` | Ada Lovelace | L4, L40, RTX 4090 |
-| `90` | Hopper | H100, H200 |
-| `100` | Blackwell | B200, GB200 |
-| `103` | Blackwell | B300, GB300 |
-| `120` | Blackwell | RTX PRO 6000 |
-
-```{tip}
-Use `native` (the default) for the fastest compilation when you only need to run on your local GPU.
-Use multiple architectures when building portable binaries (e.g., for a shared cluster with mixed GPU types).
-The `-real` suffix generates device code only (no PTX fallback), which reduces binary size.
-```
+Typical targets are `sm_75` (Turing/T4), `sm_80` (Ampere/A100), `sm_89` (Ada/L4),
+and `sm_90` (Hopper/H100). A target defines the minimum capability; the driver can
+JIT its PTX for later compatible architectures. No C++ or CUDA C++ source is
+compiled by the package build.
 
 ## Docker
 

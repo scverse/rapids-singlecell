@@ -41,7 +41,7 @@ MAX_BATCH = 4096
 # Max per-device work excess over ideal before round-robin batch assignment is
 # rejected for the work-balanced split (see _plan_device_batches).
 DEVICE_WORK_IMBALANCE_TOL = 0.2
-COST_TILE = 16  # must match constexpr int TILE in sinkhorn.cu
+COST_TILE = 16  # must match the tile width in the Rust Sinkhorn cost kernel
 # Over-relaxation: omega 1 = plain Sinkhorn; (1, 2) is the convergent SOR range.
 MIN_RELAXATION = 1.0
 MAX_RELAXATION = 2.0
@@ -256,7 +256,7 @@ def _plan_device_batches(
 class WassersteinMetric(BaseMetric):
     """GPU-accelerated 2-Wasserstein distance (entropic, Sinkhorn).
 
-    Returns OTT-JAX's ``reg_ot_cost`` value: the regularized OT objective
+    Returns OTT-JAX's ``reg_ot_cost`` value: the regularized optimal transport objective
     at convergence with uniform marginals and squared-Euclidean cost.
 
     The Sinkhorn solver configuration (auto epsilon = ``0.05 * std(C)``,
@@ -318,7 +318,7 @@ class WassersteinMetric(BaseMetric):
     ) -> cp.ndarray:
         """Solve all (i, j) Sinkhorn problems, returning a flat ``(n_pairs,)`` array.
 
-        Each pair is oriented larger-group-as-columns (the OT cost is symmetric)
+        Each pair uses the larger group as columns (optimal transport is symmetric)
         so the cooperative ``update_f`` reduction runs on the big axis. Pairs are
         split across ``device_ids`` and solved in batch-rounds, with per-iteration
         launches interleaved across devices' streams so the GPUs overlap.

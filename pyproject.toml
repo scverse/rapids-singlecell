@@ -3,7 +3,6 @@ requires = [
     "hatchling",
     "scikit-build-core[hatchling]>=1.0.1",
     "hatch-vcs",
-    "nanobind>=2.0.0",
 ]
 build-backend = "hatchling.build"
 
@@ -149,9 +148,27 @@ local_scheme = "node-and-date"
 [tool.hatch.build.hooks.vcs]
 version-file = "src/rapids_singlecell/_version.py"
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "rust",
+    "cmake",
+    "scripts",
+    "tests",
+    "docs",
+    "docker",
+    "conda",
+    "CMakeLists.txt",
+    "pyproject.toml",
+    "hatch.toml",
+    "README.md",
+    "LICENSE",
+]
+exclude = [ "**/target/**", "**/__pycache__/**", "**/*.so", "**/*.pyc", "docs/_build/**" ]
+
 [tool.hatch.build.targets.wheel]
 packages = [ "src/rapids_singlecell", "src/testing" ]
-exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
+exclude = [ "**/*.cu", "**/*.cuh", "**/*.h", "src/rapids_singlecell/_cuda/*.so" ]
 
 [tool.hatch.build.targets.wheel.hooks.scikit-build]
 
@@ -161,9 +178,9 @@ wheel.py-api = "cp312"
 cmake.version = ">=3.24"
 cmake.build-type = "Release"
 ninja.version = ">=1.10"
-# Default: use native arch for source builds (auto-detect user's GPU)
-# CI overrides via SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES env var
-cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
+# Turing PTX is forward-compatible with newer supported GPUs. Building the
+# package never requires a local GPU. Override for a higher minimum capability.
+cmake.define.RSC_RUST_CUDA_ARCH = "sm_75"
 build-dir = "build"
 
 # Use abi3audit to catch issues with Limited API wheels

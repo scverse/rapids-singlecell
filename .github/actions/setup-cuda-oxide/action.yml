@@ -1,0 +1,15 @@
+name: Set up pinned Rust CUDA compiler
+description: Install the Rust and cuda-oxide revisions declared by the repository
+runs:
+  using: composite
+  steps:
+    - name: Install host build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang libclang-dev build-essential curl git
+    - name: Install pinned compiler
+      shell: bash
+      run: |
+        bash scripts/install_cuda_oxide.sh
+        echo "${CARGO_HOME:-${HOME}/.cargo}/bin" >> "$GITHUB_PATH"

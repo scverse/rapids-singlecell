@@ -18,32 +18,32 @@ jobs:
     strategy:
       matrix:
         include:
-          # CUDA 12 wheels (compiled with 12.2 for runtime 12.2+ compatibility)
+          # CUDA 12 dependency wheels: the shared Rust backend is built with CUDA 13.0.
           - os: linux-intel
             cuda_major: "12"
-            cuda_minor: "2"
+            cuda_minor: "0"
             runs-on: ubuntu-latest
-            cibw_image: "quay.io/manylinux_cuda/manylinux_2_28_x86_64_cuda12_2:latest"
-            cuda_archs: "75-real;80-real;86-real;89-real;90"
+            cibw_image: "quay.io/manylinux_cuda/manylinux_2_28_x86_64_cuda13_0:latest"
+            cuda_archs: "sm_75"
           - os: linux-arm
             cuda_major: "12"
-            cuda_minor: "2"
+            cuda_minor: "0"
             runs-on: ubuntu-24.04-arm
-            cibw_image: "quay.io/manylinux_cuda/manylinux_2_28_aarch64_cuda12_2:latest"
-            cuda_archs: "75-real;80-real;86-real;89-real;90"
-          # CUDA 13 wheels (native Blackwell support)
+            cibw_image: "quay.io/manylinux_cuda/manylinux_2_28_aarch64_cuda13_0:latest"
+            cuda_archs: "sm_75"
+          # CUDA 13 dependency wheels use the same forward-compatible Turing PTX.
           - os: linux-intel
             cuda_major: "13"
             cuda_minor: "0"
             runs-on: ubuntu-latest
             cibw_image: "quay.io/manylinux_cuda/manylinux_2_28_x86_64_cuda13_0:latest"
-            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;120"
+            cuda_archs: "sm_75"
           - os: linux-arm
             cuda_major: "13"
             cuda_minor: "0"
             runs-on: ubuntu-24.04-arm
             cibw_image: "quay.io/manylinux_cuda/manylinux_2_28_aarch64_cuda13_0:latest"
-            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;120"
+            cuda_archs: "sm_75"
 
     steps:
       - uses: actions/checkout@v5
@@ -58,7 +58,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Detected version: $VERSION"
 
-      - name: Set package name, extras, and CUDA archs for CUDA ${{ matrix.cuda_major }}
+      - name: Set package name and dependency extras for CUDA ${{ matrix.cuda_major }}
         run: |
           python3 - ${{ matrix.cuda_major }} "${{ matrix.cuda_archs }}" "${{ steps.version.outputs.version }}" <<'SCRIPT'
           import re, sys, pathlib
@@ -112,10 +112,10 @@ jobs:
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
           text = remove_toml_array(text, f"rapids-cu{other}")
 
-          # Set CUDA architectures (replace "native" with CI target archs)
+          # Select the minimum GPU capability for portable PTX.
           text = text.replace(
-              'CMAKE_CUDA_ARCHITECTURES = "native"',
-              f'CMAKE_CUDA_ARCHITECTURES = "{cuda_archs}"',
+              'RSC_RUST_CUDA_ARCH = "sm_75"',
+              f'RSC_RUST_CUDA_ARCH = "{cuda_archs}"',
           )
 
           path.write_text(text)
@@ -139,17 +139,14 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.os == 'linux-intel' && matrix.cibw_image || '' }}
           CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.os == 'linux-arm' && matrix.cibw_image || '' }}
           CIBW_ENVIRONMENT: >
-            CUDA_PATH=/usr/local/cuda
+            CUDA_TOOLKIT_PATH=/usr/local/cuda
             LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-            PATH=/usr/local/cuda/bin:$PATH
+            PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
           CIBW_BEFORE_ALL: >
-            dnf install -y --setopt=obsoletes=0
-            libcusolver-devel-${{ matrix.cuda_major }}-${{ matrix.cuda_minor }}
-            libcusparse-devel-${{ matrix.cuda_major }}-${{ matrix.cuda_minor }}
-            libnvjitlink-${{ matrix.cuda_major }}-${{ matrix.cuda_minor }}
+            dnf install -y clang clang-devel curl git gcc-c++ libcurand-devel-13-0
+            && bash {project}/scripts/install_cuda_oxide.sh
           CIBW_BEFORE_BUILD: >
-            python -m pip install -U pip
-            scikit-build-core cmake ninja nanobind
+            python -m pip install -U pip scikit-build-core cmake ninja
           CIBW_TEST_SKIP: "*"
           CIBW_TEST_COMMAND: ""
           # Exclude CUDA runtime libs provided by dependency wheels.
@@ -157,7 +154,10 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND: "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
 
-      - name: Check wheels link no RAPIDS C++ libs
+      - name: Audit Python stable ABI
+        run: pipx run abi3audit --strict --report wheelhouse/*.whl
+
+      - name: Check wheel backend and native linkage
         run: |
           python3 - <<'SCRIPT'
           import pathlib
@@ -171,11 +171,15 @@ jobs:
           if readelf is None:
               raise SystemExit("readelf is required for the RAPIDS linkage check")
 
-          # Kernels use a CuPy-backed scratch allocator and the CUDA toolkit's
-          # bundled CCCL, so no extension may pull in librmm/librapids_logger.
-          banned = ("librmm", "librapids_logger")
+          # The Rust extension loads the CUDA driver dynamically. GPU libraries
+          # are provided by the caller's CuPy/RAPIDS environment.
+          banned = ("librmm", "librapids_logger", "libstdc++", "libcudart")
           failures = []
           for wheel in sorted(pathlib.Path("wheelhouse").glob("*.whl")):
+              with zipfile.ZipFile(wheel) as zf:
+                  extensions = [n for n in zf.namelist() if n.startswith("rapids_singlecell/_cuda/") and n.endswith(".so")]
+                  if extensions != ["rapids_singlecell/_cuda/_rust_cuda.abi3.so"]:
+                      raise SystemExit(f"Unexpected native backend artifacts: {extensions}")
               with tempfile.TemporaryDirectory() as tmp:
                   tmp_path = pathlib.Path(tmp)
                   with zipfile.ZipFile(wheel) as zf:

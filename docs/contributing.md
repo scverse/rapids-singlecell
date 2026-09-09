@@ -4,32 +4,35 @@
 
 ### Prerequisites
 
-- NVIDIA GPU with CUDA support
-- [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
-- A RAPIDS environment (e.g., conda `rapids-26.08` or pip-installed RAPIDS)
-- CUDA toolkit for building from source
-
-```{note}
-Building the CUDA extensions needs only nvcc and the CUDA toolkit — no RAPIDS C++
-package is required. Kernels use a CuPy-backed scratch allocator instead of RMM, and
-the `cub/` headers come from the toolkit's own bundled CCCL, so nothing links
-`librmm` or `librapids_logger`.
-```
+- A Turing or newer NVIDIA GPU with an R580+ driver for execution.
+- A supported RAPIDS/CuPy environment, using CUDA 12 or CUDA 13 dependencies.
+- CUDA Toolkit 13.0+, Clang/libclang, and a native Rust linker for source builds.
+- The pinned Rust/cuda-oxide toolchain in the [Rust backend guide](rust_backend.md).
 
 ### Clone and install
 
 ```bash
 git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
 cd rapids-singlecell
-(uv) pip install -e ".[test]"
+bash scripts/install_cuda_oxide.sh
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.0
+python -m pip install -e '.[test]'
 ```
 
-The documentation notebooks live in a Git submodule. If the repository was
-already cloned without `--recurse-submodules`, initialize them with
-`git submodule update --init` before building the documentation.
+The documentation notebooks live in a Git submodule. If needed, initialize them
+with `git submodule update --init` before building documentation.
 
-The editable install compiles the CUDA kernels for your local GPU architecture.
-After the install, compiled `.so` modules and `.pyi` type stubs are placed in `src/rapids_singlecell/_cuda/`.
+The native implementation is Rust/cuda-oxide with PyO3 bindings. An editable
+build places the shared `_rust_cuda.abi3.so` extension and type stubs under
+`src/rapids_singlecell/_cuda/`. Kernels use portable `sm_75` PTX by default;
+compilation does not require a GPU.
+
+```{toctree}
+:hidden:
+
+rust_backend.md
+```
 
 ### Pre-commit hooks
 
@@ -55,102 +58,87 @@ rapids_singlecell/
 │   ├── pertpy_gpu/              # perturbation analysis (edistance, etc.)
 │   ├── decoupler_gpu/           # pathway analysis
 │   ├── get/                     # CPU/GPU data transfer utilities
-│   └── _cuda/                   # Compiled CUDA kernels (nanobind)
-│       ├── nb_types.h           # Shared ndarray type aliases
-│       ├── <module>/            # Each kernel module (e.g., wilcoxon/)
-│       │   ├── <module>.cu      # nanobind bindings + launch wrappers
-│       │   └── kernels_*.cuh    # CUDA kernel implementations
-│       ├── *.abi3.so            # Compiled modules (gitignored)
-│       ├── *.pyi                # Type stubs (gitignored, auto-generated)
+│   └── _cuda/                   # Stable Python import paths for GPU modules
+│       ├── _rust_cuda.abi3.so    # Shared PyO3 extension (gitignored)
+│       ├── *.pyi                # Installed/copied type stubs (gitignored)
 │       └── py.typed             # PEP 561 marker (gitignored, auto-generated)
+├── rust/
+│   ├── kernels/                 # cuda-oxide device kernels compiled to PTX
+│   └── python/                  # PyO3 bindings and checked-in type stubs
+├── cmake/RustBackend.cmake      # Cargo build and extension packaging
 ├── tests/                       # pytest test suite
 ├── docs/                        # Sphinx documentation
 ├── docker/                      # Docker and CI build images
 ├── conda/                       # Conda environment files
-├── CMakeLists.txt               # CMake build for CUDA extensions
+├── CMakeLists.txt               # Cargo orchestration and packaging
 └── pyproject.toml               # Project metadata and build config
 ```
 
 ## Contributing GPU code
 
-All contributions are welcome, regardless of the GPU programming approach you use.
-You do **not** need to know C++ or nanobind to contribute GPU-accelerated functions.
+New native backend work should use **Rust/cuda-oxide** kernels and **PyO3**
+bindings. Keep custom device kernels in Rust rather than embedding CUDA C++
+strings inside Python.
 
-We accept pull requests using any of the following:
+You can also contribute GPU-accelerated functions with:
 
 - **Pure CuPy** (array API, `cupyx.scipy`, etc.)
-- **CuPy RawKernels**
 - **numba-cuda** kernels
-- **nanobind/CUDA C++** extensions
 
 Please **do not** introduce JAX or PyTorch as dependencies.
 The project is built on the RAPIDS/CuPy stack and we want to keep the dependency footprint "minimal".
 
-The most important thing is a **correct, tested implementation**.
-Performance optimization and porting to nanobind C++ (if needed) can happen in follow-up PRs or directly on your branch by the maintainers.
-Don't let unfamiliarity with the internal kernel system stop you from contributing — a working CuPy implementation is a great starting point.
+Start with a **correct, tested implementation**. Performance optimization and
+porting to Rust kernels can follow. A working CuPy implementation is a useful
+starting point if you are unfamiliar with the native backend.
 
 ```{tip}
 When opening a pull request, please enable **"Allow edits by maintainers"** (the checkbox on the PR creation page).
-This lets us make small fixes, optimizations, or nanobind ports directly on your branch without extra back-and-forth.
+This lets us make small fixes, optimizations, or Rust ports directly on your branch without extra back-and-forth.
 ```
 
-## CUDA kernel architecture (nanobind)
+## GPU backend architecture
 
-### Overview
+### Rust kernels and PyO3 bindings
 
-GPU-accelerated functions are implemented as **nanobind** C++ extensions compiled with CUDA.
-Each kernel module lives in its own subdirectory under `src/rapids_singlecell/_cuda/` and consists of:
+Device kernels live in `rust/kernels/` and compile to PTX with cuda-oxide.
+Native PyO3 bindings live in `rust/python/`, borrow CuPy memory and CUDA
+streams, and expose the existing `rapids_singlecell._cuda` module interfaces.
+The bindings share array validation in `rust/python/src/array.rs` and CUDA
+module caching, context handling, and launches in `rust/python/src/runtime.rs`.
+The [Rust backend guide](rust_backend.md) documents toolchain requirements,
+module organization, compatibility, and validation.
 
-- A `.cu` file with nanobind bindings and kernel launch wrappers
-- One or more `.cuh` headers with the actual CUDA kernel implementations
+When adding or porting a native kernel:
 
-The shared header `nb_types.h` provides type aliases used across all modules:
+1. Implement the device operation in `rust/kernels/`, documenting pointer,
+   bounds, alignment, and launch requirements for unsafe code.
+2. Add PyO3 bindings and checked-in type stubs under `rust/python/`. Preserve
+   the Python signatures, dtype/layout dispatch, output ownership, and CUDA
+   stream semantics of existing functions.
+3. Register the module in the shared `_rust_cuda` extension and the Python
+   `_cuda` package, and update `cmake/RustBackend.cmake` packaging as needed.
+   Include its stub in wheel and editable installs, and embed the required PTX.
+4. For a new module, register its name in `__all__` in
+   `src/rapids_singlecell/_cuda/__init__.py` for lazy loading.
+5. Rebuild the package and run GPU tests with
+   `--require-rust-backend` to verify that migrated imports use the shared Rust
+   extension before collecting tests.
+6. Run direct GPU tests and public Python API tests with a timeout, and compare
+   performance for representative workloads before replacing a default. CPU
+   import-routing checks run independently with
+   `python -m pytest tests/cpu --confcutdir=tests/cpu --timeout=120`.
 
-```cpp
-cuda_array<T>                  // no contiguity constraint
-cuda_array_c<T>                // C-contiguous (row-major)
-cuda_array_f<T>                // F-contiguous (column-major)
-cuda_array_contig<T, Contig>   // parameterized contiguity
-```
+Validate allocation bounds, shapes, dtypes, layout, device, and incompatible
+overlap before unsafe launches. Preserve supported managed-memory allocations
+and use the caller's CuPy allocator for scratch storage. Borrowed arrays and
+streams must stay alive until asynchronous work completes; account for that
+lifetime when releasing temporary allocations. Restore the caller's CUDA
+context and avoid adding synchronization to asynchronous APIs.
 
-Choose the appropriate alias based on how the kernel accesses data.
-Use `cuda_array_f` for kernels that index column-by-column (e.g., `data + col * n_rows`), and `cuda_array_c` for row-major access.
-nanobind will reject arrays with the wrong memory layout at runtime.
+### Python imports
 
-### Adding a new kernel
-
-1. Create a directory under `src/rapids_singlecell/_cuda/your_module/`
-2. Write the kernel header (`kernels_your_module.cuh`) and bindings (`your_module.cu`)
-3. Include `"../nb_types.h"` for the shared type aliases
-4. Register the module in `CMakeLists.txt`:
-   ```cmake
-   add_nb_cuda_module(_your_module_cuda src/rapids_singlecell/_cuda/your_module/your_module.cu)
-   ```
-5. Add the module name to the `__all__` list in `src/rapids_singlecell/_cuda/__init__.py`:
-   ```python
-   __all__ = [
-       ...,
-       "_your_module_cuda",
-   ]
-   ```
-   This registers the module for lazy loading — imports return `None` instead of raising `ImportError` when the compiled extension is unavailable (e.g., docs builds without a GPU).
-6. Rebuild: `uv pip install -e .`
-
-The `add_nb_cuda_module` helper automatically handles:
-- Stable ABI + LTO compilation
-- Linking against CUDA runtime
-- Installing the `.so` into the wheel
-- Generating `.pyi` type stubs (install-time for wheels, build-time for editable installs)
-- Copying the built module into the source tree for editable installs
-
-### Kernel conventions
-
-- Each kernel launch wrapper is a `static inline` function in the `.cu` file
-- Use `nb::kw_only()` to separate data arguments from configuration arguments
-- Accept `std::uintptr_t stream` as the last parameter (default `0`) to support stream-based execution
-- Keep kernel logic in `.cuh` headers, bindings in `.cu` files
-- **Import `_cuda` modules via `rapids_singlecell._cuda`**. The `_cuda` package uses lazy loading with automatic `ImportError` handling — if the compiled extension is unavailable (e.g., docs builds without a GPU), the import returns `None` instead of raising an error:
+- **Import `_cuda` modules via `rapids_singlecell._cuda`**. Native modules resolve to the shared Rust extension; an absent extension (for example in a documentation build) resolves to `None`. A present extension that fails to load raises its import error:
 
   ```python
   from rapids_singlecell._cuda import _my_module_cuda as _my
@@ -205,7 +193,7 @@ For quick iteration during development, you can pass specific test paths:
 
 ```{important}
 Always set a timeout when running tests with new CUDA kernels, as they may hang on launch failures.
-Tests have a default 120-second timeout configured in `pyproject.toml`.
+Tests have a default 60-second timeout configured in `pyproject.toml`; use `--timeout=120` when needed.
 ```
 
 ### Test guidelines
@@ -246,43 +234,32 @@ Wheels are built via [cibuildwheel](https://cibuildwheel.pypa.io/) in GitHub Act
 The CI renames the package and adjusts optional dependencies per CUDA version using an inline Python script in `publish.yml`.
 
 Each wheel contains:
-- Compiled `.abi3.so` modules (stable ABI, one wheel per platform for all Python 3.12+ versions)
+- One `_rust_cuda.abi3.so` extension (stable ABI for supported Python 3.12+ versions)
 - `.pyi` type stubs for IDE support
 - `py.typed` PEP 561 marker
 
-Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via Hatchling's wheel target configuration in `pyproject.toml`.
-They are included in the source distribution for self-compilation.
+Rust sources and the pinned Cargo lockfile are included in source distributions.
+Wheels contain the compiled extension and exclude stale editable native artifacts.
 
-### CUDA architectures
+### CUDA architectures and dependency variants
 
-CUDA 12 wheels target: `75` (Turing), `80` (Ampere), `86` (Ampere), `89` (Ada), `90` (Hopper + PTX for forward compatibility).
-CUDA 13 wheels target: `75` (Turing), `80` (Ampere), `86` (Ampere), `89` (Ada), `90` (Hopper), `100` (Blackwell), `120` (Blackwell).
-
-Source builds (`pip install rapids-singlecell`) compile for the local GPU architecture by default (`CMAKE_CUDA_ARCHITECTURES=native`).
+Both CUDA dependency variants are built with CUDA Toolkit 13.0 and portable
+`sm_75` PTX, supporting Turing through later compatible GPU generations through
+driver JIT compilation. Both require driver R580+; CUDA 12 libraries remain
+supported on those newer drivers. Source builds can select a higher minimum
+capability with `SKBUILD_CMAKE_DEFINE_RSC_RUST_CUDA_ARCH`.
 
 ### Docker containers
 
-The `docker/` directory contains two types of Dockerfiles:
+`Dockerfile.deps` creates a matching CUDA 12 or CUDA 13 RAPIDS environment.
+`Dockerfile` builds the native wheel in a separate CUDA 13.0/Rust build stage,
+then installs only the wheel in that environment. Compiler caches and development
+tools stay out of the application image.
 
-**User-facing containers** (for running rapids-singlecell):
-
-| File | Purpose |
-|---|---|
-| `Dockerfile.deps` | Base image with conda RAPIDS environment + pip dependencies. Uses `nvidia/cuda:*-devel` for CUDA toolkit access. |
-| `Dockerfile` | Final image that builds on `rapids-singlecell-deps` and compiles rapids-singlecell from source for all supported GPU architectures. |
-
-These are built by `docker-push.sh`, which strips the `rapids-singlecell` pip line from the conda environment file and builds both images in sequence.
-
-**CI manylinux images** (for building PyPI wheels):
-
-Wheels are built by cibuildwheel against prebuilt manylinux + CUDA images published at
-`quay.io/manylinux_cuda/manylinux_2_28_<arch>_cuda<ver>`. `publish.yml` selects the image
-per matrix entry via `cibw_image`.
-
-These images ship nvcc, cudart, and cublas (plus gcc-toolset-12 on the CUDA 12.2 image,
-since nvcc on 12.2 requires GCC 12 or older). The remaining libraries rapids-singlecell
-links against (cusolver, cusparse, and nvJitLink) are installed at build time via
-`CIBW_BEFORE_ALL` in `publish.yml`.
+The wheel workflow similarly uses CUDA 13.0 manylinux images for both dependency
+families. It installs the pinned compiler with `scripts/install_cuda_oxide.sh`,
+checks that each wheel contains exactly one Rust extension, and audits native
+linkage and the Python stable ABI.
 
 ### Release process
 

@@ -14,6 +14,10 @@ on:
       - '.github/workflows/docker.yml'
       - 'conda/*.yml'
       - 'pyproject.toml'
+      - 'rust/**'
+      - 'cmake/**'
+      - 'scripts/install_cuda_oxide.sh'
+      - 'CMakeLists.txt'
   pull_request:
     branches: [main]
     paths:
@@ -21,6 +25,10 @@ on:
       - '.github/workflows/docker.yml'
       - 'conda/*.yml'
       - 'pyproject.toml'
+      - 'rust/**'
+      - 'cmake/**'
+      - 'scripts/install_cuda_oxide.sh'
+      - 'CMakeLists.txt'
   release:
     types: [published]
 
@@ -182,7 +190,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            CUDA_ARCHS=${{ matrix.CUDA_SUFFIX.label == 'cuda12' && '75-real;80-real;86-real;89-real;90' || '75-real;80-real;86-real;89-real;90-real;100-real;120' }}
+            RSC_RUST_CUDA_ARCH=sm_75
             RSC_VERSION=${{ steps.source-version.outputs.version }}
           #cache-from: type=registry,ref=ghcr.io/${{ github.repository }}
           build-contexts: |

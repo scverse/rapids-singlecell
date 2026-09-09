@@ -20,10 +20,40 @@ intentionally left alone (it synthesizes data per-call with varying parameters).
 from __future__ import annotations
 
 import functools
+import importlib
 
+import pytest
 import scanpy as sc
 
 _CACHED_LOADERS = ("pbmc3k", "pbmc3k_processed", "pbmc68k_reduced", "paul15")
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--require-rust-backend",
+        action="store_true",
+        help="Fail before collection unless every native module uses the Rust backend.",
+    )
+
+
+def pytest_sessionstart(session):
+    if not session.config.getoption("--require-rust-backend"):
+        return
+    try:
+        backend = importlib.import_module("rapids_singlecell._cuda._rust_cuda")
+        package = importlib.import_module("rapids_singlecell._cuda")
+        active = backend.__backend__ == "rust" and set(backend.__all__) == set(
+            package.__all__
+        )
+        for name in backend.__all__:
+            routed = importlib.import_module(f"rapids_singlecell._cuda.{name}")
+            active = active and routed is getattr(backend, name)
+    except (ImportError, AttributeError) as exc:
+        raise pytest.UsageError(
+            f"Rust backend is required but failed to load: {exc}"
+        ) from exc
+    if not active:
+        raise pytest.UsageError("Native modules are not all using the Rust backend")
 
 
 def _memoize_loader(loader):

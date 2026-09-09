@@ -829,7 +829,7 @@ def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
             )
 
 
-# Host-dense OVR has only float32/float64 nanobind overloads.
+# Native host-dense OVR accepts float32/float64 inputs.
 # Other numpy numeric dtypes must cast to float32 rather than raise.
 @pytest.mark.parametrize(
     "data_dtype", [np.int32, np.int64, np.uint16, np.float16, bool]

@@ -29,14 +29,21 @@ PanGPA.log
 /build.ninja
 /.ninja_deps
 /.ninja_log
-/libnanobind-static.a
-/install_manifest__mean_var_cuda.txt
 /_skbuild/
 /*.egg-info/
 
+# Rust compiler caches and generated CUDA device artifacts
+/rust/**/target/
+/rust/**/*.ptx
+/rust/**/*.cubin
+/rust/**/*.ll
+/rust/**/*.ltoir
+
 # Compiled CUDA extensions and stubs copied for editable installs
 *.so
+*.so.tmp
 *.pyi
+!/rust/python/*.pyi
 py.typed
 
 # Test/coverage caches

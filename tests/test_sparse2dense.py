@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cupy as cp
+import pytest
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 
 from rapids_singlecell.preprocessing._utils import _sparse_to_dense
@@ -67,3 +68,30 @@ def test_sparse2dense_random_shapes_seeded():
             cp.testing.assert_array_equal(got_csr_f, exp)
             cp.testing.assert_array_equal(got_csc_c, exp)
             cp.testing.assert_array_equal(got_csc_f, exp)
+
+
+@pytest.mark.parametrize("sparse_type", [csr_matrix, csc_matrix])
+@pytest.mark.parametrize("order", ["C", "F"])
+@pytest.mark.parametrize("shape", [(0, 0), (0, 4), (3, 0), (3, 4)])
+def test_sparse2dense_empty(sparse_type, order, shape):
+    sparse = sparse_type(shape, dtype=cp.float32)
+
+    dense = _sparse_to_dense(sparse, order=order)
+
+    assert dense.shape == shape
+    assert dense.flags.c_contiguous if order == "C" else dense.flags.f_contiguous
+    cp.testing.assert_array_equal(dense, cp.zeros(shape, dtype=cp.float32))
+
+
+@pytest.mark.parametrize("sparse_type", [csr_matrix, csc_matrix])
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_sparse2dense_uses_current_stream(sparse_type, order):
+    stream = cp.cuda.Stream(non_blocking=True)
+    with stream:
+        expected = cp.arange(64 * 32, dtype=cp.float64).reshape(64, 32)
+        sparse = sparse_type(expected)
+        result = _sparse_to_dense(sparse, order=order)
+        observed = result.copy()
+    stream.synchronize()
+
+    cp.testing.assert_array_equal(observed, expected)

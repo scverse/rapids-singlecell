@@ -9,11 +9,6 @@ declare -A cuda_versions=(
     [cu13]="13.3.0"
 )
 
-declare -A cuda_archs=(
-    [cu12]="75-real;80-real;86-real;89-real;90"
-    [cu13]="75-real;80-real;86-real;89-real;90-real;100-real;120"
-)
-
 declare -A conda_labels=(
     [cu12]="cuda12"
     [cu13]="cuda13"
@@ -24,6 +19,7 @@ for pkg in cu12 cu13; do
 
     grep -v -- '- rapids-singlecell' conda/rsc_rapids_${rapids_version}_${conda_labels[$pkg]}.yml > docker/rsc_rapids.yml
     docker build \
+        --build-context source=. \
         --build-arg CUDA_VER="${ver}" \
         -t rapids-singlecell-deps-${pkg}:latest \
         -f docker/Dockerfile.deps \
@@ -31,7 +27,8 @@ for pkg in cu12 cu13; do
     rm docker/rsc_rapids.yml
 
     docker build \
-        --build-arg CUDA_ARCHS="${cuda_archs[$pkg]}" \
+        --build-context source=. \
+        --build-arg RSC_RUST_CUDA_ARCH=sm_75 \
         --build-context rapids-singlecell-deps=docker-image://rapids-singlecell-deps-${pkg}:latest \
         -t rapids-singlecell-${pkg}:latest \
         -f docker/Dockerfile \

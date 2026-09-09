@@ -109,13 +109,11 @@ def test_normalize_pearson_residuals_values(sparsity_func, dtype, theta, clip):
 def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
     """Regression test: float64 precision of the sparse Pearson-residual kernels.
 
-    ``sparse_norm_res_csr_kernel`` / ``sparse_norm_res_csc_kernel`` (in
-    ``_cuda/pr/kernels_pr.cuh``) previously divided by the single-precision
-    intrinsic ``sqrtf``. Because the kernels are templated on the element
-    type, a ``float64`` instantiation silently narrowed the variance term
-    to ``float32``, capping accuracy at ~7 significant digits regardless of
-    the requested dtype. The ``rtol``/``atol`` of 1e-9 below is tight enough
-    to fail on a single-precision result and pass on a genuine float64 one.
+    The legacy implementation used a single-precision square root, silently
+    narrowing the variance term to float32 even for float64 input. This capped
+    accuracy at ~7 significant digits regardless of the requested dtype.
+    The ``rtol``/``atol`` of 1e-9 below preserves float64 precision in the Rust
+    implementation and catches any reintroduction of that narrowing.
     """
     rng = np.random.default_rng(0)
     counts = rng.poisson(0.3, size=(300, 200)).astype(np.float64)
