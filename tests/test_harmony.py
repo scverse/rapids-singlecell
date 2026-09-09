@@ -170,6 +170,38 @@ def test_harmony_stratified_sample_known_quotas():
     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("batch_key", ["stratum", ["row", "column"]])
+def test_harmony_initialization_sample_covers_strata(batch_key, monkeypatch):
+    rng = np.random.default_rng(0)
+    strata = np.tile(np.arange(9), 2)
+    adata = ad.AnnData(
+        X=None,
+        obs=pd.DataFrame(
+            {
+                "stratum": pd.Categorical(strata, categories=np.arange(12)),
+                "row": strata // 3,
+                "column": strata % 3,
+            },
+            index=[f"cell_{i}" for i in range(strata.size)],
+        ),
+        obsm={"X_pca": rng.normal(size=(strata.size, 4)).astype(np.float32)},
+    )
+    monkeypatch.setattr(harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", 2)
+    rsc.pp.harmony_integrate(
+        adata,
+        batch_key,
+        n_clusters=2,
+        max_iter_harmony=1,
+        max_iter_clustering=2,
+        block_proportion=1.0,
+        random_state=0,
+    )
+
+    assert adata.obsm["X_pca_harmony"].shape == (strata.size, 4)
+    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
+
+
 def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
     n_covariates = 64
     batch_codes = np.stack(

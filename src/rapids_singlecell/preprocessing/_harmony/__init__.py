@@ -478,6 +478,9 @@ def _initialize_centroids(
     # that contains every observed batch stratum: reproducible and cheaper than
     # fitting every cell.
     n_init_cells = min(Z_norm.shape[0], _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
+    if n_init_cells < cat_offsets.size - 1:
+        n_strata = int(cp.count_nonzero(cp.diff(cat_offsets)))
+        n_init_cells = max(n_init_cells, n_strata)
     Z_init = Z_norm
     if n_init_cells < Z_norm.shape[0]:
         sample_indices = _stratified_sample_indices(
