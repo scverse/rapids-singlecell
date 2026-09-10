@@ -10,6 +10,11 @@
 .. autosummary::
     :toctree: generated
 
+    gr.spatial_neighbors_knn
+    gr.spatial_neighbors_radius
+    gr.spatial_neighbors_delaunay
+    gr.spatial_neighbors_grid
+    gr.SpatialNeighborsResult
     gr.spatial_autocorr
     gr.co_occurrence
     gr.ligrec

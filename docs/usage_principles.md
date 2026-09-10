@@ -108,6 +108,7 @@ res, res_var = distance.pairwise(
 rapids_singlecell includes GPU-accelerated implementations of common `squidpy` workflows under {mod}`rapids_singlecell.gr` like:
 
 ```python
+rsc.gr.spatial_neighbors_knn(adata, n_neighs=6)
 rsc.gr.spatial_autocorr(
     adata,
     connectivity_key="spatial_connectivities",
