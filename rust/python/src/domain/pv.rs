@@ -15,6 +15,20 @@ fn rev_cummin64(
 
     let x = read(Some(x), &cupy, "x", "double", false)?;
     let out = read(Some(out), &cupy, "out", "double", false)?;
+    let elements = n_rows
+        .checked_mul(m)
+        .ok_or_else(|| PyValueError::new_err("reverse cumulative minimum dimensions overflow"))?;
+    if elements > x.len() || elements > out.len() {
+        return Err(PyValueError::new_err(
+            "reverse cumulative minimum dimensions exceed an allocation",
+        ));
+    }
+    if x.pointer() != out.pointer() {
+        out.array
+            .as_ref()
+            .unwrap()
+            .require_disjoint(x.array.as_ref().unwrap())?;
+    }
     launch(
         &cupy,
         &[&x, &out],

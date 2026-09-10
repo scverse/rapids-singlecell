@@ -10,6 +10,7 @@ use pyo3::{
 };
 use std::ffi::c_void;
 
+#[derive(Clone, Copy)]
 pub enum Arg {
     P(u64),
     N(u64),
@@ -17,7 +18,7 @@ pub enum Arg {
     F(f64),
 }
 impl Arg {
-    fn pointer(&mut self) -> *mut c_void {
+    pub(crate) fn pointer(&mut self) -> *mut c_void {
         match self {
             Self::P(x) | Self::N(x) => (x as *mut u64).cast(),
             Self::U(x) => (x as *mut u32).cast(),
@@ -241,8 +242,46 @@ pub fn stats(
     out_cols: u64,
     col_offset: u64,
     stream: usize,
+    column_blocks: bool,
 ) -> PyResult<()> {
-    let x = floating(x, cp, "block", Layout::F)?;
+    stats_with_zero_policy(
+        cp,
+        x,
+        codes,
+        mask,
+        sums,
+        squares,
+        nnz,
+        total,
+        total_nnz,
+        out_cols,
+        col_offset,
+        stream,
+        column_blocks,
+        false,
+    )
+}
+
+/// Streaming aggregation omits zero values, preserving its original fast path
+/// and signed-zero accumulator behavior. Ranking statistics keep every value.
+#[allow(clippy::too_many_arguments)]
+pub fn stats_with_zero_policy(
+    cp: &Bound<'_, PyModule>,
+    x: &Bound<'_, PyAny>,
+    codes: &Bound<'_, PyAny>,
+    mask: Option<&Bound<'_, PyAny>>,
+    sums: Option<&Bound<'_, PyAny>>,
+    squares: Option<&Bound<'_, PyAny>>,
+    nnz: Option<&Bound<'_, PyAny>>,
+    total: Option<&Bound<'_, PyAny>>,
+    total_nnz: Option<&Bound<'_, PyAny>>,
+    out_cols: u64,
+    col_offset: u64,
+    stream: usize,
+    column_blocks: bool,
+    skip_zeros: bool,
+) -> PyResult<()> {
+    let x = floating(x, cp, "block", Layout::Contiguous)?;
     let (rows, cols) = matrix(&x, "block")?;
     if col_offset
         .checked_add(cols)
@@ -295,12 +334,19 @@ pub fn stats(
     let mut arrays = vec![&x, &c];
     arrays.extend(m.iter());
     arrays.extend(outputs.iter().flatten());
-    let c_order = 0;
-    // Callers materialize F-order tiles before entering this shared operation.
+    let c_order = u32::from(x.c_contiguous) | (u32::from(skip_zeros) << 1);
     launch(
         cp,
-        "rank_stats",
-        x.len,
+        if column_blocks {
+            "rank_stats_columns"
+        } else {
+            "rank_stats"
+        },
+        if column_blocks {
+            product(&[cols, 256])?
+        } else {
+            x.len
+        },
         stream,
         &arrays,
         &mut [

@@ -63,7 +63,7 @@ pub fn histogram_dense(
     launch(
         cp,
         "rank_hist_dense",
-        rows * cols,
+        product(&[cols, 256])?,
         stream,
         &[&x, &codes, &h],
         &mut [
@@ -124,10 +124,17 @@ pub fn histogram_sparse(
     for a in [&d, &ix, &p, &codes] {
         h.require_disjoint(a)?;
     }
+    let segments = if csc { p.len.saturating_sub(1) } else { rows };
+    // Keep a CSC column's contended histogram on its own block. Short CSR
+    // rows benefit from sharing a block because their writes span columns.
+    let full_block = csc || (segments > 0 && d.len / segments >= 128);
     launch(
         cp,
         "rank_hist_sparse",
-        product(&[if csc { cols } else { rows }, 32])?,
+        product(&[
+            if csc { cols } else { rows },
+            if full_block { 256 } else { 32 },
+        ])?,
         stream,
         &[&d, &ix, &p, &codes, &h],
         &mut [
@@ -147,6 +154,7 @@ pub fn histogram_sparse(
             Arg::U(wide(d.dtype)?),
             Arg::U(integer(&ix)?),
             Arg::U(csc as u32),
+            Arg::U(full_block as u32),
         ],
     )
 }

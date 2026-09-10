@@ -1,6 +1,6 @@
 //! Native replacements for formerly embedded elementwise and reduction kernels.
 #![allow(clippy::too_many_arguments)]
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicI32};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF64, DeviceAtomicI32};
 use cuda_device::{kernel, thread, warp};
 
 macro_rules! float_kernels {
@@ -221,8 +221,7 @@ macro_rules! index_kernels {
                     let value = unsafe { *data.add(i as usize) };
                     if mode == 2 {
                         if value != 0.0 {
-                            unsafe { DeviceAtomicF32::from_ptr(counts.add(g as usize)) }
-                                .fetch_add(1.0, AtomicOrdering::Relaxed);
+                            unsafe { crate::atomics::add_f32(counts.add(g as usize), 1.0) };
                         }
                     } else {
                         unsafe { DeviceAtomicF64::from_ptr(sums.add(g as usize)) }

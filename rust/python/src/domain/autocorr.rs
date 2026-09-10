@@ -84,8 +84,16 @@ fn morans_sparse(
             &mean_array,
             &num,
         ],
-        "domain_autocorr_morans_sparse",
-        n_samples * 128,
+        if n_features > 1024 {
+            if data_values.kind() == 0 {
+                "domain_autocorr_morans_sparse_wide_f32"
+            } else {
+                "domain_autocorr_morans_sparse_wide_f64"
+            }
+        } else {
+            "domain_autocorr_morans_sparse"
+        },
+        n_samples * 1024,
         stream,
         vec![
             adj_row_ptr.pointer(),
@@ -181,8 +189,16 @@ fn gearys_sparse(
             &data_values,
             &num,
         ],
-        "domain_autocorr_gearys_sparse",
-        n_samples * 128,
+        if n_features > 1024 {
+            if data_values.kind() == 0 {
+                "domain_autocorr_gearys_sparse_wide_f32"
+            } else {
+                "domain_autocorr_gearys_sparse_wide_f64"
+            }
+        } else {
+            "domain_autocorr_gearys_sparse"
+        },
+        n_samples * 1024,
         stream,
         vec![
             adj_row_ptr.pointer(),

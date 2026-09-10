@@ -1,6 +1,21 @@
 //! Native nn_descent CUDA kernels.
 use super::*;
 
+// Match CUDA rsqrtf's original PTX at the release sm75 floor. The cuda-oxide
+// scalar intrinsic currently has an unnecessarily restrictive sm80 catalog gate.
+#[inline(always)]
+fn inverse_norm(value: f32) -> f32 {
+    if value > 0.0 {
+        let result: f32;
+        unsafe {
+            cuda_device::ptx_asm!("rsqrt.approx.f32 %0, %1;", out("=f") result, in("f") value);
+        }
+        result
+    } else {
+        0.0
+    }
+}
+
 /// # Safety
 /// The caller must supply validated, aligned device allocations matching each
 /// descriptor and keep them alive until the borrowed stream completes.
@@ -62,7 +77,8 @@ pub unsafe fn domain_nn_descent_sqeuclidean(
             while d < n_features {
                 let x = data.single(a * n_features + d);
                 let y = data.single(b * n_features + d);
-                val += (x - y) * (x - y);
+                let difference = x - y;
+                val = difference.mul_add(difference, val);
                 d += 1;
             }
             let dist = val;
@@ -134,23 +150,12 @@ pub unsafe fn domain_nn_descent_cosine(
             while d < n_features {
                 let x = data.single(a * n_features + d);
                 let y = data.single(b * n_features + d);
-                val += x * y;
-                norm_a += x * x;
-                norm_b += y * y;
+                val = x.mul_add(y, val);
+                norm_a = x.mul_add(x, norm_a);
+                norm_b = y.mul_add(y, norm_b);
                 d += 1;
             }
-            let dist = 1.0
-                - val
-                    * if norm_a > 0.0 {
-                        1.0 / norm_a.sqrt()
-                    } else {
-                        0.0
-                    }
-                    * if norm_b > 0.0 {
-                        1.0 / norm_b.sqrt()
-                    } else {
-                        0.0
-                    };
+            let dist = 1.0 - val * inverse_norm(norm_a) * inverse_norm(norm_b);
             out.put_single(p, dist);
         }
         p += stride();
@@ -217,7 +222,7 @@ pub unsafe fn domain_nn_descent_inner(
             while d < n_features {
                 let x = data.single(a * n_features + d);
                 let y = data.single(b * n_features + d);
-                val += x * y;
+                val = x.mul_add(y, val);
                 d += 1;
             }
             let dist = val;

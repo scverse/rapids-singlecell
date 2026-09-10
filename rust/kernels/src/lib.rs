@@ -1,5 +1,6 @@
 //! Device kernels compiled to PTX by cuda-oxide, separately from the PyO3 host.
 
+mod atomics;
 pub mod domain;
 pub mod elementwise;
 pub mod gmm;
@@ -8,9 +9,13 @@ pub mod harmony_correction;
 pub mod preprocessing;
 pub mod rank_stream;
 pub mod ranking;
+mod ranking_ovo;
+mod ranking_ovr;
 mod ranking_sort;
 pub mod sparse2dense;
+mod sparse_csr;
 mod sparse_ovo;
+mod sparse_ovo_dense;
 mod sparse_ovr;
 
 use cuda_device::{kernel, thread};

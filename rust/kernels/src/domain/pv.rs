@@ -21,32 +21,30 @@ pub unsafe fn domain_pv_rev_cummin64(
     out_rows: u64,
     out_cols: u64,
 ) {
-    let x = Buffer {
-        pointer: x,
-        len: x_len,
-        kind: x_kind,
-        order: x_order,
-        rows: x_rows,
-        cols: x_cols,
-    };
-    let out = Buffer {
-        pointer: out,
-        len: out_len,
-        kind: out_kind,
-        order: out_order,
-        rows: out_rows,
-        cols: out_cols,
-    };
-    let mut r = tid();
-    while r < n_rows {
-        let mut j = m;
-        let mut v = f64::INFINITY;
-        while j > 0 {
-            j -= 1;
-            let q = x.f(r * m + j);
-            v = if q < v { q } else { v };
-            out.put(r * m + j, v);
+    // The typed host API checks both full extents once before this launch.
+    let x = x as *const f64;
+    let out = out as *mut f64;
+    let mut row = tid();
+    while row < n_rows {
+        if m != 0 {
+            let input = unsafe { x.add((row * m) as usize) };
+            let output = unsafe { out.add((row * m) as usize) };
+            // A trailing NaN propagates left; earlier NaNs fail the original
+            // ordered comparison. Reading before writing supports in-place use.
+            let mut column = m - 1;
+            let mut minimum = unsafe { *input.add(column as usize) };
+            unsafe {
+                *output.add(column as usize) = minimum;
+            }
+            while column > 0 {
+                column -= 1;
+                let value = unsafe { *input.add(column as usize) };
+                minimum = if value < minimum { value } else { minimum };
+                unsafe {
+                    *output.add(column as usize) = minimum;
+                }
+            }
         }
-        r += stride();
+        row += stride();
     }
 }

@@ -1,30 +1,8 @@
 //! Sparse row/column scatter with additive handling of duplicate indices.
 
+use crate::atomics::add_f32 as atomic_add_f32;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF64};
-use cuda_device::{kernel, ptx_asm, thread};
-
-/// Add with the same native float atomic instruction as CUDA `atomicAdd`.
-///
-/// cuda-oxide's float32 `fetch_add` currently lowers to a CAS loop that
-/// preserves subnormals. The native instruction preserves the existing
-/// backend's flush-to-zero behavior and avoids that loop under contention.
-///
-/// # Safety
-/// `out` must point to an aligned, valid global-memory f32 allocation, with
-/// no concurrent non-atomic accesses to that location.
-#[inline(always)]
-unsafe fn atomic_add_f32(out: *mut f32, value: f32) {
-    let _previous: f32;
-    unsafe {
-        ptx_asm!(
-            "atom.global.add.f32 %0, [%1], %2;",
-            out("=f") _previous,
-            in("l") out as u64,
-            in("f") value,
-            clobber("memory"),
-        );
-    }
-}
+use cuda_device::{kernel, thread};
 
 /// # Safety
 /// `out` must point to an aligned, valid global-memory f64 allocation, with

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, fs, path::PathBuf};
+use std::{collections::BTreeSet, env, fmt::Write, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RSC_CUDA_OXIDE_PTX");
@@ -20,6 +20,23 @@ fn main() {
         expected.difference(&actual).collect::<Vec<_>>(),
         actual.difference(&expected).collect::<Vec<_>>()
     );
-    let destination = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("kernels.ptx");
-    fs::write(destination, ptx).expect("failed to embed cuda-oxide PTX");
+    let directory = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    // CUDA reads the kernel's parameter count from the image, not the host
+    // argument slice. Cache its arity so stale internal call sites fail with a
+    // Python error instead of letting the driver read beyond that host slice.
+    let mut abi = String::from("fn kernel_arity(name: &str) -> Option<usize> { match name {\n");
+    for entry in ptx.split(".entry ").skip(1) {
+        let (name, tail) = entry.split_once('(').expect("PTX entry signature");
+        let parameters = tail.split_once(')').expect("PTX parameter list").0;
+        writeln!(
+            abi,
+            "{:?} => Some({}),",
+            name.trim(),
+            parameters.matches(".param ").count()
+        )
+        .unwrap();
+    }
+    abi.push_str("_ => None, } }\n");
+    fs::write(directory.join("kernel_abi.rs"), abi).expect("failed to emit PTX ABI");
+    fs::write(directory.join("kernels.ptx"), ptx).expect("failed to embed cuda-oxide PTX");
 }

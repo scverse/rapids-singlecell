@@ -21,6 +21,15 @@ fn gram_csr_upper(
     let data = read(Some(data), &cupy, "data", "T", false)?;
     let out = read(Some(out), &cupy, "out", "T", false)?;
     same(&out, &data)?;
+    let matrix_size = ncols
+        .checked_mul(ncols)
+        .ok_or_else(|| PyValueError::new_err("Gram matrix dimensions overflow"))?;
+    if nrows >= indptr.len() || matrix_size > out.len() {
+        return Err(PyValueError::new_err(
+            "Gram matrix dimensions exceed an input or output allocation",
+        ));
+    }
+
     launch(
         &cupy,
         &[&indptr, &index, &data, &out],

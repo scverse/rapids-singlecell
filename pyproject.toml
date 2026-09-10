@@ -204,7 +204,7 @@ repair-wheel-command = [
 
 [tool.codespell]
 skip = '*.ipynb,*.csv'
-ignore-words-list = "nd"
+ignore-words-list = "nd,disjointness"
 
 [tool.coverage.run]
 data_file = "test-data/coverage"

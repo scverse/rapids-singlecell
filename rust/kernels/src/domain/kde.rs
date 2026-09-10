@@ -39,6 +39,10 @@ pub unsafe fn domain_kde_gaussian_kde_2d(
         rows: out_rows,
         cols: out_cols,
     };
+    // The pair loop can use direct typed loads after this one extent check.
+    if n > xy.len / 2 || n > out.len {
+        return;
+    }
     let a = f64::from_bits(a);
     let b = f64::from_bits(b);
     let c = f64::from_bits(c);
@@ -46,14 +50,14 @@ pub unsafe fn domain_kde_gaussian_kde_2d(
         let (a, b, c) = (a as f32, b as f32, c as f32);
         let mut i = tid();
         while i < n {
-            let xi = xy.single(i * 2);
-            let yi = xy.single(i * 2 + 1);
+            let xi = unsafe { *(xy.pointer as *const f32).add((i * 2) as usize) };
+            let yi = unsafe { *(xy.pointer as *const f32).add((i * 2 + 1) as usize) };
             let mut maximum = f32::NEG_INFINITY;
             let mut sum = 0.0f32;
             let mut j = 0;
             while j < n {
-                let dx = xi - xy.single(j * 2);
-                let dy = yi - xy.single(j * 2 + 1);
+                let dx = xi - unsafe { *(xy.pointer as *const f32).add((j * 2) as usize) };
+                let dy = yi - unsafe { *(xy.pointer as *const f32).add((j * 2 + 1) as usize) };
                 let q = a * dx * dx + b * dx * dy + c * dy * dy;
                 if q > maximum {
                     sum = sum * (maximum - q).exp() + 1.0;

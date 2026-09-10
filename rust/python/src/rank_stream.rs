@@ -1,71 +1,24 @@
 //! Bounded host-to-device streaming for aggregation and histograms.
 //!
-//! Two CuPy streams overlap staging and native reductions. Each slot retains
+//! Bounded CuPy streams overlap staging and native reductions. Each slot retains
 //! its host and device allocations until the prior batch has completed, and
 //! all work completes before returning to Python, preserving the host API.
 #![allow(non_snake_case, clippy::too_many_arguments)]
+mod dense;
 use crate::{
-    array::{Dtype, Layout},
+    array::{Array, Dtype, Layout},
     rank_support::*,
-    runtime, wilcoxon_binned,
+    staging::BatchStreams,
+    wilcoxon_binned,
 };
+use dense::dense_host;
 use pyo3::{
     exceptions::{PyMemoryError, PyTypeError, PyValueError},
     prelude::*,
-    types::PyDict,
 };
-use std::cell::Cell;
-thread_local! {static HOST_WORKERS:Cell<i32>=const{Cell::new(0)};}
 #[pyfunction]
 pub fn _set_host_worker_limit(limit: i32) -> i32 {
-    HOST_WORKERS.with(|v| v.replace(limit.max(0)))
-}
-
-struct Slot<'py> {
-    stream: Bound<'py, PyAny>,
-    pending: Vec<Py<PyAny>>,
-}
-impl Slot<'_> {
-    fn prepare(&mut self) -> PyResult<usize> {
-        self.stream.call_method0("synchronize")?;
-        self.pending.clear();
-        self.stream.getattr("ptr")?.extract()
-    }
-    fn keep(&mut self, a: &Bound<'_, PyAny>) {
-        self.pending.push(a.clone().unbind());
-    }
-}
-struct Streams<'py> {
-    slots: Vec<Slot<'py>>,
-}
-impl<'py> Streams<'py> {
-    fn new(cp: &Bound<'py, PyModule>) -> PyResult<Self> {
-        sync(cp)?;
-        let kw = PyDict::new(cp.py());
-        kw.set_item("non_blocking", true)?;
-        let factory = cp.getattr("cuda")?.getattr("Stream")?;
-        let mut slots = Vec::new();
-        for _ in 0..2 {
-            slots.push(Slot {
-                stream: factory.call((), Some(&kw))?,
-                pending: Vec::new(),
-            });
-        }
-        Ok(Self { slots })
-    }
-    fn finish(&mut self) -> PyResult<()> {
-        for slot in &mut self.slots {
-            slot.prepare()?;
-        }
-        Ok(())
-    }
-}
-impl Drop for Streams<'_> {
-    fn drop(&mut self) {
-        for slot in &self.slots {
-            let _ = slot.stream.call_method0("synchronize");
-        }
-    }
+    crate::host_parallel::set_worker_limit(limit)
 }
 
 fn host_array<'py>(
@@ -90,6 +43,15 @@ fn host_array<'py>(
             "unsupported {name} dtype: {dtype}"
         )));
     }
+    if !obj
+        .getattr("dtype")?
+        .getattr("isnative")?
+        .extract::<bool>()?
+    {
+        return Err(PyTypeError::new_err(format!(
+            "{name} must use native byte order"
+        )));
+    }
     let flags = obj.getattr("flags")?;
     if !flags.getattr("c_contiguous")?.extract::<bool>()?
         && !flags.getattr("f_contiguous")?.extract::<bool>()?
@@ -98,14 +60,34 @@ fn host_array<'py>(
     }
     Ok((dims, dtype))
 }
-fn nnz_budget(cp: &Bound<'_, PyModule>, bytes: u64) -> PyResult<usize> {
+/// Reserve at most one fifth of currently available device memory across all
+/// reusable slots. Private pinned snapshots have the same bounded capacities.
+fn staging_budget(cp: &Bound<'_, PyModule>) -> PyResult<u64> {
     let free: (u64, u64) = cp
         .getattr("cuda")?
         .getattr("runtime")?
         .call_method0("memGetInfo")?
         .extract()?;
-    Ok((free.0 / 5 / bytes.max(1)).clamp(1, 2_000_000_000) as usize)
+    Ok(free.0 / 5)
 }
+
+fn dtype_bytes(name: &str) -> u64 {
+    if name.ends_with("64") { 8 } else { 4 }
+}
+
+fn histogram_window<'py>(
+    h: &Histogram<'_, 'py>,
+    start: usize,
+    stop: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let plane = product(&[h.groups, h.bins + 1])?;
+    let first = product(&[(start - h.start) as u64, plane])?;
+    let last = product(&[(stop - h.start) as u64, plane])?;
+    h.out
+        .call_method0("ravel")?
+        .get_item(slice(h.out.py(), first as usize, last as usize))
+}
+
 fn outputs_present(
     s: Option<&Bound<'_, PyAny>>,
     c: Option<&Bound<'_, PyAny>>,
@@ -225,6 +207,17 @@ struct Histogram<'a, 'py> {
     start: usize,
     stop: usize,
 }
+
+/// Validate shared operands once; every streaming batch borrows these same
+/// caller-owned allocations until its completion guard has drained all work.
+struct ValidatedStream {
+    codes: Array,
+    mask: Option<Array>,
+    outputs: Vec<Option<Array>>,
+    histogram: Option<Array>,
+    groups: u64,
+}
+
 fn validate_stream(
     cp: &Bound<'_, PyModule>,
     codes: &Bound<'_, PyAny>,
@@ -233,7 +226,7 @@ fn validate_stream(
     rows: usize,
     cols: usize,
     hist: Option<&Histogram<'_, '_>>,
-) -> PyResult<()> {
+) -> PyResult<ValidatedStream> {
     product(&[rows as u64, cols as u64])?;
     let codes = vector(codes, cp, "group codes", Some(Dtype::I32))?;
     capacity(&codes, rows as u64, "group codes")?;
@@ -271,7 +264,11 @@ fn validate_stream(
     }
     let histogram = hist
         .map(|h| {
-            if h.bins == 0 || !h.low.is_finite() || !h.inverse.is_finite() {
+            if h.bins == 0
+                || h.bins > i32::MAX as u64
+                || !h.low.is_finite()
+                || !h.inverse.is_finite()
+            {
                 return Err(PyValueError::new_err("invalid histogram bin configuration"));
             }
             let a = read(h.out, cp, "hist", Some(Dtype::U32), Layout::C)?;
@@ -292,7 +289,13 @@ fn validate_stream(
     arrays.extend(outputs.iter().flatten());
     arrays.extend(histogram.iter());
     crate::array::current_device(cp, &arrays)?;
-    Ok(())
+    Ok(ValidatedStream {
+        codes,
+        mask,
+        outputs,
+        histogram,
+        groups: groups.unwrap_or(0),
+    })
 }
 
 fn sparse_host<'py>(
@@ -330,18 +333,7 @@ fn sparse_host<'py>(
         cols,
         hist.as_ref(),
     )?;
-    let index_dtype = if itype == "int64" || ptype == "int64" {
-        "int64"
-    } else {
-        "int32"
-    };
-    // Reading the host indptr is safe and bounds are checked before every slice.
-    let pointers: Vec<i64> = indptr.call_method0("tolist")?.extract()?;
-    if pointers.iter().any(|&p| p < 0 || p as usize > ds[0])
-        || pointers.windows(2).any(|w| w[0] > w[1])
-    {
-        return Err(PyValueError::new_err("invalid compressed sparse indptr"));
-    }
+    let pointers = crate::host_buffer::sparse_offsets(py, indptr, ds[0])?;
     let first = if csc {
         hist.as_ref().map_or(0, |h| h.start)
     } else {
@@ -352,22 +344,64 @@ fn sparse_host<'py>(
     } else {
         rows
     };
+    if first == last {
+        return Ok(());
+    }
+    let budget = staging_budget(&cp)?;
+    // Histograms use one index-width flag for both compressed arrays. Promote
+    // only that path; standalone aggregation supports independent widths.
+    let histogram_i64 = hist.is_some() && (itype == "int64" || ptype == "int64");
+    let pointer_bytes = if histogram_i64 {
+        8
+    } else {
+        dtype_bytes(&ptype)
+    };
+    let value_bytes = dtype_bytes(&dtype)
+        + if histogram_i64 {
+            8
+        } else {
+            dtype_bytes(&itype)
+        };
+    let max_segment = pointers[first..=last]
+        .windows(2)
+        .map(|p| (p[1] - p[0]) as u64)
+        .max()
+        .unwrap_or(0);
+    let minimum = product(&[max_segment, value_bytes])?
+        .checked_add(2 * pointer_bytes)
+        .ok_or_else(|| PyValueError::new_err("sparse staging size overflow"))?;
+    if minimum > budget {
+        return Err(PyMemoryError::new_err(
+            "one sparse segment exceeds the streaming device-memory budget",
+        ));
+    }
+    let slots = if minimum <= budget / 2 && last - first > 1 {
+        2
+    } else {
+        1
+    };
+    let per_slot = budget / slots as u64;
+    // Reserve the maximum pointer allocation independently of nonzero counts.
+    // Reused data/index/pointer capacities can peak in different batches.
+    let max_segments = (per_slot.saturating_sub(product(&[max_segment, value_bytes])?)
+        / pointer_bytes)
+        .saturating_sub(1)
+        .min(1 << 20) as usize;
     let sub = (if requested <= 0 {
         4096
     } else {
         requested as usize
     })
-    .clamp(1, 1 << 20);
-    let cap = nnz_budget(
-        &cp,
-        if dtype == "float64" { 8 } else { 4 } + if index_dtype == "int64" { 8 } else { 4 },
-    )?;
+    .clamp(1, max_segments.max(1))
+    .min(last - first);
+    let pointer_budget = product(&[(sub + 1) as u64, pointer_bytes])?;
+    let cap = ((per_slot - pointer_budget) / value_bytes).min(usize::MAX as u64) as usize;
     if csc && hist.is_none() {
         for a in [sums, counts, squares].into_iter().flatten() {
             a.call_method1("fill", (0,))?;
         }
     }
-    let mut streams = Streams::new(&cp)?;
+    let mut streams = BatchStreams::new(&cp, slots)?;
     let mut start = first;
     let mut batch_i = 0;
     while start < last {
@@ -382,17 +416,27 @@ fn sparse_host<'py>(
                 "one sparse segment exceeds the streaming device-memory budget",
             ));
         }
-        let slot = &mut streams.slots[batch_i % 2];
-        let stream = slot.prepare()?;
-        let _scope = runtime::StreamScope::new(&cp, stream)?;
+        let slot = batch_i % slots;
+        let _scope = streams.enter(slot)?;
+        let stream = stream(&cp)?;
         let hd = data.get_item(slice(py, base, end))?;
         let hi = indices.get_item(slice(py, base, end))?;
         let hp = indptr
             .get_item(slice(py, start, stop + 1))?
             .call_method1("__sub__", (base,))?;
-        let dd = array(&cp, &hd, &dtype, "C")?;
-        let di = array(&cp, &hi, index_dtype, "C")?;
-        let dp = array(&cp, &hp, index_dtype, "C")?;
+        let hi = if histogram_i64 && itype != "int64" {
+            hi.call_method1("astype", ("int64",))?
+        } else {
+            hi
+        };
+        let hp = if histogram_i64 && ptype != "int64" {
+            hp.call_method1("astype", ("int64",))?
+        } else {
+            hp
+        };
+        let dd = streams.upload_vector(slot, 0, &hd)?;
+        let di = streams.upload_vector(slot, 1, &hi)?;
+        let dp = streams.upload_vector(slot, 2, &hp)?;
         let local_codes = if csc {
             codes.clone()
         } else {
@@ -407,13 +451,18 @@ fn sparse_host<'py>(
                 }
             })
             .transpose()?;
+        streams.retain(slot, local_codes.clone());
+        if let Some(a) = &local_mask {
+            streams.retain(slot, a.clone());
+        }
         let block_rows = if csc { rows } else { stop - start };
         if let Some(h) = &hist {
             let out = if csc {
-                h.out.get_item(slice(py, start - h.start, stop - h.start))?
+                histogram_window(h, start, stop)?
             } else {
                 h.out.clone()
             };
+            streams.retain(slot, out.clone());
             wilcoxon_binned::histogram_sparse(
                 &cp,
                 &dd,
@@ -453,140 +502,6 @@ fn sparse_host<'py>(
                 csc,
                 stream,
             )?;
-        }
-        for a in [&hd, &hi, &hp, &dd, &di, &dp, &local_codes] {
-            slot.keep(a);
-        }
-        if let Some(a) = &local_mask {
-            slot.keep(a);
-        }
-        start = stop;
-        batch_i += 1;
-    }
-    streams.finish()
-}
-
-fn dense_host<'py>(
-    py: Python<'py>,
-    X: &Bound<'py, PyAny>,
-    codes: &Bound<'py, PyAny>,
-    sums: Option<&Bound<'py, PyAny>>,
-    counts: Option<&Bound<'py, PyAny>>,
-    squares: Option<&Bound<'py, PyAny>>,
-    mask: Option<&Bound<'py, PyAny>>,
-    requested: isize,
-    hist: Option<Histogram<'_, 'py>>,
-) -> PyResult<()> {
-    let cp = py.import("cupy")?;
-    let (dims, dtype) = host_array(X, "X", false)?;
-    if dims.len() != 2 {
-        return Err(PyValueError::new_err("X must be two-dimensional"));
-    }
-    let rows = dims[0];
-    let cols = dims[1];
-    validate_stream(
-        &cp,
-        codes,
-        mask,
-        [sums, counts, squares],
-        rows,
-        cols,
-        hist.as_ref(),
-    )?;
-    let fortran = X
-        .getattr("flags")?
-        .getattr("f_contiguous")?
-        .extract::<bool>()?;
-    let columns = fortran || hist.is_some();
-    let first = hist.as_ref().map_or(0, |h| h.start);
-    let last = if columns {
-        hist.as_ref().map_or(cols, |h| h.stop)
-    } else {
-        rows
-    };
-    let sub = batch(
-        &cp,
-        if columns { rows } else { cols },
-        if requested <= 0 { 4096 } else { requested },
-        last - first,
-    )?;
-    if fortran && hist.is_none() {
-        for a in [sums, counts, squares].into_iter().flatten() {
-            a.call_method1("fill", (0,))?;
-        }
-    }
-    if let Some(h) = &hist {
-        for a in [sums, counts].into_iter().flatten() {
-            a.get_item((all(py), slice(py, h.start, h.stop)))?
-                .call_method1("fill", (0,))?;
-        }
-    }
-    let mut streams = Streams::new(&cp)?;
-    let mut start = first;
-    let mut batch_i = 0;
-    while start < last {
-        let stop = (start + sub).min(last);
-        let slot = &mut streams.slots[batch_i % 2];
-        let stream = slot.prepare()?;
-        let _scope = runtime::StreamScope::new(&cp, stream)?;
-        let hx = if columns {
-            window(X, start, stop)?
-        } else {
-            X.get_item((slice(py, start, stop), all(py)))?
-        };
-        let dx = array(&cp, &hx, &dtype, "F")?;
-        let local_codes = if columns {
-            codes.clone()
-        } else {
-            codes.get_item(slice(py, start, stop))?
-        };
-        let local_mask = mask
-            .map(|m| {
-                if columns {
-                    Ok(m.clone())
-                } else {
-                    m.get_item(slice(py, start, stop))
-                }
-            })
-            .transpose()?;
-        if let Some(h) = &hist {
-            let out = h.out.get_item(slice(py, start - h.start, stop - h.start))?;
-            wilcoxon_binned::histogram_dense(
-                &cp,
-                &dx,
-                &local_codes,
-                &out,
-                rows as u64,
-                (stop - start) as u64,
-                h.groups,
-                h.bins,
-                h.low,
-                h.inverse,
-                false,
-                stream,
-            )?;
-        }
-        if sums.is_some() || counts.is_some() || squares.is_some() {
-            stats(
-                &cp,
-                &dx,
-                &local_codes,
-                local_mask.as_ref(),
-                sums,
-                squares,
-                counts,
-                None,
-                None,
-                cols as u64,
-                if columns { start as u64 } else { 0 },
-                stream,
-            )?;
-        }
-        for a in [&hx, &dx, &local_codes] {
-            slot.keep(a);
-        }
-        if let Some(a) = &local_mask {
-            slot.keep(a);
         }
         start = stop;
         batch_i += 1;

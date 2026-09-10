@@ -51,23 +51,27 @@ pub unsafe fn domain_pseudobulk_paired_squared(
         rows: out_rows,
         cols: out_cols,
     };
-    let mut p = tid() / 128;
-    let lane = tid() % 128;
+    let block = thread::blockDim_x() as u64;
+    let mut p = tid() / block;
+    let lane = thread::threadIdx_x() as u64;
     while p < n_pairs {
         let xi = p;
         let yi = p;
         let mut d = lane;
         let mut acc = 0.0;
         while d < n_features {
-            let diff = X.f(xi * n_features + d) - Y.f(yi * n_features + d);
+            let diff = unsafe {
+                *(X.pointer as *const f64).add((xi * n_features + d) as usize)
+                    - *(Y.pointer as *const f64).add((yi * n_features + d) as usize)
+            };
             acc += diff * diff;
-            d += 128;
+            d += block;
         }
         let acc = domain_block_total(acc);
         if lane == 0 {
             out.put(p, acc);
         }
-        p += stride() / 128;
+        p += stride() / block;
     }
 }
 /// # Safety
@@ -120,23 +124,27 @@ pub unsafe fn domain_pseudobulk_paired_abs_mean(
         rows: out_rows,
         cols: out_cols,
     };
-    let mut p = tid() / 128;
-    let lane = tid() % 128;
+    let block = thread::blockDim_x() as u64;
+    let mut p = tid() / block;
+    let lane = thread::threadIdx_x() as u64;
     while p < n_pairs {
         let xi = p;
         let yi = p;
         let mut d = lane;
         let mut acc = 0.0;
         while d < n_features {
-            let diff = X.f(xi * n_features + d) - Y.f(yi * n_features + d);
+            let diff = unsafe {
+                *(X.pointer as *const f64).add((xi * n_features + d) as usize)
+                    - *(Y.pointer as *const f64).add((yi * n_features + d) as usize)
+            };
             acc += diff.abs();
-            d += 128;
+            d += block;
         }
         let acc = domain_block_total(acc);
         if lane == 0 {
             out.put(p, acc / n_features as f64);
         }
-        p += stride() / 128;
+        p += stride() / block;
     }
 }
 /// # Safety
@@ -190,23 +198,27 @@ pub unsafe fn domain_pseudobulk_pairwise_squared(
         rows: out_rows,
         cols: out_cols,
     };
-    let mut p = tid() / 128;
-    let lane = tid() % 128;
+    let block = thread::blockDim_x() as u64;
+    let mut p = tid() / block;
+    let lane = thread::threadIdx_x() as u64;
     while p < n_x * n_y {
         let xi = p / n_y;
         let yi = p % n_y;
         let mut d = lane;
         let mut acc = 0.0;
         while d < n_features {
-            let diff = X.f(xi * n_features + d) - Y.f(yi * n_features + d);
+            let diff = unsafe {
+                *(X.pointer as *const f64).add((xi * n_features + d) as usize)
+                    - *(Y.pointer as *const f64).add((yi * n_features + d) as usize)
+            };
             acc += diff * diff;
-            d += 128;
+            d += block;
         }
         let acc = domain_block_total(acc);
         if lane == 0 {
             out.put(p, acc);
         }
-        p += stride() / 128;
+        p += stride() / block;
     }
 }
 /// # Safety
@@ -260,22 +272,26 @@ pub unsafe fn domain_pseudobulk_pairwise_abs_mean(
         rows: out_rows,
         cols: out_cols,
     };
-    let mut p = tid() / 128;
-    let lane = tid() % 128;
+    let block = thread::blockDim_x() as u64;
+    let mut p = tid() / block;
+    let lane = thread::threadIdx_x() as u64;
     while p < n_x * n_y {
         let xi = p / n_y;
         let yi = p % n_y;
         let mut d = lane;
         let mut acc = 0.0;
         while d < n_features {
-            let diff = X.f(xi * n_features + d) - Y.f(yi * n_features + d);
+            let diff = unsafe {
+                *(X.pointer as *const f64).add((xi * n_features + d) as usize)
+                    - *(Y.pointer as *const f64).add((yi * n_features + d) as usize)
+            };
             acc += diff.abs();
-            d += 128;
+            d += block;
         }
         let acc = domain_block_total(acc);
         if lane == 0 {
             out.put(p, acc / n_features as f64);
         }
-        p += stride() / 128;
+        p += stride() / block;
     }
 }

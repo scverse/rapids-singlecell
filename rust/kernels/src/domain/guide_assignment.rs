@@ -61,6 +61,108 @@ fn guide_broadcast(v: f32) -> f32 {
     result
 }
 
+// Reduce all five EM sufficient statistics together. Keeping the original
+// float32 arithmetic and sharing barriers avoids five serial double reductions.
+#[inline(always)]
+fn guide_em_total(mut values: [f32; 5]) -> [f32; 5] {
+    static mut PARTIAL: cuda_device::SharedArray<f32, 40> = cuda_device::SharedArray::UNINIT;
+    let lane = thread::threadIdx_x() as usize;
+    let warp_id = lane / 32;
+    let mut d = 16;
+    while d > 0 {
+        values[0] += warp::shuffle_down_f32_sync(u32::MAX, values[0], d);
+        values[1] += warp::shuffle_down_f32_sync(u32::MAX, values[1], d);
+        values[2] += warp::shuffle_down_f32_sync(u32::MAX, values[2], d);
+        values[3] += warp::shuffle_down_f32_sync(u32::MAX, values[3], d);
+        values[4] += warp::shuffle_down_f32_sync(u32::MAX, values[4], d);
+        d /= 2;
+    }
+    if lane.is_multiple_of(32) {
+        unsafe {
+            PARTIAL[warp_id] = values[0];
+            PARTIAL[8 + warp_id] = values[1];
+            PARTIAL[16 + warp_id] = values[2];
+            PARTIAL[24 + warp_id] = values[3];
+            PARTIAL[32 + warp_id] = values[4];
+        }
+    }
+    thread::sync_threads();
+    if warp_id == 0 {
+        unsafe {
+            values[0] = if lane < 8 { PARTIAL[lane] } else { 0.0 };
+            values[1] = if lane < 8 { PARTIAL[8 + lane] } else { 0.0 };
+            values[2] = if lane < 8 { PARTIAL[16 + lane] } else { 0.0 };
+            values[3] = if lane < 8 { PARTIAL[24 + lane] } else { 0.0 };
+            values[4] = if lane < 8 { PARTIAL[32 + lane] } else { 0.0 };
+        }
+        d = 16;
+        while d > 0 {
+            values[0] += warp::shuffle_down_f32_sync(u32::MAX, values[0], d);
+            values[1] += warp::shuffle_down_f32_sync(u32::MAX, values[1], d);
+            values[2] += warp::shuffle_down_f32_sync(u32::MAX, values[2], d);
+            values[3] += warp::shuffle_down_f32_sync(u32::MAX, values[3], d);
+            values[4] += warp::shuffle_down_f32_sync(u32::MAX, values[4], d);
+            d /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                PARTIAL[0] = values[0];
+                PARTIAL[1] = values[1];
+                PARTIAL[2] = values[2];
+                PARTIAL[3] = values[3];
+                PARTIAL[4] = values[4];
+            }
+        }
+    }
+    thread::sync_threads();
+    let result = unsafe { [PARTIAL[0], PARTIAL[1], PARTIAL[2], PARTIAL[3], PARTIAL[4]] };
+    thread::sync_threads();
+    result
+}
+
+#[inline(always)]
+fn guide_percentile(x: Buffer, guide: u64, cells: u64, count: u64) -> f32 {
+    static mut HISTOGRAM: cuda_device::SharedArray<i32, 4097> = cuda_device::SharedArray::UNINIT;
+    let lane = thread::threadIdx_x() as u64;
+    let mut bin = lane;
+    while bin <= 4096 {
+        unsafe {
+            HISTOGRAM[bin as usize] = 0;
+        }
+        bin += 256;
+    }
+    thread::sync_threads();
+    let mut cell = lane;
+    while cell < cells {
+        let value = x.single_at(cell, guide);
+        if value > 0.0 {
+            let bin = value.ceil().clamp(1.0, 4096.0) as usize;
+            unsafe {
+                DeviceAtomicI32::from_ptr(core::ptr::addr_of_mut!(HISTOGRAM[bin]))
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        cell += 256;
+    }
+    thread::sync_threads();
+    let mut location = 0.0;
+    if lane == 0 {
+        let target = (count as f32 * 0.75) as u64;
+        let mut cumulative = 0;
+        let mut bin = 1;
+        while bin <= 4096 {
+            cumulative += unsafe { HISTOGRAM[bin] } as u64;
+            if cumulative > target {
+                let q = (bin as f32).log2();
+                location = if q > 0.5 { q } else { 3.0 };
+                break;
+            }
+            bin += 1;
+        }
+    }
+    guide_broadcast(location)
+}
+
 /// # Safety
 /// The caller must supply validated, aligned device allocations matching each
 /// descriptor and keep them alive until the borrowed stream completes.
@@ -408,28 +510,7 @@ pub unsafe fn domain_guide_assignment_fit_assign_dense(
         let mut threshold = f32::NAN;
         if valid {
             lambda = (logsum / nz as f32 * 0.5).clamp(0.01, 0.5);
-            let target = (nz * 0.75) as u64;
-            let mut lo = 1;
-            let mut hi = 4096;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                cell = lane;
-                let mut below = 0.0;
-                while cell < n_cells {
-                    let x = f64::from(X.single_at(cell, guide));
-                    if x > 0.0 && x.ceil().min(4096.0) <= mid as f64 {
-                        below += 1.0;
-                    }
-                    cell += 256;
-                }
-                if guide_total(below) > target as f64 {
-                    hi = mid;
-                } else {
-                    lo = mid + 1;
-                }
-            }
-            let q = (lo as f32).log2();
-            location = if q > 0.5 { q } else { 3.0 };
+            location = guide_percentile(X, guide, n_cells, nz as u64);
             deviation = 1.0;
             weight = 0.85;
             let mut iter = 0;
@@ -454,11 +535,7 @@ pub unsafe fn domain_guide_assignment_fit_assign_dense(
                     }
                     cell += 256;
                 }
-                let s0 = guide_total(s0 as f64) as f32;
-                let s1 = guide_total(s1 as f64) as f32;
-                let y0 = guide_total(y0 as f64) as f32;
-                let y1 = guide_total(y1 as f64) as f32;
-                let y2 = guide_total(y2 as f64) as f32;
+                let [s0, s1, y0, y1, y2] = guide_em_total([s0, s1, y0, y1, y2]);
                 let lmle = y0 / s0.max(1e-10);
                 let nl = (s0 * lmle.max(1e-10).ln() / (s0 + 1.0)).exp();
                 let ss = (deviation * deviation).max(1e-10);

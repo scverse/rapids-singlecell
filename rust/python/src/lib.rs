@@ -1,12 +1,17 @@
 //! Shared PyO3 bindings for the Rust CUDA backend.
 
 mod array;
+mod blas;
+mod device_sparse;
 mod domain;
 mod elementwise;
 mod gmm;
 mod harmony;
 mod harmony_clustering;
 mod harmony_correction;
+mod host_buffer;
+mod host_parallel;
+mod host_sparse;
 mod jaccard;
 mod preprocessing;
 mod rank_sort;
@@ -17,6 +22,7 @@ mod runtime;
 mod sparse2dense;
 mod sparse_ovo;
 mod sparse_ovr;
+mod staging;
 mod wilcoxon;
 mod wilcoxon_binned;
 mod wilcoxon_sparse;

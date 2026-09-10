@@ -17,11 +17,23 @@ fn paired_squared(
     let X = read(Some(X), &cupy, "X", "double", false)?;
     let Y = read(Some(Y), &cupy, "Y", "double", false)?;
     let out = read(Some(out), &cupy, "out", "double", false)?;
+    let x_elements = n_pairs
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("X dimensions overflow"))?;
+    let y_elements = n_pairs
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("Y dimensions overflow"))?;
+    if x_elements > X.len() || y_elements > Y.len() || n_pairs > out.len() {
+        return Err(PyValueError::new_err(
+            "pseudobulk dimensions exceed an input or output allocation",
+        ));
+    }
+
     launch(
         &cupy,
         &[&X, &Y, &out],
         "domain_pseudobulk_paired_squared",
-        n_pairs * 128,
+        n_pairs * pseudobulk_block(n_features),
         stream,
         vec![X.pointer(), Y.pointer(), out.pointer(), n_pairs, n_features],
     )?;
@@ -43,11 +55,23 @@ fn paired_abs_mean(
     let X = read(Some(X), &cupy, "X", "double", false)?;
     let Y = read(Some(Y), &cupy, "Y", "double", false)?;
     let out = read(Some(out), &cupy, "out", "double", false)?;
+    let x_elements = n_pairs
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("X dimensions overflow"))?;
+    let y_elements = n_pairs
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("Y dimensions overflow"))?;
+    if x_elements > X.len() || y_elements > Y.len() || n_pairs > out.len() {
+        return Err(PyValueError::new_err(
+            "pseudobulk dimensions exceed an input or output allocation",
+        ));
+    }
+
     launch(
         &cupy,
         &[&X, &Y, &out],
         "domain_pseudobulk_paired_abs_mean",
-        n_pairs * 128,
+        n_pairs * pseudobulk_block(n_features),
         stream,
         vec![X.pointer(), Y.pointer(), out.pointer(), n_pairs, n_features],
     )?;
@@ -70,6 +94,21 @@ fn pairwise_squared(
     let X = read(Some(X), &cupy, "X", "double", false)?;
     let Y = read(Some(Y), &cupy, "Y", "double", false)?;
     let out = read(Some(out), &cupy, "out", "double", false)?;
+    let pairs = n_x
+        .checked_mul(n_y)
+        .ok_or_else(|| PyValueError::new_err("pair count overflow"))?;
+    let x_elements = n_x
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("X dimensions overflow"))?;
+    let y_elements = n_y
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("Y dimensions overflow"))?;
+    if x_elements > X.len() || y_elements > Y.len() || pairs > out.len() {
+        return Err(PyValueError::new_err(
+            "pseudobulk dimensions exceed an input or output allocation",
+        ));
+    }
+
     launch(
         &cupy,
         &[&X, &Y, &out],
@@ -104,6 +143,21 @@ fn pairwise_abs_mean(
     let X = read(Some(X), &cupy, "X", "double", false)?;
     let Y = read(Some(Y), &cupy, "Y", "double", false)?;
     let out = read(Some(out), &cupy, "out", "double", false)?;
+    let pairs = n_x
+        .checked_mul(n_y)
+        .ok_or_else(|| PyValueError::new_err("pair count overflow"))?;
+    let x_elements = n_x
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("X dimensions overflow"))?;
+    let y_elements = n_y
+        .checked_mul(n_features)
+        .ok_or_else(|| PyValueError::new_err("Y dimensions overflow"))?;
+    if x_elements > X.len() || y_elements > Y.len() || pairs > out.len() {
+        return Err(PyValueError::new_err(
+            "pseudobulk dimensions exceed an input or output allocation",
+        ));
+    }
+
     launch(
         &cupy,
         &[&X, &Y, &out],

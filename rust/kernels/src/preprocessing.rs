@@ -5,7 +5,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(static_mut_refs)] // Block-local SharedArray access is synchronized below.
 
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicI32};
+use crate::atomics::add_f32;
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF64, DeviceAtomicI32};
 use cuda_device::{SharedArray, kernel, thread, warp};
 
 #[inline(always)]
@@ -13,120 +14,34 @@ unsafe fn add_i32(out: *mut i32, value: i32) {
     unsafe { DeviceAtomicI32::from_ptr(out) }.fetch_add(value, AtomicOrdering::Relaxed);
 }
 #[inline(always)]
-unsafe fn add_f32(out: *mut f32, value: f32) {
-    unsafe { DeviceAtomicF32::from_ptr(out) }.fetch_add(value, AtomicOrdering::Relaxed);
-}
-#[inline(always)]
 unsafe fn add_f64(out: *mut f64, value: f64) {
     unsafe { DeviceAtomicF64::from_ptr(out) }.fetch_add(value, AtomicOrdering::Relaxed);
 }
 
-// These baseline PTX instructions are available on Turing. The pinned
-// cuda-oxide generated wrappers conservatively require sm_80, so use their
-// identical instructions directly to retain the sm_75 deployment target.
-#[inline(always)]
-fn rsqrt_approx_f32(value: f32) -> f32 {
-    let result: f32;
-    unsafe {
-        cuda_device::ptx_asm!("rsqrt.approx.f32 %0, %1;", out("=f") result, in("f") value);
-    }
-    result
-}
+mod pearson;
+mod statistics;
 
-#[inline(always)]
-fn rsqrt_approx_f64(value: f64) -> f64 {
-    let result: f64;
-    unsafe {
-        cuda_device::ptx_asm!("rsqrt.approx.f64 %0, %1;", out("=d") result, in("d") value);
-    }
-    result
+// Only lane zero holds the completed sum. Match the original halving tree;
+// butterfly all-reduce would give other lanes a different cancellation order.
+macro_rules! normalization_sum {
+    ($name:ident, $value:ty, $shuffle:ident) => {
+        #[inline(always)]
+        fn $name(mut sum: $value) -> $value {
+            let mut offset = 16;
+            while offset != 0 {
+                sum += warp::$shuffle(u32::MAX, sum, offset);
+                offset /= 2;
+            }
+            sum
+        }
+    };
 }
+normalization_sum!(normalization_sum_f32, f32, shuffle_down_f32_sync);
+normalization_sum!(normalization_sum_f64, f64, shuffle_down_f64_sync);
 
 macro_rules! sparse_kernels {
-    ($stats_major:ident, $stats_minor:ident, $norm:ident, $scale:ident, $qc:ident,
-     $residual:ident, $value:ty, $index:ty, $add:ident, $reduce:ident, $rsqrt:ident, $fma:ident) => {
-        /// Sum and sum of squares, or masked NaN-aware sum and NaN count.
-        /// # Safety
-        /// Host-validated arrays; launch exactly 64 threads per block. `mode`
-        /// selects moments (0) or masked NaN statistics (1).
-        #[kernel]
-        pub unsafe fn $stats_major(
-            indptr: *const $index,
-            index: *const $index,
-            data: *const $value,
-            sums: *mut f64,
-            squares: *mut f64,
-            nans: *mut i32,
-            mask: *const u8,
-            major: u64,
-            minor: u64,
-            nnz: u64,
-            mode: u32,
-        ) {
-            static mut SUM: SharedArray<f64, 64> = SharedArray::UNINIT;
-            static mut SECOND: SharedArray<f64, 64> = SharedArray::UNINIT;
-            let lane = thread::threadIdx_x() as usize;
-            let mut row = thread::blockIdx_x() as u64;
-            while row < major {
-                let start = unsafe { *indptr.add(row as usize) } as i64;
-                let stop = unsafe { *indptr.add(row as usize + 1) } as i64;
-                let mut sum = 0.0_f64;
-                let mut second = 0.0_f64;
-                if start >= 0 && stop >= start && stop as u64 <= nnz {
-                    let mut p = start as u64 + lane as u64;
-                    while p < stop as u64 {
-                        let mut selected = true;
-                        if mode == 1 {
-                            let col = unsafe { *index.add(p as usize) } as i64;
-                            selected = col >= 0
-                                && (col as u64) < minor
-                                && unsafe { *mask.add(col as usize) != 0 };
-                        }
-                        if selected {
-                            let v = unsafe { *data.add(p as usize) } as f64;
-                            if mode == 0 {
-                                sum += v;
-                                second += v * v;
-                            } else if v.is_nan() {
-                                second += 1.0;
-                            } else {
-                                sum += v;
-                            }
-                        }
-                        p += 64;
-                    }
-                }
-                unsafe {
-                    SUM[lane] = sum;
-                    SECOND[lane] = second;
-                }
-                thread::sync_threads();
-                let mut offset = 32;
-                while offset > 0 {
-                    if lane < offset {
-                        unsafe {
-                            SUM[lane] += SUM[lane + offset];
-                            SECOND[lane] += SECOND[lane + offset];
-                        }
-                    }
-                    thread::sync_threads();
-                    offset /= 2;
-                }
-                if lane == 0 {
-                    unsafe {
-                        *sums.add(row as usize) = SUM[0];
-                        if mode == 0 {
-                            *squares.add(row as usize) = SECOND[0];
-                        } else {
-                            *nans.add(row as usize) = SECOND[0] as i32;
-                        }
-                    }
-                }
-                thread::sync_threads();
-                row += thread::gridDim_x() as u64;
-            }
-        }
-
+    ($stats_minor:ident, $norm:ident, $scale:ident, $qc:ident,
+     $value:ty, $index:ty, $add:ident, $reduce:ident, $broadcast:ident) => {
         /// Scatter moments, NaN statistics, or sparse QC counts by minor index.
         /// # Safety
         /// Arrays have the lengths validated by the host; updates are atomic.
@@ -172,9 +87,9 @@ macro_rules! sparse_kernels {
             }
         }
 
-        /// Sparse normalization and row sums, using one warp per row.
+        /// Sparse normalization and row sums, using one or eight warps per row.
         /// # Safety
-        /// Host validates compressed storage. Launch 32 threads per block.
+        /// Host validates compressed storage. Launch 32 or 256 threads per block.
         /// Modes: normalize=0, sum=1, masked normalize=2, masked sum=3,
         /// identify high genes=4, precomputed scaling=5. Mode 4 receives an
         /// aligned i32 flag array through `mask`; other masks contain bytes.
@@ -192,6 +107,8 @@ macro_rules! sparse_kernels {
             scalar: f64,
             mode: u32,
         ) {
+            static mut WARPS: SharedArray<$value, 8> = SharedArray::UNINIT;
+            let width = thread::blockDim_x() as u64;
             let lane = thread::threadIdx_x() as u64;
             let mut row = thread::blockIdx_x() as u64;
             while row < major {
@@ -201,20 +118,79 @@ macro_rules! sparse_kernels {
                     let mut total = 0.0 as $value;
                     let mut p = start as u64 + lane;
                     if mode != 5 {
-                        while p < stop as u64 {
-                            let mut selected = true;
-                            if mode == 2 || mode == 3 {
+                        // Keep uniform mode dispatch outside the hot loops.
+                        // Otherwise NVVM retains a branch and advances an
+                        // unused index pointer for every unmasked element.
+                        if mode == 2 || mode == 3 {
+                            while p < stop as u64 {
                                 let col = unsafe { *index.add(p as usize) } as i64;
-                                selected = col >= 0
+                                if col >= 0
                                     && (col as u64) < minor
-                                    && unsafe { *mask.add(col as usize) == 0 };
+                                    && unsafe { *mask.add(col as usize) == 0 }
+                                {
+                                    total += unsafe { *data.add(p as usize) };
+                                }
+                                p += width;
                             }
-                            if selected {
+                        } else {
+                            // Preserve the sequential addition order while
+                            // overlapping loads from four CSR loop steps, as
+                            // NVCC does for the original 64-bit row cursor.
+                            while p + 3 * width < stop as u64 {
                                 total += unsafe { *data.add(p as usize) };
+                                total += unsafe { *data.add((p + width) as usize) };
+                                total += unsafe { *data.add((p + 2 * width) as usize) };
+                                total += unsafe { *data.add((p + 3 * width) as usize) };
+                                p += 4 * width;
                             }
-                            p += 32;
+                            while p < stop as u64 {
+                                total += unsafe { *data.add(p as usize) };
+                                p += width;
+                            }
                         }
-                        total = warp::$reduce(total);
+                        total = $reduce(total);
+                        if width > 32 {
+                            if lane % 32 == 0 {
+                                unsafe {
+                                    WARPS[(lane / 32) as usize] = total;
+                                }
+                            }
+                            thread::sync_threads();
+                            if lane < 32 {
+                                let partial = if lane < width / 32 {
+                                    unsafe { WARPS[lane as usize] }
+                                } else {
+                                    0.0 as $value
+                                };
+                                let reduced = $reduce(partial);
+                                if lane == 0 {
+                                    unsafe {
+                                        WARPS[0] = if mode == 1 || mode == 3 {
+                                            reduced
+                                        } else if mode == 4 {
+                                            (scalar as $value) * reduced
+                                        } else if reduced > 0.0 {
+                                            (scalar as $value) / reduced
+                                        } else {
+                                            0.0
+                                        };
+                                    }
+                                }
+                            }
+                            thread::sync_threads();
+                            total = unsafe { WARPS[0] };
+                        } else {
+                            if lane == 0 && mode != 1 && mode != 3 {
+                                total = if mode == 4 {
+                                    (scalar as $value) * total
+                                } else if total > 0.0 {
+                                    (scalar as $value) / total
+                                } else {
+                                    0.0
+                                };
+                            }
+                            total = warp::$broadcast(u32::MAX, total, 0);
+                        }
                     }
                     if mode == 1 || mode == 3 {
                         if lane == 0 {
@@ -225,17 +201,13 @@ macro_rules! sparse_kernels {
                     } else {
                         let factor = if mode == 5 {
                             unsafe { *scales.add(row as usize) }
-                        } else if mode == 4 {
-                            (scalar as $value) * total
-                        } else if total > 0.0 {
-                            (scalar as $value) / total
                         } else {
-                            0.0
+                            total
                         };
                         p = start as u64 + lane;
-                        while p < stop as u64 {
-                            unsafe {
-                                if mode == 4 {
+                        if mode == 4 {
+                            while p < stop as u64 {
+                                unsafe {
                                     let col = *index.add(p as usize) as i64;
                                     if col >= 0
                                         && (col as u64) < minor
@@ -246,15 +218,33 @@ macro_rules! sparse_kernels {
                                         )
                                         .fetch_or(1, AtomicOrdering::Relaxed);
                                     }
-                                } else if mode == 5 || factor > 0.0 {
+                                }
+                                p += width;
+                            }
+                        } else if mode == 5 || factor > 0.0 {
+                            while p + 3 * width < stop as u64 {
+                                unsafe {
+                                    *data.add(p as usize) *= factor;
+                                    *data.add((p + width) as usize) *= factor;
+                                    *data.add((p + 2 * width) as usize) *= factor;
+                                    *data.add((p + 3 * width) as usize) *= factor;
+                                }
+                                p += 4 * width;
+                            }
+                            while p < stop as u64 {
+                                unsafe {
                                     *data.add(p as usize) *= factor;
                                 }
+                                p += width;
                             }
-                            p += 32;
                         }
                     }
                 }
                 row += thread::gridDim_x() as u64;
+                // Only a following row can overwrite the shared broadcast.
+                if width > 32 && mode != 5 && row < major {
+                    thread::sync_threads();
+                }
             }
         }
 
@@ -371,93 +361,15 @@ macro_rules! sparse_kernels {
                 row += stride;
             }
         }
-
-        /// Sparse clipped Pearson residuals and their per-gene variance.
-        /// # Safety
-        /// Host validates output size and compressed storage; rows must be sorted.
-        /// Modes: CSR=0, CSC=1, CSC residual variance=2.
-        #[kernel]
-        pub unsafe fn $residual(
-            indptr: *const $index,
-            index: *const $index,
-            data: *const $value,
-            cells: *const $value,
-            genes: *const $value,
-            output: *mut $value,
-            n_cells: u64,
-            n_genes: u64,
-            nnz: u64,
-            inv_sum: f64,
-            clip: f64,
-            inv_theta: f64,
-            mode: u32,
-        ) {
-            let major = if mode == 0 { n_cells } else { n_genes };
-            let minor = if mode == 0 { n_genes } else { n_cells };
-            let mut row = thread::index_1d().get() as u64;
-            let stride = thread::blockDim_x() as u64 * thread::gridDim_x() as u64;
-            while row < major {
-                let start = unsafe { *indptr.add(row as usize) } as i64;
-                let stop = unsafe { *indptr.add(row as usize + 1) } as i64;
-                let valid = start >= 0 && stop >= start && stop as u64 <= nnz;
-                let mut p = if valid { start as u64 } else { 0 };
-                let end = if valid { stop as u64 } else { 0 };
-                let mut mean = 0.0 as $value;
-                let mut m2 = 0.0 as $value;
-                let mut col = 0_u64;
-                while col < minor {
-                    let (cell, gene) = if mode == 0 { (row, col) } else { (col, row) };
-                    let offset = (cell * n_genes + gene) as usize;
-                    let mut value = if mode == 2 {
-                        0.0
-                    } else {
-                        unsafe { *output.add(offset) }
-                    };
-                    if p < end && unsafe { *index.add(p as usize) } as i64 == col as i64 {
-                        value += unsafe { *data.add(p as usize) };
-                        p += 1;
-                    }
-                    let mu = unsafe { *genes.add(gene as usize) * *cells.add(cell as usize) }
-                        * inv_sum as $value;
-                    let mut x = (value - mu) * $rsqrt(mu + mu * mu * inv_theta as $value);
-                    if mode == 2 {
-                        x = x.max(-(clip as $value)).min(clip as $value);
-                    } else {
-                        if x < -(clip as $value) {
-                            x = -(clip as $value);
-                        }
-                        if x > clip as $value {
-                            x = clip as $value;
-                        }
-                    }
-                    if mode == 2 {
-                        let delta = x - mean;
-                        mean += delta / (cell + 1) as $value;
-                        m2 = delta.mul_add(x - mean, m2);
-                    } else {
-                        unsafe {
-                            *output.add(offset) = x;
-                        }
-                    }
-                    col += 1;
-                }
-                if mode == 2 {
-                    unsafe {
-                        *output.add(row as usize) = m2 / n_cells as $value;
-                    }
-                }
-                row += stride;
-            }
-        }
     };
 }
 
 macro_rules! dense_kernels {
-    ($norm:ident, $scale:ident, $qc:ident, $expected:ident, $residual:ident,
-     $value:ty, $add:ident, $reduce:ident, $rsqrt:ident, $fma:ident) => {
+    ($norm:ident, $scale:ident, $qc:ident, $expected:ident,
+     $value:ty, $add:ident, $reduce:ident, $broadcast:ident) => {
         /// Dense row normalization or multiplication by supplied row factors.
         /// # Safety
-        /// Host validates `rows * cols` and scales; launch 32 threads per block.
+        /// Host validates `rows * cols` and scales; launch 32 or 256 threads per block.
         #[kernel]
         pub unsafe fn $norm(
             data: *mut $value,
@@ -467,6 +379,8 @@ macro_rules! dense_kernels {
             scalar: f64,
             mode: u32,
         ) {
+            static mut WARPS: SharedArray<$value, 8> = SharedArray::UNINIT;
+            let width = thread::blockDim_x() as u64;
             let lane = thread::threadIdx_x() as u64;
             let mut row = thread::blockIdx_x() as u64;
             while row < rows {
@@ -475,16 +389,50 @@ macro_rules! dense_kernels {
                 if mode == 0 {
                     while col < cols {
                         sum += unsafe { *data.add((row * cols + col) as usize) };
-                        col += 32;
+                        col += width;
                     }
-                    sum = warp::$reduce(sum);
+                    sum = $reduce(sum);
+                    if width > 32 {
+                        if lane % 32 == 0 {
+                            unsafe {
+                                WARPS[(lane / 32) as usize] = sum;
+                            }
+                        }
+                        thread::sync_threads();
+                        if lane < 32 {
+                            let partial = if lane < width / 32 {
+                                unsafe { WARPS[lane as usize] }
+                            } else {
+                                0.0 as $value
+                            };
+                            let reduced = $reduce(partial);
+                            if lane == 0 {
+                                unsafe {
+                                    WARPS[0] = if reduced > 0.0 {
+                                        (scalar as $value) / reduced
+                                    } else {
+                                        0.0
+                                    };
+                                }
+                            }
+                        }
+                        thread::sync_threads();
+                        sum = unsafe { WARPS[0] };
+                    } else {
+                        if lane == 0 {
+                            sum = if sum > 0.0 {
+                                (scalar as $value) / sum
+                            } else {
+                                0.0
+                            };
+                        }
+                        sum = warp::$broadcast(u32::MAX, sum, 0);
+                    }
                 }
                 let factor = if mode == 1 {
                     unsafe { *scales.add(row as usize) }
-                } else if sum > 0.0 {
-                    scalar as $value / sum
                 } else {
-                    0.0
+                    sum
                 };
                 if mode == 1 || factor > 0.0 {
                     col = lane;
@@ -492,10 +440,13 @@ macro_rules! dense_kernels {
                         unsafe {
                             *data.add((row * cols + col) as usize) *= factor;
                         }
-                        col += 32;
+                        col += width;
                     }
                 }
                 row += thread::gridDim_x() as u64;
+                if width > 32 && mode == 0 && row < rows {
+                    thread::sync_threads();
+                }
             }
         }
 
@@ -549,7 +500,8 @@ macro_rules! dense_kernels {
 
         /// Dense QC or masked cell sums. Dense QC counts strictly positive values.
         /// # Safety
-        /// Host validates all lengths. Modes: full=0, subset=1, cells=2, genes=3.
+        /// Host validates all lengths and launches 16x16 tiles. Modes:
+        /// full=0, subset=1, cells=2, genes=3.
         #[kernel]
         pub unsafe fn $qc(
             data: *const $value,
@@ -562,29 +514,34 @@ macro_rules! dense_kernels {
             cols: u64,
             mode: u32,
         ) {
-            let mut p = thread::index_1d().get() as u64;
-            let stride = thread::blockDim_x() as u64 * thread::gridDim_x() as u64;
-            while p < rows * cols {
-                let row = (p / cols) as usize;
-                let col = (p % cols) as usize;
-                let v = unsafe { *data.add(p as usize) };
-                unsafe {
-                    if mode == 1 {
-                        if *mask.add(col) != 0 {
-                            $add(cells.add(row), v);
-                        }
-                    } else if v > 0.0 {
-                        if mode != 3 {
-                            $add(cells.add(row), v);
-                            add_i32(cell_ex.add(row), 1);
-                        }
-                        if mode != 2 {
-                            $add(genes.add(col), v);
-                            add_i32(gene_ex.add(col), 1);
+            let mut row = thread::blockIdx_x() as u64 * 16 + thread::threadIdx_x() as u64;
+            while row < rows {
+                let mut col = thread::blockIdx_y() as u64 * 16 + thread::threadIdx_y() as u64;
+                while col < cols {
+                    let v = unsafe { *data.add((row * cols + col) as usize) };
+                    unsafe {
+                        if mode == 1 {
+                            if *mask.add(col as usize) != 0 {
+                                $add(cells.add(row as usize), v);
+                            }
+                        } else if v > 0.0 {
+                            if mode != 2 {
+                                $add(genes.add(col as usize), v);
+                            }
+                            if mode != 3 {
+                                $add(cells.add(row as usize), v);
+                            }
+                            if mode != 2 {
+                                add_i32(gene_ex.add(col as usize), 1);
+                            }
+                            if mode != 3 {
+                                add_i32(cell_ex.add(row as usize), 1);
+                            }
                         }
                     }
+                    col += thread::gridDim_y() as u64 * 16;
                 }
-                p += stride;
+                row += thread::gridDim_x() as u64 * 16;
             }
         }
 
@@ -615,149 +572,72 @@ macro_rules! dense_kernels {
                 gene += stride;
             }
         }
-
-        /// Dense Pearson residuals (C layout) or per-gene variance (F layout).
-        /// # Safety
-        /// Host validates the mode-dependent output length and storage layout.
-        #[kernel]
-        pub unsafe fn $residual(
-            data: *const $value,
-            cells: *const $value,
-            genes: *const $value,
-            out: *mut $value,
-            rows: u64,
-            cols: u64,
-            inv_sum: f64,
-            clip: f64,
-            inv_theta: f64,
-            mode: u32,
-        ) {
-            let mut p = thread::index_1d().get() as u64;
-            let stride = thread::blockDim_x() as u64 * thread::gridDim_x() as u64;
-            let size = if mode == 0 { rows * cols } else { cols };
-            while p < size {
-                if mode == 0 {
-                    let row = p / cols;
-                    let col = p % cols;
-                    let mu = unsafe { *genes.add(col as usize) * *cells.add(row as usize) }
-                        * inv_sum as $value;
-                    let mut x = (unsafe { *data.add(p as usize) } - mu)
-                        * $rsqrt(mu + mu * mu * inv_theta as $value);
-                    if x < -(clip as $value) {
-                        x = -(clip as $value);
-                    }
-                    if x > clip as $value {
-                        x = clip as $value;
-                    }
-                    unsafe {
-                        *out.add(p as usize) = x;
-                    }
-                } else {
-                    let gene_sum = unsafe { *genes.add(p as usize) };
-                    let mut mean = 0.0 as $value;
-                    let mut m2 = 0.0 as $value;
-                    let mut cell = 0_u64;
-                    while cell < rows {
-                        let mu =
-                            gene_sum * unsafe { *cells.add(cell as usize) } * inv_sum as $value;
-                        let value = unsafe { *data.add((p * rows + cell) as usize) };
-                        let x = ((value - mu) * $rsqrt(mu + mu * mu * inv_theta as $value))
-                            .max(-(clip as $value))
-                            .min(clip as $value);
-                        let delta = x - mean;
-                        mean += delta / (cell + 1) as $value;
-                        m2 = delta.mul_add(x - mean, m2);
-                        cell += 1;
-                    }
-                    unsafe {
-                        *out.add(p as usize) = m2 / rows as $value;
-                    }
-                }
-                p += stride;
-            }
-        }
     };
 }
 
 sparse_kernels!(
-    prep_stats_major_f32_i32,
     prep_stats_minor_f32_i32,
     prep_norm_f32_i32,
     prep_scale_f32_i32,
     prep_qc_f32_i32,
-    prep_residual_f32_i32,
     f32,
     i32,
     add_f32,
-    reduce_sum_f32,
-    rsqrt_approx_f32,
-    fma_rn_f32
+    normalization_sum_f32,
+    shuffle_f32_sync
 );
 sparse_kernels!(
-    prep_stats_major_f32_i64,
     prep_stats_minor_f32_i64,
     prep_norm_f32_i64,
     prep_scale_f32_i64,
     prep_qc_f32_i64,
-    prep_residual_f32_i64,
     f32,
     i64,
     add_f32,
-    reduce_sum_f32,
-    rsqrt_approx_f32,
-    fma_rn_f32
+    normalization_sum_f32,
+    shuffle_f32_sync
 );
 sparse_kernels!(
-    prep_stats_major_f64_i32,
     prep_stats_minor_f64_i32,
     prep_norm_f64_i32,
     prep_scale_f64_i32,
     prep_qc_f64_i32,
-    prep_residual_f64_i32,
     f64,
     i32,
     add_f64,
-    reduce_sum_f64,
-    rsqrt_approx_f64,
-    fma_rn_f64
+    normalization_sum_f64,
+    shuffle_f64_sync
 );
 sparse_kernels!(
-    prep_stats_major_f64_i64,
     prep_stats_minor_f64_i64,
     prep_norm_f64_i64,
     prep_scale_f64_i64,
     prep_qc_f64_i64,
-    prep_residual_f64_i64,
     f64,
     i64,
     add_f64,
-    reduce_sum_f64,
-    rsqrt_approx_f64,
-    fma_rn_f64
+    normalization_sum_f64,
+    shuffle_f64_sync
 );
 dense_kernels!(
     prep_norm_dense_f32,
     prep_scale_dense_f32,
     prep_qc_dense_f32,
     prep_expected_f32,
-    prep_residual_dense_f32,
     f32,
     add_f32,
-    reduce_sum_f32,
-    rsqrt_approx_f32,
-    fma_rn_f32
+    normalization_sum_f32,
+    shuffle_f32_sync
 );
 dense_kernels!(
     prep_norm_dense_f64,
     prep_scale_dense_f64,
     prep_qc_dense_f64,
     prep_expected_f64,
-    prep_residual_dense_f64,
     f64,
     add_f64,
-    reduce_sum_f64,
-    rsqrt_approx_f64,
-    fma_rn_f64
+    normalization_sum_f64,
+    shuffle_f64_sync
 );
 
 /// Merge atomic integer flags into the caller's existing bool mask.

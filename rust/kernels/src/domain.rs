@@ -98,15 +98,7 @@ impl Buffer {
         unsafe {
             match self.kind {
                 0 => {
-                    let previous: f32;
-                    cuda_device::ptx_asm!(
-                        "atom.global.add.f32 %0, [%1], %2;",
-                        out("=f") previous,
-                        in("l") (self.pointer as *mut f32).add(i as usize) as u64,
-                        in("f") v as f32,
-                        clobber("memory"),
-                    );
-                    let _ = previous;
+                    crate::atomics::add_f32((self.pointer as *mut f32).add(i as usize), v as f32);
                 }
                 1 => {
                     DeviceAtomicF64::from_ptr((self.pointer as *mut f64).add(i as usize))
@@ -123,14 +115,6 @@ impl Buffer {
                 _ => {}
             }
         }
-    }
-    #[inline(always)]
-    fn at(self, row: u64, col: u64) -> f64 {
-        self.f(if self.order == 0 {
-            row * self.cols + col
-        } else {
-            col * self.rows + row
-        })
     }
     #[inline(always)]
     fn single_at(self, row: u64, col: u64) -> f32 {

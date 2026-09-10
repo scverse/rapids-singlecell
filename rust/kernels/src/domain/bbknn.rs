@@ -167,9 +167,11 @@ pub unsafe fn domain_bbknn_find_top_k_per_row_sorted(
                 let mut count = 0u32;
                 let mut p = start + lane;
                 while p < end {
-                    let v = data.f(p) as f32;
+                    let v = data.single(p);
                     let bits = v.to_bits();
-                    let key = if bits & 0x80000000 != 0 {
+                    let key = if bits & 0x7fffffff == 0 {
+                        0x80000000
+                    } else if bits & 0x80000000 != 0 {
                         !bits
                     } else {
                         bits ^ 0x80000000
@@ -178,6 +180,11 @@ pub unsafe fn domain_bbknn_find_top_k_per_row_sorted(
                         count += 1;
                     }
                     p += 32;
+                }
+                // CUB sorts a full 2048-key tile padded with -Inf. Those
+                // padding keys precede negative NaNs in descending order.
+                if lane == 0 && (0x007fffff & !(bit - 1)) == (prefix | bit) {
+                    count += 2048_u64.saturating_sub(end - start) as u32;
                 }
                 let mut d = 16;
                 while d > 0 {
@@ -198,9 +205,40 @@ pub unsafe fn domain_bbknn_find_top_k_per_row_sorted(
                 !prefix
             };
             cut = f32::from_bits(bits);
+            if prefix == 0x80000000 {
+                // CUB considers both zero signs equal and preserves input
+                // order. Recover the remaining-th zero's original bit pattern.
+                let mut base = start;
+                while base < end {
+                    let position = base + lane;
+                    let bits = if position < end {
+                        data.single(position).to_bits()
+                    } else {
+                        0
+                    };
+                    let mut mask =
+                        warp::ballot_sync(u32::MAX, position < end && bits & 0x7fffffff == 0);
+                    let count = mask.count_ones() as u64;
+                    if remaining <= count {
+                        let mut skip = remaining - 1;
+                        while skip != 0 {
+                            mask &= mask - 1;
+                            skip -= 1;
+                        }
+                        cut = f32::from_bits(warp::shuffle_sync(
+                            u32::MAX,
+                            bits,
+                            mask.trailing_zeros(),
+                        ));
+                        break;
+                    }
+                    remaining -= count;
+                    base += 32;
+                }
+            }
         }
         if lane == 0 {
-            vals.put(row, cut as f64);
+            vals.put_single(row, cut);
         }
         row += stride() / 32;
     }

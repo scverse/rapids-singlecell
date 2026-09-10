@@ -15,6 +15,7 @@ fn cooc_value(result: Buffer, i: u64, j: u64, t: u64, k: u64, l: u64, format: u6
 /// The caller must supply validated, aligned device allocations matching each
 /// descriptor and keep them alive until the borrowed stream completes.
 #[kernel]
+#[cuda_device::launch_bounds(1024)]
 pub unsafe fn domain_cooc_count_csr_catpairs(
     spatial: u64,
     thresholds: u64,
@@ -122,72 +123,91 @@ pub unsafe fn domain_cooc_count_csr_catpairs(
         rows: counts_rows,
         cols: counts_cols,
     };
-    // Private warp histograms avoid a global atomic for every threshold and
-    // cell pair. Threshold windows keep shared memory bounded for large grids.
-    static mut HIST: cuda_device::SharedArray<u64, 1024> = cuda_device::SharedArray::UNINIT;
-    static mut COORDS: cuda_device::SharedArray<f32, 256> = cuda_device::SharedArray::UNINIT;
-    let hist = unsafe { cuda_device::SharedArray::as_raw_mut_ptr(&raw mut HIST) };
-    let mut tile = tid() / 128;
-    let lane = tid() % 128;
+    // Coordinate tiles and per-warp histograms share a bounded dynamic region.
+    // The host preserves the original adaptive block/tile configurations and
+    // caps the threshold window when the whole histogram would exceed 48 KiB.
+    let coords = cuda_device::DynamicSharedArray::<u64>::get().cast::<f32>();
+    let hist = unsafe { coords.add(cell_tile as usize * 2).cast::<u64>() };
+    let threads = thread::blockDim_x() as u64;
+    let lane = thread::threadIdx_x() as u64;
+    let warps = threads / 32;
+    let padded = (shared_mem - cell_tile * 8) / (warps * 8);
+    let thresholds = thresholds.pointer as *const f32;
+    let mut tile = thread::blockIdx_x() as u64;
     while tile < num_pairs * blocks_per_pair {
         let pair = tile / blocks_per_pair;
         let part = tile % blocks_per_pair;
-        let l = pair_left.i(pair);
-        let r = pair_right.i(pair);
-        let mut ls = cat_offsets.i(l);
-        let mut le = cat_offsets.i(l + 1);
-        let mut rs = cat_offsets.i(r);
-        let mut re = cat_offsets.i(r + 1);
+        let left = pair_left.i(pair);
+        let right = pair_right.i(pair);
+        let mut ls = cat_offsets.i(left);
+        let mut le = cat_offsets.i(left + 1);
+        let mut rs = cat_offsets.i(right);
+        let mut re = cat_offsets.i(right + 1);
         if le.saturating_sub(ls) < re.saturating_sub(rs) {
             core::mem::swap(&mut ls, &mut rs);
             core::mem::swap(&mut le, &mut re);
         }
         let na = le.saturating_sub(ls);
         let nb = re.saturating_sub(rs);
+        // All threads agree when this partition owns no A cells. Its counts
+        // are zero, so skip shared initialization and global zero atomics.
+        // Previous grid-stride work finished at the loop's final barrier.
+        if part * threads >= na || nb == 0 {
+            tile += thread::gridDim_x() as u64;
+            continue;
+        }
         let mut threshold_base = 0;
         while threshold_base < l_val {
-            let width = (l_val - threshold_base).min(256);
+            let width = (l_val - threshold_base).min(padded);
             let mut q = lane;
-            while q < 1024 {
+            while q < warps * padded {
                 unsafe {
                     *hist.add(q as usize) = 0;
                 }
-                q += 128;
+                q += threads;
             }
             thread::sync_threads();
             let mut bbase = 0;
             while bbase < nb {
-                let cells = (nb - bbase).min(128);
+                let cells = (nb - bbase).min(cell_tile);
                 q = lane;
-                while q < 256 {
-                    let local = q / 2;
-                    let b = cell_indices.i(rs + bbase + local);
+                while q < cells * 2 {
+                    let cell = cell_indices.i(rs + bbase + q / 2);
+                    let index = cell * 2 + q % 2;
                     unsafe {
-                        COORDS[q as usize] = if local < cells {
-                            spatial.single(b * 2 + q % 2)
+                        *coords.add(q as usize) = if index < spatial.len {
+                            *(spatial.pointer as *const f32).add(index as usize)
                         } else {
                             0.0
                         };
                     }
-                    q += 128;
+                    q += threads;
                 }
                 thread::sync_threads();
-                let mut ai = part * 128 + lane;
+                let mut ai = part * threads + lane;
                 while ai < na {
-                    let a = cell_indices.i(ls + ai);
-                    let x = spatial.single(a * 2);
-                    let y = spatial.single(a * 2 + 1);
+                    let cell = cell_indices.i(ls + ai);
+                    let (x, y) = if cell < spatial.len / 2 {
+                        unsafe {
+                            let p = (spatial.pointer as *const f32).add(cell as usize * 2);
+                            (*p, *p.add(1))
+                        }
+                    } else {
+                        (0.0, 0.0)
+                    };
                     let mut bi = 0;
                     while bi < cells {
-                        if l != r || ai < bbase + bi {
-                            let dx = x - unsafe { COORDS[(bi * 2) as usize] };
-                            let dy = y - unsafe { COORDS[(bi * 2 + 1) as usize] };
-                            let distance = dx * dx + dy * dy;
+                        if left != right || ai < bbase + bi {
+                            let dx = x - unsafe { *coords.add(bi as usize * 2) };
+                            let dy = y - unsafe { *coords.add(bi as usize * 2 + 1) };
+                            let distance = dx.mul_add(dx, dy * dy);
                             let mut lo = 0;
                             let mut hi = width;
                             while lo < hi {
                                 let mid = (lo + hi) / 2;
-                                if distance <= thresholds.single(threshold_base + mid) {
+                                if distance
+                                    <= unsafe { *thresholds.add((threshold_base + mid) as usize) }
+                                {
                                     hi = mid;
                                 } else {
                                     lo = mid + 1;
@@ -196,7 +216,7 @@ pub unsafe fn domain_cooc_count_csr_catpairs(
                             if lo < width {
                                 unsafe {
                                     cuda_device::atomic::BlockAtomicU64::from_ptr(
-                                        hist.add(((lane / 32) * 256 + lo) as usize),
+                                        hist.add(((lane / 32) * padded + lo) as usize),
                                     )
                                     .fetch_add(1, AtomicOrdering::Relaxed);
                                 }
@@ -204,50 +224,59 @@ pub unsafe fn domain_cooc_count_csr_catpairs(
                         }
                         bi += 1;
                     }
-                    ai += blocks_per_pair * 128;
+                    ai += blocks_per_pair * threads;
                 }
+                // Every reader finishes before any thread overwrites the tile.
                 thread::sync_threads();
-                bbase += 128;
+                bbase += cell_tile;
             }
-            q = lane;
-            while q < width {
-                unsafe {
-                    *hist.add(q as usize) += *hist.add((q + 256) as usize)
-                        + *hist.add((q + 512) as usize)
-                        + *hist.add((q + 768) as usize);
-                }
-                q += 128;
-            }
-            thread::sync_threads();
-            if lane == 0 {
-                let mut total = 0;
-                q = 0;
+            if lane < 32 {
+                q = lane;
                 while q < width {
+                    let mut total = 0;
+                    let mut warp = 0;
+                    while warp < warps {
+                        total += unsafe { *hist.add((warp * padded + q) as usize) };
+                        warp += 1;
+                    }
                     unsafe {
-                        total += *hist.add(q as usize);
                         *hist.add(q as usize) = total;
                     }
-                    q += 1;
+                    q += 32;
                 }
-            }
-            thread::sync_threads();
-            q = lane;
-            while q < width {
-                let output = (l * k + r) * l_val + threshold_base + q;
-                if output < counts.len {
-                    unsafe {
-                        DeviceAtomicU64::from_ptr(
-                            (counts.pointer as *mut u64).add(output as usize),
-                        )
-                        .fetch_add(*hist.add(q as usize), AtomicOrdering::Relaxed);
+                warp::sync_mask(u32::MAX);
+                if lane == 0 {
+                    let mut total = 0;
+                    q = 0;
+                    while q < width {
+                        unsafe {
+                            total += *hist.add(q as usize);
+                            *hist.add(q as usize) = total;
+                        }
+                        q += 1;
                     }
                 }
-                q += 128;
+                warp::sync_mask(u32::MAX);
+                q = lane;
+                while q < width {
+                    let output = (left * k + right) * l_val + threshold_base + q;
+                    if output < counts.len {
+                        unsafe {
+                            DeviceAtomicU64::from_ptr(
+                                (counts.pointer as *mut u64).add(output as usize),
+                            )
+                            .fetch_add(*hist.add(q as usize), AtomicOrdering::Relaxed);
+                        }
+                    }
+                    q += 32;
+                }
             }
+            // Covers all warps before the next threshold window or pair reuses
+            // the shared histogram (including grid-stride launches).
             thread::sync_threads();
-            threshold_base += 256;
+            threshold_base += padded;
         }
-        tile += stride() / 128;
+        tile += thread::gridDim_x() as u64;
     }
 }
 /// # Safety
@@ -322,7 +351,7 @@ pub unsafe fn domain_cooc_count_pairwise(
         while j < n {
             let dx = spatial.single(i * 2) - spatial.single(j * 2);
             let dy = spatial.single(i * 2 + 1) - spatial.single(j * 2 + 1);
-            let ds = dx * dx + dy * dy;
+            let ds = dx.mul_add(dx, dy * dy);
             let a = labels.i(i);
             let b = labels.i(j);
             let mut low = a.min(b);

@@ -1,7 +1,7 @@
 //! Weighted regression and multi-covariate correction kernels.
 #![allow(clippy::too_many_arguments, clippy::missing_safety_doc)]
 use super::harmony::{add_f32, add_f64, sum_f32, sum_f64};
-use cuda_device::{SharedArray, kernel, thread, warp};
+use cuda_device::{SharedArray, kernel, ptx_asm, thread, warp};
 #[kernel]
 pub unsafe fn harmony_inverse_f32(
     o: *const f32,
@@ -138,154 +138,139 @@ pub unsafe fn harmony_column_f64(src: *const f64, dst: *mut f64, rows: u64, cols
         }
     }
 }
-#[kernel]
-pub unsafe fn harmony_weighted_rhs_f32(
-    x: *const f32,
-    r: *const f32,
-    offsets: *const i32,
-    indices: *const i32,
-    out: *mut f32,
-    rows: u64,
-    pcs: u64,
-    clusters: u64,
-    batches: u64,
-    cluster: i32,
-) {
+// Read the original paired-PC vector only when both coordinates are present
+// and naturally aligned; odd feature counts retain the scalar tail.
+#[inline(always)]
+unsafe fn rhs_load2_f32(pointer: *const f32) -> [f32; 2] {
+    let (a, b): (f32, f32);
     unsafe {
-        static mut REDUCE: SharedArray<f32, 32> = SharedArray::UNINIT;
-        let reduce = SharedArray::as_raw_mut_ptr(&raw mut REDUCE);
-        let tid = thread::threadIdx_x() as usize;
-        let lane = tid % 32;
-        let block = thread::blockDim_x() as usize;
-        let mut row = thread::blockIdx_x() as usize;
-        let stride = thread::gridDim_x() as usize;
-        let (n, d, k, b) = (
-            rows as usize,
-            pcs as usize,
-            clusters as usize,
-            batches as usize,
-        );
-        let count = if cluster < 0 { k } else { 1 };
-        while row < count * (b + 1) * d {
-            let pc = row % d;
-            let batch = (row / d) % (b + 1);
-            let cl = row / (d * (b + 1));
-            let kk = if cluster < 0 { cl } else { cluster as usize };
-            let (begin, end) = if batch == 0 {
-                (0, n as i32)
-            } else {
-                (*offsets.add(batch - 1), *offsets.add(batch))
-            };
-            let mut v = 0_f32;
-            if begin >= 0 && end >= begin && end <= n as i32 && (batch != 0 || n < 300_000) {
-                let mut pos = begin as usize + tid;
-                while pos < end as usize {
-                    let cell = if batch == 0 {
-                        pos as i32
-                    } else {
-                        *indices.add(pos)
-                    };
-                    if cell >= 0 && (cell as usize) < n {
-                        v += *x.add(cell as usize * d + pc) * *r.add(cell as usize * k + kk);
-                    }
-                    pos += block;
-                }
-            }
-            v = sum_f32(v);
-            if lane == 0 {
-                *reduce.add(tid / 32) = v;
-            }
-            thread::sync_threads();
-            if tid < 32 {
-                let partial = if tid < block / 32 {
-                    *reduce.add(tid)
-                } else {
-                    0_f32
-                };
-                let total = sum_f32(partial);
-                if tid == 0 {
-                    *out.add(row) = total;
-                }
-            }
-            thread::sync_threads();
-            row += stride;
-        }
+        ptx_asm!("ld.global.v2.f32 {%0, %1}, [%2];", out("=f") a, out("=f") b, in("l") pointer as u64, clobber("memory"));
     }
+    [a, b]
 }
-#[kernel]
-pub unsafe fn harmony_weighted_rhs_f64(
-    x: *const f64,
-    r: *const f64,
-    offsets: *const i32,
-    indices: *const i32,
-    out: *mut f64,
-    rows: u64,
-    pcs: u64,
-    clusters: u64,
-    batches: u64,
-    cluster: i32,
-) {
+#[inline(always)]
+unsafe fn rhs_load2_f64(pointer: *const f64) -> [f64; 2] {
+    let (a, b): (f64, f64);
     unsafe {
-        static mut REDUCE: SharedArray<f64, 32> = SharedArray::UNINIT;
-        let reduce = SharedArray::as_raw_mut_ptr(&raw mut REDUCE);
-        let tid = thread::threadIdx_x() as usize;
-        let lane = tid % 32;
-        let block = thread::blockDim_x() as usize;
-        let mut row = thread::blockIdx_x() as usize;
-        let stride = thread::gridDim_x() as usize;
-        let (n, d, k, b) = (
-            rows as usize,
-            pcs as usize,
-            clusters as usize,
-            batches as usize,
-        );
-        let count = if cluster < 0 { k } else { 1 };
-        while row < count * (b + 1) * d {
-            let pc = row % d;
-            let batch = (row / d) % (b + 1);
-            let cl = row / (d * (b + 1));
-            let kk = if cluster < 0 { cl } else { cluster as usize };
-            let (begin, end) = if batch == 0 {
-                (0, n as i32)
-            } else {
-                (*offsets.add(batch - 1), *offsets.add(batch))
-            };
-            let mut v = 0_f64;
-            if begin >= 0 && end >= begin && end <= n as i32 && (batch != 0 || n < 300_000) {
-                let mut pos = begin as usize + tid;
-                while pos < end as usize {
-                    let cell = if batch == 0 {
-                        pos as i32
-                    } else {
-                        *indices.add(pos)
-                    };
-                    if cell >= 0 && (cell as usize) < n {
-                        v += *x.add(cell as usize * d + pc) * *r.add(cell as usize * k + kk);
-                    }
-                    pos += block;
-                }
-            }
-            v = sum_f64(v);
-            if lane == 0 {
-                *reduce.add(tid / 32) = v;
-            }
-            thread::sync_threads();
-            if tid < 32 {
-                let partial = if tid < block / 32 {
-                    *reduce.add(tid)
-                } else {
-                    0_f64
-                };
-                let total = sum_f64(partial);
-                if tid == 0 {
-                    *out.add(row) = total;
-                }
-            }
-            thread::sync_threads();
-            row += stride;
-        }
+        ptx_asm!("ld.global.v2.f64 {%0, %1}, [%2];", out("=d") a, out("=d") b, in("l") pointer as u64, clobber("memory"));
     }
+    [a, b]
 }
+macro_rules! weighted_rhs {
+    ($name:ident, $value:ty, $load:ident, $sum:ident, $atomic:ident) => {
+        #[kernel]
+        #[cuda_device::launch_bounds(1024)]
+        pub unsafe fn $name(
+            x: *const $value,
+            bias: *const $value,
+            offsets: *const i32,
+            indices: *const i32,
+            out: *mut $value,
+            rows: u64,
+            pcs: u64,
+            batches: u64,
+        ) {
+            unsafe {
+                static mut PARTIAL: SharedArray<$value, 64> = SharedArray::UNINIT;
+                let tid = thread::threadIdx_x() as usize;
+                let block = thread::blockDim_x() as usize;
+                let stride = thread::gridDim_x() as usize;
+                let (n, d, b) = (rows as usize, pcs as usize, batches as usize);
+                let pairs = d.div_ceil(2);
+                let parts = if n < 300_000 { 8 } else { 0 };
+                let mut task = thread::blockIdx_x() as usize;
+                while task < (b + parts) * pairs {
+                    let segment = task / pairs;
+                    let pc = (task % pairs) * 2;
+                    let second = pc + 1 < d;
+                    let intercept = segment < parts;
+                    let batch = if intercept { 0 } else { segment - parts + 1 };
+                    let (begin, end) = if intercept {
+                        let span = n.div_ceil(8);
+                        (
+                            (segment * span).min(n) as i32,
+                            ((segment + 1) * span).min(n) as i32,
+                        )
+                    } else {
+                        (*offsets.add(batch - 1), *offsets.add(batch))
+                    };
+                    let (mut a, mut z) = (0.0 as $value, 0.0 as $value);
+                    if begin >= 0 && end >= begin && end as usize <= n {
+                        let mut position = begin as usize + tid;
+                        while position < end as usize {
+                            let cell = if intercept {
+                                position as i32
+                            } else {
+                                *indices.add(position)
+                            };
+                            if cell >= 0 && (cell as usize) < n {
+                                let pointer = x.add(cell as usize * d + pc);
+                                let weight = *bias.add(cell as usize);
+                                let values = if second
+                                    && (pointer as usize)
+                                        .is_multiple_of(2 * core::mem::size_of::<$value>())
+                                {
+                                    $load(pointer)
+                                } else {
+                                    [*pointer, if second { *pointer.add(1) } else { 0.0 }]
+                                };
+                                a = values[0].mul_add(weight, a);
+                                z = values[1].mul_add(weight, z);
+                            }
+                            position += block;
+                        }
+                    }
+                    a = $sum(a);
+                    z = $sum(z);
+                    if tid.is_multiple_of(32) {
+                        PARTIAL[tid / 32] = a;
+                        PARTIAL[32 + tid / 32] = z;
+                    }
+                    thread::sync_threads();
+                    if tid < 32 {
+                        a = $sum(if tid < block / 32 { PARTIAL[tid] } else { 0.0 });
+                        z = $sum(if tid < block / 32 {
+                            PARTIAL[32 + tid]
+                        } else {
+                            0.0
+                        });
+                        if tid == 0 {
+                            if intercept {
+                                $atomic(out.add(pc), a);
+                                if second {
+                                    $atomic(out.add(pc + 1), z);
+                                }
+                            } else {
+                                *out.add(batch * d + pc) = a;
+                                if second {
+                                    *out.add(batch * d + pc + 1) = z;
+                                }
+                            }
+                        }
+                    }
+                    // All first-warp shared reads finish before the next task
+                    // overwrites the same bounded pair reduction workspace.
+                    thread::sync_threads();
+                    task += stride;
+                }
+            }
+        }
+    };
+}
+weighted_rhs!(
+    harmony_weighted_rhs_f32,
+    f32,
+    rhs_load2_f32,
+    sum_f32,
+    add_f32
+);
+weighted_rhs!(
+    harmony_weighted_rhs_f64,
+    f64,
+    rhs_load2_f64,
+    sum_f64,
+    add_f64
+);
 #[kernel]
 pub unsafe fn harmony_apply_f32(
     x: *const f32,

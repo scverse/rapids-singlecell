@@ -18,6 +18,11 @@ fn gaussian_kde_2d(
     let xy = read(Some(xy), &cupy, "xy", "T", false)?;
     let out = read(Some(out), &cupy, "out", "T", false)?;
     same(&out, &xy)?;
+    if n > xy.len() / 2 || n > out.len() {
+        return Err(PyValueError::new_err(
+            "n exceeds the input or output allocation",
+        ));
+    }
     launch(
         &cupy,
         &[&xy, &out],

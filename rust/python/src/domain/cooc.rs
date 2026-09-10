@@ -30,6 +30,43 @@ fn count_csr_catpairs(
     let pair_left = read(Some(pair_left), &cupy, "pair_left", "int", false)?;
     let pair_right = read(Some(pair_right), &cupy, "pair_right", "int", false)?;
     let counts = read(Some(counts), &cupy, "counts", "cooc_count_t", false)?;
+    if !(32..=1024).contains(&block_size) || !block_size.is_multiple_of(32) {
+        return Err(PyValueError::new_err(
+            "block_size must be a multiple of 32 from 32 through 1024",
+        ));
+    }
+    let cell_tile = if [16, 32, 64, 128, 256, 512, 1024].contains(&cell_tile) {
+        cell_tile
+    } else {
+        16 // Preserve the original launcher's default tile specialization.
+    };
+    let padded = l_val
+        .checked_add(31)
+        .ok_or_else(|| PyValueError::new_err("too many thresholds"))?
+        / 32
+        * 32;
+    let warps = block_size / 32;
+    // Bound every launch by the supported 48 KiB floor. Large threshold sets
+    // use independent cumulative windows instead of an unbounded histogram.
+    let window = padded.min((48 * 1024 - cell_tile * 8) / (warps * 8) / 32 * 32);
+    let _ = shared_mem; // A caller's tuning hint cannot enlarge the safe budget.
+    let shared_mem = cell_tile * 8 + warps * window * 8;
+    let work = num_pairs
+        .checked_mul(blocks_per_pair)
+        .and_then(|n| n.checked_mul(block_size))
+        .ok_or_else(|| PyValueError::new_err("cooccurrence launch extent overflow"))?;
+    if thresholds.len() < l_val
+        || pair_left.len() < num_pairs
+        || pair_right.len() < num_pairs
+        || cat_offsets.len() <= k
+        || k.checked_mul(k)
+            .and_then(|n| n.checked_mul(l_val))
+            .is_none_or(|n| counts.len() < n)
+    {
+        return Err(PyValueError::new_err(
+            "cooccurrence dimensions exceed array extents",
+        ));
+    }
     launch(
         &cupy,
         &[
@@ -42,7 +79,7 @@ fn count_csr_catpairs(
             &counts,
         ],
         "domain_cooc_count_csr_catpairs",
-        num_pairs * blocks_per_pair * 128,
+        work,
         stream,
         vec![
             spatial.pointer(),
@@ -174,12 +211,49 @@ fn reduce_global(
     Ok(())
 }
 #[pyfunction]
-fn get_kernel_config(l_val: u64, n_cells: u64, k: u64) -> PyResult<Option<(u64, u64, u64, u64)>> {
+fn get_kernel_config(
+    py: Python<'_>,
+    l_val: u64,
+    n_cells: u64,
+    k: u64,
+) -> PyResult<Option<(u64, u64, u64, u64)>> {
     if k == 0 {
         return Err(PyValueError::new_err("k must be positive"));
     }
-    let _ = n_cells;
-    Ok(Some((128, l_val.div_ceil(32) * 32, 128, 0)))
+    let cp = py.import("cupy")?;
+    let runtime = cp.getattr("cuda")?.getattr("runtime")?;
+    let device = runtime.call_method0("getDevice")?;
+    let properties = runtime.call_method1("getDeviceProperties", (device,))?;
+    let maximum = properties
+        .get_item("sharedMemPerBlock")?
+        .extract::<u64>()?
+        .min(48 * 1024);
+    let padded = l_val
+        .checked_add(31)
+        .ok_or_else(|| PyValueError::new_err("too many thresholds"))?
+        / 32
+        * 32;
+    let target = match n_cells / k {
+        10000.. => 1024,
+        5000.. => 512,
+        2500.. => 256,
+        _ => 128,
+    };
+    for block in [target, 128, 256, 512, 1024] {
+        for tile in [1024, 512, 256, 128, 64, 32, 16] {
+            if let Some(bytes) = padded
+                .checked_mul(block / 32 * 8)
+                .and_then(|n| n.checked_add(tile * 8))
+                && bytes <= maximum
+            {
+                return Ok(Some((tile, padded, block, bytes)));
+            }
+        }
+    }
+    // The bounded window path also supports threshold sets that exhausted the
+    // original launcher's shared-memory configurations.
+    let window = padded.min((maximum - 128 * 8) / (4 * 8) / 32 * 32);
+    Ok(Some((128, padded, 128, 128 * 8 + 4 * window * 8)))
 }
 pub(super) fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = submodule(parent, "_cooc_cuda")?;

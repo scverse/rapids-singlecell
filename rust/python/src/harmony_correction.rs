@@ -221,23 +221,27 @@ pub fn correction_fast(
                 Arg::U64(k),
             ],
         )?;
-        launch(
+        if n_cells < 300_000 {
+            // Eight independent intercept partitions accumulate into row 0;
+            // category rows are owned and overwritten by their paired blocks.
+            zero(&cp, Phi_t_diag_R_X.pointer, n_pcs * itemsize(dtype), stream)?;
+        }
+        launch_grid(
             device,
             "harmony_weighted_rhs",
             dtype,
-            (n_batches + 1) * n_pcs * 256,
+            (n_batches + if n_cells < 300_000 { 8 } else { 0 }) * n_pcs.div_ceil(2),
+            1024,
             stream,
             &mut [
                 Arg::Ptr(X.pointer),
-                Arg::Ptr(R.pointer),
+                Arg::Ptr(R_col.pointer),
                 Arg::Ptr(cat_offsets.pointer),
                 Arg::Ptr(cell_indices.pointer),
                 Arg::Ptr(Phi_t_diag_R_X.pointer),
                 Arg::U64(n_cells),
                 Arg::U64(n_pcs),
-                Arg::U64(n_clusters),
                 Arg::U64(n_batches),
-                Arg::I32(k as i32),
             ],
         )?;
         if n_cells >= 300_000 {

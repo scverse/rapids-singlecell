@@ -86,12 +86,7 @@ fn read(
             array.dtype.name()
         )));
     }
-    let order = u64::from(
-        !object
-            .getattr("flags")?
-            .getattr("c_contiguous")?
-            .extract::<bool>()?,
-    );
+    let order = u64::from(!array.c_contiguous);
     let rows = array.shape.first().copied().unwrap_or(0) as u64;
     let cols = array.shape.get(1).copied().unwrap_or(1) as u64;
     Ok(Buffer {
@@ -109,6 +104,10 @@ fn same(a: &Buffer, b: &Buffer) -> PyResult<()> {
     }
     Ok(())
 }
+fn pseudobulk_block(features: u64) -> u64 {
+    features.min(256).next_power_of_two().max(32)
+}
+
 fn launch(
     cupy: &Bound<'_, PyModule>,
     buffers: &[&Buffer],
@@ -126,22 +125,46 @@ fn launch(
         args.extend([b.len(), b.kind(), b.order, b.rows, b.cols]);
     }
     let block = match name {
+        name if name.starts_with("domain_pseudobulk_") => {
+            pseudobulk_block(args[if name.contains("_paired_") { 4 } else { 5 }])
+        }
+        "domain_cooc_count_csr_catpairs" => args[12],
+        "domain_aucell_auc" if buffers[1].len() / args[6].max(1) >= 128 => 256,
+        "domain_pv_rev_cummin64" => 256,
+        name if name.starts_with("domain_edistance_dense_") => args[11],
+        name if name.starts_with("domain_edistance_sparse_") => args[13],
+        name if name.starts_with("domain_autocorr_morans_sparse")
+            || name.starts_with("domain_autocorr_gearys_sparse") =>
+        {
+            1024
+        }
         "domain_ligrec_sum_count_dense" | "domain_ligrec_mean_dense" => 1024,
         "domain_guide_assignment_assign_threshold_dense"
         | "domain_guide_assignment_fit_assign_dense"
-        | "domain_mixscale_project_score" => 256,
+        | "domain_mixscale_project_score"
+        | "domain_sinkhorn_build_cost" => 256,
         _ => 128,
+    };
+    let grid = if name == "domain_aucell_auc" && block == 256 {
+        (work.div_ceil(8).min(65_535) as u32, 1, 1)
+    } else {
+        (work.div_ceil(block).min(65_535) as u32, 1, 1)
     };
     let mut pointers: Vec<*mut c_void> = args.iter_mut().map(|a| (a as *mut u64).cast()).collect();
     // SAFETY: every argument is a u64 slot, matching the device entry ABI;
-    // descriptors are validated CuPy allocations. Device Buffer bounds-checks
-    // all accesses, including those indexed by sparse metadata.
+    // descriptors are validated CuPy allocations. Typed entries check complete
+    // extents on the host; indirect metadata remains checked on the device.
     unsafe {
-        runtime::launch(
+        runtime::launch_shared(
             device,
             name,
-            (work.div_ceil(block).min(65_535) as u32, 1, 1),
+            grid,
             (block as u32, 1, 1),
+            if name == "domain_cooc_count_csr_catpairs" {
+                args[13] as u32
+            } else {
+                0
+            },
             stream,
             &mut pointers,
         )

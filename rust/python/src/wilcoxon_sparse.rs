@@ -11,33 +11,89 @@ use crate::{
 use pyo3::{
     exceptions::{PyTypeError, PyValueError},
     prelude::*,
-    types::PyDict,
+    types::{PyDict, PySlice},
 };
 
-fn csc_block<'py>(
-    cp: &Bound<'py, PyModule>,
-    source: &Bound<'py, PyAny>,
-    host: bool,
-) -> PyResult<CscBlock<'py>> {
-    let source = source.call_method0("tocsc")?;
-    let data = source.getattr("data")?;
-    let indices = source.getattr("indices")?;
-    let indptr = source.getattr("indptr")?;
-    if !host {
-        return Ok(CscBlock {
-            data,
-            indices,
-            indptr,
-        });
+/// Validated sparse host storage with one reusable row-span plan per call.
+enum HostSource<'py> {
+    Csc(Bound<'py, PyAny>),
+    Csr {
+        data: Bound<'py, PyAny>,
+        indices: Bound<'py, PyAny>,
+        spans: crate::host_sparse::CsrSpans,
+        shape: [usize; 2],
+    },
+}
+
+impl<'py> HostSource<'py> {
+    fn csr(
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        indices: &Bound<'py, PyAny>,
+        starts: &Bound<'py, PyAny>,
+        stops: &Bound<'py, PyAny>,
+        columns: usize,
+    ) -> PyResult<Self> {
+        host_vector(data, "data", false)?;
+        host_vector(indices, "indices", true)?;
+        if data.len()? != indices.len()? {
+            return Err(PyValueError::new_err(
+                "CSR data and indices lengths must match",
+            ));
+        }
+        let spans = crate::host_sparse::CsrSpans::new(py, indices, starts, stops, columns)?;
+        Ok(Self::Csr {
+            data: data.clone(),
+            indices: indices.clone(),
+            spans,
+            shape: [starts.len()?, columns],
+        })
     }
-    let dtype: String = data.getattr("dtype")?.getattr("name")?.extract()?;
-    let idtype: String = indices.getattr("dtype")?.getattr("name")?.extract()?;
-    let pdtype: String = indptr.getattr("dtype")?.getattr("name")?.extract()?;
-    Ok(CscBlock {
-        data: array(cp, &data, &dtype, "C")?,
-        indices: array(cp, &indices, &idtype, "C")?,
-        indptr: array(cp, &indptr, &pdtype, "C")?,
-    })
+
+    fn shape(&self) -> PyResult<[usize; 2]> {
+        match self {
+            Self::Csc(source) => {
+                let (rows, cols) = source.getattr("shape")?.extract()?;
+                Ok([rows, cols])
+            }
+            Self::Csr { shape, .. } => Ok(*shape),
+        }
+    }
+
+    fn window(&self, first: usize, stop: usize) -> PyResult<CscBlock<'py>> {
+        match self {
+            Self::Csc(source) => host_csc_window(source, first, stop),
+            Self::Csr {
+                data,
+                indices,
+                spans,
+                ..
+            } => spans
+                .window(data.py(), data, indices, first, stop)
+                .map(CscBlock::Owned),
+        }
+    }
+}
+
+/// Slice validated host CSC storage without SciPy's redundant value/index copy.
+/// The staging layer takes the owned snapshot required before detaching.
+fn host_csc_window<'py>(
+    source: &Bound<'py, PyAny>,
+    first: usize,
+    stop: usize,
+) -> PyResult<CscBlock<'py>> {
+    let py = source.py();
+    let indptr = source.getattr("indptr")?;
+    let begin = indptr.get_item(first)?.extract::<isize>()?;
+    let end = indptr.get_item(stop)?.extract::<isize>()?;
+    let entries = PySlice::new(py, begin, end, 1);
+    let pointers = PySlice::new(py, first as isize, stop as isize + 1, 1);
+    let data = source.getattr("data")?.get_item(&entries)?;
+    let indices = source.getattr("indices")?.get_item(&entries)?;
+    let indptr = indptr
+        .get_item(pointers)?
+        .call_method1("__sub__", (begin,))?;
+    crate::host_sparse::CscWindow::from_arrays(py, &data, &indices, &indptr).map(CscBlock::Owned)
 }
 
 fn host_vector(object: &Bound<'_, PyAny>, name: &str, integer_only: bool) -> PyResult<()> {
@@ -66,20 +122,18 @@ fn host_vector(object: &Bound<'_, PyAny>, name: &str, integer_only: bool) -> PyR
     }
     Ok(())
 }
-/// Host sparse objects borrow the original NumPy storage. Column slicing compacts
-/// only the current window before any data are copied to the GPU.
-fn host_sparse<'py>(
+/// Validate host CSC metadata once while borrowing the original NumPy arrays.
+fn host_csc<'py>(
     data: &Bound<'py, PyAny>,
     indices: &Bound<'py, PyAny>,
     indptr: &Bound<'py, PyAny>,
     rows: usize,
     cols: usize,
-    csc: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     host_vector(data, "data", false)?;
     host_vector(indices, "indices", true)?;
     host_vector(indptr, "indptr", true)?;
-    if data.len()? != indices.len()? || indptr.len()? != if csc { cols + 1 } else { rows + 1 } {
+    if data.len()? != indices.len()? || indptr.len()? != cols + 1 {
         return Err(PyValueError::new_err("inconsistent sparse array lengths"));
     }
     let kw = PyDict::new(data.py());
@@ -88,7 +142,7 @@ fn host_sparse<'py>(
     let matrix = data
         .py()
         .import("scipy.sparse")?
-        .getattr(if csc { "csc_matrix" } else { "csr_matrix" })?
+        .getattr("csc_matrix")?
         .call(((data, indices, indptr),), Some(&kw))?;
     // Checking offsets before native sparse slicing prevents malformed metadata
     // from escaping through the host library's unchecked indexing paths.
@@ -174,6 +228,10 @@ fn ovr_device(
                 .call(((data, indices, indptr),), Some(&kwargs))?,
         )
     };
+    let mut csr_windows = source
+        .as_ref()
+        .map(|source| crate::device_sparse::CsrWindows::new(&cp, source, c.len as usize, out[1]))
+        .transpose()?;
     sparse_ovr::ovr(
         &cp,
         c.len as usize,
@@ -184,15 +242,16 @@ fn ovr_device(
         compute,
         batch,
         None,
-        |a, b| {
-            if let Some(source) = &source {
-                csc_block(&cp, &window(source, a, b)?, false)
+        false,
+        |a, b, staging, slot| {
+            if let Some(windows) = &mut csr_windows {
+                windows.window(&cp, a, b, staging, slot)
             } else {
-                Ok(CscBlock {
-                    data: data.clone(),
-                    indices: indices.clone(),
-                    indptr: indptr.get_item(slice(py, a, b + 1))?,
-                })
+                Ok(CscBlock::arrays(
+                    data.clone(),
+                    indices.clone(),
+                    indptr.get_item(slice(py, a, b + 1))?,
+                ))
             }
         },
     )
@@ -256,9 +315,7 @@ pub fn ovr_sparse_csc_device(
 
 fn ovr_host(
     py: Python<'_>,
-    data: &Bound<'_, PyAny>,
-    indices: &Bound<'_, PyAny>,
-    indptr: &Bound<'_, PyAny>,
+    source: &HostSource<'_>,
     codes: &Bound<'_, PyAny>,
     sizes: &Bound<'_, PyAny>,
     ranks: &Bound<'_, PyAny>,
@@ -267,26 +324,29 @@ fn ovr_host(
     nnz: &Bound<'_, PyAny>,
     total: &Bound<'_, PyAny>,
     total_nnz: &Bound<'_, PyAny>,
-    n_cols: usize,
     compute: bool,
     compute_nnz: bool,
     compute_totals: bool,
     start: isize,
     stop: isize,
     batch: isize,
-    csc: bool,
 ) -> PyResult<()> {
     let cp = py.import("cupy")?;
     host_vector(codes, "group_codes", true)?;
     let rows = codes.len()?;
-    let (start, stop) = range(start, stop, n_cols)?;
+    let dimensions = source.shape()?;
+    if dimensions[0] != rows {
+        return Err(PyValueError::new_err(
+            "group codes must match the source rows",
+        ));
+    }
+    let (start, stop) = range(start, stop, dimensions[1])?;
     let out = shape(ranks)?;
     if out != [sizes.len()?, stop - start] {
         return Err(PyValueError::new_err(
             "rank_sums must have shape (n_groups, window_cols)",
         ));
     }
-    let source = host_sparse(data, indices, indptr, rows, n_cols, csc)?;
     let gc = array(&cp, codes, "int32", "C")?;
     let gs = array(&cp, sizes, "float64", "C")?;
     let st = Stats {
@@ -305,7 +365,8 @@ fn ovr_host(
         compute,
         batch,
         Some(st),
-        |a, b| csc_block(&cp, &window(&source, start + a, start + b)?, true),
+        true,
+        |a, b, _, _| source.window(start + a, start + b),
     )
 }
 #[pyfunction]
@@ -332,11 +393,16 @@ pub fn ovr_sparse_csc_host(
         .len()?
         .checked_sub(1)
         .ok_or_else(|| PyValueError::new_err("indptr must not be empty"))?;
-    ovr_host(
-        py,
+    let source = HostSource::Csc(host_csc(
         h_data,
         h_indices,
         h_indptr,
+        h_group_codes.len()?,
+        cols,
+    )?);
+    ovr_host(
+        py,
+        &source,
         h_group_codes,
         h_group_sizes,
         d_rank_sums,
@@ -345,14 +411,12 @@ pub fn ovr_sparse_csc_host(
         d_group_nnz,
         d_total_sums,
         d_total_nnz,
-        cols,
         compute_tie_corr,
         compute_nnz,
         compute_totals,
         0,
         -1,
         sub_batch_cols,
-        true,
     )
 }
 #[pyfunction]
@@ -386,11 +450,17 @@ pub fn ovr_sparse_csr_host(
     if h_row_starts.len()? != h_group_codes.len()? || h_row_stops.len()? != h_group_codes.len()? {
         return Err(PyValueError::new_err("row span arrays must match n_rows"));
     }
+    host_vector(h_indptr, "h_indptr", true)?;
+    if h_indptr.len()? != h_group_codes.len()? + 1 {
+        return Err(PyValueError::new_err(
+            "CSR indptr must have n_rows+1 entries",
+        ));
+    }
+    crate::host_buffer::sparse_offsets(py, h_indptr, h_data.len()?)?;
+    let source = HostSource::csr(py, h_data, h_indices, h_row_starts, h_row_stops, n_cols)?;
     ovr_host(
         py,
-        h_data,
-        h_indices,
-        h_indptr,
+        &source,
         h_group_codes,
         h_group_sizes,
         d_rank_sums,
@@ -399,14 +469,12 @@ pub fn ovr_sparse_csr_host(
         d_group_nnz,
         d_total_sums,
         d_total_nnz,
-        n_cols,
         compute_tie_corr,
         compute_nnz,
         compute_totals,
         col_start,
         col_stop,
         sub_batch_cols,
-        false,
     )
 }
 
@@ -415,25 +483,33 @@ fn row_ids<'py>(
     rows: &Bound<'py, PyAny>,
     mapped: bool,
     n: usize,
+    completion: &mut crate::staging::BatchStreams<'py>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let ids = array(cp, rows, "int32", "C")?;
+    completion.retain(0, ids.clone());
     let ids = if mapped {
         let mask = ids.call_method1("__ge__", (0,))?;
+        completion.retain(0, mask.clone());
         let selected = cp.call_method1("flatnonzero", (&mask,))?;
+        completion.retain(0, selected.clone());
         let values = ids.get_item(&selected)?;
+        completion.retain(0, values.clone());
         let order = cp.call_method1("argsort", (&values,))?;
+        completion.retain(0, order.clone());
         let sorted_positions = values.get_item(&order)?;
+        completion.retain(0, sorted_positions.clone());
         let expected = cp.call_method1("arange", (n,))?;
-        if !cp
-            .call_method1("array_equal", (&sorted_positions, &expected))?
-            .call_method0("item")?
-            .extract::<bool>()?
-        {
+        completion.retain(0, expected.clone());
+        let equal = cp.call_method1("array_equal", (&sorted_positions, &expected))?;
+        completion.retain(0, equal.clone());
+        if !equal.call_method0("item")?.extract::<bool>()? {
             return Err(PyValueError::new_err(
                 "row maps must contain each selected position exactly once",
             ));
         }
-        selected.get_item(order)?
+        let selected = selected.get_item(order)?;
+        completion.retain(0, selected.clone());
+        selected
     } else {
         ids
     };
@@ -461,6 +537,10 @@ fn ovo_device(
     csc: bool,
 ) -> PyResult<()> {
     let cp = py.import("cupy")?;
+    // Selection casts and row-map gathering precede the main sparse pipeline.
+    // Retain each temporary as it is created so early callback/allocation
+    // failures still drain the caller stream before releasing GPU storage.
+    let mut completion = crate::staging::BatchStreams::caller(&cp)?;
     let dims = shape(ranks)?;
     if dims.len() != 2 {
         return Err(PyValueError::new_err("rank_sums must be two-dimensional"));
@@ -474,8 +554,8 @@ fn ovo_device(
             .ok_or_else(|| PyValueError::new_err("empty indptr"))?
     };
     validate_device_sparse(&cp, data, indices, indptr, rows, dims[1], csc, ranks)?;
-    let refs = row_ids(&cp, ref_rows, csc, n_ref)?;
-    let grps = row_ids(&cp, grp_rows, csc, n_all_grp)?;
+    let refs = row_ids(&cp, ref_rows, csc, n_ref, &mut completion)?;
+    let grps = row_ids(&cp, grp_rows, csc, n_all_grp, &mut completion)?;
     let offsets = wilcoxon::offsets(&cp, grp_offsets, n_all_grp)?;
     if compute {
         let tie = read(tie, &cp, "tie_corr", Some(Dtype::F64), Layout::C)?;
@@ -495,6 +575,10 @@ fn ovo_device(
                 .call(((data, indices, indptr),), Some(&kwargs))?,
         )
     };
+    let mut csr_windows = source
+        .as_ref()
+        .map(|source| crate::device_sparse::CsrWindows::new(&cp, source, rows, dims[1]))
+        .transpose()?;
     sparse_ovo::ovo(
         &cp,
         rows,
@@ -506,15 +590,18 @@ fn ovo_device(
         compute,
         requested,
         None,
-        |a, b| {
-            if let Some(source) = &source {
-                csc_block(&cp, &window(source, a, b)?, false)
+        None,
+        false,
+        |_| Ok(None),
+        |a, b, staging, slot| {
+            if let Some(windows) = &mut csr_windows {
+                windows.window(&cp, a, b, staging, slot)
             } else {
-                Ok(CscBlock {
-                    data: data.clone(),
-                    indices: indices.clone(),
-                    indptr: indptr.get_item(slice(py, a, b + 1))?,
-                })
+                Ok(CscBlock::arrays(
+                    data.clone(),
+                    indices.clone(),
+                    indptr.get_item(slice(py, a, b + 1))?,
+                ))
             }
         },
     )
@@ -590,7 +677,7 @@ pub fn ovo_streaming_csc_device(
 
 fn ovo_host<'py>(
     cp: &Bound<'py, PyModule>,
-    source: &Bound<'py, PyAny>,
+    source: &HostSource<'py>,
     refs: &Bound<'py, PyAny>,
     grps: &Bound<'py, PyAny>,
     offsets: &Bound<'py, PyAny>,
@@ -598,13 +685,14 @@ fn ovo_host<'py>(
     tie: &Bound<'py, PyAny>,
     sums: &Bound<'py, PyAny>,
     nnz: &Bound<'py, PyAny>,
+    stat_codes: Option<&Bound<'py, PyAny>>,
     compute: bool,
     compute_nnz: bool,
     requested: isize,
     start: isize,
     stop: isize,
 ) -> PyResult<()> {
-    let dims = shape(source)?;
+    let dims = source.shape()?;
     let (start, stop) = range(start, stop, dims[1])?;
     if shape(ranks)?.get(1) != Some(&(stop - start)) {
         return Err(PyValueError::new_err(
@@ -629,7 +717,18 @@ fn ovo_host<'py>(
         compute,
         requested,
         Some(st),
-        |a, b| csc_block(cp, &window(source, start + a, start + b)?, true),
+        stat_codes,
+        true,
+        |populations| match source {
+            HostSource::Csr {
+                data,
+                indices,
+                spans,
+                ..
+            } => spans.dense_rank_pack(cp.py(), data, indices, populations, start, stop),
+            HostSource::Csc(_) => Ok(None),
+        },
+        |a, b, _, _| source.window(start + a, start + b),
     )
 }
 #[pyfunction]
@@ -664,9 +763,22 @@ pub fn ovo_streaming_csc_host(
         .len()?
         .checked_sub(1)
         .ok_or_else(|| PyValueError::new_err("empty indptr"))?;
-    let source = host_sparse(h_data, h_indices, h_indptr, rows, cols, true)?;
-    let refs = row_ids(&cp, h_ref_row_map, true, n_ref)?;
-    let grps = row_ids(&cp, h_grp_row_map, true, n_all_grp)?;
+    let source = HostSource::Csc(host_csc(h_data, h_indices, h_indptr, rows, cols)?);
+    let numpy = py.import("numpy")?;
+    let refs = numpy.call_method1(
+        "asarray",
+        (
+            crate::host_sparse::mapped_rows(py, h_ref_row_map, n_ref)?,
+            "int64",
+        ),
+    )?;
+    let grps = numpy.call_method1(
+        "asarray",
+        (
+            crate::host_sparse::mapped_rows(py, h_grp_row_map, n_all_grp)?,
+            "int64",
+        ),
+    )?;
     ovo_host(
         &cp,
         &source,
@@ -677,6 +789,7 @@ pub fn ovo_streaming_csc_host(
         d_tie_corr,
         d_group_sums,
         d_group_nnz,
+        Some(h_stats_codes),
         compute_tie_corr,
         compute_nnz,
         sub_batch_cols,
@@ -712,50 +825,18 @@ pub fn ovo_streaming_csr_host(
 ) -> PyResult<()> {
     let _ = analytic_zeros;
     let cp = py.import("cupy")?;
-    let np = py.import("numpy")?;
-    host_vector(h_row_starts, "h_row_starts", true)?;
-    host_vector(h_row_stops, "h_row_stops", true)?;
-    let rows = h_row_starts.len()?;
-    if h_row_stops.len()? != rows {
-        return Err(PyValueError::new_err(
-            "row spans must have matching lengths",
-        ));
-    }
-    let first = if rows == 0 {
-        0
-    } else {
-        h_row_starts.get_item(0)?.extract::<usize>()?
-    };
-    let last = if rows == 0 {
-        0
-    } else {
-        h_row_stops.get_item(rows - 1)?.extract::<usize>()?
-    };
-    if last < first || last > h_data.len()? {
-        return Err(PyValueError::new_err("invalid sparse row spans"));
-    }
-    let ends = h_row_stops.get_item(slice(py, rows.saturating_sub(1), rows))?;
-    let p = if rows == 0 {
-        np.call_method1("array", (vec![0i64],))?
-    } else {
-        np.call_method1("concatenate", ((h_row_starts, &ends),))?
-    };
-    let p = p.call_method1("__sub__", (first,))?;
-    let data = h_data.get_item(slice(py, first, last))?;
-    let indices = h_indices.get_item(slice(py, first, last))?;
-    let source = host_sparse(&data, &indices, &p, rows, n_cols, false)?;
-    let refs = row_ids(&cp, h_ref_row_ids, false, h_ref_row_ids.len()?)?;
-    let grps = row_ids(&cp, h_grp_row_ids, false, h_grp_row_ids.len()?)?;
+    let source = HostSource::csr(py, h_data, h_indices, h_row_starts, h_row_stops, n_cols)?;
     ovo_host(
         &cp,
         &source,
-        &refs,
-        &grps,
+        h_ref_row_ids,
+        h_grp_row_ids,
         h_grp_offsets,
         d_rank_sums,
         d_tie_corr,
         d_group_sums,
         d_group_nnz,
+        None,
         compute_tie_corr,
         compute_nnz,
         sub_batch_cols,
@@ -765,20 +846,62 @@ pub fn ovo_streaming_csr_host(
 }
 
 use pyo3::buffer::PyBuffer;
+
 enum HostIndex {
     I32(PyBuffer<i32>),
     I64(PyBuffer<i64>),
 }
+enum OwnedIndex {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+impl Default for OwnedIndex {
+    fn default() -> Self {
+        Self::I32(Vec::new())
+    }
+}
+impl OwnedIndex {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::I32(v) => v.capacity() * 4,
+            Self::I64(v) => v.capacity() * 8,
+        }
+    }
+}
+#[derive(Default)]
+struct BoundaryWorkspace {
+    indices: OwnedIndex,
+    indptr: OwnedIndex,
+    cuts: Vec<i64>,
+    output: OwnedIndex,
+}
+thread_local! {
+    // Retain only one bounded workspace per caller, avoiding repeated large
+    // allocation/page-fault costs when planning successive windows.
+    static BOUNDARY_WORKSPACE: std::cell::RefCell<Option<BoundaryWorkspace>> = const { std::cell::RefCell::new(None) };
+}
+const MAX_BOUNDARY_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
 impl HostIndex {
     fn read(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
         let name: String = obj.getattr("dtype")?.getattr("name")?.extract()?;
-        match name.as_str() {
-            "int32" => Ok(Self::I32(PyBuffer::get(obj)?)),
-            "int64" => Ok(Self::I64(PyBuffer::get(obj)?)),
-            _ => Err(PyTypeError::new_err(
-                "host sparse indices must have dtype int32 or int64",
-            )),
+        let buffer = match name.as_str() {
+            "int32" => Self::I32(PyBuffer::get(obj)?),
+            "int64" => Self::I64(PyBuffer::get(obj)?),
+            _ => {
+                return Err(PyTypeError::new_err(
+                    "host sparse indices must have dtype int32 or int64",
+                ));
+            }
+        };
+        let contiguous = match &buffer {
+            Self::I32(b) => b.is_c_contiguous(),
+            Self::I64(b) => b.is_c_contiguous(),
+        };
+        if !contiguous {
+            return Err(PyValueError::new_err("host indices must be C-contiguous"));
         }
+        Ok(buffer)
     }
     fn len(&self) -> usize {
         match self {
@@ -786,40 +909,135 @@ impl HostIndex {
             Self::I64(b) => b.item_count(),
         }
     }
-    fn get(&self, py: Python<'_>, i: usize) -> PyResult<i64> {
+    fn snapshot_into(&self, py: Python<'_>, destination: &mut OwnedIndex) -> PyResult<()> {
         match self {
-            Self::I32(b) => b
-                .as_slice(py)
-                .and_then(|s| s.get(i))
-                .map(|v| v.get() as i64),
-            Self::I64(b) => b.as_slice(py).and_then(|s| s.get(i)).map(|v| v.get()),
+            Self::I32(buffer) => {
+                if !matches!(destination, OwnedIndex::I32(_)) {
+                    *destination = OwnedIndex::I32(Vec::new());
+                }
+                let OwnedIndex::I32(values) = destination else {
+                    unreachable!()
+                };
+                values.resize(buffer.item_count(), 0);
+                buffer.copy_to_slice(py, values)
+            }
+            Self::I64(buffer) => {
+                if !matches!(destination, OwnedIndex::I64(_)) {
+                    *destination = OwnedIndex::I64(Vec::new());
+                }
+                let OwnedIndex::I64(values) = destination else {
+                    unreachable!()
+                };
+                values.resize(buffer.item_count(), 0);
+                buffer.copy_to_slice(py, values)
+            }
         }
-        .ok_or_else(|| PyValueError::new_err("invalid host index buffer or offset"))
     }
-    fn set(&self, py: Python<'_>, i: usize, value: i64) -> PyResult<()> {
+    fn writable(&self, py: Python<'_>) -> bool {
         match self {
-            Self::I32(b) => {
-                let v = i32::try_from(value)
-                    .map_err(|_| PyValueError::new_err("boundary exceeds int32 range"))?;
-                b.as_mut_slice(py)
-                    .and_then(|s| s.get(i))
-                    .ok_or_else(|| {
-                        PyValueError::new_err("boundaries must be writable and contiguous")
-                    })?
-                    .set(v);
-            }
-            Self::I64(b) => {
-                b.as_mut_slice(py)
-                    .and_then(|s| s.get(i))
-                    .ok_or_else(|| {
-                        PyValueError::new_err("boundaries must be writable and contiguous")
-                    })?
-                    .set(value);
-            }
+            Self::I32(b) => b.as_mut_slice(py).is_some(),
+            Self::I64(b) => b.as_mut_slice(py).is_some(),
         }
-        Ok(())
     }
 }
+trait BoundaryIndex: Copy + Default + Send + Sync + Into<i64> {
+    fn offset(value: usize) -> Self;
+}
+impl BoundaryIndex for i32 {
+    fn offset(value: usize) -> Self {
+        value as i32
+    }
+}
+impl BoundaryIndex for i64 {
+    fn offset(value: usize) -> Self {
+        value as i64
+    }
+}
+
+fn find_boundaries<I: BoundaryIndex, P: BoundaryIndex>(
+    indices: &[I],
+    indptr: &[P],
+    cuts: &[i64],
+    n_cols: usize,
+    plan: crate::host_parallel::Parallelism,
+    output: &mut Vec<P>,
+) -> PyResult<()> {
+    if cuts.iter().any(|&cut| cut < 0 || cut as usize > n_cols)
+        || cuts.windows(2).any(|w| w[0] > w[1])
+    {
+        return Err(PyValueError::new_err(
+            "cuts must be sorted within [0,n_cols]",
+        ));
+    }
+    // Complete validation precedes all output writes, including for empty cuts.
+    let mut previous = 0;
+    for &pointer in indptr {
+        let value = pointer.into();
+        if value < previous || value as usize > indices.len() {
+            return Err(PyValueError::new_err(
+                "indptr must be monotonic and within indices",
+            ));
+        }
+        previous = value;
+    }
+    let rows = indptr.len() - 1;
+    let count = rows
+        .checked_mul(cuts.len())
+        .ok_or_else(|| PyValueError::new_err("boundary shape overflow"))?;
+    output
+        .try_reserve_exact(count.saturating_sub(output.len()))
+        .map_err(|_| {
+            pyo3::exceptions::PyMemoryError::new_err("unable to allocate boundary workspace")
+        })?;
+    output.resize(count, P::default());
+    if rows == 0 || cuts.is_empty() {
+        return Ok(());
+    }
+
+    // Partition every column into the same disjoint row spans. This preserves
+    // the legacy advancing lower bound across sorted cuts without raw pointers
+    // or a row-major temporary and transpose.
+    let chunk = rows.div_ceil(plan.workers());
+    let mut partitions: Vec<_> = (0..rows)
+        .step_by(chunk)
+        .map(|start| (start, Vec::with_capacity(cuts.len())))
+        .collect();
+    for column in output.chunks_mut(rows) {
+        for ((_, spans), part) in partitions.iter_mut().zip(column.chunks_mut(chunk)) {
+            spans.push(part);
+        }
+    }
+    plan.for_each_chunk(&mut partitions, |_, parts| {
+        for (row_start, spans) in parts {
+            for local_row in 0..spans[0].len() {
+                let row = *row_start + local_row;
+                let base = indptr[row].into() as usize;
+                let end = indptr[row + 1].into() as usize;
+                let values = &indices[base..end];
+                let mut start = 0;
+                if cuts.len() >= values.len().div_ceil(16) {
+                    // Many cuts over a short sparse row are cheaper as one
+                    // ordered merge than repeated binary searches.
+                    for (&cut, column) in cuts.iter().zip(spans.iter_mut()) {
+                        while start < values.len() && values[start].into() < cut {
+                            start += 1;
+                        }
+                        column[local_row] = P::offset(base + start);
+                    }
+                } else {
+                    for (&cut, column) in cuts.iter().zip(spans.iter_mut()) {
+                        start += values[start..].partition_point(|&value| value.into() < cut);
+                        // The result lies between validated indptr entries and
+                        // therefore fits the original pointer dtype.
+                        column[local_row] = P::offset(base + start);
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 #[pyfunction]
 #[pyo3(signature=(h_indices,h_indptr,h_col_cuts,h_boundaries,*,n_cols))]
 pub fn csr_row_boundaries_host(
@@ -841,6 +1059,9 @@ pub fn csr_row_boundaries_host(
         .len()
         .checked_sub(1)
         .ok_or_else(|| PyValueError::new_err("indptr must not be empty"))?;
+    if n_cols > i64::MAX as usize {
+        return Err(PyValueError::new_err("n_cols exceeds int64 range"));
+    }
     if shape(h_boundaries)? != [cuts.len(), rows]
         || h_boundaries
             .getattr("dtype")?
@@ -848,6 +1069,11 @@ pub fn csr_row_boundaries_host(
     {
         return Err(PyValueError::new_err(
             "boundaries must have shape (n_cuts,n_rows) and indptr dtype",
+        ));
+    }
+    if !out.writable(py) {
+        return Err(PyValueError::new_err(
+            "boundaries must be writable and contiguous",
         ));
     }
     let np = py.import("numpy")?;
@@ -859,47 +1085,66 @@ pub fn csr_row_boundaries_host(
             return Err(PyValueError::new_err("boundaries must not overlap inputs"));
         }
     }
-    let mut cut_values = Vec::with_capacity(cuts.len());
-    for i in 0..cuts.len() {
-        let v = cuts.get(py, i)?;
-        if v < 0 || v as usize > n_cols || cut_values.last().is_some_and(|last| *last > v) {
-            return Err(PyValueError::new_err(
-                "cuts must be sorted within [0,n_cols]",
-            ));
-        }
-        cut_values.push(v);
+    // NumPy may be changed by another Python thread while detached. Workers
+    // therefore only see immutable Rust-owned snapshots and private output.
+    // Keep the output buffer exported until the final attached copy, preventing
+    // normal NumPy resize operations from invalidating its storage.
+    let mut workspace = BOUNDARY_WORKSPACE
+        .with(|cache| cache.borrow_mut().take())
+        .unwrap_or_default();
+    indices.snapshot_into(py, &mut workspace.indices)?;
+    indptr.snapshot_into(py, &mut workspace.indptr)?;
+    workspace.cuts.clear();
+    match &cuts {
+        HostIndex::I32(buffer) => workspace.cuts.extend(
+            buffer
+                .as_slice(py)
+                .unwrap()
+                .iter()
+                .map(|value| i64::from(value.get())),
+        ),
+        HostIndex::I64(buffer) => workspace
+            .cuts
+            .extend(buffer.as_slice(py).unwrap().iter().map(|value| value.get())),
     }
-    // Validate every row before writing any output.
-    let mut previous = indptr.get(py, 0)?;
-    if previous < 0 || previous as usize > indices.len() {
-        return Err(PyValueError::new_err("invalid indptr"));
+    if matches!(indptr, HostIndex::I32(_)) && !matches!(workspace.output, OwnedIndex::I32(_)) {
+        workspace.output = OwnedIndex::I32(Vec::new());
     }
-    for i in 1..indptr.len() {
-        let v = indptr.get(py, i)?;
-        if v < previous || v as usize > indices.len() {
-            return Err(PyValueError::new_err(
-                "indptr must be monotonic and within indices",
-            ));
-        }
-        previous = v;
+    if matches!(indptr, HostIndex::I64(_)) && !matches!(workspace.output, OwnedIndex::I64(_)) {
+        workspace.output = OwnedIndex::I64(Vec::new());
     }
-    for row in 0..rows {
-        let mut start = indptr.get(py, row)? as usize;
-        let end = indptr.get(py, row + 1)? as usize;
-        for (cut, &value) in cut_values.iter().enumerate() {
-            let mut hi = end;
-            while start < hi {
-                let mid = start + (hi - start) / 2;
-                if indices.get(py, mid)? < value {
-                    start = mid + 1;
-                } else {
-                    hi = mid;
-                }
+    let result = crate::host_parallel::run(py, rows, |plan| {
+        match (&workspace.indices, &workspace.indptr, &mut workspace.output) {
+            (OwnedIndex::I32(i), OwnedIndex::I32(p), OwnedIndex::I32(o)) => {
+                find_boundaries(i, p, &workspace.cuts, n_cols, plan, o)
             }
-            out.set(py, cut * rows + row, start as i64)?;
+            (OwnedIndex::I64(i), OwnedIndex::I32(p), OwnedIndex::I32(o)) => {
+                find_boundaries(i, p, &workspace.cuts, n_cols, plan, o)
+            }
+            (OwnedIndex::I32(i), OwnedIndex::I64(p), OwnedIndex::I64(o)) => {
+                find_boundaries(i, p, &workspace.cuts, n_cols, plan, o)
+            }
+            (OwnedIndex::I64(i), OwnedIndex::I64(p), OwnedIndex::I64(o)) => {
+                find_boundaries(i, p, &workspace.cuts, n_cols, plan, o)
+            }
+            _ => unreachable!("boundary workspace dtype matches indptr"),
         }
+    })
+    .and_then(|result| result)
+    .and_then(|()| match (&out, &workspace.output) {
+        (HostIndex::I32(buffer), OwnedIndex::I32(values)) => buffer.copy_from_slice(py, values),
+        (HostIndex::I64(buffer), OwnedIndex::I64(values)) => buffer.copy_from_slice(py, values),
+        _ => unreachable!("boundary dtype was validated against indptr"),
+    });
+    if workspace.indices.bytes()
+        + workspace.indptr.bytes()
+        + workspace.output.bytes()
+        + workspace.cuts.capacity() * 8
+        <= MAX_BOUNDARY_CACHE_BYTES
+    {
+        BOUNDARY_WORKSPACE.with(|cache| *cache.borrow_mut() = Some(workspace));
     }
-    Ok(())
+    result
 }
 #[pyfunction]
 #[pyo3(signature=(indices,indptr,local_indptr,*,col_start,col_stop,stream=0))]

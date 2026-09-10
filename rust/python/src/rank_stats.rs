@@ -187,6 +187,7 @@ pub fn group_chunk_stats(
         cols,
         0,
         stream,
+        false,
     )
 }
 pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {

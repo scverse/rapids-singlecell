@@ -65,32 +65,55 @@ pub unsafe fn domain_spca_gram_csr_upper(
         rows: out_rows,
         cols: out_cols,
     };
-    let mut row = tid() / 128;
-    let lane = tid() % 128;
-    while row < nrows {
-        let start = indptr.i(row);
-        let end = indptr.i(row + 1).min(data.len).min(index.len);
-        let mut p = start;
-        while p < end {
-            let a = index.i(p);
-            let mut q = p + lane;
-            while q < end {
-                let b = index.i(q);
-                if a < ncols && b < ncols {
-                    out.add(
-                        a.min(b) * ncols + a.max(b),
-                        if data.kind == 0 {
-                            (data.single(p) * data.single(q)) as f64
-                        } else {
-                            data.f(p) * data.f(q)
-                        },
-                    );
+    macro_rules! gram {
+        ($value:ty, $index:ty, $atomic:ident) => {{
+            let mut row = tid() / 128;
+            let lane = tid() % 128;
+            while row < nrows {
+                let start = unsafe { *(indptr.pointer as *const $index).add(row as usize) } as u64;
+                let end = (unsafe { *(indptr.pointer as *const $index).add((row + 1) as usize) }
+                    as u64)
+                    .min(data.len)
+                    .min(index.len);
+                let mut p = start;
+                while p < end {
+                    let a = unsafe { *(index.pointer as *const $index).add(p as usize) } as u64;
+                    if a < ncols {
+                        let av = unsafe { *(data.pointer as *const $value).add(p as usize) };
+                        let mut q = p + lane;
+                        while q < end {
+                            let b =
+                                unsafe { *(index.pointer as *const $index).add(q as usize) } as u64;
+                            if b < ncols {
+                                let bv =
+                                    unsafe { *(data.pointer as *const $value).add(q as usize) };
+                                unsafe {
+                                    crate::harmony::$atomic(
+                                        (out.pointer as *mut $value)
+                                            .add((a.min(b) * ncols + a.max(b)) as usize),
+                                        av * bv,
+                                    );
+                                }
+                            }
+                            q += 128;
+                        }
+                    }
+                    p += 1;
                 }
-                q += 128;
+                row += stride() / 128;
             }
-            p += 1;
+        }};
+    }
+    if data.kind == 0 {
+        if index.kind == 2 {
+            gram!(f32, i32, add_f32);
+        } else {
+            gram!(f32, i64, add_f32);
         }
-        row += stride() / 128;
+    } else if index.kind == 2 {
+        gram!(f64, i32, add_f64);
+    } else {
+        gram!(f64, i64, add_f64);
     }
 }
 /// # Safety

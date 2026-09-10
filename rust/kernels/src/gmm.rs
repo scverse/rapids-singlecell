@@ -1,9 +1,248 @@
 //! Gaussian-mixture device kernels and per-gene fused EM.
 #![allow(clippy::too_many_arguments, clippy::missing_safety_doc)]
 use super::harmony::{max_f32, max_f64, sum_f32, sum_f64};
-use cuda_device::{kernel, thread, warp};
+use cuda_device::{kernel, ptx_asm, thread, warp};
 
-unsafe fn em_f32(
+// Match the original 256-thread halving tree: grouping each warp first
+// changes EM's convergence decision for poorly separated components. The first
+// warp gathers the upper three levels in registers, then performs the remaining
+// five levels with synchronized shuffles in the same addition order.
+macro_rules! em_reduce4 {
+    ($name:ident, $value:ty, $shuffle:ident) => {
+        #[inline(always)]
+        fn $name(mut values: [$value; 4]) -> [$value; 4] {
+            static mut SHARED: cuda_device::SharedArray<$value, 1024> =
+                cuda_device::SharedArray::UNINIT;
+            let tid = thread::threadIdx_x() as usize;
+            unsafe {
+                SHARED[tid] = values[0];
+                SHARED[256 + tid] = values[1];
+                SHARED[512 + tid] = values[2];
+                SHARED[768 + tid] = values[3];
+            }
+            thread::sync_threads();
+            if tid < 32 {
+                let mut component = 0;
+                while component < 4 {
+                    let index = component * 256 + tid;
+                    unsafe {
+                        let low = (SHARED[index] + SHARED[index + 128])
+                            + (SHARED[index + 64] + SHARED[index + 192]);
+                        let high = (SHARED[index + 32] + SHARED[index + 160])
+                            + (SHARED[index + 96] + SHARED[index + 224]);
+                        values[component] = low + high;
+                    }
+                    component += 1;
+                }
+                let mut offset = 16;
+                while offset > 0 {
+                    values[0] += warp::$shuffle(u32::MAX, values[0], offset);
+                    values[1] += warp::$shuffle(u32::MAX, values[1], offset);
+                    values[2] += warp::$shuffle(u32::MAX, values[2], offset);
+                    values[3] += warp::$shuffle(u32::MAX, values[3], offset);
+                    offset /= 2;
+                }
+                if tid == 0 {
+                    unsafe {
+                        SHARED[0] = values[0];
+                        SHARED[256] = values[1];
+                        SHARED[512] = values[2];
+                        SHARED[768] = values[3];
+                    }
+                }
+            }
+            thread::sync_threads();
+            let result = unsafe { [SHARED[0], SHARED[256], SHARED[512], SHARED[768]] };
+            // Every consumer must finish reading before the next reduction
+            // reuses this storage; this also protects grid-stride gene reuse.
+            thread::sync_threads();
+            result
+        }
+    };
+}
+em_reduce4!(em_reduce4_f32, f32, shuffle_down_f32_sync);
+em_reduce4!(em_reduce4_f64, f64, shuffle_down_f64_sync);
+// Inputs are validated disjoint from all projection/EM outputs. Preserve
+// CUDA's read-only cache path across the serial population and dot-product scans.
+#[inline(always)]
+unsafe fn read_only_mask(pointer: *const u8) -> u8 {
+    let value: u32;
+    unsafe {
+        ptx_asm!("ld.global.nc.u8 %0, [%1];", out("=r") value, in("l") pointer as u64, clobber("memory"));
+    }
+    value as u8
+}
+macro_rules! projection_read {
+    ($load:ident, $sum:ident, $dot:ident, $value:ty, $instruction:literal, $constraint:literal) => {
+        #[inline(always)]
+        unsafe fn $load(pointer: *const $value) -> $value {
+            let value: $value;
+            unsafe { ptx_asm!($instruction, out($constraint) value, in("l") pointer as u64, clobber("memory")); }
+            value
+        }
+        #[inline(always)]
+        unsafe fn $dot(dat: *const $value, direction: *const $value, features: usize) -> $value {
+            unsafe {
+                let mut sum = 0.0 as $value;
+                let mut feature = 0;
+                // Gather direction entries before the read-only global loads,
+                // exposing the original four-feature shared-load/FMA sequence.
+                // Accumulation order stays serial across every feature.
+                while feature + 3 < features {
+                    let v0 = *direction.add(feature);
+                    let v1 = *direction.add(feature + 1);
+                    let v2 = *direction.add(feature + 2);
+                    let v3 = *direction.add(feature + 3);
+                    sum = $load(dat.add(feature)).mul_add(v0, sum);
+                    sum = $load(dat.add(feature + 1)).mul_add(v1, sum);
+                    sum = $load(dat.add(feature + 2)).mul_add(v2, sum);
+                    sum = $load(dat.add(feature + 3)).mul_add(v3, sum);
+                    feature += 4;
+                }
+                while feature < features {
+                    sum = $load(dat.add(feature)).mul_add(*direction.add(feature), sum);
+                    feature += 1;
+                }
+                sum
+            }
+        }
+        #[inline(always)]
+        unsafe fn $sum(dat: *const $value, guide: *const u8, n: usize, k: usize, column: usize) -> $value {
+            unsafe {
+                let mut sum = 0.0 as $value;
+                let mut cell = 0;
+                // Keep the original sequential sum and expose four independent
+                // read-only loads per loop, matching NVCC's population unroll.
+                while cell + 3 < n {
+                    if read_only_mask(guide.add(cell)) != 0 { sum += $load(dat.add(cell * k + column)); }
+                    if read_only_mask(guide.add(cell + 1)) != 0 { sum += $load(dat.add((cell + 1) * k + column)); }
+                    if read_only_mask(guide.add(cell + 2)) != 0 { sum += $load(dat.add((cell + 2) * k + column)); }
+                    if read_only_mask(guide.add(cell + 3)) != 0 { sum += $load(dat.add((cell + 3) * k + column)); }
+                    cell += 4;
+                }
+                while cell < n {
+                    if read_only_mask(guide.add(cell)) != 0 { sum += $load(dat.add(cell * k + column)); }
+                    cell += 1;
+                }
+                sum
+            }
+        }
+    };
+}
+projection_read!(
+    read_only_f32,
+    guide_sum_f32,
+    projection_dot_f32,
+    f32,
+    "ld.global.nc.f32 %0, [%1];",
+    "=f"
+);
+projection_read!(
+    read_only_f64,
+    guide_sum_f64,
+    projection_dot_f64,
+    f64,
+    "ld.global.nc.f64 %0, [%1];",
+    "=d"
+);
+
+// Projection statistics are identical for every lane in a gene. Compute
+// their divisions once and broadcast through the same warp/block split as EM.
+#[inline(always)]
+unsafe fn projection_parameters_f32<const THREADS: usize>(
+    sn: f32,
+    sn2: f32,
+    sg: f32,
+    sg2: f32,
+    ng: f32,
+    nn: f32,
+    lane: usize,
+) -> [f32; 4] {
+    static mut PARAMETERS: cuda_device::SharedArray<f32, 4> = cuda_device::SharedArray::UNINIT;
+    let mut values = [0.0_f32; 4];
+    if lane == 0 {
+        values[0] = sn / nn.max(1.0);
+        values[1] = if nn > 1.0 {
+            (sn2 - sn * sn / nn) / (nn - 1.0)
+        } else {
+            1e-12
+        };
+        values[2] = sg / ng.max(1.0);
+        values[3] = if ng > 1.0 {
+            (sg2 - sg * sg / ng) / (ng - 1.0)
+        } else {
+            1e-12
+        };
+    }
+    if THREADS == 32 {
+        [
+            warp::shuffle_f32_sync(u32::MAX, values[0], 0),
+            warp::shuffle_f32_sync(u32::MAX, values[1], 0),
+            warp::shuffle_f32_sync(u32::MAX, values[2], 0),
+            warp::shuffle_f32_sync(u32::MAX, values[3], 0),
+        ]
+    } else {
+        unsafe {
+            if lane == 0 {
+                PARAMETERS[0] = values[0];
+                PARAMETERS[1] = values[1];
+                PARAMETERS[2] = values[2];
+                PARAMETERS[3] = values[3];
+            }
+            thread::sync_threads();
+            [PARAMETERS[0], PARAMETERS[1], PARAMETERS[2], PARAMETERS[3]]
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn projection_parameters_f64<const THREADS: usize>(
+    sn: f64,
+    sn2: f64,
+    sg: f64,
+    sg2: f64,
+    ng: f64,
+    nn: f64,
+    lane: usize,
+) -> [f64; 4] {
+    static mut PARAMETERS: cuda_device::SharedArray<f64, 4> = cuda_device::SharedArray::UNINIT;
+    let mut values = [0.0_f64; 4];
+    if lane == 0 {
+        values[0] = sn / nn.max(1.0);
+        values[1] = if nn > 1.0 {
+            (sn2 - sn * sn / nn) / (nn - 1.0)
+        } else {
+            1e-12
+        };
+        values[2] = sg / ng.max(1.0);
+        values[3] = if ng > 1.0 {
+            (sg2 - sg * sg / ng) / (ng - 1.0)
+        } else {
+            1e-12
+        };
+    }
+    if THREADS == 32 {
+        [
+            warp::shuffle_f64_sync(u32::MAX, values[0], 0),
+            warp::shuffle_f64_sync(u32::MAX, values[1], 0),
+            warp::shuffle_f64_sync(u32::MAX, values[2], 0),
+            warp::shuffle_f64_sync(u32::MAX, values[3], 0),
+        ]
+    } else {
+        unsafe {
+            if lane == 0 {
+                PARAMETERS[0] = values[0];
+                PARAMETERS[1] = values[1];
+                PARAMETERS[2] = values[2];
+                PARAMETERS[3] = values[3];
+            }
+            thread::sync_threads();
+            [PARAMETERS[0], PARAMETERS[1], PARAMETERS[2], PARAMETERS[3]]
+        }
+    }
+}
+
+unsafe fn em_f32<const THREADS: usize>(
     p: *const f32,
     out: *mut f32,
     n: usize,
@@ -16,6 +255,7 @@ unsafe fn em_f32(
     reg: f32,
     lane: usize,
 ) -> (f32, f32, f32) {
+    static mut PARAMETERS: cuda_device::SharedArray<f32, 4> = cuda_device::SharedArray::UNINIT;
     unsafe {
         let mut w = 0.5_f32;
         let mut prev = -1e30_f32;
@@ -38,21 +278,50 @@ unsafe fn em_f32(
                 s1 += r * y;
                 s2 += r * y * y;
                 ll += l;
-                i += 32;
+                i += THREADS;
             }
-            n1 = sum_f32(n1);
-            s1 = sum_f32(s1);
-            s2 = sum_f32(s2);
-            ll = sum_f32(ll);
-            let mean = ll / n as f32;
-            if (mean - prev).abs() < tol {
+            [n1, s1, s2, ll] = if THREADS == 32 {
+                [sum_f32(n1), sum_f32(s1), sum_f32(s2), sum_f32(ll)]
+            } else {
+                em_reduce4_f32([n1, s1, s2, ll])
+            };
+            // One lane updates mixture parameters, as in the original EM.
+            // Small populations share within their warp; large populations
+            // broadcast to all eight warps through block-owned storage.
+            let mut done = 0.0_f32;
+            if lane == 0 {
+                let mean = ll / n as f32;
+                if (mean - prev).abs() < tol {
+                    done = 1.0;
+                } else {
+                    prev = mean;
+                    let inv = 1_f32 / n1.max(1e-12_f32);
+                    m1 = s1 * inv;
+                    v1 = (s2 * inv - m1 * m1 + reg).max(reg);
+                    w = n1 / n as f32;
+                }
+            }
+            if THREADS == 32 {
+                m1 = warp::shuffle_f32_sync(u32::MAX, m1, 0);
+                v1 = warp::shuffle_f32_sync(u32::MAX, v1, 0);
+                w = warp::shuffle_f32_sync(u32::MAX, w, 0);
+                done = warp::shuffle_f32_sync(u32::MAX, done, 0);
+            } else {
+                if lane == 0 {
+                    PARAMETERS[0] = m1;
+                    PARAMETERS[1] = v1;
+                    PARAMETERS[2] = w;
+                    PARAMETERS[3] = done;
+                }
+                thread::sync_threads();
+                m1 = PARAMETERS[0];
+                v1 = PARAMETERS[1];
+                w = PARAMETERS[2];
+                done = PARAMETERS[3];
+            }
+            if done != 0.0 {
                 break;
             }
-            prev = mean;
-            let inv = 1_f32 / n1.max(1e-12_f32);
-            m1 = s1 * inv;
-            v1 = (s2 * inv - m1 * m1 + reg).max(reg);
-            w = n1 / n as f32;
         }
         let c0 = (1_f32 - w).max(1e-10_f32).ln() - 0.5_f32 * v0.ln() - 0.918_938_5_f32;
         let c1 = w.max(1e-10_f32).ln() - 0.5_f32 * v1.ln() - 0.918_938_5_f32;
@@ -64,13 +333,13 @@ unsafe fn em_f32(
             let lp0 = c0 - 0.5_f32 / v0 * a * a;
             let lp1 = c1 - 0.5_f32 / v1 * b * b;
             *out.add(i) = 1_f32 / (1_f32 + (lp0 - lp1).exp());
-            i += 32;
+            i += THREADS;
         }
         (m1, v1, w)
     }
 }
 
-unsafe fn em_f64(
+unsafe fn em_f64<const THREADS: usize>(
     p: *const f64,
     out: *mut f64,
     n: usize,
@@ -83,6 +352,7 @@ unsafe fn em_f64(
     reg: f64,
     lane: usize,
 ) -> (f64, f64, f64) {
+    static mut PARAMETERS: cuda_device::SharedArray<f64, 4> = cuda_device::SharedArray::UNINIT;
     unsafe {
         let mut w = 0.5_f64;
         let mut prev = -1e30_f64;
@@ -105,21 +375,50 @@ unsafe fn em_f64(
                 s1 += r * y;
                 s2 += r * y * y;
                 ll += l;
-                i += 32;
+                i += THREADS;
             }
-            n1 = sum_f64(n1);
-            s1 = sum_f64(s1);
-            s2 = sum_f64(s2);
-            ll = sum_f64(ll);
-            let mean = ll / n as f64;
-            if (mean - prev).abs() < tol {
+            [n1, s1, s2, ll] = if THREADS == 32 {
+                [sum_f64(n1), sum_f64(s1), sum_f64(s2), sum_f64(ll)]
+            } else {
+                em_reduce4_f64([n1, s1, s2, ll])
+            };
+            // One lane updates mixture parameters, as in the original EM.
+            // Small populations share within their warp; large populations
+            // broadcast to all eight warps through block-owned storage.
+            let mut done = 0.0_f64;
+            if lane == 0 {
+                let mean = ll / n as f64;
+                if (mean - prev).abs() < tol {
+                    done = 1.0;
+                } else {
+                    prev = mean;
+                    let inv = 1_f64 / n1.max(1e-12_f64);
+                    m1 = s1 * inv;
+                    v1 = (s2 * inv - m1 * m1 + reg).max(reg);
+                    w = n1 / n as f64;
+                }
+            }
+            if THREADS == 32 {
+                m1 = warp::shuffle_f64_sync(u32::MAX, m1, 0);
+                v1 = warp::shuffle_f64_sync(u32::MAX, v1, 0);
+                w = warp::shuffle_f64_sync(u32::MAX, w, 0);
+                done = warp::shuffle_f64_sync(u32::MAX, done, 0);
+            } else {
+                if lane == 0 {
+                    PARAMETERS[0] = m1;
+                    PARAMETERS[1] = v1;
+                    PARAMETERS[2] = w;
+                    PARAMETERS[3] = done;
+                }
+                thread::sync_threads();
+                m1 = PARAMETERS[0];
+                v1 = PARAMETERS[1];
+                w = PARAMETERS[2];
+                done = PARAMETERS[3];
+            }
+            if done != 0.0 {
                 break;
             }
-            prev = mean;
-            let inv = 1_f64 / n1.max(1e-12_f64);
-            m1 = s1 * inv;
-            v1 = (s2 * inv - m1 * m1 + reg).max(reg);
-            w = n1 / n as f64;
         }
         let c0 = (1_f64 - w).max(1e-10_f64).ln() - 0.5_f64 * v0.ln() - 0.9189385332046727_f64;
         let c1 = w.max(1e-10_f64).ln() - 0.5_f64 * v1.ln() - 0.9189385332046727_f64;
@@ -131,7 +430,7 @@ unsafe fn em_f64(
             let lp0 = c0 - 0.5_f64 / v0 * a * a;
             let lp1 = c1 - 0.5_f64 / v1 * b * b;
             *out.add(i) = 1_f64 / (1_f64 + (lp0 - lp1).exp());
-            i += 32;
+            i += THREADS;
         }
         (m1, v1, w)
     }
@@ -150,7 +449,9 @@ pub unsafe fn gmm_logprob_f32(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let (n, d, k) = (n as usize, d as usize, k as usize);
         while row < n * k {
@@ -191,7 +492,9 @@ pub unsafe fn gmm_logprob_f64(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let (n, d, k) = (n as usize, d as usize, k as usize);
         while row < n * k {
@@ -222,7 +525,9 @@ pub unsafe fn gmm_logprob_f64(
 pub unsafe fn gmm_normalize_f32(lp: *const f32, resp: *mut f32, ll: *mut f32, n: u64, k: u64) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let k = k as usize;
         while row < n as usize {
@@ -257,7 +562,9 @@ pub unsafe fn gmm_normalize_f32(lp: *const f32, resp: *mut f32, ll: *mut f32, n:
 pub unsafe fn gmm_normalize_f64(lp: *const f64, resp: *mut f64, ll: *mut f64, n: u64, k: u64) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let k = k as usize;
         while row < n as usize {
@@ -351,7 +658,9 @@ pub unsafe fn gmm_logprob_y_f32(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let d = d as usize;
         while row < n as usize {
@@ -386,7 +695,9 @@ pub unsafe fn gmm_logprob_y_f64(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let d = d as usize;
         while row < n as usize {
@@ -537,7 +848,9 @@ pub unsafe fn gmm_identity_f64(a: *mut f64, d: u64, k: u64) {
 pub unsafe fn gmm_logdet_f32(a: *const f32, out: *mut f32, d: u64, k: u64) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let d = d as usize;
         while row < k as usize {
@@ -559,7 +872,9 @@ pub unsafe fn gmm_logdet_f32(a: *const f32, out: *mut f32, d: u64, k: u64) {
 pub unsafe fn gmm_logdet_f64(a: *const f64, out: *mut f64, d: u64, k: u64) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         let d = d as usize;
         while row < k as usize {
@@ -597,7 +912,9 @@ pub unsafe fn gmm_spherical_f32(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         while row < genes as usize {
             let start = *offsets.add(row);
@@ -606,7 +923,7 @@ pub unsafe fn gmm_spherical_f32(
             let init_v = *v1.add(row);
             let mut result = (init_m, init_v, 0.5_f32);
             if start >= 0 && end > start && (end as u64) <= len {
-                result = em_f32(
+                result = em_f32::<32>(
                     p.add(start as usize),
                     resp.add(start as usize),
                     (end - start) as usize,
@@ -649,7 +966,9 @@ pub unsafe fn gmm_spherical_f64(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         while row < genes as usize {
             let start = *offsets.add(row);
@@ -658,7 +977,7 @@ pub unsafe fn gmm_spherical_f64(
             let init_v = *v1.add(row);
             let mut result = (init_m, init_v, 0.5_f64);
             if start >= 0 && end > start && (end as u64) <= len {
-                result = em_f64(
+                result = em_f64::<32>(
                     p.add(start as usize),
                     resp.add(start as usize),
                     (end - start) as usize,
@@ -681,8 +1000,8 @@ pub unsafe fn gmm_spherical_f64(
         }
     }
 }
-#[kernel]
-pub unsafe fn gmm_project_f32(
+#[inline(always)]
+unsafe fn gmm_project_impl_f32<const SHARED: bool>(
     dat: *const f32,
     dat_off: *const i64,
     ns: *const i32,
@@ -708,7 +1027,9 @@ pub unsafe fn gmm_project_f32(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         while row < nactive as usize {
             let gene = *active.add(row);
@@ -739,26 +1060,34 @@ pub unsafe fn gmm_project_f32(
                     let (mut ng, mut nn) = (0_f32, 0_f32);
                     let mut i = lane;
                     while i < n {
-                        ng += if *guide.add(co + i) != 0 {
+                        ng += if read_only_mask(guide.add(co + i)) != 0 {
                             1_f32
                         } else {
                             0_f32
                         };
-                        nn += if *nt.add(co + i) != 0 { 1_f32 } else { 0_f32 };
+                        nn += if read_only_mask(nt.add(co + i)) != 0 {
+                            1_f32
+                        } else {
+                            0_f32
+                        };
                         i += 32;
                     }
                     ng = sum_f32(ng);
                     nn = sum_f32(nn);
-                    let v = vec.add(row * maxk as usize);
+                    // A null global workspace selects the original shared
+                    // direction vector. Warp kernels reserve one vector per
+                    // warp; the block variant reserves one for the whole gene.
+                    let v = if SHARED {
+                        cuda_device::DynamicSharedArray::<f32>::get()
+                            .add((thread::threadIdx_x() as usize / 32) * maxk as usize)
+                    } else {
+                        vec.add(row * maxk as usize)
+                    };
+                    let inv_ng = 1_f32 / ng.max(1_f32);
                     let mut j = lane;
                     while j < k {
-                        let mut s = 0_f32;
-                        for i in 0..n {
-                            if *guide.add(co + i) != 0 {
-                                s += *dat.add(off + i * k + j);
-                            }
-                        }
-                        *v.add(j) = s / ng.max(1_f32) - *ntmean.add(feature_offset + j);
+                        let s = guide_sum_f32(dat.add(off), guide.add(co), n, k, j);
+                        *v.add(j) = s * inv_ng - read_only_f32(ntmean.add(feature_offset + j));
                         j += 32;
                     }
                     warp::sync_mask(u32::MAX);
@@ -766,26 +1095,24 @@ pub unsafe fn gmm_project_f32(
                     j = lane;
                     while j < k {
                         let x = *v.add(j);
-                        vv += x * x;
+                        vv = x.mul_add(x, vv);
                         j += 32;
                     }
                     vv = sum_f32(vv).max(1e-12_f32);
+                    let inv_vv = 1_f32 / vv;
                     i = lane;
                     let (mut sg, mut sg2, mut sn, mut sn2) = (0_f32, 0_f32, 0_f32, 0_f32);
                     while i < n {
-                        let mut s = 0_f32;
-                        for j in 0..k {
-                            s += *dat.add(off + i * k + j) * *v.add(j);
-                        }
-                        let y = s / vv;
+                        let s = projection_dot_f32(dat.add(off + i * k), v, k);
+                        let y = s * inv_vv;
                         *p.add(co + i) = y;
-                        if *guide.add(co + i) != 0 {
+                        if read_only_mask(guide.add(co + i)) != 0 {
                             sg += y;
-                            sg2 += y * y;
+                            sg2 = y.mul_add(y, sg2);
                         }
-                        if *nt.add(co + i) != 0 {
+                        if read_only_mask(nt.add(co + i)) != 0 {
                             sn += y;
-                            sn2 += y * y;
+                            sn2 = y.mul_add(y, sn2);
                         }
                         i += 32;
                     }
@@ -793,20 +1120,10 @@ pub unsafe fn gmm_project_f32(
                     sg2 = sum_f32(sg2);
                     sn = sum_f32(sn);
                     sn2 = sum_f32(sn2);
-                    let m0 = sn / nn.max(1_f32);
-                    let m1 = sg / ng.max(1_f32);
-                    let v0 = if nn > 1_f32 {
-                        (sn2 - sn * sn / nn) / (nn - 1_f32)
-                    } else {
-                        1e-12_f32
-                    };
-                    let v1 = if ng > 1_f32 {
-                        (sg2 - sg * sg / ng) / (ng - 1_f32)
-                    } else {
-                        1e-12_f32
-                    };
+                    let [m0, v0, m1, v1] =
+                        projection_parameters_f32::<32>(sn, sn2, sg, sg2, ng, nn, lane);
                     warp::sync_mask(u32::MAX);
-                    let _ = em_f32(
+                    let _ = em_f32::<32>(
                         p.add(co),
                         resp.add(co),
                         n,
@@ -825,8 +1142,8 @@ pub unsafe fn gmm_project_f32(
         }
     }
 }
-#[kernel]
-pub unsafe fn gmm_project_f64(
+#[inline(always)]
+unsafe fn gmm_project_impl_f64<const SHARED: bool>(
     dat: *const f64,
     dat_off: *const i64,
     ns: *const i32,
@@ -852,7 +1169,9 @@ pub unsafe fn gmm_project_f64(
 ) {
     unsafe {
         let lane = thread::threadIdx_x() as usize % 32;
-        let mut row = thread::index_1d().get() as usize / 32;
+        let mut row = (thread::blockIdx_x() as usize * thread::blockDim_x() as usize
+            + thread::threadIdx_x() as usize)
+            / 32;
         let stride = (thread::blockDim_x() * thread::gridDim_x()) as usize / 32;
         while row < nactive as usize {
             let gene = *active.add(row);
@@ -883,26 +1202,34 @@ pub unsafe fn gmm_project_f64(
                     let (mut ng, mut nn) = (0_f64, 0_f64);
                     let mut i = lane;
                     while i < n {
-                        ng += if *guide.add(co + i) != 0 {
+                        ng += if read_only_mask(guide.add(co + i)) != 0 {
                             1_f64
                         } else {
                             0_f64
                         };
-                        nn += if *nt.add(co + i) != 0 { 1_f64 } else { 0_f64 };
+                        nn += if read_only_mask(nt.add(co + i)) != 0 {
+                            1_f64
+                        } else {
+                            0_f64
+                        };
                         i += 32;
                     }
                     ng = sum_f64(ng);
                     nn = sum_f64(nn);
-                    let v = vec.add(row * maxk as usize);
+                    // A null global workspace selects the original shared
+                    // direction vector. Warp kernels reserve one vector per
+                    // warp; the block variant reserves one for the whole gene.
+                    let v = if SHARED {
+                        cuda_device::DynamicSharedArray::<f64>::get()
+                            .add((thread::threadIdx_x() as usize / 32) * maxk as usize)
+                    } else {
+                        vec.add(row * maxk as usize)
+                    };
+                    let inv_ng = 1_f64 / ng.max(1_f64);
                     let mut j = lane;
                     while j < k {
-                        let mut s = 0_f64;
-                        for i in 0..n {
-                            if *guide.add(co + i) != 0 {
-                                s += *dat.add(off + i * k + j);
-                            }
-                        }
-                        *v.add(j) = s / ng.max(1_f64) - *ntmean.add(feature_offset + j);
+                        let s = guide_sum_f64(dat.add(off), guide.add(co), n, k, j);
+                        *v.add(j) = s * inv_ng - read_only_f64(ntmean.add(feature_offset + j));
                         j += 32;
                     }
                     warp::sync_mask(u32::MAX);
@@ -910,26 +1237,24 @@ pub unsafe fn gmm_project_f64(
                     j = lane;
                     while j < k {
                         let x = *v.add(j);
-                        vv += x * x;
+                        vv = x.mul_add(x, vv);
                         j += 32;
                     }
                     vv = sum_f64(vv).max(1e-12_f64);
+                    let inv_vv = 1_f64 / vv;
                     i = lane;
                     let (mut sg, mut sg2, mut sn, mut sn2) = (0_f64, 0_f64, 0_f64, 0_f64);
                     while i < n {
-                        let mut s = 0_f64;
-                        for j in 0..k {
-                            s += *dat.add(off + i * k + j) * *v.add(j);
-                        }
-                        let y = s / vv;
+                        let s = projection_dot_f64(dat.add(off + i * k), v, k);
+                        let y = s * inv_vv;
                         *p.add(co + i) = y;
-                        if *guide.add(co + i) != 0 {
+                        if read_only_mask(guide.add(co + i)) != 0 {
                             sg += y;
-                            sg2 += y * y;
+                            sg2 = y.mul_add(y, sg2);
                         }
-                        if *nt.add(co + i) != 0 {
+                        if read_only_mask(nt.add(co + i)) != 0 {
                             sn += y;
-                            sn2 += y * y;
+                            sn2 = y.mul_add(y, sn2);
                         }
                         i += 32;
                     }
@@ -937,20 +1262,10 @@ pub unsafe fn gmm_project_f64(
                     sg2 = sum_f64(sg2);
                     sn = sum_f64(sn);
                     sn2 = sum_f64(sn2);
-                    let m0 = sn / nn.max(1_f64);
-                    let m1 = sg / ng.max(1_f64);
-                    let v0 = if nn > 1_f64 {
-                        (sn2 - sn * sn / nn) / (nn - 1_f64)
-                    } else {
-                        1e-12_f64
-                    };
-                    let v1 = if ng > 1_f64 {
-                        (sg2 - sg * sg / ng) / (ng - 1_f64)
-                    } else {
-                        1e-12_f64
-                    };
+                    let [m0, v0, m1, v1] =
+                        projection_parameters_f64::<32>(sn, sn2, sg, sg2, ng, nn, lane);
                     warp::sync_mask(u32::MAX);
-                    let _ = em_f64(
+                    let _ = em_f64::<32>(
                         p.add(co),
                         resp.add(co),
                         n,
@@ -990,6 +1305,7 @@ macro_rules! logprob_small_impl {
             use cuda_device::SharedArray;
             const CAPACITY: usize = if $dimension == 0 { 64 } else { $dimension };
             static mut MEAN: SharedArray<$value, CAPACITY> = SharedArray::UNINIT;
+            static mut CONSTANT: SharedArray<$value, 1> = SharedArray::UNINIT;
             static mut PRECISION: SharedArray<$value, { CAPACITY * (CAPACITY + 1) / 2 }> =
                 SharedArray::UNINIT;
             unsafe {
@@ -1001,6 +1317,10 @@ macro_rules! logprob_small_impl {
                 let cl = thread::blockIdx_y() as usize;
                 let tid = thread::threadIdx_x() as usize;
                 let row = thread::blockIdx_x() as usize * thread::blockDim_x() as usize + tid;
+                if tid == 0 {
+                    CONSTANT[0] = -0.5 as $value * dim as $value * 1.8378770664093453_f64 as $value
+                        + *logdet.add(cl) + (*weights.add(cl)).ln();
+                }
                 let mean = SharedArray::as_raw_mut_ptr(&raw mut MEAN);
                 let precision_cache = SharedArray::as_raw_mut_ptr(&raw mut PRECISION);
                 let mut i = tid;
@@ -1043,11 +1363,7 @@ macro_rules! logprob_small_impl {
                             mahal = y.mul_add(y, mahal);
                         }
                     )*
-                    *out.add(row * k as usize + cl) =
-                        -0.5 as $value * dim as $value * 1.8378770664093453_f64 as $value
-                            + *logdet.add(cl)
-                            + (*weights.add(cl)).ln()
-                            - 0.5 as $value * mahal;
+                    *out.add(row * k as usize + cl) = CONSTANT[0] - 0.5 as $value * mahal;
                 }
             }
         }
@@ -1169,3 +1485,446 @@ macro_rules! logprob_tiled {
 }
 logprob_tiled!(gmm_tiled_f32, f32);
 logprob_tiled!(gmm_tiled_f64, f64);
+
+#[kernel]
+pub unsafe fn gmm_spherical_block_f32(
+    p: *const f32,
+    offsets: *const i32,
+    m0: *const f32,
+    v0: *const f32,
+    m1: *const f32,
+    v1: *const f32,
+    resp: *mut f32,
+    mo: *mut f32,
+    vo: *mut f32,
+    wo: *mut f32,
+    genes: u64,
+    len: u64,
+    max_iter: u32,
+    tol: f32,
+    reg: f32,
+) {
+    unsafe {
+        let lane = thread::threadIdx_x() as usize;
+        let mut row = thread::blockIdx_x() as usize;
+        let stride = thread::gridDim_x() as usize;
+        while row < genes as usize {
+            let start = *offsets.add(row);
+            let end = *offsets.add(row + 1);
+            let init_m = *m1.add(row);
+            let init_v = *v1.add(row);
+            let mut result = (init_m, init_v, 0.5_f32);
+            if start >= 0 && end > start && (end as u64) <= len {
+                result = em_f32::<256>(
+                    p.add(start as usize),
+                    resp.add(start as usize),
+                    (end - start) as usize,
+                    *m0.add(row),
+                    *v0.add(row),
+                    init_m,
+                    init_v.max(reg),
+                    max_iter,
+                    tol,
+                    reg,
+                    lane,
+                );
+            }
+            if lane == 0 {
+                *mo.add(row) = result.0;
+                *vo.add(row) = result.1;
+                *wo.add(row) = result.2;
+            }
+            row += stride;
+        }
+    }
+}
+
+#[kernel]
+pub unsafe fn gmm_spherical_block_f64(
+    p: *const f64,
+    offsets: *const i32,
+    m0: *const f64,
+    v0: *const f64,
+    m1: *const f64,
+    v1: *const f64,
+    resp: *mut f64,
+    mo: *mut f64,
+    vo: *mut f64,
+    wo: *mut f64,
+    genes: u64,
+    len: u64,
+    max_iter: u32,
+    tol: f64,
+    reg: f64,
+) {
+    unsafe {
+        let lane = thread::threadIdx_x() as usize;
+        let mut row = thread::blockIdx_x() as usize;
+        let stride = thread::gridDim_x() as usize;
+        while row < genes as usize {
+            let start = *offsets.add(row);
+            let end = *offsets.add(row + 1);
+            let init_m = *m1.add(row);
+            let init_v = *v1.add(row);
+            let mut result = (init_m, init_v, 0.5_f64);
+            if start >= 0 && end > start && (end as u64) <= len {
+                result = em_f64::<256>(
+                    p.add(start as usize),
+                    resp.add(start as usize),
+                    (end - start) as usize,
+                    *m0.add(row),
+                    *v0.add(row),
+                    init_m,
+                    init_v.max(reg),
+                    max_iter,
+                    tol,
+                    reg,
+                    lane,
+                );
+            }
+            if lane == 0 {
+                *mo.add(row) = result.0;
+                *vo.add(row) = result.1;
+                *wo.add(row) = result.2;
+            }
+            row += stride;
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn gmm_project_block_impl_f32<const SHARED: bool>(
+    dat: *const f32,
+    dat_off: *const i64,
+    ns: *const i32,
+    ks: *const i32,
+    cells: *const i32,
+    features: *const i32,
+    ntmean: *const f32,
+    guide: *const u8,
+    nt: *const u8,
+    active: *const i32,
+    p: *mut f32,
+    resp: *mut f32,
+    vec: *mut f32,
+    nactive: u64,
+    genes: u64,
+    maxk: u64,
+    datlen: u64,
+    celllen: u64,
+    featlen: u64,
+    max_iter: u32,
+    tol: f32,
+    reg: f32,
+) {
+    unsafe {
+        let lane = thread::threadIdx_x() as usize;
+        let mut row = thread::blockIdx_x() as usize;
+        let stride = thread::gridDim_x() as usize;
+        while row < nactive as usize {
+            let gene = *active.add(row);
+            if gene >= 0 && (gene as u64) < genes {
+                let g = gene as usize;
+                let n = *ns.add(g);
+                let k = *ks.add(g);
+                let co = *cells.add(g);
+                let feature_offset = *features.add(g);
+                let off = *dat_off.add(g);
+                if n > 0
+                    && k > 0
+                    && co >= 0
+                    && feature_offset >= 0
+                    && off >= 0
+                    && (k as u64) <= maxk
+                    && (co as u64 + n as u64) <= celllen
+                    && (feature_offset as u64 + k as u64) <= featlen
+                    && (off as u64 + n as u64 * k as u64) <= datlen
+                {
+                    let (n, k, co, feature_offset, off) = (
+                        n as usize,
+                        k as usize,
+                        co as usize,
+                        feature_offset as usize,
+                        off as usize,
+                    );
+                    let (mut ng, mut nn) = (0_f32, 0_f32);
+                    let mut i = lane;
+                    while i < n {
+                        ng += if read_only_mask(guide.add(co + i)) != 0 {
+                            1_f32
+                        } else {
+                            0_f32
+                        };
+                        nn += if read_only_mask(nt.add(co + i)) != 0 {
+                            1_f32
+                        } else {
+                            0_f32
+                        };
+                        i += 256;
+                    }
+                    [ng, nn, _, _] = em_reduce4_f32([ng, nn, 0.0, 0.0]);
+                    // A null global workspace selects the original shared
+                    // direction vector. Warp kernels reserve one vector per
+                    // warp; the block variant reserves one for the whole gene.
+                    let v = if SHARED {
+                        cuda_device::DynamicSharedArray::<f32>::get().add(0)
+                    } else {
+                        vec.add(row * maxk as usize)
+                    };
+                    let inv_ng = 1_f32 / ng.max(1_f32);
+                    let mut j = lane;
+                    while j < k {
+                        let s = guide_sum_f32(dat.add(off), guide.add(co), n, k, j);
+                        *v.add(j) = s * inv_ng - read_only_f32(ntmean.add(feature_offset + j));
+                        j += 256;
+                    }
+                    thread::sync_threads();
+                    let mut vv = 0_f32;
+                    j = lane;
+                    while j < k {
+                        let x = *v.add(j);
+                        vv = x.mul_add(x, vv);
+                        j += 256;
+                    }
+                    vv = em_reduce4_f32([vv, 0.0, 0.0, 0.0])[0].max(1e-12_f32);
+                    let inv_vv = 1_f32 / vv;
+                    i = lane;
+                    let (mut sg, mut sg2, mut sn, mut sn2) = (0_f32, 0_f32, 0_f32, 0_f32);
+                    while i < n {
+                        let s = projection_dot_f32(dat.add(off + i * k), v, k);
+                        let y = s * inv_vv;
+                        *p.add(co + i) = y;
+                        if read_only_mask(guide.add(co + i)) != 0 {
+                            sg += y;
+                            sg2 = y.mul_add(y, sg2);
+                        }
+                        if read_only_mask(nt.add(co + i)) != 0 {
+                            sn += y;
+                            sn2 = y.mul_add(y, sn2);
+                        }
+                        i += 256;
+                    }
+                    [sg, sg2, sn, sn2] = em_reduce4_f32([sg, sg2, sn, sn2]);
+                    let [m0, v0, m1, v1] =
+                        projection_parameters_f32::<256>(sn, sn2, sg, sg2, ng, nn, lane);
+                    let _ = em_f32::<256>(
+                        p.add(co),
+                        resp.add(co),
+                        n,
+                        m0,
+                        v0.max(1e-12_f32),
+                        m1,
+                        v1.max(1e-12_f32),
+                        max_iter,
+                        tol,
+                        reg,
+                        lane,
+                    );
+                }
+            }
+            row += stride;
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn gmm_project_block_impl_f64<const SHARED: bool>(
+    dat: *const f64,
+    dat_off: *const i64,
+    ns: *const i32,
+    ks: *const i32,
+    cells: *const i32,
+    features: *const i32,
+    ntmean: *const f64,
+    guide: *const u8,
+    nt: *const u8,
+    active: *const i32,
+    p: *mut f64,
+    resp: *mut f64,
+    vec: *mut f64,
+    nactive: u64,
+    genes: u64,
+    maxk: u64,
+    datlen: u64,
+    celllen: u64,
+    featlen: u64,
+    max_iter: u32,
+    tol: f64,
+    reg: f64,
+) {
+    unsafe {
+        let lane = thread::threadIdx_x() as usize;
+        let mut row = thread::blockIdx_x() as usize;
+        let stride = thread::gridDim_x() as usize;
+        while row < nactive as usize {
+            let gene = *active.add(row);
+            if gene >= 0 && (gene as u64) < genes {
+                let g = gene as usize;
+                let n = *ns.add(g);
+                let k = *ks.add(g);
+                let co = *cells.add(g);
+                let feature_offset = *features.add(g);
+                let off = *dat_off.add(g);
+                if n > 0
+                    && k > 0
+                    && co >= 0
+                    && feature_offset >= 0
+                    && off >= 0
+                    && (k as u64) <= maxk
+                    && (co as u64 + n as u64) <= celllen
+                    && (feature_offset as u64 + k as u64) <= featlen
+                    && (off as u64 + n as u64 * k as u64) <= datlen
+                {
+                    let (n, k, co, feature_offset, off) = (
+                        n as usize,
+                        k as usize,
+                        co as usize,
+                        feature_offset as usize,
+                        off as usize,
+                    );
+                    let (mut ng, mut nn) = (0_f64, 0_f64);
+                    let mut i = lane;
+                    while i < n {
+                        ng += if read_only_mask(guide.add(co + i)) != 0 {
+                            1_f64
+                        } else {
+                            0_f64
+                        };
+                        nn += if read_only_mask(nt.add(co + i)) != 0 {
+                            1_f64
+                        } else {
+                            0_f64
+                        };
+                        i += 256;
+                    }
+                    [ng, nn, _, _] = em_reduce4_f64([ng, nn, 0.0, 0.0]);
+                    // A null global workspace selects the original shared
+                    // direction vector. Warp kernels reserve one vector per
+                    // warp; the block variant reserves one for the whole gene.
+                    let v = if SHARED {
+                        cuda_device::DynamicSharedArray::<f64>::get().add(0)
+                    } else {
+                        vec.add(row * maxk as usize)
+                    };
+                    let inv_ng = 1_f64 / ng.max(1_f64);
+                    let mut j = lane;
+                    while j < k {
+                        let s = guide_sum_f64(dat.add(off), guide.add(co), n, k, j);
+                        *v.add(j) = s * inv_ng - read_only_f64(ntmean.add(feature_offset + j));
+                        j += 256;
+                    }
+                    thread::sync_threads();
+                    let mut vv = 0_f64;
+                    j = lane;
+                    while j < k {
+                        let x = *v.add(j);
+                        vv = x.mul_add(x, vv);
+                        j += 256;
+                    }
+                    vv = em_reduce4_f64([vv, 0.0, 0.0, 0.0])[0].max(1e-12_f64);
+                    let inv_vv = 1_f64 / vv;
+                    i = lane;
+                    let (mut sg, mut sg2, mut sn, mut sn2) = (0_f64, 0_f64, 0_f64, 0_f64);
+                    while i < n {
+                        let s = projection_dot_f64(dat.add(off + i * k), v, k);
+                        let y = s * inv_vv;
+                        *p.add(co + i) = y;
+                        if read_only_mask(guide.add(co + i)) != 0 {
+                            sg += y;
+                            sg2 = y.mul_add(y, sg2);
+                        }
+                        if read_only_mask(nt.add(co + i)) != 0 {
+                            sn += y;
+                            sn2 = y.mul_add(y, sn2);
+                        }
+                        i += 256;
+                    }
+                    [sg, sg2, sn, sn2] = em_reduce4_f64([sg, sg2, sn, sn2]);
+                    let [m0, v0, m1, v1] =
+                        projection_parameters_f64::<256>(sn, sn2, sg, sg2, ng, nn, lane);
+                    let _ = em_f64::<256>(
+                        p.add(co),
+                        resp.add(co),
+                        n,
+                        m0,
+                        v0.max(1e-12_f64),
+                        m1,
+                        v1.max(1e-12_f64),
+                        max_iter,
+                        tol,
+                        reg,
+                        lane,
+                    );
+                }
+            }
+            row += stride;
+        }
+    }
+}
+
+// Specializing at the entry point keeps projection-vector loads in their
+// native shared/global address space and avoids a generic pointer in the dot loop.
+macro_rules! project_entry {
+    ($name:ident, $implementation:ident, $value:ty, $specialization:literal) => {
+        #[kernel]
+        pub unsafe fn $name(
+            dat: *const $value,
+            dat_off: *const i64,
+            ns: *const i32,
+            ks: *const i32,
+            cells: *const i32,
+            features: *const i32,
+            ntmean: *const $value,
+            guide: *const u8,
+            nt: *const u8,
+            active: *const i32,
+            p: *mut $value,
+            resp: *mut $value,
+            vec: *mut $value,
+            nactive: u64,
+            genes: u64,
+            maxk: u64,
+            datlen: u64,
+            celllen: u64,
+            featlen: u64,
+            max_iter: u32,
+            tol: $value,
+            reg: $value,
+        ) {
+            unsafe {
+                $implementation::<$specialization>(
+                    dat, dat_off, ns, ks, cells, features, ntmean, guide, nt, active, p, resp, vec,
+                    nactive, genes, maxk, datlen, celllen, featlen, max_iter, tol, reg,
+                )
+            }
+        }
+    };
+}
+project_entry!(gmm_project_f32, gmm_project_impl_f32, f32, false);
+project_entry!(gmm_project_shared_f32, gmm_project_impl_f32, f32, true);
+project_entry!(gmm_project_f64, gmm_project_impl_f64, f64, false);
+project_entry!(gmm_project_shared_f64, gmm_project_impl_f64, f64, true);
+project_entry!(
+    gmm_project_block_f32,
+    gmm_project_block_impl_f32,
+    f32,
+    false
+);
+project_entry!(
+    gmm_project_block_shared_f32,
+    gmm_project_block_impl_f32,
+    f32,
+    true
+);
+project_entry!(
+    gmm_project_block_f64,
+    gmm_project_block_impl_f64,
+    f64,
+    false
+);
+project_entry!(
+    gmm_project_block_shared_f64,
+    gmm_project_block_impl_f64,
+    f64,
+    true
+);

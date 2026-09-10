@@ -44,7 +44,42 @@ pub(crate) fn launch(
     stream: usize,
     args: &mut [Arg],
 ) -> PyResult<()> {
-    if work == 0 {
+    launch_grid(device, name, dtype, work.div_ceil(256), 256, stream, args)
+}
+
+pub(crate) fn pen_kernel(covariates: u64) -> &'static str {
+    match covariates {
+        1 => "harmony_pen_norm_cov1",
+        2 => "harmony_pen_norm_cov2",
+        3 => "harmony_pen_norm_cov3",
+        4 => "harmony_pen_norm_cov4",
+        _ => "harmony_pen_norm",
+    }
+}
+
+pub(crate) fn launch_rows(
+    device: usize,
+    name: &str,
+    dtype: Dtype,
+    rows: u64,
+    cols: u64,
+    stream: usize,
+    args: &mut [Arg],
+) -> PyResult<()> {
+    let block = cols.clamp(1, 256).div_ceil(32) * 32;
+    launch_grid(device, name, dtype, rows, block, stream, args)
+}
+
+pub(crate) fn launch_grid(
+    device: usize,
+    name: &str,
+    dtype: Dtype,
+    blocks: u64,
+    block: u64,
+    stream: usize,
+    args: &mut [Arg],
+) -> PyResult<()> {
+    if blocks == 0 {
         return Ok(());
     }
     let suffix = match dtype {
@@ -61,8 +96,8 @@ pub(crate) fn launch(
         runtime::launch(
             device,
             &name,
-            (work.div_ceil(256).min(65535) as u32, 1, 1),
-            (256, 1, 1),
+            (blocks.min(65535) as u32, 1, 1),
+            (block as u32, 1, 1),
             stream,
             &mut pointers,
         )
@@ -327,6 +362,36 @@ pub fn outer(
         ],
     )
 }
+pub(crate) fn colsum_multiprocessors(cp: &Bound<'_, PyModule>, device: usize) -> PyResult<u64> {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    static COUNTS: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+    let counts = COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(count) = counts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&device)
+        .copied()
+    {
+        return Ok(count);
+    }
+    let properties = cp
+        .getattr("cuda")?
+        .getattr("runtime")?
+        .call_method1("getDeviceProperties", (device,))?;
+    let count = properties
+        .get_item("multiProcessorCount")?
+        .extract::<u64>()?
+        .max(1);
+    counts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(device, count);
+    Ok(count)
+}
+
 fn colsum_impl(
     py: Python<'_>,
     A: &Bound<'_, PyAny>,
@@ -341,20 +406,81 @@ fn colsum_impl(
     let out = read(out, &cp, "out", Some(a.dtype), cols)?;
     let device = current_device(&cp, &[&a, &out])?;
     out.require_disjoint(&a)?;
-    launch(
+    launch_colsum(
+        &cp,
         device,
-        "harmony_colsum",
         a.dtype,
-        cols * 32,
+        a.pointer,
+        out.pointer,
+        rows,
+        cols,
+        accumulate,
         stream,
-        &mut [
-            Arg::Ptr(a.pointer),
-            Arg::Ptr(out.pointer),
-            Arg::U64(rows),
-            Arg::U64(cols),
-            Arg::U32(accumulate as u32),
-        ],
     )
+}
+
+/// Launch a column reduction over buffers already validated by an outer binding.
+pub(crate) fn launch_colsum(
+    cp: &Bound<'_, PyModule>,
+    device: usize,
+    dtype: Dtype,
+    source: u64,
+    destination: u64,
+    rows: u64,
+    cols: u64,
+    accumulate: bool,
+    stream: usize,
+) -> PyResult<()> {
+    if cols == 0 {
+        return Ok(());
+    }
+    let multiprocessors = colsum_multiprocessors(cp, device)?;
+    let (blocks, threads, rows_per_tile) = if accumulate {
+        let col_tiles = cols.div_ceil(32);
+        let target = (multiprocessors * 4 / col_tiles).max(1);
+        let rows_per_tile = rows.div_ceil(target).max(32);
+        (
+            product(&[col_tiles, rows.div_ceil(rows_per_tile)])?,
+            256,
+            rows_per_tile,
+        )
+    } else {
+        (
+            cols.min(multiprocessors * 8),
+            rows.div_ceil(32).clamp(1, 32) * 32,
+            1,
+        )
+    };
+    if blocks == 0 {
+        return Ok(());
+    }
+    let name = match dtype {
+        Dtype::F32 => "harmony_colsum_f32",
+        Dtype::F64 => "harmony_colsum_f64",
+        Dtype::I32 => "harmony_colsum_i32",
+        _ => return Err(PyTypeError::new_err("unsupported column sum dtype")),
+    };
+    let mut args = [
+        Arg::Ptr(source),
+        Arg::Ptr(destination),
+        Arg::U64(rows),
+        Arg::U64(cols),
+        Arg::U32(accumulate as u32),
+        Arg::U64(rows_per_tile),
+    ];
+    let mut pointers: Vec<_> = args.iter_mut().map(Arg::pointer).collect();
+    // SAFETY: validated extents and exclusive output above; the accumulating
+    // entry owns 32 columns per block and exactly eight cooperating warps.
+    unsafe {
+        runtime::launch(
+            device,
+            name,
+            (blocks.min(65_535) as u32, 1, 1),
+            (threads as u32, 1, 1),
+            stream,
+            &mut pointers,
+        )
+    }
 }
 #[pyfunction]
 #[pyo3(signature=(A,*,out,rows,cols,stream=0))]
@@ -397,11 +523,12 @@ fn norm_impl(
         dst.require_disjoint(&src)?;
     }
     let device = current_device(&cp, &[&src, &dst])?;
-    launch(
+    launch_rows(
         device,
         "harmony_normalize",
         src.dtype,
-        rows * 32,
+        rows,
+        cols,
         stream,
         &mut [
             Arg::Ptr(src.pointer),
@@ -456,7 +583,7 @@ pub fn kmeans_err(
         device,
         "harmony_kmeans",
         r.dtype,
-        n,
+        n.min(colsum_multiprocessors(&cp, device)? * 8 * 256),
         stream,
         &mut [
             Arg::Ptr(r.pointer),
@@ -548,11 +675,12 @@ pub fn fused_pen_norm_int(
     for a in [&s, &p, &c, &idx] {
         out.require_disjoint(a)?;
     }
-    launch(
+    launch_rows(
         device,
-        "harmony_pen_norm",
+        pen_kernel(n_covariates),
         s.dtype,
-        n_rows * 32,
+        n_rows,
+        n_cols,
         stream,
         &mut [
             Arg::Ptr(s.pointer),
@@ -588,74 +716,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Call the caller's cuBLAS handle directly; host scalars are copied by cuBLAS.
-pub(crate) fn gemm(
-    py: Python<'_>,
-    dtype: Dtype,
-    handle: usize,
-    stream: usize,
-    ta: i32,
-    tb: i32,
-    m: u64,
-    n: u64,
-    k: u64,
-    a: u64,
-    lda: u64,
-    b: u64,
-    ldb: u64,
-    c: u64,
-    ldc: u64,
-    beta: f64,
-) -> PyResult<()> {
-    if m == 0 || n == 0 {
-        return Ok(());
-    }
-    for d in [m, n, k, lda, ldb, ldc] {
-        if d > i32::MAX as u64 {
-            return Err(PyValueError::new_err("cuBLAS dimensions exceed int32"));
-        }
-    }
-    let blas = py.import("cupy_backends.cuda.libs.cublas")?;
-    blas.call_method1("setStream", (handle, stream))?;
-    let one32 = 1f32;
-    let beta32 = beta as f32;
-    let one64 = 1f64;
-    let beta64 = beta;
-    let (name, alpha_ptr, beta_ptr) = if dtype == Dtype::F32 {
-        (
-            "sgemm",
-            (&one32 as *const f32) as usize,
-            (&beta32 as *const f32) as usize,
-        )
-    } else {
-        (
-            "dgemm",
-            (&one64 as *const f64) as usize,
-            (&beta64 as *const f64) as usize,
-        )
-    };
-    let args = pyo3::types::PyTuple::new(
-        py,
-        [
-            handle.into_pyobject(py)?.into_any(),
-            ta.into_pyobject(py)?.into_any(),
-            tb.into_pyobject(py)?.into_any(),
-            m.into_pyobject(py)?.into_any(),
-            n.into_pyobject(py)?.into_any(),
-            k.into_pyobject(py)?.into_any(),
-            alpha_ptr.into_pyobject(py)?.into_any(),
-            a.into_pyobject(py)?.into_any(),
-            lda.into_pyobject(py)?.into_any(),
-            b.into_pyobject(py)?.into_any(),
-            ldb.into_pyobject(py)?.into_any(),
-            beta_ptr.into_pyobject(py)?.into_any(),
-            c.into_pyobject(py)?.into_any(),
-            ldc.into_pyobject(py)?.into_any(),
-        ],
-    )?;
-    blas.getattr(name)?.call1(args)?;
-    Ok(())
-}
+pub(crate) use crate::blas::gemm;
 
 /// Check writable scratch and outputs before any kernel can mutate them.
 pub(crate) fn disjoint(outputs: &[&Array], inputs: &[&Array]) -> PyResult<()> {

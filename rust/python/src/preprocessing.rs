@@ -186,6 +186,20 @@ impl<'py> Launch<'py> {
             work.div_ceil(block as u64)
         }
         .min(65_535) as u32;
+        // Match the original dense QC tile: each warp covers 16 cells and
+        // two genes, avoiding 32 competing atomics to a single cell sum.
+        let (grid_shape, block_shape) = if family == "qc_dense" {
+            (
+                (
+                    slots[6].div_ceil(16).min(65_535) as u32,
+                    slots[7].div_ceil(16).min(65_535) as u32,
+                    1,
+                ),
+                (16, 16, 1),
+            )
+        } else {
+            ((grid, 1, 1), (block, 1, 1))
+        };
         let mut args = slots
             .iter_mut()
             .map(|slot| (slot as *mut u64).cast::<c_void>())
@@ -194,16 +208,7 @@ impl<'py> Launch<'py> {
         // u64 and f64 slots occupy eight bytes; a u32 mode reads the low four
         // bytes on CUDA's little-endian ABI. Arrays are validated and kept alive
         // by the Python caller; kernels additionally bound-check sparse indices.
-        unsafe {
-            runtime::launch(
-                device,
-                &name,
-                (grid, 1, 1),
-                (block, 1, 1),
-                stream,
-                &mut args,
-            )
-        }
+        unsafe { runtime::launch(device, &name, grid_shape, block_shape, stream, &mut args) }
     }
 }
 
@@ -239,7 +244,7 @@ pub fn mean_var_major(
         64,
         true,
         stream,
-        vec![p, i, d, m, v, 0, 0, major, minor, nnz, 0],
+        vec![p, i, d, m, v, 0, 0, major, minor, nnz],
     )
 }
 
@@ -292,7 +297,7 @@ pub fn nan_mean_minor(
     call.run(
         "stats_minor",
         nnz,
-        256,
+        32,
         false,
         stream,
         vec![i, d, m, 0, n, mask, 0, nnz, minor, 1],
@@ -322,12 +327,12 @@ pub fn nan_mean_major(
     let n = call.vector(nans, "nans", Dtype::I32, Some(major), true)?;
     let mask = call.vector(mask, "mask", Dtype::Bool, Some(minor), false)?;
     call.run(
-        "stats_major",
+        "nan_major",
         major,
         64,
         true,
         stream,
-        vec![p, i, d, m, 0, n, mask, major, minor, nnz, 1],
+        vec![p, i, d, m, 0, n, mask, major, minor, nnz],
     )
 }
 
@@ -347,7 +352,7 @@ pub fn mul_dense(
     call.run(
         "norm_dense",
         nrows,
-        32,
+        if ncols >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![d, scales, nrows, ncols, target_sum.to_bits(), 0],
@@ -377,7 +382,7 @@ pub fn mul_csr(
     call.run(
         "norm",
         major,
-        32,
+        if nnz / major.max(1) >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![
@@ -418,7 +423,7 @@ pub fn sum_major(
     call.run(
         "norm",
         major,
-        32,
+        if nnz / major.max(1) >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![
@@ -465,7 +470,7 @@ pub fn find_hi_genes_csr(
     call.run(
         "norm",
         major,
-        32,
+        if nnz / major.max(1) >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![
@@ -520,7 +525,7 @@ pub fn masked_mul_csr(
     call.run(
         "norm",
         major,
-        32,
+        if nnz / major.max(1) >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![
@@ -563,7 +568,7 @@ pub fn masked_sum_major(
     call.run(
         "norm",
         major,
-        32,
+        if nnz / major.max(1) >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![
@@ -605,7 +610,7 @@ pub fn prescaled_mul_csr(
     call.run(
         "norm",
         major,
-        32,
+        if nnz / major.max(1) >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![
@@ -640,7 +645,7 @@ pub fn prescaled_mul_dense(
     call.run(
         "norm_dense",
         nrows,
-        32,
+        if ncols >= 256 { 256 } else { 32 },
         true,
         stream,
         vec![d, scales, nrows, ncols, 0.0_f64.to_bits(), 1],
@@ -665,7 +670,7 @@ pub fn csc_scale_diff(
     call.run(
         "scale",
         ncols,
-        256,
+        64,
         true,
         stream,
         vec![p, 0, d, s, 0, ncols, ncols, nnz, 0, 0],
@@ -696,7 +701,7 @@ pub fn csr_scale_diff(
     call.run(
         "scale",
         nrows,
-        256,
+        64,
         true,
         stream,
         vec![p, i, d, s, mask, nrows, ncols, nnz, clipper.to_bits(), 1],
@@ -789,7 +794,7 @@ pub fn sparse_qc_csc(
     call.run(
         "qc",
         major,
-        256,
+        32,
         false,
         stream,
         vec![p, i, d, a, b, a_ex, b_ex, mask, major, minor, nnz, 0],
@@ -825,7 +830,7 @@ pub fn sparse_qc_csr(
     call.run(
         "qc",
         major,
-        256,
+        32,
         false,
         stream,
         vec![p, i, d, a, b, a_ex, b_ex, mask, major, minor, nnz, 0],
@@ -859,7 +864,7 @@ pub fn sparse_qc_csc_sub(
     call.run(
         "qc",
         major,
-        256,
+        32,
         false,
         stream,
         vec![p, i, d, a, b, a_ex, b_ex, mask, major, minor, nnz, 1],
@@ -893,7 +898,7 @@ pub fn sparse_qc_csr_sub(
     call.run(
         "qc",
         major,
-        256,
+        32,
         false,
         stream,
         vec![p, i, d, a, b, a_ex, b_ex, mask, major, minor, nnz, 2],
@@ -977,20 +982,16 @@ pub fn sparse_qc_csr_cells(
     let d = call.data(data, None, true, false, false)?;
     let nnz = call.len();
     let p = call.indptr(indptr, major)?;
-    let i = call.indices(index, nnz)?;
+    call.indices(index, nnz)?;
     let a = call.vector(sums_cells, "sums_cells", call.value, Some(major), true)?;
-    let minor = 0;
-    let b = 0;
     let a_ex = call.vector(cell_ex, "cell_ex", Dtype::I32, Some(major), true)?;
-    let b_ex = 0;
-    let mask = 0;
     call.run(
-        "qc",
+        "qc_cells",
         major,
-        256,
+        32,
         false,
         stream,
-        vec![p, i, d, a, b, a_ex, b_ex, mask, major, minor, nnz, 3],
+        vec![p, d, a, a_ex, major, nnz],
     )
 }
 
@@ -1144,9 +1145,9 @@ pub fn sparse_norm_res_csc(
         true,
     )?;
     call.run(
-        "residual",
+        "residual_csc",
         n_genes,
-        256,
+        32,
         false,
         stream,
         vec![
@@ -1162,7 +1163,6 @@ pub fn sparse_norm_res_csc(
             inv_sum_total.to_bits(),
             clip.to_bits(),
             inv_theta.to_bits(),
-            1,
         ],
     )
 }
@@ -1201,9 +1201,9 @@ pub fn sparse_norm_res_csr(
         true,
     )?;
     call.run(
-        "residual",
+        "residual_csr",
         n_cells,
-        256,
+        8,
         false,
         stream,
         vec![
@@ -1219,7 +1219,6 @@ pub fn sparse_norm_res_csr(
             inv_sum_total.to_bits(),
             clip.to_bits(),
             inv_theta.to_bits(),
-            0,
         ],
     )
 }
@@ -1270,7 +1269,6 @@ pub fn dense_norm_res(
             inv_sum_total.to_bits(),
             clip.to_bits(),
             inv_theta.to_bits(),
-            0,
         ],
     )
 }
@@ -1302,7 +1300,7 @@ pub fn sparse_sum_csc(
     call.run(
         "qc",
         major,
-        256,
+        32,
         false,
         stream,
         vec![p, i, d, a, b, a_ex, b_ex, mask, major, minor, nnz, 4],
@@ -1348,9 +1346,9 @@ pub fn csc_hvg_res(
         ));
     }
     call.run(
-        "residual",
+        "residual_hvg",
         n_genes,
-        256,
+        32,
         false,
         stream,
         vec![
@@ -1366,7 +1364,6 @@ pub fn csc_hvg_res(
             inv_sum_total.to_bits(),
             clip.to_bits(),
             inv_theta.to_bits(),
-            2,
         ],
     )
 }
@@ -1406,9 +1403,9 @@ pub fn dense_hvg_res(
         ));
     }
     call.run(
-        "residual_dense",
+        "residual_dense_hvg",
         n_genes,
-        256,
+        32,
         false,
         stream,
         vec![
@@ -1421,7 +1418,6 @@ pub fn dense_hvg_res(
             inv_sum_total.to_bits(),
             clip.to_bits(),
             inv_theta.to_bits(),
-            1,
         ],
     )
 }

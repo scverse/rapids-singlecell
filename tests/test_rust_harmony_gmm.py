@@ -45,9 +45,12 @@ def _pinned_em(values, control, guide, *, max_iter, tol, reg):
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("managed", [False, True])
-def test_projection_em_preserves_stream_and_temporary_lifetime(dtype, managed):
+@pytest.mark.parametrize("counts", [(100, 80), (2049, 1537)])
+@pytest.mark.parametrize("features", [(3, 4), (129, 257), (769, 1025)])
+def test_projection_em_preserves_stream_and_temporary_lifetime(
+    dtype, managed, counts, features, *, max_k_hint=None
+):
     rng = np.random.default_rng(12)
-    counts, features = [100, 80], [3, 4]
     matrices, guides, controls, nt_means, projections, probabilities = (
         [],
         [],
@@ -83,15 +86,20 @@ def test_projection_em_preserves_stream_and_temporary_lifetime(dtype, managed):
         with work:
             arrays = [
                 cp.asarray(np.concatenate([a.ravel() for a in matrices])),
-                cp.asarray([0, counts[0] * features[0]], dtype=cp.int64),
+                cp.asarray(
+                    np.cumsum(
+                        [0] + [n * k for n, k in zip(counts, features, strict=True)]
+                    )[:-1],
+                    dtype=cp.int64,
+                ),
                 cp.asarray(counts, dtype=cp.int32),
                 cp.asarray(features, dtype=cp.int32),
-                cp.asarray([0, counts[0]], dtype=cp.int32),
-                cp.asarray([0, features[0]], dtype=cp.int32),
+                cp.asarray(np.cumsum([0, *counts])[:-1], dtype=cp.int32),
+                cp.asarray(np.cumsum([0, *features])[:-1], dtype=cp.int32),
                 cp.asarray(np.concatenate(nt_means)),
                 cp.asarray(np.concatenate(guides)),
                 cp.asarray(np.concatenate(controls)),
-                cp.asarray([0, 1], dtype=cp.int32),
+                cp.arange(len(counts), dtype=cp.int32),
             ]
             projection_out = cp.empty(sum(counts), dtype=dtype)
             probability_out = cp.empty_like(projection_out)
@@ -99,8 +107,8 @@ def test_projection_em_preserves_stream_and_temporary_lifetime(dtype, managed):
             *arrays,
             projection_out,
             probability_out,
-            n_active=2,
-            max_k=max(features),
+            n_active=len(counts),
+            max_k=max(features) if max_k_hint is None else max_k_hint,
             max_iter=100,
             tol=1e-6,
             reg_covar=1e-4,
@@ -125,6 +133,23 @@ def test_projection_em_preserves_stream_and_temporary_lifetime(dtype, managed):
             rtol=tolerance,
         )
         assert len(allocations) == 16
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_small_projection_warp_and_block_match_reference(dtype):
+    # Small and larger gene batches exercise the block and warp reductions.
+    # Legal overestimates also cover shared/global direction storage without
+    # changing the data or CPU oracle. This mixture is sensitive to the
+    # reduction tree through EM's likelihood-based convergence decision.
+    for copies in (1, 5):
+        for max_k_hint in (4, 257, 12289):
+            test_projection_em_preserves_stream_and_temporary_lifetime(
+                dtype,
+                False,
+                (100, 80) * copies,
+                (3, 4) * copies,
+                max_k_hint=max_k_hint,
+            )
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -156,11 +181,29 @@ def test_gmm_rejects_overlapping_output_before_mutation(dtype):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_large_harmony_intercept_matches_ridge_reference(dtype):
+@pytest.mark.parametrize(
+    ("shape", "capture", "pointer_mode"),
+    [
+        ((101, 3), False, 0),
+        ((1031, 4), False, 0),
+        ((300_003, 3), False, 0),
+        ((101, 3), True, 0),
+        ((1031, 4), True, 1),
+    ],
+)
+def test_large_harmony_intercept_matches_ridge_reference(
+    dtype, shape, capture, pointer_mode
+):
     from rapids_singlecell._cuda import _harmony_correction_cuda
 
+    if (
+        pointer_mode
+        and getattr(_harmony_correction_cuda, "__backend__", None) != "rust"
+    ):
+        pytest.skip("Rust native BLAS restores the caller's scalar pointer mode")
     rng = np.random.default_rng(48)
-    n, d, k, b = 300_003, 3, 2, 3
+    n, d = shape
+    k, b = 2, 3
     categories = rng.integers(0, b, n, dtype=np.int32)
     data = (rng.normal(size=(n, d)) + categories[:, None]).astype(dtype)
     responsibilities = rng.uniform(0.1, 1, (n, k)).astype(dtype)
@@ -215,6 +258,25 @@ def test_large_harmony_intercept_matches_ridge_reference(dtype):
         }
     _harmony_correction_cuda.correction_fast(x, **arguments)
     work.synchronize()
+    if capture:
+        from cupy_backends.cuda.libs import cublas
+
+        handle = arguments["handle"]
+        previous_mode = cublas.getPointerMode(handle)
+        try:
+            cublas.setPointerMode(handle, pointer_mode)
+            with work:
+                work.begin_capture()
+                try:
+                    _harmony_correction_cuda.correction_fast(x, **arguments)
+                finally:
+                    graph = work.end_capture()
+                arguments["Z"].fill(cp.nan)
+                graph.launch(work)
+            work.synchronize()
+            assert cublas.getPointerMode(handle) == pointer_mode
+        finally:
+            cublas.setPointerMode(handle, previous_mode)
     tolerance = 1e-5 if dtype == np.float32 else 1e-11
     np.testing.assert_allclose(
         cp.asnumpy(arguments["Z"]), expected, atol=tolerance, rtol=tolerance

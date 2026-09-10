@@ -52,7 +52,7 @@ def _random_idx(n_src, n_dst, seed=42):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_rows,n_cols", [(100, 50), (1, 20), (500, 3)])
+@pytest.mark.parametrize("n_rows,n_cols", [(100, 50), (1, 20), (500, 3), (17, 4097)])
 @pytest.mark.parametrize("in_place", [False, True])
 def test_l2_row_normalize(dtype, n_rows, n_cols, in_place):
     rng = cp.random.default_rng(42)
@@ -127,7 +127,7 @@ def test_penalty(dtype, n_batches, n_clusters, stabilized):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_rows,n_cols", [(200, 50), (50, 100)])
+@pytest.mark.parametrize("n_rows,n_cols", [(200, 50), (50, 100), (17, 4097)])
 def test_fused_pen_norm_int(dtype, n_rows, n_cols):
     rng = cp.random.default_rng(99)
     n_batches = 3
@@ -195,9 +195,10 @@ def test_fused_pen_norm_int_with_permutation(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("n_covariates", [2, 3, 4])
-def test_fused_pen_norm_multi_int(dtype, n_covariates):
+@pytest.mark.parametrize("n_cols", [64, 4097])
+def test_fused_pen_norm_multi_int(dtype, n_covariates, n_cols):
     """Marginal penalty factors multiply across batch variables."""
-    n_rows, n_cols = 80, 64
+    n_rows = 80
     levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
     rng = cp.random.default_rng(734)
@@ -210,7 +211,7 @@ def test_fused_pen_norm_multi_int(dtype, n_covariates):
     cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
     idx_in = _random_idx(n_rows + 13, n_rows, seed=734)
     R_out = cp.empty((n_rows, n_cols), dtype=dtype)
-    term = -7.0
+    term = 2.0 if n_covariates == 1 else -7.0
 
     _pen.fused_pen_norm_int(
         similarities,
@@ -235,7 +236,7 @@ def test_fused_pen_norm_multi_int(dtype, n_covariates):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_covariates", [2, 3, 4])
+@pytest.mark.parametrize("n_covariates", [1, 2, 3, 4])
 def test_fused_pen_norm_multi_int_avoids_product_overflow(dtype, n_covariates):
     """Large finite marginal factors are normalized without overflow."""
     n_rows, n_cols = 7, 19
@@ -244,7 +245,11 @@ def test_fused_pen_norm_multi_int_avoids_product_overflow(dtype, n_covariates):
     rng = cp.random.default_rng(735)
 
     similarities = rng.random((n_rows, n_cols), dtype=dtype)
-    scale = dtype(1e30 if dtype == np.float32 else 1e200)
+    scale = (
+        dtype(np.finfo(dtype).max / 2)
+        if n_covariates == 1
+        else dtype(1e30 if dtype == np.float32 else 1e200)
+    )
     relative = rng.uniform(0.5, 1.0, size=(int(levels.sum()), n_cols)).astype(dtype)
     penalty = scale * relative
     local_codes = cp.stack(
@@ -614,3 +619,45 @@ def test_compute_inv_mat_absent_batch(dtype):
         expected = _inv_mat_reference(O[:, k], lambda_kb[:, k], dtype)
         atol = 1e-6 if dtype == cp.float32 else 1e-12
         cp.testing.assert_allclose(inv_mat, expected, atol=atol, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_l2_row_normalize_large_exponent_range(dtype):
+    scales = [1e-15, 1.0, 1e15]
+    if dtype == np.float64:
+        scales = [1e-150, 1e-15, 1.0, 1e100, 1e150]
+    rng = np.random.default_rng(281)
+    values = rng.normal(size=(len(scales), 33)).astype(dtype)
+    values *= np.asarray(scales, dtype=dtype)[:, None]
+    expected = values.astype(np.float64)
+    expected /= np.maximum(np.linalg.norm(expected, axis=1, keepdims=True), 1e-12)
+    stream = cp.cuda.Stream(non_blocking=True)
+    with stream:
+        device = cp.asarray(values)
+        output = cp.empty_like(device)
+        _norm.l2_row_normalize(
+            device, dst=output, n_rows=len(scales), n_cols=33, stream=stream.ptr
+        )
+    stream.synchronize()
+    tolerance = 2e-6 if dtype == np.float32 else 1e-12
+    np.testing.assert_allclose(output.get(), expected, rtol=tolerance, atol=0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("l2", [False, True])
+def test_row_normalize_nonfinite_values(dtype, l2):
+    values = np.asarray([[np.nan, 1.0], [np.inf, 1.0], [-np.inf, 0.0]], dtype=dtype)
+    with np.errstate(invalid="ignore"):
+        norms = (
+            np.linalg.norm(values, axis=1, keepdims=True)
+            if l2
+            else np.abs(values).sum(axis=1, keepdims=True)
+        )
+        expected = values / norms
+    device = cp.asarray(values)
+    if l2:
+        _norm.l2_row_normalize(device, dst=device, n_rows=3, n_cols=2)
+    else:
+        _norm.normalize(device, rows=3, cols=2)
+    cp.cuda.get_current_stream().synchronize()
+    np.testing.assert_allclose(device.get(), expected, equal_nan=True)

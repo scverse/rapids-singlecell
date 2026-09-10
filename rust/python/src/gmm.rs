@@ -94,14 +94,16 @@ pub fn e_step(
         let suffix = if dtype == Dtype::F32 { "f32" } else { "f64" };
         let name = format!("gmm_small_{dimension}_{suffix}");
         let mut pointers: Vec<_> = args.iter_mut().map(Arg::pointer).collect();
-        // SAFETY: typed input/output extents above match this specialization;
-        // each 64-thread block caches one component and owns distinct cells.
+        // Larger float32 blocks amortize component loading; float64 retains
+        // the smaller block because its register and arithmetic costs differ.
+        let threads = if dtype == Dtype::F32 { 256 } else { 64 };
+        // SAFETY: each block caches one component and owns distinct cells.
         unsafe {
             crate::runtime::launch(
                 device,
                 &name,
-                (n.div_ceil(64) as u32, K as u32, 1),
-                (64, 1, 1),
+                (n.div_ceil(threads) as u32, K as u32, 1),
+                (threads as u32, 1, 1),
                 stream,
                 &mut pointers,
             )?;
@@ -659,11 +661,16 @@ pub fn spherical_gmm_fit_batched(
         &[&resp1, &m1_out, &v1_out, &w1_out],
         &[&pvec, &offsets, &m0, &v0, &m1_init, &v1_init],
     )?;
+    let block_em = pvec.dtype == Dtype::F64 || pvec.len / n_genes.max(1) > 1024;
     launch(
         device,
-        "gmm_spherical",
+        if block_em {
+            "gmm_spherical_block"
+        } else {
+            "gmm_spherical"
+        },
         dtype,
-        n_genes * 32,
+        n_genes * if block_em { 256 } else { 32 },
         stream,
         &mut [
             Arg::Ptr(pvec.pointer),
@@ -825,47 +832,87 @@ pub fn mixscape_project_em(
     if max_k == 0 || n_active == 0 {
         return Ok(());
     }
-    let kw = PyDict::new(py);
-    kw.set_item("dtype", dtype.name())?;
-    let vec_obj = cp.getattr("empty")?.call(((n_active, max_k),), Some(&kw))?;
-    let vec = read(
-        &vec_obj,
-        &cp,
-        "projection workspace",
-        Some(dtype),
-        product(&[n_active, max_k])?,
-    )?;
-    launch(
-        device,
-        "gmm_project",
-        dtype,
-        n_active * 32,
-        stream,
-        &mut [
-            Arg::Ptr(dat.pointer),
-            Arg::Ptr(dat_offsets.pointer),
-            Arg::Ptr(n_per_gene.pointer),
-            Arg::Ptr(k_per_gene.pointer),
-            Arg::Ptr(cell_offsets.pointer),
-            Arg::Ptr(feat_offsets.pointer),
-            Arg::Ptr(nt_cells_mean.pointer),
-            Arg::Ptr(guide_sel.pointer),
-            Arg::Ptr(nt_in_all.pointer),
-            Arg::Ptr(active_genes.pointer),
-            Arg::Ptr(pvec_scratch.pointer),
-            Arg::Ptr(resp1.pointer),
-            Arg::Ptr(vec.pointer),
-            Arg::U64(n_active),
-            Arg::U64(n_per_gene.len),
-            Arg::U64(max_k),
-            Arg::U64(dat.len),
-            Arg::U64(pvec_scratch.len),
-            Arg::U64(nt_cells_mean.len),
-            Arg::U32(max_iter),
-            scalar(dtype, tol),
-            scalar(dtype, reg_covar),
-        ],
-    )?;
+    // A small number of genes needs the original full block even for wide
+    // projections. The shared/global vector choice below budgets the actual
+    // feature width; limiting this dispatch by width serializes that work in
+    // one warp and can force eight unnecessary vectors into global memory.
+    let block_em = pvec_scratch.len / n_per_gene.len.max(1) > 1024 || n_active <= 8;
+    let vectors = if block_em { 1 } else { 8 };
+    let requested_shared = max_k
+        .checked_mul(dtype.size())
+        .and_then(|n| n.checked_mul(vectors));
+    // Leave room for static reduction storage within Turing's 48 KiB limit.
+    // Wider vectors retain the existing global-workspace fallback.
+    let shared_budget = 47 * 1024 - if block_em { 1024 * dtype.size() } else { 0 };
+    let shared_bytes = requested_shared
+        .filter(|&bytes| bytes <= shared_budget)
+        .unwrap_or(0) as u32;
+    let vec_obj = if shared_bytes == 0 {
+        let kw = PyDict::new(py);
+        kw.set_item("dtype", dtype.name())?;
+        Some(cp.getattr("empty")?.call(((n_active, max_k),), Some(&kw))?)
+    } else {
+        None
+    };
+    let vec_pointer = if let Some(vec) = &vec_obj {
+        read(
+            vec,
+            &cp,
+            "projection workspace",
+            Some(dtype),
+            product(&[n_active, max_k])?,
+        )?
+        .pointer
+    } else {
+        0
+    };
+    let mut args = [
+        Arg::Ptr(dat.pointer),
+        Arg::Ptr(dat_offsets.pointer),
+        Arg::Ptr(n_per_gene.pointer),
+        Arg::Ptr(k_per_gene.pointer),
+        Arg::Ptr(cell_offsets.pointer),
+        Arg::Ptr(feat_offsets.pointer),
+        Arg::Ptr(nt_cells_mean.pointer),
+        Arg::Ptr(guide_sel.pointer),
+        Arg::Ptr(nt_in_all.pointer),
+        Arg::Ptr(active_genes.pointer),
+        Arg::Ptr(pvec_scratch.pointer),
+        Arg::Ptr(resp1.pointer),
+        Arg::Ptr(vec_pointer),
+        Arg::U64(n_active),
+        Arg::U64(n_per_gene.len),
+        Arg::U64(max_k),
+        Arg::U64(dat.len),
+        Arg::U64(pvec_scratch.len),
+        Arg::U64(nt_cells_mean.len),
+        Arg::U32(max_iter),
+        scalar(dtype, tol),
+        scalar(dtype, reg_covar),
+    ];
+
+    let stem = if block_em {
+        "gmm_project_block"
+    } else {
+        "gmm_project"
+    };
+    let storage = if shared_bytes != 0 { "_shared" } else { "" };
+    let suffix = if dtype == Dtype::F32 { "f32" } else { "f64" };
+    let work = product(&[n_active, if block_em { 256 } else { 32 }])?;
+    let mut pointers: Vec<_> = args.iter_mut().map(Arg::pointer).collect();
+    // SAFETY: validated extents and one shared direction vector per independent
+    // gene/warp. The launch budget includes static reduction storage as well.
+    unsafe {
+        crate::runtime::launch_shared(
+            device,
+            &format!("{stem}{storage}_{suffix}"),
+            (work.div_ceil(256).min(65535) as u32, 1, 1),
+            (256, 1, 1),
+            shared_bytes,
+            stream,
+            &mut pointers,
+        )?;
+    }
     // CuPy's memory pool associates temporary storage with this current stream,
     // keeping recycling ordered after the native kernel that consumes it.
     Ok(())

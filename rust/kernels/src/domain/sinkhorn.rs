@@ -292,13 +292,29 @@ pub unsafe fn domain_sinkhorn_update_g(
                 let nc = m.i(b);
                 let offset = cost_off.i(b);
                 let off = f_off.i(b);
+                // Check the complete ragged matrix and vector once so the
+                // coalesced column walk does not branch on every value load.
+                if off > f.len
+                    || nr > f.len - off
+                    || offset > cost.len
+                    || nc == 0
+                    || j >= nc
+                    || nr > (cost.len - offset) / nc
+                {
+                    c += stride();
+                    continue;
+                }
                 let e = eps.single(b);
                 let inv_e = 1.0 / e;
                 let mut i = 0;
                 let mut maximum = f32::NEG_INFINITY;
                 let mut sum = 0.0;
                 while i < nr {
-                    let v = (f.single(off + i) - cost.single(offset + i * nc + j)) * inv_e;
+                    let v = unsafe {
+                        (*(f.pointer as *const f32).add((off + i) as usize)
+                            - *(cost.pointer as *const f32).add((offset + i * nc + j) as usize))
+                            * inv_e
+                    };
                     if v > maximum {
                         sum = sum * (maximum - v).exp() + 1.0;
                         maximum = v;
@@ -329,12 +345,29 @@ pub unsafe fn domain_sinkhorn_update_g(
                 let nc = m.i(b);
                 let offset = cost_off.i(b);
                 let off = f_off.i(b);
+                // Check the complete ragged matrix and vector once so the
+                // coalesced column walk does not branch on every value load.
+                if off > f.len
+                    || nr > f.len - off
+                    || offset > cost.len
+                    || nc == 0
+                    || j >= nc
+                    || nr > (cost.len - offset) / nc
+                {
+                    c += stride();
+                    continue;
+                }
                 let e = eps.f(b);
+                let inv_e = 1.0 / e;
                 let mut i = 0;
                 let mut maximum = f64::NEG_INFINITY;
                 let mut sum = 0.0;
                 while i < nr {
-                    let v = cost.round((f.f(off + i) - cost.f(offset + i * nc + j)) / e);
+                    let v = unsafe {
+                        (*(f.pointer as *const f64).add((off + i) as usize)
+                            - *(cost.pointer as *const f64).add((offset + i * nc + j) as usize))
+                            * inv_e
+                    };
                     if v > maximum {
                         sum = sum * (maximum - v).exp() + 1.0;
                         maximum = v;
@@ -968,36 +1001,77 @@ pub unsafe fn domain_sinkhorn_build_cost(
         rows: cost_rows,
         cols: cost_cols,
     };
-    let mut p = tid();
-    while p < tile_pair.len * 256 {
-        let tile = p / 256;
-        let lane = p % 256;
-        let b = tile_pair.i(tile);
-        let i = tile_i0.i(tile) + lane / 16;
-        let j = tile_j0.i(tile) + lane % 16;
-        if i < n.i(b) && j < m.i(b) {
-            let a = cidx_l.i(f_off.i(b) + i);
-            let z = cidx_r.i(g_off.i(b) + j);
-            if emb.kind == 0 {
-                let mut d = 0;
-                let mut square = 0.0f32;
-                while d < emb.cols {
-                    let diff = emb.single(a * emb.cols + d) - emb.single(z * emb.cols + d);
-                    square += diff * diff;
-                    d += 1;
+    // A 16x16 output tile reuses two feature tiles. The odd 33-element
+    // stride prevents the shared-memory bank conflict of a 32-element stride.
+    static mut CACHE: cuda_device::SharedArray<u64, 1056> = cuda_device::SharedArray::UNINIT;
+    macro_rules! tiled_cost {
+        ($value:ty, $load:ident, $store:ident) => {{
+            let cache = unsafe { core::ptr::addr_of_mut!(CACHE[0]) as *mut $value };
+            let mut tile = tid() / 256;
+            let lane = tid() % 256;
+            while tile < tile_pair.len {
+                let b = tile_pair.i(tile);
+                let i0 = tile_i0.i(tile);
+                let j0 = tile_j0.i(tile);
+                let nr = n.i(b);
+                let nc = m.i(b);
+                let i = i0 + lane / 16;
+                let j = j0 + lane % 16;
+                let mut square = 0.0 as $value;
+                let mut f0 = 0;
+                while f0 < emb.cols {
+                    let width = (emb.cols - f0).min(32);
+                    let mut q = lane;
+                    while q < 512 {
+                        let row = q / 32;
+                        let feature = q % 32;
+                        let mut left = 0.0;
+                        let mut right = 0.0;
+                        if feature < width {
+                            if i0 + row < nr {
+                                let cell = cidx_l.i(f_off.i(b) + i0 + row);
+                                if cell < emb.rows {
+                                    left = emb.$load(cell * emb.cols + f0 + feature);
+                                }
+                            }
+                            if j0 + row < nc {
+                                let cell = cidx_r.i(g_off.i(b) + j0 + row);
+                                if cell < emb.rows {
+                                    right = emb.$load(cell * emb.cols + f0 + feature);
+                                }
+                            }
+                        }
+                        unsafe {
+                            *cache.add((row * 33 + feature) as usize) = left;
+                            *cache.add((528 + row * 33 + feature) as usize) = right;
+                        }
+                        q += 256;
+                    }
+                    thread::sync_threads();
+                    if i < nr && j < nc {
+                        let mut feature = 0;
+                        while feature < width {
+                            let diff = unsafe {
+                                *cache.add((lane / 16 * 33 + feature) as usize)
+                                    - *cache.add((528 + lane % 16 * 33 + feature) as usize)
+                            };
+                            square += diff * diff;
+                            feature += 1;
+                        }
+                    }
+                    thread::sync_threads();
+                    f0 += 32;
                 }
-                cost.put_single(cost_off.i(b) + i * m.i(b) + j, square);
-            } else {
-                let mut d = 0;
-                let mut s = 0.0;
-                while d < emb.cols {
-                    let diff = emb.round(emb.at(a, d) - emb.at(z, d));
-                    s = emb.round(s + emb.round(diff * diff));
-                    d += 1;
+                if i < nr && j < nc {
+                    cost.$store(cost_off.i(b) + i * nc + j, square);
                 }
-                cost.put(cost_off.i(b) + i * m.i(b) + j, s);
+                tile += stride() / 256;
             }
-        }
-        p += stride();
+        }};
+    }
+    if emb.kind == 0 {
+        tiled_cost!(f32, single, put_single);
+    } else {
+        tiled_cost!(f64, f, put);
     }
 }

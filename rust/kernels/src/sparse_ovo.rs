@@ -120,15 +120,20 @@ pub unsafe fn sparse_ovo_memberships(
 /// Count or pack only stored values belonging to a selected population.
 /// # Safety
 /// Valid CSC arrays span nnz entries and cols+1 pointers. Labels has rows
-/// entries. Counts and offsets have (groups+1)*cols and one extra entry.
+/// entries. Counts has (groups+1)*cols+1 entries: its last entry is a NaN
+/// flag included in the host's existing population-planning transfer.
+/// Offsets has at least (groups+1)*cols+1 entries.
 /// Mode 0 counts; mode 1 uses precomputed offsets and zeroed write cursors.
-/// Optional statistics outputs have (groups+1)*out_cols entries.
+/// Optional statistics outputs have stat_groups*out_cols entries. When
+/// stat_labels is non-null it has rows entries and labels every statistics
+/// population independently from the selected ranking populations.
 #[kernel]
 pub unsafe fn sparse_ovo_csc(
     data: *const u8,
     indices: *const u8,
     indptr: *const u8,
     labels: *const i32,
+    stat_labels: *const i32,
     counts: *mut u64,
     offsets: *const u64,
     packed: *mut u32,
@@ -137,6 +142,7 @@ pub unsafe fn sparse_ovo_csc(
     rows: u64,
     cols: u64,
     groups: u64,
+    stat_groups: u64,
     nnz: u64,
     out_cols: u64,
     output_begin: u64,
@@ -155,8 +161,32 @@ pub unsafe fn sparse_ovo_csc(
                 let row = unsafe { index(indices, p, index_wide) };
                 if row >= 0 && (row as u64) < rows {
                     let group = unsafe { *labels.add(row as usize) };
+                    if mode != 0 && !stat_labels.is_null() {
+                        let stat_group = unsafe { *stat_labels.add(row as usize) };
+                        if stat_group >= 0 && (stat_group as u64) < stat_groups {
+                            let v = unsafe { value(data, p, data_wide) };
+                            let out = (stat_group as u64 * out_cols + output_begin + col) as usize;
+                            unsafe {
+                                if !sums.is_null() {
+                                    add(sums.add(out), v);
+                                }
+                                if !nonzero.is_null() && v != 0.0 {
+                                    add(nonzero.add(out), 1.0);
+                                }
+                            }
+                        }
+                    }
+
                     if group >= 0 && (group as u64) <= groups {
                         let segment = group as u64 * cols + col;
+                        if mode == 0 && unsafe { value(data, p, data_wide) }.is_nan() {
+                            unsafe {
+                                DeviceAtomicU64::from_ptr(
+                                    counts.add(((groups + 1) * cols) as usize),
+                                )
+                            }
+                            .fetch_or(1, AtomicOrdering::Relaxed);
+                        }
                         let offset =
                             unsafe { DeviceAtomicU64::from_ptr(counts.add(segment as usize)) }
                                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -166,17 +196,22 @@ pub unsafe fn sparse_ovo_csc(
                             if offset < last - first {
                                 let v = unsafe { value(data, p, data_wide) };
                                 unsafe {
-                                    *packed.add((first + offset) as usize) = ordered(v as f32)
+                                    *packed.add((first + offset) as usize) =
+                                        ordered(if data_wide != 0 {
+                                            v as f32
+                                        } else {
+                                            *data.cast::<f32>().add(p as usize)
+                                        })
                                 };
                                 // Historical statistics rows contain all test
                                 // groups first and the reference group last.
                                 let stat_group = if group == 0 { groups } else { group as u64 - 1 };
                                 let out = (stat_group * out_cols + output_begin + col) as usize;
                                 unsafe {
-                                    if !sums.is_null() {
+                                    if stat_labels.is_null() && !sums.is_null() {
                                         add(sums.add(out), v);
                                     }
-                                    if !nonzero.is_null() && v != 0.0 {
+                                    if stat_labels.is_null() && !nonzero.is_null() && v != 0.0 {
                                         add(nonzero.add(out), 1.0);
                                     }
                                 }
@@ -185,6 +220,81 @@ pub unsafe fn sparse_ovo_csc(
                     }
                 }
                 p += thread::blockDim_x() as u64;
+            }
+        }
+        col += thread::gridDim_x() as u64;
+    }
+}
+
+/// Materialize selected CSC rows in their original reference/group order.
+/// The host uses this bounded path only when a selected value is NaN: the
+/// compact integer-key rank identity then differs from floating searches.
+/// # Safety
+/// CSC arrays cover nnz entries and cols+1 pointers. Sorted selected_rows and
+/// positions have selected entries; positions is a permutation of 0..selected.
+/// Outputs are zeroed F arrays [nref,width] and [selected-nref,width].
+/// First+width does not exceed cols. Duplicate coordinates are processed in
+/// stored-entry order by a single row owner, without conflicting writes.
+#[kernel]
+pub unsafe fn sparse_ovo_nan_dense(
+    data: *const u8,
+    indices: *const u8,
+    indptr: *const u8,
+    selected_rows: *const u64,
+    positions: *const u64,
+    reference: *mut f32,
+    group: *mut f32,
+    rows: u64,
+    cols: u64,
+    nnz: u64,
+    selected: u64,
+    nref: u64,
+    first: u64,
+    width: u64,
+    data_wide: u32,
+    index_wide: u32,
+    pointer_wide: u32,
+) {
+    let mut col = thread::blockIdx_x() as u64;
+    while col < width && first + col < cols {
+        let begin = unsafe { index(indptr, first + col, pointer_wide) };
+        let end = unsafe { index(indptr, first + col + 1, pointer_wide) };
+        if begin >= 0 && end >= begin && end as u64 <= nnz {
+            let mut p = begin as u64;
+            while p < end as u64 {
+                let row = unsafe { index(indices, p, index_wide) };
+                if row >= 0
+                    && (row as u64) < rows
+                    && row as u64 % thread::blockDim_x() as u64 == thread::threadIdx_x() as u64
+                {
+                    let mut lo = 0;
+                    let mut hi = selected;
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        if unsafe { *selected_rows.add(mid as usize) } < row as u64 {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if lo < selected && unsafe { *selected_rows.add(lo as usize) } == row as u64 {
+                        let position = unsafe { *positions.add(lo as usize) };
+                        let v = if data_wide != 0 {
+                            unsafe { *data.cast::<f64>().add(p as usize) as f32 }
+                        } else {
+                            unsafe { *data.cast::<f32>().add(p as usize) }
+                        };
+                        unsafe {
+                            if position < nref {
+                                *reference.add((col * nref + position) as usize) = v;
+                            } else if position < selected {
+                                *group.add((col * (selected - nref) + position - nref) as usize) =
+                                    v;
+                            }
+                        }
+                    }
+                }
+                p += 1;
             }
         }
         col += thread::gridDim_x() as u64;

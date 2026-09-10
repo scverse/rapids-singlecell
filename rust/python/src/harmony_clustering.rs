@@ -30,7 +30,7 @@ fn objective(
         device,
         "harmony_kmeans",
         dtype,
-        n * k,
+        (n * k).min(colsum_multiprocessors(cp, device)? * 8 * 256),
         stream,
         &mut [Arg::Ptr(R), Arg::Ptr(sim), Arg::Ptr(out), Arg::U64(n * k)],
     )?;
@@ -458,11 +458,12 @@ pub fn clustering_loop(
             n_pcs,
             0.,
         )?;
-        launch(
+        launch_rows(
             device,
             "harmony_normalize",
             dtype,
-            n_clusters * 32,
+            n_clusters,
+            n_pcs,
             stream,
             &mut [
                 Arg::Ptr(Y.pointer),
@@ -587,19 +588,16 @@ pub fn clustering_loop(
                     ],
                 )?;
             }
-            launch(
+            launch_colsum(
+                &cp,
                 device,
-                "harmony_colsum",
                 dtype,
-                n_clusters * 32,
+                R_out_buffer.pointer,
+                R_in_sum.pointer,
+                bs,
+                n_clusters,
+                false,
                 stream,
-                &mut [
-                    Arg::Ptr(R_out_buffer.pointer),
-                    Arg::Ptr(R_in_sum.pointer),
-                    Arg::U64(bs),
-                    Arg::U64(n_clusters),
-                    Arg::U32(0),
-                ],
             )?;
             if let (Some(j), Some(jin), Some(off), Some(idx)) = (
                 &O_joint,
@@ -691,11 +689,12 @@ pub fn clustering_loop(
                     Arg::U32(stabilized as u32),
                 ],
             )?;
-            launch(
+            launch_rows(
                 device,
-                "harmony_pen_norm",
+                crate::harmony::pen_kernel(n_covariates),
                 dtype,
-                bs * 32,
+                bs,
+                n_clusters,
                 stream,
                 &mut [
                     Arg::Ptr(similarities.pointer),
@@ -727,19 +726,16 @@ pub fn clustering_loop(
                     Arg::U32(1),
                 ],
             )?;
-            launch(
+            launch_colsum(
+                &cp,
                 device,
-                "harmony_colsum",
                 dtype,
-                n_clusters * 32,
+                R_out_buffer.pointer,
+                R_out_sum.pointer,
+                bs,
+                n_clusters,
+                false,
                 stream,
-                &mut [
-                    Arg::Ptr(R_out_buffer.pointer),
-                    Arg::Ptr(R_out_sum.pointer),
-                    Arg::U64(bs),
-                    Arg::U64(n_clusters),
-                    Arg::U32(0),
-                ],
             )?;
             if let (Some(j), Some(jin), Some(off), Some(idx)) = (
                 &O_joint,

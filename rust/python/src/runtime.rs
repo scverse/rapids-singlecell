@@ -13,6 +13,7 @@ use std::{
 };
 
 const PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.ptx"));
+include!(concat!(env!("OUT_DIR"), "/kernel_abi.rs"));
 
 /// Run CuPy allocations and primitives on the stream borrowed by a binding.
 /// The context manager restores the caller's stream on every return path.
@@ -43,6 +44,10 @@ impl<'py> StreamScope<'py> {
         } else {
             cuda.getattr("ExternalStream")?.call1((stream,))?
         };
+        Self::enter(context)
+    }
+
+    pub(crate) fn enter(context: Bound<'py, PyAny>) -> PyResult<Self> {
         context.call_method0("__enter__")?;
         Ok(Self(context))
     }
@@ -59,7 +64,13 @@ impl Drop for StreamScope<'_> {
 struct DeviceModule {
     context: Arc<CudaContext>,
     module: Arc<CudaModule>,
-    functions: Mutex<HashMap<String, CudaFunction>>,
+    functions: Mutex<HashMap<String, CachedFunction>>,
+}
+
+#[derive(Clone)]
+struct CachedFunction {
+    function: CudaFunction,
+    arity: usize,
 }
 
 // No Python objects are stored here. Each function retains the module/context,
@@ -70,7 +81,10 @@ fn cuda_error(error: DriverError) -> PyErr {
     PyRuntimeError::new_err(format!("Rust CUDA backend: {error}"))
 }
 
-struct ContextGuard(sys::CUcontext);
+struct ContextGuard {
+    original: sys::CUcontext,
+    restore: bool,
+}
 
 impl ContextGuard {
     fn capture() -> PyResult<Self> {
@@ -79,14 +93,19 @@ impl ContextGuard {
         unsafe { sys::cuCtxGetCurrent(&mut context) }
             .result()
             .map_err(cuda_error)?;
-        Ok(Self(context))
+        Ok(Self {
+            original: context,
+            restore: true,
+        })
     }
 }
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {
         // SAFETY: this borrowed context was current on this thread at entry.
-        unsafe { sys::cuCtxSetCurrent(self.0) };
+        if self.restore {
+            unsafe { sys::cuCtxSetCurrent(self.original) };
+        }
     }
 }
 
@@ -123,13 +142,35 @@ pub unsafe fn launch(
     stream: usize,
     arguments: &mut [*mut c_void],
 ) -> PyResult<()> {
-    let caller_context = ContextGuard::capture()?;
+    // SAFETY: this preserves the caller's kernel ABI and storage requirements.
+    unsafe { launch_shared(device, name, grid, block, 0, stream, arguments) }
+}
+
+/// Enqueue a kernel with explicitly sized dynamic shared storage.
+///
+/// # Safety
+/// All requirements of `launch` apply. `shared_bytes` must cover every dynamic
+/// shared-memory access and fit the device's per-block launch limit.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_shared(
+    device: usize,
+    name: &str,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    shared_bytes: u32,
+    stream: usize,
+    arguments: &mut [*mut c_void],
+) -> PyResult<()> {
+    let mut caller_context = ContextGuard::capture()?;
     let module = device_module(device)?;
-    if !caller_context.0.is_null() && caller_context.0 != module.context.cu_ctx() {
+    if !caller_context.original.is_null() && caller_context.original != module.context.cu_ctx() {
         return Err(PyValueError::new_err(
             "Rust CUDA kernels require the current device's primary context",
         ));
     }
+    // The common CuPy path already has this primary context current. Avoid
+    // redundant driver context switches before and after every kernel launch.
+    caller_context.restore = caller_context.original != module.context.cu_ctx();
     let mut functions = module
         .functions
         .lock()
@@ -137,7 +178,12 @@ pub unsafe fn launch(
     if !functions.contains_key(name) {
         functions.insert(
             name.to_owned(),
-            module.module.load_function(name).map_err(cuda_error)?,
+            CachedFunction {
+                arity: kernel_arity(name).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!("unknown native CUDA kernel: {name}"))
+                })?,
+                function: module.module.load_function(name).map_err(cuda_error)?,
+            },
         );
     }
     let function = functions
@@ -145,15 +191,24 @@ pub unsafe fn launch(
         .expect("function inserted above")
         .clone();
     drop(functions);
-    module.context.bind_to_thread().map_err(cuda_error)?;
+    if arguments.len() != function.arity {
+        return Err(PyRuntimeError::new_err(format!(
+            "native CUDA ABI mismatch for {name}: expected {} arguments, got {}",
+            function.arity,
+            arguments.len()
+        )));
+    }
+    if caller_context.restore {
+        module.context.bind_to_thread().map_err(cuda_error)?;
+    }
     // SAFETY: the caller establishes kernel-specific ABI and memory invariants.
     // CUDA copies argument slots during this call; device pointers stay borrowed.
     unsafe {
         cuda_core::launch_kernel(
-            function.cu_function(),
+            function.function.cu_function(),
             grid,
             block,
-            0,
+            shared_bytes,
             stream as sys::CUstream,
             arguments,
         )
