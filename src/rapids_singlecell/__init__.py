@@ -8,6 +8,8 @@ from ._settings import Preset, settings  # isort: skip
 from . import dcg, get, gr, pp, ptg, tl
 from ._version import __version__
 
+__all__ = ["dcg", "get", "gr", "pp", "ptg", "tl"]
+
 
 def _detect_duplicate_installation():
     """Warn if multiple rapids_singlecell variants are installed."""
