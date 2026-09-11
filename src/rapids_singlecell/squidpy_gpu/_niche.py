@@ -15,8 +15,12 @@ from scverse_misc import Deprecation, deprecated
 import rapids_singlecell as rsc
 from rapids_singlecell._keys import _embedding_keys
 
+from ._utils import _extract_adata_if_sdata
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from spatialdata import SpatialData
 
 
 __all__ = [
@@ -47,7 +51,7 @@ def _normalize_resolutions(
 
 
 def calculate_niche_neighborhood(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
     groups: str,
     resolutions: float | Sequence[float],
@@ -61,6 +65,7 @@ def calculate_niche_neighborhood(
     mask: pd.Series | None = None,
     library_key: str | None = None,
     inplace: bool = True,
+    table_key: str | None = None,
 ) -> AnnData | None:
     """\
     Compute spatial niches from cell-type neighborhood profiles on the GPU.
@@ -101,7 +106,11 @@ def calculate_niche_neighborhood(
         per sample and labels are prefixed with ``lib=<id>_``.
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
+    table_key
+        Key in :attr:`spatialdata.SpatialData.tables` selecting the table to use.
+        Required if ``adata`` is a :class:`~spatialdata.SpatialData`.
     """
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     resolutions = _normalize_resolutions(resolutions)
     _check_key(adata, spatial_connectivities_key)
     if groups is None:
@@ -138,7 +147,7 @@ def calculate_niche_neighborhood(
 
 
 def calculate_niche_utag(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
     resolutions: float | Sequence[float],
     n_neighbors: int = 15,
@@ -147,6 +156,7 @@ def calculate_niche_utag(
     mask: pd.Series | None = None,
     library_key: str | None = None,
     inplace: bool = True,
+    table_key: str | None = None,
 ) -> AnnData | None:
     """\
     Compute spatial niches from UTAG-smoothed expression on the GPU.
@@ -177,7 +187,11 @@ def calculate_niche_utag(
         per sample and labels are prefixed with ``lib=<id>_``.
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
+    table_key
+        Key in :attr:`spatialdata.SpatialData.tables` selecting the table to use.
+        Required if ``adata`` is a :class:`~spatialdata.SpatialData`.
     """
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     resolutions = _normalize_resolutions(resolutions)
     _check_key(adata, spatial_connectivities_key)
     if n_neighbors < 1:
@@ -200,7 +214,7 @@ def calculate_niche_utag(
 
 
 def calculate_niche_cellcharter(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
     distance: int = 3,
     aggregation: Literal["mean", "variance"] = "mean",
@@ -212,6 +226,7 @@ def calculate_niche_cellcharter(
     mask: pd.Series | None = None,
     library_key: str | None = None,
     inplace: bool = True,
+    table_key: str | None = None,
 ) -> AnnData | None:
     """\
     Compute spatial niches with the CellCharter approach on the GPU.
@@ -251,7 +266,11 @@ def calculate_niche_cellcharter(
         per sample and labels are prefixed with ``lib=<id>_``.
     inplace
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
+    table_key
+        Key in :attr:`spatialdata.SpatialData.tables` selecting the table to use.
+        Required if ``adata`` is a :class:`~spatialdata.SpatialData`.
     """
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     if use_rep is None:
         _check_key(adata, spatial_connectivities_key)
     if distance < 0:
@@ -302,7 +321,7 @@ def calculate_niche_cellcharter(
     )
 )
 def calculate_niche(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
     flavor: Literal["neighborhood", "utag", "cellcharter"],
     groups: str | None = None,
@@ -322,6 +341,7 @@ def calculate_niche(
     random_state: int = 42,
     inplace: bool = True,
     copy: bool | None = None,
+    table_key: str | None = None,
     **kwargs,
 ) -> AnnData | None:
     """\
@@ -392,9 +412,12 @@ def calculate_niche(
         Write the niche columns to ``adata``. If ``False``, return a modified copy.
     copy
         Deprecated alias for ``inplace``; ``copy=True`` is ``inplace=False``.
+    table_key
+        Table to use when ``adata`` is a :class:`~spatialdata.SpatialData`.
     kwargs
         Accepts the removed ``gmm_init`` argument, which is ignored with a warning.
     """
+    adata = _extract_adata_if_sdata(adata, table_key=table_key)
     if flavor not in FLAVORS:
         raise ValueError(
             f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'."

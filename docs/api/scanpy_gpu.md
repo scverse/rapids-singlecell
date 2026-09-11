@@ -2,6 +2,23 @@
 
 These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html) {cite}`Wolf2018`.
 
+## Scanpy backend
+
+With Scanpy versions that support computational backends, RAPIDS-singlecell is
+available as the `rapids-singlecell` backend with the aliases `cuda`, `rapids`,
+and `rapids_singlecell`.
+
+```python
+import scanpy as sc
+
+sc.settings.backend = "cuda"
+```
+
+The backend exposes RAPIDS-singlecell's `pp` and `tl` functions, plus {func}`rapids_singlecell.get.aggregate`, for Scanpy's backend dispatcher.
+The data must already be on the GPU: move it with {func}`~rapids_singlecell.get.anndata_to_GPU` before calling the accelerated functions (see {doc}`/usage_principles`). Scanpy's `copy` argument, and `subset`/`inplace` of {func}`~rapids_singlecell.pp.highly_variable_genes`, behave as in Scanpy; other arguments that RAPIDS-singlecell does not support are dropped with a warning.
+
+Backend calls use RAPIDS-singlecell's native defaults and return types. In particular, {func}`~rapids_singlecell.pp.normalize_total` and {func}`~rapids_singlecell.pp.normalize_pearson_residuals` return the normalized GPU matrix directly with `inplace=False`, rather than Scanpy's result dictionary. {func}`~rapids_singlecell.pp.calculate_qc_metrics` defaults to `inplace=False` through the backend, matching Scanpy.
+
 ## Preprocessing `pp`
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
 

@@ -75,8 +75,9 @@ def rank_genes_groups(
     n_bins: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
     skip_empty_groups: bool = False,
+    copy: bool = False,
     **kwds,
-) -> None:
+) -> AnnData | None:
     """
     Rank genes for characterizing groups using GPU acceleration.
 
@@ -197,6 +198,8 @@ def rank_genes_groups(
         Skip selected groups with fewer than two observations after filtering.
         This is useful for perturbation workflows where a per-cell-type slice
         keeps categories that are empty or singleton in that slice.
+    copy
+        Return an annotated copy instead of updating `adata`.
     **kwds
         Additional arguments passed to the method. For `'logreg'`, these are
         passed to :class:`cuml.linear_model.LogisticRegression`.
@@ -228,6 +231,7 @@ def rank_genes_groups(
     `adata.uns['rank_genes_groups' | key_added]['pts_rest']`
         Fraction of cells expressing genes in rest. Only if `pts=True` and `reference='rest'`.
     """
+    adata = adata.copy() if copy else adata
     method = resolve_default(method)
     mean_in_log_space = resolve_default(mean_in_log_space)
 
@@ -360,7 +364,7 @@ def rank_genes_groups(
             test_obj.pts_rest.T, index=test_obj.var_names, columns=groups_names
         )
 
-    return None
+    return adata if copy else None
 
 
 @deprecated(Deprecation("0.14.1", "Use `rank_genes_groups(method='logreg')` instead."))

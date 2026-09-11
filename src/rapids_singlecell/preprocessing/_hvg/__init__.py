@@ -3,8 +3,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
+from anndata import AnnData
+from cupyx.scipy.sparse import issparse
 
 from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 from ._cutoffs import _Cutoffs
@@ -17,7 +20,7 @@ from ._seurat_cellranger import (
 from ._seurat_v3 import _highly_variable_genes_seurat_v3
 
 if TYPE_CHECKING:
-    from anndata import AnnData
+    import pandas as pd
 
 flavors = Literal[
     "seurat",
@@ -47,7 +50,9 @@ def highly_variable_genes(
     chunksize: int = 1000,
     n_samples: int = 10000,
     batch_key: str | None = None,
-) -> None:
+    subset: bool = False,
+    inplace: bool = True,
+) -> pd.DataFrame | None:
     """\
     Annotate highly variable genes :cite:p:`Satija2015,Zheng2017,Stuart2019,Lause2021,Andrews2019`.
 
@@ -117,10 +122,15 @@ def highly_variable_genes(
             of enrichment of zeros for each gene (only for `flavor='poisson_gene_selection'`).
         batch_key
             If specified, highly-variable genes are selected within each batch separately and merged.
+        subset
+            Restrict the result to highly variable genes.
+        inplace
+            Write metrics to `adata.var`. If `False`, return the metrics as a DataFrame.
 
     Returns
     -------
-        updates `adata.var` with the following fields:
+        Returns the metrics if `inplace=False`; otherwise updates `adata.var`
+        with the following fields and subsets `adata` if requested:
 
             `highly_variable` : bool
                 boolean indicator of highly-variable genes
@@ -147,6 +157,17 @@ def highly_variable_genes(
                 If batch_key is given, this denotes the genes that are highly variable in all batches
     """
     flavor = resolve_default(flavor)
+
+    if not inplace:
+        adata = AnnData(
+            X=adata.X,
+            obs=adata.obs.copy(),
+            var=adata.var[[]].copy(),
+            layers=adata.layers,
+        )
+        X = _get_obs_rep(adata, layer=layer)
+        if issparse(X) and not X.has_canonical_format:
+            _set_obs_rep(adata, X.copy(), layer=layer)
 
     if batch_key is not None:
         _sanitize_column(adata, batch_key)
@@ -221,3 +242,9 @@ def highly_variable_genes(
             adata.var["highly_variable_intersection"] = df[
                 "highly_variable_intersection"
             ]
+
+    if not inplace:
+        return adata.var.loc[adata.var["highly_variable"]] if subset else adata.var
+    if subset:
+        adata._inplace_subset_var(adata.var["highly_variable"])
+    return None
