@@ -4,11 +4,10 @@ template <typename R, typename C, typename I, typename T, bool with_distances>
 __global__ void assemble_graphs_kernel(
     const R* __restrict__ rows, const C* __restrict__ columns,
     const T* __restrict__ distances, const long long n_edges,
-    const long long n_obs, const bool set_diag,
-    I* __restrict__ adj_indptr, I* __restrict__ dst_indptr,
-    I* __restrict__ adj_columns, I* __restrict__ dst_columns,
-    float* __restrict__ adj_data, T* __restrict__ dst_data
-) {
+    const long long n_obs, const bool set_diag, I* __restrict__ adj_indptr,
+    I* __restrict__ dst_indptr, I* __restrict__ adj_columns,
+    I* __restrict__ dst_columns, float* __restrict__ adj_data,
+    T* __restrict__ dst_data) {
     const long long edge = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     // Sparse rows get independent diagonal threads to avoid long serial gaps.
     const bool sparse_rows = n_edges < n_obs;
@@ -18,8 +17,10 @@ __global__ void assemble_graphs_kernel(
         long long left = 0, right = n_edges;
         while (left < right) {
             const long long middle = left + (right - left) / 2;
-            if (rows[middle] < row) left = middle + 1;
-            else right = middle;
+            if (rows[middle] < row)
+                left = middle + 1;
+            else
+                right = middle;
         }
         const long long out = left + row;
         adj_indptr[row] = out;

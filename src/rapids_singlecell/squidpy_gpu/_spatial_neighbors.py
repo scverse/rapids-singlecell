@@ -134,9 +134,10 @@ def spatial_neighbors_delaunay(
     ``(0, radius)``. Percentile pruning follows radius pruning.
     Shared parameters and outputs follow :func:`spatial_neighbors_knn`.
 
-    Suitable larger 2D inputs use validated GPU triangulation. Small inputs,
-    3D, duplicates, and ambiguous geometry fall back to SciPy/Qhull. Distances,
-    pruning, and connectivity transforms run on the GPU in either case.
+    Suitable larger 2D inputs use validated GPU triangulation, including
+    duplicate coordinates and repairable ambiguous geometry. Small inputs,
+    non-2D inputs, and failed GPU triangulations fall back to SciPy/Qhull.
+    Distances, pruning, and connectivity transforms run on the GPU in either case.
     Inputs and graph data use float32; CuPy/Qhull triangulation requires double
     internally, including the GPU geometry validation predicates.
     """

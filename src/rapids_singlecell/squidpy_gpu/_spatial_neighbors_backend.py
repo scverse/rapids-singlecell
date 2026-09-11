@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import cupy as cp
-from cupyx.scipy.spatial import KDTree
 
 from rapids_singlecell._cuda import _spatial_cuda
+
+from ._spatial_kdtree import _build_kdtree
 
 
 def _knn_edges(
     coords: cp.ndarray, n_neighs: int
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Exact GPU search using CuPy's left-balanced KDTree."""
-    tree = KDTree(coords)
+    tree, index = _build_kdtree(coords)
     rows = cp.repeat(cp.arange(len(coords), dtype=cp.int64), n_neighs)
     columns = cp.empty(len(rows), dtype=cp.int64)
     distances = cp.empty(len(rows), dtype=coords.dtype)
     _spatial_cuda.knn(
         coords,
-        tree.tree,
-        tree.index,
+        tree,
+        index,
         k=n_neighs,
         columns=columns,
         distances=distances,
@@ -30,18 +31,23 @@ def _radius_edges(
     coords: cp.ndarray, radius: float
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Count then fill radius edges with O(observations + edges) GPU memory."""
-    tree = KDTree(coords)
+    tree, index = _build_kdtree(coords)
     counts = cp.empty(len(coords), dtype=cp.int64)
     stream = cp.cuda.get_current_stream().ptr
     # Keep the caller's double radius, including for float32 coordinates.
     _spatial_cuda.radius_count(
         coords,
-        tree.tree,
-        tree.index,
+        tree,
+        index,
         radius=radius,
         counts=counts,
         stream=stream,
     )
+    if radius > float(cp.finfo(coords.dtype).max) and bool((counts < 0).any()):
+        raise ValueError(
+            "Spatial distances exceed the coordinate dtype's finite range. "
+            "Rescale the coordinates."
+        )
     offsets = cp.empty(len(coords) + 1, dtype=cp.int64)
     offsets[0] = 0
     cp.cumsum(counts, out=offsets[1:])
@@ -52,8 +58,8 @@ def _radius_edges(
     if n_edges:
         _spatial_cuda.radius_fill(
             coords,
-            tree.tree,
-            tree.index,
+            tree,
+            index,
             radius=radius,
             offsets=offsets,
             rows=rows,

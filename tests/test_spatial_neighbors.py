@@ -175,6 +175,34 @@ def test_radius_duplicates_and_inclusive_bounds(radius):
 
 
 @pytest.mark.parametrize(
+    "coords",
+    [
+        [[-3e38, 0], [3e38, 0]],
+        [[0, 0], [3e38, 3e38]],
+    ],
+    ids=["subtraction", "norm"],
+)
+def test_radius_rejects_unrepresentable_distances(coords):
+    with pytest.raises(ValueError, match="Rescale"):
+        _call("radius", _adata(np.array(coords, dtype=np.float32)), radius=1e39)
+
+
+@pytest.mark.parametrize("radius", [0, 1, 1e38, 5e38])
+def test_radius_excludes_overflowing_distances(radius):
+    coords = np.array(
+        [[-3e38, 0], [-3e38, 0], [-3e38, 1], [3e38, 0], [3e38, 0], [3e38, 1]],
+        dtype=np.float32,
+    )
+    result = _call("radius", _adata(coords), radius=radius, copy=True)
+    delta = coords[:, None].astype(np.float64) - coords[None, :]
+    distances = np.linalg.norm(delta, axis=-1)
+    expected = distances <= radius
+    np.fill_diagonal(expected, False)
+    np.testing.assert_array_equal(result.connectivities.toarray(), expected)
+    np.testing.assert_array_equal(result.distances.toarray(), distances * expected)
+
+
+@pytest.mark.parametrize(
     "method,kwargs,count", [("knn", {"n_neighs": 3}, 3), ("radius", {"radius": 0}, 7)]
 )
 def test_float32_rounding_and_ties_exclude_self(method, kwargs, count):

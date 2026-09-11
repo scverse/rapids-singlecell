@@ -1,5 +1,3 @@
-"""GPU graph builders and reusable spatial graph postprocessors."""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -141,6 +139,8 @@ class _SpatialBuilder(GraphBuilderCSR):
 
     def uns_params(self) -> dict[str, Any]:
         params = {name: getattr(self, name) for name in self._parameters}
+        if isinstance(params.get("radius"), tuple):
+            params["radius"] = list(params["radius"])
         if "n_neighs" in params:
             params["n_neighbors"] = params.pop("n_neighs")
         return {"coord_type": self._coord_type, **params, "transform": self.transform}
@@ -198,9 +198,11 @@ class RadiusBuilder(_SpatialBuilder):
 class DelaunayBuilder(_SpatialBuilder):
     """Connect Delaunay neighbors and store their Euclidean distances.
 
-    Larger, nondegenerate 2D inputs use validated GPU triangulation; 3D,
-    duplicates, and ambiguous/unsupported geometry use SciPy/Qhull. Distances,
-    pruning, and transforms run on GPU. Scalar ``radius`` prunes to ``(0, radius)``.
+    Larger 2D inputs use validated GPU triangulation. Duplicate coordinates use
+    their first observation; other copies have no Delaunay edges. Ambiguous
+    triangulations may differ from SciPy/Qhull. Small inputs, 3D, and unsupported
+    GPU cases use SciPy/Qhull; 3D emits a warning inviting a GPU feature request.
+    Distances, pruning, and transforms run on GPU. Scalar ``radius`` prunes to ``(0, radius)``.
     Coordinates and graph data use float32; triangulation requires double internally.
     """
 
