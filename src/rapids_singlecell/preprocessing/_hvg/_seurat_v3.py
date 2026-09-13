@@ -9,6 +9,7 @@ import pandas as pd
 from cupyx.scipy.sparse import issparse, isspmatrix_csc
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 from rapids_singlecell.get import _get_obs_rep
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
@@ -20,31 +21,24 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 
-_seurat_v3_elementwise_kernel = cp.ElementwiseKernel(
-    "T data, S idx, raw D clip_val",
-    "raw D sq_sum, raw D sum",
-    """
-    D element = min((double)data, clip_val[idx]);
-    atomicAdd(&sq_sum[idx], element * element);
-    atomicAdd(&sum[idx], element);
-    """,
-    "seurat_v3_elementwise_kernel",
-    no_return=True,
-)
-
-
 def _clip_square_sum_sparse(X, clip_val):
     """Compute clipped sum and sum-of-squares for a sparse CSR matrix."""
+    from rapids_singlecell._cuda import _hvg_cuda
+
     if isspmatrix_csc(X):
         X = X.tocsr()
     squared_batch_counts_sum = cp.zeros(clip_val.shape, dtype=cp.float64)
     batch_counts_sum = cp.zeros(clip_val.shape, dtype=cp.float64)
-    _seurat_v3_elementwise_kernel(
-        X.data,
+    _minor_reduce(
+        X,
+        _hvg_cuda.clip_square_sum,
+        X.indptr,
         X.indices,
-        clip_val,
-        squared_batch_counts_sum,
-        batch_counts_sum,
+        X.data,
+        clip_val=cp.ascontiguousarray(clip_val, dtype=cp.float64),
+        sq_sum=squared_batch_counts_sum,
+        sum=batch_counts_sum,
+        stream=cp.cuda.get_current_stream().ptr,
     )
     return squared_batch_counts_sum, batch_counts_sum
 

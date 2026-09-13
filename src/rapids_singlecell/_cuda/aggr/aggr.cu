@@ -45,27 +45,29 @@ constexpr int BLOCK_SIZE_DENSE = 256;
                 "provided");                                                 \
     }
 
+// CSC keeps the per-gene block kernel (genes are the compressed axis). CSR
+// runs the grouped tile sweep and returns whether unsorted rows were detected.
 template <typename T, typename IdxT, int MASK>
-static inline void launch_sparse_aggr(bool is_csc, const IdxT* indptr,
-                                      const IdxT* index, const T* data,
-                                      double* out_sum, double* out_count,
-                                      double* out_sqsum, const int* cats,
-                                      const bool* mask, size_t n_cells,
-                                      size_t n_genes, cudaStream_t stream) {
-    dim3 block(BLOCK_SIZE_SPARSE);
+static inline bool launch_sparse_aggr(
+    bool is_csc, const IdxT* indptr, const IdxT* index, const T* data,
+    double* out_sum, double* out_count, double* out_sqsum, const int* cats,
+    const bool* mask, size_t n_cells, size_t n_genes, int n_groups,
+    long long nnz, bool assume_unsorted, cudaStream_t stream) {
     if (is_csc) {
+        dim3 block(BLOCK_SIZE_SPARSE);
         dim3 grid((unsigned)n_genes);
         csc_aggr_kernel<T, IdxT, MASK><<<grid, block, 0, stream>>>(
             indptr, index, data, out_sum, out_count, out_sqsum, cats, mask,
             n_cells, n_genes);
         CUDA_CHECK_LAST_ERROR(csc_aggr_kernel);
-    } else {
-        dim3 grid((unsigned)n_cells);
-        csr_aggr_kernel<T, IdxT, MASK><<<grid, block, 0, stream>>>(
-            indptr, index, data, out_sum, out_count, out_sqsum, cats, mask,
-            n_cells, n_genes);
-        CUDA_CHECK_LAST_ERROR(csr_aggr_kernel);
+        return false;
     }
+    RmmScratchPool pool;
+    const GroupedRows groups =
+        build_grouped_rows(pool, cats, mask, (int)n_cells, n_groups, stream);
+    AggrOp<T, MASK> op{data, out_sum, out_count, out_sqsum, n_genes, 0};
+    return minor_reduce<IdxT>(indptr, index, op, (int)n_cells, (int)n_genes,
+                              nnz, assume_unsorted, stream, &groups);
 }
 
 template <typename T, int MASK>
@@ -124,23 +126,43 @@ void def_sparse_aggr(nb::module_& m) {
            std::optional<gpu_array_c<double, Device>> out_sqsum,
            gpu_array_c<const int, Device> cats,
            gpu_array_c<const bool, Device> mask, size_t n_cells, size_t n_genes,
-           bool is_csc, std::uintptr_t stream) {
+           bool is_csc, bool assume_unsorted, std::uintptr_t stream) {
             double* ps = out_sum ? out_sum->data() : nullptr;
             double* pc = out_count ? out_count->data() : nullptr;
             double* pq = out_sqsum ? out_sqsum->data() : nullptr;
             int active = (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) |
                          (pq ? AGGR_SQSUM : 0);
+            // Every provided plane must be (n_groups, n_genes); n_groups is
+            // read off shape(0), so a flattened plane would over-size the
+            // memsets and the grouping.
+            int n_groups = 0;
+            for (const auto* plane : {&out_sum, &out_count, &out_sqsum}) {
+                if (!*plane) continue;
+                require_arg(
+                    (*plane)->ndim() == 2 && (*plane)->shape(1) == n_genes,
+                    "sparse_aggr: outputs must be (n_groups, n_genes)");
+                const int g = (int)(*plane)->shape(0);
+                require_arg(n_groups == 0 || g == n_groups,
+                            "sparse_aggr: outputs must have the same shape");
+                n_groups = g;
+            }
+            require_csr_arrays("sparse_aggr", indptr, index, data);
+            require_arg(cats.shape(0) == n_cells && mask.shape(0) == n_cells,
+                        "sparse_aggr: cats and mask must have n_cells entries");
+            bool unsorted = false;
 #define LAUNCH(M)                                                     \
-    launch_sparse_aggr<T, IdxT, M>(                                   \
+    unsorted = launch_sparse_aggr<T, IdxT, M>(                        \
         is_csc, indptr.data(), index.data(), data.data(), ps, pc, pq, \
-        cats.data(), mask.data(), n_cells, n_genes, (cudaStream_t)stream)
+        cats.data(), mask.data(), n_cells, n_genes, n_groups,         \
+        (long long)data.shape(0), assume_unsorted, (cudaStream_t)stream)
             AGGR_DISPATCH_MASK(active, LAUNCH);
 #undef LAUNCH
+            return unsorted;
         },
         "indptr"_a, "index"_a, "data"_a, nb::kw_only(),
         "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
         "out_sqsum"_a = nb::none(), "cats"_a, "mask"_a, "n_cells"_a,
-        "n_genes"_a, "is_csc"_a, "stream"_a = 0);
+        "n_genes"_a, "is_csc"_a, "assume_unsorted"_a = false, "stream"_a = 0);
 }
 
 template <typename T, typename DataContig, typename Device>
@@ -237,4 +259,5 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_aggr_cuda, m) {
     REGISTER_GPU_BINDINGS(register_bindings, m);
+    register_scratch_allocator(m);
 }
