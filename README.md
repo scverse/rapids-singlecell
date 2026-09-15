@@ -17,6 +17,22 @@ Computations use CuPy and NVIDIA RAPIDS for performance on large datasets.
 - **GPU acceleration**: Common single-cell workflows on `AnnData` run on the GPU.
 - **Ecosystem compatibility**: Works with Scanpy APIs; includes pieces from Squidpy, decoupler, and pertpy.
 - **Simple installation**: Available via Conda and PyPI.
+- **Version-matched agent skill**: Released pip packages include an analysis skill for Codex, Claude, and other agents.
+
+## Agent skill
+
+Released packages include the matching model-neutral analysis skill:
+
+```bash
+rapids-singlecell-install-skills --agent codex
+rapids-singlecell-install-skills --agent claude
+rapids-singlecell-install-skills --agent claude-science  # or: --agent agents
+rapids-singlecell-check-kernel                    # before starting Jupyter
+```
+
+Use `--dest /path/to/skills/rapids-singlecell` for another agent. See the
+[installation guide](https://rapids-singlecell.readthedocs.io/en/latest/installation.html#agent-skill)
+for installation and preflight details.
 
 ## Documentation
 
