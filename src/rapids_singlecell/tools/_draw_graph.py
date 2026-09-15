@@ -33,7 +33,8 @@ def draw_graph(
     max_iter: int = 500,
     rng: SeedLike | RNGLike | None = None,
     key_added: str | Default | None = Default(("draw_graph", "key_added")),
-) -> None:
+    copy: bool = False,
+) -> AnnData | None:
     """
     Force-directed graph drawing :cite:p:`Fruchterman1991,Jacomy2014`.
 
@@ -64,6 +65,8 @@ def draw_graph(
             The superseded `random_state` argument is still accepted.
         key_added
             Template controlling where coordinates and parameters are stored.
+        copy
+            Return an annotated copy instead of updating `adata`.
 
     Returns
     -------
@@ -72,6 +75,7 @@ def draw_graph(
             X_draw_graph_layout_fa : `adata.obsm`
                 Coordinates of graph layout.
     """
+    adata = adata.copy() if copy else adata
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
@@ -132,3 +136,4 @@ def draw_graph(
     keys = _embedding_keys("draw_graph", key_added, layout=layout)
     adata.uns[keys.uns] = {"params": {"layout": layout, **meta_random_state}}
     adata.obsm[keys.obsm] = positions.get()  # Format output
+    return adata if copy else None

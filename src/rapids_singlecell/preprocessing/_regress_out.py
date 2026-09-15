@@ -26,7 +26,8 @@ def regress_out(
     inplace: bool = True,
     batchsize: int | Literal["all"] | None = None,
     verbose: bool = False,
-) -> Union[cp.ndarray, None]:  # noqa: UP007
+    copy: bool = False,
+) -> Union[cp.ndarray, AnnData, None]:  # noqa: UP007
     """
     Use linear regression to adjust for the effects of unwanted noise
     and variation.
@@ -54,6 +55,8 @@ def regress_out(
 
         verbose
             Print debugging information
+        copy
+            Return a corrected AnnData copy when `inplace=True`.
 
     Returns
     -------
@@ -64,6 +67,7 @@ def regress_out(
         raise ValueError("batchsize must be `int`, `None` or `'all'`")
 
     if isinstance(adata, AnnData):
+        adata = adata.copy() if copy and inplace else adata
         view_to_actual(adata)
 
     X = _get_obs_rep(adata, layer=layer)
@@ -99,6 +103,7 @@ def regress_out(
 
     if inplace:
         _set_obs_rep(adata, X, layer=layer)
+        return adata if copy else None
     else:
         return X
 
