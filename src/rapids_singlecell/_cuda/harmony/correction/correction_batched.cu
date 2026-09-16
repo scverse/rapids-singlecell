@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
+#include <nanobind/stl/optional.h>
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -17,6 +19,8 @@ constexpr int WARP_SIZE = 32;
 constexpr int MAX_BLOCK_DIM = 256;
 constexpr int BLOCK_DIM_1D = 256;
 constexpr int MULTI_RHS_BLOCK_DIM = 256;
+constexpr int MAX_JOINT_PARTS = 32;
+constexpr int JOINT_ROWS_PER_PART = 1024;
 
 template <typename T>
 static void prepare_multi_impl(
@@ -27,7 +31,8 @@ static void prepare_multi_impl(
     const uint8_t* active, int n_cells, int n_pcs, int n_clusters,
     int n_batches, int n_covariates, int n_joint_categories,
     // workspace/output
-    T* gram, T* rhs, T* joint_O, T* joint_rhs, cudaStream_t stream,
+    T* gram, T* rhs, T* joint_O, T* joint_rhs, T* joint_rhs_partials,
+    const int* joint_tile_offsets, size_t max_tiles, cudaStream_t stream,
     cublasHandle_t handle) {
     if (n_covariates < 2)
         throw std::invalid_argument(
@@ -43,11 +48,30 @@ static void prepare_multi_impl(
     cudaMemsetAsync(rhs, 0, rhs_elements * sizeof(T), stream);
 
     if (n_cells > 0 && n_clusters > 0) {
-        size_t work = (size_t)n_cells * n_clusters;
+        // Reuse joint_rhs before its values are computed. At most D partials
+        // per (joint, cluster) fit in that existing J-by-K-by-D buffer.
+        long long target_rows =
+            std::max(1LL, (long long)n_joint_categories * JOINT_ROWS_PER_PART);
+        int n_parts =
+            std::min(std::min(MAX_JOINT_PARTS, std::max(1, n_pcs)),
+                     (int)std::max(1LL, ((long long)n_cells + target_rows - 1) /
+                                            target_rows));
+        size_t blocks =
+            (size_t)n_joint_categories * ((n_clusters + 31) / 32) * n_parts;
+        T* partial = n_parts == 1 ? joint_O : joint_rhs;
         joint_observed_kernel<T>
-            <<<strided_grid((long long)work, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-               stream>>>(R, joint_codes, joint_O, n_cells, n_clusters);
+            <<<strided_grid((long long)blocks * BLOCK_DIM_1D, BLOCK_DIM_1D),
+               BLOCK_DIM_1D, 0, stream>>>(R, joint_offsets, joint_cell_indices,
+                                          partial, n_clusters,
+                                          n_joint_categories, n_parts);
         CUDA_CHECK_LAST_ERROR(joint_observed_kernel);
+        if (n_parts > 1) {
+            finish_joint_observed_kernel<T>
+                <<<strided_grid((long long)joint_elements, BLOCK_DIM_1D),
+                   BLOCK_DIM_1D, 0, stream>>>(partial, joint_O, joint_elements,
+                                              n_parts);
+            CUDA_CHECK_LAST_ERROR(finish_joint_observed_kernel);
+        }
     }
 
     if (n_clusters > 0) {
@@ -59,20 +83,24 @@ static void prepare_multi_impl(
     }
 
     if (joint_elements > 0) {
-        dim3 grid(strided_grid((long long)joint_elements, BLOCK_DIM_1D));
+        dim3 grid(
+            strided_grid((long long)n_batches * n_clusters, BLOCK_DIM_1D));
         dim3 block(BLOCK_DIM_1D);
         if (n_covariates == 2) {
             add_joint_cross_kernel<T, 2><<<grid, block, 0, stream>>>(
-                joint_O, joint_cats, active, gram, n_joint_categories,
-                n_covariates, n_batches, n_clusters);
+                joint_O, joint_cats, marginal_joint_offsets,
+                marginal_joint_indices, active, gram, n_covariates, n_batches,
+                n_clusters);
         } else if (n_covariates == 3) {
             add_joint_cross_kernel<T, 3><<<grid, block, 0, stream>>>(
-                joint_O, joint_cats, active, gram, n_joint_categories,
-                n_covariates, n_batches, n_clusters);
+                joint_O, joint_cats, marginal_joint_offsets,
+                marginal_joint_indices, active, gram, n_covariates, n_batches,
+                n_clusters);
         } else {
             add_joint_cross_kernel<T, 0><<<grid, block, 0, stream>>>(
-                joint_O, joint_cats, active, gram, n_joint_categories,
-                n_covariates, n_batches, n_clusters);
+                joint_O, joint_cats, marginal_joint_offsets,
+                marginal_joint_indices, active, gram, n_covariates, n_batches,
+                n_clusters);
         }
         CUDA_CHECK_LAST_ERROR(add_joint_cross_kernel);
     }
@@ -91,18 +119,40 @@ static void prepare_multi_impl(
 
     // Compute each observed joint row once, then deterministically gather the
     // much smaller joint result into all marginal category rows.
-    int pc_pairs = (n_pcs + 1) / 2;
-    size_t joint_rhs_blocks =
-        (size_t)n_joint_categories * n_clusters * pc_pairs;
-    if (joint_rhs_blocks > 0) {
-        if (joint_rhs_blocks > (size_t)max_grid_dim_x())
-            throw std::invalid_argument(
-                "prepare_multi joint RHS grid exceeds the CUDA grid-x limit");
-        segmented_joint_rhs_kernel<T><<<(unsigned int)joint_rhs_blocks,
-                                        MULTI_RHS_BLOCK_DIM, 0, stream>>>(
-            X, R, joint_offsets, joint_cell_indices, joint_cats, active,
-            joint_rhs, n_pcs, n_clusters, n_joint_categories, n_covariates);
-        CUDA_CHECK_LAST_ERROR(segmented_joint_rhs_kernel);
+    size_t joint_rhs_elements = joint_elements * n_pcs;
+    if (joint_rhs_elements > 0) {
+        if (joint_rhs_partials != nullptr) {
+            size_t blocks =
+                max_tiles *
+                ((n_clusters + JOINT_RHS_CLUSTER_LANES - 1) /
+                 JOINT_RHS_CLUSTER_LANES) *
+                ((n_pcs + JOINT_RHS_PC_LANES - 1) / JOINT_RHS_PC_LANES);
+            joint_rhs_partials_kernel<T>
+                <<<strided_grid((long long)blocks, 1),
+                   dim3(JOINT_RHS_PC_LANES, JOINT_RHS_ROW_LANES), 0, stream>>>(
+                    X, R, joint_offsets, joint_cell_indices, joint_cats, active,
+                    joint_tile_offsets, joint_rhs_partials, n_pcs, n_clusters,
+                    n_joint_categories, n_covariates, max_tiles);
+            CUDA_CHECK_LAST_ERROR(joint_rhs_partials_kernel);
+            finish_joint_rhs_kernel<T>
+                <<<strided_grid((long long)joint_rhs_elements, BLOCK_DIM_1D),
+                   BLOCK_DIM_1D, 0, stream>>>(
+                    joint_rhs_partials, joint_tile_offsets, joint_rhs, n_pcs,
+                    n_clusters, joint_rhs_elements);
+            CUDA_CHECK_LAST_ERROR(finish_joint_rhs_kernel);
+        } else {
+            size_t blocks = joint_elements * ((n_pcs + 1) / 2);
+            if (blocks > (size_t)max_grid_dim_x())
+                throw std::invalid_argument(
+                    "prepare_multi joint RHS grid exceeds the CUDA grid-x "
+                    "limit");
+            segmented_joint_rhs_kernel<T>
+                <<<(unsigned int)blocks, MULTI_RHS_BLOCK_DIM, 0, stream>>>(
+                    X, R, joint_offsets, joint_cell_indices, joint_cats, active,
+                    joint_rhs, n_pcs, n_clusters, n_joint_categories,
+                    n_covariates);
+            CUDA_CHECK_LAST_ERROR(segmented_joint_rhs_kernel);
+        }
     }
 
     size_t marginal_rhs_elements = (size_t)n_batches * n_clusters * n_pcs;
@@ -329,8 +379,23 @@ static void register_correction_batched(nb::module_& m) {
            int n_clusters, int n_batches, int n_covariates,
            int n_joint_categories, gpu_array_c<T, Device> gram,
            gpu_array_c<T, Device> rhs, gpu_array_c<T, Device> joint_O,
-           gpu_array_c<T, Device> joint_rhs, std::uintptr_t stream,
-           std::uintptr_t handle) {
+           gpu_array_c<T, Device> joint_rhs,
+           std::optional<gpu_array_c<T, Device>> joint_rhs_partials,
+           std::optional<gpu_array_c<const int, Device>> joint_tile_offsets,
+           std::uintptr_t stream, std::uintptr_t handle) {
+            if (joint_rhs_partials.has_value() !=
+                joint_tile_offsets.has_value())
+                throw std::invalid_argument(
+                    "prepare_multi requires both joint RHS scratch arrays");
+            if (joint_rhs_partials &&
+                (joint_rhs_partials->ndim() != 3 ||
+                 joint_rhs_partials->shape(1) != (size_t)n_clusters ||
+                 joint_rhs_partials->shape(2) != (size_t)n_pcs ||
+                 joint_tile_offsets->ndim() != 1 ||
+                 joint_tile_offsets->shape(0) !=
+                     (size_t)n_joint_categories + 1))
+                throw std::invalid_argument(
+                    "prepare_multi joint RHS scratch shape mismatch");
             prepare_multi_impl<T>(
                 X.data(), R.data(), O.data(), joint_codes.data(),
                 joint_cats.data(), joint_offsets.data(),
@@ -338,14 +403,19 @@ static void register_correction_batched(nb::module_& m) {
                 marginal_joint_indices.data(), lambda_kb.data(), active.data(),
                 n_cells, n_pcs, n_clusters, n_batches, n_covariates,
                 n_joint_categories, gram.data(), rhs.data(), joint_O.data(),
-                joint_rhs.data(), (cudaStream_t)stream, (cublasHandle_t)handle);
+                joint_rhs.data(),
+                joint_rhs_partials ? joint_rhs_partials->data() : nullptr,
+                joint_tile_offsets ? joint_tile_offsets->data() : nullptr,
+                joint_rhs_partials ? joint_rhs_partials->shape(0) : 0,
+                (cudaStream_t)stream, (cublasHandle_t)handle);
         },
         "X"_a, nb::kw_only(), "R"_a, "O"_a, "joint_codes"_a, "joint_cats"_a,
         "joint_offsets"_a, "joint_cell_indices"_a, "marginal_joint_offsets"_a,
         "marginal_joint_indices"_a, "lambda_kb"_a, "active_mask"_a, "n_cells"_a,
         "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a,
         "n_joint_categories"_a, "gram"_a, "rhs"_a, "joint_O"_a, "joint_rhs"_a,
-        "stream"_a = 0, "handle"_a);
+        "joint_rhs_partials"_a = nb::none(),
+        "joint_tile_offsets"_a = nb::none(), "stream"_a = 0, "handle"_a);
 
     m.def(
         "apply_multi",
@@ -372,5 +442,6 @@ void register_bindings(nb::module_& m) {
 }
 
 NB_MODULE(_harmony_correction_batched_cuda, m) {
+    m.attr("JOINT_RHS_TILE_ROWS") = nb::int_(JOINT_RHS_TILE_ROWS);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }
