@@ -12,7 +12,7 @@
 
 rapids-singlecell provides GPU-accelerated single-cell analysis with an AnnData-first API.
 It is largely compatible with Scanpy and includes selected functionality from Squidpy, decoupler, and pertpy.
-Computations use CuPy and NVIDIA RAPIDS for performance on large datasets.
+Computations use CuPy and NVIDIA CUDA-X Data Science (formerly RAPIDS) for performance on large datasets.
 
 - **GPU acceleration**: Common single-cell workflows on `AnnData` run on the GPU.
 - **Ecosystem compatibility**: Works with Scanpy APIs; includes pieces from Squidpy, decoupler, and pertpy.

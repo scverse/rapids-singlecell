@@ -1,13 +1,15 @@
 # Memory Management
 
-In rapids-singlecell, efficient memory management is crucial for handling large-scale datasets.
-This is facilitated by the integration of the RAPIDS Memory Manager ({mod}`rmm`). {mod}`rmm` is automatically invoked upon importing `rapids-singlecell`, modifying the default allocator for cupy.
-Integrating {mod}`rmm` with `rapids-singlecell` slightly modifies the execution speed of {mod}`cupy`. This change typically results in a minimal performance trade-off.
-However, it's crucial to be aware that certain specific functions, like {func}`~.pp.harmony_integrate`, might experience a more significant impact on performance efficiency due to this integration.
-Users can overwrite the default behavior with {func}`rmm.reinitialize`.
+rapids-singlecell uses NVIDIA RMM ({mod}`rmm`) for GPU memory allocation.
+Importing `rapids_singlecell` loads cuML, which configures {mod}`cupy` to use RMM.
+This selects the allocator but does not enable a memory pool or managed memory.
+Use {func}`rmm.reinitialize` to configure these memory policies.
 Configure RMM before creating GPU arrays; reinitializing while earlier RMM
 allocations are still alive results in undefined behavior.
 The `devices` argument configures RMM memory resources; it does not restrict which GPUs a CUDA process can access.
+It defaults to logical device `0`. The examples below explicitly configure the
+current device; for an operation using several GPUs, pass all intended logical
+device IDs, such as `devices=[0, 1]`.
 See {doc}`gpu_configuration` for device selection and isolation.
 
 ## Quick start
@@ -21,7 +23,8 @@ RMM also supports a pool backed by managed memory. This can reduce allocation
 overhead while retaining oversubscription, but it requires deliberate
 `initial_pool_size` and `maximum_pool_size` values. In particular, the maximum
 must be large enough to grow beyond VRAM if oversubscription is required.
-Managed memory remains incompatible with NVLink.
+For Dask-CUDA clusters, managed memory cannot be combined with the NVLink
+transport option; see the [Dask-CUDA API](https://docs.nvidia.com/dask-cuda/latest/api/).
 
 ## Managed Memory
 
@@ -30,13 +33,22 @@ Managed memory remains incompatible with NVLink.
 - Trade-off: slower than fully-in-VRAM; slowdown grows with how much you spill.
 - Good for: very large datasets that otherwise OOM; exploratory or batch runs where correctness matters more than peak speed.
 
+Oversubscription requires CUDA support for concurrent managed access and enough
+host RAM. Systems with limited unified memory support, including Windows and
+WSL, cannot oversubscribe GPU memory; see the
+[CUDA unified memory guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#limited-unified-memory-support).
+
 ```python
 # Enable `managed_memory`
 import rmm
 import cupy as cp
 from rmm.allocators.cupy import rmm_cupy_allocator
 
-rmm.reinitialize(managed_memory=True, pool_allocator=False)
+rmm.reinitialize(
+    managed_memory=True,
+    pool_allocator=False,
+    devices=cp.cuda.Device().id,
+)
 cp.cuda.set_allocator(rmm_cupy_allocator)
 ```
 
@@ -56,6 +68,7 @@ from rmm.allocators.cupy import rmm_cupy_allocator
 rmm.reinitialize(
     managed_memory=False,
     pool_allocator=True,
+    devices=cp.cuda.Device().id,
 )
 cp.cuda.set_allocator(rmm_cupy_allocator)
 ```
@@ -73,7 +86,7 @@ To achieve optimal memory management in rapids-singlecell, consider the followin
 - Very slow runtime with managed memory → reduce oversubscription or switch back to [Pool Allocator](#pool-allocator) if VRAM allows.
 
 ## Further Reading
-For a more in-depth understanding of rmm and its functionalities, refer to the [RAPIDS Memory Manager documentation](https://docs.rapids.ai/api/rmm/stable/python/).
+For a more in-depth understanding of rmm and its functionalities, refer to the [NVIDIA RMM documentation](https://docs.rapids.ai/api/rmm/stable/python/).
 
 
 ## System requirements and limits
