@@ -7,6 +7,7 @@ from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
 from rapids_singlecell._settings import settings
+from rapids_singlecell._utils._sparse_rows import _minor_reduce
 
 from . import pca
 
@@ -67,21 +68,44 @@ def _choose_representation(adata, use_rep=None, n_pcs=None):
     return X
 
 
-def _nan_mean_minor_dask_sparse(X, major, minor, *, mask=None, n_features=None):
+def _nan_mean_minor_sums(X, mean, nans, mask):
+    """
+    Accumulate the minor-axis NaN-aware sums and NaN counts of a compressed matrix.
+
+    Parameters
+    ----------
+    X
+        CSR or CSC matrix
+    mean
+        Zero-initialised float64 output for the sums
+    nans
+        Zero-initialised int32 output for the NaN counts
+    mask
+        Boolean mask over the minor axis
+    """
     from rapids_singlecell._cuda import _nanmean_cuda as _nm
 
+    _minor_reduce(
+        X,
+        _nm.nan_mean_minor_tiled,
+        X.indptr,
+        X.indices,
+        X.data,
+        means=mean,
+        nans=nans,
+        mask=mask,
+        major=X.indptr.size - 1,
+        minor=mean.size,
+        nnz=X.nnz,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+
+
+def _nan_mean_minor_dask_sparse(X, major, minor, *, mask=None, n_features=None):
     def __nan_mean_minor(X_part):
         mean = cp.zeros(minor, dtype=cp.float64)
         nans = cp.zeros(minor, dtype=cp.int32)
-        _nm.nan_mean_minor(
-            X_part.indices,
-            X_part.data,
-            means=mean,
-            nans=nans,
-            mask=mask,
-            nnz=X_part.nnz,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
+        _nan_mean_minor_sums(X_part, mean, nans, mask)
         return cp.vstack([mean, nans.astype(cp.float64)])[None, ...]
 
     n_blocks = X.blocks.size
@@ -156,19 +180,9 @@ def _nan_mean_dense_dask(X, axis, *, mask, n_features):
 
 
 def _nan_mean_minor(X, major, minor, *, mask=None, n_features=None):
-    from rapids_singlecell._cuda import _nanmean_cuda as _nm
-
     mean = cp.zeros(minor, dtype=cp.float64)
     nans = cp.zeros(minor, dtype=cp.int32)
-    _nm.nan_mean_minor(
-        X.indices,
-        X.data,
-        means=mean,
-        nans=nans,
-        mask=mask,
-        nnz=X.nnz,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
+    _nan_mean_minor_sums(X, mean, nans, mask)
     mean /= n_features - nans
     return mean
 
