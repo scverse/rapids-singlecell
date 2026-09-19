@@ -16,10 +16,8 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    :toctree: generated/
 
    pp.calculate_qc_metrics
-   pp.flag_gene_family
    pp.filter_cells
    pp.filter_genes
-   pp.filter_highly_variable
    pp.normalize_total
    pp.log1p
    pp.sqrt
@@ -98,7 +96,6 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 
     tl.louvain
     tl.leiden
-    tl.kmeans
 ```
 
 ### Gene scores, Cell cycle
