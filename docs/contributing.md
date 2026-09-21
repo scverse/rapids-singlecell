@@ -4,7 +4,7 @@
 
 ### Prerequisites
 
-- NVIDIA GPU with CUDA support and Python 3.12–3.14
+- NVIDIA GPU with CUDA support
 - [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
 - A CUDA-X Data Science environment (e.g., conda `rapids-26.08` or pip-installed CUDA-X Data Science)
 - CUDA toolkit for building from source
@@ -21,10 +21,8 @@ the `cub/` headers come from the toolkit's own bundled CCCL, so nothing links
 ```bash
 git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
 cd rapids-singlecell
-uv pip install -e ".[test]"
+[uv] pip install -e ".[test]"
 ```
-
-Use `pip install -e ".[test]"` if you do not use uv.
 
 The documentation notebooks live in a Git submodule. If the repository was
 already cloned without `--recurse-submodules`, initialize them with
@@ -138,7 +136,7 @@ Template the binding registration function on `Device` and use `REGISTER_GPU_BIN
    ]
    ```
    This registers the module for lazy loading — imports return `None` when the compiled extension is absent (e.g., docs builds without a GPU). Errors loading an installed extension are propagated.
-6. Rebuild: `uv pip install -e .`
+6. Rebuild: `[uv] pip install -e .`
 
 The `add_nb_cuda_module` helper automatically handles:
 - Stable ABI + LTO compilation
@@ -185,16 +183,14 @@ To run the test suite against a specific matrix combination:
 
 ```bash
 # Run stable tests with CUDA 13
-uvx hatch run hatch-test.stable-13:run
+[uvx] hatch run hatch-test.stable-13:run
 
 # Run stable tests with CUDA 12
-uvx hatch run hatch-test.stable-12:run
+[uvx] hatch run hatch-test.stable-12:run
 
 # Run dev tests (upstream anndata/scanpy) with CUDA 13
-uvx hatch run hatch-test.dev-13:run
+[uvx] hatch run hatch-test.dev-13:run
 ```
-
-If Hatch is already installed, use `hatch` in place of `uvx hatch`.
 
 ### Running individual tests
 
@@ -202,10 +198,10 @@ For quick iteration during development, you can pass specific test paths:
 
 ```bash
 # Run a specific test file
-uvx hatch run hatch-test.stable-13:run tests/path/to/test.py -v
+[uvx] hatch run hatch-test.stable-13:run tests/path/to/test.py -v
 
 # Run a specific test
-uvx hatch run hatch-test.stable-13:run tests/path/to/test.py::test_name -v
+[uvx] hatch run hatch-test.stable-13:run tests/path/to/test.py::test_name -v
 ```
 
 ```{important}
@@ -222,13 +218,13 @@ Tests have a default 60-second per-test timeout configured in `pyproject.toml`.
 ## Building documentation
 
 ```bash
-uvx hatch run docs:build
+[uvx] hatch run docs:build
 ```
 
 To build without compiling CUDA extensions (e.g., on a machine without a GPU):
 
 ```bash
-CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" uvx hatch run docs:build
+CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" [uvx] hatch run docs:build
 ```
 
 The built docs are in `docs/_build/html/`.

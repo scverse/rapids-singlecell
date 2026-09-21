@@ -64,12 +64,12 @@ Install the wheel matching your CUDA version:
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-pip install rapids-singlecell-cu13
+[uv] pip install rapids-singlecell-cu13
 ```
 ````
 ````{tab-item} CUDA 12
 ```bash
-pip install rapids-singlecell-cu12
+[uv] pip install rapids-singlecell-cu12
 ```
 ````
 `````
@@ -91,18 +91,17 @@ first used.
 ### Prebuilt wheels with CUDA-X Data Science dependencies
 
 To also install the CUDA-X Data Science stack via pip, use the `rapids` extra.
-The dependency extras retain their `rapids` names for compatibility.
 This requires the `--extra-index-url` flag for the NVIDIA PyPI index:
 
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-pip install 'rapids-singlecell-cu13[rapids]' --extra-index-url=https://pypi.nvidia.com
+[uv] pip install 'rapids-singlecell-cu13[rapids]' --extra-index-url=https://pypi.nvidia.com
 ```
 ````
 ````{tab-item} CUDA 12
 ```bash
-pip install 'rapids-singlecell-cu12[rapids]' --extra-index-url=https://pypi.nvidia.com
+[uv] pip install 'rapids-singlecell-cu12[rapids]' --extra-index-url=https://pypi.nvidia.com
 ```
 ````
 `````
@@ -113,14 +112,14 @@ The `rapids-singlecell` package on PyPI contains the source distribution.
 Building from source requires a CUDA toolkit and a C++ compiler:
 
 ```bash
-pip install rapids-singlecell
+[uv] pip install rapids-singlecell
 ```
 
 The CUDA kernels will be compiled during installation for your local GPU architecture.
 You can select CUDA-X Data Science dependencies with the `rapids-cu12` or `rapids-cu13` extras:
 
 ```bash
-pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
+[uv] pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
 ```
 
 ```{note}
@@ -136,13 +135,13 @@ on both CUDA 12 and CUDA 13 without `--no-build-isolation`.
 To install the latest development version directly from GitHub:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+[uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 ```
 
 Or from a specific branch or tag:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
+[uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
 ```
 
 This compiles the CUDA kernels during installation. By default, kernels are compiled for your local GPU architecture only (`native`).
@@ -150,10 +149,10 @@ To compile for different or multiple architectures, pass the CUDA architectures 
 
 ```bash
 # Compile for a specific architecture (e.g., Ampere)
-CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real" [uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 
 # Compile for multiple architectures
-CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real;86-real;89-real;90-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real;86-real;89-real;90-real" [uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 ```
 
 Common architecture codes:
