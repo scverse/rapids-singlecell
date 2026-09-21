@@ -15,15 +15,14 @@ For more information, see the tutorials and API documentation.
 
 ### Settings
 
-Function defaults follow Scanpy 1. Set {attr}`rsc.settings.preset <rapids_singlecell.settings.preset>` to {attr}`~rapids_singlecell.Preset.ScanpyV2Preview` to opt into the Scanpy 2 preview defaults, either globally or temporarily:
+Function defaults follow Scanpy 1. Use {meth}`rsc.settings.override <rapids_singlecell.settings.override>` to temporarily opt into the Scanpy 2 preview defaults:
 
 ```python
-rsc.settings.preset = "scanpy-v2-preview"
-
 with rsc.settings.override(preset="scanpy-v2-preview"):
     rsc.pp.pca(adata)  # writes to `adata.obsm["pca"]`
 ```
 
+To enable the preview globally, set {attr}`rsc.settings.preset <rapids_singlecell.settings.preset>` to `"scanpy-v2-preview"`.
 See {ref}`settings` for the full list of presets and what they change.
 
 ### AnnData setup
@@ -52,6 +51,7 @@ The preprocessing can be handled by the functions in {mod}`~.pp`. They offer acc
 Example:
 
 ```python
+rsc.get.anndata_to_GPU(adata, layer="counts")
 rsc.pp.highly_variable_genes(
     adata,
     n_top_genes=5000,
@@ -78,12 +78,15 @@ sc.pl.tsne(adata, color="leiden")
 
 ### Decoupler-GPU
 
-`dcg` offers accelerated drop-in replacements for {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ulm`, and {func}`~rapids_singlecell.dcg.aucell`:
+`dcg` accelerates decoupler methods including {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ulm`, and {func}`~rapids_singlecell.dcg.aucell`:
 
 ```python
 import decoupler as dc
 
 model = dc.op.resource("PanglaoDB", organism="human")
+model = model.loc[model["human"] & model["canonical_marker"]]
+model = model.rename(columns={"cell_type": "source", "genesymbol": "target"})
+model = model[["source", "target"]].drop_duplicates()
 rsc.dcg.ulm(adata, model, tmin=3)
 acts_ulm = dc.pp.get_obsm(adata, key="score_ulm")
 sc.pl.umap(acts_ulm, color=["NK cells"], cmap="coolwarm", vcenter=0)
