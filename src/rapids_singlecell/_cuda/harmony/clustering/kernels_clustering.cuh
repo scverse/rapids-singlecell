@@ -139,7 +139,8 @@ __global__ void objective_rows_kernel(const T* R, const T* similarities,
         diversity +=
             sigma * theta[i / n_cols] * O[i] * log(numerator / (E[i] + T(1)));
     }
-    T total = objective_block_sum(distance + sigma * entropy + diversity, false);
+    T total =
+        objective_block_sum(distance + sigma * entropy + diversity, false);
     if (threadIdx.x == 0) partial[row] = total;
 }
 
