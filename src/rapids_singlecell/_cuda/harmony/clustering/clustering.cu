@@ -508,6 +508,9 @@ static void register_compute_objective(nb::module_& m) {
            gpu_array_c<T, Device> obj_scalar, int n_cells, int n_clusters,
            int n_batches, bool stabilized,
            gpu_array_c<T, Device> objective_partials, std::uintptr_t stream) {
+            if (objective_partials.size() < (size_t)n_cells)
+                throw std::invalid_argument(
+                    "objective_partials must hold at least n_cells elements");
             return compute_objective<T>(
                 R.data(), similarities.data(), O.data(), E.data(), theta.data(),
                 static_cast<T>(sigma), obj_scalar.data(),
@@ -529,7 +532,11 @@ static void register_kmeans_selection(nb::module_& m) {
            gpu_array_c<int, Device> n_draws, int cluster,
            std::uintptr_t stream) {
             int n_rows = (int)X.shape(0), n_cols = (int)X.shape(1);
-            int n_tiles = (int)totals.size();
+            int n_tiles = n_rows / KMEANS_WEIGHT_TILE_ROWS +
+                          (n_rows % KMEANS_WEIGHT_TILE_ROWS != 0);
+            if (totals.size() < (size_t)n_tiles)
+                throw std::invalid_argument(
+                    "k-means totals workspace is too small");
             auto cuda_stream = (cudaStream_t)stream;
             kmeans_weight_tiles_kernel<T>
                 <<<n_tiles, KMEANS_WEIGHT_THREADS, 0, cuda_stream>>>(
@@ -561,19 +568,18 @@ static void register_scatter(nb::module_& m) {
                 throw std::invalid_argument(
                     "grouped scatter requires both category_offsets and "
                     "cell_indices");
+            size_t required_bytes =
+                scatter_temp_bytes(n_rows, n_cols, n_categories, n_covariates,
+                                   sizeof(T), category_offsets.has_value());
+            if (workspace.size() < required_bytes)
+                throw std::invalid_argument("scatter workspace is too small");
             if (category_offsets) {
-                size_t required_bytes =
-                    scatter_temp_bytes(n_rows, n_cols, n_categories,
-                                       n_covariates, sizeof(T), true);
                 if (category_offsets->ndim() != 1 ||
                     category_offsets->size() != (size_t)n_categories + 1 ||
                     cell_indices->ndim() != 1 ||
                     cell_indices->size() != (size_t)n_rows)
                     throw std::invalid_argument(
                         "grouped scatter CSR arrays have incorrect shapes");
-                if (workspace.size() < required_bytes)
-                    throw std::invalid_argument(
-                        "grouped scatter workspace is too small");
                 int* tiles = reinterpret_cast<int*>(workspace.data());
                 T* partial = reinterpret_cast<T*>(
                     workspace.data() + scatter_grouped_int_bytes(n_categories));
@@ -624,5 +630,6 @@ void register_bindings(nb::module_& m) {
 }
 
 NB_MODULE(_harmony_clustering_cuda, m) {
+    m.attr("KMEANS_WEIGHT_TILE_ROWS") = nb::int_(KMEANS_WEIGHT_TILE_ROWS);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

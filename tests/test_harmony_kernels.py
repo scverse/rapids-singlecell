@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import cupy as cp
 import numpy as np
 import pytest
@@ -358,8 +360,9 @@ def test_colsum_columns_multiple_cols_per_block(dtype, rows):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("switcher", [0, 1])
 @pytest.mark.parametrize("n_covariates,grouped", [(1, False), (1, True), (4, False)])
-def test_scatter_add(dtype, switcher, n_covariates, grouped):
-    n_rows, n_cols, n_categories = 2305, 17, 13
+@pytest.mark.parametrize("n_rows,n_categories", [(2305, 13), (2049, 9000)])
+def test_scatter_add(dtype, switcher, n_covariates, grouped, *, n_rows, n_categories):
+    n_cols = 17
     rng = np.random.default_rng(734)
     values_host = rng.normal(size=(n_rows, n_cols)).astype(dtype)
     categories_host = np.arange(n_rows * n_covariates, dtype=np.int32).reshape(
@@ -391,7 +394,8 @@ def test_scatter_add(dtype, switcher, n_covariates, grouped):
     outputs = []
     for _ in range(2):
         out = cp.zeros((n_categories, n_cols), dtype=dtype)
-        _cl.scatter_add(
+        scatter_add = partial(
+            _cl.scatter_add,
             values,
             categories=categories,
             category_offsets=category_offsets,
@@ -404,11 +408,37 @@ def test_scatter_add(dtype, switcher, n_covariates, grouped):
             n_covariates=n_covariates,
             switcher=switcher,
         )
+        scatter_add()
         outputs.append(out.copy())
+    with pytest.raises(ValueError, match="scatter workspace is too small"):
+        scatter_add(workspace=workspace[:-1])
     assert outputs[0].get().tobytes() == outputs[1].get().tobytes()
     atol = 2e-4 if dtype == np.float32 else 1e-10
     cp.testing.assert_allclose(outputs[0], cp.asarray(expected), rtol=1e-5, atol=atol)
     assert not cp.any(outputs[0][-1])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_select_kmeans_center_totals_workspace(dtype):
+    n_rows = _cl.KMEANS_WEIGHT_TILE_ROWS + 1
+    X = cp.arange(n_rows * 2, dtype=dtype).reshape(n_rows, 2)
+    weights = cp.zeros(n_rows, dtype=dtype)
+    weights[-1] = 1
+    centers = cp.empty((1, 2), dtype=dtype)
+    totals = cp.empty(2, dtype=cp.float64)
+    n_draws = cp.zeros(1, dtype=cp.int32)
+    kwargs = {
+        "weights": weights,
+        "uniforms": cp.asarray([0.5], dtype=cp.float64),
+        "centers": centers,
+        "n_draws": n_draws,
+        "cluster": 0,
+    }
+    with pytest.raises(ValueError, match="k-means totals workspace is too small"):
+        _cl.select_kmeans_center(X, totals=totals[:-1], **kwargs)
+    _cl.select_kmeans_center(X, totals=totals, **kwargs)
+    cp.testing.assert_array_equal(centers[0], X[-1])
+    assert int(n_draws[0]) == 1
 
 
 # ---------- compute_objective ----------
@@ -447,7 +477,8 @@ def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
     sigma = 0.1
 
     obj_scalar = cp.zeros(1, dtype=dtype)
-    result = _cl.compute_objective(
+    compute_objective = partial(
+        _cl.compute_objective,
         R,
         similarities=similarities,
         O=O,
@@ -461,6 +492,11 @@ def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
         stabilized=stabilized,
         objective_partials=cp.empty(n_cells, dtype=dtype),
     )
+    with pytest.raises(
+        ValueError, match="objective_partials must hold at least n_cells elements"
+    ):
+        compute_objective(objective_partials=cp.empty(n_cells - 1, dtype=dtype))
+    result = compute_objective()
 
     expected = _compute_objective_reference(
         R, similarities, O=O, E=E, theta=theta, sigma=sigma, stabilized=stabilized

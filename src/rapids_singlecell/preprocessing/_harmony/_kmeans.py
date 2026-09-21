@@ -9,7 +9,6 @@ from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
 
 _ASSIGNMENT_BATCH_ROWS = 65_536
 _DISTANCE_ERROR_FACTOR = 4
-_WEIGHT_TILE_ROWS = 1024
 _HOST_COUNTS_MAX_CLUSTERS = 4096
 
 _refine_squared_distances = cp.ElementwiseKernel(
@@ -77,8 +76,9 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
     centers[0] = X[index]
     uniforms = cp.asarray(deepcopy(rng).random(n_clusters - 1))
     n_draws = cp.zeros(1, dtype=cp.int32)
+    weight_tile_rows = _clustering_cuda.KMEANS_WEIGHT_TILE_ROWS
     totals = cp.empty(
-        (n_rows + _WEIGHT_TILE_ROWS - 1) // _WEIGHT_TILE_ROWS, dtype=cp.float64
+        (n_rows + weight_tile_rows - 1) // weight_tile_rows, dtype=cp.float64
     )
     for cluster in range(n_clusters):
         candidate = _squared_distances(
