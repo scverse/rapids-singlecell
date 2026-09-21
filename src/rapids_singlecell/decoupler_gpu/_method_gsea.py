@@ -115,9 +115,11 @@ def _func_gsea(
     device cache shares permutations across observations within each invocation.
 
     %(yestest)s
+
     %(params)s
     %(times)s
     %(seed)s
+
     %(returns)s
     """
     for name, value in (("times", times), ("seed", seed)):
