@@ -249,7 +249,7 @@ with cp.cuda.Device(gpu_device):
 Creating a CUDA context is enough for the process to appear on a GPU in `nvidia-smi`.
 Contexts normally remain until the process or notebook kernel exits.
 
-rapids-singlecell integrates with the RAPIDS Memory Manager ({mod}`rmm`).
+rapids-singlecell integrates with NVIDIA RMM ({mod}`rmm`).
 RMM controls how GPU memory is allocated, but it does not select or hide GPUs.
 
 Most users do not need to reinitialize RMM to choose a GPU.
