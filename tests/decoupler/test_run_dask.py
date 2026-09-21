@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 import rapids_singlecell.decoupler_gpu as dc
 
@@ -77,6 +78,23 @@ class TestDask:
             dask_adata.obsm["score_aucell"].values,
             rtol=1e-5,
         )
+
+    def test_gsea_dask_preserves_scores_and_pvalues(self, adata, net):
+        import dask.array as da
+
+        dense = adata.copy()
+        dc.gsea(dense, net, tmin=0, times=63, bsize=7)
+
+        dask_adata = adata.copy()
+        # Exercise feature rechunking and an incomplete final observation batch.
+        dask_adata.X = da.from_array(np.asarray(adata.X), chunks=(9, 7))
+        dc.gsea(dask_adata, net, tmin=0, times=63)
+
+        for key, tolerance in [("score_gsea", 1e-12), ("padj_gsea", 0)]:
+            pd.testing.assert_frame_equal(
+                dask_adata.obsm[key], dense.obsm[key], rtol=tolerance, atol=tolerance
+            )
+        assert np.any(dask_adata.obsm["padj_gsea"].to_numpy() < 1)
 
     def test_zscore_dask_vs_dense(self, adata, net):
         """Test that Dask and dense produce similar results for zscore."""

@@ -13,6 +13,7 @@
     dcg.mlm
     dcg.ulm
     dcg.aucell
+    dcg.gsea
     dcg.waggr
     dcg.zscore
 ```
