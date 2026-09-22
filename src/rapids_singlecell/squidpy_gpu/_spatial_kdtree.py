@@ -3,13 +3,14 @@ from __future__ import annotations
 import math
 
 import cupy as cp
-from cupyx.scipy.spatial._kdtree_utils import KD_MODULE
 
 _BLOCK_SIZE = 128
 
 
 def _build_kdtree(points: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
     """Fix CuPy's KDTree tag-precision bug by keeping sorting tags as integers."""
+    from cupyx.scipy.spatial._kdtree_utils import KD_MODULE
+
     x = points.copy()
     track_idx = cp.arange(x.shape[0], dtype=cp.int64)
     tags = cp.zeros(x.shape[0], dtype=cp.int64)

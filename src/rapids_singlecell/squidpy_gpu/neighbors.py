@@ -10,7 +10,6 @@ import cupy as cp
 import numpy as np
 from cupyx.scipy import sparse as cp_sparse
 
-from ._spatial_delaunay import _delaunay_edges
 from ._spatial_graph import build_adjacency, build_graphs
 from ._spatial_neighbors_backend import _edge_distances, _knn_edges, _radius_edges
 
@@ -175,7 +174,10 @@ class KNNBuilder(_SpatialBuilder):
 
 
 class RadiusBuilder(_SpatialBuilder):
-    """Connect observations within a scalar radius or inclusive radius interval."""
+    """Connect all observations within a scalar radius or inclusive radius interval.
+
+    A pair queries all neighbors within its maximum, then prunes to the interval.
+    """
 
     _parameters = ("radius",)
 
@@ -216,14 +218,16 @@ class DelaunayBuilder(_SpatialBuilder):
         set_diag: bool = False,
         percentile: float | None = None,
     ) -> None:
-        if radius is not None:
-            radius = _validate_radius(radius)
-            if not isinstance(radius, tuple):
-                radius = (0.0, radius)
-        self.radius = radius
+        self.radius = _validate_radius(radius) if radius is not None else None
         super().__init__(transform, set_diag=set_diag, percentile=percentile)
+        if self.radius is not None and not isinstance(self.radius, tuple):
+            self._postprocessors.insert(
+                0, DistanceIntervalPostprocessor((0.0, self.radius))
+            )
 
     def build_graph(self, coords: cp.ndarray) -> CSRPair:
+        from ._spatial_delaunay import _delaunay_edges
+
         rows, cols = _delaunay_edges(coords)
         values = _edge_distances(coords, rows, cols)
         return self._from_edges(coords, (rows, cols, values))
@@ -279,6 +283,8 @@ class GridBuilder(_SpatialBuilder):
 
     def _base_adjacency(self, coords: cp.ndarray, *, set_diag: bool) -> CSR:
         if self.delaunay:
+            from ._spatial_delaunay import _delaunay_edges
+
             rows, cols = _delaunay_edges(coords)
         else:
             _validate_neighbor_count(coords, self.n_neighs)

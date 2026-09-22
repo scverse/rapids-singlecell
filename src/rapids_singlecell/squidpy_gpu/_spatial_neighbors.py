@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import cupy as cp
 import numpy as np
-from scipy import sparse as sc_sparse
+import scipy.sparse
 
 from ._utils import _assert_categorical_obs, _assert_spatial_basis
 from .neighbors import (
@@ -26,8 +26,8 @@ _Transform = Literal["spectral", "cosine"] | None
 class SpatialNeighborsResult(NamedTuple):
     """Spatial connectivity and distance matrices returned with ``copy=True``."""
 
-    connectivities: sc_sparse.csr_matrix
-    distances: sc_sparse.csr_matrix
+    connectivities: scipy.sparse.csr_matrix
+    distances: scipy.sparse.csr_matrix
 
 
 def spatial_neighbors_knn(
@@ -96,7 +96,9 @@ def spatial_neighbors_radius(
     """Build a graph of observations within an inclusive radius.
 
     ``radius`` is a nonnegative finite maximum distance or a pair defining
-    an interval (sorted before use). Zero connects distinct coincident points.
+    an interval (sorted before use). A pair queries all neighbors up to
+    ``max(radius)``, then retains distances within the inclusive interval;
+    there is no ``n_neighs`` cap. Zero connects distinct coincident points.
     Percentile pruning follows interval pruning and includes its stored zeros.
 
     Shared parameters and outputs follow :func:`spatial_neighbors_knn`.
@@ -243,7 +245,7 @@ def spatial_neighbors_from_builder(
         result = builder.combine(graphs, np.concatenate(groups))
     result = SpatialNeighborsResult(
         *(
-            sc_sparse.csr_matrix(graph.get() if hasattr(graph, "get") else graph)
+            scipy.sparse.csr_matrix(graph.get() if hasattr(graph, "get") else graph)
             for graph in result
         )
     )
