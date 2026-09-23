@@ -13,6 +13,18 @@ import scanpy as sc
 The workflow of *rapids-singlecell* is broadly the same as *scanpy's*.
 For more information, see the tutorials and API documentation.
 
+### Settings
+
+Function defaults follow Scanpy 1. Use {meth}`rsc.settings.override <rapids_singlecell.settings.override>` to temporarily opt into the Scanpy 2 preview defaults:
+
+```python
+with rsc.settings.override(preset="scanpy-v2-preview"):
+    rsc.pp.pca(adata)  # writes to `adata.obsm["pca"]`
+```
+
+To enable the preview globally, set {attr}`rsc.settings.preset <rapids_singlecell.settings.preset>` to `"scanpy-v2-preview"`.
+See {ref}`settings` for the full list of presets and what they change.
+
 ### AnnData setup
 
 {class}`~anndata.AnnData` supports GPU-enabled cupy arrays and sparse matrices.
@@ -39,6 +51,7 @@ The preprocessing can be handled by the functions in {mod}`~.pp`. They offer acc
 Example:
 
 ```python
+rsc.get.anndata_to_GPU(adata, layer="counts")
 rsc.pp.highly_variable_genes(
     adata,
     n_top_genes=5000,
@@ -65,12 +78,15 @@ sc.pl.tsne(adata, color="leiden")
 
 ### Decoupler-GPU
 
-`dcg` offers accelerated drop-in replacements for {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ulm`, and {func}`~rapids_singlecell.dcg.aucell`:
+`dcg` accelerates decoupler methods including {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ulm`, and {func}`~rapids_singlecell.dcg.aucell`:
 
 ```python
 import decoupler as dc
 
 model = dc.op.resource("PanglaoDB", organism="human")
+model = model.loc[model["human"] & model["canonical_marker"]]
+model = model.rename(columns={"cell_type": "source", "genesymbol": "target"})
+model = model[["source", "target"]].drop_duplicates()
 rsc.dcg.ulm(adata, model, tmin=3)
 acts_ulm = dc.pp.get_obsm(adata, key="score_ulm")
 sc.pl.umap(acts_ulm, color=["NK cells"], cmap="coolwarm", vcenter=0)
@@ -86,7 +102,7 @@ from rapids_singlecell import ptg
 distance = ptg.Distance(metric="edistance", obsm_key="X_pca")
 result = distance.pairwise(adata, groupby="perturbation")
 res, res_var = distance.pairwise(
-	adata, groupby="perturbation", bootstrap=True, n_bootstrap=100, multi_gpu=None
+    adata, groupby="perturbation", bootstrap=True, n_bootstrap=100, multi_gpu=None
 )
 ```
 

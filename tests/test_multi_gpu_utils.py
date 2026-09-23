@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import cupy as cp
+import pytest
 
-from rapids_singlecell._utils import _split_pairs, parse_device_ids
+from rapids_singlecell._utils import _multi_gpu, _split_pairs, parse_device_ids
 
 
 class TestSplitPairs:
@@ -274,3 +275,78 @@ class TestParseDeviceIds:
             assert parse_device_ids(multi_gpu=None) == [0]
             assert parse_device_ids(multi_gpu=True) == [0]
             assert parse_device_ids(multi_gpu=False) == [0]
+
+
+class TestDeviceCopy:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        _multi_gpu._peer_copy_works.cache_clear()
+        yield
+        _multi_gpu._peer_copy_works.cache_clear()
+
+    def test_check_is_cached_per_direction(self, monkeypatch):
+        checked = []
+
+        def cannot_access(*pair):
+            checked.append(pair)
+            return False
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", cannot_access)
+        monkeypatch.setattr(
+            cp,
+            "copyto",
+            lambda *_: pytest.fail("a non-P2P pair must not run the canary"),
+        )
+
+        assert not _multi_gpu._peer_copy_works(1, 0)
+        assert not _multi_gpu._peer_copy_works(1, 0)
+        assert not _multi_gpu._peer_copy_works(0, 1)
+        assert checked == [(1, 0), (0, 1)]
+
+    def test_silent_copy_failure_is_detected(self, monkeypatch):
+        if cp.cuda.runtime.getDeviceCount() < 2:
+            pytest.skip("requires two GPUs")
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+        monkeypatch.setattr(cp, "copyto", lambda *_: None)
+
+        assert not _multi_gpu._peer_copy_works(1, 0)
+
+    @pytest.mark.parametrize(
+        ("works", "selected", "unused"),
+        [
+            (True, "_copy_to_device_p2p", "_copy_to_device_via_host"),
+            (False, "_copy_to_device_via_host", "_copy_to_device_p2p"),
+        ],
+    )
+    def test_copy_route(self, monkeypatch, works, selected, unused):
+        source = cp.arange(4)
+        copied = object()
+        destination = source.device.id + 1
+        monkeypatch.setattr(_multi_gpu, "_peer_copy_works", lambda *_: works)
+        monkeypatch.setattr(_multi_gpu, selected, lambda *_: copied)
+        monkeypatch.setattr(
+            _multi_gpu, unused, lambda *_: pytest.fail("wrong copy route")
+        )
+
+        assert _multi_gpu._copy_to_device(source, destination) is copied
+
+    def test_same_device_returns_original(self, monkeypatch):
+        source = cp.arange(4)
+        monkeypatch.setattr(
+            _multi_gpu,
+            "_peer_copy_works",
+            lambda *_: pytest.fail("same-device copies must not check P2P"),
+        )
+
+        assert _multi_gpu._copy_to_device(source, source.device.id) is source
+
+    def test_host_copy(self):
+        if cp.cuda.runtime.getDeviceCount() < 2:
+            pytest.skip("requires two GPUs")
+        with cp.cuda.Device(0):
+            source = cp.arange(8)
+
+        copied = _multi_gpu._copy_to_device_via_host(source, 1)
+
+        assert copied.device.id == 1
+        assert copied.get().tolist() == list(range(8))

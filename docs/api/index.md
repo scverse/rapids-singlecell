@@ -14,5 +14,6 @@ scanpy_gpu
 squidpy_gpu
 pertpy_gpu
 decoupler_gpu
+settings
 get
 ```

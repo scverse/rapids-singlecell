@@ -1,7 +1,11 @@
 # Installation
+
+*rapids-singlecell* requires Python 3.12–3.14 and an NVIDIA GPU.
+
 ## Conda
 The easiest way to install *rapids-singlecell* is to use one of the *yaml* files provided in the [conda](https://github.com/scverse/rapids-singlecell/tree/main/conda) folder.
 These *yaml* files install everything needed to run the example notebooks and get you started.
+Download the matching file or run the commands below from a repository checkout.
 
 `````{tab-set}
 ````{tab-item} CUDA 13
@@ -22,8 +26,15 @@ mamba env create -f conda/rsc_rapids_26.08_cuda12.yml
 ````
 `````
 
+Activate the environment before running Python or Jupyter:
+
+```bash
+conda activate rapids_singlecell
+```
+
 ```{note}
-RAPIDS currently doesn't support `channel_priority: strict`; use `channel_priority: flexible` instead
+NVIDIA CUDA-X Data Science (formerly RAPIDS) supports both `channel_priority: strict` and `channel_priority: flexible`.
+See the [NVIDIA installation guide](https://docs.nvidia.com/datascience/install/#conda).
 ```
 
 ## PyPI
@@ -41,7 +52,8 @@ The prebuilt wheels support the following CUDA runtime versions:
 | `rapids-singlecell-cu12` | CUDA 12.2 | CUDA 12.2–12.9+ | Turing through Hopper (native), Blackwell (via PTX JIT) |
 | `rapids-singlecell-cu13` | CUDA 13.0 | CUDA 13.0+ | Turing through Blackwell (precompiled cubins) |
 
-The CUDA 12 wheels are compiled with CUDA 12.2 to match the [RAPIDS 26.04 support matrix](https://docs.rapids.ai/platform-support/) (CUDA 12.2–12.9).
+The CUDA 12 wheels are compiled with CUDA 12.2.
+Check the [CUDA-X Data Science support matrix](https://docs.nvidia.com/datascience/platform-support/) for the CUDA runtime and driver requirements of your dependency versions.
 Blackwell GPUs (CC 100, 103, and 120) are supported via PTX just-in-time compilation from the `sm_90` PTX included in the wheel.
 The CUDA 13 wheels include compatible Blackwell cubins, so no PTX JIT is needed.
 
@@ -52,43 +64,44 @@ Install the wheel matching your CUDA version:
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-pip install rapids-singlecell-cu13
+[uv] pip install rapids-singlecell-cu13
 ```
 ````
 ````{tab-item} CUDA 12
 ```bash
-pip install rapids-singlecell-cu12
+[uv] pip install rapids-singlecell-cu12
 ```
 ````
 `````
 
-This installs the precompiled CUDA kernels but **not** the RAPIDS stack (cupy, cuml, cudf, etc.).
-This is the recommended approach for **conda/mamba users** who already have RAPIDS installed in their environment.
+This installs the precompiled CUDA kernels but **not** the CUDA-X Data Science stack (cupy, cuml, cudf, etc.).
+This is the recommended approach for **conda/mamba users** who already have CUDA-X Data Science installed in their environment.
 
 ```{note}
-The RAPIDS stack is **required**, not optional: `rapids_singlecell` imports
+The CUDA-X Data Science stack is **required**, not optional: `rapids_singlecell` imports
 `cuml`/`cupy` at the top of its package `__init__`. These are
-provided by an existing RAPIDS conda/mamba environment or by the
+provided by an existing CUDA-X Data Science conda/mamba environment or by the
 `[rapids]`/`[rapids-cuXX]` extra below. Installing the bare
-`rapids-singlecell-cuXX` wheel into an environment without RAPIDS raises an
+`rapids-singlecell-cuXX` wheel into an environment without CUDA-X Data Science raises an
 `ImportError` on `import rapids_singlecell` itself — not merely when a kernel is
 first used.
 ```
 
-### Prebuilt wheels with RAPIDS dependencies
+(prebuilt-wheels-with-rapids-dependencies)=
+### Prebuilt wheels with CUDA-X Data Science dependencies
 
-To also install the RAPIDS stack via pip, use the `rapids` extra.
+To also install the CUDA-X Data Science stack via pip, use the `rapids` extra.
 This requires the `--extra-index-url` flag for the NVIDIA PyPI index:
 
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-pip install 'rapids-singlecell-cu13[rapids]' --extra-index-url=https://pypi.nvidia.com
+[uv] pip install 'rapids-singlecell-cu13[rapids]' --extra-index-url=https://pypi.nvidia.com
 ```
 ````
 ````{tab-item} CUDA 12
 ```bash
-pip install 'rapids-singlecell-cu12[rapids]' --extra-index-url=https://pypi.nvidia.com
+[uv] pip install 'rapids-singlecell-cu12[rapids]' --extra-index-url=https://pypi.nvidia.com
 ```
 ````
 `````
@@ -99,21 +112,21 @@ The `rapids-singlecell` package on PyPI contains the source distribution.
 Building from source requires a CUDA toolkit and a C++ compiler:
 
 ```bash
-pip install rapids-singlecell
+[uv] pip install rapids-singlecell
 ```
 
 The CUDA kernels will be compiled during installation for your local GPU architecture.
-You can select RAPIDS dependencies with the `rapids-cu12` or `rapids-cu13` extras:
+You can select CUDA-X Data Science dependencies with the `rapids-cu12` or `rapids-cu13` extras:
 
 ```bash
-pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
+[uv] pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
 ```
 
 ```{note}
 Building from source requires the CUDA toolkit (nvcc) and CMake >= 3.24 to be available in your environment.
-The nvcc/CUDAToolkit found during the build should match the RAPIDS/CuPy CUDA major runtime version in or linked to the environment.
+The nvcc/CUDAToolkit found during the build should match the CUDA major runtime version used by CUDA-X Data Science and CuPy in or linked to the environment.
 
-No RAPIDS C++ package is needed at build time, so the default isolated build works
+No CUDA-X Data Science C++ package is needed at build time, so the default isolated build works
 on both CUDA 12 and CUDA 13 without `--no-build-isolation`.
 ```
 
@@ -122,24 +135,24 @@ on both CUDA 12 and CUDA 13 without `--no-build-isolation`.
 To install the latest development version directly from GitHub:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+[uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 ```
 
 Or from a specific branch or tag:
 
 ```bash
-pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
+[uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git@main"
 ```
 
 This compiles the CUDA kernels during installation. By default, kernels are compiled for your local GPU architecture only (`native`).
-To compile for different or multiple architectures, set the scikit-build-core environment variable that overrides the CUDA architectures:
+To compile for different or multiple architectures, pass the CUDA architectures through `CMAKE_ARGS`:
 
 ```bash
 # Compile for a specific architecture (e.g., Ampere)
-SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES="80-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real" [uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 
 # Compile for multiple architectures
-SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES="80-real;86-real;89-real;90-real" pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
+CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real;86-real;89-real;90-real" [uv] pip install "rapids-singlecell @ git+https://github.com/scverse/rapids-singlecell.git"
 ```
 
 Common architecture codes:
@@ -226,17 +239,17 @@ docker pull ghcr.io/scverse/rapids-singlecell-cu12:latest
 ````
 `````
 
-To run the Docker container, use the following command:
+To open an interactive shell in the Docker container, use the following command:
 
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-docker run --rm --gpus all ghcr.io/scverse/rapids-singlecell-cu13:latest
+docker run --rm -it --gpus all ghcr.io/scverse/rapids-singlecell-cu13:latest bash
 ```
 ````
 ````{tab-item} CUDA 12
 ```bash
-docker run --rm --gpus all ghcr.io/scverse/rapids-singlecell-cu12:latest
+docker run --rm -it --gpus all ghcr.io/scverse/rapids-singlecell-cu12:latest bash
 ```
 ````
 `````

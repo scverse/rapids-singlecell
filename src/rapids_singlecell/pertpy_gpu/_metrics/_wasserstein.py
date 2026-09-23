@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from rapids_singlecell._cuda import _sinkhorn_cuda as _sk
+from rapids_singlecell._utils import _copy_to_device
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 from ._base_metric import BaseMetric, parse_device_ids
@@ -116,12 +117,11 @@ def _build_ragged_layout(
         loc_c = cp.arange(total_cols, dtype=cp.int64) - g_off[col2pair]
     else:
         # Resample with replacement to each group's own size (bootstrap).
-        loc_r = (
-            rng.random(total_rows, dtype=dtype) * n[row2pair].astype(dtype)
-        ).astype(cp.int64)
-        loc_c = (
-            rng.random(total_cols, dtype=dtype) * m[col2pair].astype(dtype)
-        ).astype(cp.int64)
+        int_max = cp.iinfo(cp.int64).max
+        loc_r = rng.integers(0, int_max, size=total_rows, dtype=cp.int64)
+        loc_c = rng.integers(0, int_max, size=total_cols, dtype=cp.int64)
+        loc_r %= n[row2pair].astype(cp.int64)
+        loc_c %= m[col2pair].astype(cp.int64)
     gather_f = offs_row[row2pair] + loc_r
     gather_g = offs_col[col2pair] + loc_c
     cidx_l = cp.ascontiguousarray(cell_indices[gather_f].astype(cp.int32))
@@ -346,7 +346,7 @@ class WassersteinMetric(BaseMetric):
         plans = _plan_device_batches(n_row, n_col, itemsize, len(device_ids))
 
         out = cp.empty(n_pairs, dtype=dtype)
-        home = device_ids[0]
+        output_device = out.device.id
 
         # Move the shared inputs to each participating device once.
         streams: dict[int, cp.cuda.Stream] = {}
@@ -358,9 +358,9 @@ class WassersteinMetric(BaseMetric):
                 streams[dev] = cp.cuda.Stream(non_blocking=True)
                 with streams[dev]:
                     inputs[dev] = (
-                        cp.ascontiguousarray(cp.asarray(embedding)),
-                        cp.asarray(cat_offsets),
-                        cp.asarray(cell_indices),
+                        cp.ascontiguousarray(_copy_to_device(embedding, dev)),
+                        _copy_to_device(cat_offsets, dev),
+                        _copy_to_device(cell_indices, dev),
                     )
 
         # Grow-only per-device cost buffers, reused across rounds (avoids a fresh
@@ -438,9 +438,11 @@ class WassersteinMetric(BaseMetric):
             for u in units:
                 with cp.cuda.Device(u["dev"]):
                     u["stream"].synchronize()
-            with cp.cuda.Device(home):
+            with cp.cuda.Device(output_device):
                 for u in units:
-                    out[u["start"] : u["stop"]] = cp.asarray(u["reg"])
+                    out[u["start"] : u["stop"]] = _copy_to_device(
+                        u["reg"], output_device
+                    )
             for u in units:
                 with cp.cuda.Device(u["dev"]):
                     converged = converged and bool(u["state"]["conv"].all().get())
@@ -477,9 +479,9 @@ class WassersteinMetric(BaseMetric):
             empty = cp.zeros(0, dtype=dtype)
             return empty, empty
         with cp.cuda.Device(device):
-            emb = cp.ascontiguousarray(cp.asarray(embedding))
-            offs = cp.asarray(cat_offsets)
-            cidx = cp.asarray(cell_indices)
+            emb = cp.ascontiguousarray(_copy_to_device(embedding, device))
+            offs = _copy_to_device(cat_offsets, device)
+            cidx = _copy_to_device(cell_indices, device)
             # Sizes/orientation on the host so the per-chunk build never syncs.
             co_h = cp.asnumpy(offs)
             sizes_h = np.diff(co_h)
@@ -635,6 +637,7 @@ class WassersteinMetric(BaseMetric):
             if pair_left:
                 il = cp.asarray(pair_left, dtype=cp.intp)
                 jr = cp.asarray(pair_right, dtype=cp.intp)
+                flat = _copy_to_device(flat, mat.device.id)
                 mat[il, jr] = flat
                 mat[jr, il] = flat
             df = pd.DataFrame(mat.get(), index=groups_list, columns=groups_list)

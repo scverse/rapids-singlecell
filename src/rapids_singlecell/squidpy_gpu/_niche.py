@@ -818,6 +818,7 @@ def _neighborhood_profile(
     if adj.dtype != cp.float32:
         adj = adj.astype(cp.float32)
     adj.eliminate_zeros()
+    adj.data[:] = 1.0
 
     if distance == 1 or weights is None:
         weights = [1.0] * distance
@@ -831,6 +832,7 @@ def _neighborhood_profile(
     for hop in range(distance):
         if hop > 0:
             adj_k = adj_k @ adj
+            adj_k.data[:] = 1.0
         counts = adj_k @ one_hot  # (n_obs, n_cats) dense
         if not abs_nhood:
             row_sum = counts.sum(axis=1, keepdims=True)

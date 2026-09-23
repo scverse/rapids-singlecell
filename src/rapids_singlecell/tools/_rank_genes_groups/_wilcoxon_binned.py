@@ -278,7 +278,11 @@ def wilcoxon_binned(
     n_hist_groups = n_cells_per_group_hist.shape[0]
     from ._stream_multi_gpu import resolve_stream_devices
 
-    device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [0]
+    device_ids = (
+        resolve_stream_devices(multi_gpu=rg._multi_gpu)
+        if is_host
+        else [cp.cuda.Device().id]
+    )
     if fuse_means:
         group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
         group_nnz_ext = (

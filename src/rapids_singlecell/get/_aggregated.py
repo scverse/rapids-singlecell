@@ -251,6 +251,7 @@ class Aggregate:
                     n_cells=X_part.shape[0],
                     n_genes=X_part.shape[1],
                     is_csc=False,
+                    stream=cp.cuda.get_current_stream().ptr,
                 )
             else:
                 _aggr_cuda.dense_aggr(
@@ -263,6 +264,7 @@ class Aggregate:
                     n_cells=X_part.shape[0],
                     n_genes=X_part.shape[1],
                     is_fortran=X_part.flags.f_contiguous,
+                    stream=cp.cuda.get_current_stream().ptr,
                 )
             return out
 

@@ -47,6 +47,90 @@ def test_umap_connectivities_euclidean(algo):
     assert np.allclose(adata.obsp["connectivities"].toarray(), connectivities_umap)
 
 
+@pytest.mark.parametrize("batch_balanced", [False, True])
+def test_inner_product_connectivities_match_cosine(batch_balanced):
+    X = np.random.default_rng(0).random((100, 5), dtype=np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    cosine, inner_product = AnnData(X.copy()), AnnData(X.copy())
+    for adata, metric in [(cosine, "cosine"), (inner_product, "inner_product")]:
+        if batch_balanced:
+            adata.obs["batch"] = np.arange(adata.n_obs) % 2
+            bbknn(
+                adata,
+                batch_key="batch",
+                neighbors_within_batch=5,
+                trim=0,
+                metric=metric,
+            )
+        else:
+            neighbors(adata, n_neighbors=10, metric=metric)
+    np.testing.assert_allclose(
+        inner_product.obsp["connectivities"].toarray(),
+        cosine.obsp["connectivities"].toarray(),
+        atol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("method", ["umap", "gauss"])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_inner_product_unnormalized_connectivities(method, sparse):
+    X = np.random.default_rng(8).normal(size=(40, 5)).astype(np.float32)
+    X *= np.geomspace(0.1, 10, len(X))[:, None]
+    products = X @ X.T
+    k = 6
+    expected_indices = np.argsort(-products, axis=1)[:, :k]
+    assert np.any(expected_indices[:, 0] != np.arange(len(X)))
+    assert np.any(~np.any(expected_indices == np.arange(len(X))[:, None], axis=1))
+    graphs = []
+    for scale in [1, 10]:
+        adata = AnnData(sc_sparse.csr_matrix(X * scale) if sparse else X * scale)
+        neighbors(adata, n_neighbors=k, metric="inner_product", method=method)
+        distances = adata.obsp["distances"]
+        indices = distances.indices.reshape(len(X), k)
+        np.testing.assert_array_equal(
+            np.sort(indices, axis=1), np.sort(expected_indices, axis=1)
+        )
+        np.testing.assert_allclose(
+            distances.data.reshape(len(X), k),
+            products[np.arange(len(X))[:, None], indices] * scale**2,
+            rtol=1e-5,
+        )
+        graph = adata.obsp["connectivities"]
+        assert np.all(np.isfinite(graph.data))
+        assert np.all((graph.data > 0) & (graph.data <= 1))
+        assert np.any(graph.data < 0.9)
+        assert not np.any(graph.diagonal())
+        graphs.append(graph.toarray())
+    np.testing.assert_allclose(graphs[0], graphs[1], atol=1e-4)
+
+
+@pytest.mark.parametrize("method", ["umap", "gauss"])
+def test_inner_product_tied_scores(method):
+    adata = AnnData(np.ones((10, 2), dtype=np.float32))
+    neighbors(adata, n_neighbors=4, metric="inner_product", method=method)
+    graph = adata.obsp["connectivities"]
+    assert graph.nnz > 0
+    assert np.all(np.isfinite(graph.data))
+    assert np.all((graph.data > 0) & (graph.data <= 1))
+    assert not np.any(graph.diagonal())
+
+
+def test_inner_product_bbknn_preserves_cross_batch_neighbors():
+    adata = AnnData(np.array([[1], [2], [-1], [-2]], dtype=np.float32))
+    adata.obs["batch"] = ["a", "a", "b", "b"]
+    bbknn(
+        adata,
+        batch_key="batch",
+        neighbors_within_batch=1,
+        metric="inner_product",
+        trim=0,
+    )
+    np.testing.assert_array_equal(
+        adata.obsp["connectivities"].toarray(),
+        [[0, 0, 1, 1], [0, 0, 1, 0], [1, 1, 0, 0], [1, 0, 0, 0]],
+    )
+
+
 @pytest.mark.parametrize("algo", ["brute", "ivfflat", "cagra", "ivfpq", "nn_descent"])
 def test_algo(algo):
     adata = pbmc68k_reduced()

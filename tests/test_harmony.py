@@ -18,13 +18,11 @@ from rapids_singlecell.preprocessing._harmony import (
     _solve_spd_batched,
 )
 from rapids_singlecell.preprocessing._harmony._helper import (
-    _choose_colsum_algo_benchmark,
     _choose_colsum_algo_heuristic,
     _colsum_heuristic,
     _factorize_joint_codes,
     _get_batch_codes,
     _get_theta_array,
-    _scatter_add_cp,
     _stratified_sample_indices,
 )
 
@@ -168,6 +166,38 @@ def test_harmony_stratified_sample_known_quotas():
     counts = np.bincount(cell_groups[sampled], minlength=6)
 
     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("batch_key", ["stratum", ["row", "column"]])
+def test_harmony_initialization_sample_covers_strata(batch_key, monkeypatch):
+    rng = np.random.default_rng(0)
+    strata = np.tile(np.arange(9), 2)
+    adata = ad.AnnData(
+        X=None,
+        obs=pd.DataFrame(
+            {
+                "stratum": pd.Categorical(strata, categories=np.arange(12)),
+                "row": strata // 3,
+                "column": strata % 3,
+            },
+            index=[f"cell_{i}" for i in range(strata.size)],
+        ),
+        obsm={"X_pca": rng.normal(size=(strata.size, 4)).astype(np.float32)},
+    )
+    monkeypatch.setattr(harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", 2)
+    rsc.pp.harmony_integrate(
+        adata,
+        batch_key,
+        n_clusters=2,
+        max_iter_harmony=1,
+        max_iter_clustering=2,
+        block_proportion=1.0,
+        random_state=0,
+    )
+
+    assert adata.obsm["X_pca_harmony"].shape == (strata.size, 4)
+    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
 
 
 def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
@@ -520,16 +550,7 @@ def test_choose_colsum_algo(compute_capability):
     for rows in np.arange(1000, 300000, 1000):
         for columns in np.arange(10, 5000, 50):
             algo = _colsum_heuristic(rows, columns, compute_capability)
-            assert algo in ["columns", "atomics", "gemm"]
-
-
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_benchmark_colsum_algorithms(dtype):
-    # Test that the benchmark_colsum_algorithms function returns the correct algorithm
-    # for the given shape of the matrix
-    test_shape = (1000, 100)
-    algo_func = _choose_colsum_algo_benchmark(test_shape[0], test_shape[1], dtype)
-    assert callable(algo_func)
+            assert algo in ["columns", "gemm"]
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
@@ -568,47 +589,6 @@ def test_harmony_integrate_reference(
         ).min()
         > 0.95
     )
-
-
-@pytest.mark.parametrize("n_cells", [1000, 60000])
-@pytest.mark.parametrize("n_pcs", [20, 50])
-@pytest.mark.parametrize("n_batches", [3, 10])
-@pytest.mark.parametrize("switcher", [0, 1])
-def test_scatter_add_shared_vs_optimized(n_cells, n_pcs, n_batches, switcher):
-    """
-    Test that shared memory and non-shared scatter add kernels produce identical results.
-
-    Uses small integer values (as float32) for exact verification of correctness.
-    """
-    rng = np.random.default_rng(42)
-    X_np = rng.integers(1, 10, size=(n_cells, n_pcs)).astype(np.float32)
-    cats_np = rng.integers(0, n_batches, size=n_cells, dtype=np.int32)
-
-    X = cp.asarray(X_np)
-    cats = cp.asarray(cats_np)
-
-    # Compute expected result using numpy
-    expected_np = np.zeros((n_batches, n_pcs), dtype=np.float32)
-    for i in range(n_cells):
-        cat = cats_np[i]
-        if switcher == 1:
-            expected_np[cat] += X_np[i]
-        else:
-            expected_np[cat] -= X_np[i]
-    expected = cp.asarray(expected_np)
-
-    # Run optimized (non-shared) kernel via _scatter_add_cp
-    out_optimized = cp.zeros((n_batches, n_pcs), dtype=cp.float32)
-    _scatter_add_cp(X, out_optimized, cats, switcher, n_batches, use_shared=False)
-
-    # Run shared memory kernel via _scatter_add_cp
-    out_shared = cp.zeros((n_batches, n_pcs), dtype=cp.float32)
-    _scatter_add_cp(X, out_shared, cats, switcher, n_batches, use_shared=True)
-
-    # Both kernels should produce identical results
-    cp.testing.assert_array_equal(out_optimized, expected)
-    cp.testing.assert_array_equal(out_shared, expected)
-    cp.testing.assert_array_equal(out_optimized, out_shared)
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
@@ -756,3 +736,50 @@ def test_harmony_unseeded_random_state():
     )
 
     assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
+
+
+def _repeatability_adata(dtype):
+    rng = np.random.default_rng(5102)
+    n_cells = 480
+    ordinal = np.arange(n_cells)
+    return ad.AnnData(
+        X=None,
+        obs=pd.DataFrame(
+            {
+                "batch": ordinal % 5,
+                "second": (ordinal // 5) % 3,
+                "third": (ordinal // 15) % 2,
+            },
+            index=ordinal.astype(str),
+        ),
+        obsm={"X_pca": rng.standard_normal((n_cells, 17)).astype(dtype)},
+    )
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize(
+    "key", ["batch", ["batch", "second"], ["batch", "second", "third"]]
+)
+@pytest.mark.parametrize("kmeans_cells_per_cluster", [5000, 1])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_harmony_integrate_repeats_bitwise(
+    monkeypatch, key, kmeans_cells_per_cluster, dtype
+):
+    monkeypatch.setattr(
+        harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", kmeans_cells_per_cluster
+    )
+    outputs = []
+    for _ in range(2):
+        adata = _repeatability_adata(dtype)
+        rsc.pp.harmony_integrate(
+            adata,
+            key,
+            dtype=dtype,
+            rng=734,
+            n_clusters=7,
+            max_iter_harmony=2,
+        )
+        outputs.append(adata.obsm["X_pca_harmony"])
+    assert outputs[0].dtype == dtype
+    assert np.isfinite(outputs[0]).all()
+    assert outputs[0].tobytes() == outputs[1].tobytes()

@@ -138,9 +138,13 @@ def _get_connectivities_umap(
     n_obs: int,
     n_neighbors: int,
     rng: np.random.Generator,
-    metric: str,
 ) -> cp_sparse.coo_matrix:
-    """UMAP fuzzy simplicial set connectivities."""
+    """UMAP fuzzy simplicial set connectivities.
+
+    The graph is built from the precomputed ``knn_indices``/``knn_dist``, so the
+    metric is never recomputed here. Forwarding it would only make cuML reject
+    the metrics it does not know itself, such as ``inner_product``.
+    """
     set_op_mix_ratio = 1.0
     local_connectivity = 1.0
 
@@ -151,7 +155,6 @@ def _get_connectivities_umap(
         n_neighbors,
         # cuML seeds its fuzzy simplicial set, so draw the seed right here
         _seed_from_rng(rng),
-        metric=metric,
         knn_indices=knn_indices,
         knn_dists=knn_dist,
         set_op_mix_ratio=set_op_mix_ratio,
@@ -261,6 +264,36 @@ def _get_connectivities_jaccard(
     return W
 
 
+def _inner_product_distances(
+    knn_indices: cp.ndarray,
+    similarities: cp.ndarray,
+    *,
+    batch_codes: cp.ndarray | None = None,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Prepare row-local score gaps with one self-neighbor for graph weighting."""
+    n_obs, k = knn_indices.shape
+    self_indices = cp.arange(n_obs, dtype=knn_indices.dtype)[:, None]
+    scores = cp.where(knn_indices == self_indices, -cp.inf, similarities)
+    if batch_codes is not None:
+        # Replace self within its own batch, preserving BBKNN's batch balance.
+        same_batch = batch_codes[knn_indices] == batch_codes[:, None]
+        replace = cp.argmin(cp.where(same_batch, scores, cp.inf), axis=1)
+        scores[cp.arange(n_obs), replace] = -cp.inf
+    order = cp.argsort(-scores, axis=1)[:, : k - 1]
+    indices = cp.take_along_axis(knn_indices, order, axis=1)
+    scores = cp.take_along_axis(scores, order, axis=1)
+    gaps = scores[:, :1] - scores
+    if k > 1:
+        # A positive offset keeps UMAP's rho on the best nonself neighbor;
+        # using the local span preserves score differences without a global shift.
+        span = gaps[:, -1:]
+        gaps += cp.where(span > 0, span, 1)
+    return (
+        cp.concatenate((self_indices, indices), axis=1),
+        cp.concatenate((cp.zeros((n_obs, 1), dtype=similarities.dtype), gaps), axis=1),
+    )
+
+
 def _calc_connectivities(
     knn_indices: cp.ndarray,
     knn_dist: cp.ndarray,
@@ -268,8 +301,9 @@ def _calc_connectivities(
     n_obs: int,
     n_neighbors: int,
     rng: np.random.Generator,
-    metric: str,
     method: Literal["umap", "gauss", "jaccard"] = "umap",
+    metric: _Metrics = "euclidean",
+    batch_codes: cp.ndarray | None = None,
 ) -> cp_sparse.spmatrix:
     """Compute connectivities from KNN arrays.
 
@@ -285,15 +319,21 @@ def _calc_connectivities(
         Number of nearest neighbors.
     rng
         Random generator (a seed is drawn for the UMAP fuzzy simplicial set).
-    metric
-        Distance metric name.
     method
         Method for computing connectivities.
+    metric
+        Search metric; inner-product similarities are converted for weighting.
+    batch_codes
+        Per-cell batch codes for preserving BBKNN's self-neighbor allocation.
 
     Returns
     -------
     CuPy sparse matrix on GPU.
     """
+    if metric == "inner_product" and method != "jaccard":
+        knn_indices, knn_dist = _inner_product_distances(
+            knn_indices, knn_dist, batch_codes=batch_codes
+        )
     if method == "gauss":
         return _get_connectivities_gauss(
             knn_indices,
@@ -312,5 +352,4 @@ def _calc_connectivities(
         n_obs=n_obs,
         n_neighbors=n_neighbors,
         rng=rng,
-        metric=metric,
     )

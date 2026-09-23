@@ -28,7 +28,6 @@ __all__ = [
     "_harmony_colsum_cuda",
     "_harmony_correction_batched_cuda",
     "_harmony_correction_cuda",
-    "_harmony_kmeans_cuda",
     "_harmony_normalize_cuda",
     "_harmony_outer_cuda",
     "_harmony_pen_cuda",

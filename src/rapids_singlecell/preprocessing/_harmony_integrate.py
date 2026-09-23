@@ -83,11 +83,10 @@ def harmony_integrate(
         the naming of the basis it corrected (``"X_pca"`` gives
         ``"X_pca_harmony"``, ``"pca"`` gives ``"pca_harmony"``).
     dtype
-        The data type to use for Harmony computation. Defaults to 32-bit, which
-        agrees with the 64-bit result to a Pearson correlation of >0.999 per
-        principal component while being substantially faster on GPUs with
-        reduced double-precision throughput. Pass ``numpy.float64`` for the
-        previous behavior.
+        The data type used for initialization and Harmony computation.
+        Defaults to ``numpy.float32``. Use ``numpy.float64`` when additional
+        precision is needed; it can be slower on GPUs with reduced
+        double-precision throughput.
     flavor
         Which version of the Harmony algorithm to use.
         ``"harmony2"`` (default) enables the stabilized diversity penalty,
@@ -167,7 +166,8 @@ def harmony_integrate(
     colsum_algo
         Algorithm for column sums.
         If ``None``, chosen automatically.
-        If ``"benchmark"``, benchmarks all algorithms.
+        The legacy ``"atomics"`` and ``"benchmark"`` values use automatic
+        deterministic selection.
     block_proportion
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
@@ -175,6 +175,11 @@ def harmony_integrate(
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
+        Sequential calls with identical inputs, parameters, and integer seed
+        are bitwise reproducible on the same hardware and software stack in
+        float32 and float64. Initialization uses k-means++ and fixed-order
+        Lloyd reductions. Results may differ across GPU architectures or
+        CUDA versions; concurrent CUDA streams are outside this guarantee.
     verbose
         Whether to print benchmarking and convergence information.
 

@@ -5,32 +5,28 @@ from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
 import numpy as np
-from cuml import KMeans as CumlKMeans
 
-from rapids_singlecell._cuda import _harmony_clustering_cuda as _hc_cl
-from rapids_singlecell._cuda import _harmony_correction_batched_cuda as _hc_corr_b
-from rapids_singlecell._cuda import _harmony_correction_cuda as _hc_corr
+from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
+from rapids_singlecell._cuda import (
+    _harmony_correction_batched_cuda as _correction_batched_cuda,
+)
+from rapids_singlecell._cuda import _harmony_correction_cuda as _correction_cuda
 from rapids_singlecell._utils import _create_category_index_mapping
 from rapids_singlecell._utils._random import _seed_from_rng
 
-from ._fuses import (
-    _calc_R,
-)
 from ._helper import (
-    _choose_colsum_algo_benchmark,
     _choose_colsum_algo_heuristic,
     _column_sum,
-    _column_sum_atomic,
     _factorize_joint_codes,
     _gemm_colsum,
     _get_batch_codes,
     _get_theta_array,
     _normalize_cp,
     _outer_cp,
-    _scatter_add_cp,
     _stratified_sample_indices,
     _validate_output_buffer,
 )
+from ._kmeans import _kmeans
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -135,10 +131,17 @@ def harmonize(
         warning.
 
     colsum_algo
-        Choose which algorithm to use for column sum. If `None`, choose the algorithm based on the number of rows and columns. If `'benchmark'`, benchmark all algorithms and choose the best one.
+        Choose ``columns`` or ``gemm`` for column sums. ``None`` selects a
+        deterministic algorithm based on the matrix shape. The legacy
+        ``atomics`` and ``benchmark`` values use this automatic selection.
 
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducing results.
+        Sequential calls with identical inputs, parameters, and integer seed
+        are bitwise reproducible on the same hardware and software stack in
+        float32 and float64. Initialization uses k-means++ and fixed-order
+        Lloyd reductions. Results may differ across GPU architectures or
+        CUDA versions; concurrent CUDA streams are outside this guarantee.
 
     stabilized_penalty
         If ``True`` (default), use the Harmony2 stabilized diversity penalty
@@ -231,14 +234,9 @@ def harmonize(
     # TODO: Allow for multiple colsum algorithms in a list
     assert colsum_algo in ["columns", "atomics", "gemm", "benchmark", None]
     colsum_func_big = _choose_colsum_algo_heuristic(n_cells, n_clusters, None)
-    if colsum_algo == "benchmark":
-        colsum_func_small = _choose_colsum_algo_benchmark(
-            int(n_cells * block_proportion), n_clusters, Z.dtype, verbose=verbose
-        )
-    else:
-        colsum_func_small = _choose_colsum_algo_heuristic(
-            int(n_cells * block_proportion), n_clusters, colsum_algo
-        )
+    colsum_func_small = _choose_colsum_algo_heuristic(
+        int(n_cells * block_proportion), n_clusters, colsum_algo
+    )
     theta_array = _get_theta_array(theta, n_levels, Z.dtype)
     if tau > 0:
         theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
@@ -309,8 +307,55 @@ def harmonize(
     # successive kernel launches decorrelated.
     kernel_seed = _seed_from_rng(rng, allow_none=False)
 
+    block_size = int(n_cells * block_proportion)
+    joint_scatter_work = 2 * block_size + n_covariates * n_joint_categories
+    marginal_scatter_work = 2 * n_covariates * block_size
+    joint_workspace_bytes = n_joint_categories * n_clusters * Z.dtype.itemsize
+    use_joint_scatter = (
+        n_covariates > 1
+        and joint_scatter_work < marginal_scatter_work
+        and joint_workspace_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES
+    )
+    scatter_bytes = _clustering_cuda.get_scatter_temp_bytes(
+        n_rows=n_cells,
+        n_cols=n_clusters,
+        n_categories=n_batches,
+        n_covariates=n_covariates,
+        itemsize=Z.dtype.itemsize,
+        grouped=n_covariates == 1,
+    )
+    scatter_block_sizes = [block_size]
+    if block_size and n_cells % block_size:
+        scatter_block_sizes.append(n_cells % block_size)
+    for scatter_rows in scatter_block_sizes:
+        scatter_bytes = max(
+            scatter_bytes,
+            _clustering_cuda.get_scatter_temp_bytes(
+                n_rows=scatter_rows,
+                n_cols=n_clusters,
+                n_categories=n_joint_categories if use_joint_scatter else n_batches,
+                n_covariates=1 if use_joint_scatter else n_covariates,
+                itemsize=Z.dtype.itemsize,
+            ),
+        )
+    if use_joint_scatter:
+        scatter_bytes = max(
+            scatter_bytes,
+            _clustering_cuda.get_scatter_temp_bytes(
+                n_rows=n_cells,
+                n_cols=n_clusters,
+                n_categories=n_joint_categories,
+                itemsize=Z.dtype.itemsize,
+                grouped=True,
+            ),
+        )
+    reduction_workspace = {
+        "objective_partials": cp.empty(n_cells, dtype=Z.dtype),
+        "scatter_workspace": cp.empty(scatter_bytes, dtype=cp.uint8),
+    }
+
     # Initialize algorithm
-    R, E, O, objectives_harmony = _initialize_centroids(
+    R, E, O, objectives_harmony = _initialize_clusters(
         Z_norm,
         n_clusters=n_clusters,
         sigma=sigma,
@@ -323,20 +368,11 @@ def harmonize(
         stabilized_penalty=stabilized_penalty,
         cat_offsets=init_offsets,
         cell_indices=init_indices,
+        reduction_workspace=reduction_workspace,
     )
 
-    block_size = int(n_cells * block_proportion)
-    joint_scatter_work = 2 * block_size + n_covariates * n_joint_categories
-    marginal_scatter_work = 2 * n_covariates * block_size
-    joint_workspace_bytes = n_joint_categories * n_clusters * Z.dtype.itemsize
-    use_joint_scatter = (
-        n_covariates > 1
-        and joint_scatter_work < marginal_scatter_work
-        and joint_workspace_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES
-    )
-
-    # Pre-allocate C++ workspace buffers (reused across harmony iterations).
-    cpp_workspace = _allocate_clustering_workspace(
+    # Allocate clustering buffers once for all Harmony iterations.
+    clustering_workspace = _allocate_clustering_workspace(
         n_cells,
         n_pcs=Z.shape[1],
         n_clusters=n_clusters,
@@ -347,13 +383,20 @@ def harmonize(
         block_size=block_size,
         dtype=Z_norm.dtype,
     )
+    clustering_workspace.update(reduction_workspace)
     if use_joint_scatter:
-        _scatter_add_cp(
+        _clustering_cuda.scatter_add(
             R,
-            cpp_workspace["O_joint"],
-            joint_codes,
-            1,
-            n_batches=n_joint_categories,
+            categories=joint_codes,
+            category_offsets=joint_offsets,
+            cell_indices=joint_cell_indices,
+            out=clustering_workspace["O_joint"],
+            workspace=reduction_workspace["scatter_workspace"],
+            n_rows=n_cells,
+            n_cols=n_clusters,
+            n_categories=n_joint_categories,
+            switcher=1,
+            stream=cp.cuda.get_current_stream().ptr,
         )
 
     # Main harmony iterations
@@ -384,7 +427,7 @@ def harmonize(
             use_joint_scatter=use_joint_scatter,
             kernel_seed=kernel_seed + i * 1000003,
             stabilized_penalty=stabilized_penalty,
-            cpp_workspace=cpp_workspace,
+            clustering_workspace=clustering_workspace,
         )
         # Compute per-(k,b) ridge regularization
         lambda_kb = _compute_lambda_kb(
@@ -448,7 +491,12 @@ def harmonize(
     return Z_hat
 
 
-def _initialize_centroids(
+@cp.fuse
+def _compute_assignment_weights(term: float, similarities: cp.ndarray) -> cp.ndarray:
+    return cp.exp(term * (1 - similarities))
+
+
+def _initialize_clusters(
     Z_norm: cp.ndarray,
     *,
     n_clusters: int,
@@ -462,6 +510,7 @@ def _initialize_centroids(
     stabilized_penalty: bool = True,
     cat_offsets: cp.ndarray,
     cell_indices: cp.ndarray,
+    reduction_workspace: dict,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list]:
     """
     Initialize cluster centroids and related matrices for Harmony algorithm.
@@ -472,12 +521,11 @@ def _initialize_centroids(
         O: Observed cluster assignment by batch
         objectives_harmony: List to store objective function values
     """
-    # cuML's k-means is not reproducible in float32 -- repeated calls with the
-    # same seed move centroids by ~0.3 in L2 and stop at different iterations.
-    # Seeding only needs K centroids, so fit it in float64 on a bounded sample
-    # that contains every observed batch stratum: reproducible and cheaper than
-    # fitting every cell.
+    # Fit only the initialization sample, retaining every observed stratum.
     n_init_cells = min(Z_norm.shape[0], _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
+    if n_init_cells < cat_offsets.size - 1:
+        n_strata = int(cp.count_nonzero(cp.diff(cat_offsets)))
+        n_init_cells = max(n_init_cells, n_strata)
     Z_init = Z_norm
     if n_init_cells < Z_norm.shape[0]:
         sample_indices = _stratified_sample_indices(
@@ -487,22 +535,18 @@ def _initialize_centroids(
             rng,
         )
         Z_init = Z_norm[sample_indices]
-    kmeans = CumlKMeans(
-        n_clusters=n_clusters,
-        init="k-means||",
-        n_init=1,
+    Y = _kmeans(
+        Z_init,
+        n_clusters,
         max_iter=_KMEANS_MAX_ITER,
-        # cuML's KMeans is seeded, so draw the seed right here
-        random_state=_seed_from_rng(rng),
+        rng=_seed_from_rng(rng),
     )
-    kmeans.fit(cp.ascontiguousarray(Z_init, dtype=cp.float64))
-    Y = kmeans.cluster_centers_.astype(Z_norm.dtype)
     Y_norm = _normalize_cp(Y, p=2)
 
     # Initialize cluster assignment matrix R
     term = Z_norm.dtype.type(-2 / sigma)
     similarities = cp.dot(Z_norm, Y_norm.T)
-    R = _calc_R(term, similarities)
+    R = _compute_assignment_weights(term, similarities)
     R = _normalize_cp(R, p=1)
 
     # Initialize E (expected) and O (observed) matrices
@@ -511,7 +555,21 @@ def _initialize_centroids(
     _outer_cp(E, Pr_b, R_sum, 1)
 
     O = cp.zeros((n_batches, R.shape[1]), dtype=Z_norm.dtype)
-    _scatter_add_cp(R, O, cats, 1, n_batches=n_batches)
+    n_covariates = cats.shape[1] if cats.ndim == 2 else 1
+    _clustering_cuda.scatter_add(
+        R,
+        categories=cats,
+        category_offsets=cat_offsets if n_covariates == 1 else None,
+        cell_indices=cell_indices if n_covariates == 1 else None,
+        out=O,
+        workspace=reduction_workspace["scatter_workspace"],
+        n_rows=R.shape[0],
+        n_cols=R.shape[1],
+        n_categories=n_batches,
+        n_covariates=n_covariates,
+        switcher=1,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
 
     # Initialize objectives list
     objectives_harmony = []
@@ -524,6 +582,7 @@ def _initialize_centroids(
         E=E,
         objective_arr=objectives_harmony,
         stabilized_penalty=stabilized_penalty,
+        objective_partials=reduction_workspace["objective_partials"],
     )
 
     return R, E, O, objectives_harmony
@@ -541,8 +600,8 @@ def _allocate_clustering_workspace(
     block_size: int,
     dtype: cp.dtype,
 ) -> dict:
-    """Pre-allocate workspace buffers for the C++ clustering loop."""
-    cub_temp_bytes = _hc_cl.get_cub_sort_temp_bytes(n_cells=n_cells)
+    """Allocate temporary arrays for the clustering loop."""
+    cub_temp_bytes = _clustering_cuda.get_cub_sort_temp_bytes(n_cells=n_cells)
     workspace = {
         "Y": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
@@ -571,10 +630,9 @@ def _allocate_clustering_workspace(
     return workspace
 
 
-# Map colsum function to C++ enum: 0=columns, 1=atomics, 2=gemm
+# Map colsum function to C++ enum: 0=columns, 2=gemm
 _COLSUM_MAP = {
     _column_sum: 0,
-    _column_sum_atomic: 1,
     _gemm_colsum: 2,
 }
 
@@ -603,7 +661,7 @@ def _clustering(
     use_joint_scatter: bool,
     kernel_seed: int,
     stabilized_penalty: bool = True,
-    cpp_workspace: dict = None,
+    clustering_workspace: dict = None,
 ) -> None:
     """
     Perform iterative clustering updates on normalized input data, adjusting
@@ -632,7 +690,7 @@ def _clustering(
             "marginal_joint_indices": marginal_joint_indices,
         }
 
-    _hc_cl.clustering_loop(
+    _clustering_cuda.clustering_loop(
         Z_norm,
         R=R,
         E=E,
@@ -641,7 +699,7 @@ def _clustering(
         cats=cats,
         theta=theta,
         **joint_args,
-        **cpp_workspace,
+        **clustering_workspace,
         n_cells=n_cells,
         n_pcs=Z_norm.shape[1],
         n_clusters=n_clusters,
@@ -659,7 +717,7 @@ def _clustering(
         stream=cp.cuda.get_current_stream().ptr,
         handle=cp.cuda.device.get_cublas_handle(),
     )
-    objectives_harmony.append(float(cpp_workspace["last_obj"][0]))
+    objectives_harmony.append(float(clustering_workspace["last_obj"][0]))
 
 
 def _compute_lambda_kb(
@@ -769,14 +827,36 @@ def _correction_multi(
         marginal_joint_indices = (flat_joint_indices // n_covariates).astype(
             cp.int32, copy=False
         )
-    cluster_chunk_size = _multi_correction_cluster_chunk_size(
-        n_cells=n_cells,
-        n_pcs=n_pcs,
-        n_clusters=n_clusters,
-        n_batches=n_batches,
-        n_joint_categories=n_joint_categories,
-        itemsize=X.dtype.itemsize,
-    )
+    rhs_tile_rows = _correction_batched_cuda.JOINT_RHS_TILE_ROWS
+    n_rhs_tiles = (n_cells + rhs_tile_rows - 1) // rhs_tile_rows + n_joint_categories
+    for rhs_tiles in (n_rhs_tiles, 0):
+        try:
+            cluster_chunk_size = _multi_correction_cluster_chunk_size(
+                n_cells=n_cells,
+                n_pcs=n_pcs,
+                n_clusters=n_clusters,
+                n_batches=n_batches,
+                n_joint_categories=n_joint_categories,
+                itemsize=X.dtype.itemsize,
+                n_rhs_tiles=rhs_tiles,
+            )
+        except MemoryError:
+            if rhs_tiles == 0:
+                raise
+        else:
+            n_rhs_tiles = rhs_tiles
+            break
+    joint_tile_offsets = None
+    if n_rhs_tiles:
+        joint_sizes = cp.diff(joint_offsets)
+        joint_tile_offsets = cp.empty_like(joint_offsets)
+        joint_tile_offsets[0] = 0
+        cp.cumsum(
+            joint_sizes // rhs_tile_rows + (joint_sizes % rhs_tile_rows != 0),
+            dtype=cp.int32,
+            out=joint_tile_offsets[1:],
+        )
+        del joint_sizes
 
     Z = _correction_output(X, output)
     for cluster_start in range(0, n_clusters, cluster_chunk_size):
@@ -800,11 +880,16 @@ def _correction_multi(
         joint_rhs = cp.empty(
             (n_joint_categories, chunk_n_clusters, n_pcs), dtype=X.dtype
         )
+        joint_rhs_partials = (
+            cp.empty((n_rhs_tiles, chunk_n_clusters, n_pcs), dtype=X.dtype)
+            if n_rhs_tiles
+            else None
+        )
         active_mask = cp.ascontiguousarray(
             (lambda_kb_chunk < X.dtype.type(_SUPPRESS_PENALTY)).astype(cp.uint8)
         )
 
-        _hc_corr_b.prepare_multi(
+        _correction_batched_cuda.prepare_multi(
             X,
             R=R_chunk,
             O=O_chunk,
@@ -826,13 +911,15 @@ def _correction_multi(
             rhs=rhs,
             joint_O=joint_O,
             joint_rhs=joint_rhs,
+            joint_rhs_partials=joint_rhs_partials,
+            joint_tile_offsets=joint_tile_offsets,
             stream=cp.cuda.get_current_stream().ptr,
             handle=cp.cuda.device.get_cublas_handle(),
         )
 
         W_all = _solve_spd_batched(gram, rhs)
         W_all[:, 0, :] = 0
-        _hc_corr_b.apply_multi(
+        _correction_batched_cuda.apply_multi(
             X,
             R=R_chunk,
             W_all=W_all,
@@ -851,6 +938,7 @@ def _correction_multi(
             gram,
             joint_O,
             joint_rhs,
+            joint_rhs_partials,
             lambda_kb_chunk,
             O_chunk,
             R_chunk,
@@ -946,18 +1034,25 @@ def _multi_correction_cluster_chunk_size(
     n_batches: int,
     n_joint_categories: int,
     itemsize: int,
+    n_rhs_tiles: int = 0,
 ) -> int:
     """Choose a cluster chunk that keeps multi-key scratch below 1 GiB."""
     if n_clusters < 1:
         return 0
 
     nb1 = n_batches + 1
+    fixed_bytes = (
+        (n_joint_categories + 1) * np.dtype(np.int32).itemsize if n_rhs_tiles else 0
+    )
 
     def _workspace_bytes(chunk_n_clusters: int, *, copy_cluster_slices: bool) -> int:
         # CuPy's solve preserves its inputs. Account conservatively for the
         # Gram/RHS copies, solve output, and a possible contiguous output copy.
         float_elements_per_cluster = (
-            3 * nb1 * nb1 + 3 * nb1 * n_pcs + n_joint_categories * (n_pcs + 1)
+            3 * nb1 * nb1
+            + 3 * nb1 * n_pcs
+            + n_joint_categories * (n_pcs + 1)
+            + n_rhs_tiles * n_pcs
         )
         if copy_cluster_slices:
             float_elements_per_cluster += n_cells + 2 * n_batches
@@ -965,7 +1060,7 @@ def _multi_correction_cluster_chunk_size(
         # Active-mask construction can temporarily hold bool and uint8 arrays;
         # LU also needs pivots and device pointer arrays per cluster.
         auxiliary_bytes_per_cluster = 2 * n_batches + 4 * nb1 + 16
-        return chunk_n_clusters * (
+        return fixed_bytes + chunk_n_clusters * (
             float_elements_per_cluster * itemsize + auxiliary_bytes_per_cluster
         )
 
@@ -984,7 +1079,8 @@ def _multi_correction_cluster_chunk_size(
 
     return min(
         n_clusters,
-        _CORRECTION_WORKSPACE_LIMIT_BYTES // single_cluster_workspace,
+        (_CORRECTION_WORKSPACE_LIMIT_BYTES - fixed_bytes)
+        // (single_cluster_workspace - fixed_bytes),
     )
 
 
@@ -1023,7 +1119,7 @@ def _correction_fast(
     g_factor = cp.empty(n_batches, dtype=dtype)
     g_P_row0 = cp.empty(n_batches, dtype=dtype)
 
-    _hc_corr.correction_fast(
+    _correction_cuda.correction_fast(
         X,
         R=R,
         O=O,
@@ -1085,7 +1181,7 @@ def _correction_batched(
     X_batch = cp.empty((batch_chunk_size, n_pcs), dtype=dtype)
     R_batch = cp.empty((batch_chunk_size, n_clusters), dtype=dtype)
 
-    _hc_corr_b.correction_batched(
+    _correction_batched_cuda.correction_batched(
         X,
         R=R,
         O=O,
@@ -1122,6 +1218,7 @@ def _compute_objective(
     E: cp.ndarray,
     objective_arr: list,
     stabilized_penalty: bool = True,
+    objective_partials: cp.ndarray,
 ) -> None:
     """
     Compute the objective function value for Harmony.
@@ -1133,7 +1230,7 @@ def _compute_objective(
     n_cells, n_clusters = R.shape
     n_batches = O.shape[0]
     obj_scalar = cp.zeros(1, dtype=R.dtype)
-    obj = _hc_cl.compute_objective(
+    obj = _clustering_cuda.compute_objective(
         R,
         similarities=similarities,
         O=O,
@@ -1145,6 +1242,7 @@ def _compute_objective(
         n_clusters=n_clusters,
         n_batches=n_batches,
         stabilized=stabilized_penalty,
+        objective_partials=objective_partials,
         stream=cp.cuda.get_current_stream().ptr,
     )
     objective_arr.append(obj)

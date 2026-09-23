@@ -7,7 +7,7 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 import pytest
-from anndata import read_h5ad
+from anndata import AnnData, read_h5ad
 from cupyx.scipy import sparse as sparse_gpu
 from scipy import sparse
 
@@ -178,6 +178,55 @@ def test_n_hop_neighbors(adata):
         n_hop_weights=[1.0, 0.5, 0.25],
     )
     assert "nhood_niche_res=0.5" in adata.obs.columns
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("on_gpu", [False, True])
+@pytest.mark.parametrize("abs_nhood", [False, True])
+def test_neighborhood_profile_counts_unique_neighbors(weighted, on_gpu, abs_nhood):
+    # Cell 3 is reachable from cell 0 by two paths, cell 4 by one.
+    # Cell 5 has no label and an explicitly stored zero self-edge.
+    edge_weights = [2, 5, 7, 3, 1, 4] if weighted else [1] * 6
+    graph = sparse.csr_matrix(
+        (edge_weights + [0], ([0, 0, 0, 1, 1, 2, 5], [1, 2, 5, 3, 4, 3, 5])),
+        shape=(6, 6),
+        dtype=np.float32,
+    )
+    a = AnnData(
+        obs=pd.DataFrame(
+            {GROUPS: pd.Categorical(["A", "A", "B", "A", "B", None])},
+            index=[str(i) for i in range(6)],
+        ),
+        obsp={
+            SPATIAL_CONNECTIVITIES_KEY: sparse_gpu.csr_matrix(graph)
+            if on_gpu
+            else graph
+        },
+    )
+    before = graph.copy()
+
+    profile = cp.asnumpy(
+        _neighborhood_profile(
+            a,
+            groups=GROUPS,
+            distance=2,
+            weights=[1.0, 0.5],
+            abs_nhood=abs_nhood,
+            key=SPATIAL_CONNECTIVITIES_KEY,
+        )
+    )
+
+    expected = (
+        [[1.5, 1.5], [1, 1], [1, 0], [0, 0], [0, 0], [0, 0]]
+        if abs_nhood
+        else [[0.5, 0.5], [1 / 3, 1 / 3], [2 / 3, 0], [0, 0], [0, 0], [0, 0]]
+    )
+    np.testing.assert_allclose(profile, expected)
+    after = a.obsp[SPATIAL_CONNECTIVITIES_KEY]
+    if on_gpu:
+        after = after.get()
+    for attr in ("data", "indices", "indptr"):
+        np.testing.assert_array_equal(getattr(after, attr), getattr(before, attr))
 
 
 def test_min_niche_size_relabels_all(adata):

@@ -107,7 +107,7 @@ def spatial_autocorr(
             GPU selection for permutation tests:
             - None: Use all GPUs if available (default)
             - True: Use all available GPUs
-            - False: Use only GPU 0
+            - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
         copy

@@ -561,7 +561,8 @@ def _lda_fit_transform_gpu(
 
     std = cp.std(centered, axis=0)
     std = cp.where(std == 0, dtype.type(1.0), std)
-    fac = dtype.type(1.0 / (n_samples - n_classes))
+    # Maximum-likelihood within-class covariance, matching scikit-learn >= 1.9.1.
+    fac = dtype.type(1.0 / n_samples)
     within = cp.sqrt(fac) * (centered / std)
     _, s, vt = cp.linalg.svd(within, full_matrices=False)
     rank = int(cp.sum(s > tol).item())

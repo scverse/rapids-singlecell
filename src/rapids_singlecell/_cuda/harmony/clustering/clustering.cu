@@ -13,11 +13,11 @@
 #include "../../nb_types.h"
 
 #include "../colsum/kernels_colsum.cuh"
-#include "../kmeans/kernels_kmeans.cuh"
 #include "../normalize/kernels_normalize.cuh"
 #include "../outer/kernels_outer.cuh"
 #include "../pen/kernels_pen.cuh"
 #include "../scatter/kernels_scatter.cuh"
+#include "../scatter/kernels_scatter_reduce.cuh"
 #include "kernels_clustering.cuh"
 
 using namespace nb::literals;
@@ -27,8 +27,6 @@ constexpr unsigned MAX_BLOCK_DIM = 256;
 constexpr int BLOCK_DIM_1D = 256;
 constexpr int MAX_BLOCK_DIM_1D = 1024;
 constexpr int BLOCKS_PER_SM = 8;
-constexpr int SCATTER_SHARED_BLOCKS_PER_SM = 4;
-constexpr int SCATTER_SHARED_CELLS_PER_BLOCK = 64;
 
 // ---------- Launch helpers ----------
 
@@ -63,11 +61,7 @@ static size_t get_cub_sort_temp_bytes(int n_cells) {
 
 // ---------- Column-sum dispatch ----------
 
-enum ColsumAlgo : int {
-    COLSUM_COLUMNS = 0,
-    COLSUM_ATOMICS = 1,
-    COLSUM_GEMM = 2
-};
+enum ColsumAlgo : int { COLSUM_COLUMNS = 0, COLSUM_GEMM = 2 };
 
 template <typename T>
 static inline void colsum_dispatch(int algo, cublasHandle_t handle, const T* A,
@@ -87,81 +81,12 @@ static inline void colsum_dispatch(int algo, cublasHandle_t handle, const T* A,
             CUDA_CHECK_LAST_ERROR(colsum_kernel);
             break;
         }
-        case COLSUM_ATOMICS: {
-            cudaMemsetAsync(out, 0, cols * sizeof(T), stream);
-            int col_tiles = (cols + (int)WARP_SIZE - 1) / (int)WARP_SIZE;
-            int target_row_tiles =
-                std::max(1, n_sm * SCATTER_SHARED_BLOCKS_PER_SM /
-                                std::max(1, col_tiles));
-            int rows_per_tile =
-                std::max((int)WARP_SIZE,
-                         (rows + target_row_tiles - 1) / target_row_tiles);
-            int row_tiles = (rows + rows_per_tile - 1) / rows_per_tile;
-            colsum_atomic_kernel<T>
-                <<<dim3(col_tiles, row_tiles), dim3(WARP_SIZE, WARP_SIZE), 0,
-                   stream>>>(A, out, rows, cols, rows_per_tile);
-            CUDA_CHECK_LAST_ERROR(colsum_atomic_kernel);
-            break;
-        }
         default:  // COLSUM_GEMM
             cublas_check_status(
                 cublas_gemv<T>(handle, CUBLAS_OP_N, cols, rows, &one, A, cols,
                                ones_vec, 1, &zero, out, 1),
                 "cublas_gemv(colsum)");
             break;
-    }
-}
-
-// ---------- Scatter-add to O (add/subtract block contribution) ----------
-
-template <typename T, int N_COVARIATES>
-static inline void scatter_add_to_O_impl(const T* R_buf, const int* cats_in,
-                                         int current_bs, int n_clusters,
-                                         int n_batches, int n_covariates,
-                                         int switcher, T* O, bool use_shared,
-                                         size_t shared_bytes, int n_sm,
-                                         cudaStream_t stream) {
-    if (use_shared) {
-        int max_blocks =
-            std::max(1, (current_bs + SCATTER_SHARED_CELLS_PER_BLOCK - 1) /
-                            SCATTER_SHARED_CELLS_PER_BLOCK);
-        int blocks = std::min(n_sm * SCATTER_SHARED_BLOCKS_PER_SM, max_blocks);
-        scatter_add_shared_kernel<T, N_COVARIATES>
-            <<<blocks, BLOCK_DIM_1D, shared_bytes, stream>>>(
-                R_buf, cats_in, current_bs, n_clusters, n_batches, n_covariates,
-                switcher, O);
-        CUDA_CHECK_LAST_ERROR(scatter_add_shared_kernel);
-    } else {
-        size_t N = (size_t)current_bs * n_clusters;
-        scatter_add_kernel<T, N_COVARIATES>
-            <<<grid_1d((long long)N, n_sm), BLOCK_DIM_1D, 0, stream>>>(
-                R_buf, cats_in, (size_t)current_bs, (size_t)n_clusters,
-                n_covariates, switcher, O);
-        CUDA_CHECK_LAST_ERROR(scatter_add_kernel);
-    }
-}
-
-template <typename T>
-static inline void scatter_add_to_O_dispatch(
-    const T* R_buf, const int* cats_in, int current_bs, int n_clusters,
-    int n_batches, int n_covariates, int switcher, T* O, bool use_shared,
-    size_t shared_bytes, int n_sm, cudaStream_t stream) {
-    if (n_covariates == 1) {
-        scatter_add_to_O_impl<T, 1>(R_buf, cats_in, current_bs, n_clusters,
-                                    n_batches, n_covariates, switcher, O,
-                                    use_shared, shared_bytes, n_sm, stream);
-    } else if (n_covariates == 2) {
-        scatter_add_to_O_impl<T, 2>(R_buf, cats_in, current_bs, n_clusters,
-                                    n_batches, n_covariates, switcher, O,
-                                    use_shared, shared_bytes, n_sm, stream);
-    } else if (n_covariates == 3) {
-        scatter_add_to_O_impl<T, 3>(R_buf, cats_in, current_bs, n_clusters,
-                                    n_batches, n_covariates, switcher, O,
-                                    use_shared, shared_bytes, n_sm, stream);
-    } else {
-        scatter_add_to_O_impl<T, 0>(R_buf, cats_in, current_bs, n_clusters,
-                                    n_batches, n_covariates, switcher, O,
-                                    use_shared, shared_bytes, n_sm, stream);
     }
 }
 
@@ -247,6 +172,8 @@ struct ClusteringArgs {
     T* obj_scalar;
     const T* ones_vec;
     T* last_obj;
+    uint8_t* scatter_workspace;
+    T* objective_partials;
 
     // Dimensions
     int n_cells;
@@ -267,59 +194,6 @@ struct ClusteringArgs {
     cublasHandle_t handle;
 };
 
-// ---------- Standalone objective computation ----------
-
-template <typename T>
-static T compute_objective_impl(const T* R, const T* similarities, const T* O,
-                                const T* E, const T* theta, T sigma,
-                                T* obj_scalar, int n_cells, int n_clusters,
-                                int n_batches, bool stabilized,
-                                cudaStream_t stream) {
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    int n_sm = prop.multiProcessorCount;
-
-    cudaMemsetAsync(obj_scalar, 0, sizeof(T), stream);
-
-    // K-means error: sum(R[i] * 2 * (1 - sim[i]))
-    {
-        size_t n = (size_t)n_cells * n_clusters;
-        kmeans_err_kernel<T>
-            <<<grid_1d((long long)n, n_sm), BLOCK_DIM_1D, 0, stream>>>(
-                R, similarities, n, obj_scalar);
-        CUDA_CHECK_LAST_ERROR(kmeans_err_kernel);
-    }
-
-    // Entropy: sigma * sum(x_norm * log(x_norm + eps)), row-normalized
-    // internally
-    entropy_kernel<T><<<n_cells, warp_aligned_bdim(n_clusters), 0, stream>>>(
-        R, sigma, n_cells, n_clusters, obj_scalar);
-    CUDA_CHECK_LAST_ERROR(entropy_kernel);
-
-    // Diversity penalty (stabilized selects Harmony2 formula)
-    {
-        int ob_total = n_batches * n_clusters;
-        int threads = (int)warp_aligned_bdim(ob_total);
-        int blocks =
-            std::max(1, std::min(n_sm, (ob_total + threads - 1) / threads));
-        if (stabilized)
-            diversity_kernel<T, true><<<blocks, threads, 0, stream>>>(
-                O, E, theta, sigma, n_batches, n_clusters, obj_scalar);
-        else
-            diversity_kernel<T, false><<<blocks, threads, 0, stream>>>(
-                O, E, theta, sigma, n_batches, n_clusters, obj_scalar);
-        CUDA_CHECK_LAST_ERROR(diversity_kernel);
-    }
-
-    T host_obj;
-    cudaMemcpyAsync(&host_obj, obj_scalar, sizeof(T), cudaMemcpyDeviceToHost,
-                    stream);
-    cudaStreamSynchronize(stream);
-    return host_obj;
-}
-
 // ---------- Main clustering loop ----------
 
 template <typename T>
@@ -336,6 +210,8 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
             throw std::invalid_argument(
                 "joint scatter requires all joint input and workspace arrays");
     }
+    if (!a.objective_partials || !a.scatter_workspace)
+        throw std::invalid_argument("clustering requires its workspace arrays");
 
     size_t cub_temp_bytes = get_cub_sort_temp_bytes(a.n_cells);
 
@@ -352,17 +228,6 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
     int n_sm = prop.multiProcessorCount;
-
-    // Scatter-add: prefer shared-memory variant when O fits in smem
-    size_t scatter_shared_bytes =
-        (size_t)a.n_batches * a.n_clusters * sizeof(T);
-    bool use_scatter_shared =
-        (scatter_shared_bytes <= (size_t)prop.sharedMemPerBlock);
-    size_t joint_scatter_shared_bytes =
-        (size_t)a.n_joint_categories * a.n_clusters * sizeof(T);
-    bool use_joint_scatter_shared =
-        a.use_joint_scatter &&
-        (joint_scatter_shared_bytes <= (size_t)prop.sharedMemPerBlock);
 
     // Host-side convergence tracking
     std::vector<T> objectives;
@@ -392,11 +257,9 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
 
         // ---- Shuffle: random permutation via PCG hash + radix sort ----
         pcg_hash_kernel<<<grid_1d(a.n_cells, n_sm), BLOCK_DIM_1D, 0,
-                          a.stream>>>(a.sort_keys, a.n_cells, a.seed + iter);
+                          a.stream>>>(a.sort_keys, a.idx_list, a.n_cells,
+                                      a.seed + iter);
         CUDA_CHECK_LAST_ERROR(pcg_hash_kernel);
-        iota_kernel<<<grid_1d(a.n_cells, n_sm), BLOCK_DIM_1D, 0, a.stream>>>(
-            a.idx_list, a.n_cells);
-        CUDA_CHECK_LAST_ERROR(iota_kernel);
 
         cudaError_t sort_status = cub::DeviceRadixSort::SortPairs(
             a.cub_temp, cub_temp_bytes, a.sort_keys, a.sort_keys_alt,
@@ -440,20 +303,17 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
                                a.R_in_sum, a.ones_vec, bs, a.n_clusters, n_sm,
                                a.stream);
             if (a.use_joint_scatter) {
-                scatter_add_to_O_impl<T, 1>(
-                    a.R_out_buffer, a.joint_codes_in, bs, a.n_clusters,
-                    a.n_joint_categories, 1, 0, a.O_joint,
-                    use_joint_scatter_shared, joint_scatter_shared_bytes, n_sm,
-                    a.stream);
+                scatter_reduce(a.R_out_buffer, a.joint_codes_in, bs,
+                               a.n_clusters, a.n_joint_categories, 1, 0,
+                               a.O_joint, a.scatter_workspace, a.stream);
                 materialize_marginal_from_joint<T>(
                     a.O_joint, a.marginal_joint_offsets,
                     a.marginal_joint_indices, a.O, a.n_batches, a.n_clusters,
                     n_sm, a.stream);
             } else {
-                scatter_add_to_O_dispatch<T>(
-                    a.R_out_buffer, a.cats_in, bs, a.n_clusters, a.n_batches,
-                    a.n_covariates, 0, a.O, use_scatter_shared,
-                    scatter_shared_bytes, n_sm, a.stream);
+                scatter_reduce(a.R_out_buffer, a.cats_in, bs, a.n_clusters,
+                               a.n_batches, a.n_covariates, 0, a.O,
+                               a.scatter_workspace, a.stream);
             }
             outer_kernel<T><<<(ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
                               BLOCK_DIM_1D, 0, a.stream>>>(
@@ -490,16 +350,13 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
                                a.R_out_sum, a.ones_vec, bs, a.n_clusters, n_sm,
                                a.stream);
             if (a.use_joint_scatter) {
-                scatter_add_to_O_impl<T, 1>(
-                    a.R_out_buffer, a.joint_codes_in, bs, a.n_clusters,
-                    a.n_joint_categories, 1, 1, a.O_joint,
-                    use_joint_scatter_shared, joint_scatter_shared_bytes, n_sm,
-                    a.stream);
+                scatter_reduce(a.R_out_buffer, a.joint_codes_in, bs,
+                               a.n_clusters, a.n_joint_categories, 1, 1,
+                               a.O_joint, a.scatter_workspace, a.stream, true);
             } else {
-                scatter_add_to_O_dispatch<T>(
-                    a.R_out_buffer, a.cats_in, bs, a.n_clusters, a.n_batches,
-                    a.n_covariates, 1, a.O, use_scatter_shared,
-                    scatter_shared_bytes, n_sm, a.stream);
+                scatter_reduce(a.R_out_buffer, a.cats_in, bs, a.n_clusters,
+                               a.n_batches, a.n_covariates, 1, a.O,
+                               a.scatter_workspace, a.stream, true);
             }
             outer_kernel<T><<<(ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
                               BLOCK_DIM_1D, 0, a.stream>>>(
@@ -515,9 +372,10 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
         }
 
         // ---- Objective function (reuses similarities buffer) ----
-        host_obj = compute_objective_impl(
+        host_obj = compute_objective(
             a.R, a.similarities, a.O, a.E, a.theta, a.sigma, a.obj_scalar,
-            a.n_cells, a.n_clusters, a.n_batches, a.stabilized, a.stream);
+            a.objective_partials, a.n_cells, a.n_clusters, a.n_batches,
+            a.stabilized, a.stream);
         objectives.push_back(host_obj);
 
         if (static_cast<int>(objectives.size()) >= WINDOW_SIZE + 1) {
@@ -564,7 +422,9 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<T, Device> penalty_buf,
            gpu_array_c<T, Device> obj_scalar,
            gpu_array_c<const T, Device> ones_vec,
-           gpu_array_c<T, Device> last_obj, int n_cells, int n_pcs,
+           gpu_array_c<T, Device> last_obj,
+           gpu_array_c<uint8_t, Device> scatter_workspace,
+           gpu_array_c<T, Device> objective_partials, int n_cells, int n_pcs,
            int n_clusters, int n_batches, int n_covariates,
            int n_joint_categories, int block_size, int colsum_algo,
            double sigma, double tol, int max_iter, unsigned int seed,
@@ -601,6 +461,8 @@ static void register_clustering_loop(nb::module_& m) {
                 obj_scalar.data(),
                 ones_vec.data(),
                 last_obj.data(),
+                scatter_workspace.data(),
+                objective_partials.data(),
                 n_cells,
                 n_pcs,
                 n_clusters,
@@ -628,10 +490,11 @@ static void register_clustering_loop(nb::module_& m) {
         "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a, "R_out_buffer"_a,
         "cats_in"_a, "joint_codes_in"_a = nb::none(), "R_in_sum"_a,
         "R_out_sum"_a, "penalty"_a, "obj_scalar"_a, "ones_vec"_a, "last_obj"_a,
-        "n_cells"_a, "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a,
-        "n_joint_categories"_a, "block_size"_a, "colsum_algo"_a, "sigma"_a,
-        "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a, "use_joint_scatter"_a,
-        "stream"_a = 0, "handle"_a);
+        "scatter_workspace"_a, "objective_partials"_a, "n_cells"_a, "n_pcs"_a,
+        "n_clusters"_a, "n_batches"_a, "n_covariates"_a, "n_joint_categories"_a,
+        "block_size"_a, "colsum_algo"_a, "sigma"_a, "tol"_a, "max_iter"_a,
+        "seed"_a, "stabilized"_a, "use_joint_scatter"_a, "stream"_a = 0,
+        "handle"_a);
 }
 
 template <typename T, typename Device>
@@ -643,15 +506,101 @@ static void register_compute_objective(nb::module_& m) {
            gpu_array_c<const T, Device> O, gpu_array_c<const T, Device> E,
            gpu_array_c<const T, Device> theta, double sigma,
            gpu_array_c<T, Device> obj_scalar, int n_cells, int n_clusters,
-           int n_batches, bool stabilized, std::uintptr_t stream) {
-            return compute_objective_impl<T>(
+           int n_batches, bool stabilized,
+           gpu_array_c<T, Device> objective_partials, std::uintptr_t stream) {
+            if (objective_partials.size() < (size_t)n_cells)
+                throw std::invalid_argument(
+                    "objective_partials must hold at least n_cells elements");
+            return compute_objective<T>(
                 R.data(), similarities.data(), O.data(), E.data(), theta.data(),
-                static_cast<T>(sigma), obj_scalar.data(), n_cells, n_clusters,
-                n_batches, stabilized, (cudaStream_t)stream);
+                static_cast<T>(sigma), obj_scalar.data(),
+                objective_partials.data(), n_cells, n_clusters, n_batches,
+                stabilized, (cudaStream_t)stream);
         },
         "R"_a, nb::kw_only(), "similarities"_a, "O"_a, "E"_a, "theta"_a,
         "sigma"_a, "obj_scalar"_a, "n_cells"_a, "n_clusters"_a, "n_batches"_a,
-        "stabilized"_a, "stream"_a = 0);
+        "stabilized"_a, "objective_partials"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+static void register_kmeans_selection(nb::module_& m) {
+    m.def(
+        "select_kmeans_center",
+        [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> weights,
+           gpu_array_c<const double, Device> uniforms,
+           gpu_array_c<T, Device> centers, gpu_array_c<double, Device> totals,
+           gpu_array_c<int, Device> n_draws, int cluster,
+           std::uintptr_t stream) {
+            int n_rows = (int)X.shape(0), n_cols = (int)X.shape(1);
+            int n_tiles = n_rows / KMEANS_WEIGHT_TILE_ROWS +
+                          (n_rows % KMEANS_WEIGHT_TILE_ROWS != 0);
+            if (totals.size() < (size_t)n_tiles)
+                throw std::invalid_argument(
+                    "k-means totals workspace is too small");
+            auto cuda_stream = (cudaStream_t)stream;
+            kmeans_weight_tiles_kernel<T>
+                <<<n_tiles, KMEANS_WEIGHT_THREADS, 0, cuda_stream>>>(
+                    weights.data(), totals.data(), n_rows);
+            CUDA_CHECK_LAST_ERROR(kmeans_weight_tiles_kernel);
+            kmeans_select_center_kernel<T>
+                <<<1, KMEANS_WEIGHT_THREADS, 0, cuda_stream>>>(
+                    X.data(), weights.data(), totals.data(), uniforms.data(),
+                    centers.data(), n_draws.data(), n_rows, n_cols, n_tiles,
+                    cluster);
+            CUDA_CHECK_LAST_ERROR(kmeans_select_center_kernel);
+        },
+        "X"_a, nb::kw_only(), "weights"_a, "uniforms"_a, "centers"_a,
+        "totals"_a, "n_draws"_a, "cluster"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+static void register_scatter(nb::module_& m) {
+    m.def(
+        "scatter_add",
+        [](gpu_array_c<const T, Device> values,
+           gpu_array_c<const int, Device> categories,
+           gpu_array_c<T, Device> out, gpu_array_c<uint8_t, Device> workspace,
+           int n_rows, int n_cols, int n_categories, int n_covariates,
+           int switcher, std::uintptr_t stream,
+           std::optional<gpu_array_c<const int, Device>> category_offsets,
+           std::optional<gpu_array_c<const int, Device>> cell_indices) {
+            if (category_offsets.has_value() != cell_indices.has_value())
+                throw std::invalid_argument(
+                    "grouped scatter requires both category_offsets and "
+                    "cell_indices");
+            size_t required_bytes =
+                scatter_temp_bytes(n_rows, n_cols, n_categories, n_covariates,
+                                   sizeof(T), category_offsets.has_value());
+            if (workspace.size() < required_bytes)
+                throw std::invalid_argument("scatter workspace is too small");
+            if (category_offsets) {
+                if (category_offsets->ndim() != 1 ||
+                    category_offsets->size() != (size_t)n_categories + 1 ||
+                    cell_indices->ndim() != 1 ||
+                    cell_indices->size() != (size_t)n_rows)
+                    throw std::invalid_argument(
+                        "grouped scatter CSR arrays have incorrect shapes");
+                int* tiles = reinterpret_cast<int*>(workspace.data());
+                T* partial = reinterpret_cast<T*>(
+                    workspace.data() + scatter_grouped_int_bytes(n_categories));
+                scatter_tile_offsets_kernel<<<1, SCATTER_SCAN_THREADS, 0,
+                                              (cudaStream_t)stream>>>(
+                    category_offsets->data(), n_categories, tiles);
+                CUDA_CHECK_LAST_ERROR(scatter_tile_offsets_kernel);
+                scatter_reduce_tiles(
+                    values.data(), n_rows, n_cols, n_categories,
+                    cell_indices->data(), category_offsets->data(), tiles,
+                    partial, switcher, out.data(), (cudaStream_t)stream);
+                return;
+            }
+            scatter_reduce(values.data(), categories.data(), n_rows, n_cols,
+                           n_categories, n_covariates, switcher, out.data(),
+                           workspace.data(), (cudaStream_t)stream);
+        },
+        "values"_a, nb::kw_only(), "categories"_a, "out"_a, "workspace"_a,
+        "n_rows"_a, "n_cols"_a, "n_categories"_a, "n_covariates"_a = 1,
+        "switcher"_a, "stream"_a = 0, "category_offsets"_a = nb::none(),
+        "cell_indices"_a = nb::none());
 }
 
 template <typename Device>
@@ -660,13 +609,27 @@ void register_bindings(nb::module_& m) {
         "get_cub_sort_temp_bytes",
         [](int n_cells) { return get_cub_sort_temp_bytes(n_cells); },
         nb::kw_only(), "n_cells"_a);
+    m.def(
+        "get_scatter_temp_bytes",
+        [](int n_rows, int n_cols, int n_categories, int n_covariates,
+           int itemsize, bool grouped) {
+            return scatter_temp_bytes(n_rows, n_cols, n_categories,
+                                      n_covariates, itemsize, grouped);
+        },
+        nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_categories"_a,
+        "n_covariates"_a = 1, "itemsize"_a = 4, "grouped"_a = false);
 
     register_clustering_loop<float, Device>(m);
     register_clustering_loop<double, Device>(m);
     register_compute_objective<float, Device>(m);
     register_compute_objective<double, Device>(m);
+    register_scatter<float, Device>(m);
+    register_scatter<double, Device>(m);
+    register_kmeans_selection<float, Device>(m);
+    register_kmeans_selection<double, Device>(m);
 }
 
 NB_MODULE(_harmony_clustering_cuda, m) {
+    m.attr("KMEANS_WEIGHT_TILE_ROWS") = nb::int_(KMEANS_WEIGHT_TILE_ROWS);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

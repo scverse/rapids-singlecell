@@ -98,6 +98,23 @@ def test_regress_out_categorical(dtype, sparse_format):
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("batchsize", ["all", 100])
+def test_regress_out_covariate_scale(dtype, batchsize):
+    adata = sc.datasets.pbmc68k_reduced()
+    adata = adata.raw.to_adata()[:200, :200].copy()
+    adata.obs["n_counts"] = adata.obs["n_counts"].to_numpy() * 100
+    rsc.get.anndata_to_GPU(adata)
+    adata.X = adata.X.astype(dtype)
+    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=batchsize)
+    # Same reference as test_regress_out_reproducible: scaling changes nothing.
+    tester = np.load(HERE / "_data/regress_test_small.npy")
+    if dtype == "float32":
+        cp.testing.assert_allclose(adata.X, tester, atol=1e-5)
+    else:
+        cp.testing.assert_allclose(adata.X, tester, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("batchsize", ["all", 100])
 def test_regress_out_reproducible(dtype, batchsize):
     adata = sc.datasets.pbmc68k_reduced()
     adata = adata.raw.to_adata()[:200, :200].copy()

@@ -191,6 +191,49 @@ def test_perturbation_signature_writes_layer(mixscape_adata):
     assert mixscape_adata.layers["X_pert"].shape == mixscape_adata.shape
 
 
+@pytest.mark.parametrize("analyzer", [rsc.ptg.Mixscape, rsc.ptg.Mixscale])
+@pytest.mark.parametrize("preset", list(rsc.Preset))
+@pytest.mark.parametrize("pca_keys", [("X_pca",), ("pca",), ("X_pca", "pca")])
+def test_perturbation_signature_recomputes_short_pca(
+    mixscape_adata, analyzer, preset, pca_keys
+):
+    adata = mixscape_adata
+    selected_key = pca_keys[0]
+    key_added = None if selected_key == "X_pca" else selected_key
+    with rsc.settings.override(preset=preset, N_PCS=3):
+        rsc.pp.pca(adata, n_comps=2, key_added=key_added)
+        if len(pca_keys) > 1:
+            rsc.pp.pca(adata, n_comps=6, key_added="pca")
+        expected = adata.copy()
+        rsc.pp.pca(expected, n_comps=4, key_added=key_added)
+
+        for target in (adata, expected):
+            analyzer().perturbation_signature(
+                target, pert_key="gene_target", control="NT", n_pcs=4
+            )
+
+    assert adata.obsm[selected_key].shape[1] == 4
+    assert set(adata.obsm) == set(pca_keys)
+    if len(pca_keys) > 1:
+        np.testing.assert_array_equal(adata.obsm["pca"], expected.obsm["pca"])
+    cp.testing.assert_allclose(adata.layers["X_pert"], expected.layers["X_pert"])
+
+
+@pytest.mark.parametrize("use_rep", ["X_pca", "pca", "custom"])
+def test_perturbation_signature_explicit_rep_is_not_recomputed(mixscape_adata, use_rep):
+    adata = mixscape_adata
+    adata.obsm[use_rep] = np.zeros((adata.n_obs, 2), dtype=np.float32)
+    with (
+        rsc.settings.override(N_PCS=3),
+        pytest.raises(ValueError, match="does not have enough Dimensions"),
+    ):
+        rsc.ptg.Mixscape().perturbation_signature(
+            adata, pert_key="gene_target", control="NT", use_rep=use_rep, n_pcs=4
+        )
+    assert adata.obsm[use_rep].shape[1] == 2
+    assert "pca" not in adata.uns
+
+
 def test_mixscape_requires_signature(mixscape_adata):
     with pytest.raises(KeyError, match="X_pert"):
         rsc.ptg.Mixscape().mixscape(

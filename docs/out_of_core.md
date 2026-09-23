@@ -21,9 +21,9 @@ from dask_cuda import LocalCUDACluster
 cluster = LocalCUDACluster(
     CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
     protocol="ucx",
-    threads_per_worker=1,           # GPU-safe default
-    rmm_pool_size="80%",            # per-worker pool; % of free VRAM at start
-    rmm_managed_memory=False,       # avoid UM to maximize P2P
+    threads_per_worker=1,  # GPU-safe default
+    rmm_pool_size="80%",  # per-worker pool; % of free VRAM at start
+    rmm_managed_memory=False,  # avoid UM to maximize P2P
     rmm_allocator_external_lib_list=["cupy"],  # auto-patch CuPy to use RMM
 )
 client = Client(cluster)
@@ -36,10 +36,10 @@ from dask.distributed import Client
 from dask_cuda import LocalCUDACluster
 
 cluster = LocalCUDACluster(
-    CUDA_VISIBLE_DEVICES="0,1",     # scale as needed
-    protocol="tcp",                 # TCP is often more predictable with UVM
+    CUDA_VISIBLE_DEVICES="0,1",  # scale as needed
+    protocol="tcp",  # TCP is often more predictable with UVM
     threads_per_worker=1,
-    rmm_managed_memory=True,        # allow oversubscription (paging)
+    rmm_managed_memory=True,  # allow oversubscription (paging)
     rmm_allocator_external_lib_list=["cupy"],
 )
 client = Client(cluster)
@@ -53,29 +53,21 @@ client = Client(cluster)
 
 ## Loading AnnData lazily from Zarr (from the multi-GPU notebook)
 
-Load `AnnData` from a Zarr store with `X` as a Dask array, and `obs/var` read eagerly. Chunk by rows.
+Load `AnnData` from a Zarr store with dense or CSR-encoded `X` as a Dask array, and `obs/var` read eagerly. Chunk by rows, keeping all genes in each chunk.
 
 ```python
 import anndata as ad
-from importlib.metadata import version
-from packaging.version import parse as parse_version
-
-if parse_version(version("anndata")) < parse_version("0.12.0rc1"):
-    from anndata.experimental import read_elem_as_dask as read_dask
-else:
-    from anndata.experimental import read_elem_lazy as read_dask
-
 import zarr
+from anndata.experimental import read_elem_lazy
 
 SPARSE_CHUNK_SIZE = 20_000
 data_pth = "zarr/cell_atlas.zarr"  # example zarr path
 
 f = zarr.open(data_pth, mode="r")
 X = f["X"]
-shape = X.attrs["shape"]
 
 adata = ad.AnnData(
-    X=read_dask(X, (SPARSE_CHUNK_SIZE, shape[1])),
+    X=read_elem_lazy(X, chunks=(SPARSE_CHUNK_SIZE, -1)),
     obs=ad.io.read_elem(f["obs"]),
     var=ad.io.read_elem(f["var"]),
 )
@@ -85,6 +77,7 @@ adata = ad.AnnData(
 
 ```python
 import rapids_singlecell as rsc
+
 rsc.get.anndata_to_GPU(adata)
 # Normalize and transform
 rsc.pp.normalize_total(adata)
@@ -103,10 +96,11 @@ Most functions operate lazily; use `.compute()` only when you need concrete valu
 
 ## Computing results explicitly
 
+Calling `.compute()` gathers the entire result onto the client, where it must fit in GPU memory.
+
 ```python
 # Dense dask+cupy matrix → cupy
 X_gpu = adata.X.compute()
-
 ```
 
 ## Persist and chunk sizes
@@ -146,14 +140,14 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.pp.pca`
 - {func}`~.tl.score_genes`
 - {func}`~.tl.score_genes_cell_cycle`
-- {func}`~.tl.louvain`
-- {func}`~.tl.leiden`
+- {func}`~.tl.louvain` (set `use_dask=True` to distribute graph clustering)
+- {func}`~.tl.leiden` (set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`
 
 For Dask inputs, {func}`~.pp.normalize_total` does not support
 `exclude_highly_expressed=True`. {func}`~.pp.pca` uses the
-`covariance_eigh` solver; `chunked=True`, `lanczos`, and `randomized` are not
+`covariance_eigh` solver by default; `chunked=True`, `lanczos`, and `randomized` are not
 supported.
 
 ## Troubleshooting

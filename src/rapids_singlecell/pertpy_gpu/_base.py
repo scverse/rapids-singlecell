@@ -9,6 +9,7 @@ import pandas as pd
 from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
 
+from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
 from rapids_singlecell.tools._utils import _choose_representation
 
@@ -290,7 +291,19 @@ def _choose_representation_gpu(
     Always returns a float32 representation: neighbor selection does not need
     float64 precision, and the cuVS backends (ivfflat/cagra) only accept float32.
     """
-    rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+    try:
+        rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+    except ValueError:
+        # A preset PCA with fewer than ``n_pcs`` components is recomputed;
+        # an explicit ``use_rep`` or a missing ``.X`` keeps the original error.
+        pca_keys = _existing_preset_keys(adata, "pca") if use_rep is None else None
+        if pca_keys is None or adata.X is None:
+            raise
+        from rapids_singlecell.preprocessing import pca
+
+        key_added = None if pca_keys == _embedding_keys("pca", None) else pca_keys.obsm
+        pca(adata, n_comps=n_pcs, key_added=key_added)
+        rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     rep = _to_dense_gpu(rep)
     rep = cp.asarray(rep, dtype=cp.float32)
     if n_pcs is not None and n_pcs < rep.shape[1]:

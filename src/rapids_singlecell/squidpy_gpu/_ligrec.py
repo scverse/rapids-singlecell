@@ -433,7 +433,6 @@ def ligrec(
         dtype=np.uint32,
     )
 
-    data["clusters"] = cat.rename_categories(cluster_mapper)
     # much faster than applymap (tested on 1M interactions)
     interactions_ = np.vectorize(lambda g: gene_mapper[g])(interactions.values)
 
@@ -443,7 +442,7 @@ def ligrec(
         data_cp = cp.array(mat)
 
     # Convert the 'clusters' column to a CuPy array
-    clusters = cp.array(data["clusters"].values, dtype=cp.int32)
+    clusters = cp.array(cat.codes.values, dtype=cp.int32)
 
     # Find the unique clusters and the number of clusters
     unique_clusters = cp.unique(clusters)

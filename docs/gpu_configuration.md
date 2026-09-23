@@ -175,7 +175,7 @@ AnnData stores {attr}`~anndata.AnnData.raw` in CPU memory, even when `.X` was al
 rsc.get.anndata_to_GPU(adata)
 adata.raw = adata.copy()
 
-print(type(adata.X))      # CuPy or cupyx: GPU
+print(type(adata.X))  # CuPy or cupyx: GPU
 print(type(adata.raw.X))  # NumPy or SciPy: CPU
 ```
 
@@ -249,7 +249,7 @@ with cp.cuda.Device(gpu_device):
 Creating a CUDA context is enough for the process to appear on a GPU in `nvidia-smi`.
 Contexts normally remain until the process or notebook kernel exits.
 
-rapids-singlecell integrates with the RAPIDS Memory Manager ({mod}`rmm`).
+rapids-singlecell integrates with NVIDIA RMM ({mod}`rmm`).
 RMM controls how GPU memory is allocated, but it does not select or hide GPUs.
 
 Most users do not need to reinitialize RMM to choose a GPU.
