@@ -22,13 +22,13 @@ Read this file for CRISPR screens, perturbation signatures, or distance-based pe
 Two steps, and the call sites differ: `create_contrasts` is a staticmethod on the class, while `contrast_distances` needs a configured instance.
 
 ```python
-contrasts = rsc.ptg.Distance.create_contrasts(   # staticmethod: call on the class
+contrasts = rsc.ptg.Distance.create_contrasts(  # staticmethod: call on the class
     adata,
     groupby="target_gene",
-    selected_group="Non_target",   # a sequence compares against several references
-    split_by="cell_type",          # one contrast per perturbation *within* each cell type
+    selected_group="Non_target",  # a sequence compares against several references
+    split_by="cell_type",  # one contrast per perturbation *within* each cell type
 )
-contrasts = contrasts[contrasts["target_gene"].isin(hits)]   # filter before computing
+contrasts = contrasts[contrasts["target_gene"].isin(hits)]  # filter before computing
 result = rsc.ptg.Distance(metric="edistance").contrast_distances(adata, contrasts)
 ```
 

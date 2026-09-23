@@ -32,19 +32,29 @@ SEED = 0
 Adapt this shape, one stage per cell, resolving every call against the live package:
 
 ```python
-adata = sc.read_h5ad(path)                 # inspect shape/sparsity/counts before choosing methods
-adata.layers["counts"] = adata.X.copy()    # preserve immutable source counts
-rsc.get.anndata_to_GPU(adata, convert_all=True)      # layers too, or pp raises _check_gpu_X
-rsc.pp.calculate_qc_metrics(adata, ...)    # plot distributions with sc.pl, justify thresholds
-rsc.pp.filter_cells(adata, ...); rsc.pp.filter_genes(adata, ...)
-rsc.pp.highly_variable_genes(adata, layer="counts", flavor="seurat_v3", n_top_genes=2000)
-rsc.pp.normalize_total(adata); rsc.pp.log1p(adata)   # normalize the full object
-rsc.pp.pca(adata, mask_var="highly_variable")        # float32
+adata = sc.read_h5ad(path)  # inspect shape/sparsity/counts before choosing methods
+adata.layers["counts"] = adata.X.copy()  # preserve immutable source counts
+rsc.get.anndata_to_GPU(adata, convert_all=True)  # layers too, or pp raises _check_gpu_X
+rsc.pp.calculate_qc_metrics(
+    adata, ...
+)  # plot distributions with sc.pl, justify thresholds
+rsc.pp.filter_cells(adata, ...)
+rsc.pp.filter_genes(adata, ...)
+rsc.pp.highly_variable_genes(
+    adata, layer="counts", flavor="seurat_v3", n_top_genes=2000
+)
+rsc.pp.normalize_total(adata)
+rsc.pp.log1p(adata)  # normalize the full object
+rsc.pp.pca(adata, mask_var="highly_variable")  # float32
 rsc.pp.neighbors(adata)
-rsc.tl.leiden(adata, dtype="float64", random_state=SEED)   # float64 keeps the partition stable
+rsc.tl.leiden(
+    adata, dtype="float64", random_state=SEED
+)  # float64 keeps the partition stable
 rsc.tl.umap(adata, random_state=SEED)
-rsc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon")   # annotate from evidence
-rsc.get.anndata_to_CPU(adata)              # one intentional interop boundary
+rsc.tl.rank_genes_groups(
+    adata, groupby="leiden", method="wilcoxon"
+)  # annotate from evidence
+rsc.get.anndata_to_CPU(adata)  # one intentional interop boundary
 adata.write(out_path)
 ```
 
