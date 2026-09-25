@@ -11,11 +11,14 @@ from anndata import AnnData
 from tqdm.auto import tqdm
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.decoupler_gpu._helper._data import extract
+from rapids_singlecell.decoupler_gpu._helper._data import (
+    _get_batch,
+    _mat_to_array,
+    extract,
+)
 from rapids_singlecell.decoupler_gpu._helper._log import _log
 from rapids_singlecell.decoupler_gpu._helper._net import adjmat, idxmat, prune
 from rapids_singlecell.decoupler_gpu._helper._pv import fdr_bh_axis1
-from rapids_singlecell.preprocessing._utils import _sparse_to_dense
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,43 +52,6 @@ def _return(
         return es, pv
 
 
-def _get_batch(mat, srt, end):
-    if sps.issparse(mat):
-        bmat = csps.csr_matrix(mat[srt:end])
-        bmat = _sparse_to_dense(bmat)
-    elif csps.issparse(mat):
-        bmat = _sparse_to_dense(mat[srt:end])
-    elif isinstance(mat, np.ndarray):
-        bmat = cp.array(mat[srt:end, :])
-    elif isinstance(mat, cp.ndarray):
-        bmat = mat[srt:end, :]
-    else:
-        bmat, msk_col = mat
-        bmat = bmat[srt:end, :]
-        if sps.issparse(bmat):
-            bmat = csps.csr_matrix(bmat)
-            bmat = _sparse_to_dense(bmat)
-        else:
-            bmat = cp.array(bmat)
-        bmat = bmat[:, msk_col]
-    return bmat.astype(cp.float32)
-
-
-def _mat_to_array(mat):
-    if sps.issparse(mat):
-        mat = csps.csr_matrix(mat)
-        mat = _sparse_to_dense(mat)
-    elif csps.issparse(mat):
-        mat = _sparse_to_dense(mat)
-    elif isinstance(mat, np.ndarray):
-        mat = cp.array(mat)
-    elif isinstance(mat, cp.ndarray):
-        mat = mat
-    else:
-        raise ValueError(f"Unsupported matrix type: {type(mat)}")
-    return mat.astype(cp.float32)
-
-
 def _run_dask_adj(
     func: Callable,
     mat: DaskArray,
@@ -106,7 +72,7 @@ def _run_dask_adj(
     def process_chunk(chunk, adjm, block_info=None):
         # Convert to GPU inside chunk
         adjm_gpu = cp.array(adjm, dtype=cp.float32)
-        chunk_gpu = _mat_to_array(chunk) if not isinstance(chunk, cp.ndarray) else chunk
+        chunk_gpu = _mat_to_array(chunk)
         es, pv = func(chunk_gpu, adjm_gpu, verbose=False, **kwargs)
         # Free GPU memory
         del chunk_gpu, adjm_gpu
@@ -144,8 +110,8 @@ def _run_dask_idx(
     *,
     verbose: bool = False,
     **kwargs,
-) -> tuple[np.ndarray, None]:
-    """Dask execution for adj=False methods (AUCell) - each chunk = one batch."""
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Dask execution for adj=False methods (AUCell, ORA) - each chunk = one batch."""
     import dask
 
     # Wrap arrays in delayed to avoid serializing per-task
@@ -158,8 +124,8 @@ def _run_dask_idx(
         cnct_gpu = cp.array(cnct, dtype=cp.int32)
         starts_gpu = cp.array(starts, dtype=cp.int32)
         offsets_gpu = cp.array(offsets, dtype=cp.int32)
-        chunk_gpu = _mat_to_array(chunk) if not isinstance(chunk, cp.ndarray) else chunk
-        es, _ = func(
+        chunk_gpu = _mat_to_array(chunk)
+        es, pv = func(
             chunk_gpu,
             cnct=cnct_gpu,
             starts=starts_gpu,
@@ -170,7 +136,7 @@ def _run_dask_idx(
         # Free GPU memory
         del chunk_gpu, cnct_gpu, starts_gpu, offsets_gpu
         cp.get_default_memory_pool().free_all_blocks()
-        return es
+        return es, pv
 
     # Create delayed tasks for each row block
     # Rechunk to ensure all features are in one chunk per row block
@@ -186,9 +152,8 @@ def _run_dask_idx(
         tasks.append(task)
 
     _log("dask - computing batches", level="info", verbose=verbose)
-    results = dask.compute(*tasks)
-    computed = np.vstack(results)
-    return computed, None
+    es, pv = zip(*dask.compute(*tasks), strict=True)
+    return np.vstack(es), np.vstack(pv) if pv[0] is not None else None
 
 
 def _run(
