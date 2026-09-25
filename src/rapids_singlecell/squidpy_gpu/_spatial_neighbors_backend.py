@@ -1,72 +1,64 @@
 from __future__ import annotations
 
+from functools import partial
+
 import cupy as cp
 
 from rapids_singlecell._cuda import _spatial_cuda
 
-from ._spatial_kdtree import _build_kdtree
+
+def _build_kdtree(
+    points: cp.ndarray, codes: cp.ndarray | None = None
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+    """CuPy's KDTree layout per library: tree, index, node boxes, and offsets."""
+    n, dims = points.shape
+    # Rank float bits as ordered integers, as CuPy kernels flush subnormals.
+    # Equal coordinates share a rank, so ties keep CuPy's stable sort order.
+    bits = points.view(cp.int32 if points.itemsize == 4 else cp.int64)
+    bits = cp.where(bits < 0, -(bits & cp.iinfo(bits.dtype).max), bits)
+    ranks = cp.empty((n, dims), dtype=cp.int32)
+    for dim in range(dims):
+        ranks[:, dim] = cp.searchsorted(cp.sort(bits[:, dim]), bits[:, dim])
+    sizes = cp.asarray([n]) if codes is None else cp.bincount(codes)
+    segments = cp.zeros(len(sizes) + 1, dtype=cp.int64)
+    cp.cumsum(sizes, out=segments[1:])
+    index = cp.empty(n, dtype=cp.int32)
+    boxes = cp.empty((n, 2, dims), dtype=points.dtype)
+    max_length = n if codes is None else int(sizes.max())  # Avoid a sync.
+    stream = cp.cuda.get_current_stream().ptr
+    _spatial_cuda.build_tree(
+        points, ranks, codes, segments, max_length, index, boxes, stream
+    )
+    return points[index], index, boxes, segments
 
 
 def _knn_edges(
-    coords: cp.ndarray, n_neighs: int
+    coords: cp.ndarray, n_neighs: int, codes: cp.ndarray | None = None
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Exact GPU search using CuPy's left-balanced KDTree."""
-    tree, index = _build_kdtree(coords)
-    rows = cp.repeat(cp.arange(len(coords), dtype=cp.int64), n_neighs)
-    columns = cp.empty(len(rows), dtype=cp.int64)
-    distances = cp.empty(len(rows), dtype=coords.dtype)
-    _spatial_cuda.knn(
-        coords,
-        tree,
-        index,
-        k=n_neighs,
-        columns=columns,
-        distances=distances,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-    return rows, columns, distances
+    """Exact kNN within each library; distance ties prefer lower indices."""
+    return _tree_edges(coords, codes, n_neighs, 0.0)
 
 
 def _radius_edges(
-    coords: cp.ndarray, radius: float
+    coords: cp.ndarray, radius: float, codes: cp.ndarray | None = None
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Count then fill radius edges with O(observations + edges) GPU memory."""
-    tree, index = _build_kdtree(coords)
-    counts = cp.empty(len(coords), dtype=cp.int64)
+    """Edges within ``radius`` (kept as double) in each library."""
+    return _tree_edges(coords, codes, 0, radius)
+
+
+def _tree_edges(coords, codes, k, radius):
     stream = cp.cuda.get_current_stream().ptr
-    # Keep the caller's double radius, including for float32 coordinates.
-    _spatial_cuda.radius_count(
-        coords,
-        tree,
-        index,
-        radius=radius,
-        counts=counts,
-        stream=stream,
-    )
-    if radius > float(cp.finfo(coords.dtype).max) and bool((counts < 0).any()):
-        raise ValueError(
-            "Spatial distances exceed the coordinate dtype's finite range. "
-            "Rescale the coordinates."
-        )
-    offsets = cp.empty(len(coords) + 1, dtype=cp.int64)
-    offsets[0] = 0
-    cp.cumsum(counts, out=offsets[1:])
-    n_edges = int(offsets[-1])
+    tree = _build_kdtree(coords, codes)
+    search = partial(_spatial_cuda.tree_search, coords, *tree, codes, k, radius)
+    offsets = None if k else cp.zeros(len(coords) + 1, dtype=cp.int64)
+    if not k:  # Count, then fill with O(observations + edges) memory.
+        search(offsets, stream=stream)
+    n_edges = len(coords) * k if k else int(offsets.cumsum(out=offsets)[-1])
     rows = cp.empty(n_edges, dtype=cp.int64)
     columns = cp.empty(n_edges, dtype=cp.int64)
     distances = cp.empty(n_edges, dtype=coords.dtype)
     if n_edges:
-        _spatial_cuda.radius_fill(
-            coords,
-            tree,
-            index,
-            radius=radius,
-            offsets=offsets,
-            rows=rows,
-            columns=columns,
-            distances=distances,
-            stream=stream,
-        )
+        search(offsets, rows, columns, distances, stream=stream)
     return rows, columns, distances
 
 
@@ -74,11 +66,6 @@ def _edge_distances(
     coords: cp.ndarray, rows: cp.ndarray, columns: cp.ndarray
 ) -> cp.ndarray:
     distances = cp.empty(len(rows), dtype=coords.dtype)
-    _spatial_cuda.edge_distances(
-        coords,
-        rows,
-        columns,
-        distances=distances,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
+    stream = cp.cuda.get_current_stream().ptr
+    _spatial_cuda.edge_distances(coords, rows, columns, distances, stream)
     return distances

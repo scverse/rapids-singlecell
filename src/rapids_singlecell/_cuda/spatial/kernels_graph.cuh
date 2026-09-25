@@ -1,65 +1,51 @@
 #pragma once
 
-template <typename R, typename C, typename I, typename T, bool with_distances>
-__global__ void assemble_graphs_kernel(
-    const R* __restrict__ rows, const C* __restrict__ columns,
-    const T* __restrict__ distances, const long long n_edges,
-    const long long n_obs, const bool set_diag, I* __restrict__ adj_indptr,
-    I* __restrict__ dst_indptr, I* __restrict__ adj_columns,
-    I* __restrict__ dst_columns, float* __restrict__ adj_data,
-    T* __restrict__ dst_data) {
-    const long long edge = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    // Sparse rows get independent diagonal threads to avoid long serial gaps.
-    const bool sparse_rows = n_edges < n_obs;
-    if (sparse_rows && edge >= n_edges) {
-        const long long row = edge - n_edges;
-        if (row > n_obs) return;
-        long long left = 0, right = n_edges;
-        while (left < right) {
-            const long long middle = left + (right - left) / 2;
-            if (rows[middle] < row)
-                left = middle + 1;
+// CSR graphs from row-grouped unique off-diagonal edges. Row r stores its
+// diagonal first (zeros too), at (edges of rows < r) + r: a row's first edge
+// thread writes it, and row threads set indptr and edgeless rows' diagonals.
+template <typename R, typename C, typename I, typename T>
+__global__ void assemble_graphs(const R* rows, const C* cols, const T* values,
+                                long long n_edges, long long n_obs, float diag,
+                                I* indptr, I* indices, float* adj,
+                                I* dst_indices, T* dst) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i > n_edges + n_obs) return;
+    long long e = i, r = -1;  // write the diagonal of row r at e + r
+    if (i < n_edges) {
+        const long long slot = e + rows[i] + 1;
+        indices[slot] = cols[i], adj[slot] = 1;
+        if (dst) dst_indices[slot] = cols[i], dst[slot] = values[i];
+        if (i == 0 || rows[i - 1] != rows[i]) r = rows[i];
+    } else {
+        const long long row = i - n_edges;
+        long long hi = n_edges;
+        for (e = 0; e < hi;) {  // e = first edge of row
+            const long long mid = (e + hi) / 2;
+            if (rows[mid] < row)
+                e = mid + 1;
             else
-                right = middle;
+                hi = mid;
         }
-        const long long out = left + row;
-        adj_indptr[row] = out;
-        if (with_distances) dst_indptr[row] = out;
-        if (row < n_obs) {
-            adj_columns[out] = row;
-            adj_data[out] = set_diag ? 1.0f : 0.0f;
-            if (with_distances) {
-                dst_columns[out] = row;
-                dst_data[out] = 0;
-            }
-        }
-        return;
+        indptr[row] = e + row;
+        if (row < n_obs && (e == n_edges || rows[e] != row)) r = row;
     }
-    if (edge > n_edges) return;
-    const long long row = edge < n_edges ? rows[edge] : n_obs;
-    if (edge < n_edges) {
-        const long long out = edge + row + 1;
-        adj_columns[out] = columns[edge];
-        adj_data[out] = 1.0f;
-        if (with_distances) {
-            dst_columns[out] = columns[edge];
-            dst_data[out] = distances[edge];
-        }
-    }
-    if (sparse_rows) return;
-    // Place a stored diagonal before every row, including skipped empty rows.
-    const long long previous = edge ? rows[edge - 1] : -1;
-    for (long long r = previous + 1; r <= row; ++r) {
-        const long long out = edge + r;
-        adj_indptr[r] = out;
-        if (with_distances) dst_indptr[r] = out;
-        if (r < n_obs) {
-            adj_columns[out] = r;
-            adj_data[out] = set_diag ? 1.0f : 0.0f;
-            if (with_distances) {
-                dst_columns[out] = r;
-                dst_data[out] = 0;
-            }
-        }
-    }
+    if (r < 0) return;
+    indices[e + r] = r, adj[e + r] = diag;
+    if (dst) dst_indices[e + r] = r, dst[e + r] = 0;
+}
+
+// cupy.percentile's linear interpolation within each library's sorted values.
+template <typename T>
+__global__ void library_percentile(const double* index, const T* values,
+                                   const long long* starts,
+                                   const long long* sizes, long long n,
+                                   T* out) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i >= n || !sizes[i]) return;
+    const long long below = floor(index[i]), last = sizes[i] - 1;
+    const long long bottom = starts[i] + below;
+    const long long top = starts[i] + min(below + 1, last);
+    const T weight = index[i] - below, diff = values[top] - values[bottom];
+    out[i] = weight < 0.5 ? values[bottom] + diff * weight
+                          : values[top] - diff * (1 - weight);
 }

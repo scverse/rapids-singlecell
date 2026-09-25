@@ -10,19 +10,42 @@ from scipy.spatial import ConvexHull, Delaunay
 from rapids_singlecell.squidpy_gpu import _spatial_delaunay as delaunay
 from rapids_singlecell.squidpy_gpu import _spatial_neighbors_backend as backend
 from rapids_singlecell.squidpy_gpu._spatial_graph import build_adjacency, build_graphs
-from rapids_singlecell.squidpy_gpu._spatial_kdtree import _build_kdtree
+from rapids_singlecell.squidpy_gpu._spatial_neighbors_backend import _build_kdtree
 
 
 def test_kdtree_preserves_integer_tags():
-    # float16 exposes lost integer tags with a small tree suitable for CI.
+    # Rounded coordinates add ties that must keep CuPy's stable sort order.
     points = cp.asarray(
-        np.random.default_rng(147).uniform(size=(4096, 2)), dtype=cp.float16
+        np.random.default_rng(147).uniform(size=(4096, 2)).round(2), dtype=cp.float32
     )
-    tree, index = _build_kdtree(points)
+    tree, index, _, _ = _build_kdtree(points)
     reference = KDTree(points.astype(cp.float64))
     assert tree.dtype == points.dtype
     np.testing.assert_array_equal(index.get(), reference.index.get())
     np.testing.assert_array_equal(tree.get(), reference.tree.get())
+
+
+def test_library_trees_match_separate_trees():
+    rng = np.random.default_rng(5)
+    sizes = [1, 2, 3, 0, 7, 1025, 4097]
+    codes = np.repeat(np.arange(len(sizes)), sizes)
+    rng.shuffle(codes)
+    points = cp.asarray(rng.uniform(size=(len(codes), 2)).round(2), dtype=cp.float32)
+    tree, index, boxes, segments = _build_kdtree(
+        points, cp.asarray(codes, dtype=cp.int32)
+    )
+    np.testing.assert_array_equal(segments.get(), np.r_[0, np.cumsum(sizes)])
+    for code in np.flatnonzero(sizes):
+        group = np.flatnonzero(codes == code)
+        part = slice(int(segments[code]), int(segments[code + 1]))
+        expected = _build_kdtree(points[cp.asarray(group)])
+        np.testing.assert_array_equal(tree[part].get(), expected[0].get())
+        np.testing.assert_array_equal(index[part].get(), group[expected[1].get()])
+        np.testing.assert_array_equal(boxes[part].get(), expected[2].get())
+        np.testing.assert_array_equal(
+            boxes[part][0].get(),
+            [points[group].min(0).get(), points[group].max(0).get()],
+        )
 
 
 def _dense_distances(coords):
@@ -32,7 +55,10 @@ def _dense_distances(coords):
     return distances
 
 
-@pytest.mark.parametrize("method,n_neighs", [("knn", 8), ("knn", 9), ("radius", None)])
+@pytest.mark.parametrize(
+    "method,n_neighs",
+    [("knn", 8), ("knn", 9), ("knn", 17), ("knn", 33), ("radius", None)],
+)
 @pytest.mark.parametrize(
     "dtype,dimensions,offset,scale",
     [
@@ -46,7 +72,7 @@ def _dense_distances(coords):
 def test_tree_matches_dense_search(
     *, method, n_neighs, dtype, dimensions, offset, scale
 ):
-    points = np.random.default_rng(21).normal(size=(31, dimensions)) * scale + offset
+    points = np.random.default_rng(21).normal(size=(40, dimensions)) * scale + offset
     search = getattr(backend, f"_{method}_edges")
     parameter = n_neighs if method == "knn" else 1.25 * scale
     stream = cp.cuda.Stream(non_blocking=True)
@@ -79,6 +105,37 @@ def test_tree_matches_dense_search(
             cp.sort(expected_rows * len(coords) + expected_cols).get(),
         )
     np.testing.assert_array_equal(distances.get(), direct[rows, cols].get())
+
+
+@pytest.mark.parametrize("method", ["knn", "radius"])
+def test_tree_search_with_far_outlier(method):
+    points = np.random.default_rng(8).uniform(size=(2000, 2))
+    points[0] = 1e4  # Only bounding boxes, not split lines, prune its search.
+    coords = cp.asarray(points, dtype=cp.float32)
+    direct = _dense_distances(coords)
+    cp.fill_diagonal(direct, cp.inf)
+    if method == "knn":
+        rows, cols, distances = backend._knn_edges(coords, 6)
+        np.testing.assert_array_equal(
+            distances.reshape(-1, 6).get(), cp.sort(direct, axis=1)[:, :6].get()
+        )
+    else:
+        rows, cols, distances = backend._radius_edges(coords, 0.05)
+        expected_rows, expected_cols = cp.nonzero(direct <= 0.05)
+        np.testing.assert_array_equal(
+            cp.sort(rows * len(coords) + cols).get(),
+            (expected_rows * len(coords) + expected_cols).get(),
+        )
+    np.testing.assert_array_equal(distances.get(), direct[rows, cols].get())
+
+
+def test_knn_subnormal_coordinates():
+    # CuPy kernels flush subnormals; the tree must still order them.
+    coords = cp.asarray(
+        [[4e-41, 0], [3e-41, 0], [1e-41, 0], [2e-41, 0]], dtype=cp.float32
+    )
+    _, cols, _ = backend._knn_edges(coords, 1)
+    np.testing.assert_array_equal(cols.get(), [1, 0, 3, 2])
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -237,6 +294,23 @@ def test_ambiguous_delaunay_uses_gpu(force_gpu, monkeypatch, kind):
         assert not np.any(
             (left[:, None] < left) & (left < right[:, None]) & (right[:, None] < right)
         )
+
+
+def test_gpu_delaunay_rejects_nan(force_gpu):
+    points = cp.asarray(np.random.default_rng(1).uniform(size=(64, 2)))
+    points[3, 1] = cp.nan
+    with pytest.raises(ValueError, match="finite"):
+        delaunay._gpu_delaunay_edges(points)
+
+
+@pytest.mark.parametrize("error", [AttributeError, TypeError])
+def test_changed_cupy_internals_use_qhull(force_gpu, monkeypatch, error):
+    def changed(*args):
+        raise error("Changed private CuPy API.")
+
+    monkeypatch.setattr(delaunay, "_FullDelaunay", changed)
+    points = np.random.default_rng(3).uniform(size=(64, 2))
+    _assert_delaunay_edges(delaunay._delaunay_edges(cp.asarray(points)), points)
 
 
 @pytest.mark.parametrize("dimensions", [2, 3])

@@ -1,242 +1,151 @@
 #pragma once
 
-#include <cuda_runtime.h>
 #include <math_constants.h>
+
 #include "kernels_predicates.cuh"
 
-constexpr double PREDICATE_ERROR_FACTOR = 64 * 0x1p-52;
-
-// Explicit rounding keeps the predicates independent of compiler FMA settings.
+// Float filters with explicit rounding (independent of FMA contraction), then
+// Shewchuk's exact expansions.
 __device__ double orientation(const double* p, int a, int b, int c) {
     double x = (p[2 * a] - p[2 * c]) * (p[2 * b + 1] - p[2 * c + 1]);
     double y = (p[2 * a + 1] - p[2 * c + 1]) * (p[2 * b] - p[2 * c]);
     double area = __dsub_rn(x, y);
-    if (fabs(area) > PREDICATE_ERROR_FACTOR * (fabs(x) + fabs(y))) return area;
+    if (fabs(area) > 0x1p-46 * (fabs(x) + fabs(y))) return area;
     return spatial_predicates::orient2dExact(spatial_predicates::constants,
                                              p + 2 * a, p + 2 * b, p + 2 * c);
 }
 
-__device__ double incircle(const double* points, int a, int b, int c, int d) {
-    double ax = points[2 * a] - points[2 * d];
-    double ay = points[2 * a + 1] - points[2 * d + 1];
-    double bx = points[2 * b] - points[2 * d];
-    double by = points[2 * b + 1] - points[2 * d + 1];
-    double cx = points[2 * c] - points[2 * d];
-    double cy = points[2 * c + 1] - points[2 * d + 1];
-    double alift = __dadd_rn(ax * ax, ay * ay);
-    double blift = __dadd_rn(bx * bx, by * by);
-    double clift = __dadd_rn(cx * cx, cy * cy);
-    double det = __dadd_rn(__dadd_rn(alift * __dsub_rn(bx * cy, by * cx),
-                                     blift * __dsub_rn(cx * ay, cy * ax)),
-                           clift * __dsub_rn(ax * by, ay * bx));
-    double permanent =
-        __dadd_rn(__dadd_rn(alift * __dadd_rn(fabs(bx * cy), fabs(by * cx)),
-                            blift * __dadd_rn(fabs(cx * ay), fabs(cy * ax))),
-                  clift * __dadd_rn(fabs(ax * by), fabs(ay * bx)));
-    if (fabs(det) <= PREDICATE_ERROR_FACTOR * permanent) {
-        // A tiny cluster can underflow degree-four arithmetic after
-        // global scaling. Local binary scaling preserves its sign.
-        double local[8] = {
-            points[2 * a], points[2 * a + 1], points[2 * b], points[2 * b + 1],
-            points[2 * c], points[2 * c + 1], points[2 * d], points[2 * d + 1]};
-        double magnitude = 0;
-        for (int i = 0; i < 8; ++i) magnitude = fmax(magnitude, fabs(local[i]));
-        int exponent;
-        frexp(magnitude, &exponent);
-        for (int i = 0; i < 8; ++i) local[i] = ldexp(local[i], -exponent);
-        det = spatial_predicates::incircleExact(spatial_predicates::constants,
-                                                local, local + 2, local + 4,
-                                                local + 6);
-    }
-    return det;
+__device__ double incircle(const double* p, int a, int b, int c, int d) {
+    double ax = p[2 * a] - p[2 * d], ay = p[2 * a + 1] - p[2 * d + 1];
+    double bx = p[2 * b] - p[2 * d], by = p[2 * b + 1] - p[2 * d + 1];
+    double cx = p[2 * c] - p[2 * d], cy = p[2 * c + 1] - p[2 * d + 1];
+    double al = __dadd_rn(ax * ax, ay * ay), bl = __dadd_rn(bx * bx, by * by);
+    double cl = __dadd_rn(cx * cx, cy * cy);
+    double det = __dadd_rn(__dadd_rn(al * __dsub_rn(bx * cy, by * cx),
+                                     bl * __dsub_rn(cx * ay, cy * ax)),
+                           cl * __dsub_rn(ax * by, ay * bx));
+    double bound =
+        __dadd_rn(__dadd_rn(al * __dadd_rn(fabs(bx * cy), fabs(by * cx)),
+                            bl * __dadd_rn(fabs(cx * ay), fabs(cy * ax))),
+                  cl * __dadd_rn(fabs(ax * by), fabs(ay * bx)));
+    if (fabs(det) > 0x1p-46 * bound) return det;
+    // Local binary scaling keeps tiny clusters from underflowing.
+    double q[8] = {p[2 * a], p[2 * a + 1], p[2 * b], p[2 * b + 1],
+                   p[2 * c], p[2 * c + 1], p[2 * d], p[2 * d + 1]};
+    double m = 0;
+    for (int i = 0; i < 8; ++i) m = fmax(m, fabs(q[i]));
+    int e;
+    frexp(m, &e);
+    for (int i = 0; i < 8; ++i) q[i] = ldexp(q[i], -e);
+    return spatial_predicates::incircleExact(spatial_predicates::constants, q,
+                                             q + 2, q + 4, q + 6);
 }
 
-extern "C" __global__ void delaunay_orientations(const double* points, int n,
-                                                 int a, int b, double* output) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c < n) output[c] = orientation(points, a, b, c);
+// nvcc keeps float32 subnormals, which CuPy's casts flush to zero.
+__global__ void delaunay_widen(const float* in, long long n, int shift,
+                               double* out) {
+    long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ldexp((double)in[i], shift);
 }
 
-extern "C" __global__ void delaunay_triangle_orientations(
-    const double* points, int n, const int* triangles, int nt, double* output) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= nt) return;
-    int a = triangles[3 * t], b = triangles[3 * t + 1],
-        c = triangles[3 * t + 2];
-    output[t] = a < 0 || a >= n || b < 0 || b >= n || c < 0 || c >= n
-                    ? CUDART_NAN
-                    : orientation(points, a, b, c);
-}
-
-extern "C" __global__ void delaunay_normalize(const float* points,
-                                              long long size, int exponent,
-                                              double* output) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= size) return;
-    unsigned int bits = __float_as_uint(points[i]);
-    unsigned int fraction = bits & 0x7fffff;
-    int biased = (bits >> 23) & 0xff;
-    if (biased == 0xff) {
-        output[i] = static_cast<double>(points[i]);
-        return;
-    }
-    // Decode the significand as an integer so float32 subnormals cannot be
-    // flushed before conversion to double, including under a CuPy FTZ build.
-    unsigned int significand = biased ? fraction | 0x800000 : fraction;
-    int power = biased ? biased - 150 : -149;
-    double value = ldexp(static_cast<double>(significand), power - exponent);
-    output[i] = bits >> 31 ? -value : value;
-}
-
-extern "C" __global__ void validate_triangles(const double* points,
-                                              const int* tri, const int* opp,
-                                              int n, int nt, int* invalid,
-                                              int* seen, int* next_boundary,
-                                              int* prev_boundary,
-                                              int* boundary_count) {
+__global__ void delaunay_orientations(const double* p, const int* tri,
+                                      long long nt, long long n, double* out) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt) return;
     int a = tri[3 * t], b = tri[3 * t + 1], c = tri[3 * t + 2];
-    if (a < 0 || a >= n || b < 0 || b >= n || c < 0 || c >= n) {
-        atomicOr(invalid, 1);
-        return;
-    }
-    if (!(orientation(points, a, b, c) > 0)) {
-        atomicOr(invalid, 1);
+    out[t] = min(a, min(b, c)) < 0 || max(a, max(b, c)) >= n
+                 ? CUDART_NAN
+                 : orientation(p, a, b, c);
+}
+
+// state: failure bits (1 invalid mesh, 2 illegal edge), boundary edges,
+// lowest boundary vertices. Illegal edges vote for CuPy's flip kernels.
+__global__ void delaunay_validate_triangles(const double* p, const int* tri,
+                                            const int* opp, long long n,
+                                            long long nt, int* state, int* seen,
+                                            int* after, int* before,
+                                            int* votes) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt) return;
+    int a = tri[3 * t], b = tri[3 * t + 1], c = tri[3 * t + 2];
+    if (min(a, min(b, c)) < 0 || max(a, max(b, c)) >= n ||
+        !(orientation(p, a, b, c) > 0)) {
+        atomicOr(state, 1);
         return;
     }
     for (int vi = 0; vi < 3; ++vi) {
-        int encoded = opp[3 * t + vi];
-        int other = encoded >> 4;
-        int ov = encoded & 3;
+        int code = opp[3 * t + vi], other = code >> 4, ov = code & 3;
         int u = tri[3 * t + (vi + 1) % 3], v = tri[3 * t + (vi + 2) % 3];
-        if (encoded >= 0) {
-            if (other < 0 || other >= nt || ov > 2 || other == t) {
-                atomicOr(invalid, 1);
-                continue;
-            }
-            int reverse = opp[3 * other + ov];
-            if ((reverse >> 4) != t || (reverse & 3) != vi ||
+        if (code >= 0) {
+            // The neighbor must share the reversed edge and point back.
+            if (other >= nt || ov > 2 || other == t ||
+                opp[3 * other + ov] >> 4 != t ||
+                (opp[3 * other + ov] & 3) != vi ||
                 tri[3 * other + (ov + 1) % 3] != v ||
                 tri[3 * other + (ov + 2) % 3] != u) {
-                atomicOr(invalid, 1);
+                atomicOr(state, 1);
                 continue;
             }
             if (t > other) continue;
             int d = tri[3 * other + ov];
             if (d < 0 || d >= n) {
-                atomicOr(invalid, 1);
-                continue;
+                atomicOr(state, 1);
+            } else if (incircle(p, a, b, c, d) > 0) {
+                // Cocircular quads accept either diagonal.
+                atomicOr(state, 2);
+                atomicMin(votes + t, t << 2 | vi);
+                atomicMin(votes + other, t << 2 | vi);
             }
-            double det = incircle(points, a, b, c, d);
-            // Either diagonal is valid for an exactly cocircular quadrilateral.
-            if (!isfinite(det))
-                atomicOr(invalid, 1);
-            else if (det > 0)
-                atomicOr(invalid, 2);
+        } else if (code != -1 || atomicCAS(after + u, -1, v) != -1 ||
+                   atomicCAS(before + v, -1, u) != -1) {
+            atomicOr(state, 1);
         } else {
-            if (encoded != -1) {
-                atomicOr(invalid, 1);
-                continue;
-            }
-            if (atomicCAS(next_boundary + u, -1, v) != -1 ||
-                atomicCAS(prev_boundary + v, -1, u) != -1)
-                atomicOr(invalid, 1);
-            atomicAdd(boundary_count, 1);
+            atomicAdd(state + 1, 1);
         }
         atomicAdd(seen + u, 1);
         atomicAdd(seen + v, 1);
     }
 }
 
-extern "C" __global__ void validate_boundary(const double* points, int n,
-                                             int nt, const int* seen,
-                                             const int* next_boundary,
-                                             const int* prev_boundary,
-                                             int* boundary_count,
-                                             int* invalid) {
+__device__ bool delaunay_between(double a, double b, double c) {
+    return (a < b && b < c) || (a > b && b > c);
+}
+
+__device__ bool delaunay_below(const double* a, const double* b) {
+    return a[1] < b[1] || (a[1] == b[1] && a[0] < b[0]);
+}
+
+__global__ void delaunay_validate_boundary(const double* p, long long n,
+                                           const int* seen, const int* after,
+                                           const int* before, int* state) {
     int v = blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= n) return;
-    int nb = *boundary_count;
-    if (nb < 3 || nt != 2 * n - nb - 2) {
-        atomicOr(invalid, 1);
-        return;
-    }
-    if (!seen[v]) atomicOr(invalid, 1);
-    int before = prev_boundary[v], after = next_boundary[v];
-    if (before < 0 && after < 0) return;
-    if (before < 0 || after < 0 || before >= n || after >= n ||
-        next_boundary[before] != v || prev_boundary[after] != v) {
-        atomicOr(invalid, 1);
-        return;
-    }
-    double turn = orientation(points, before, v, after);
-    bool between_x = (points[2 * before] < points[2 * v] &&
-                      points[2 * v] < points[2 * after]) ||
-                     (points[2 * before] > points[2 * v] &&
-                      points[2 * v] > points[2 * after]);
-    bool between_y = (points[2 * before + 1] < points[2 * v + 1] &&
-                      points[2 * v + 1] < points[2 * after + 1]) ||
-                     (points[2 * before + 1] > points[2 * v + 1] &&
-                      points[2 * v + 1] > points[2 * after + 1]);
-    if (!(turn >= 0) || (turn == 0 && !between_x && !between_y)) {
-        atomicOr(invalid, 1);
-        return;
-    }
-    // Nonnegative turns and exactly one full rotation certify one convex
-    // boundary cycle, including straight runs, without traversing every edge.
-    bool incoming_lower = points[2 * v + 1] < points[2 * before + 1] ||
-                          (points[2 * v + 1] == points[2 * before + 1] &&
-                           points[2 * v] < points[2 * before]);
-    bool outgoing_lower = points[2 * after + 1] < points[2 * v + 1] ||
-                          (points[2 * after + 1] == points[2 * v + 1] &&
-                           points[2 * after] < points[2 * v]);
-    if (incoming_lower && !outgoing_lower) atomicAdd(boundary_count + 1, 1);
+    int u = before[v], w = after[v];
+    if (!seen[v] || (u < 0) != (w < 0)) atomicOr(state, 1);
+    if (u < 0 || w < 0) return;
+    // Nonnegative turns, straight runs that pass through, and one lowest
+    // vertex certify a convex boundary traversed once.
+    double turn = orientation(p, u, v, w);
+    if (!(turn >= 0) ||
+        (turn == 0 && !delaunay_between(p[2 * u], p[2 * v], p[2 * w]) &&
+         !delaunay_between(p[2 * u + 1], p[2 * v + 1], p[2 * w + 1])))
+        atomicOr(state, 1);
+    if (delaunay_below(p + 2 * v, p + 2 * u) &&
+        !delaunay_below(p + 2 * w, p + 2 * v))
+        atomicAdd(state + 2, 1);
 }
 
-extern "C" __global__ void validate_boundary_winding(const int* boundary_count,
-                                                     int* invalid) {
-    if (boundary_count[1] != 1) atomicOr(invalid, 1);
-}
-
-// Called only after validation reports a valid mesh with illegal interior
-// edges.
-extern "C" __global__ void exact_flip_votes(const double* points,
-                                            const int* tri, const int* opp,
-                                            int nt, int* votes) {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= nt) return;
-    int a = tri[3 * t], b = tri[3 * t + 1], c = tri[3 * t + 2];
-    for (int vi = 0; vi < 3; ++vi) {
-        int encoded = opp[3 * t + vi];
-        int other = encoded >> 4;
-        if (encoded < 0 || t >= other) continue;
-        int d = tri[3 * other + (encoded & 3)];
-        if (!(incircle(points, a, b, c, d) > 0)) continue;
-        int u = tri[3 * t + (vi + 1) % 3], v = tri[3 * t + (vi + 2) % 3];
-        int apex = tri[3 * t + vi];
-        if (!(orientation(points, apex, u, d) > 0) ||
-            !(orientation(points, apex, d, v) > 0))
-            continue;
-        int vote = (t << 2) | vi;
-        atomicMin(votes + t, vote);
-        atomicMin(votes + other, vote);
-    }
-}
-
-extern "C" __global__ void fill_edges(const int* tri, const int* opp, int nt,
-                                      int* cursor, int* rows, int* cols) {
+__global__ void delaunay_fill_edges(const int* tri, const int* opp,
+                                    long long nt, int* cursor, int* rows,
+                                    int* cols) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nt) return;
     for (int vi = 0; vi < 3; ++vi) {
         int other = opp[3 * t + vi] >> 4;
         if (other >= 0 && t > other) continue;
         int u = tri[3 * t + (vi + 1) % 3], v = tri[3 * t + (vi + 2) % 3];
-        int forward = atomicAdd(cursor + u, 1);
-        int reverse = atomicAdd(cursor + v, 1);
-        rows[forward] = u;
-        cols[forward] = v;
-        rows[reverse] = v;
-        cols[reverse] = u;
+        int i = atomicAdd(cursor + u, 1), j = atomicAdd(cursor + v, 1);
+        rows[i] = cols[j] = u;
+        cols[i] = rows[j] = v;
     }
 }

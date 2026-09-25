@@ -183,8 +183,10 @@ def test_radius_duplicates_and_inclusive_bounds(radius):
     ids=["subtraction", "norm"],
 )
 def test_radius_rejects_unrepresentable_distances(coords):
+    # Filler points put tree levels between the root and the overflowing pair.
+    coords = np.concatenate([coords, np.random.default_rng(4).uniform(size=(64, 2))])
     with pytest.raises(ValueError, match="Rescale"):
-        _call("radius", _adata(np.array(coords, dtype=np.float32)), radius=1e39)
+        _call("radius", _adata(coords.astype(np.float32)), radius=1e39)
 
 
 @pytest.mark.parametrize("radius", [0, 1, 1e38, 5e38])
@@ -252,6 +254,79 @@ def test_libraries_restore_order_and_process_independently(method, kwargs):
     result = _call(method, adata, **kwargs, library_key="library", copy=True)
     _assert_graphs(result, _library_reference(coords, labels, method, **kwargs))
     assert not result.connectivities.toarray()[labels[:, None] != labels[None, :]].any()
+
+
+@pytest.mark.parametrize("method,kwargs", _MODES)
+def test_library_batches_match_separate_builds(method, kwargs):
+    rng = np.random.default_rng(41)
+    labels = np.repeat(np.arange(4), [5, 40, 300, 1200])
+    rng.shuffle(labels)
+    coords = rng.normal(size=(len(labels), 2))
+    coords[labels == 1] *= 10
+    adata = _adata(coords)
+    adata.obs["library"] = pd.Categorical(labels, categories=[3, 1, 9, 0, 2])
+    kwargs = dict(kwargs, set_diag=True, transform="spectral")
+    if method == "radius":
+        kwargs["radius"] = (0.2, 1.3)
+    if method != "grid":
+        kwargs["percentile"] = 70
+    builder = getattr(rsc.gr.neighbors, f"{method.capitalize()}Builder", None)
+    builder = builder or getattr(rsc.gr.neighbors, f"{method.upper()}Builder")
+    # Subclasses keep the per-library loop.
+    separate = type("Separate", (builder,), {})
+    results = [
+        rsc.gr.spatial_neighbors_from_builder(
+            adata, cls(**kwargs), library_key="library", copy=True
+        )
+        for cls in (builder, separate)
+    ]
+    for batched, expected in zip(*results, strict=True):
+        batched.sort_indices()
+        expected.sort_indices()
+        np.testing.assert_array_equal(batched.indptr, expected.indptr)
+        np.testing.assert_array_equal(batched.indices, expected.indices)
+        np.testing.assert_array_equal(batched.data, expected.data)
+
+
+def test_cosine_handles_sparse_large_graphs():
+    # cuSPARSE's int32 SpGEMM rejects nonempty rows 2**15 apart.
+    n = 2**15 + 1
+    diagonal = cp.asarray([0, n - 1])
+    adj = cp_sparse.csr_matrix(
+        (cp.ones(2, dtype=cp.float32), (diagonal, diagonal)), shape=(n, n)
+    )
+    adj, _ = rsc.gr.neighbors.TransformPostprocessor("cosine")(adj, adj.copy())
+    np.testing.assert_array_equal(adj.indices.get(), [0, n - 1])
+    np.testing.assert_array_equal(adj.data.get(), [1, 1])
+
+
+def test_cosine_splits_large_products():
+    # Dense libraries together exceed cuSPARSE's SpGEMM work limit.
+    adata = _adata(np.zeros((3000, 2)))
+    adata.obs["library"] = pd.Categorical(np.repeat([0, 1, 2], 1000))
+    result = _call(
+        "radius", adata, radius=1, transform="cosine", library_key="library", copy=True
+    )
+    assert result.connectivities.nnz == 3 * 1000**2
+
+
+def test_builder_override_may_share_csr_arrays():
+    class SharedWeights(rsc.gr.neighbors.KNNBuilder):
+        def build_graph(self, coords):
+            _, dst = super().build_graph(coords)
+            weights = cp.exp(-dst.data)
+            return cp_sparse.csr_matrix((weights, dst.indices, dst.indptr)), dst
+
+    adata = _adata(np.random.default_rng(5).normal(size=(64, 2)))
+    result = rsc.gr.spatial_neighbors_from_builder(adata, SharedWeights(4), copy=True)
+    expected = _call("knn", adata, n_neighs=4, copy=True).distances
+    np.testing.assert_array_equal(result.distances.toarray(), expected.toarray())
+
+
+def test_neighbors_module_import():
+    from rapids_singlecell.gr.neighbors import KNNBuilder
+
+    assert KNNBuilder is rsc.gr.neighbors.KNNBuilder
 
 
 @pytest.mark.parametrize("method", ["delaunay", "grid"])
