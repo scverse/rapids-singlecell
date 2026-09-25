@@ -78,7 +78,7 @@ test-minimal = [
 ]
 test = [
     "igraph",
-    { include-group="test-minimal" },
+    { include-group = "test-minimal" },
 ]
 
 dev = [
