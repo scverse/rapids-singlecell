@@ -5,7 +5,7 @@ submodules:
 build:
   os: ubuntu-24.04
   tools:
-    python: '3.13'
+    python: '3.14'
   jobs:
     post_checkout:
       # unshallow so version can be derived from tag
@@ -16,5 +16,5 @@ build:
       - asdf global uv latest
     build:
       html:
-        - CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" uvx --from "hatch==1.16.5" hatch run docs:build
+        - CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" uvx hatch run docs:build
         - mv docs/_build $READTHEDOCS_OUTPUT

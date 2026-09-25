@@ -48,7 +48,8 @@ rapids-cu12 = [
     "cuvs-cu12>=25.12",
 ]
 
-doc = [
+[dependency-groups]
+docs = [
     "sphinx>=4.5.0",
     "sphinx-copybutton",
     "nbsphinx>=0.8.12",
