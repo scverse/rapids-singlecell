@@ -142,10 +142,11 @@ def _run_dask_idx(
     starts_cpu: np.ndarray,
     offsets_cpu: np.ndarray,
     *,
+    test: bool = False,
     verbose: bool = False,
     **kwargs,
-) -> tuple[np.ndarray, None]:
-    """Dask execution for adj=False methods (AUCell) - each chunk = one batch."""
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Dask execution for indexed feature sets - each chunk = one batch."""
     import dask
 
     # Wrap arrays in delayed to avoid serializing per-task
@@ -159,7 +160,7 @@ def _run_dask_idx(
         starts_gpu = cp.array(starts, dtype=cp.int32)
         offsets_gpu = cp.array(offsets, dtype=cp.int32)
         chunk_gpu = _mat_to_array(chunk) if not isinstance(chunk, cp.ndarray) else chunk
-        es, _ = func(
+        es, pv = func(
             chunk_gpu,
             cnct=cnct_gpu,
             starts=starts_gpu,
@@ -170,6 +171,8 @@ def _run_dask_idx(
         # Free GPU memory
         del chunk_gpu, cnct_gpu, starts_gpu, offsets_gpu
         cp.get_default_memory_pool().free_all_blocks()
+        if test:
+            return np.hstack([es, pv])
         return es
 
     # Create delayed tasks for each row block
@@ -188,6 +191,9 @@ def _run_dask_idx(
     _log("dask - computing batches", level="info", verbose=verbose)
     results = dask.compute(*tasks)
     computed = np.vstack(results)
+    if test:
+        n_sources = starts_cpu.size
+        return computed[:, :n_sources], computed[:, n_sources:]
     return computed, None
 
 
@@ -266,7 +272,7 @@ def _run(
         if is_dask:
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
             es, pv = _run_dask_idx(
-                func, mat, cnct, starts, offsets, verbose=verbose, **kwargs
+                func, mat, cnct, starts, offsets, test=test, verbose=verbose, **kwargs
             )
             es = pd.DataFrame(es, index=obs, columns=sources)
         else:
