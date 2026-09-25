@@ -104,7 +104,7 @@ def _ora_tables(offsets, count, background, correction, *, limit=2_000_000):
 
 
 def _validate_ora(nvar, n_up, n_bm, n_bg, ha_corr):
-    """Convert decoupler 2.2.0's strict rank thresholds to GPU tail counts."""
+    """Validate and round the numbers of top- and bottom-ranked features."""
     if n_up is None:
         n_up = max(int(np.ceil(0.05 * nvar)), 2)
     if n_bg is None:
@@ -120,23 +120,19 @@ def _validate_ora(nvar, n_up, n_bm, n_bg, ha_corr):
         assert value > 0 if positive else value >= 0, (
             f"{name} must be {'> 0' if positive else '>= 0'}"
         )
-    # Match 2.2.0: ascending ranks, (rank > n_up) | (rank < n_bm).
-    n_up = max(0, nvar - min(int(np.floor(n_up)), nvar))
-    n_bm = min(nvar, max(0, int(np.ceil(n_bm)) - 1))
-    if n_up + n_bm >= nvar:
-        n_up, n_bm = nvar, 0
+    n_up, n_bm = int(np.ceil(n_up)), int(np.ceil(n_bm))
+    assert n_up + n_bm <= nvar, (
+        f"For nvar={nvar}, n_up={n_up} and n_bm={n_bm} overlap, decrease any of them"
+    )
+    assert n_bg == 0 or n_bg >= n_up + n_bm, (
+        "n_bg must be at least the number of selected features n_up + n_bm"
+    )
     assert isinstance(ha_corr, int | float) and np.isfinite(ha_corr), (
         "ha_corr must be finite and numeric"
     )
-    if n_up + n_bm == 0:
-        raise ValueError("ORA rank thresholds select no features")
     n_bg = nvar if n_bg == 0 else n_bg
     if max(nvar, n_bg) > np.iinfo(np.int32).max:
         raise ValueError("ORA feature counts and n_bg must fit in int32")
-    if n_bg < n_up + n_bm:
-        raise ValueError(
-            "n_bg is too small for the union of selected features and a term"
-        )
     return n_up, n_bm, n_bg
 
 
@@ -160,20 +156,17 @@ def _func_ora(
     Over Representation Analysis (ORA).
 
     Tests feature-set overlaps with Fisher's exact test and corrected log odds.
-    Ranked selection and probability ties match decoupler 2.2.0, so results may
-    differ from SciPy. Input matrices use float32; Fisher calculations and
-    outputs use float64.
+    Input matrices use float32; Fisher calculations use float64.
 
     %(yestest)s
 
     %(params)s
     n_up
-        Select ascending, one-based ranks strictly greater than this threshold.
-        Defaults to ``max(ceil(0.05 * n_genes), 2)``, selecting approximately
-        95%% of genes under decoupler 2.2.0's semantics.
+        Number of highest-ranked features to select. Defaults to the top 5%%
+        of features, with a minimum of two. Fractional values are rounded up.
     n_bm
-        Also select ranks strictly less than this threshold (default zero).
-        Fractional thresholds are unrounded; overlapping selections form a union.
+        Number of lowest-ranked features to select (default zero), rounded up.
+        The sum of ``n_up`` and ``n_bm`` must not exceed the number of features.
     n_bg
         Background size (default 20,000), including in value-cutoff mode.
         ``None`` or zero uses all processed genes. Must accommodate the union

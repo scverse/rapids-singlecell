@@ -8,7 +8,7 @@ constexpr unsigned MASK = 0xffffffff;
 constexpr int BLOCK_SIZE = 128;
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
 
-// Packed CPU factors preserve decoupler 2.2.0's probability ties. Other tests
+// Packed CPU factors preserve decoupler's probability ties. Other tests
 // evaluate log-gamma on the GPU. Wide offsets avoid overflowing packed indices.
 template <bool compat>
 struct LogFactorial {

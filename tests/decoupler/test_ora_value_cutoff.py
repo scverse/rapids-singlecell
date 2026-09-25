@@ -84,7 +84,7 @@ def test_ranked_one_sided(deg_data, alternative):
     _, net = deg_data
     data = pd.DataFrame([np.arange(1, 9)], index=["up"], columns=list("abcdefgh"))
     result = dc.ora(data, net, n_up=2, n_bg=8, alternative=alternative, tmin=2)
-    _assert_fisher(result, {"up": "cdefgh"}, alternative=alternative)
+    _assert_fisher(result, {"up": "gh"}, alternative=alternative)
 
 
 @pytest.mark.parametrize(
