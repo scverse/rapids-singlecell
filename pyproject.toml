@@ -86,7 +86,7 @@ dev = [
 ]
 
 [project.urls]
-Documentation = "https://rapids-singlecell.readthedocs.io"
+Documentation = "https://rapids-singlecell.scverse.org/"
 Source = "https://github.com/scverse/rapids_singlecell"
 
 [tool.ruff]
