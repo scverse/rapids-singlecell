@@ -1,6 +1,6 @@
 # pertpy-GPU: `ptg`
 
-[pertpy](https://pertpy.readthedocs.io) provides tools for perturbation analysis {cite}`Heumos2025`.
+{doc}`pertpy <pertpy:index>` provides tools for perturbation analysis {cite}`Heumos2025`.
 {mod}`rapids_singlecell.ptg` accelerates some of these methods.
 
 ```{eval-rst}
