@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import cupy as cp
 import numpy as np
 import pytest
@@ -10,212 +12,155 @@ from scipy.spatial import ConvexHull, Delaunay
 from rapids_singlecell.squidpy_gpu import _spatial_delaunay as delaunay
 from rapids_singlecell.squidpy_gpu import _spatial_neighbors_backend as backend
 from rapids_singlecell.squidpy_gpu._spatial_graph import build_adjacency, build_graphs
-from rapids_singlecell.squidpy_gpu._spatial_neighbors_backend import _build_kdtree
+
+_UNEXPECTED = Mock(side_effect=AssertionError("Unexpected call"))
 
 
-def test_kdtree_preserves_integer_tags():
+def _subtree_boxes(tree):
+    boxes = np.stack([tree, tree], axis=1)
+    for child in range(len(tree) - 1, 0, -1):
+        low, high = boxes[(child - 1) // 2]
+        np.minimum(low, boxes[child, 0], out=low)
+        np.maximum(high, boxes[child, 1], out=high)
+    return boxes
+
+
+@pytest.mark.parametrize("sizes", [[4096], [1, 2, 3, 0, 7, 1025, 4097]])
+def test_kdtrees_match_cupy_per_library(sizes):
     # Rounded coordinates add ties that must keep CuPy's stable sort order.
-    points = cp.asarray(
-        np.random.default_rng(147).uniform(size=(4096, 2)).round(2), dtype=cp.float32
-    )
-    tree, index, _, _ = _build_kdtree(points)
-    reference = KDTree(points.astype(cp.float64))
-    assert tree.dtype == points.dtype
-    np.testing.assert_array_equal(index.get(), reference.index.get())
-    np.testing.assert_array_equal(tree.get(), reference.tree.get())
-
-
-def test_library_trees_match_separate_trees():
     rng = np.random.default_rng(5)
-    sizes = [1, 2, 3, 0, 7, 1025, 4097]
-    codes = np.repeat(np.arange(len(sizes)), sizes)
-    rng.shuffle(codes)
+    codes = rng.permutation(np.repeat(np.arange(len(sizes)), sizes))
     points = cp.asarray(rng.uniform(size=(len(codes), 2)).round(2), dtype=cp.float32)
-    tree, index, boxes, segments = _build_kdtree(
-        points, cp.asarray(codes, dtype=cp.int32)
-    )
+    library = cp.asarray(codes, dtype=cp.int32) if len(sizes) > 1 else None
+    tree, index, boxes, segments = backend._build_kdtree(points, library)
+    assert tree.dtype == boxes.dtype == points.dtype
     np.testing.assert_array_equal(segments.get(), np.r_[0, np.cumsum(sizes)])
     for code in np.flatnonzero(sizes):
         group = np.flatnonzero(codes == code)
-        part = slice(int(segments[code]), int(segments[code + 1]))
-        expected = _build_kdtree(points[cp.asarray(group)])
-        np.testing.assert_array_equal(tree[part].get(), expected[0].get())
-        np.testing.assert_array_equal(index[part].get(), group[expected[1].get()])
-        np.testing.assert_array_equal(boxes[part].get(), expected[2].get())
-        np.testing.assert_array_equal(
-            boxes[part][0].get(),
-            [points[group].min(0).get(), points[group].max(0).get()],
-        )
+        part = slice(*segments[code : code + 2].tolist())
+        expected = KDTree(points[cp.asarray(group)].astype(cp.float64))
+        reference = expected.tree.get()
+        np.testing.assert_array_equal(tree[part].get(), reference)
+        np.testing.assert_array_equal(index[part].get(), group[expected.index.get()])
+        np.testing.assert_array_equal(boxes[part].get(), _subtree_boxes(reference))
 
 
-def _dense_distances(coords):
-    distances = cp.zeros((len(coords), len(coords)), dtype=coords.dtype)
-    for dim in range(coords.shape[1]):
-        cp.hypot(distances, coords[:, dim, None] - coords[None, :, dim], out=distances)
-    return distances
+def _searches(dtype, dimensions, offset, scale):
+    points = np.random.default_rng(21).normal(size=(40, dimensions)) * scale + offset
+    points[-1] = points[0]
+    searches = [("knn", 8), ("knn", 9), ("knn", 17), ("knn", 33)]  # Top-k buckets.
+    return [(dtype, points, *s) for s in [*searches, ("radius", 1.25 * scale)]]
+
+
+_OUTLIER = np.random.default_rng(8).uniform(size=(2000, 2))
+_OUTLIER[0] = 1e4  # Only bounding boxes, not split lines, prune its search.
 
 
 @pytest.mark.parametrize(
-    "method,n_neighs",
-    [("knn", 8), ("knn", 9), ("knn", 17), ("knn", 33), ("radius", None)],
-)
-@pytest.mark.parametrize(
-    "dtype,dimensions,offset,scale",
+    "dtype,points,method,parameter",
     [
-        (np.float32, 2, 1e6, 1),
-        (np.float64, 3, 1e12, 1),
-        (np.float32, 2, 0, 1e-30),
-        (np.float64, 3, 0, 1e-200),
-        (np.float64, 4, 0, 1e200),
+        *_searches(np.float32, 2, 1e6, 1),
+        *_searches(np.float64, 3, 1e12, 1),
+        *_searches(np.float32, 2, 0, 1e-30),
+        *_searches(np.float64, 3, 0, 1e-200),
+        *_searches(np.float64, 4, 0, 1e200),
+        (np.float32, _OUTLIER, "knn", 6),
+        (np.float32, _OUTLIER, "radius", 0.05),
+        # Radii stay double: the largest double below 1 excludes length 1.
+        *[
+            (dtype, [[0, 0], [0, 0], [1, 0]], "radius", radius)
+            for dtype in (np.float32, np.float64)
+            for radius in (0, np.nextafter(1.0, 0.0), 1)
+        ],
     ],
 )
-def test_tree_matches_dense_search(
-    *, method, n_neighs, dtype, dimensions, offset, scale
-):
-    points = np.random.default_rng(21).normal(size=(40, dimensions)) * scale + offset
-    search = getattr(backend, f"_{method}_edges")
-    parameter = n_neighs if method == "knn" else 1.25 * scale
+def test_tree_matches_dense_search(dtype, points, method, parameter):
     stream = cp.cuda.Stream(non_blocking=True)
     with stream:
         coords = cp.asarray(points, dtype=dtype)
-        coords[-1] = coords[0]
-        rows, cols, distances = search(coords, parameter)
+        rows, cols, distances = getattr(backend, f"_{method}_edges")(coords, parameter)
+        # Fused edge distances use the search's formula, exact at any scale.
+        fused = backend._edge_distances(coords, rows, cols.astype(cp.int32))
     stream.synchronize()
-    direct = _dense_distances(coords)
+    direct = cp.zeros((len(coords), len(coords)), dtype=dtype)
+    for dim in range(coords.shape[1]):
+        cp.hypot(direct, coords[:, dim, None] - coords[None, :, dim], out=direct)
     cp.fill_diagonal(direct, cp.inf)
-    assert distances.dtype == coords.dtype
-    assert bool((rows != cols).all())
-    assert bool((cp.diff(rows) >= 0).all())
-    assert len(cp.unique(rows * len(coords) + cols)) == len(rows)
+    keys = rows * len(coords) + cols
+    assert distances.dtype == fused.dtype == coords.dtype
+    assert bool((rows != cols).all()) and bool((cp.diff(rows) >= 0).all())
+    assert len(cp.unique(keys)) == len(rows)
     if method == "knn":
-        # Ties may choose different indices, but neighbor distances must match.
-        np.testing.assert_array_equal(cp.bincount(rows).get(), n_neighs)
-        np.testing.assert_allclose(
-            cp.sort(distances.reshape(-1, n_neighs), axis=1).get(),
-            cp.sort(direct, axis=1)[:, :n_neighs].get(),
-            rtol=1e-6,
-            atol=0,
+        # Ties may choose different indices, but ascending distances must match.
+        np.testing.assert_array_equal(cp.bincount(rows).get(), parameter)
+        np.testing.assert_array_equal(
+            distances.reshape(-1, parameter).get(),
+            cp.sort(direct, axis=1)[:, :parameter].get(),
         )
     else:
-        expected_rows, expected_cols = cp.nonzero(
-            direct.astype(cp.float64) <= parameter
-        )
-        np.testing.assert_array_equal(
-            cp.sort(rows * len(coords) + cols).get(),
-            cp.sort(expected_rows * len(coords) + expected_cols).get(),
-        )
+        expected = cp.flatnonzero(direct.astype(cp.float64) <= parameter)
+        np.testing.assert_array_equal(cp.sort(keys).get(), expected.get())
     np.testing.assert_array_equal(distances.get(), direct[rows, cols].get())
-
-
-@pytest.mark.parametrize("method", ["knn", "radius"])
-def test_tree_search_with_far_outlier(method):
-    points = np.random.default_rng(8).uniform(size=(2000, 2))
-    points[0] = 1e4  # Only bounding boxes, not split lines, prune its search.
-    coords = cp.asarray(points, dtype=cp.float32)
-    direct = _dense_distances(coords)
-    cp.fill_diagonal(direct, cp.inf)
-    if method == "knn":
-        rows, cols, distances = backend._knn_edges(coords, 6)
-        np.testing.assert_array_equal(
-            distances.reshape(-1, 6).get(), cp.sort(direct, axis=1)[:, :6].get()
-        )
-    else:
-        rows, cols, distances = backend._radius_edges(coords, 0.05)
-        expected_rows, expected_cols = cp.nonzero(direct <= 0.05)
-        np.testing.assert_array_equal(
-            cp.sort(rows * len(coords) + cols).get(),
-            (expected_rows * len(coords) + expected_cols).get(),
-        )
-    np.testing.assert_array_equal(distances.get(), direct[rows, cols].get())
+    np.testing.assert_array_equal(fused.get(), distances.get())
 
 
 def test_knn_subnormal_coordinates():
     # CuPy kernels flush subnormals; the tree must still order them.
-    coords = cp.asarray(
-        [[4e-41, 0], [3e-41, 0], [1e-41, 0], [2e-41, 0]], dtype=cp.float32
-    )
-    _, cols, _ = backend._knn_edges(coords, 1)
+    x = [[4e-41, 0], [3e-41, 0], [1e-41, 0], [2e-41, 0]]
+    _, cols, _ = backend._knn_edges(cp.asarray(x, dtype=cp.float32), 1)
     np.testing.assert_array_equal(cols.get(), [1, 0, 3, 2])
 
 
-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_radius_boundary_precision_and_duplicates(dtype):
-    coords = cp.asarray([[0, 0], [0, 0], [1, 0]], dtype=dtype)
-    direct = _dense_distances(coords).astype(cp.float64)
-    cp.fill_diagonal(direct, cp.inf)
-    for radius, count in [(0, 2), (np.nextafter(1.0, 0.0), 2), (1.0, 6)]:
-        rows, cols, distances = backend._radius_edges(coords, radius)
-        expected_rows, expected_cols = cp.nonzero(direct <= radius)
-        assert len(rows) == len(cp.unique(rows * 3 + cols)) == count
-        np.testing.assert_array_equal(
-            cp.sort(rows * 3 + cols).get(), (expected_rows * 3 + expected_cols).get()
-        )
-        np.testing.assert_array_equal(distances.get(), direct[rows, cols].get())
-
-
-def _assert_csr(actual, expected):
-    actual, expected = actual.get(), expected.get()
-    actual.sort_indices()
-    expected.sort_indices()
-    assert actual.dtype == expected.dtype
-    np.testing.assert_array_equal(actual.indptr, expected.indptr)
-    np.testing.assert_array_equal(actual.indices, expected.indices)
-    np.testing.assert_allclose(actual.data, expected.data, rtol=2e-6)
+_EDGES = [2, 2, 2, 5, 5, 6], [6, 0, 1, 7, 2, 3], [0, 1, 3, 4, 2, 1]
 
 
 @pytest.mark.parametrize(
-    "case,dtype,set_diag",
+    "edges,n,dtype,set_diag",
     [
-        ("unsorted", np.float32, False),
-        ("unsorted", np.float64, True),
-        ("empty", np.float32, True),
-        ("gap", np.float64, False),
+        (_EDGES, 9, np.float32, False),
+        (_EDGES, 9, np.float64, True),
+        (([], [], []), 513, np.float32, True),
+        (([0, 100000], [1, 99999], [0, 2]), 200000, np.float64, False),
     ],
+    ids=["unsorted", "unsorted-diag", "empty", "gap"],
 )
-def test_csr_assembly_storage_gaps_and_stream(case, dtype, set_diag):
-    rows, cols, values, n = (
-        [2, 2, 2, 5, 5, 6],
-        [6, 0, 1, 7, 2, 3],
-        [0, 1, 3, 4, 2, 1],
-        9,
-    )
-    if case == "empty":
-        rows, cols, values, n = [], [], [], 513
-    elif case == "gap":
-        rows, cols, values, n = [0, 100000], [1, 99999], [0, 2], 200000
+def test_csr_assembly_storage_gaps_and_stream(edges, n, dtype, set_diag):
     stream = cp.cuda.Stream(non_blocking=True)
     with stream:
         # Strided input conversion and assembly must respect the caller's stream.
-        rows = cp.repeat(cp.asarray(rows, dtype=cp.int64), 2)[::2]
-        cols = cp.repeat(cp.asarray(cols, dtype=cp.int32), 2)[::2]
-        values = cp.repeat(cp.asarray(values, dtype=dtype), 2)[::2]
+        rows, cols, values = (
+            cp.repeat(cp.asarray(x, dtype=t), 2)[::2]
+            for x, t in zip(edges, (cp.int64, cp.int32, dtype), strict=True)
+        )
         adj, dst = build_graphs(rows, cols, values, n, set_diag=set_diag)
         adjacency = build_adjacency(rows, cols, n, set_diag=set_diag)
-        expected_adj = cp_sparse.csr_matrix(
-            (cp.ones(len(rows), dtype=cp.float32), (rows, cols)), shape=(n, n)
-        )
+        ones = cp.ones(len(rows), dtype=cp.float32)
+        expected_adj = cp_sparse.csr_matrix((ones, (rows, cols)), shape=(n, n))
         expected_dst = cp_sparse.csr_matrix((values, (rows, cols)), shape=(n, n))
         expected_adj.setdiag(1 if set_diag else 0)
         expected_dst.setdiag(0)
     stream.synchronize()
-    _assert_csr(adj, expected_adj)
-    _assert_csr(dst, expected_dst)
-    _assert_csr(adjacency, expected_adj)
+    pairs = (adj, expected_adj), (dst, expected_dst), (adjacency, expected_adj)
+    for actual, expected in pairs:
+        actual, expected = actual.get(), expected.get()
+        actual.sort_indices()
+        expected.sort_indices()
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual.indptr, expected.indptr)
+        np.testing.assert_array_equal(actual.indices, expected.indices)
+        np.testing.assert_allclose(actual.data, expected.data, rtol=2e-6)
     assert adj.nnz == dst.nnz == len(rows) + n  # Stored diagonal zeros survive.
     for name in ("indices", "indptr", "data"):
         assert getattr(adj, name).data.ptr != getattr(dst, name).data.ptr
 
 
 def _assert_delaunay_edges(edges, points):
-    rows, cols = edges
-    indptr, reference_cols = Delaunay(points).vertex_neighbor_vertices
-    reference_rows = np.repeat(np.arange(len(points)), np.diff(indptr))
-    np.testing.assert_array_equal(
-        cp.sort(rows.astype(cp.int64) * len(points) + cols).get(),
-        np.sort(reference_rows * len(points) + reference_cols),
-    )
-    assert bool((cp.diff(rows) >= 0).all())
-    assert bool((rows != cols).all())
+    rows, cols = (cp.asarray(edge, dtype=cp.int64) for edge in edges)
+    indptr, neighbors = Delaunay(points).vertex_neighbor_vertices
+    n = len(points)
+    expected = np.repeat(np.arange(n), np.diff(indptr)) * n + neighbors
+    np.testing.assert_array_equal(cp.sort(rows * n + cols).get(), np.sort(expected))
+    assert bool((cp.diff(rows) >= 0).all()) and bool((rows != cols).all())
 
 
 @pytest.fixture
@@ -232,55 +177,36 @@ def test_gpu_delaunay_exact_edges(force_gpu, kind):
         points = (points + 4) * 2.0**-100
     else:
         lower, upper = points.min(), points.max()
-        points[:2] = lower + np.array([[5000.2, 11000.2], [5000.3, 11000.3]]) * (
-            (upper - lower) / 32768
-        )
+        offsets = np.array([[5000.2, 11000.2], [5000.3, 11000.3]])
+        points[:2] = lower + offsets * ((upper - lower) / 32768)
         gpu = cp.asarray(points)
         keys = cp.empty(len(points), dtype=cp.int32)
-        delaunay.get_morton_number(
-            gpu, len(points), gpu.min(), gpu.max() - gpu.min(), keys
-        )
+        low, span = gpu.min(), gpu.max() - gpu.min()
+        delaunay.get_morton_number(gpu, len(points), low, span, keys)
         assert int(keys[0]) == int(keys[1])
     stream = cp.cuda.Stream(non_blocking=True)
     with stream:
         edges = delaunay._gpu_delaunay_edges(cp.asarray(points))
     stream.synchronize()
-    assert edges is not None
     _assert_delaunay_edges(edges, points)
+    points[3, 1] = np.nan  # Rejected before triangulation, which can hang.
+    with pytest.raises(ValueError, match="finite"):
+        delaunay._gpu_delaunay_edges(cp.asarray(points[:64]))
 
 
 @pytest.mark.parametrize("kind", ["duplicates", "circle", "close_pair"])
 def test_ambiguous_delaunay_uses_gpu(force_gpu, monkeypatch, kind):
     points = np.random.default_rng(147).uniform(size=(2048, 2))
+    points[1] = points[0] + (1e-10 if kind == "close_pair" else 0)
     if kind == "circle":
         # Integer points are exactly cocircular, so either diagonal is valid.
-        points = np.array(
-            [
-                [5, 0],
-                [4, 3],
-                [3, 4],
-                [0, 5],
-                [-3, 4],
-                [-4, 3],
-                [-5, 0],
-                [-4, -3],
-                [-3, -4],
-                [0, -5],
-                [3, -4],
-                [4, -3],
-            ],
-            dtype=np.float64,
-        )
-    else:
-        points[1] = points[0] + (1e-10 if kind == "close_pair" else 0)
-    monkeypatch.setattr(
-        delaunay, "Delaunay", lambda *args: pytest.fail("Unexpected CPU fallback")
-    )
+        z = np.array([5, 4 + 3j, 3 + 4j]) * np.array([1, 1j, -1, -1j])[:, None]
+        points = np.c_[z.real.ravel(), z.imag.ravel()]
+    monkeypatch.setattr(delaunay, "Delaunay", _UNEXPECTED)
     rows, cols = (x.get() for x in delaunay._delaunay_edges(cp.asarray(points)))
     n = len(points)
     keys = rows * n + cols
-    assert np.all(rows != cols)
-    assert np.all(np.diff(rows) >= 0)
+    assert np.all(rows != cols) and np.all(np.diff(rows) >= 0)
     np.testing.assert_array_equal(np.sort(keys), np.unique(keys))
     np.testing.assert_array_equal(np.sort(keys), np.sort(cols * n + rows))
     unique, representatives = np.unique(points, axis=0, return_index=True)
@@ -296,97 +222,49 @@ def test_ambiguous_delaunay_uses_gpu(force_gpu, monkeypatch, kind):
         )
 
 
-def test_gpu_delaunay_rejects_nan(force_gpu):
-    points = cp.asarray(np.random.default_rng(1).uniform(size=(64, 2)))
-    points[3, 1] = cp.nan
-    with pytest.raises(ValueError, match="finite"):
-        delaunay._gpu_delaunay_edges(points)
-
-
-@pytest.mark.parametrize("error", [AttributeError, TypeError])
-def test_changed_cupy_internals_use_qhull(force_gpu, monkeypatch, error):
-    def changed(*args):
-        raise error("Changed private CuPy API.")
-
-    monkeypatch.setattr(delaunay, "_FullDelaunay", changed)
-    points = np.random.default_rng(3).uniform(size=(64, 2))
+@pytest.mark.parametrize("case", ["small", "3d", AttributeError, TypeError])
+def test_delaunay_falls_back_to_qhull(monkeypatch, recwarn, case):
+    # Small and 3D inputs use Qhull, as do changed private CuPy APIs.
+    points = np.random.default_rng(177).normal(size=(34, 3 if case == "3d" else 2))
+    monkeypatch.setattr(delaunay, "_GPU_MIN_POINTS", 35 if case == "small" else 3)
+    error = AssertionError if isinstance(case, str) else case
+    monkeypatch.setattr(delaunay, "_FullDelaunay", Mock(side_effect=error))
     _assert_delaunay_edges(delaunay._delaunay_edges(cp.asarray(points)), points)
-
-
-@pytest.mark.parametrize("dimensions", [2, 3])
-def test_delaunay_small_2d_and_3d_use_qhull(monkeypatch, recwarn, dimensions):
-    points = np.random.default_rng(177).normal(size=(34, dimensions))
-    if dimensions == 3:
-        monkeypatch.setattr(delaunay, "_GPU_MIN_POINTS", 0)
-    monkeypatch.setattr(
-        delaunay, "_FullDelaunay", lambda *args: pytest.fail("Unexpected GPU")
-    )
-    _assert_delaunay_edges(delaunay._delaunay_edges(cp.asarray(points)), points)
-    if dimensions == 3:
+    if case == "3d":
         message = str(recwarn.pop(UserWarning).message)
-        assert "3D" in message
-        assert "using CPU triangulation" in message
-        assert "feature request" in message
-        assert "https://github.com/scverse/rapids_singlecell/issues" in message
+        issues = "https://github.com/scverse/rapids_singlecell/issues"
+        for part in ("3D", "using CPU triangulation", "feature request", issues):
+            assert part in message
     assert not recwarn
 
 
-@pytest.mark.parametrize("kind", ["ordinary", "nearly_cocircular"])
-def test_validation_repairs_non_delaunay_triangulation(kind):
-    points = cp.array([[0, 0], [1, 0], [1, 1.1], [0, 1]], dtype=cp.float64)
-    if kind == "nearly_cocircular":
-        # CuPy's adaptive incircle predicate gives the wrong sign on this quad.
-        points = cp.array(
-            [
-                [0.3497366723201419, 0.3573293439313845],
-                [0.3265864214768884, 0.37860442325324223],
-                [0.33804635178765785, -0.368408284438685],
-                [0.42119129982159276, -0.26943995426550443],
-            ],
-            dtype=cp.float64,
-        )
+_QUAD = [[0, 0], [1, 0], [1, 1.1], [0, 1]]
+# CuPy's adaptive incircle predicate gives the wrong sign on this nearly
+# cocircular quad.
+_COCIRCULAR = [
+    [0.3497366723201419, 0.3573293439313845],
+    [0.3265864214768884, 0.37860442325324223],
+    [0.33804635178765785, -0.368408284438685],
+    [0.42119129982159276, -0.26943995426550443],
+]
+
+
+@pytest.mark.parametrize(
+    "points,corruption",
+    [(_QUAD, None), (_COCIRCULAR, None), (_QUAD, (1, 2, 0)), (_QUAD, (0, 0, -2))],
+    ids=["ordinary", "nearly_cocircular", "reciprocal", "boundary"],
+)
+def test_validation_repairs_or_rejects_triangulations(monkeypatch, points, corruption):
+    points = cp.asarray(points, dtype=cp.float64)
     triangles = cp.array([[0, 1, 2], [0, 2, 3]], dtype=cp.int32)
     opposite = cp.array([[-1, 18, -1], [-1, -1, 1]], dtype=cp.int32)
-    edges = delaunay._validated_edges(points, triangles, opposite)
-    assert edges is not None
-    rows, cols = edges
+    if corruption:
+        opposite[corruption[:2]] = corruption[2]
+        monkeypatch.setattr(delaunay, "_flip_delaunay_edges", _UNEXPECTED)
+        assert delaunay._validated_edges(points, triangles, opposite) is None
+        return
+    rows, cols = delaunay._validated_edges(points, triangles, opposite)
     # Preserve the hull and replace the illegal 0--2 diagonal with 1--3.
-    expected = np.array([[0, 1], [1, 2], [2, 3], [3, 0], [1, 3]])
-    expected = np.concatenate((expected, expected[:, ::-1]))
-    np.testing.assert_array_equal(
-        cp.sort(rows * len(points) + cols).get(),
-        np.sort(expected[:, 0] * len(points) + expected[:, 1]),
-    )
-
-
-@pytest.mark.parametrize("corruption", ["reciprocal", "boundary"])
-def test_validation_rejects_invalid_topology(monkeypatch, corruption):
-    points = cp.array([[0, 0], [1, 0], [1, 1.1], [0, 1]], dtype=cp.float64)
-    triangles = cp.array([[0, 1, 2], [0, 2, 3]], dtype=cp.int32)
-    opposite = cp.array([[-1, 18, -1], [-1, -1, 1]], dtype=cp.int32)
-    if corruption == "reciprocal":
-        opposite[1, 2] = 0
-    else:
-        opposite[0, 0] = -2
-    monkeypatch.setattr(
-        delaunay,
-        "_flip_delaunay_edges",
-        lambda *args: pytest.fail("Attempted to repair invalid topology"),
-    )
-    assert delaunay._validated_edges(points, triangles, opposite) is None
-
-
-@pytest.mark.parametrize("dtype,scale", [(np.float32, 1e30), (np.float64, 1e-200)])
-def test_fused_distances_preserve_extreme_scales(dtype, scale):
-    stream = cp.cuda.Stream(non_blocking=True)
-    with stream:
-        coords = cp.asarray(
-            np.random.default_rng(33).normal(size=(20, 3)) * scale, dtype=dtype
-        )
-        rows = cp.arange(len(coords), dtype=cp.int64)
-        cols = ((rows + 3) % len(coords)).astype(cp.int32)
-        actual = backend._edge_distances(coords, rows, cols)
-        expected = _dense_distances(coords)[rows, cols]
-    stream.synchronize()
-    assert actual.dtype == dtype
-    np.testing.assert_allclose(actual.get(), expected.get(), rtol=2e-7, atol=0)
+    left, right = np.array([[0, 1, 2, 3, 1], [1, 2, 3, 0, 3]])
+    expected = np.sort(np.r_[left * 4 + right, right * 4 + left])
+    np.testing.assert_array_equal(cp.sort(rows * 4 + cols).get(), expected)
