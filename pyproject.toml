@@ -77,8 +77,8 @@ test-minimal = [
     "fast-array-utils",
 ]
 test = [
-    "rapids_singlecell[test-minimal]",
     "igraph",
+    { include-group="test-minimal" },
 ]
 
 dev = [
