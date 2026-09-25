@@ -2,7 +2,7 @@
 [![PyPI](https://img.shields.io/pypi/v/rapids-singlecell?logo=PyPI)](https://pypi.org/project/rapids-singlecell)
 [![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-total.json)](https://pypi.org/project/rapids-singlecell)
 [![Downloads/month](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-month.json)](https://pypi.org/project/rapids-singlecell)
-[![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.readthedocs.io/en/latest/?badge=latest)
+[![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.scverse.org/)
 [![CI-Pass](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml)
 [![codecov](https://codecov.io/gh/scverse/rapids-singlecell/graph/badge.svg?token=PFHJEQD94X)](https://codecov.io/gh/scverse/rapids-singlecell)
 [![Chat](https://img.shields.io/badge/zulip-join_chat-%2367b08f.svg)](https://scverse.zulipchat.com)
@@ -20,7 +20,7 @@ Computations use CuPy and NVIDIA CUDA-X Data Science (formerly RAPIDS) for perfo
 
 ## Documentation
 
-For more information please have a look through the [documentation](https://rapids-singlecell.readthedocs.io/en/latest/)
+For more information please have a look through the [documentation](https://rapids-singlecell.scverse.org/)
 
 ## Citation
 
