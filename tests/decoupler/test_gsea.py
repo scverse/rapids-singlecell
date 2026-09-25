@@ -19,9 +19,8 @@ from rapids_singlecell.decoupler_gpu import _method_gsea as g
 def _permutations(nvar, times, seed):
     permutations = np.tile(np.arange(nvar, dtype=np.int32), (times, 1))
     rng = np.random.default_rng(seed)
-    if seed:
-        for permutation in permutations:
-            rng.shuffle(permutation)
+    for permutation in permutations:
+        rng.shuffle(permutation)
     return permutations
 
 
@@ -193,8 +192,8 @@ def test_full_zero_subnormal_and_signed_scores(times, nvar):
     ]
     mat[3] = -0.0
     sets = [np.arange(nvar), [0], [1], [2, 3]]
-    expected, expected_p = _reference(mat, sets, times, 0)
-    score, pval = _run(mat, sets, times=times, seed=0)
+    expected, expected_p = _reference(mat, sets, times, 42)
+    score, pval = _run(mat, sets, times=times, seed=42)
     np.testing.assert_allclose(score, expected, rtol=1e-13, atol=1e-13)
     np.testing.assert_array_equal(pval, expected_p)
     score, _ = _run([[3, 2, 1]], [[1]], times=0)
@@ -311,13 +310,14 @@ def test_cache_chunk_handoff_budget_and_pickle(forward, fits, nvar, times):
 
 
 @pytest.mark.parametrize("max_bytes", [0, 256 * 1024**2])
+@pytest.mark.parametrize("seed", [0, 42])
 def test_streamed_and_cached_scoring_counts_each_permutation_once(
-    monkeypatch, max_bytes
+    monkeypatch, max_bytes, seed
 ):
     mat = np.zeros((2, 257), dtype=np.float32)
     mat[:, :66] = np.linspace(3, 1, 66)
     sets = [np.arange(8), np.arange(257), np.arange(65)]
-    expected, expected_p = _reference(mat, sets, 513, 42)
+    expected, expected_p = _reference(mat, sets, 513, seed)
     original = g._gs.sparse
     submitted = {}
 
@@ -331,7 +331,7 @@ def test_streamed_and_cached_scoring_counts_each_permutation_once(
     cache = g._PermutationCache(max_bytes)
     for _ in range(2):
         submitted.clear()
-        score, pval = _run(mat, sets, times=513, _permutation_cache=cache)
+        score, pval = _run(mat, sets, times=513, seed=seed, _permutation_cache=cache)
         np.testing.assert_allclose(score, expected, rtol=1e-13, atol=1e-13)
         np.testing.assert_array_equal(pval, expected_p)
         assert submitted == {8: 513, 128: 513}

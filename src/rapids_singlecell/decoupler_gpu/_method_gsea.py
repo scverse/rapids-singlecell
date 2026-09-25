@@ -17,9 +17,7 @@ def _permutations(nvar, times, seed, size=128):
     identity = np.arange(nvar, dtype=np.int32)
     for start in range(0, times, size):
         rows = np.tile(identity, (min(size, times - start), 1))
-        # Seed zero keeps the identity permutations, matching decoupler.
-        if seed:
-            rng.permuted(rows, axis=1, out=rows)
+        rng.permuted(rows, axis=1, out=rows)
         yield rows
 
 
@@ -106,13 +104,9 @@ def _func_gsea(
     r"""
     Gene Set Enrichment Analysis (GSEA).
 
-    Rank features with decoupler's Numba tie ordering and compute signed,
-    absolute-value-weighted running-sum extrema. Network weights are ignored.
-    With ``times > 1``, membership permutations give same-sign normalized scores
+    Test whether feature sets are enriched at either end of a ranked list.
+    Network weights are ignored. With ``times > 1``, return normalized scores
     and empirical p-values; otherwise return raw scores and p-values of one.
-    Zero-weight sets score zero. Sensitive comparisons replay the float64 walk.
-    ``seed=0`` uses identity permutations, matching decoupler. A bounded 256 MiB
-    device cache shares permutations across observations within each invocation.
 
     %(yestest)s
 
