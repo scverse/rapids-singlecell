@@ -396,6 +396,11 @@ def _knn(coords: cp.ndarray, n_neighs: int, codes: cp.ndarray | None):
 
 def _validate_coordinates(coords: Any) -> cp.ndarray:
     coords = coords.to_numpy() if hasattr(coords, "to_numpy") else coords
+    if (
+        not isinstance(coords, (np.ndarray, cp.ndarray))
+        or coords.dtype.kind not in "iuf"
+    ):
+        raise TypeError("Spatial coordinates must be a dense array of real numbers.")
     coords = cp.asarray(coords, dtype=cp.float32, order="C")
     if coords.ndim != 2 or 0 in coords.shape:
         raise ValueError("Spatial coordinates must be a nonempty 2D array.")

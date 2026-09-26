@@ -159,7 +159,7 @@ def spatial_neighbors_from_builder(
     single = codes is None or codes.min() == codes.max()
     if type(builder) in _BUILDERS and {*map(type, builder.postprocessors())} <= _STEPS:
         result = builder._build(coords, None if single else cp.asarray(codes, "int32"))
-    elif single:
+    elif codes is None:
         result = builder.build(coords)
     else:
         order = np.argsort(codes, kind="stable")
