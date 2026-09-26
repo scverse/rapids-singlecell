@@ -336,7 +336,7 @@ def calculate_niche(
         - :func:`~rapids_singlecell.gr.calculate_niche_cellcharter`
 
     The spatial graph in ``adata.obsp[spatial_connectivities_key]`` must be
-    precomputed (e.g. via :func:`squidpy.gr.spatial_neighbors`), except for
+    precomputed (e.g. via :func:`~rapids_singlecell.gr.spatial_neighbors_knn`), except for
     ``flavor="cellcharter"`` when ``use_rep`` is provided.
 
     Parameters
@@ -525,7 +525,7 @@ def _check_key(adata: AnnData, key: str) -> None:
     if key not in adata.obsp:
         raise KeyError(
             f"'{key}' not found in `adata.obsp`. "
-            "Compute it first with `squidpy.gr.spatial_neighbors`."
+            "Compute it first with `rapids_singlecell.gr.spatial_neighbors_knn`."
         )
 
 
