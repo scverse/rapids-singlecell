@@ -1,58 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
-
-template <typename T, typename IdxT>
-__global__ void qc_csc_kernel(const IdxT* __restrict__ indptr,
-                              const IdxT* __restrict__ index,
-                              const T* __restrict__ data,
-                              T* __restrict__ sums_cells,
-                              T* __restrict__ sums_genes,
-                              int* __restrict__ cell_ex,
-                              int* __restrict__ gene_ex, int n_genes) {
-    int gene = blockDim.x * blockIdx.x + threadIdx.x;
-    if (gene >= n_genes) return;
-    IdxT start_idx = indptr[gene];
-    IdxT stop_idx = indptr[gene + 1];
-    T sums_genes_i = T(0);
-    int gene_ex_i = 0;
-    for (IdxT p = start_idx; p < stop_idx; ++p) {
-        T v = data[p];
-        IdxT cell = index[p];
-        sums_genes_i += v;
-        atomicAdd(&sums_cells[cell], v);
-        ++gene_ex_i;
-        atomicAdd(&cell_ex[cell], 1);
-    }
-    sums_genes[gene] = sums_genes_i;
-    gene_ex[gene] = gene_ex_i;
-}
-
-template <typename T, typename IdxT>
-__global__ void qc_csr_kernel(const IdxT* __restrict__ indptr,
-                              const IdxT* __restrict__ index,
-                              const T* __restrict__ data,
-                              T* __restrict__ sums_cells,
-                              T* __restrict__ sums_genes,
-                              int* __restrict__ cell_ex,
-                              int* __restrict__ gene_ex, int n_cells) {
-    int cell = blockDim.x * blockIdx.x + threadIdx.x;
-    if (cell >= n_cells) return;
-    IdxT start_idx = indptr[cell];
-    IdxT stop_idx = indptr[cell + 1];
-    T sums_cells_i = T(0);
-    int cell_ex_i = 0;
-    for (IdxT p = start_idx; p < stop_idx; ++p) {
-        T v = data[p];
-        IdxT gene = index[p];
-        atomicAdd(&sums_genes[gene], v);
-        sums_cells_i += v;
-        atomicAdd(&gene_ex[gene], 1);
-        ++cell_ex_i;
-    }
-    sums_cells[cell] = sums_cells_i;
-    cell_ex[cell] = cell_ex_i;
-}
+#include "../minor_tiles.cuh"
 
 template <typename T>
 __global__ void qc_dense_kernel(const T* __restrict__ data,
@@ -74,41 +23,6 @@ __global__ void qc_dense_kernel(const T* __restrict__ data,
     }
 }
 
-template <typename T, typename IdxT>
-__global__ void qc_csc_sub_kernel(const IdxT* __restrict__ indptr,
-                                  const IdxT* __restrict__ index,
-                                  const T* __restrict__ data,
-                                  T* __restrict__ sums_cells,
-                                  const bool* __restrict__ mask, int n_genes) {
-    int gene = blockDim.x * blockIdx.x + threadIdx.x;
-    if (gene >= n_genes) return;
-    if (!mask[gene]) return;
-    IdxT start_idx = indptr[gene];
-    IdxT stop_idx = indptr[gene + 1];
-    for (IdxT p = start_idx; p < stop_idx; ++p) {
-        IdxT cell = index[p];
-        atomicAdd(&sums_cells[cell], data[p]);
-    }
-}
-
-template <typename T, typename IdxT>
-__global__ void qc_csr_sub_kernel(const IdxT* __restrict__ indptr,
-                                  const IdxT* __restrict__ index,
-                                  const T* __restrict__ data,
-                                  T* __restrict__ sums_cells,
-                                  const bool* __restrict__ mask, int n_cells) {
-    int cell = blockDim.x * blockIdx.x + threadIdx.x;
-    if (cell >= n_cells) return;
-    IdxT start_idx = indptr[cell];
-    IdxT stop_idx = indptr[cell + 1];
-    T sums_cells_i = T(0);
-    for (IdxT p = start_idx; p < stop_idx; ++p) {
-        IdxT gene = index[p];
-        if (mask[gene]) sums_cells_i += data[p];
-    }
-    sums_cells[cell] = sums_cells_i;
-}
-
 template <typename T>
 __global__ void qc_dense_sub_kernel(const T* __restrict__ data,
                                     T* __restrict__ sums_cells,
@@ -121,3 +35,51 @@ __global__ void qc_dense_sub_kernel(const T* __restrict__ data,
     long long idx = (long long)cell * n_genes + gene;
     atomicAdd(&sums_cells[cell], data[idx]);
 }
+
+/// Minor-axis sum (as T) and stored-entry count per column (see
+/// minor_tiles.cuh). Layout: double sums, int counts.
+template <typename T>
+struct QcOp {
+    const T* data;
+    T* sums;
+    int* counts;
+    int tile_size;
+    static constexpr size_t bytes_per_col = sizeof(double) + sizeof(int);
+    static constexpr bool needs_rows = false;
+    __device__ double* s_sum(char* acc) const {
+        return reinterpret_cast<double*>(acc);
+    }
+    __device__ int* s_cnt(char* acc) const {
+        return reinterpret_cast<int*>(acc + (size_t)tile_size * sizeof(double));
+    }
+    __device__ bool row_active(int) const {
+        return true;
+    }
+    __device__ void zero_col(char* acc, int g, int) const {
+        s_sum(acc)[g] = 0.0;
+        s_cnt(acc)[g] = 0;
+    }
+    __device__ void add(char* acc, long long q, int g) const {
+        atomicAdd(&s_sum(acc)[g], static_cast<double>(data[q]));
+        atomicAdd(&s_cnt(acc)[g], 1);
+    }
+    __device__ void flush_col(const char* acc, int, int col, int g) const {
+        char* a = const_cast<char*>(acc);
+        const int c = s_cnt(a)[g];
+        if (c != 0) {
+            atomicAdd(&sums[col], static_cast<T>(s_sum(a)[g]));
+            atomicAdd(&counts[col], c);
+        }
+    }
+    __device__ void add_global(long long q, int col, int) const {
+        atomicAdd(&sums[col], data[q]);
+        atomicAdd(&counts[col], 1);
+    }
+    void zero_outputs(int minor, int, cudaStream_t stream) const {
+        cuda_check(cudaMemsetAsync(sums, 0, (size_t)minor * sizeof(T), stream),
+                   "cudaMemsetAsync(QcOp outputs)");
+        cuda_check(
+            cudaMemsetAsync(counts, 0, (size_t)minor * sizeof(int), stream),
+            "cudaMemsetAsync(QcOp outputs)");
+    }
+};
