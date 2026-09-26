@@ -48,6 +48,23 @@ def test_autocorr_consistency(mode):
     assert not np.array_equal(idx_df, idx_adata)
 
 
+def test_autocorr_spatialdata():
+    """Check that a SpatialData table gives the same result as the AnnData."""
+    spatialdata = pytest.importorskip("spatialdata")
+    file = Path(__file__).parent / Path("_data/dummy.h5ad")
+    dummy_adata = read_h5ad(file)
+    sdata = spatialdata.SpatialData(tables={"table": dummy_adata.copy()})
+
+    expected = spatial_autocorr(dummy_adata, mode="moran", copy=True)
+    actual = spatial_autocorr(sdata, mode="moran", copy=True, table_key="table")
+
+    np.testing.assert_allclose(actual.to_numpy(), expected.to_numpy())
+    spatial_autocorr(sdata, mode="moran", table_key="table")
+    assert MORAN_I in sdata.tables["table"].uns
+    with pytest.raises(TypeError, match="table_key"):
+        spatial_autocorr(sdata, mode="moran")
+
+
 @pytest.mark.parametrize("mode", ["moran", "geary"])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_autocorr_sparse(mode, dtype):

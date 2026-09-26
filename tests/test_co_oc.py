@@ -41,6 +41,24 @@ def test_co_occurrence(adata: AnnData):
     assert arr.shape[1] == arr.shape[0] == adata.obs["leiden"].unique().shape[0]
 
 
+def test_co_occurrence_spatialdata(adata: AnnData):
+    """Check that a SpatialData table gives the same result as the AnnData."""
+    spatialdata = pytest.importorskip("spatialdata")
+    sdata = spatialdata.SpatialData(tables={"table": adata.copy()})
+
+    expected = co_occurrence(adata, cluster_key="leiden", copy=True)
+    actual = co_occurrence(sdata, cluster_key="leiden", copy=True, table_key="table")
+
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(actual_value, expected_value)
+    co_occurrence(sdata, cluster_key="leiden", table_key="table")
+    assert "leiden_co_occurrence" in sdata.tables["table"].uns
+    with pytest.raises(TypeError, match="table_key"):
+        co_occurrence(sdata, cluster_key="leiden")
+    with pytest.raises(ValueError, match="not found"):
+        co_occurrence(sdata, cluster_key="leiden", table_key="missing")
+
+
 def test_co_occurrence_reproducibility(adata: AnnData):
     """Check co_occurrence reproducibility results."""
     arr_1, interval_1 = co_occurrence(adata, cluster_key="leiden", copy=True)

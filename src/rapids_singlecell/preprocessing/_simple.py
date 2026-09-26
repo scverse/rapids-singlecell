@@ -63,7 +63,8 @@ def filter_genes(
     max_cells: int | None = None,
     inplace: bool = True,
     verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray] | None:
+    copy: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | AnnData | None:
     """\
     Filter genes based on number of cells or counts.
 
@@ -91,6 +92,8 @@ def filter_genes(
         Perform computation inplace or return result.
     verbose
         Print number of discarded genes
+    copy
+        Return a filtered AnnData copy when `inplace=True`.
 
     Returns
     -------
@@ -154,9 +157,11 @@ def filter_genes(
             print(msg)
 
     if isinstance(data, AnnData) and inplace:
+        data = data.copy() if copy else data
         col = "n_counts" if (min_cells is None and max_cells is None) else "n_cells"
         data.var[col] = number_per_gene.get()
         data._inplace_subset_var(gene_subset.get())
+        return data if copy else None
     else:
         return gene_subset.get(), number_per_gene.get()
 
@@ -170,7 +175,8 @@ def filter_cells(
     max_genes: int | None = None,
     inplace: bool = True,
     verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray] | None:
+    copy: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | AnnData | None:
     """\
     Filter cell outliers based on counts and numbers of genes expressed.
 
@@ -198,6 +204,8 @@ def filter_cells(
         Perform computation inplace or return result.
     verbose
         Print number of discarded cells
+    copy
+        Return a filtered AnnData copy when `inplace=True`.
 
     Returns
     -------
@@ -294,9 +302,11 @@ def filter_cells(
             print(msg)
 
     if isinstance(data, AnnData) and inplace:
+        data = data.copy() if copy else data
         col = "n_counts" if (min_genes is None and max_genes is None) else "n_genes"
         data.obs[col] = number_per_cell.get()
         data._inplace_subset_obs(cell_subset.get())
+        return data if copy else None
     else:
         return cell_subset.get(), number_per_cell.get()
 

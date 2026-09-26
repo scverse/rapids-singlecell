@@ -155,6 +155,22 @@ def test_copy_returns_new_object(adata):
     assert list(adata.obs.columns) == before
 
 
+def test_spatialdata_table(adata):
+    """A SpatialData table gives the same niches as the AnnData and is updated in place."""
+    spatialdata = pytest.importorskip("spatialdata")
+    sdata = spatialdata.SpatialData(tables={"table": adata.copy()})
+
+    calculate_niche_utag(sdata, resolutions=0.5, n_neighbors=10, table_key="table")
+    calculate_niche_utag(adata, resolutions=0.5, n_neighbors=10)
+
+    np.testing.assert_array_equal(
+        sdata.tables["table"].obs["utag_niche_res=0.5"].astype(str),
+        adata.obs["utag_niche_res=0.5"].astype(str),
+    )
+    with pytest.raises(TypeError, match="table_key"):
+        calculate_niche_utag(sdata, resolutions=0.5, n_neighbors=10)
+
+
 def test_multiple_resolutions(adata):
     calculate_niche(
         adata,

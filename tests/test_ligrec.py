@@ -234,7 +234,12 @@ class TestValidBehavior:
             assert np.nanmax(r["pvalues"].values) <= 1.0, np.nanmax(r["pvalues"].values)
             assert np.nanmin(r["pvalues"].values) >= 0, np.nanmin(r["pvalues"].values)
 
-    def test_result_correct_index(self, adata: AnnData, interactions: Interactions_t):
+    @pytest.mark.parametrize("integer_categories", [False, True])
+    def test_result_correct_index(
+        self, adata: AnnData, interactions: Interactions_t, integer_categories: bool
+    ):
+        if integer_categories:
+            adata.obs[_CK] = adata.obs[_CK].cat.codes.astype("category")
         r = ligrec(adata, _CK, interactions=interactions, n_perms=5, copy=True)
 
         np.testing.assert_array_equal(r["means"].index, r["pvalues"].index)
@@ -243,6 +248,9 @@ class TestValidBehavior:
         np.testing.assert_array_equal(r["means"].columns, r["pvalues"].columns)
         assert not np.array_equal(r["means"].columns, r["metadata"].columns)
         assert not np.array_equal(r["pvalues"].columns, r["metadata"].columns)
+        assert set(r["means"].columns.get_level_values("cluster_1")) == set(
+            map(str, adata.obs[_CK].cat.categories)
+        )
 
     def test_result_is_sparse(self, adata: AnnData, interactions: Interactions_t):
         interactions = pd.DataFrame(interactions, columns=["source", "target"])
