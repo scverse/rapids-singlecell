@@ -111,7 +111,7 @@ def _run_dask_idx(
     verbose: bool = False,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Dask execution for adj=False methods (AUCell, ORA) - each chunk = one batch."""
+    """Dask execution for indexed feature sets - each chunk = one batch."""
     import dask
 
     # Wrap arrays in delayed to avoid serializing per-task
