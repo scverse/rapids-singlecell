@@ -14,6 +14,8 @@
     dcg.ulm
     dcg.aucell
     dcg.gsea
+    dcg.ora
+    dcg.query_set
     dcg.waggr
     dcg.zscore
 ```

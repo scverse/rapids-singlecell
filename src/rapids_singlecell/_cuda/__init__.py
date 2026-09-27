@@ -42,6 +42,7 @@ __all__ = [
     "_nanmean_cuda",
     "_nn_descent_cuda",
     "_norm_cuda",
+    "_ora_cuda",
     "_pr_cuda",
     "_pv_cuda",
     "_qc_cuda",

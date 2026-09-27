@@ -9,7 +9,7 @@ from rapids_singlecell.decoupler_gpu._helper._log import _log
 
 @docs.dedent
 def prune(
-    features: np.ndarray,
+    features: np.ndarray | None,
     net: pd.DataFrame,
     tmin: int = 5,
     *,
@@ -31,11 +31,11 @@ def prune(
     """
     # Validate
     vnet = _validate_net(net, verbose=verbose)
-    features_set = set(features)
     assert isinstance(tmin, int | float) and tmin >= 0, "tmin must be numeric and >= 0"
     # Find shared targets between mat and net
-    msk = vnet["target"].isin(features_set)
-    vnet = vnet.loc[msk]
+    if features is not None:
+        msk = vnet["target"].isin(set(features))
+        vnet = vnet.loc[msk]
     # Find unique sources with tmin
     sources = vnet["source"].value_counts()
     sources = set(sources[sources >= tmin].index)
