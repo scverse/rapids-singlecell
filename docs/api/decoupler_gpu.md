@@ -13,6 +13,8 @@
     dcg.mlm
     dcg.ulm
     dcg.aucell
+    dcg.ora
+    dcg.query_set
     dcg.waggr
     dcg.zscore
 ```
