@@ -31,33 +31,40 @@ __device__ void exchange(Value& left, Value& right) {
     right = temporary;
 }
 
-template <typename Index>
-__device__ float prepare_pivot(const float* values, Index* order, int low,
+template <bool IndexTies, typename Index>
+__device__ bool precedes(const float* values, Index left, Index right) {
+    return values[left] > values[right] ||
+           (IndexTies && values[left] == values[right] && left < right);
+}
+
+template <bool IndexTies, typename Index>
+__device__ Index prepare_pivot(const float* values, Index* order, int low,
                                int high) {
     const int middle = low + (high - low) / 2;
-    if (values[order[middle]] > values[order[low]]) {
+    if (precedes<IndexTies>(values, order[middle], order[low])) {
         exchange(order[low], order[middle]);
     }
-    if (values[order[high]] > values[order[middle]]) {
+    if (precedes<IndexTies>(values, order[high], order[middle])) {
         exchange(order[high], order[middle]);
     }
-    if (values[order[middle]] > values[order[low]]) {
+    if (precedes<IndexTies>(values, order[middle], order[low])) {
         exchange(order[low], order[middle]);
     }
     exchange(order[high], order[middle]);
-    return values[order[high]];
+    return order[high];
 }
 
-template <typename Index>
+template <bool IndexTies, typename Index>
 __device__ int partition(const float* values, Index* order, int low, int high,
-                         float pivot) {
+                         Index pivot) {
     int left = low;
     int right = high - 1;
     while (true) {
-        while (left < high && values[order[left]] > pivot) {
+        while (left < high && precedes<IndexTies>(values, order[left], pivot)) {
             ++left;
         }
-        while (right >= low && pivot > values[order[right]]) {
+        while (right >= low &&
+               precedes<IndexTies>(values, pivot, order[right])) {
             --right;
         }
         if (left >= right) {
@@ -71,7 +78,7 @@ __device__ int partition(const float* values, Index* order, int low, int high,
     return left;
 }
 
-template <typename Index>
+template <bool IndexTies, typename Index>
 __device__ void quicksort(const float* values, Index* order, int2 range) {
     // Processing smaller children first bounds the int32-sized stack at 32.
     int2 stack[32];
@@ -80,9 +87,9 @@ __device__ void quicksort(const float* values, Index* order, int2 range) {
     while (pending_ranges) {
         range = stack[--pending_ranges];
         while (range.y - range.x >= INSERTION_CUTOFF) {
-            const int pivot =
-                partition(values, order, range.x, range.y,
-                          prepare_pivot(values, order, range.x, range.y));
+            const int pivot = partition<IndexTies>(
+                values, order, range.x, range.y,
+                prepare_pivot<IndexTies>(values, order, range.x, range.y));
             int2 left = make_int2(range.x, pivot - 1);
             int2 right = make_int2(pivot + 1, range.y);
             if (left.y - left.x > right.y - right.x) {
@@ -95,7 +102,7 @@ __device__ void quicksort(const float* values, Index* order, int2 range) {
             const Index gene = order[position];
             int insertion = position;
             while (insertion > range.x &&
-                   values[gene] > values[order[insertion - 1]]) {
+                   precedes<IndexTies>(values, gene, order[insertion - 1])) {
                 order[insertion] = order[insertion - 1];
                 --insertion;
             }
@@ -104,7 +111,7 @@ __device__ void quicksort(const float* values, Index* order, int2 range) {
     }
 }
 
-template <typename Index>
+template <bool IndexTies, typename Index>
 __device__ void sort_order(const float* values, Index* order, int n_columns,
                            Work& work) {
     if (threadIdx.x == 0) {
@@ -117,9 +124,9 @@ __device__ void sort_order(const float* values, Index* order, int n_columns,
             const int2 range = work.ranges[threadIdx.x];
             int2 right = make_int2(0, -1);
             if (range.y - range.x >= INSERTION_CUTOFF) {
-                const int pivot =
-                    partition(values, order, range.x, range.y,
-                              prepare_pivot(values, order, range.x, range.y));
+                const int pivot = partition<IndexTies>(
+                    values, order, range.x, range.y,
+                    prepare_pivot<IndexTies>(values, order, range.x, range.y));
                 work.ranges[threadIdx.x].y = pivot - 1;
                 right = make_int2(pivot + 1, range.y);
             }
@@ -127,7 +134,7 @@ __device__ void sort_order(const float* values, Index* order, int n_columns,
         }
         __syncthreads();
     }
-    quicksort(values, order, work.ranges[threadIdx.x]);
+    quicksort<IndexTies>(values, order, work.ranges[threadIdx.x]);
     __syncthreads();
 }
 
@@ -137,10 +144,13 @@ template <typename Index>
 __device__ int2 zero_partition(const float* values, Index* order, int n_columns,
                                int* scratch, Work& work) {
     if (threadIdx.x == 0) {
-        const float pivot = prepare_pivot(values, order, 0, n_columns - 1);
+        const Index pivot_gene =
+            prepare_pivot<false>(values, order, 0, n_columns - 1);
+        const float pivot = values[pivot_gene];
         work.metadata = make_int2(
-            pivot == 0 ? n_columns - 1
-                       : partition(values, order, 0, n_columns - 1, pivot),
+            pivot == 0
+                ? n_columns - 1
+                : partition<false>(values, order, 0, n_columns - 1, pivot_gene),
             -1);
         work.ranges[0].x = pivot == 0;  // The range queue is unused here.
     }
@@ -271,11 +281,11 @@ __device__ void sort_zero_chain(const float* values, Index* order,
             high = pivot - 1;
         } else {
             // A positive pivot leaves every zero on the right.
-            sort_order(values, order + low, split.x, work);
+            sort_order<false>(values, order + low, split.x, work);
             low = pivot + 1;
         }
     }
-    sort_order(values, order + low, high - low + 1, work);
+    sort_order<false>(values, order + low, high - low + 1, work);
 }
 
 template <typename Index>
@@ -320,7 +330,7 @@ __global__ void rank_kernel(const float* values, size_t n_rows, int n_columns,
             sort_zero_chain(row_values, row_order, n_columns,
                             ranks + row * n_columns, work);
         } else {
-            sort_order(row_values, row_order, n_columns, work);
+            sort_order<false>(row_values, row_order, n_columns, work);
         }
         for (size_t position = threadIdx.x; position < size_t(n_columns);
              position += THREADS) {
