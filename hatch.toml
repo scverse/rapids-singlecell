@@ -1,10 +1,10 @@
 [envs.default]
 installer = "uv"
-features = [ "dev" ]
+dependency-groups = [ "dev" ]
 
 [envs.hatch-test]
 default-args = [  ]
-features = [ "test" ]
+dependency-groups = [ "test" ]
 
 # Select CUDA feature per matrix
 overrides.matrix.cuda.features = [
@@ -129,8 +129,8 @@ overrides.name."rapids_prerelease-13$".extra-dependencies = [
 ## For prerelease we rely on UV_PRERELEASE + nightly index; features select cu12/cu13
 
 [envs.docs]
-features = [ "doc" ]
-scripts.build = "sphinx-build -W --keep-going -b html docs docs/_build/html {args}"
+dependency-groups = [ "docs" ]
+scripts.build = "sphinx-build -W -b html docs docs/_build/html {args}"
 scripts.clean = "git clean -fXd docs"
 
 [envs.default.pip]

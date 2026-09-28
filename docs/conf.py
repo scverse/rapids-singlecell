@@ -111,7 +111,7 @@ source_suffix = {
 }
 
 intersphinx_mapping = {
-    "anndata": ("https://anndata.readthedocs.io/en/latest/", None),
+    "anndata": ("https://anndata.scverse.org/en/stable/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "scipy": ("https://docs.scipy.org/doc/scipy/", None),
     "cupy": ("https://docs.cupy.dev/en/stable/", None),
@@ -120,9 +120,9 @@ intersphinx_mapping = {
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "cudf": ("https://docs.rapids.ai/api/cudf/stable/", None),
     "cugraph": ("https://docs.rapids.ai/api/cugraph/stable/", None),
-    "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
+    "scanpy": ("https://scanpy.scverse.org/en/stable/", None),
     "squidpy": ("https://squidpy.readthedocs.io/en/stable/", None),
-    "pertpy": ("https://pertpy.readthedocs.io/en/stable/", None),
+    "pertpy": ("https://pertpy.scverse.org/en/stable/", None),
     "seaborn": ("https://seaborn.pydata.org/", None),
     "decoupler": ("https://decoupler.readthedocs.io/en/latest/", None),
     "rmm": ("https://docs.rapids.ai/api/rmm/stable/", None),

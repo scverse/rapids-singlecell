@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.decoupler_gpu._helper._docs import docs
 from rapids_singlecell.decoupler_gpu._helper._log import _log
-from rapids_singlecell.preprocessing._utils import _check_use_raw
+from rapids_singlecell.preprocessing._utils import _check_use_raw, _sparse_to_dense
 
 DataType = Union[  # noqa: UP007
     AnnData, pd.DataFrame, cudf.DataFrame, tuple[np.ndarray, np.ndarray, np.ndarray]
@@ -32,6 +32,24 @@ getnnz_0 = cp.ElementwiseKernel(
     """,
     "get_nnz_0",
 )
+
+
+def _mat_to_array(mat):
+    """Convert a matrix or materialized chunk to a dense float32 GPU array."""
+    if issparse(mat) or cp_issparse(mat):
+        mat = cp_csr_matrix(mat.astype(np.float32, copy=False))
+        return _sparse_to_dense(mat)
+    if isinstance(mat, np.ndarray | cp.ndarray):
+        return cp.asarray(mat, dtype=cp.float32)
+    raise ValueError(f"Unsupported matrix type: {type(mat)}")
+
+
+def _get_batch(mat, srt, end):
+    """Slice before converting so backed input stays bounded by batch size."""
+    if isinstance(mat, tuple):
+        mat, msk_col = mat
+        return _mat_to_array(mat[srt:end, :])[:, msk_col]
+    return _mat_to_array(mat[srt:end, :])
 
 
 def _validate_mat(
@@ -75,11 +93,6 @@ def _validate_mat(
             msk_col = msk_col.get()
         col = col[~msk_col]
         mat = mat[:, ~msk_col]
-    # Check for repeated features
-    assert not np.any(col[1:] == col[:-1]), (
-        "mat contains repeated feature names, please make them unique"
-    )
-
     # Check for empty samples
     if isinstance(mat, csr_matrix):
         msk_row = mat.getnnz(axis=1) == 0
@@ -260,6 +273,8 @@ def extract(
     # Extract
     mat, row, col = _extract(data, layer=layer, raw=raw, pre_load=pre_load)
     # Validate
+    if not pd.Index(col).is_unique:
+        raise ValueError("mat contains repeated feature names, please make them unique")
     isbacked = hasattr(data, "isbacked") and data.isbacked
     mat_tuple: (
         tuple[np.ndarray, np.ndarray, np.ndarray]

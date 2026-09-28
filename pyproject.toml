@@ -50,7 +50,8 @@ rapids-cu12 = [
     "cuvs-cu12>=25.12",
 ]
 
-doc = [
+[dependency-groups]
+docs = [
     "sphinx>=4.5.0",
     "sphinx-copybutton",
     "nbsphinx>=0.8.12",
@@ -78,8 +79,8 @@ test-minimal = [
     "fast-array-utils",
 ]
 test = [
-    "rapids_singlecell[test-minimal]",
     "igraph",
+    { include-group = "test-minimal" },
 ]
 
 dev = [
@@ -88,7 +89,7 @@ dev = [
 ]
 
 [project.urls]
-Documentation = "https://rapids-singlecell.readthedocs.io"
+Documentation = "https://rapids-singlecell.scverse.org/"
 Source = "https://github.com/scverse/rapids_singlecell"
 
 [tool.ruff]

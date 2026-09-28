@@ -1,6 +1,6 @@
 # scanpy-GPU
 
-These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html) {cite}`Wolf2018`.
+These functions offer accelerated near drop-in replacements for common tools provided by {doc}`scanpy <scanpy:api/index>` {cite}`Wolf2018`.
 
 ## Preprocessing `pp`
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
