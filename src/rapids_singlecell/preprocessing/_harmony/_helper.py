@@ -5,27 +5,15 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from rapids_singlecell._cuda import _harmony_colsum_cuda as _hc_cs
-from rapids_singlecell._cuda import _harmony_normalize_cuda as _hc_norm
-from rapids_singlecell._cuda import _harmony_outer_cuda as _hc_out
-from rapids_singlecell._cuda import _harmony_scatter_cuda as _hc_sc
+from rapids_singlecell._cuda import _harmony_colsum_cuda as _colsum_cuda
+from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
+from rapids_singlecell._cuda import _harmony_outer_cuda as _outer_cuda
 
 if TYPE_CHECKING:
     import pandas as pd
 
-# Shared-memory scatter_add heuristics
-MIN_CELLS_FOR_SHARED = 50_000
-MIN_CELLS_PER_BATCH_SHARED = 10_000
-MAX_SHARED_MEM_BYTES = 48 * 1024  # 48 KB shared memory budget
-MIN_CELLS_PER_BLOCK = 64
-
 # Column-sum heuristic thresholds (rows x cols regions)
 _COLSUM_COLS_SMALL = 200
-_COLSUM_COLS_MEDIUM = 800
-_COLSUM_COLS_LARGE = 1024
-_COLSUM_COLS_XLARGE = 2000
-_COLSUM_ROWS_TINY = 5_000
-_COLSUM_ROWS_SMALL = 10_000
 _COLSUM_ROWS_MEDIUM = 20_000
 _COLSUM_ROWS_LARGE = 100_000
 
@@ -47,7 +35,7 @@ def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
 
     rows, cols = X.shape
 
-    _hc_norm.normalize(
+    _normalize_cuda.normalize(
         X,
         rows=rows,
         cols=cols,
@@ -56,98 +44,12 @@ def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
     return X
 
 
-def _scatter_add_cp(
-    X: cp.ndarray,
-    out: cp.ndarray,
-    cats: cp.ndarray,
-    switcher: int,
-    n_batches: int | None = None,
-    *,
-    use_shared: bool | None = None,
-) -> None:
-    """
-    Scatter add operation for Harmony algorithm.
-
-    Uses shared memory kernel when n_batches is provided and output fits
-    in shared memory (< 48KB). This reduces global atomic contention.
-
-    The shared memory kernel is only beneficial when atomic contention is high,
-    which occurs when n_cells / n_batches is large (many cells per batch bucket).
-    With many batches, contention is naturally low and the original kernel is faster.
-
-    Parameters
-    ----------
-    X
-        Input array of shape (n_cells, n_pcs)
-    out
-        Output array of shape (n_batches, n_pcs)
-    cats
-        Category indices for each cell
-    switcher
-        0 for subtraction, 1 for addition
-    n_batches
-        Number of batch categories
-    use_shared
-        Force shared memory kernel (True), force optimized kernel (False),
-        or auto-select based on heuristics (None, default)
-    """
-    n_cells = X.shape[0]
-    n_pcs = X.shape[1]
-    n_covariates = cats.shape[1] if cats.ndim == 2 else 1
-
-    # Determine whether to use shared memory kernel
-    if use_shared is None:
-        use_shared = False
-        if n_batches is not None and n_cells >= MIN_CELLS_FOR_SHARED:
-            cells_per_batch = n_cells * n_covariates // n_batches
-            shared_mem_needed = n_batches * n_pcs * X.dtype.itemsize
-            if (
-                shared_mem_needed <= MAX_SHARED_MEM_BYTES
-                and cells_per_batch >= MIN_CELLS_PER_BATCH_SHARED
-            ):
-                use_shared = True
-
-    if use_shared:
-        if n_batches is None:
-            raise ValueError("n_batches must be provided when use_shared=True")
-        dev = cp.cuda.Device()
-        n_sm = dev.attributes["MultiProcessorCount"]
-        max_blocks_by_cells = max(
-            1, (n_cells + MIN_CELLS_PER_BLOCK - 1) // MIN_CELLS_PER_BLOCK
-        )
-        n_blocks = min(n_sm * 4, max_blocks_by_cells)
-
-        _hc_sc.scatter_add_shared(
-            X,
-            cats=cats,
-            n_cells=n_cells,
-            n_pcs=n_pcs,
-            n_batches=n_batches,
-            n_covariates=n_covariates,
-            switcher=switcher,
-            a=out,
-            n_blocks=n_blocks,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-    else:
-        _hc_sc.scatter_add(
-            X,
-            cats=cats,
-            n_cells=n_cells,
-            n_pcs=n_pcs,
-            n_covariates=n_covariates,
-            switcher=switcher,
-            a=out,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-
-
 def _outer_cp(
     E: cp.ndarray, Pr_b: cp.ndarray, R_sum: cp.ndarray, switcher: int
 ) -> None:
     n_cats, n_pcs = E.shape
 
-    _hc_out.outer(
+    _outer_cuda.outer(
         E,
         Pr_b=Pr_b,
         R_sum=R_sum,
@@ -184,7 +86,7 @@ def _normalize_cp(
         else:
             _validate_output_buffer(X, out, operation="Normalization")
         rows, cols = X.shape
-        _hc_norm.l2_row_normalize(
+        _normalize_cuda.l2_row_normalize(
             X,
             dst=out,
             n_rows=rows,
@@ -351,32 +253,7 @@ def _column_sum(X: cp.ndarray) -> cp.ndarray:
 
     out = cp.zeros(cols, dtype=X.dtype)
 
-    _hc_cs.colsum(
-        X,
-        out=out,
-        rows=rows,
-        cols=cols,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-    return out
-
-
-def _column_sum_atomic(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column of the 2D, C-contiguous array A.
-
-    Uses 2D grid: blockIdx.x = column tile, blockIdx.y = row tile.
-    Each thread processes multiple rows to reduce atomic contention.
-    """
-    assert X.ndim == 2
-    rows, cols = X.shape
-    if not X.flags.c_contiguous:
-        return X.sum(axis=0)
-
-    out = cp.zeros(cols, dtype=X.dtype)
-
-    _hc_cs.colsum_atomic(
+    _colsum_cuda.colsum(
         X,
         out=out,
         rows=rows,
@@ -395,20 +272,14 @@ def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
 
 
 def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> callable:
-    """
-    Returns one of:
-    - _column_sum
-    - _column_sum_atomic
-    - _gemm_colsum
-    """
-    # first pick the strategy string
+    """Choose a deterministic column reduction from the shape and device."""
+    if algo in {"atomics", "benchmark"}:
+        algo = None
     if algo is None:
         cc = cp.cuda.Device().compute_capability
         algo = _colsum_heuristic(rows, cols, cc)
     if algo == "columns":
         return _column_sum
-    if algo == "atomics":
-        return _column_sum_atomic
     return _gemm_colsum
 
 
@@ -419,120 +290,4 @@ def _colsum_heuristic(rows: int, cols: int, compute_capability: str) -> str:
         return "columns"
     if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_LARGE and is_data_center:
         return "columns"
-    if cols < _COLSUM_COLS_MEDIUM and rows < _COLSUM_ROWS_SMALL:
-        return "atomics"
-    if cols < _COLSUM_COLS_LARGE and rows < _COLSUM_ROWS_TINY:
-        return "atomics"
-    if cols < _COLSUM_COLS_MEDIUM and rows < _COLSUM_ROWS_MEDIUM and is_data_center:
-        return "atomics"
-    if cols < _COLSUM_COLS_XLARGE and rows < _COLSUM_ROWS_SMALL and is_data_center:
-        return "atomics"
     return "gemm"
-
-
-# TODO: Make this more robust
-def _benchmark_colsum_algorithms(
-    shape: tuple[int, int],
-    dtype: cp.dtype = cp.float32,
-    n_warmup: int = 1,
-    n_trials: int = 3,
-) -> callable:
-    """
-    Benchmark all column sum algorithms and return the fastest one.
-    Parameters
-    ----------
-    shape
-        Shape of the test matrix (rows, cols)
-    dtype
-        Data type for the test matrix
-    n_warmup
-        Number of warmup iterations
-    n_trials
-        Number of benchmark trials
-    Returns
-    -------
-    Name of the fastest algorithm: 'columns', 'atomics', or 'gemm'
-    """
-    rows, cols = shape
-
-    # Create test data. The values only need to be plausible, not reproducible,
-    # but the generator is local so the global CuPy state stays untouched.
-    X = cp.random.default_rng(0).random(shape, dtype=dtype)
-
-    # Ensure it's C-contiguous for fair comparison
-    if not X.flags.c_contiguous:
-        X = cp.ascontiguousarray(X)
-
-    algorithms = {
-        "columns": _column_sum,
-        "atomics": _column_sum_atomic,
-        "gemm": _gemm_colsum,
-    }
-
-    results = {}
-
-    for name, func in algorithms.items():
-        # Warmup
-        for _ in range(n_warmup):
-            try:
-                _ = func(X)
-                cp.cuda.Stream.null.synchronize()
-            except Exception:  # noqa: BLE001
-                # If algorithm fails, skip it
-                results[name] = float("inf")
-                break
-        else:
-            # Benchmark
-            times = []
-            for _ in range(n_trials):
-                try:
-                    start_event = cp.cuda.Event()
-                    end_event = cp.cuda.Event()
-
-                    start_event.record()
-                    _ = func(X)
-                    end_event.record()
-                    end_event.synchronize()
-                    elapsed_ms = cp.cuda.get_elapsed_time(start_event, end_event)
-                    times.append(elapsed_ms)
-                except Exception:  # noqa: BLE001
-                    results[name] = float("inf")
-                    break
-            else:
-                # Use median time for robustness
-                results[name] = cp.median(cp.array(times))
-
-    # Return the algorithm with minimum time
-    fastest_algo = min(results.items(), key=lambda x: x[1])[0]
-
-    return algorithms[fastest_algo], fastest_algo
-
-
-def _choose_colsum_algo_benchmark(
-    rows: int,
-    cols: int,
-    dtype: cp.dtype = cp.float32,
-    *,
-    verbose: bool = True,
-) -> callable:
-    """
-    Automatically choose the best column sum algorithm by benchmarking.
-
-    Parameters
-    ----------
-    rows
-        Number of rows
-    cols
-        Number of columns
-    dtype
-        Data type
-    verbose
-        Whether to print the chosen algorithm
-    Returns
-    -------
-    Function of the fastest algorithm
-    """
-    func, algo = _benchmark_colsum_algorithms((rows, cols), dtype)
-    if verbose:
-        print(f"Using {algo} for column sum")
-    return func

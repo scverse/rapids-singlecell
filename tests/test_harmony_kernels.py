@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import cupy as cp
 import numpy as np
 import pytest
@@ -16,9 +18,6 @@ from rapids_singlecell._cuda import (
     _harmony_correction_cuda as _corr,
 )
 from rapids_singlecell._cuda import (
-    _harmony_kmeans_cuda as _km,
-)
-from rapids_singlecell._cuda import (
     _harmony_normalize_cuda as _norm,
 )
 from rapids_singlecell._cuda import (
@@ -27,13 +26,13 @@ from rapids_singlecell._cuda import (
 from rapids_singlecell._cuda import (
     _harmony_scatter_cuda as _scatter,
 )
+from rapids_singlecell._utils import _create_category_index_mapping
 
 pytestmark = pytest.mark.skipif(
     _norm is None
     or _pen is None
     or _scatter is None
     or _colsum is None
-    or _km is None
     or _cl is None
     or _corr is None,
     reason="Harmony CUDA modules not available",
@@ -281,48 +280,6 @@ def test_fused_pen_norm_multi_int_avoids_product_overflow(dtype, n_covariates):
     cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-5)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_covariates", [2, 3, 4])
-@pytest.mark.parametrize("shared", [False, True])
-@pytest.mark.parametrize("switcher", [0, 1])
-def test_scatter_add_multi(dtype, n_covariates, shared, switcher):
-    """Each cell value is scattered once to every marginal level."""
-    n_cells, n_cols = 257, 11
-    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
-    offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
-    n_batches = int(levels.sum())
-    rng = cp.random.default_rng(991)
-
-    values = rng.random((n_cells, n_cols), dtype=dtype)
-    local_codes = cp.stack(
-        [rng.integers(0, int(level), size=n_cells) for level in levels], axis=1
-    ).astype(cp.int32)
-    cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
-    out = cp.zeros((n_batches, n_cols), dtype=dtype)
-
-    kwargs = {
-        "cats": cats,
-        "n_cells": n_cells,
-        "n_pcs": n_cols,
-        "n_covariates": n_covariates,
-        "switcher": switcher,
-        "a": out,
-    }
-    if shared:
-        _scatter.scatter_add_shared(values, n_batches=n_batches, n_blocks=3, **kwargs)
-    else:
-        _scatter.scatter_add(values, **kwargs)
-    cp.cuda.Device().synchronize()
-
-    expected = cp.zeros_like(out)
-    signed_values = values if switcher == 1 else -values
-    for covariate in range(n_covariates):
-        cp.add.at(expected, cats[:, covariate], signed_values)
-
-    atol = 1e-5 if dtype == np.float32 else 1e-12
-    cp.testing.assert_allclose(out, expected, atol=atol, rtol=1e-5)
-
-
 # ---------- gather_rows ----------
 
 
@@ -400,26 +357,88 @@ def test_colsum_columns_multiple_cols_per_block(dtype, rows):
     cp.testing.assert_allclose(out, cp.asarray(expected_np), atol=atol, rtol=rtol)
 
 
-# ---------- kmeans_err ----------
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("switcher", [0, 1])
+@pytest.mark.parametrize("n_covariates,grouped", [(1, False), (1, True), (4, False)])
+@pytest.mark.parametrize("n_rows,n_categories", [(2305, 13), (2049, 9000)])
+def test_scatter_add(dtype, switcher, n_covariates, grouped, *, n_rows, n_categories):
+    n_cols = 17
+    rng = np.random.default_rng(734)
+    values_host = rng.normal(size=(n_rows, n_cols)).astype(dtype)
+    categories_host = np.arange(n_rows * n_covariates, dtype=np.int32).reshape(
+        n_rows, n_covariates
+    ) % (n_categories - 1)
+    categories_host[:2100, 0] = 0
+    expected = np.zeros((n_categories, n_cols), dtype=np.float64)
+    np.add.at(
+        expected,
+        categories_host.ravel(),
+        np.repeat(values_host.astype(np.float64), n_covariates, axis=0)
+        * (1 if switcher else -1),
+    )
+    values, categories = cp.asarray(values_host), cp.asarray(categories_host)
+    category_offsets = cell_indices = None
+    if grouped:
+        category_offsets, cell_indices = _create_category_index_mapping(
+            categories.ravel(), n_categories
+        )
+    workspace_bytes = _cl.get_scatter_temp_bytes(
+        n_rows=n_rows,
+        n_cols=n_cols,
+        n_categories=n_categories,
+        n_covariates=n_covariates,
+        itemsize=np.dtype(dtype).itemsize,
+        grouped=grouped,
+    )
+    workspace = cp.empty(workspace_bytes, dtype=cp.uint8)
+    outputs = []
+    for _ in range(2):
+        out = cp.zeros((n_categories, n_cols), dtype=dtype)
+        scatter_add = partial(
+            _cl.scatter_add,
+            values,
+            categories=categories,
+            category_offsets=category_offsets,
+            cell_indices=cell_indices,
+            out=out,
+            workspace=workspace,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            n_categories=n_categories,
+            n_covariates=n_covariates,
+            switcher=switcher,
+        )
+        scatter_add()
+        outputs.append(out.copy())
+    with pytest.raises(ValueError, match="scatter workspace is too small"):
+        scatter_add(workspace=workspace[:-1])
+    assert outputs[0].get().tobytes() == outputs[1].get().tobytes()
+    atol = 2e-4 if dtype == np.float32 else 1e-10
+    cp.testing.assert_allclose(outputs[0], cp.asarray(expected), rtol=1e-5, atol=atol)
+    assert not cp.any(outputs[0][-1])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n", [0, 1, 257, 8192])
-def test_kmeans_err_offset_contiguous(dtype, n):
-    r_base = cp.arange(n + 1, dtype=dtype)
-    dot_base = cp.linspace(dtype(0.1), dtype(0.9), n + 1, dtype=dtype)
-    r = r_base[1:]
-    dot = dot_base[1:]
-    out = cp.zeros(1, dtype=dtype)
-
-    _km.kmeans_err(r, dot=dot, n=n, out=out)
-    cp.cuda.Device().synchronize()
-
-    r_np = cp.asnumpy(r)
-    dot_np = cp.asnumpy(dot)
-    expected_np = np.sum(r_np * dtype(2) * (dtype(1) - dot_np), dtype=dtype)
-    atol = 1e-4 if dtype == np.float32 else 1e-10
-    cp.testing.assert_allclose(out[0], dtype(expected_np), atol=atol, rtol=1e-5)
+def test_select_kmeans_center_totals_workspace(dtype):
+    n_rows = _cl.KMEANS_WEIGHT_TILE_ROWS + 1
+    X = cp.arange(n_rows * 2, dtype=dtype).reshape(n_rows, 2)
+    weights = cp.zeros(n_rows, dtype=dtype)
+    weights[-1] = 1
+    centers = cp.empty((1, 2), dtype=dtype)
+    totals = cp.empty(2, dtype=cp.float64)
+    n_draws = cp.zeros(1, dtype=cp.int32)
+    kwargs = {
+        "weights": weights,
+        "uniforms": cp.asarray([0.5], dtype=cp.float64),
+        "centers": centers,
+        "n_draws": n_draws,
+        "cluster": 0,
+    }
+    with pytest.raises(ValueError, match="k-means totals workspace is too small"):
+        _cl.select_kmeans_center(X, totals=totals[:-1], **kwargs)
+    _cl.select_kmeans_center(X, totals=totals, **kwargs)
+    cp.testing.assert_array_equal(centers[0], X[-1])
+    assert int(n_draws[0]) == 1
 
 
 # ---------- compute_objective ----------
@@ -458,7 +477,8 @@ def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
     sigma = 0.1
 
     obj_scalar = cp.zeros(1, dtype=dtype)
-    result = _cl.compute_objective(
+    compute_objective = partial(
+        _cl.compute_objective,
         R,
         similarities=similarities,
         O=O,
@@ -470,13 +490,18 @@ def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
         n_clusters=n_clusters,
         n_batches=n_batches,
         stabilized=stabilized,
+        objective_partials=cp.empty(n_cells, dtype=dtype),
     )
+    with pytest.raises(
+        ValueError, match="objective_partials must hold at least n_cells elements"
+    ):
+        compute_objective(objective_partials=cp.empty(n_cells - 1, dtype=dtype))
+    result = compute_objective()
 
     expected = _compute_objective_reference(
         R, similarities, O=O, E=E, theta=theta, sigma=sigma, stabilized=stabilized
     )
 
-    # atomicAdd reduction ordering causes slight non-determinism
     rtol = 1e-5 if dtype == np.float32 else 1e-10
     np.testing.assert_allclose(result, expected, rtol=rtol)
 

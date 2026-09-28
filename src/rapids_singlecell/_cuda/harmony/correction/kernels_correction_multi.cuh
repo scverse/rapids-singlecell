@@ -5,21 +5,61 @@
 #include <stdint.h>
 #include <type_traits>
 
-// Accumulate the probability assigned to each observed joint category.  The
-// joint categories are used only as a compact factorization of the marginal
-// design matrix; the regression coefficients remain marginal.
+// Coalesced cluster lanes reduce fixed row partitions within each joint
+// category. The existing joint RHS buffer holds partials until RHS assembly.
 template <typename T>
 __global__ void joint_observed_kernel(const T* __restrict__ R,
-                                      const int* __restrict__ joint_codes,
-                                      T* __restrict__ joint_O, int n_cells,
-                                      int n_clusters) {
-    size_t total = (size_t)n_cells * n_clusters;
+                                      const int* __restrict__ joint_offsets,
+                                      const int* __restrict__ cell_indices,
+                                      T* __restrict__ partial, int n_clusters,
+                                      int n_joint_categories, int n_parts) {
+    constexpr int CLUSTER_LANES = 32;
+    constexpr int ROW_LANES = 8;
+    __shared__ T sums[ROW_LANES * CLUSTER_LANES];
+    int cluster_tiles = (n_clusters + CLUSTER_LANES - 1) / CLUSTER_LANES;
+    size_t total = (size_t)n_joint_categories * cluster_tiles * n_parts;
+    int lane = threadIdx.x % CLUSTER_LANES;
+    int row_lane = threadIdx.x / CLUSTER_LANES;
+
+    for (size_t block = blockIdx.x; block < total; block += gridDim.x) {
+        int part = (int)(block % n_parts);
+        size_t tile = block / n_parts;
+        int cluster = (int)(tile % cluster_tiles) * CLUSTER_LANES + lane;
+        int joint = (int)(tile / cluster_tiles);
+        T sum = T(0);
+        if (cluster < n_clusters) {
+            for (long long position = (long long)joint_offsets[joint] +
+                                      part * ROW_LANES + row_lane;
+                 position < joint_offsets[joint + 1];
+                 position += n_parts * ROW_LANES) {
+                int cell = cell_indices[position];
+                sum += R[(size_t)cell * n_clusters + cluster];
+            }
+        }
+        sums[threadIdx.x] = sum;
+        __syncthreads();
+        if (row_lane == 0 && cluster < n_clusters) {
+            T value = sums[lane];
+#pragma unroll
+            for (int row = 1; row < ROW_LANES; ++row)
+                value += sums[row * CLUSTER_LANES + lane];
+            partial[((size_t)joint * n_clusters + cluster) * n_parts + part] =
+                value;
+        }
+        __syncthreads();
+    }
+}
+
+template <typename T>
+__global__ void finish_joint_observed_kernel(const T* __restrict__ partial,
+                                             T* __restrict__ joint_O,
+                                             size_t total, int n_parts) {
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += (size_t)blockDim.x * gridDim.x) {
-        int cell = (int)(idx / n_clusters);
-        int cluster = (int)(idx % n_clusters);
-        int joint = joint_codes[cell];
-        atomicAdd(&joint_O[(size_t)joint * n_clusters + cluster], R[idx]);
+        T value = partial[idx * n_parts];
+        for (int part = 1; part < n_parts; ++part)
+            value += partial[idx * n_parts + part];
+        joint_O[idx] = value;
     }
 }
 
@@ -88,58 +128,43 @@ __global__ void initialize_multi_gram_kernel(const T* __restrict__ O,
 // joint_cats contains the F active marginal levels for one observed joint
 // category.  Same-covariate blocks are diagonal and were initialized from O.
 template <typename T, int N_COVARIATES>
-__global__ void add_joint_cross_kernel(const T* __restrict__ joint_O,
-                                       const int* __restrict__ joint_cats,
-                                       const uint8_t* __restrict__ active,
-                                       T* __restrict__ gram,
-                                       int n_joint_categories, int n_covariates,
-                                       int n_batches, int n_clusters) {
-    size_t total = (size_t)n_joint_categories * n_clusters;
+__global__ void add_joint_cross_kernel(
+    const T* __restrict__ joint_O, const int* __restrict__ joint_cats,
+    const int* __restrict__ marginal_joint_offsets,
+    const int* __restrict__ marginal_joint_indices,
+    const uint8_t* __restrict__ active, T* __restrict__ gram, int n_covariates,
+    int n_batches, int n_clusters) {
+    size_t total = (size_t)n_batches * n_clusters;
     int nb1 = n_batches + 1;
 
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += (size_t)blockDim.x * gridDim.x) {
-        int joint = (int)(idx / n_clusters);
+        int batch = (int)(idx / n_clusters);
         int cluster = (int)(idx % n_clusters);
-        T value = joint_O[idx];
-        if (value == T(0)) continue;
-
-        const int* levels =
-            joint_cats +
-            (size_t)joint * (N_COVARIATES > 0 ? N_COVARIATES : n_covariates);
+        if (active[idx] == 0) continue;
+        int row = batch + 1;
         T* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
-
-        if constexpr (N_COVARIATES > 0) {
+        // The lower category owns each symmetric pair and visits its joint
+        // categories in CSR order. No other thread writes either entry.
+        for (int position = marginal_joint_offsets[batch];
+             position < marginal_joint_offsets[batch + 1]; ++position) {
+            int joint = marginal_joint_indices[position];
+            T value = joint_O[(size_t)joint * n_clusters + cluster];
+            if (value == T(0)) continue;
+            const int* levels =
+                joint_cats + (size_t)joint * (N_COVARIATES > 0 ? N_COVARIATES
+                                                               : n_covariates);
+            int count = N_COVARIATES > 0 ? N_COVARIATES : n_covariates;
 #pragma unroll
-            for (int left = 0; left < N_COVARIATES; ++left) {
-                int left_batch = levels[left];
-                if (active[(size_t)left_batch * n_clusters + cluster] == 0)
+            for (int other = 0; other < count; ++other) {
+                int other_batch = levels[other];
+                if (other_batch <= batch ||
+                    active[(size_t)other_batch * n_clusters + cluster] == 0)
                     continue;
-#pragma unroll
-                for (int right = left + 1; right < N_COVARIATES; ++right) {
-                    int right_batch = levels[right];
-                    if (active[(size_t)right_batch * n_clusters + cluster] == 0)
-                        continue;
-                    int row = left_batch + 1;
-                    int col = right_batch + 1;
-                    atomicAdd(&cluster_gram[(size_t)row * nb1 + col], value);
-                    atomicAdd(&cluster_gram[(size_t)col * nb1 + row], value);
-                }
-            }
-        } else {
-            for (int left = 0; left < n_covariates; ++left) {
-                int left_batch = levels[left];
-                if (active[(size_t)left_batch * n_clusters + cluster] == 0)
-                    continue;
-                for (int right = left + 1; right < n_covariates; ++right) {
-                    int right_batch = levels[right];
-                    if (active[(size_t)right_batch * n_clusters + cluster] == 0)
-                        continue;
-                    int row = left_batch + 1;
-                    int col = right_batch + 1;
-                    atomicAdd(&cluster_gram[(size_t)row * nb1 + col], value);
-                    atomicAdd(&cluster_gram[(size_t)col * nb1 + row], value);
-                }
+                int col = other_batch + 1;
+                T updated = cluster_gram[(size_t)row * nb1 + col] + value;
+                cluster_gram[(size_t)row * nb1 + col] = updated;
+                cluster_gram[(size_t)col * nb1 + row] = updated;
             }
         }
     }
@@ -224,6 +249,145 @@ __global__ void segmented_joint_rhs_kernel(
             joint_rhs[out] = block_sum0;
             if (has_pc1) joint_rhs[out + 1] = block_sum1;
         }
+    }
+}
+
+constexpr int JOINT_RHS_TILE_ROWS = 4096;
+constexpr int JOINT_RHS_CLUSTER_LANES = 8;
+constexpr int JOINT_RHS_PC_LANES = 32;
+constexpr int JOINT_RHS_ROW_LANES = 8;
+
+template <typename T>
+__device__ __forceinline__ void accumulate_multi_rhs(T value, T& sum,
+                                                     T& correction) {
+    if constexpr (std::is_same<T, float>::value) {
+        T adjusted = value - correction;
+        T next = sum + adjusted;
+        correction = (next - sum) - adjusted;
+        sum = next;
+    } else {
+        sum += value;
+    }
+}
+
+// Reuse coalesced PC loads across clusters. Fixed row tiles bound rounding
+// error and keep the reduction order independent of workspace capacity.
+template <typename T>
+__global__ void joint_rhs_partials_kernel(
+    const T* __restrict__ X, const T* __restrict__ R,
+    const int* __restrict__ joint_offsets,
+    const int* __restrict__ joint_cell_indices,
+    const int* __restrict__ joint_cats, const uint8_t* __restrict__ active,
+    const int* __restrict__ tile_offsets, T* __restrict__ partials, int n_pcs,
+    int n_clusters, int n_joint_categories, int n_covariates,
+    size_t max_tiles) {
+    constexpr int CK = JOINT_RHS_CLUSTER_LANES;
+    constexpr int PC = JOINT_RHS_PC_LANES;
+    constexpr int ROWS = JOINT_RHS_ROW_LANES;
+    __shared__ T reduced[CK][ROWS][PC];
+    int pc_tiles = (n_pcs + PC - 1) / PC;
+    int cluster_tiles = (n_clusters + CK - 1) / CK;
+    size_t total = max_tiles * cluster_tiles * pc_tiles;
+
+    for (size_t block = blockIdx.x; block < total; block += gridDim.x) {
+        int pc = (int)(block % pc_tiles) * PC + threadIdx.x;
+        size_t remainder = block / pc_tiles;
+        int cluster = (int)(remainder % cluster_tiles) * CK;
+        size_t tile = remainder / cluster_tiles;
+        if (tile >= (size_t)tile_offsets[n_joint_categories]) continue;
+
+        int joint = 0;
+        if (threadIdx.x == 0) {
+            int high = n_joint_categories;
+            while (joint < high) {
+                int mid = joint + (high - joint) / 2;
+                if ((size_t)tile_offsets[mid + 1] <= tile)
+                    joint = mid + 1;
+                else
+                    high = mid;
+            }
+        }
+        joint = __shfl_sync(0xffffffff, joint, 0);
+        bool enabled[CK];
+        T sums[CK], corrections[CK];
+        bool any_active = false;
+#pragma unroll
+        for (int c = 0; c < CK; ++c) {
+            enabled[c] = false;
+            sums[c] = corrections[c] = T(0);
+            if (cluster + c < n_clusters) {
+                for (int cov = 0; cov < n_covariates; ++cov) {
+                    int batch = joint_cats[(size_t)joint * n_covariates + cov];
+                    enabled[c] |=
+                        active[(size_t)batch * n_clusters + cluster + c] != 0;
+                }
+            }
+            any_active |= enabled[c];
+        }
+
+        if (any_active) {
+            long long begin =
+                joint_offsets[joint] +
+                (long long)(tile - tile_offsets[joint]) * JOINT_RHS_TILE_ROWS;
+            long long end = min(begin + JOINT_RHS_TILE_ROWS,
+                                (long long)joint_offsets[joint + 1]);
+            for (long long pos = begin + threadIdx.y; pos < end; pos += ROWS) {
+                int cell = threadIdx.x == 0 ? joint_cell_indices[pos] : 0;
+                cell = __shfl_sync(0xffffffff, cell, 0);
+                T loaded =
+                    threadIdx.x < CK && cluster + threadIdx.x < n_clusters
+                        ? R[(size_t)cell * n_clusters + cluster + threadIdx.x]
+                        : T(0);
+                T value = pc < n_pcs ? X[(size_t)cell * n_pcs + pc] : T(0);
+#pragma unroll
+                for (int c = 0; c < CK; ++c) {
+                    T weight = __shfl_sync(0xffffffff, loaded, c);
+                    if (enabled[c]) {
+                        if constexpr (std::is_same<T, float>::value)
+                            accumulate_multi_rhs(__fmul_rn(value, weight),
+                                                 sums[c], corrections[c]);
+                        else
+                            sums[c] += value * weight;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < CK; ++c)
+            reduced[c][threadIdx.y][threadIdx.x] = sums[c];
+        __syncthreads();
+        if (threadIdx.y == 0 && pc < n_pcs) {
+#pragma unroll
+            for (int c = 0; c < CK; ++c) {
+                if (cluster + c >= n_clusters) continue;
+                T value = reduced[c][0][threadIdx.x], correction = T(0);
+                for (int row = 1; row < ROWS; ++row)
+                    accumulate_multi_rhs(reduced[c][row][threadIdx.x], value,
+                                         correction);
+                partials[(tile * n_clusters + cluster + c) * n_pcs + pc] =
+                    value;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <typename T>
+__global__ void finish_joint_rhs_kernel(const T* __restrict__ partials,
+                                        const int* __restrict__ tile_offsets,
+                                        T* __restrict__ joint_rhs, int n_pcs,
+                                        int n_clusters, size_t total) {
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+        size_t joint_stride = (size_t)n_clusters * n_pcs;
+        int joint = (int)(idx / joint_stride);
+        size_t offset = idx % joint_stride;
+        T value = T(0), correction = T(0);
+        for (int tile = tile_offsets[joint]; tile < tile_offsets[joint + 1];
+             ++tile)
+            accumulate_multi_rhs(partials[(size_t)tile * joint_stride + offset],
+                                 value, correction);
+        joint_rhs[idx] = value;
     }
 }
 

@@ -8,16 +8,11 @@
 
 using namespace nb::literals;
 
-// Default threshold: use cuBLAS GEMV for row-0 scatter when n_cells >= this
-// value.
-static constexpr int DEFAULT_GEMV_THRESHOLD = 300000;
-
 constexpr int WARP_SIZE = 32;
-constexpr int MAX_BLOCK_DIM = 256;
+constexpr int MAX_BLOCK_DIM = 1024;
 constexpr int BLOCK_DIM_1D = 256;
 constexpr int SCATTER_BLOCK_DIM = 1024;
 constexpr int PCS_PER_THREAD = 2;  // Each thread handles 2 PCs
-constexpr int GRID_Y = 8;          // Y-dimension of grid for scatter_add
 
 template <typename T>
 static void correction_fast_impl(
@@ -59,19 +54,10 @@ static void correction_fast_impl(
                         stream);
 
         // Row 0: sum(X[i,:] * R_col[i]) for all cells
-        if (n_cells < DEFAULT_GEMV_THRESHOLD) {
-            dim3 block(SCATTER_BLOCK_DIM);
-            dim3 grid((n_pcs + PCS_PER_THREAD - 1) / PCS_PER_THREAD, GRID_Y);
-            scatter_add_kernel_with_bias_cat0<T><<<grid, block, 0, stream>>>(
-                X, n_cells, n_pcs, Phi_t_diag_R_X, R_col);
-            CUDA_CHECK_LAST_ERROR(scatter_add_kernel_with_bias_cat0);
-        } else {
-            // cuBLAS GEMV: Phi_t_diag_R_X[0,:] = X^T @ R_col
-            cublas_check_status(
-                cublas_gemv<T>(handle, CUBLAS_OP_N, n_pcs, n_cells, &one, X,
-                               n_pcs, R_col, 1, &zero, Phi_t_diag_R_X, 1),
-                "cublas_gemv(correction_fast row0)");
-        }
+        cublas_check_status(
+            cublas_gemv<T>(handle, CUBLAS_OP_N, n_pcs, n_cells, &one, X, n_pcs,
+                           R_col, 1, &zero, Phi_t_diag_R_X, 1),
+            "cublas_gemv(correction_fast row0)");
 
         // Rows 1..n_batches: per-batch biased scatter-add
         {

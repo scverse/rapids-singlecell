@@ -100,6 +100,9 @@ __global__ void compute_inv_mats_kernel(const T* __restrict__ O,
     __syncthreads();
 
     T c_inv = s_c_inv;
+    for (int b = threadIdx.x; b < n_batches; b += blockDim.x)
+        inv[(size_t)(b + 1) * nb1] = my_P_row0[b] * c_inv;
+    __syncthreads();
 
     // Phase 2: fill inv_mat entries (read factor/P_row0 from global memory)
     int total = nb1 * nb1;
@@ -113,9 +116,9 @@ __global__ void compute_inv_mats_kernel(const T* __restrict__ O,
         } else if (i == 0) {
             val = c_inv * my_P_row0[j - 1];
         } else if (j == 0) {
-            val = my_P_row0[i - 1] * c_inv;
+            continue;
         } else {
-            val = my_P_row0[i - 1] * c_inv * my_P_row0[j - 1];
+            val = inv[(size_t)i * nb1] * my_P_row0[j - 1];
             if (i == j) val += my_factor[i - 1];
         }
         inv[idx] = val;

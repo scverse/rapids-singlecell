@@ -21,7 +21,7 @@ the `cub/` headers come from the toolkit's own bundled CCCL, so nothing links
 ```bash
 git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
 cd rapids-singlecell
-[uv] pip install -e ".[test]"
+hatch env create hatch-test.stable-13
 ```
 
 The documentation notebooks live in a Git submodule. If the repository was
