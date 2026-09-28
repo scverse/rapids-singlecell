@@ -17,7 +17,8 @@ tmin
 _bsize = """\
 bsize
     For large datasets in sparse format, this parameter controls how many observations are processed at once.
-    Increasing this value speeds up computation but uses more memory."""
+    Increasing this value speeds up computation but uses more memory.
+    If omitted, uses the method's default batch size."""
 
 _verbose = """\
 verbose

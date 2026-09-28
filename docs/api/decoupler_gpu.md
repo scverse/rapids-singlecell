@@ -14,6 +14,7 @@
     dcg.ulm
     dcg.aucell
     dcg.gsea
+    dcg.gsva
     dcg.ora
     dcg.query_set
     dcg.waggr

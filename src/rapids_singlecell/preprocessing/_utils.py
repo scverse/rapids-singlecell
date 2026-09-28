@@ -40,6 +40,7 @@ def _sparse_to_dense(X: spmatrix, order: Literal["C", "F"] | None = None) -> cp.
         minor=minor,
         c_switch=switcher,
         max_nnz=max_nnz,
+        stream=cp.cuda.get_current_stream().ptr,
     )
     return dense
 

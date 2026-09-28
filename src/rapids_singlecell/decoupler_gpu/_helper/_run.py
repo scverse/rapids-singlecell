@@ -22,6 +22,7 @@ from rapids_singlecell.decoupler_gpu._helper._pv import fdr_bh_axis1
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Literal
 
     from rapids_singlecell.decoupler_gpu._helper._data import DataType
 
@@ -59,6 +60,7 @@ def _run_dask_adj(
     *,
     test: bool,
     verbose: bool = False,
+    dense: bool = True,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Dask execution for adj=True methods - each chunk = one batch."""
@@ -72,7 +74,7 @@ def _run_dask_adj(
     def process_chunk(chunk, adjm, block_info=None):
         # Convert to GPU inside chunk
         adjm_gpu = cp.array(adjm, dtype=cp.float32)
-        chunk_gpu = _mat_to_array(chunk)
+        chunk_gpu = _mat_to_array(chunk, dense=dense)
         es, pv = func(chunk_gpu, adjm_gpu, verbose=False, **kwargs)
         # Free GPU memory
         del chunk_gpu, adjm_gpu
@@ -109,6 +111,7 @@ def _run_dask_idx(
     offsets_cpu: np.ndarray,
     *,
     verbose: bool = False,
+    dense: bool = True,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Dask execution for indexed feature sets - each chunk = one batch."""
@@ -124,7 +127,7 @@ def _run_dask_idx(
         cnct_gpu = cp.array(cnct, dtype=cp.int32)
         starts_gpu = cp.array(starts, dtype=cp.int32)
         offsets_gpu = cp.array(offsets, dtype=cp.int32)
-        chunk_gpu = _mat_to_array(chunk)
+        chunk_gpu = _mat_to_array(chunk, dense=dense)
         es, pv = func(
             chunk_gpu,
             cnct=cnct_gpu,
@@ -172,6 +175,8 @@ def _run(
     verbose: bool = False,
     pre_load: bool = False,
     adj_pv_gpu: bool = False,
+    batch_on: Literal["rows", "backed"] = "rows",
+    dense: bool = True,
     **kwargs,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | AnnData | None:
     _log(f"{name} - Running {name}", level="info", verbose=verbose)
@@ -184,9 +189,12 @@ def _run(
         verbose=verbose,
         bsize=bsize,
         pre_load=pre_load,
+        materialize=batch_on == "backed",
     )
     issparse = sps.issparse(mat) or csps.issparse(mat)
     isbacked = isinstance(mat, tuple)
+    if batch_on == "backed" and not isbacked:
+        bsize = obs.size
     is_dask = isinstance(mat, DaskArray) or (
         isinstance(mat, tuple) and isinstance(mat[0], DaskArray)
     )
@@ -200,7 +208,7 @@ def _run(
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
             adjm_cpu = adjm  # Keep as numpy for Dask path
             es, pv = _run_dask_adj(
-                func, mat, adjm_cpu, test=test, verbose=verbose, **kwargs
+                func, mat, adjm_cpu, test=test, verbose=verbose, dense=dense, **kwargs
             )
             es = pd.DataFrame(es, index=obs, columns=sources)
         # Handle batches for sparse/backed data
@@ -214,15 +222,15 @@ def _run(
                 else:
                     batch_verbose = False
                 srt, end = i * bsize, i * bsize + bsize
-                bmat = _get_batch(mat, srt, end)
+                bmat = _get_batch(mat, srt, end, dense=dense)
                 bes, bpv = func(bmat, adjm, verbose=batch_verbose, **kwargs)
                 es.append(bes)
                 pv.append(bpv)
-            es = np.vstack(es)
+            es = es[0] if len(es) == 1 else np.vstack(es)
             es = pd.DataFrame(es, index=obs, columns=sources)
         else:
             adjm = cp.array(adjm, dtype=cp.float32)
-            mat = _mat_to_array(mat)
+            mat = _mat_to_array(mat, dense=dense)
             es, pv = func(mat, adjm, verbose=verbose, **kwargs)
             es = pd.DataFrame(es, index=obs, columns=sources)
     else:
@@ -231,7 +239,7 @@ def _run(
         if is_dask:
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
             es, pv = _run_dask_idx(
-                func, mat, cnct, starts, offsets, verbose=verbose, **kwargs
+                func, mat, cnct, starts, offsets, verbose=verbose, dense=dense, **kwargs
             )
             es = pd.DataFrame(es, index=obs, columns=sources)
         else:
@@ -242,7 +250,7 @@ def _run(
             es, pv = [], []
             for i in tqdm(range(nbatch), disable=not verbose):
                 srt, end = i * bsize, i * bsize + bsize
-                bmat = _get_batch(mat, srt, end)
+                bmat = _get_batch(mat, srt, end, dense=dense)
                 if i == 0 and verbose:
                     batch_verbose = True
                 else:
@@ -257,7 +265,7 @@ def _run(
                 )
                 es.append(bes)
                 pv.append(bpv)
-            es = np.vstack(es)
+            es = es[0] if len(es) == 1 else np.vstack(es)
             es = pd.DataFrame(es, index=obs, columns=sources)
     # Handle pvals and FDR correction
     if test:

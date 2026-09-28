@@ -300,38 +300,16 @@ _ora = MethodMeta(
 )
 
 
-class _OraMethod(Method):
-    """Keep decoupler's public positional call contract and batching default."""
-
-    def __call__(  # noqa: PLR0917 - Preserve decoupler's positional API.
-        self,
-        data,
-        net,
-        tmin: int | float = 5,
-        raw: bool = False,  # noqa: FBT001, FBT002
-        empty: bool = True,  # noqa: FBT001, FBT002
-        bsize: int | float = 250_000,
-        verbose: bool = False,  # noqa: FBT001, FBT002
-        **kwargs,
-    ):
-        layer = kwargs.get("layer")
-        assert layer is None or isinstance(layer, str), "layer must be str or None"
-        assert isinstance(raw, bool), "raw must be bool"
-        if isinstance(data, AnnData) and raw:
-            assert data.raw is not None, "Received raw=True, but data.raw is empty"
-            kwargs["layer"] = None  # Match decoupler's raw precedence.
-        if kwargs.get("value_cutoff") is not None:
-            empty = False  # Keep non-DEGs and comparisons without selected genes.
-        return super().__call__(
-            data,
-            net,
-            tmin=tmin,
-            raw=raw,
-            empty=empty,
-            bsize=bsize,
-            verbose=verbose,
-            **kwargs,
-        )
+def _prepare_ora(kwargs):
+    """Preserve raw precedence and the complete background for cutoff selection."""
+    data, raw, layer = kwargs["data"], kwargs["raw"], kwargs.get("layer")
+    assert layer is None or isinstance(layer, str), "layer must be str or None"
+    assert isinstance(raw, bool), "raw must be bool"
+    if isinstance(data, AnnData) and raw:
+        assert data.raw is not None, "Received raw=True, but data.raw is empty"
+        kwargs["layer"] = None  # Match decoupler's raw precedence.
+    if kwargs.get("value_cutoff") is not None:
+        kwargs["empty"] = False  # Keep non-DEGs and rows without selected genes.
 
 
-ora = _OraMethod(_method=_ora)
+ora = Method(_method=_ora, default_bsize=250_000, prepare=_prepare_ora)
