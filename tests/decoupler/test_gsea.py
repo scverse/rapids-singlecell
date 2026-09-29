@@ -309,6 +309,50 @@ def test_cache_chunk_handoff_budget_and_pickle(forward, fits, nvar, times):
     assert restored.lock is not cache.lock
 
 
+@pytest.mark.parametrize("dask_input", [False, True])
+@pytest.mark.parametrize("explicit_cache", [False, True])
+def test_public_cache_is_shared_by_batches_and_scoped_to_call(
+    monkeypatch, dask_input, explicit_cache
+):
+    import dask
+    import dask.array as da
+
+    frame = pd.DataFrame(
+        np.arange(1, 16, dtype=np.float32).reshape(5, 3),
+        index=[f"cell{i}" for i in range(5)],
+        columns=list("abc"),
+    )
+    net = pd.DataFrame({"source": ["set", "set"], "target": ["a", "b"]})
+    data = frame
+    if dask_input:
+        data = AnnData(frame)
+        data.X = da.from_array(data.X, chunks=(2, 3))
+    supplied_cache = g._PermutationCache()
+    options = {"_permutation_cache": supplied_cache} if explicit_cache else {}
+    observed = []
+
+    def record_batch(mat, *, starts, _permutation_cache, **kwargs):
+        observed.append((mat.shape[0], _permutation_cache))
+        shape = (mat.shape[0], starts.size)
+        return np.zeros(shape), np.ones(shape)
+
+    monkeypatch.setattr(dc.gsea, "func", record_batch)
+    calls = []
+    with dask.config.set(scheduler="synchronous"):
+        for _ in range(2):
+            observed.clear()
+            dc.gsea(data, net, tmin=0, bsize=2, **options)
+            assert sorted(size for size, _ in observed) == [1, 2, 2]
+            cache = observed[0][1]
+            assert isinstance(cache, g._PermutationCache)
+            assert all(item is cache for _, item in observed)
+            calls.append(cache)
+    if explicit_cache:
+        assert calls[0] is calls[1] is supplied_cache
+    else:
+        assert calls[0] is not calls[1]
+
+
 @pytest.mark.parametrize("max_bytes", [0, 256 * 1024**2])
 @pytest.mark.parametrize("seed", [0, 42])
 def test_streamed_and_cached_scoring_counts_each_permutation_once(
