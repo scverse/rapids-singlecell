@@ -74,7 +74,8 @@ def _fused_log_odds(a, b, c, d, correction):
 
 @cp.fuse
 def _invalid_overlap(a, counts, sizes, background):
-    return cp.any(background - sizes - counts + a < 0)
+    # A float zero avoids CuPy fusion's weak-integer promotion bug.
+    return cp.any(background - sizes - counts + a < 0.0)
 
 
 def _select_ora(mat, n_up, n_bm):
