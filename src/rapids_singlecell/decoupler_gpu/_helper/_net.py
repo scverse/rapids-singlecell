@@ -149,18 +149,15 @@ def idxmat(
     -------
     List of sources, concatenated indexes, starts and offsets.
     """
-    # Transform targets to indxs
-    table = {name: i for i, name in enumerate(features)}
-    net["idx_target"] = [table[target] for target in net["target"]]
-    # Find sets
-    cnct = net.groupby("source", observed=True)["idx_target"].apply(
-        lambda x: np.array(x, dtype=int)
+    # Stable sorting of integer source codes avoids constructing one pandas
+    # Series and NumPy array per feature set.
+    sources, source_codes = np.unique(
+        net["source"].to_numpy(dtype="U"), return_inverse=True
     )
-    net.drop(columns=["idx_target"], inplace=True)
-    sources = cnct.index.values.astype("U")
-    # Flatten net and get offsets
-    offsets = cnct.apply(lambda x: len(x)).values
-    cnct = np.concatenate(cnct.values)
+    order = np.argsort(source_codes, kind="stable")
+    cnct = pd.Index(features).get_indexer(net["target"].to_numpy())[order]
+    assert np.all(cnct >= 0), "No overlap found between features and targets"
+    offsets = np.bincount(source_codes, minlength=sources.size)
     # Define starts to subset offsets
     starts = np.zeros(offsets.shape[0], dtype=int)
     starts[1:] = np.cumsum(offsets)[:-1]
