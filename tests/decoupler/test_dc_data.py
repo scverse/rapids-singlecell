@@ -47,6 +47,20 @@ def test_extract(
     assert (X < 0).all()
 
 
+@pytest.mark.parametrize("dtype", [np.float64, np.longdouble])
+def test_cpu_sparse_dtypes_preserve_ulm(adata, net, dtype):
+    expected = adata.copy()
+    expected.X = sps.csr_matrix(expected.X, dtype=np.float32)
+    dc.ulm(expected, net, tmin=0, bsize=7)
+    adata.X = sps.csr_matrix(np.asarray(adata.X, dtype=dtype))
+    dc.ulm(adata, net, tmin=0, bsize=7)
+    assert adata.X.dtype == np.dtype(dtype)
+    for key in ["score_ulm", "padj_ulm"]:
+        pd.testing.assert_frame_equal(
+            adata.obsm[key], expected.obsm[key], rtol=2e-6, atol=2e-7
+        )
+
+
 @pytest.mark.parametrize(
     "kind", ["dataframe", "sparse", "gpu", "dask", "backed", "backed_sparse"]
 )

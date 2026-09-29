@@ -102,16 +102,17 @@ def _build_csr_source(embedding_raw, selector) -> _CSRData:
 
 
 def _materialize_source(embedding_raw, selector):
-    """Materialize the subset as a dense cupy array (dense input) or a
+    """Materialize the subset as a C-contiguous CuPy array (dense input) or a
     :class:`_CSRData` bundle (sparse input).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``.
     """
     if _is_sparse(embedding_raw):
         return _build_csr_source(embedding_raw, selector)
-    if selector is None:
-        return cp.asarray(embedding_raw)
-    return cp.asarray(embedding_raw[selector])
+    if selector is not None:
+        embedding_raw = embedding_raw[selector]
+    # Dense kernels index rows as embedding[row * n_features + feature].
+    return cp.asarray(embedding_raw, order="C")
 
 
 class EDistanceMetric(BaseMetric):
@@ -536,10 +537,10 @@ class EDistanceMetric(BaseMetric):
             embedding = _materialize_source(embedding_raw, original_indices)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         elif len(original_indices) < int(len(embedding_raw) * 0.7):
-            embedding = cp.asarray(embedding_raw[original_indices])
+            embedding = _materialize_source(embedding_raw, original_indices)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         else:
-            embedding = cp.asarray(embedding_raw)
+            embedding = _materialize_source(embedding_raw, None)
             cell_indices = cp.array(original_indices, dtype=cp.int32)
 
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
