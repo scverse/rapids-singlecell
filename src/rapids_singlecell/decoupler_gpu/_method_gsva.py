@@ -138,6 +138,8 @@ def _sparse_ecdf_values(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Return exact ECDF integer ranks for stored values and implicit zeros."""
     nobs, nvar = mat.shape
+    if mat.nnz == 0:
+        return cp.empty(0, dtype=cp.int32), cp.full(nvar, nobs, dtype=cp.int32)
     stream = cp.cuda.get_current_stream().ptr
     if not mat.has_sorted_indices:
         mat.sort_indices()

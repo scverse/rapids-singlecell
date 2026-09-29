@@ -12,6 +12,7 @@
 
     dcg.mlm
     dcg.ulm
+    dcg.viper
     dcg.aucell
     dcg.gsea
     dcg.gsva
