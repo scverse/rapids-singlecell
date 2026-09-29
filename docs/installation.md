@@ -175,6 +175,7 @@ Use multiple architectures when building portable binaries (e.g., for a shared c
 The `-real` suffix generates device code only (no PTX fallback), which reduces binary size.
 ```
 
+(agent-skill)=
 ## Agent skill
 
 Released packages contain a matching model-neutral analysis skill. Copy it to
@@ -212,12 +213,12 @@ The preflight is disposable; configure RMM again at the start of the notebook.
 If RSC is not installed, create a fresh environment from the matching canonical
 definition on `main`:
 
-- [CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.04_cuda12.yml)
-- [CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.04_cuda13.yml)
+- [CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda12.yml)
+- [CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda13.yml)
 
 ```bash
 CONDA_CHANNEL_PRIORITY=flexible mamba env create --name rsc \
-  --file /path/to/rsc_rapids_26.04_cuda13.yml
+  --file /path/to/rsc_rapids_26.08_cuda13.yml
 ```
 
 (container-deprecation)=
