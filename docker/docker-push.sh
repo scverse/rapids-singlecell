@@ -1,5 +1,8 @@
 #!/bin/bash
+# Deprecated, unmaintained reference script. See README.md in this directory.
 set -euxo pipefail
+
+echo "Warning: these container recipes are deprecated and no longer maintained. See docker/README.md." >&2
 
 docker_account=scverse
 rapids_version=26.08

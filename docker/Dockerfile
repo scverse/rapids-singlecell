@@ -1,3 +1,4 @@
+# Deprecated, unmaintained reference recipe. See README.md in this directory.
 FROM rapids-singlecell-deps
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]

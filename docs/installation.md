@@ -2,6 +2,7 @@
 
 *rapids-singlecell* requires Python 3.12–3.14 and an NVIDIA GPU.
 
+(conda-installation)=
 ## Conda
 The easiest way to install *rapids-singlecell* is to use one of the *yaml* files provided in the [conda](https://github.com/scverse/rapids-singlecell/tree/main/conda) folder.
 These *yaml* files install everything needed to run the example notebooks and get you started.
@@ -174,12 +175,26 @@ Use multiple architectures when building portable binaries (e.g., for a shared c
 The `-real` suffix generates device code only (no PTX fallback), which reduces binary size.
 ```
 
+(deprecated-containers)=
 ## Docker
 
-We also offer Docker containers for `rapids-singlecell`. These containers include all the necessary dependencies, making it even easier to get started with `rapids-singlecell`.
+```{warning}
+The project-provided CUDA 12 and CUDA 13 Docker images and their dependency images
+are deprecated. Automated builds and publication have stopped, and these images
+will no longer receive updates, including security fixes. Existing published images
+are retained, but their `latest` tags will no longer track new *rapids-singlecell* releases.
 
-To use the Docker container, first, ensure that you have Docker installed on your system and that Docker supports the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html).
-Then, pull the Docker image matching your CUDA version:
+For maintained installations, use the {ref}`Conda environments <conda-installation>`
+or the {ref}`prebuilt wheels with CUDA-X Data Science dependencies <prebuilt-wheels-with-rapids-dependencies>`.
+The `rapids-singlecell-cu12` and `rapids-singlecell-cu13` Python packages remain supported;
+this deprecation only applies to the project-provided container images.
+```
+
+### Legacy Docker and Apptainer usage
+
+The following instructions are retained for existing users of the deprecated images.
+Ensure that Docker supports the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html).
+Then, pull the legacy Docker image matching your CUDA version:
 
 `````{tab-set}
 ````{tab-item} CUDA 13
@@ -209,7 +224,7 @@ docker run --rm -it --gpus all ghcr.io/scverse/rapids-singlecell-cu12:latest bas
 ````
 `````
 
-The docker containers also work with apptainer (or singularity) on an HPC system.
+The legacy Docker containers can also be used with Apptainer (or Singularity) on an HPC system.
 
 First pull the container and wrap it in a `.sif` file:
 `````{tab-set}
