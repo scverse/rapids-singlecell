@@ -1,3 +1,4 @@
+# These images will be deprecated in a future release; see README.md in this directory.
 ARG CUDA_VER=13.3.0
 ARG LINUX_VER=ubuntu24.04
 
@@ -6,7 +7,7 @@ FROM nvidia/cuda:${CUDA_VER}-devel-${LINUX_VER}
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 ARG PYTHON_VER=3.13
-# Re-declare after FROM so it is available to RUN steps (passed by docker.yml build-args)
+# Re-declare after FROM so the build argument is available to RUN steps.
 ARG CUDA_VER=13.3.0
 
 ENV PATH=/opt/conda/bin:$PATH
