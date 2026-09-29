@@ -1,6 +1,7 @@
 # Dask and multi-GPU
 
-In-memory single-GPU runs are fastest; use managed memory for moderate overflow, and Dask when data exceed host-backed managed memory or when several GPUs should share preprocessing.
+In-memory single-GPU runs are fastest.
+Use managed memory for moderate overflow, and Dask when data exceed host-backed managed memory or when several GPUs should share preprocessing.
 
 ## Cluster
 
@@ -17,8 +18,10 @@ cluster = LocalCUDACluster(
 client = Client(cluster)
 ```
 
-- Workers get RMM from the cluster arguments; `rmm.reinitialize` in the notebook process does not reach them.
-- `protocol="ucx"` enables NVLink but cannot be combined with managed memory; TCP is the robust default.
+- Workers get RMM from the cluster arguments.
+  `rmm.reinitialize` in the notebook process does not reach them.
+- `protocol="ucx"` enables NVLink but cannot be combined with managed memory.
+  TCP is the robust default.
 
 ## Load lazily
 
@@ -41,14 +44,15 @@ rsc.get.anndata_to_GPU(adata)
 - Dask-capable: `calculate_qc_metrics`, `filter_cells`, `filter_genes`, `normalize_total` (without `exclude_highly_expressed`), `log1p`, `highly_variable_genes` (not `pearson_residuals`), `scale`, `pca` (`covariance_eigh` only), `score_genes`, `rank_genes_groups` (`wilcoxon_binned` or t-test, not exact `wilcoxon`), `rsc.get.aggregate` and every `rsc.dcg` method.
 - `rsc.tl.leiden(..., use_dask=True)` distributes clustering, but it only pays off above about 10 million cells.
 - After PCA the embedding is small: `.compute()` it if `obsm["X_pca"]` is a Dask array, then run neighbors, Leiden and UMAP in memory.
-- Stop and reduce the data for steps without Dask support; never materialize the full matrix or fall back to CPU silently.
+- Stop and reduce the data for steps without Dask support.
+  Never materialize the full matrix or fall back to CPU silently.
 
 ## Execute
 
 - `persist()` after filtering only if the result fits across workers, and call `adata.X.compute_chunk_sizes()` after row filtering.
-- `compute()` only reduced results; it gathers everything onto the client GPU.
+- `compute()` only reduced results, because it gathers everything onto the client GPU.
 - On OOM, shrink chunks and task concurrency before adding workers.
-- CuPy sparse blocks hold at most 2**31 - 1 nonzeros; row chunks avoid the limit.
+- CuPy sparse blocks hold at most 2**31 - 1 nonzeros, which row chunks avoid.
 
 ## Multi-GPU without Dask
 

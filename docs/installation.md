@@ -178,8 +178,8 @@ The `-real` suffix generates device code only (no PTX fallback), which reduces b
 (agent-skill)=
 ## Agent skill
 
-Released packages contain a matching model-neutral analysis skill. Copy it to
-an agent's personal skill directory after installing RSC:
+Released packages contain a matching model-neutral analysis skill.
+Copy it to an agent's personal skill directory after installing RSC:
 
 ```bash
 rapids-singlecell-install-skills --agent codex
@@ -189,29 +189,27 @@ rapids-singlecell-install-skills --agent agents
 rapids-singlecell-install-skills --dest /other/skills/rapids-singlecell
 ```
 
-`--check` compares the installed copy with the bundle in the active package;
-`--force` replaces a differing copy. `--print-path` prints the bundled source.
-For Claude Science, the installer resolves the active organization from
-`~/.claude-science/active-org.json`.
+`--check` compares the installed copy with the bundle in the active package.
+`--force` replaces a differing copy.
+`--print-path` prints the bundled source.
+For Claude Science, the installer resolves the active organization from `~/.claude-science/active-org.json`.
 
 ```bash
 rapids-singlecell-install-skills --check --agent codex
 ```
 
-Before starting Jupyter, verify RMM, GPU/CUDA execution, the RSC import, native
-extensions, and a representative RSC kernel:
+Before starting Jupyter, verify RMM, GPU/CUDA execution, the RSC import, native extensions, and a representative RSC kernel:
 
 ```bash
 rapids-singlecell-check-kernel
 rapids-singlecell-check-kernel --mode managed  # planned oversubscription
 ```
 
-The preflight is disposable; configure RMM again at the start of the notebook.
+The preflight is disposable, so configure RMM again at the start of the notebook.
 
 ### Bootstrap from a standalone skill
 
-If RSC is not installed, create a fresh environment from the matching canonical
-definition on `main`:
+If RSC is not installed, create a fresh environment from the matching canonical definition on `main`:
 
 - [CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda12.yml)
 - [CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda13.yml)

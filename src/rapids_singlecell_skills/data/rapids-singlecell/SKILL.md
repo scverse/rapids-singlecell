@@ -5,7 +5,8 @@ description: "GPU single-cell and spatial analysis with rapids-singlecell (rsc),
 
 # rapids-singlecell
 
-`rsc.pp`, `rsc.tl` and `rsc.get` mirror scanpy on the GPU; `rsc.gr`, `rsc.ptg` and `rsc.dcg` port parts of squidpy, pertpy and decoupler.
+`rsc.pp`, `rsc.tl` and `rsc.get` mirror scanpy on the GPU.
+`rsc.gr`, `rsc.ptg` and `rsc.dcg` port parts of squidpy, pertpy and decoupler.
 Compute with rsc, plot with `sc.pl`/`sq.pl`/`dc.pl`, and leave rsc only for the gaps listed below.
 
 ## Before the notebook
@@ -17,7 +18,8 @@ rapids-singlecell-check-kernel                        # GPU, RMM and CUDA kernel
 python -m rapids_singlecell_skills.api map --options  # every public rsc symbol with its enum choices
 ```
 
-The map reflects the installed version; do not fetch the docs website or read rsc source to discover the API.
+The map reflects the installed version.
+Do not fetch the docs website or read rsc source to discover the API.
 For one detail, run `python -m rapids_singlecell_skills.api describe rsc.pp.neighbors --parameter algorithm`.
 If either command fails, read [references/setup.md](references/setup.md).
 
@@ -35,23 +37,29 @@ import rapids_singlecell as rsc
 import scanpy as sc
 ```
 
-- The pool is the fast route when data fit in VRAM; importing rsc alone installs RMM without a pool.
-- If data do not fit, use `rmm.reinitialize(managed_memory=True)` instead; for Dask, multi-GPU or data far beyond VRAM read [references/dask.md](references/dask.md).
+- The pool is the fast route when data fit in VRAM.
+  Importing rsc alone installs RMM without a pool.
+- If data do not fit, use `rmm.reinitialize(managed_memory=True)` instead.
+  For Dask, multi-GPU or data far beyond VRAM, read [references/dask.md](references/dask.md).
 
 ## Where data live
 
-- Only `X`, and layers you move yourself, live on the GPU; rsc writes `obs`, `var`, `obsm`, `obsp` and `uns` results to the host.
-- `rsc.pp` QC, filter, normalization and HVG functions raise `_check_gpu_X` on host input; `rsc.get.anndata_to_GPU(adata)` moves `X` only, `layer=` or `convert_all=True` also moves layers.
-- Keep raw counts as a host layer, not `.raw` or a GPU copy; `rsc.get.aggregate` and `rsc.tl.rank_genes_groups` read host data directly.
-- `sc.pl` works with a GPU `X` when coloring by `obs` or `obsm`; call `rsc.get.anndata_to_CPU(adata)` once before plotting gene expression.
+- Only `X`, and layers you move yourself, live on the GPU.
+  rsc writes `obs`, `var`, `obsm`, `obsp` and `uns` results to the host.
+- `rsc.pp` QC, filter, normalization and HVG functions raise `_check_gpu_X` on host input.
+  `rsc.get.anndata_to_GPU(adata)` moves `X` only, and `layer=` or `convert_all=True` also moves layers.
+- Keep raw counts as a host layer, not `.raw` or a GPU copy.
+  `rsc.get.aggregate` and `rsc.tl.rank_genes_groups` read host data directly.
+- `sc.pl` works with a GPU `X` when coloring by `obs` or `obsm`.
+  Call `rsc.get.anndata_to_CPU(adata)` once before plotting gene expression.
 - Check `type(adata.X)` instead of converting defensively, and never hand-roll CuPy/NumPy converters.
 
 ## Standard workflow
 
 Inspect first: shape, whether `X` holds integer counts, and which `obs` columns are sample, batch and condition.
 Convert dense counts to CSR (`scipy.sparse.csr_matrix`) before moving them to the GPU.
-Cross-tabulate sample against condition; a batch nested in condition cannot be corrected without erasing the condition.
-For spatial data read [references/spatial.md](references/spatial.md) first; its QC and normalization replace QC, doublet scoring and normalization below.
+Cross-tabulate sample against condition, because a batch nested in condition cannot be corrected without erasing the condition.
+For spatial data, read [references/spatial.md](references/spatial.md) first, because its QC and normalization replace QC, doublet scoring and normalization below.
 
 ```python
 adata.layers["counts"] = adata.X.copy()  # host copy of raw counts
@@ -62,9 +70,7 @@ adata = adata[~qc_outliers(adata.obs, by="sample").to_numpy()].copy()
 rsc.pp.scrublet(adata, batch_key="sample", verbose=False)  # raw counts, per sample
 adata = adata[~adata.obs["predicted_doublet"].to_numpy()].copy()
 rsc.pp.filter_genes(adata, min_cells=20)
-rsc.pp.highly_variable_genes(
-    adata, n_top_genes=2000, flavor="seurat_v3"
-)  # batch_key optional
+rsc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3")
 rsc.pp.normalize_total(adata)  # median depth
 rsc.pp.log1p(adata)
 rsc.pp.pca(adata, n_comps=50, mask_var="highly_variable")
@@ -94,24 +100,35 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
 
 ## Defaults that override old tutorials
 
-- QC thresholds are per-sample MADs, shown on the distributions before filtering; flag rather than drop high-mito cells in tumours or metabolically active tissue.
+- QC thresholds are per-sample MADs, shown on the distributions before filtering.
+  Flag rather than drop high-mito cells in tumors or metabolically active tissue.
 - Correct ambient RNA only when contamination is evident (CellBender or SoupX, outside rsc), and keep the uncorrected counts.
 - Score doublets per sample, never on pooled samples, and remove them before clustering.
-- Normalize to median depth, not `target_sum=1e4` or `1e6`; do not `scale` (it densifies `X`) or `regress_out` before PCA.
-- Integrate only when the uncorrected embedding separates a technical batch that shares biology across batches; start with Harmony and move to scVI/scANVI for complex or cross-system batches.
+- Normalize to median depth, not `target_sum=1e4` or `1e6`.
+  Do not `scale` (it densifies `X`) or `regress_out` before PCA.
+- Select about 2000 `seurat_v3` HVGs on raw counts, where `batch_key` is optional.
+- Integrate only when the uncorrected embedding separates a technical batch that shares biology across batches.
+  Start with Harmony and move to scVI/scANVI for complex or cross-system batches.
 - Verify integration kept biology with known markers or scib-metrics, not by eye on a UMAP.
-- Leiden partitions change with the seed; sweep resolutions with 3 to 5 `rng` values and keep resolutions whose labels agree across seeds (ARI) and whose clusters have distinct markers.
-- GPU PCA on sparse input is not bitwise reproducible across reruns and can shift cluster boundaries; save final labels in the AnnData rather than expecting a rerun to reproduce them.
-- Marker p-values after clustering are only for ranking because the same data defined the clusters; filter markers by `pts` detection fractions and effect size.
-- Annotate clusters from positive and negative markers (score marker sets with `rsc.dcg.ulm` and compare cluster means) or reference transfer (CellTypist, scANVI); use `unknown` for weak or tied evidence and treat LLM-proposed labels as hypotheses.
-- UMAP is display only; never infer distances, relatedness or trajectories from it.
-- Comparing conditions needs biological replicates and pseudobulk; read [references/conditions.md](references/conditions.md) first.
-- Foundation-model embeddings do not beat PCA, Harmony or scVI baselines; use them only on request and next to a baseline.
+- Leiden partitions change with the seed.
+  Sweep resolutions with 3 to 5 `rng` values and keep resolutions whose labels agree across seeds (ARI) and whose clusters have distinct markers.
+- GPU PCA on sparse input is not bitwise reproducible across reruns and can shift cluster boundaries.
+  Save final labels in the AnnData rather than expecting a rerun to reproduce them.
+- Marker p-values after clustering are only for ranking because the same data defined the clusters.
+  Filter markers by `pts` detection fractions and effect size.
+- Annotate clusters from positive and negative markers (score marker sets with `rsc.dcg.ulm` and compare cluster means) or reference transfer (CellTypist, scANVI).
+  Use `unknown` for weak or tied evidence and treat LLM-proposed labels as hypotheses.
+- UMAP is display only, so never infer distances, relatedness or trajectories from it.
+- Comparing conditions needs biological replicates and pseudobulk, so read [references/conditions.md](references/conditions.md) first.
+- Foundation-model embeddings do not beat PCA, Harmony or scVI baselines.
+  Use them only on request and next to a baseline.
 
 ## Fast paths
 
-- `rsc.pp.neighbors` defaults to exact `brute`, fine up to about 500k cells; above that use `algorithm="nn_descent"` (5x faster at 2M cells, recall 0.99), not `ivfflat` (recall 0.72 by default).
-- `rank_genes_groups(method="wilcoxon")` runs on CUDA kernels; use `wilcoxon_binned` for Dask input or tens of millions of cells.
+- `rsc.pp.neighbors` defaults to exact `brute`, which is fine up to about 500k cells.
+  Above that use `algorithm="nn_descent"` (5x faster at 2M cells, recall 0.99), not `ivfflat` (recall 0.72 by default).
+- `rank_genes_groups(method="wilcoxon")` runs on CUDA kernels.
+  Use `wilcoxon_binned` for Dask input or tens of millions of cells.
 - Do not rerun steps on CPU to validate them or benchmark rsc against scanpy unless asked.
 
 ## Outside rsc
@@ -124,21 +141,26 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
 | Integration metrics | scib-metrics |
 | Pseudobulk DE | PyDESeq2 on `rsc.get.aggregate` output |
 | Differential abundance | pertpy `Sccoda`, `Milo` |
-| Pathway resources and plots | decoupler `dc.op`, `dc.pl`; score with `rsc.dcg` |
+| Pathway resources and plots | decoupler `dc.op`, `dc.pl`, scoring with `rsc.dcg` |
 | Cell-cell communication across samples | LIANA+ |
 | Physical spatial graph | squidpy, unless the map lists an rsc builder |
 | Other pertpy tools | pertpy |
 
-Name each crossing in the notebook; never replace a missing rsc capability with a silent CPU reimplementation.
-For CRISPR screens and perturbation distances read [references/perturbation.md](references/perturbation.md).
+Name each crossing in the notebook.
+Never replace a missing rsc capability with a silent CPU reimplementation.
+For CRISPR screens and perturbation distances, read [references/perturbation.md](references/perturbation.md).
 
 ## Notebook and deliverables
 
-- One stage per cell, under about 25 lines; plot right after the computation it shows, then interpret in a short markdown cell.
-- Write the analysis in the notebook itself; never paste standalone scripts into cells.
+- One stage per cell, under about 25 lines.
+  Plot right after the computation it shows, then interpret in a short markdown cell.
+- Write the analysis in the notebook itself and never paste standalone scripts into cells.
 - Record package versions with `session_info2`, the seed and the input path.
 - While developing, save a checkpoint AnnData after preprocessing and test new stages against it instead of re-executing the whole notebook after every edit.
-- Execute top to bottom in a fresh kernel with `jupyter nbconvert --to notebook --execute --inplace` and read every output; fix warnings you do not understand.
-- Check outputs against data scale: hundreds of clusters, clusters near cell count, or figures of hundreds of megapixels mean stop and fix.
-- Follow requested choices unless the data or design make them invalid; then show the evidence and propose an alternative.
+- Execute top to bottom in a fresh kernel with `jupyter nbconvert --to notebook --execute --inplace` and read every output.
+  Fix warnings you do not understand.
+- Check outputs against data scale.
+  Hundreds of clusters, clusters near cell count, or figures of hundreds of megapixels mean stop and fix.
+- Follow requested choices unless the data or design make them invalid.
+  In that case, show the evidence and propose an alternative.
 - Deliver the executed notebook, the final AnnData, and a short markdown report of findings, evidence and limitations.

@@ -32,19 +32,22 @@ for ct in pb.obs["cell_type"].unique():
     results[ct] = stats.results_df
 ```
 
-- Sum raw counts per sample and cell type; never test conditions with `rank_genes_groups` on cells, which treats cells as replicates.
+- Sum raw counts per sample and cell type.
+  Never test conditions with `rank_genes_groups` on cells, which treats cells as replicates.
 - Skip cell types with too few samples per condition after the cell-count filter, and say so.
 - Run a pseudobulk PCA to spot outlier samples or unmodeled covariates before trusting results.
 
 ## Differential abundance
 
-- Proportions are compositional; test them with pertpy `Sccoda` on cell-type counts per sample, or `Milo` on neighborhoods with batch in the design.
+- Proportions are compositional.
+  Test them with pertpy `Sccoda` on cell-type counts per sample, or `Milo` on neighborhoods with batch in the design.
 - Never use Fisher or chi-square tests on pooled cell counts.
 
 ## Pathways and TF activity
 
 - Load resources with decoupler: `dc.op.progeny(organism=..., top=500)` for pathways, `dc.op.collectri(organism=...)` for TFs, `dc.op.hallmark(organism=...)` for gene sets.
 - For condition contrasts, score the DE statistic rather than cells: `dc.mt.ulm(results[ct][["stat"]].T, net)` returns scores and p-values per source.
-- Per-cell scores are for display: `rsc.dcg.ulm(adata, net)` writes `obsm["score_ulm"]` and `rsc.dcg.aucell` suits unweighted gene sets; view them with `dc.pp.get_obsm(adata, "score_ulm")` and `sc.pl`.
-- Rank-based per-cell scores (AUCell) lose or flip signal in case-control comparisons; do not test conditions on them.
+- Per-cell scores are for display: `rsc.dcg.ulm(adata, net)` writes `obsm["score_ulm"]` and `rsc.dcg.aucell` suits unweighted gene sets.
+  View them with `dc.pp.get_obsm(adata, "score_ulm")` and `sc.pl`.
+- Rank-based per-cell scores (AUCell) lose or flip signal in case-control comparisons, so do not test conditions on them.
 - Score TF activity from targets (CollecTRI), not TF expression.

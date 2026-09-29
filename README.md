@@ -30,9 +30,8 @@ rapids-singlecell-install-skills --agent claude-science  # or: --agent agents
 rapids-singlecell-check-kernel                    # before starting Jupyter
 ```
 
-Use `--dest /path/to/skills/rapids-singlecell` for another agent. See the
-[installation guide](https://rapids-singlecell.readthedocs.io/en/latest/installation.html#agent-skill)
-for installation and preflight details.
+Use `--dest /path/to/skills/rapids-singlecell` for another agent.
+See the [installation guide](https://rapids-singlecell.readthedocs.io/en/latest/installation.html#agent-skill) for installation and preflight details.
 
 ## Documentation
 
