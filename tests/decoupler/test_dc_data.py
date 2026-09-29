@@ -50,7 +50,8 @@ def test_extract(
 @pytest.mark.parametrize("dtype", [np.float64, np.longdouble])
 def test_cpu_sparse_dtypes_preserve_ulm(adata, net, dtype):
     expected = adata.copy()
-    dc.ulm(expected, net, tmin=0)
+    expected.X = sps.csr_matrix(expected.X, dtype=np.float32)
+    dc.ulm(expected, net, tmin=0, bsize=7)
     adata.X = sps.csr_matrix(np.asarray(adata.X, dtype=dtype))
     dc.ulm(adata, net, tmin=0, bsize=7)
     assert adata.X.dtype == np.dtype(dtype)
