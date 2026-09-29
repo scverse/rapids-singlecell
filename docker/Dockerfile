@@ -1,3 +1,4 @@
+# These images will be deprecated in a future release; see README.md in this directory.
 FROM rapids-singlecell-deps
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
