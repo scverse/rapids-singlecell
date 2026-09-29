@@ -226,6 +226,45 @@ def test_ora_raw_layer_match_cpu(
     )
 
 
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"raw": 1}, "raw must be bool"),
+        ({"raw": True}, "data.raw is empty"),
+        ({"layer": 1}, "layer must be str or None"),
+        ({"raw": True, "layer": 1}, "layer must be str or None"),
+    ],
+)
+def test_ora_preparation_validates_raw_and_layer(
+    compatibility_frame, compatibility_net, kwargs, match
+):
+    data = ad.AnnData(compatibility_frame)
+    with pytest.raises(AssertionError, match=match):
+        rdc.ora(data, compatibility_net, tmin=2, **kwargs)
+
+
+@pytest.mark.parametrize("cutoff", [0.0, 0.5])
+def test_ora_cutoff_preserves_zero_rows_when_empty_true(cutoff):
+    frame = pd.DataFrame(
+        [[0, 0, 0, 0], [1, 0, 0, 0]],
+        index=["empty", "selected"],
+        columns=list("abcd"),
+        dtype=np.float32,
+    )
+    net = pd.DataFrame(
+        {"source": ["hit", "hit", "zero", "zero"], "target": list("abcd")}
+    )
+    options = {"value_cutoff": cutoff, "n_bg": None, "tmin": 1}
+    expected = rdc.ora(frame, net, empty=False, **options)
+    data = ad.AnnData(frame)
+    returned = rdc.ora(data, net, empty=True, **options)
+    assert returned is None
+    assert data.shape == (2, 4)
+    _assert_cpu_equal(_anndata_results(data, returned), expected)
+    assert data.obsm["score_ora"].columns.tolist() == ["hit", "zero"]
+    np.testing.assert_array_equal(data.obsm["padj_ora"].loc["empty"], 1)
+
+
 def test_ora_and_query_set_public_parameter_contract():
     for implementation, reference in [
         (rdc.ora, dc.mt.ora),

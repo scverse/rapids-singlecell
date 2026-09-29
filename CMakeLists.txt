@@ -100,6 +100,7 @@ if (RSC_BUILD_EXTENSIONS)
   add_nb_cuda_module(_viper_cuda        src/rapids_singlecell/_cuda/viper/viper.cu)
   # Preserve signed cancellation and ordered likelihood updates in VIPER.
   target_compile_options(_viper_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+  add_nb_cuda_module(_gsva_cuda         src/rapids_singlecell/_cuda/gsva/gsva.cu)
   add_nb_cuda_module(_nanmean_cuda      src/rapids_singlecell/_cuda/nanmean/nanmean.cu)
   add_nb_cuda_module(_autocorr_cuda     src/rapids_singlecell/_cuda/autocorr/autocorr.cu)
   add_nb_cuda_module(_cooc_cuda         src/rapids_singlecell/_cuda/cooc/cooc.cu)

@@ -50,6 +50,21 @@ def test_sparse2dense_csc_f_order():
     cp.testing.assert_array_equal(got, exp)
 
 
+def test_sparse2dense_uses_current_stream(monkeypatch):
+    from unittest.mock import Mock
+
+    from rapids_singlecell._cuda import _sparse2dense_cuda
+
+    launch = Mock(wraps=_sparse2dense_cuda.sparse2dense)
+    monkeypatch.setattr(_sparse2dense_cuda, "sparse2dense", launch)
+    with cp.cuda.Stream(non_blocking=True) as stream:
+        X = _make_small_csr()
+        got = _sparse_to_dense(X)
+        cp.testing.assert_array_equal(got, X.toarray())
+    launch.assert_called_once()
+    assert launch.call_args.kwargs["stream"] == stream.ptr
+
+
 def test_sparse2dense_random_shapes_seeded():
     rs = cp.random.RandomState(123)
     for dtype in (cp.float32, cp.float64):

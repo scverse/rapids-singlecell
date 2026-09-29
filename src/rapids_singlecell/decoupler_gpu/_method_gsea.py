@@ -235,24 +235,21 @@ def _func_gsea(
     return es.get(), pv.get()
 
 
-class GseaMethod(Method):
-    """GSEA with a default batch size of 100 observations."""
-
-    def __call__(self, data, net, *, bsize=100, **kwargs):
-        kwargs.setdefault("_permutation_cache", _PermutationCache())
-        return super().__call__(data, net, bsize=bsize, **kwargs)
+def _prepare_gsea(kwargs):
+    """Provide a call-scoped default cache shared by all batches."""
+    kwargs.setdefault("_permutation_cache", _PermutationCache())
 
 
-gsea = GseaMethod(
-    _method=MethodMeta(
-        name="gsea",
-        desc="Gene Set Enrichment Analysis (GSEA)",
-        func=_func_gsea,
-        stype="numerical",
-        adj=False,
-        weight=False,
-        test=True,
-        limits=(-np.inf, +np.inf),
-        reference="https://doi.org/10.1073/pnas.0506580102",
-    )
+_gsea = MethodMeta(
+    name="gsea",
+    desc="Gene Set Enrichment Analysis (GSEA)",
+    func=_func_gsea,
+    stype="numerical",
+    adj=False,
+    weight=False,
+    test=True,
+    limits=(-np.inf, +np.inf),
+    reference="https://doi.org/10.1073/pnas.0506580102",
 )
+
+gsea = Method(_method=_gsea, default_bsize=100, prepare=_prepare_gsea)
