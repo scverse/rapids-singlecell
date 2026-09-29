@@ -13,6 +13,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+permissions: {}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -26,6 +29,8 @@ jobs:
   get-envs:
     runs-on: ubuntu-latest
     needs: check
+    permissions:
+      contents: read
     outputs:
       stable-dev: ${{ steps.get-envs.outputs.stable-dev }}
       prerelease: ${{ steps.get-envs.outputs.prerelease }}
@@ -34,6 +39,7 @@ jobs:
         with:
           filter: blob:none
           fetch-depth: 0
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: false
@@ -54,7 +60,7 @@ jobs:
                 runner: "cirun-aws-gpu-t4",
               }
             )')
-          echo "stable-dev=${STABLE_DEV_JSON}" | tee -a $GITHUB_OUTPUT
+          echo "stable-dev=${STABLE_DEV_JSON}" | tee -a "$GITHUB_OUTPUT"
 
           # Prerelease environments (cu13 -> T4)
           PRERELEASE_JSON=$(uvx hatch env show --json | jq -c '
@@ -67,7 +73,7 @@ jobs:
                 runner: "cirun-aws-gpu-t4",
               }
             )')
-          echo "prerelease=${PRERELEASE_JSON}" | tee -a $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE_JSON}" | tee -a "$GITHUB_OUTPUT"
 
   test-stable-dev:
     name: Test (${{ matrix.env.name }})
@@ -81,12 +87,15 @@ jobs:
         env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           filter: blob:none
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@v8.1.0
         with:
@@ -94,23 +103,23 @@ jobs:
 
       - name: Add CUDA to PATH
         run: |
-          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
-          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> $GITHUB_ENV
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
           uv tool install hatch
-          hatch -v env create ${{ matrix.env.name }}
+          hatch -v env create "$ENV_NAME"
 
       - name: Run tests
         run: |
           mkdir -p test-data
-          if [[ "${{ matrix.env.name }}" == *"stable"* ]]; then
-            hatch run ${{ matrix.env.name }}:run-cov -v --color=yes
-            hatch run ${{ matrix.env.name }}:coverage xml
-            hatch run ${{ matrix.env.name }}:cov-report
+          if [[ "$ENV_NAME" == *"stable"* ]]; then
+            hatch run "${ENV_NAME}:run-cov" -v --color=yes
+            hatch run "${ENV_NAME}:coverage" xml
+            hatch run "${ENV_NAME}:cov-report"
           else
-            hatch run ${{ matrix.env.name }}:run -v --color=yes
+            hatch run "${ENV_NAME}:run" -v --color=yes
           fi
 
       - name: Upload test results
@@ -145,12 +154,15 @@ jobs:
         env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           filter: blob:none
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@v8.1.0
         with:
@@ -158,8 +170,8 @@ jobs:
 
       - name: Add CUDA to PATH
         run: |
-          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
-          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> $GITHUB_ENV
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
 
       - name: Check CUDA version
         run: nvcc --version
@@ -170,10 +182,10 @@ jobs:
       - name: Install dependencies
         run: |
           uv tool install hatch
-          hatch -v env create ${{ matrix.env.name }}
+          hatch -v env create "$ENV_NAME"
 
       - name: Run tests
-        run: hatch run ${{ matrix.env.name }}:run -v --color=yes
+        run: hatch run "${ENV_NAME}:run" -v --color=yes
 
   remove-label:
     name: Remove 'run-gpu-ci' Label
