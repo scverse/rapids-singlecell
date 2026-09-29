@@ -175,26 +175,24 @@ Use multiple architectures when building portable binaries (e.g., for a shared c
 The `-real` suffix generates device code only (no PTX fallback), which reduces binary size.
 ```
 
-(deprecated-containers)=
+(container-deprecation)=
 ## Docker
 
-```{warning}
+```{note}
 The project-provided CUDA 12 and CUDA 13 Docker images and their dependency images
-are deprecated. Automated builds and publication have stopped, and these images
-will no longer receive updates, including security fixes. Existing published images
-are retained, but their `latest` tags will no longer track new *rapids-singlecell* releases.
+will be deprecated in a future release. Container builds and publication continue
+for now; no deprecation date has been set.
 
-For maintained installations, use the {ref}`Conda environments <conda-installation>`
+Please plan to migrate to the {ref}`Conda environments <conda-installation>`
 or the {ref}`prebuilt wheels with CUDA-X Data Science dependencies <prebuilt-wheels-with-rapids-dependencies>`.
 The `rapids-singlecell-cu12` and `rapids-singlecell-cu13` Python packages remain supported;
-this deprecation only applies to the project-provided container images.
+the planned deprecation only applies to the project-provided container images.
 ```
 
-### Legacy Docker and Apptainer usage
+### Docker and Apptainer usage
 
-The following instructions are retained for existing users of the deprecated images.
 Ensure that Docker supports the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/index.html).
-Then, pull the legacy Docker image matching your CUDA version:
+Then, pull the Docker image matching your CUDA version:
 
 `````{tab-set}
 ````{tab-item} CUDA 13
@@ -224,7 +222,7 @@ docker run --rm -it --gpus all ghcr.io/scverse/rapids-singlecell-cu12:latest bas
 ````
 `````
 
-The legacy Docker containers can also be used with Apptainer (or Singularity) on an HPC system.
+The Docker containers can also be used with Apptainer (or Singularity) on an HPC system.
 
 First pull the container and wrap it in a `.sif` file:
 `````{tab-set}

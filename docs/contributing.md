@@ -65,7 +65,7 @@ rapids_singlecell/
 │       └── py.typed             # PEP 561 marker (gitignored, auto-generated)
 ├── tests/                       # pytest test suite
 ├── docs/                        # Sphinx documentation
-├── docker/                      # Deprecated container recipes (reference only)
+├── docker/                      # Docker container recipes
 ├── conda/                       # Conda environment files
 ├── CMakeLists.txt               # CMake build for CUDA extensions
 └── pyproject.toml               # Project metadata and build config
@@ -261,22 +261,25 @@ CUDA 13 wheels target: `75` (Turing), `80` (Ampere), `86` (Ampere), `89` (Ada), 
 
 Source builds (`pip install rapids-singlecell`) compile for the local GPU architecture by default (`CMAKE_CUDA_ARCHITECTURES=native`).
 
-### Deprecated Docker containers
+### Docker containers
 
-The project-provided containers are deprecated. Their automated build and publishing
-workflow has been removed. Existing published images are retained without further
-updates, including security fixes; see {ref}`deprecated-containers` for migration options.
+The project-provided containers will be deprecated in a future release. Automated
+builds and publication continue for now; no deprecation date has been set.
+See {ref}`container-deprecation` for migration options.
 
-The `docker/` directory retains the following unmaintained recipes for reference:
+The `docker/` directory contains the following recipes:
 
 | File | Purpose |
 |---|---|
 | `Dockerfile.deps` | Base image with conda CUDA-X Data Science environment + pip dependencies. Uses `nvidia/cuda:*-devel` for CUDA toolkit access. |
 | `Dockerfile` | Final image that builds on `rapids-singlecell-deps` and compiles rapids-singlecell from source for all supported GPU architectures. |
 
+The `.github/workflows/docker.yml` workflow builds these images using the repository as the `source` build context and passes the package version through `RSC_VERSION`.
+It removes the `rapids-singlecell` pip entry from the conda environment file before building the dependency image and publishes images on releases.
+
 ### CI manylinux images
 
-The container deprecation does not affect wheel builds. Wheels are still built by
+The planned container deprecation does not affect wheel builds. Wheels are built by
 cibuildwheel against prebuilt manylinux + CUDA images published at
 `quay.io/manylinux_cuda/manylinux_2_28_<arch>_cuda<ver>`. `publish.yml` selects the image
 per matrix entry via `cibw_image`.
