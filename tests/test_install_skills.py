@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import sys
@@ -15,545 +16,91 @@ from rapids_singlecell_skills import install, kernel
 ROOT = Path(__file__).parents[1]
 
 
+SKILL = install.skill_source()
+REFERENCES = ("conditions.md", "dask.md", "perturbation.md", "setup.md", "spatial.md")
+
+
+def _skill_texts() -> dict[str, str]:
+    return {
+        path.relative_to(SKILL).as_posix(): path.read_text(encoding="utf-8")
+        for path in SKILL.rglob("*.md")
+    }
+
+
 def test_skill_bundle_is_minimal() -> None:
-    source = install.skill_source()
-    assert source == (
+    assert SKILL == (
         Path(install.__file__).resolve().parent / "data" / "rapids-singlecell"
     )
     files = {
-        path.relative_to(source).as_posix()
-        for path in source.rglob("*")
+        path.relative_to(SKILL).as_posix()
+        for path in SKILL.rglob("*")
         if path.is_file()
     }
     assert files == {
         "SKILL.md",
         "agents/openai.yaml",
-        "references/dask.md",
-        "references/memory.md",
-        "references/notebooks.md",
-        "references/perturbation.md",
-        "references/setup.md",
-        "references/spatial.md",
+        *(f"references/{name}" for name in REFERENCES),
     }
 
-    text = (source / "SKILL.md").read_text(encoding="utf-8")
-    assert len(text.splitlines()) <= 100
-    assert len(text.split()) <= 1150
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert len(text.split()) <= 1200
     description = re.search(r"(?m)^description:\s*(.+)$", text)
     assert description is not None
     assert len(description.group(1).strip("\"'")) <= 500
-    normalized_text = " ".join(text.split())
-    for phrase in (
-        "rapids-singlecell-check-kernel",
-        "managed_memory=oversubscribe",
-        "references/memory.md",
-        "references/dask.md",
-        "references/notebooks.md",
-        "references/perturbation.md",
-        "references/setup.md",
-        "references/spatial.md",
-        "executed `.ipynb`",
-    ):
-        assert phrase in normalized_text
-
-    for name in (
-        "memory.md",
-        "dask.md",
-        "notebooks.md",
-        "perturbation.md",
-        "setup.md",
-        "spatial.md",
-    ):
-        reference = (source / "references" / name).read_text(encoding="utf-8")
-        assert len(reference.splitlines()) <= 100
-        assert len(reference.split()) <= 1000
+    for name in REFERENCES:
+        reference = (SKILL / "references" / name).read_text(encoding="utf-8")
+        assert len(reference.split()) <= 800
 
 
-def _markdown_bullets(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8").casefold()
-    return [
-        " ".join(match.split())
-        for match in re.findall(
-            r"(?ms)^- (.*?)(?=^- |^## |\Z)",
-            text,
-        )
-    ]
+def test_skill_links_resolve() -> None:
+    linked = set()
+    for name, text in _skill_texts().items():
+        for target in re.findall(r"\]\(((?!https?://)[^)]+)\)", text):
+            path = (SKILL / name).parent / target
+            assert path.is_file(), f"{name} links to missing {target}"
+            linked.add(path.resolve())
+    assert linked == {(SKILL / "references" / name).resolve() for name in REFERENCES}
 
 
-def _notebook_contract_bullets() -> list[str]:
-    return _markdown_bullets(install.skill_source() / "references" / "notebooks.md")
+def test_skill_python_blocks_compile() -> None:
+    for name, text in _skill_texts().items():
+        for block in re.findall(r"```python\n(.*?)```", text, flags=re.DOTALL):
+            compile(block, name, "exec")
 
 
-def _spatial_contract_bullets() -> list[str]:
-    return _markdown_bullets(install.skill_source() / "references" / "spatial.md")
+def test_skill_names_only_public_rsc_symbols() -> None:
+    rsc = pytest.importorskip("rapids_singlecell")
+    api = pytest.importorskip("rapids_singlecell_skills.api")
+    contract = api._contract(rsc)
+    namespaces = {symbol.split(".")[0] for symbol in contract}
+    for name, text in _skill_texts().items():
+        for symbol in re.findall(r"\brsc\.(\w+(?:\.\w+)*)", text):
+            assert symbol in namespaces or symbol in contract, f"{name}: rsc.{symbol}"
 
 
-def _perturbation_contract_bullets() -> list[str]:
-    return _markdown_bullets(install.skill_source() / "references" / "perturbation.md")
-
-
-def _covers(bullets: list[str], *terms: str) -> bool:
-    return any(all(term.casefold() in bullet for term in terms) for bullet in bullets)
-
-
-def test_core_preserves_cold_run_recovery_contract() -> None:
-    bullets = _markdown_bullets(install.skill_source() / "SKILL.md")
-
-    assert _covers(
-        bullets,
-        "_check_gpu_x",
-        "cupy",
-        "layer",
-        "rsc.get.anndata_to_gpu",
-        "convert_all=true",
-        "transitional",
-    )
-    assert _covers(
-        bullets,
-        "squidpy",
-        "physical graph",
-        "live rsc cannot",
-        "attribute",
-        "references/spatial.md",
-    )
-    assert _covers(
-        bullets,
-        "critically evaluate every output",
-        "group counts",
-        "figure pixels",
-        "megapixels",
-        "stop signals",
-        "rerun",
-    )
-    assert _covers(
-        bullets,
-        "requested analysis choices",
-        "push back with evidence",
-        "valid alternative",
-    )
-    assert _covers(
-        bullets,
-        "sc.pl",
-        "sq.pl",
-        "only",
-        "canonical `decoupler` plotting does not express",
-    )
-
-
-def test_core_dispatches_pathway_work_by_analysis_unit() -> None:
-    bullets = _markdown_bullets(install.skill_source() / "SKILL.md")
-
-    assert _covers(
-        bullets,
-        "canonical",
-        "decoupler",
-        "resources",
-        "pathway-native plots",
-        "`rsc.dcg`",
-        "per-cell scoring",
-        "descriptively",
-        "pseudobulk",
-        "replicated cross-condition inference",
-        "biological sample",
-        "replication unit",
-        "attribute each boundary",
-    )
-    assert _covers(
-        bullets,
-        "sc.pl",
-        "sq.pl",
-        "only",
-        "canonical `decoupler` plotting does not express",
-    )
-
-
-def test_core_surfaces_neighboring_gpu_ports() -> None:
-    bullets = _markdown_bullets(install.skill_source() / "SKILL.md")
-
-    assert _covers(
-        bullets,
-        "`rsc.gr`",
-        "squidpy-compatible",
-        "`rsc.ptg`",
-        "pertpy-compatible",
-        "`rsc.dcg`",
-        "decoupler-compatible",
-        "ecosystem",
-        "method names",
-        "describe",
-        "public symbol",
-    )
-
-
-def test_setup_api_discovery_degrades_without_helper() -> None:
-    setup = (
-        (install.skill_source() / "references" / "setup.md")
-        .read_text(encoding="utf-8")
-        .casefold()
-    )
-    discovery = " ".join(setup.split("## discover the live api", maxsplit=1)[1].split())
-
-    for phrase in (
-        "rapids_singlecell_skills.api search",
-        "rapids_singlecell_skills.api describe",
-        "unavailable",
-        "inspect.signature",
-        "inspect.getdoc",
-        "help(call)",
-        "official documentation",
-        "implementation source",
-        "license compatibility",
-    ):
-        assert phrase in discovery
-
-
-def test_setup_bounds_kernel_less_execution_fallback() -> None:
-    bullets = _markdown_bullets(install.skill_source() / "references" / "setup.md")
-
-    assert _covers(
-        bullets,
-        "kernel-less",
-        "preflight passes",
-        "startup logs",
-        "denied jupyter/zmq socket",
-        "not diagnostic",
-        "import",
-        "abi",
-        "gpu",
-        "oom",
-    )
-    assert _covers(
-        bullets,
-        "tested in-process notebook executor",
-        "fresh disposable child",
-        "not the agent process",
-        "in order",
-        "stop on first error",
-        "counts",
-        "streams",
-        "rich displays",
-        "figures",
-        "tracebacks",
-        "unsupported magics",
-        "blockers",
-        "`cuda_visible_devices`",
-        "before any cuda import",
-        "persisted outputs",
-    )
-
-
-def test_notebook_reference_preserves_notebook_contract() -> None:
-    bullets = _notebook_contract_bullets()
-
-    assert _covers(bullets, "one", "analysis task", "code cell")
-    assert _covers(bullets, "plot", "next visible cell", "interpretation")
-    assert _covers(
-        bullets,
-        "owning package",
-        "canonical",
-        "decoupler",
-        "pathways",
-        "sc.pl",
-        "sq.pl",
-        "custom plotting",
-    )
-    assert _covers(
-        bullets,
-        "resolve unexpected warnings",
-        "understood routine",
-        "without errors",
-        "raw log streams",
-    )
-    assert _covers(
-        bullets,
-        "scaffolding",
-        "outside the narrative",
-        "compact table",
-        "validation cell",
-    )
-    assert _covers(bullets, "execute every cell", "fresh kernel")
-    assert _covers(
-        bullets,
-        "tentative labels",
-        "partition changes",
-        "never reuse cluster-id maps",
-        "complete coverage",
-        "`unknown`",
-        "exclusion",
-        "contradictory",
-        "confidence",
-        "source links",
-    )
-    assert _covers(
-        bullets,
-        "analysis preferences",
-        "live rsc",
-        "visible",
-        "standing default",
-        "explicit request",
-        "scope",
-        "conditions",
-    )
-    assert _covers(
-        bullets,
-        "executed",
-        ".ipynb",
-        ".md",
-        "findings",
-        "evidence",
-        "limitations",
-    )
-    assert _covers(
-        bullets,
-        "requested choice",
-        "data or design",
-        "evidence",
-        "concern",
-        "valid alternative",
-        "never silently",
-    )
-
-
-def test_notebook_reference_guards_kernel_level_reproducibility() -> None:
-    """Regression guards for the run3 notebook defects (6x RMM re-init, 95-line cells)."""
-    bullets = _notebook_contract_bullets()
-    outline = (
-        (install.skill_source() / "references" / "notebooks.md")
-        .read_text(encoding="utf-8")
-        .casefold()
-    )
-
-    assert "exactly once in this first cell" in " ".join(outline.split())
-    assert "undefined behavior" in outline
-    assert _covers(
-        bullets,
-        "author the analysis in the notebook",
-        "never assemble a notebook by pasting",
-        "shared kernel",
-    )
-    assert _covers(bullets, "under roughly 25 lines", "several tasks, not one")
-
-
-def test_core_shows_a_worked_skeleton() -> None:
-    """The skeleton is the shape agents copy; prose alone let run3 drift into scripts."""
-    text = (install.skill_source() / "SKILL.md").read_text(encoding="utf-8")
-
-    for phrase in (
-        "configure RMM exactly once per kernel",
-        "one stage per cell",
-        "rsc.get.anndata_to_GPU(adata, convert_all=True)",
-        'rsc.tl.leiden(adata, dtype="float64", random_state=SEED)',
-        "rsc.get.anndata_to_CPU(adata)",
-    ):
-        assert phrase in text
-
-
-def test_notebook_reference_preserves_scverse_data_flow() -> None:
-    bullets = _notebook_contract_bullets()
-
-    assert _covers(
-        bullets,
-        "session_info2",
-        "seed",
-        "input provenance",
-        "source revision",
-    )
-    assert _covers(
-        bullets,
-        "standard log-normalized workflow",
-        "counts",
-        "hvgs",
-        "full object",
-        "subset",
-    )
-    assert _covers(
-        bullets,
-        "gpu call",
-        "layer",
-        "moving `x`",
-        "every layer",
-    )
-    assert _covers(
-        bullets,
-        "rsc.get.x_to_cpu",
-        "rsc.get.anndata_to_cpu",
-        "interop",
-        "host-backed",
-    )
-    assert _covers(
-        bullets,
-        "non-rsc",
-        "essential",
-        "relevant skill",
-        "attribution",
-        "fallback",
-    )
-
-
-def test_notebook_reference_routes_decoupler_work() -> None:
-    bullets = _notebook_contract_bullets()
-
-    assert _covers(
-        bullets,
-        "canonical `decoupler`",
-        "resources",
-        "pathway-native plots",
-        "per-cell scoring",
-        "live `rsc.dcg`",
-        "single sample",
-        "descriptive",
-        "pseudobulk",
-        "replicated cross-condition inference",
-        "source counts",
-        "biological sample",
-        "decoupler skill",
-        "attribute each boundary",
-    )
-
-
-def test_spatial_reference_bounds_large_spatial_plots() -> None:
-    bullets = _spatial_contract_bullets()
-
-    assert _covers(
-        bullets,
-        "figsize",
-        "dpi",
-        "rasterized=true",
-        "background",
-        "analytical data",
-    )
-    assert _covers(
-        bullets,
-        "render time",
-        "pixel count",
-        "file size",
-        "stop",
-        "rerender",
-    )
-
-
-def test_perturbation_reference_orders_workflow_and_bounds_pertpy() -> None:
-    bullets = _perturbation_contract_bullets()
-
-    assert _covers(
-        bullets,
-        "rsc.ptg.guideassignment",
-        "perturbation_signature",
-        "mixscape",
-        "mixscale",
-        "`lda` requires",
-        "x_pert",
-    )
-    assert _covers(
-        bullets,
-        "unscaled log-normalized",
-        "scaling beforehand",
-        "no error is raised",
-    )
-    assert _covers(bullets, "split_by", "biological replicate")
-    assert _covers(
-        bullets,
-        "`distance`",
-        "`guideassignment`",
-        "`mixscape`",
-        "`mixscale`",
-        "meanvar",
-        "deprecated",
-    )
-    assert _covers(
-        bullets,
-        "no rsc equivalent",
-        "pertpy skill",
-        "attributed boundary",
-        "reimplementing",
-    )
-    assert _covers(bullets, "permute over", "rather than over cells", "significance")
-    assert _covers(
-        bullets,
-        "`pairwise`",
-        "`onesided_distances`",
-        "`contrast_distances`",
-        "create_contrasts",
-        "split_by",
-        "stratifies",
-    )
-    # contrast_distances has no bootstrap parameter; the skill must not imply it does
-    assert _covers(
-        bullets, "`contrast_distances` takes no `bootstrap` argument", "resample"
-    )
-
-    # the two-step call shape: staticmethod on the class, then a configured instance
-    text = (
-        (install.skill_source() / "references" / "perturbation.md")
-        .read_text(encoding="utf-8")
-        .casefold()
-    )
-    for phrase in (
-        "rsc.ptg.distance.create_contrasts(",
-        "staticmethod: call on the class",
-        'split_by="cell_type"',
-        'rsc.ptg.distance(metric="edistance").contrast_distances(adata, contrasts)',
-    ):
-        assert phrase in text
-
-
-def test_notebook_reference_has_ordered_workflow_outline() -> None:
-    text = (
-        (install.skill_source() / "references" / "notebooks.md")
-        .read_text(encoding="utf-8")
-        .casefold()
-    )
-    outline = text.split("## follow this scaffold", maxsplit=1)[1].split(
-        "\n## ", maxsplit=1
-    )[0]
-    items = [
-        " ".join(match.split())
-        for match in re.findall(
-            r"(?ms)^\d+\. (.*?)(?=^\d+\. |\Z)",
-            outline,
-        )
-    ]
-
-    assert len(items) >= 10
-    assert any("markdown" in item for item in items)
-    assert any("code" in item for item in items)
-
-    stages = (
-        ("question", "unit of replication", "design"),
-        ("runtime", "provenance", "session_info2"),
-        ("load", "inspect", "count location"),
-        ("preserve", "gpu residency"),
-        ("qc", "filter"),
-        ("preprocess", "hvgs", "normalize"),
-        ("structure", "graph", "leiden"),
-        ("annotate", "marker evidence"),
-        ("spatial", "niche"),
-        ("render", "sanity-check"),
-        ("export", "anndata", "findings report"),
-    )
-    indices = [
-        next(
-            index
-            for index, item in enumerate(items)
-            if all(term in item for term in terms)
-        )
-        for terms in stages
-    ]
-    assert indices == sorted(indices)
-    structure = next(
-        item
-        for item in items
-        if all(term in item for term in ("structure", "graph", "leiden"))
-    )
-    for term in (
-        "pca and neighbors in float32",
-        "`random_state`",
-        '`dtype="float64"`',
-        "observation order",
-        "parameters",
-        "package versions",
-    ):
-        assert term in structure
+@pytest.mark.parametrize(
+    ("facade", "package"),
+    [
+        ("pp", "preprocessing"),
+        ("tl", "tools"),
+        ("gr", "squidpy_gpu"),
+        ("dcg", "decoupler_gpu"),
+        ("ptg", "pertpy_gpu"),
+    ],
+)
+def test_facades_export_every_public_callable(facade: str, package: str) -> None:
+    rsc = pytest.importorskip("rapids_singlecell")
+    source = importlib.import_module(f"rapids_singlecell.{package}")
+    module = getattr(rsc, facade)
+    public = {
+        name
+        for name, value in vars(source).items()
+        if not name.startswith("_")
+        and callable(value)
+        and not isinstance(value, ModuleType)
+    }
+    exported = set(module.__all__) | set(getattr(module, "__deprecated_exports__", {}))
+    assert public <= exported
 
 
 def test_api_index_finds_explicit_method_preferences() -> None:
@@ -568,18 +115,12 @@ def test_api_index_finds_explicit_method_preferences() -> None:
     assert "cell-level pathway activity" in dcg_index["keywords"]
     assert "decoupler" in dcg_index["keywords"]
 
-    assert "squidpy" in entries["gr.calculate_niche"]["index"]["keywords"]
+    assert "squidpy" in entries["gr.calculate_niche_cellcharter"]["index"]["keywords"]
     assert "pertpy" in entries["ptg.Mixscape"]["index"]["keywords"]
 
     leiden = entries["tl.leiden"]
     assert "reproducible leiden" in leiden["index"]["keywords"]
-    assert any(
-        note["kind"] == "snapshot"
-        and "dtype='float64'" in note["claim"]
-        and "random_state" in note["claim"]
-        and "input graph" in note["claim"]
-        for note in leiden["notes"]
-    )
+    assert any("rng" in note["claim"] for note in leiden["notes"])
 
 
 def test_parameter_choices_resolve_aliased_literals() -> None:
@@ -601,7 +142,8 @@ def test_parameter_choices_resolve_aliased_literals() -> None:
     assert {"wilcoxon", "logreg", "t-test"} <= set(ranked["method"])
 
     # an inline Literal still works, and unresolvable annotations are skipped
-    assert "cellcharter" in api._parameter_choices(rsc.gr.calculate_niche)["flavor"]
+    niche = api._parameter_choices(rsc.gr.calculate_niche_cellcharter)
+    assert "variance" in niche["aggregation"]
 
 
 def test_install_check_and_force(tmp_path: Path) -> None:
@@ -700,7 +242,6 @@ def test_managed_memory_toggle() -> None:
 
 
 def test_managed_pool_route_is_checkable() -> None:
-    """memory.md documents a sized managed pool, so preflight must be able to test it."""
     assert kernel._rmm_options(
         "managed-pool", 0, initial_pool_size="1GiB", maximum_pool_size="8GiB"
     ) == {

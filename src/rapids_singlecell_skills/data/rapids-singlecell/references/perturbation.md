@@ -1,35 +1,40 @@
 # Perturbation analysis
 
-Read this file for CRISPR screens, perturbation signatures, or distance-based perturbation comparisons.
+`rsc.ptg` ports pertpy's `Distance`, `GuideAssignment`, `Mixscape` and `Mixscale`; use pertpy itself for everything else (Augur, Milo, scCODA, E-test, DE wrappers, embedding-space methods).
 
-## Order the workflow
+## Guides and perturbation signatures
 
-- Assign guides with `rsc.ptg.GuideAssignment`, compute the signature with `perturbation_signature`, then run `mixscape` or `mixscale`; `lda` requires `mixscape` first. Each stage raises on a missing predecessor, so confirm `adata.layers["X_pert"]` exists before classifying.
-- Run `perturbation_signature` on unscaled log-normalized data. Scaling beforehand corrupts the residual silently — no error is raised — so verify what `X` holds instead of reusing a scaled preprocessing object.
-- Set `split_by` to the biological replicate so reference cells come from comparable samples, and keep inference tied to that unit.
-- RSC caps `n_neighbors` to the controls available in each split where pertpy raises instead. Note the divergence whenever results are compared against pertpy.
+- Compare at least two `rsc.ptg.GuideAssignment` strategies (threshold and mixture model) and report unassigned and multi-guide fractions; choose by on-target knockdown against non-targeting controls.
+- Order: `GuideAssignment`, then `perturbation_signature`, then `mixscape` or `mixscale`; `lda` requires `mixscape`, and each stage raises when its predecessor is missing.
+- Run `perturbation_signature` on unscaled log-normalized data; scaled input corrupts the residual silently.
+- Set `split_by` to the biological replicate so control neighbors come from the same sample.
+- rsc caps `n_neighbors` at the controls available per split where pertpy raises; note this when comparing with pertpy.
+- Prefer `Mixscale` for CRISPRi and other graded knockdowns; `Mixscape` forces a binary KO/NP call.
 
-## Respect the pertpy boundary
+## Effects and distances
 
-- `rsc.ptg` ports four APIs: `Distance`, `GuideAssignment`, `Mixscape`, and `Mixscale`. `MeanVar` is deprecated; do not use it in new analyses.
-- The rest of pertpy has no RSC equivalent — Augur, Milo, Sccoda, Scgen, Cinemaot, Dialogue, the embedding-space classes, the differential-expression wrappers, and the `Distance` significance tests. Compose these under the pertpy skill at an attributed boundary rather than reimplementing them on GPU.
-- `Distance` is the only public entry to its metrics: select one with `metric=` and pass metric-specific options through as keyword arguments. Describe the live signature for the supported set rather than assuming a metric name. Every entry point takes `multi_gpu` to fan out across devices.
-- Choose the entry point from the question: `pairwise` for all-versus-all, `onesided_distances` for every group against one reference, and `contrast_distances` for an explicit list built with `create_contrasts`, whose `split_by` stratifies each perturbation-versus-control comparison within a cell type, batch, or timepoint. That stratified shape is the usual screen design and the one the other two entry points cannot express.
-- Report effect sizes with `bootstrap` uncertainty on `pairwise` or `onesided_distances`. `contrast_distances` takes no `bootstrap` argument, so resample explicitly when a stratified contrast needs an interval. When replicates exist, permute over them rather than over cells; a cell-level permutation treats a single sample's cells as independent and overstates significance.
+- Rank perturbations by a transcriptome-wide distance to controls, not by DEG counts; most perturbations shift only a few dozen genes.
+- Keep only perturbations that differ from controls (pertpy E-test) before embedding or clustering perturbations.
+- Compare signatures against the average perturbed cell as well as against controls; programs shared by most perturbations (stress, cell cycle) are systematic, not perturbation-specific.
+- For DE, pseudobulk per perturbation and replicate against non-targeting controls, and check calibration with non-targeting-versus-non-targeting tests.
+- Any prediction or foundation-model claim needs mean, additive and linear baselines next to it.
 
-## Contrast a screen
+## Distance API
 
-Two steps, and the call sites differ: `create_contrasts` is a staticmethod on the class, while `contrast_distances` needs a configured instance.
+- `Distance(metric=...)` is the only entry to the metrics; describe it for the supported set and pass metric options as keyword arguments.
+- `pairwise` compares all groups, `onesided_distances` compares every group with one reference, and `contrast_distances` runs an explicit list from `create_contrasts`.
+- `pairwise`, `onesided_distances` and `contrast_distances` take `multi_gpu`.
+- `bootstrap=True` gives uncertainty on `pairwise` and `onesided_distances`; `contrast_distances` has no `bootstrap`, so resample yourself, over replicates rather than cells.
 
 ```python
 contrasts = rsc.ptg.Distance.create_contrasts(  # staticmethod: call on the class
     adata,
     groupby="target_gene",
-    selected_group="Non_target",  # a sequence compares against several references
-    split_by="cell_type",  # one contrast per perturbation *within* each cell type
+    selected_group="Non_target",
+    split_by="cell_type",  # one contrast per perturbation within each cell type
 )
 contrasts = contrasts[contrasts["target_gene"].isin(hits)]  # filter before computing
 result = rsc.ptg.Distance(metric="edistance").contrast_distances(adata, contrasts)
 ```
 
-`create_contrasts` returns a plain DataFrame — one row per contrast, with the reference in a `reference` column — so inspect and subset it before computing rather than discarding rows afterwards. Combinations whose reference is absent from a split are dropped for you.
+`create_contrasts` returns one row per contrast with the reference in a `reference` column, and drops splits that lack the reference.

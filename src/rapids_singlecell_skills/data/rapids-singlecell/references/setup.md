@@ -1,41 +1,33 @@
-# Runtime setup and API recovery
+# Setup and recovery
 
-Read this file for a new or broken runtime, installation/version checks, a missing helper, or failed preflight. Keep routine setup outside the notebook.
+## Install
 
-## Match the package and skill
+- The skill and the installed rsc package are one versioned artifact; `rapids-singlecell-install-skills --check --agent <codex|claude|claude-science|agents>` (or `--dest`) compares a copied skill with the package.
+- For a new environment, use the Conda files in the repository's [`conda/`](https://github.com/scverse/rapids_singlecell/tree/main/conda) directory that match the CUDA major version, or the [installation guide](https://rapids-singlecell.readthedocs.io/en/latest/installation.html).
+- Without the console scripts, run `python -m rapids_singlecell_skills.kernel` and `python -m rapids_singlecell_skills.install`.
 
-- Treat the installed RSC package and skill as one versioned artifact. For a filesystem copy, run `rapids-singlecell-install-skills --check` with the matching `--agent` (`codex`, `claude`, `claude-science`, or `agents`) or exact `--dest`. Use `python -m rapids_singlecell_skills.install` if the script is unavailable.
-- For an uploaded skill, record the active RSC version and source revision; do not claim a package match that cannot be checked.
-- Fetch documentation only when actually installing or repairing an environment, not as a routine step. For installation help, use the official [installation guide](https://rapids-singlecell.readthedocs.io/en/latest/installation.html) or the repository's `main` Conda environments for [CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.04_cuda12.yml) and [CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.04_cuda13.yml).
+## Preflight failures
 
-## Run disposable preflight
+- `rapids-singlecell-check-kernel` runs in a disposable process; `--mode managed` checks the oversubscription route.
+- Fix import, ABI, driver and GPU visibility failures before starting Jupyter; the notebook must still configure RMM itself.
 
-Run `rapids-singlecell-check-kernel` before Jupyter; if unavailable, run `python -m rapids_singlecell_skills.kernel`. Add `--mode managed` only for intentional oversubscription. Stop on failure. Preflight does not configure the notebook process, so initialize RMM again there before CuPy or RSC imports.
+## Kernel-less execution
 
-## Recover from sandbox-blocked kernel transport
+- Use it only after preflight passes and the Jupyter startup log shows denied ZMQ socket creation; `Kernel died before replying to kernel_info` alone points to import, ABI, GPU or OOM failures.
+- Execute the cells in order in one fresh child interpreter, not the agent process, stop at the first error, and persist outputs, figures and tracebacks into a notebook copy.
+- Keep a scheduler-set `CUDA_VISIBLE_DEVICES`; magics, widgets and async cells are blockers, and execution counts only once persisted outputs have been read.
 
-- Use kernel-less execution only after preflight passes and startup logs identify denied Jupyter/ZMQ socket creation. `Kernel died before replying to kernel_info` alone is not diagnostic; investigate import, ABI, GPU, and OOM failures first.
-- Use an available, tested in-process notebook executor in one fresh disposable child interpreter—not the agent process. Execute cells in order, stop on first error, and write counts, streams, rich displays, figures, and tracebacks to a notebook copy. Unsupported magics, widgets/comms, or async behavior are blockers. Preserve a scheduler-set `CUDA_VISIBLE_DEVICES`; otherwise set it in the child environment before any CUDA import. If no tested executor is available, report the blocker; claim execution only after persisted outputs are inspected.
-
-## Discover the live API
-
-Use a disposable process so failed imports or GPU allocations do not contaminate the notebook:
-
-```bash
-python -m rapids_singlecell_skills.api search "<intent>"
-python -m rapids_singlecell_skills.api describe <symbol> --parameter <name>
-```
-
-Request one parameter or section before `--full`. If the helper CLI and module are unavailable, inspect the installed public callable directly:
+## API discovery without the helper
 
 ```python
 import inspect
+
 import rapids_singlecell as rsc
 
-call = rsc.pp.highly_variable_genes  # replace with the candidate public callable
+call = rsc.pp.highly_variable_genes
 print(inspect.signature(call))
 print(inspect.getdoc(call))
-help(call)
 ```
 
-Consult the current official documentation next. Inspect active RSC implementation source only when public introspection is insufficient and license compatibility has been verified. A search miss is not proof that a capability is absent.
+- Consult the official documentation next, and the installed source only when introspection is insufficient.
+- A search miss is not proof that rsc lacks a capability.

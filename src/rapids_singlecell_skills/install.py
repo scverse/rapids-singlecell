@@ -108,7 +108,7 @@ def _looks_like_existing_skill(target: Path) -> bool:
     anchors = (
         target / "agents" / "openai.yaml",
         target / "references" / "dask.md",
-        target / "references" / "memory.md",
+        target / "references" / "setup.md",
     )
     return skill_file.is_file() and all(path.is_file() for path in anchors)
 

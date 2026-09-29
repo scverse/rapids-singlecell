@@ -1,26 +1,56 @@
-# Dask execution
+# Dask and multi-GPU
 
-Use Dask only for capacity, row-chunking, or supported multi-GPU work; it is not the default in-memory route.
+In-memory single-GPU runs are fastest; use managed memory for moderate overflow, and Dask when data exceed host-backed managed memory or when several GPUs should share preprocessing.
 
-Do not fetch the RSC [out-of-core guide](https://rapids-singlecell.readthedocs.io/en/latest/out_of_core.html) by default: the constraints below plus live API introspection cover routine planning. Open it only when you need worked examples or the current Dask support list.
+## Cluster
 
-This file deliberately duplicates only pre-import orchestration constraints. Treat the worker preflight and the out-of-core guide as authoritative for dependency and transport details.
+```python
+from dask.distributed import Client
+from dask_cuda import LocalCUDACluster
 
-## Configure workers
+cluster = LocalCUDACluster(
+    CUDA_VISIBLE_DEVICES="0,1",
+    threads_per_worker=1,
+    rmm_pool_size="80%",  # or rmm_managed_memory=True for capacity
+    rmm_allocator_external_lib_list=["cupy"],
+)
+client = Client(cluster)
+```
 
-Multi-GPU is not a flag on a call: it comes from the cluster. Stand up a `LocalCUDACluster` across the devices you intend to use, attach a client, and pass Dask-backed arrays — a method either supports that path or it does not, so confirm support before assuming a call scales out. A few methods shard internally across visible devices without Dask; check the live signature rather than inferring from the name.
+- Workers get RMM from the cluster arguments; `rmm.reinitialize` in the notebook process does not reach them.
+- `protocol="ucx"` enables NVLink but cannot be combined with managed memory; TCP is the robust default.
 
-Create and configure GPU workers before the client. Configure RMM and CuPy on each worker; client-process `rmm.reinitialize` does not configure workers. Select transport, allocator, and concurrency only after checking their current compatibility and measuring the workload.
+## Load lazily
 
-## Shape the data
+```python
+import anndata as ad
+import zarr
+from anndata.experimental import read_elem_lazy
 
-- Follow the out-of-core guide for supported block representations, conversion calls, and chunk layout. Do not infer backend support from an API name or annotation.
-- Size chunks from measured worker peak memory and record the chosen layout. Recompute the estimate after filtering when later planning depends on it.
-- Treat the co-released out-of-core support list as authoritative; API presence or a docstring alone does not establish Dask support. Confirm the selected signature with `python -m rapids_singlecell_skills.api describe <symbol>`, and add a scoped probe when behavior matters.
-- Stop there for unsupported graphs or embeddings. Materialize only an intentionally reduced object that fits the target device, or stop; never hide a CPU fallback.
+f = zarr.open(path, mode="r")
+adata = ad.AnnData(
+    X=read_elem_lazy(f["X"], chunks=(20_000, -1)),  # rows chunked, all genes per chunk
+    obs=ad.io.read_elem(f["obs"]),
+    var=ad.io.read_elem(f["var"]),
+)
+rsc.get.anndata_to_GPU(adata)
+```
 
-## Compute late
+## Supported steps
 
-Keep the graph lazy and call `.compute()` at the last possible step, so no intermediate result is materialized on the way there. Do not call `.compute()` on the full expression matrix merely to build a graph or plot. Estimate the result before `.compute()` or `.persist()`; persist only data that fits across workers.
+- Dask-capable: `calculate_qc_metrics`, `filter_cells`, `filter_genes`, `normalize_total` (without `exclude_highly_expressed`), `log1p`, `highly_variable_genes` (not `pearson_residuals`), `scale`, `pca` (`covariance_eigh` only), `score_genes`, `rank_genes_groups` (`wilcoxon_binned` or t-test, not exact `wilcoxon`), `rsc.get.aggregate` and every `rsc.dcg` method.
+- `rsc.tl.leiden(..., use_dask=True)` distributes clustering, but it only pays off above about 10 million cells.
+- After PCA the embedding is small: `.compute()` it if `obsm["X_pca"]` is a Dask array, then run neighbors, Leiden and UMAP in memory.
+- Stop and reduce the data for steps without Dask support; never materialize the full matrix or fall back to CPU silently.
 
-On OOM, reduce chunks and task concurrency before adding workers. Re-check the out-of-core guide before changing transport or allocator mode, and return only reduced results.
+## Execute
+
+- `persist()` after filtering only if the result fits across workers, and call `adata.X.compute_chunk_sizes()` after row filtering.
+- `compute()` only reduced results; it gathers everything onto the client GPU.
+- On OOM, shrink chunks and task concurrency before adding workers.
+- CuPy sparse blocks hold at most 2**31 - 1 nonzeros; row chunks avoid the limit.
+
+## Multi-GPU without Dask
+
+- `rank_genes_groups`, `rsc.gr.co_occurrence`, `rsc.gr.spatial_autocorr` and the `Distance` methods take `multi_gpu`.
+- Configure all devices with `rmm.reinitialize(pool_allocator=True, devices=[0, 1])`, and restrict visible GPUs with `CUDA_VISIBLE_DEVICES` before the process starts.
