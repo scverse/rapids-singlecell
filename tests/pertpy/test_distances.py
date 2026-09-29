@@ -253,6 +253,25 @@ def _compute_energy_distance_cpu(X: np.ndarray, Y: np.ndarray) -> float:
     return 2 * d_xy - d_xx - d_yy
 
 
+@pytest.mark.parametrize("xp", [np, cp], ids=["numpy", "cupy"])
+def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
+    distance = Distance(metric="edistance")
+    values = small_adata.obsm["X_pca"].get()
+    contrasts = distance.create_contrasts(
+        small_adata, groupby="group", selected_group="g0"
+    )
+
+    def compute(order):
+        small_adata.obsm["X_pca"] = xp.asarray(values, order=order)
+        return (
+            distance.pairwise(small_adata, groupby="group").to_numpy(),
+            distance.contrast_distances(small_adata, contrasts)["edistance"].to_numpy(),
+        )
+
+    for actual, expected in zip(compute("F"), compute("C")):
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_edistance_correctness_vs_cpu(small_adata: AnnData) -> None:
     """Test that GPU energy distance matches CPU reference implementation."""
     distance = Distance(metric="edistance")
