@@ -1,12 +1,10 @@
 # Build/push two GHCR images: dependency base and application image.
-# Release events push; PR/comment runs only validate.
+# Release events push; PR and manual runs only validate.
 
 name: Docker
 
 on:
   workflow_dispatch:
-  issue_comment:
-    types: [created]
   push:
     branches: [main]
     paths:
@@ -28,42 +26,20 @@ jobs:
   check:
     name: Check trigger
     runs-on: ubuntu-latest
-    # Skip issue_comment unless it's /test-docker on a PR
-    if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/test-docker'))
-    outputs:
-      head-sha: ${{ steps.get-sha.outputs.sha }}
-    permissions:
-      pull-requests: write
-      statuses: write
+    permissions: {}
     steps:
       - name: Check permissions
-        if: github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch'
         run: |
-          PERMISSION=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission --jq '.permission')
-          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "maintain" ]]; then
-            echo "::error::Only maintainers or admins can trigger this workflow. Your permission: $PERMISSION"
+          ROLE=$(gh api "repos/${REPOSITORY}/collaborators/${ACTOR}/permission" --jq '.role_name')
+          if [[ "$ROLE" != "admin" && "$ROLE" != "maintain" ]]; then
+            echo "::error::Only maintainers or admins can trigger this workflow. Your role: $ROLE"
             exit 1
           fi
         env:
+          ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: React to comment
-        if: github.event_name == 'issue_comment'
-        run: |
-          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions -f content=rocket
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get PR head SHA
-        id: get-sha
-        if: github.event_name == 'issue_comment'
-        run: |
-          SHA=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefOid -q .headRefOid)
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
 
   build_docker_images:
     needs: check
@@ -81,7 +57,6 @@ jobs:
       packages: write
       contents: read
       attestations: write
-      statuses: write
     steps:
       - name: Free disk space
         run: |
@@ -99,7 +74,7 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
+          persist-credentials: false
 
       - name: Set source package version
         id: source-version
@@ -112,18 +87,8 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
         shell: bash
 
-      - name: Set pending status on PR
-        if: github.event_name == 'issue_comment'
-        run: |
-          gh api repos/${{ github.repository }}/statuses/${{ needs.check.outputs.head-sha }} \
-            -f state=pending \
-            -f context="Docker Build (${{ matrix.CUDA_SUFFIX.label }})" \
-            -f description="Docker build running..." \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Log in to the Container registry
+        if: github.event_name == 'release'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -201,25 +166,3 @@ jobs:
         run: |
           docker image ls -a
         shell: bash
-
-      - name: Set success status on PR
-        if: success() && github.event_name == 'issue_comment'
-        run: |
-          gh api repos/${{ github.repository }}/statuses/${{ needs.check.outputs.head-sha }} \
-            -f state=success \
-            -f context="Docker Build (${{ matrix.CUDA_SUFFIX.label }})" \
-            -f description="Docker build passed" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set failure status on PR
-        if: failure() && github.event_name == 'issue_comment'
-        run: |
-          gh api repos/${{ github.repository }}/statuses/${{ needs.check.outputs.head-sha }} \
-            -f state=failure \
-            -f context="Docker Build (${{ matrix.CUDA_SUFFIX.label }})" \
-            -f description="Docker build failed" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
