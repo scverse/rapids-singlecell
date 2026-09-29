@@ -34,22 +34,22 @@ getnnz_0 = cp.ElementwiseKernel(
 )
 
 
-def _mat_to_array(mat):
-    """Convert a matrix or materialized chunk to a dense float32 GPU array."""
+def _mat_to_array(mat, *, dense=True):
+    """Convert to float32 on the GPU, optionally retaining sparse storage."""
     if issparse(mat) or cp_issparse(mat):
         mat = cp_csr_matrix(mat.astype(np.float32, copy=False))
-        return _sparse_to_dense(mat)
+        return _sparse_to_dense(mat) if dense else mat
     if isinstance(mat, np.ndarray | cp.ndarray):
         return cp.asarray(mat, dtype=cp.float32)
     raise ValueError(f"Unsupported matrix type: {type(mat)}")
 
 
-def _get_batch(mat, srt, end):
+def _get_batch(mat, srt, end, *, dense=True):
     """Slice before converting so backed input stays bounded by batch size."""
     if isinstance(mat, tuple):
         mat, msk_col = mat
-        return _mat_to_array(mat[srt:end, :])[:, msk_col]
-    return _mat_to_array(mat[srt:end, :])
+        return _mat_to_array(mat[srt:end, :], dense=dense)[:, msk_col]
+    return _mat_to_array(mat[srt:end, :], dense=dense)
 
 
 def _validate_mat(
@@ -250,6 +250,7 @@ def extract(
     verbose: bool = False,
     bsize: int = 250_000,
     pre_load: bool = False,
+    materialize: bool = False,
 ) -> (
     tuple[DataType_matrix, np.ndarray, np.ndarray]
     | tuple[tuple[DataType_matrix, np.ndarray], np.ndarray, np.ndarray]
@@ -265,6 +266,8 @@ def extract(
     %(empty)s
     %(verbose)s
     %(pre_load)s
+    materialize
+        Compute Dask input before validation for observation-global methods.
 
     Returns
     -------
@@ -272,6 +275,10 @@ def extract(
     """
     # Extract
     mat, row, col = _extract(data, layer=layer, raw=raw, pre_load=pre_load)
+    # Global transforms must validate and filter before shuffling features,
+    # just as for an equivalent in-memory matrix.
+    if materialize and isinstance(mat, DaskArray):
+        mat = mat.compute()
     # Validate
     if not pd.Index(col).is_unique:
         raise ValueError("mat contains repeated feature names, please make them unique")

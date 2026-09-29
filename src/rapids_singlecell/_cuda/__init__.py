@@ -23,6 +23,7 @@ __all__ = [
     "_cooc_cuda",
     "_edistance_cuda",
     "_gsea_cuda",
+    "_gsva_cuda",
     "_guide_assignment_cuda",
     "_gmm_cuda",
     "_harmony_clustering_cuda",
