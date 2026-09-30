@@ -259,11 +259,11 @@ def scrublet(
             )
             for batch, sub_rng in zip(batches, sub_rngs, strict=True)
         ]
-        scrubbed_obs = pd.concat([scrub["obs"] for scrub in scrubbed])
+        result_columns = ["doublet_score", "predicted_doublet"]
+        scrubbed_obs = pd.concat([scrub["obs"][result_columns] for scrub in scrubbed])
 
-        # Now reset the obs to get the scrublet scores
-
-        adata.obs = scrubbed_obs.loc[adata.obs_names.values]
+        # Copy outcomes in input order, preserving existing observation metadata.
+        adata.obs[result_columns] = scrubbed_obs.loc[adata.obs_names, result_columns]
 
         # Save the .uns from each batch separately
 

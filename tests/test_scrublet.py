@@ -87,6 +87,44 @@ def test_scrublet_batched():
     pd.testing.assert_frame_equal(adata.obs[merged.obs.columns], merged.obs)
 
 
+@pytest.mark.parametrize("copy", [False, True])
+def test_scrublet_batched_preserves_obs(monkeypatch, copy):
+    """Batch concatenation must preserve metadata and align results by cell."""
+    from rapids_singlecell.preprocessing import _scrublet
+
+    adata = AnnData(np.ones((4, 3)))
+    adata.obs["batch"] = pd.Categorical(
+        ["b", "a", "b", "a"], categories=["b", "a", "unused"], ordered=True
+    )
+    adata.obs["cell_type"] = pd.Categorical(
+        ["T", "B", "T", "B"], categories=["B", "T", "unused"]
+    )
+    adata.obs["count"] = pd.array([1, None, 3, 4], dtype="Int64")
+    original_obs = adata.obs.copy(deep=True)
+
+    def fake_call_doublets(adata_obs, **kwargs):
+        scores = adata_obs.obs_names.astype(int).to_numpy() / 10
+        adata_obs.obs["doublet_score"] = scores
+        adata_obs.obs["predicted_doublet"] = scores > 0.15
+        adata_obs.uns["scrublet"] = {}
+        return adata_obs
+
+    monkeypatch.setattr(_scrublet, "_scrublet_call_doublets", fake_call_doublets)
+    result = rsc.pp.scrublet(
+        adata, adata_sim=adata.copy(), batch_key="batch", copy=copy, verbose=False
+    )
+    if copy:
+        pd.testing.assert_frame_equal(adata.obs, original_obs)
+    else:
+        assert result is None
+        result = adata
+
+    pd.testing.assert_frame_equal(result.obs[original_obs.columns], original_obs)
+    assert_allclose(result.obs["doublet_score"], [0, 0.1, 0.2, 0.3])
+    assert_array_equal(result.obs["predicted_doublet"], [False, False, True, True])
+    assert result.uns["scrublet"]["batches"].keys() == {"a", "b"}
+
+
 def _preprocess_for_scrublet(adata: AnnData) -> AnnData:
     adata_pp = adata.copy()
     rsc.pp.filter_genes(adata_pp, min_cells=3)
