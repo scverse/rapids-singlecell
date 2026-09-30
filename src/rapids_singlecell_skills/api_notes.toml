@@ -1,0 +1,161 @@
+schema = 1
+
+[entries."dcg.aucell".index]
+keywords = [
+    "activity scoring",
+    "aucell",
+    "cell-level pathway activity",
+    "decoupler",
+    "decoupler gpu",
+    "gene set enrichment",
+    "gpu pathway scoring",
+    "pathway activity",
+]
+related = [ "dcg.mlm", "dcg.ulm", "dcg.waggr", "dcg.zscore" ]
+
+[entries."gr.calculate_niche_cellcharter".index]
+keywords = [ "cellcharter", "niche analysis", "spatial domains", "spatial niches", "squidpy", "squidpy gpu" ]
+related = [ "gr.calculate_niche_neighborhood", "gr.calculate_niche_utag", "gr.co_occurrence", "gr.spatial_autocorr" ]
+
+[[entries."gr.calculate_niche_cellcharter".notes]]
+kind = "durable"
+claim = "CellCharter fixes the number of niches through n_components, whereas Leiden-based niche flavors pick their own granularity and can return thousands of micro-niches on a large section. Check niche count and size against data scale whichever function you choose."
+source = "https://doi.org/10.1038/s41588-023-01588-4"
+
+[entries."get.aggregate".index]
+keywords = [ "aggregate", "aggregation", "grouped summary" ]
+related = [  ]
+
+[entries."get.anndata_to_CPU".index]
+keywords = [ "cpu transfer", "host transfer", "move anndata to cpu" ]
+related = [ "get.anndata_to_GPU", "get.X_to_CPU" ]
+
+[entries."get.anndata_to_GPU".index]
+keywords = [ "device transfer", "gpu transfer", "move anndata to gpu" ]
+related = [ "get.anndata_to_CPU", "get.X_to_GPU" ]
+
+[entries."pp.bbknn".index]
+keywords = [ "batch correction", "batch effect correction", "batch integration", "graph", "knn", "neighbors" ]
+related = [ "pp.neighbors", "pp.harmony_integrate" ]
+
+[[entries."pp.bbknn".notes]]
+kind = "durable"
+claim = "When a technical covariate is confounded with the biological effect of interest, the two effects are not separately identifiable from those data; adjustment can remove biological signal."
+source = "https://www.sc-best-practices.org/cellular_structure/integration"
+
+[entries."pp.calculate_qc_metrics".index]
+keywords = [ "quality control", "quality metrics", "qc", "qc metrics" ]
+related = [ "pp.filter_cells", "pp.filter_genes" ]
+
+[[entries."pp.calculate_qc_metrics".notes]]
+kind = "snapshot"
+claim = "Inspect multiple QC covariates per sample and prefer permissive, evidence-based outlier thresholds over a universal fixed cutoff."
+source = "https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html"
+as_of = { rsc = "0.16.1.dev7+g2ec3ef061.d20260722" }
+
+[entries."pp.harmony_integrate".index]
+keywords = [
+    "batch correction",
+    "batch effect correction",
+    "batch integration",
+    "corrected pca",
+    "harmony",
+    "representation",
+]
+related = [ "pp.neighbors", "pp.bbknn" ]
+
+[[entries."pp.harmony_integrate".notes]]
+kind = "durable"
+claim = "When a technical covariate is confounded with the biological effect of interest, the two effects are not separately identifiable from those data; adjustment can remove biological signal."
+source = "https://www.sc-best-practices.org/cellular_structure/integration"
+
+[entries."pp.highly_variable_genes".index]
+keywords = [
+    "feature selection",
+    "highly variable genes",
+    "hvg",
+    "m3drop",
+    "poisson gene selection",
+    "poisson highly variable genes",
+]
+related = [ "pp.normalize_pearson_residuals", "pp.pca" ]
+
+[entries."pp.neighbors".index]
+keywords = [ "connectivities", "graph", "knn", "nearest neighbor", "neighbors" ]
+related = [ "pp.bbknn", "pp.harmony_integrate", "tl.leiden", "tl.louvain", "tl.umap" ]
+
+[entries."pp.log1p".index]
+keywords = [ "log transform", "log1p", "logarithmize" ]
+related = [ "pp.normalize_total" ]
+
+[entries."pp.normalize_pearson_residuals".index]
+keywords = [ "normalize counts", "pearson residuals", "residual normalization" ]
+related = [ "pp.normalize_total" ]
+
+[entries."pp.normalize_total".index]
+keywords = [ "library size normalization", "normalize counts", "normalize total", "target sum" ]
+related = [ "pp.log1p", "pp.normalize_pearson_residuals" ]
+
+[entries."pp.pca".index]
+keywords = [ "dimensionality reduction", "pca", "principal component analysis", "principal components" ]
+related = [ "pp.neighbors" ]
+
+[entries."pp.scrublet".index]
+keywords = [ "detect doublets", "doublet detection", "doublets", "scrublet" ]
+related = [ "pp.scrublet_simulate_doublets" ]
+
+[entries."ptg.Mixscape".index]
+keywords = [ "mixscape", "pertpy", "pertpy gpu", "perturbation analysis" ]
+related = [ "ptg.Distance", "ptg.GuideAssignment", "ptg.Mixscale" ]
+
+[entries."tl.leiden".index]
+keywords = [
+    "cluster",
+    "clustering",
+    "community detection",
+    "leiden",
+    "neighbor graph",
+    "reproducible leiden",
+]
+related = [ "tl.louvain", "pp.neighbors" ]
+
+[[entries."tl.leiden".notes]]
+kind = "snapshot"
+claim = "Inspect more than one reasonable resolution and choose granularity using coherent marker evidence rather than treating the default partition as biological truth."
+source = "https://www.sc-best-practices.org/cellular_structure/annotation.html"
+as_of = { rsc = "0.16.1.dev7+g2ec3ef061.d20260722" }
+
+[[entries."tl.leiden".notes]]
+kind = "durable"
+claim = "Leiden partitions change with the random seed. Sweep resolutions over several rng values and keep resolutions whose labels agree across seeds."
+source = "https://doi.org/10.1038/s41467-025-60702-8"
+
+[entries."tl.louvain".index]
+keywords = [ "cluster", "clustering", "community detection", "louvain", "neighbor graph" ]
+related = [ "tl.leiden", "pp.neighbors" ]
+
+[entries."tl.rank_genes_groups".index]
+keywords = [ "differential expression", "marker genes", "markers", "rank genes" ]
+related = [  ]
+
+[[entries."tl.rank_genes_groups".notes]]
+kind = "durable"
+claim = "Cells nested within the same biological sample do not increase the number of independent biological sampling units; cell-level rankings are not replicate-aware differential expression."
+source = "https://www.sc-best-practices.org/conditions/differential_gene_expression.html"
+
+[entries."tl.score_genes_cell_cycle".index]
+keywords = [ "cell cycle", "cell cycle scoring", "score cell cycle" ]
+related = [ "tl.score_genes" ]
+
+[entries."tl.tsne".index]
+keywords = [ "dimensionality reduction", "embedding", "tsne", "visualization" ]
+related = [  ]
+
+[entries."tl.umap".index]
+keywords = [ "dimensionality reduction", "embedding", "umap", "visualization" ]
+related = [ "pp.neighbors" ]
+
+[[entries."tl.umap".notes]]
+kind = "durable"
+claim = "UMAP axes have no direct meaning; interpret the embedding as a visualization of a selected neighborhood representation, not as a statistical test."
+source = "https://www.sc-best-practices.org/preprocessing_visualization/dimensionality_reduction.html"

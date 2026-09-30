@@ -217,7 +217,8 @@ Tests have a default 60-second per-test timeout configured in `pyproject.toml`.
 
 ### GPU CI
 
-GPU tests run on every push to `main`; on pull requests they run only after a maintainer adds the `run-gpu-ci` label, which is removed automatically once the run is triggered.
+GPU tests run on every push to `main`.
+On pull requests, they run only after a maintainer adds the `run-gpu-ci` label, which is removed automatically once the run is triggered.
 Pull requests that cannot affect GPU code, such as documentation or CI changes, can carry the `skip-gpu-ci` label instead, which reports the GPU checks as passed without running them.
 `run-gpu-ci` takes precedence when both labels are set.
 
