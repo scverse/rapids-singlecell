@@ -144,6 +144,8 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.tl.leiden` (set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`
+- {func}`~rapids_singlecell.dcg.aucell`, {func}`~rapids_singlecell.dcg.gsea`, {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ora`, {func}`~rapids_singlecell.dcg.ulm`, {func}`~rapids_singlecell.dcg.waggr` and {func}`~rapids_singlecell.dcg.zscore`
+- {func}`~rapids_singlecell.dcg.gsva` (computes Dask input into memory first)
 
 For Dask inputs, {func}`~.pp.normalize_total` does not support
 `exclude_highly_expressed=True`. {func}`~.pp.pca` uses the
