@@ -52,11 +52,12 @@ import scanpy as sc
   `rsc.get.aggregate` and `rsc.tl.rank_genes_groups` read host data directly.
 - `sc.pl` works with a GPU `X` when coloring by `obs` or `obsm`.
   Call `rsc.get.anndata_to_CPU(adata)` once before plotting gene expression.
-- Check `type(adata.X)` instead of converting defensively, and never hand-roll CuPy/NumPy converters.
+- Check `type(adata.X)` instead of converting defensively or hand-rolling converters.
 
 ## Standard workflow
 
-Inspect first: shape, whether `X` holds integer counts, and which `obs` columns are sample, batch and condition.
+Inspect first: shape, whether `X` holds integer counts, and which `obs` columns hold the biological sample, batch and condition.
+The code's `sample` and `condition` stand for the dataset's own columns.
 Convert dense counts to CSR (`scipy.sparse.csr_matrix`) before moving them to the GPU.
 Cross-tabulate sample against condition, because a batch nested in condition cannot be corrected without erasing the condition.
 For spatial data, read [references/spatial.md](references/spatial.md) first, because its QC and normalization replace QC, doublet scoring and normalization below.
@@ -102,14 +103,14 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
 
 - QC thresholds are per-sample MADs, shown on the distributions before filtering.
   Flag rather than drop high-mito cells in tumors or metabolically active tissue.
-- Correct ambient RNA only when contamination is evident (CellBender or SoupX, outside rsc), and keep the uncorrected counts.
-- Score doublets per sample, never on pooled samples, and remove them before clustering.
+- Correct ambient RNA (CellBender, SoupX) only when contamination is evident, and keep the uncorrected counts.
+- Score doublets per sample and remove them before clustering.
 - Normalize to median depth, not `target_sum=1e4` or `1e6`.
   Do not `scale` (it densifies `X`) or `regress_out` before PCA.
 - Select about 2000 `seurat_v3` HVGs on raw counts, where `batch_key` is optional.
 - Integrate only when the uncorrected embedding separates a technical batch that shares biology across batches.
   Start with Harmony and move to scVI/scANVI for complex or cross-system batches.
-- Verify integration kept biology with known markers or scib-metrics, not by eye on a UMAP.
+- Verify integration kept biology with known markers or scib-metrics, not UMAP inspection.
 - Leiden partitions change with the seed.
   Sweep resolutions with 3 to 5 `rng` values and keep resolutions whose labels agree across seeds (ARI) and whose clusters have distinct markers.
 - GPU PCA on sparse input is not bitwise reproducible across reruns and can shift cluster boundaries.
@@ -120,8 +121,7 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
   Use `unknown` for weak or tied evidence and treat LLM-proposed labels as hypotheses.
 - UMAP is display only, so never infer distances, relatedness or trajectories from it.
 - Comparing conditions needs biological replicates and pseudobulk, so read [references/conditions.md](references/conditions.md) first.
-- Foundation-model embeddings do not beat PCA, Harmony or scVI baselines.
-  Use them only on request and next to a baseline.
+- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they do not beat.
 
 ## Fast paths
 

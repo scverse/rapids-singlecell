@@ -1,7 +1,9 @@
 # Comparing conditions
 
 - The replication unit is the biological sample (donor, animal, culture), never the cell.
-- Check the design with `pd.crosstab(adata.obs["sample"], adata.obs["condition"])` before any test.
+- Find the columns holding the biological sample and the condition, whatever they are called, and cross-tabulate them with `pd.crosstab` before any test.
+  If no column identifies biological samples, ask the user rather than treating batches or cells as replicates.
+- The code below calls these columns `sample` and `condition`, and the annotation column `cell_type`.
 - With fewer than two samples per condition, describe differences and do not test them.
 - Include pairing or batch covariates in the design (`~donor + condition`) when samples are paired or batches are crossed with condition.
 
