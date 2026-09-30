@@ -36,8 +36,10 @@ getnnz_0 = cp.ElementwiseKernel(
 
 def _mat_to_array(mat, *, dense=True):
     """Convert to float32 on the GPU, optionally retaining sparse storage."""
+    if issparse(mat):
+        mat = mat.astype(np.float32, copy=False)
     if issparse(mat) or cp_issparse(mat):
-        mat = cp_csr_matrix(mat.astype(np.float32, copy=False))
+        mat = cp_csr_matrix(mat, dtype=np.float32)
         return _sparse_to_dense(mat) if dense else mat
     if isinstance(mat, np.ndarray | cp.ndarray):
         return cp.asarray(mat, dtype=cp.float32)

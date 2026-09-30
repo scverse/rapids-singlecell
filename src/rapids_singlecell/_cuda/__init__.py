@@ -54,6 +54,7 @@ __all__ = [
     "_sparse2dense_cuda",
     "_spatial_cuda",
     "_spca_cuda",
+    "_viper_cuda",
     "_wilcoxon_binned_cuda",
     "_wilcoxon_cuda",
     "_wilcoxon_sparse_cuda",

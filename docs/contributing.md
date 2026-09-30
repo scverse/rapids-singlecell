@@ -65,7 +65,7 @@ rapids_singlecell/
 │       └── py.typed             # PEP 561 marker (gitignored, auto-generated)
 ├── tests/                       # pytest test suite
 ├── docs/                        # Sphinx documentation
-├── docker/                      # Docker and CI build images
+├── docker/                      # Docker container recipes
 ├── conda/                       # Conda environment files
 ├── CMakeLists.txt               # CMake build for CUDA extensions
 └── pyproject.toml               # Project metadata and build config
@@ -215,6 +215,12 @@ Tests have a default 60-second per-test timeout configured in `pyproject.toml`.
 - **GPU shared memory limits** vary across devices (e.g., T4 has 64KB per block). Kernels should query device limits at runtime rather than using fixed parameters.
 - Use `pytest.importorskip` for optional dependencies in tests.
 
+### GPU CI
+
+GPU tests run on every push to `main`; on pull requests they run only after a maintainer adds the `run-gpu-ci` label, which is removed automatically once the run is triggered.
+Pull requests that cannot affect GPU code, such as documentation or CI changes, can carry the `skip-gpu-ci` label instead, which reports the GPU checks as passed without running them.
+`run-gpu-ci` takes precedence when both labels are set.
+
 ## Building documentation
 
 ```bash
@@ -263,9 +269,11 @@ Source builds (`pip install rapids-singlecell`) compile for the local GPU archit
 
 ### Docker containers
 
-The `docker/` directory contains two types of Dockerfiles:
+The project-provided containers will be deprecated in a future release. Automated
+builds and publication continue for now; no deprecation date has been set.
+See {ref}`container-deprecation` for migration options.
 
-**User-facing containers** (for running rapids-singlecell):
+The `docker/` directory contains the following recipes:
 
 | File | Purpose |
 |---|---|
@@ -275,9 +283,10 @@ The `docker/` directory contains two types of Dockerfiles:
 The `.github/workflows/docker.yml` workflow builds these images using the repository as the `source` build context and passes the package version through `RSC_VERSION`.
 It removes the `rapids-singlecell` pip entry from the conda environment file before building the dependency image and publishes images on releases.
 
-**CI manylinux images** (for building PyPI wheels):
+### CI manylinux images
 
-Wheels are built by cibuildwheel against prebuilt manylinux + CUDA images published at
+The planned container deprecation does not affect wheel builds. Wheels are built by
+cibuildwheel against prebuilt manylinux + CUDA images published at
 `quay.io/manylinux_cuda/manylinux_2_28_<arch>_cuda<ver>`. `publish.yml` selects the image
 per matrix entry via `cibw_image`.
 
