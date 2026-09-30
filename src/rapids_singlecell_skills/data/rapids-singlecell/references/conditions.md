@@ -42,7 +42,6 @@ for ct in pb.obs["cell_type"].unique():
 ## Differential abundance
 
 - Proportions are compositional.
-  Test them with pertpy `Sccoda` on cell-type counts per sample, or `Milo` on neighborhoods with batch in the design.
 - Never use Fisher or chi-square tests on pooled cell counts.
 
 ## Pathways and TF activity

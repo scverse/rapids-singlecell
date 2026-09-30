@@ -11,8 +11,6 @@ Use pertpy itself for everything else (Augur, Milo, scCODA, E-test, DE wrappers,
   `lda` requires `mixscape`, and each stage raises when its predecessor is missing.
 - Run `perturbation_signature` on unscaled log-normalized data, because scaled input corrupts the residual silently.
 - Set `split_by` to the biological replicate so control neighbors come from the same sample.
-- rsc caps `n_neighbors` at the controls available per split where pertpy raises.
-  Note this when comparing with pertpy.
 - Prefer `Mixscale` for CRISPRi and other graded knockdowns, because `Mixscape` forces a binary KO/NP call.
 
 ## Effects and distances

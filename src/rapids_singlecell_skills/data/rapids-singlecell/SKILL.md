@@ -7,7 +7,7 @@ description: "GPU single-cell and spatial analysis with rapids-singlecell (rsc),
 
 `rsc.pp`, `rsc.tl` and `rsc.get` mirror scanpy on the GPU.
 `rsc.gr`, `rsc.ptg` and `rsc.dcg` port parts of squidpy, pertpy and decoupler.
-Compute with rsc, plot with `sc.pl`/`sq.pl`/`dc.pl`, and leave rsc only for the gaps listed below.
+Compute with rapids-singlecell (rsc), plot with `sc.pl`/`sq.pl`/`dc.pl`, and leave rsc only for the gaps listed below.
 
 ## Before the notebook
 
@@ -121,15 +121,14 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
   Use `unknown` for weak or tied evidence and treat LLM-proposed labels as hypotheses.
 - UMAP is display only, so never infer distances, relatedness or trajectories from it.
 - Comparing conditions needs biological replicates and pseudobulk, so read [references/conditions.md](references/conditions.md) first.
-- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they do not beat.
+- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they do not in most cases.
 
 ## Fast paths
 
 - `rsc.pp.neighbors` defaults to exact `brute`, which is fine up to about 500k cells.
   Above that use `algorithm="nn_descent"` (5x faster at 2M cells, recall 0.99), not `ivfflat` (recall 0.72 by default).
-- `rank_genes_groups(method="wilcoxon")` runs on CUDA kernels.
-  Use `wilcoxon_binned` for Dask input or tens of millions of cells.
-- Do not rerun steps on CPU to validate them or benchmark rsc against scanpy unless asked.
+- Use `wilcoxon_binned` for Dask input or tens of millions of cells.
+- Do not rerun steps on CPU to validate them or benchmark rsc against the CPU implementation unless asked.
 
 ## Outside rsc
 
@@ -137,16 +136,14 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
 |---|---|
 | Ambient RNA | CellBender, SoupX |
 | scVI, scANVI, sysVI | scvi-tools |
-| Reference annotation | CellTypist, scANVI |
+| Annotation | CellTypist, scANVI |
 | Integration metrics | scib-metrics |
 | Pseudobulk DE | PyDESeq2 on `rsc.get.aggregate` output |
-| Differential abundance | pertpy `Sccoda`, `Milo` |
 | Pathway resources and plots | decoupler `dc.op`, `dc.pl`, scoring with `rsc.dcg` |
 | Cell-cell communication across samples | LIANA+ |
-| Physical spatial graph | squidpy, unless the map lists an rsc builder |
-| Other pertpy tools | pertpy |
+| Physical spatial graph | squidpy |
+| Condition & perturbation analysis | pertpy |
 
-Name each crossing in the notebook.
 Never replace a missing rsc capability with a silent CPU reimplementation.
 For CRISPR screens and perturbation distances, read [references/perturbation.md](references/perturbation.md).
 
@@ -155,10 +152,9 @@ For CRISPR screens and perturbation distances, read [references/perturbation.md]
 - One stage per cell, under about 25 lines.
   Plot right after the computation it shows, then interpret in a short markdown cell.
 - Write the analysis in the notebook itself and never paste standalone scripts into cells.
-- Record package versions with `session_info2`, the seed and the input path.
+- Record package versions at the end of the notebook with `session_info2`.
 - While developing, save a checkpoint AnnData after preprocessing and test new stages against it instead of re-executing the whole notebook after every edit.
 - Execute top to bottom in a fresh kernel with `jupyter nbconvert --to notebook --execute --inplace` and read every output.
-  Fix warnings you do not understand.
 - Check outputs against data scale.
   Hundreds of clusters, clusters near cell count, or figures of hundreds of megapixels mean stop and fix.
 - Follow requested choices unless the data or design make them invalid.
