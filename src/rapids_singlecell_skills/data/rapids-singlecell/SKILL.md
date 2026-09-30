@@ -121,13 +121,13 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
   Use `unknown` for weak or tied evidence and treat LLM-proposed labels as hypotheses.
 - UMAP is display only, so never infer distances, relatedness or trajectories from it.
 - Comparing conditions needs biological replicates and pseudobulk, so read [references/conditions.md](references/conditions.md) first.
-- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they do not in most cases.
+- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they do not beat in most cases.
 
 ## Fast paths
 
 - `rsc.pp.neighbors` defaults to exact `brute`, which is fine up to about 500k cells.
   Above that use `algorithm="nn_descent"` (5x faster at 2M cells, recall 0.99), not `ivfflat` (recall 0.72 by default).
-- Use `wilcoxon_binned` for Dask input or tens of millions of cells.
+- Use `rank_genes_groups(method="wilcoxon_binned")` for Dask input or tens of millions of cells.
 - Do not rerun steps on CPU to validate them or benchmark rsc against the CPU implementation unless asked.
 
 ## Outside rsc
