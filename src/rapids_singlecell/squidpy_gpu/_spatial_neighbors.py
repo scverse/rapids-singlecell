@@ -32,18 +32,12 @@ _STEPS = {
 
 
 class SpatialNeighborsResult(NamedTuple):
-    """Spatial connectivity and distance matrices returned with ``copy=True``.
+    """Spatial connectivity and distance matrices returned with ``copy=True``."""
 
-    Attributes
-    ----------
-    connectivities
-        SciPy CSR matrix of edge weights, with shape ``(n_obs, n_obs)``.
-    distances
-        SciPy CSR matrix of Euclidean distances, or shortest directed hop
-        counts for grid graphs, with shape ``(n_obs, n_obs)``.
-    """
-
+    #: SciPy CSR matrix of edge weights, with shape ``(n_obs, n_obs)``.
     connectivities: scipy.sparse.csr_matrix
+    #: SciPy CSR matrix of Euclidean distances, or shortest directed hop
+    #: counts for grid graphs, with shape ``(n_obs, n_obs)``.
     distances: scipy.sparse.csr_matrix
 
 
