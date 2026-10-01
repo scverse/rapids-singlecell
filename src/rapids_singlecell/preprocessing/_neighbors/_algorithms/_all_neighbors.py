@@ -28,6 +28,8 @@ _DEFAULT_OVERLAP_FACTOR = 2
 _MAX_ROWS_PER_CLUSTER = 10_000_000
 _CLUSTER_IMBALANCE = 2  # largest / average cluster size
 _MEMORY_FRACTION = 0.5  # share of free memory a build may use
+# cuVS nn-descent overflows int32 indices (rows x 32 samples) beyond this many rows
+_NN_DESCENT_MAX_ROWS = 2**31 // 32
 
 
 def _default_overlap_factor(n_clusters: int) -> int:
@@ -86,6 +88,7 @@ def _all_neighbors_batching(
         unbatched_bytes = n_obs * (4 * n_features + 280 + 20 * k)
         if (
             n_devices == 1
+            and n_obs < _NN_DESCENT_MAX_ROWS
             and unbatched_bytes <= _MEMORY_FRACTION * cp.cuda.runtime.memGetInfo()[0]
         ):
             n_clusters = 1
