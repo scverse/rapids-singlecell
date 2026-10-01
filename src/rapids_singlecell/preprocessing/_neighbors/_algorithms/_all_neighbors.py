@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -22,6 +23,12 @@ if TYPE_CHECKING:
 
 _CUVS_HOST_OUTPUT_MIN_VERSION = parse_version("26.08")
 
+# Automatic batching, following the cuVS out-of-core UMAP guidance
+_DEFAULT_OVERLAP_FACTOR = 2
+_MAX_ROWS_PER_CLUSTER = 10_000_000
+_CLUSTER_IMBALANCE = 2  # largest / average cluster size
+_MEMORY_FRACTION = 0.5  # share of free memory a build may use
+
 
 def _default_overlap_factor(n_clusters: int) -> int:
     """Overlap needed to hold recall as the dataset is split into more clusters."""
@@ -30,19 +37,79 @@ def _default_overlap_factor(n_clusters: int) -> int:
     return max(2, math.ceil(math.log2(n_clusters)))
 
 
-def _all_neighbors_batching(algorithm_kwds: Mapping) -> tuple[int, int]:
-    """Resolve ``(n_clusters, overlap_factor)`` for the cuVS all-neighbors build."""
+def _available_host_memory() -> float:
+    """MemAvailable, capped by cgroup v2 limits."""
+    meminfo = Path("/proc/meminfo").read_text()
+    available = float(meminfo.split("MemAvailable:")[1].split()[0]) * 1024
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text().split("::", 1)[1].strip()
+    except (OSError, IndexError):
+        return available
+    path = Path("/sys/fs/cgroup", cgroup.lstrip("/"))
+    for group in (path, *path.parents):
+        try:
+            limit = (group / "memory.max").read_text().strip()
+            if limit != "max":
+                used = int((group / "memory.current").read_text())
+                available = min(available, int(limit) - used)
+        except (OSError, ValueError):
+            continue
+    return available
+
+
+def _batched_bytes_per_row(
+    n_features: int, k: int, graph_degree: int
+) -> tuple[int, int]:
+    """Host and device bytes per cluster row of cuVS's batched nn-descent."""
+    # padded node / intermediate degrees as in cuVS's nn-descent
+    node = 32 * math.ceil(
+        (graph_degree * 1.3 if graph_degree > 32 else graph_degree) / 32
+    )
+    internal = 32 * math.ceil(max(128, 1.5 * graph_degree) * 1.3 / 32)
+    # pinned buffers, graph, bloom filter, gathered rows, outputs
+    host = 912 + 8 * node + 2 * internal + 4 * n_features + 16 * k
+    # fp16 rows, graph buffers, outputs
+    device = 2 * n_features + 288 + 12 * k
+    return host, device
+
+
+def _all_neighbors_batching(
+    algorithm_kwds: Mapping, shape: tuple[int, int] = (0, 0), k: int = 0
+) -> tuple[int, int]:
+    """Resolve ``(n_clusters, overlap_factor)``, sized to the data and free memory."""
     n_devices = cp.cuda.runtime.getDeviceCount()
     n_clusters = algorithm_kwds.get("n_clusters")
     overlap_factor = algorithm_kwds.get("overlap_factor")
     if n_clusters is None:
-        n_clusters = 1 if n_devices == 1 else n_devices
-        while n_clusters > 1 and n_clusters <= (
-            _default_overlap_factor(n_clusters)
-            if overlap_factor is None
-            else overlap_factor
+        n_obs, n_features = shape
+        # data, nn-descent buffers and outputs on one GPU
+        unbatched_bytes = n_obs * (4 * n_features + 280 + 20 * k)
+        if (
+            n_devices == 1
+            and unbatched_bytes <= _MEMORY_FRACTION * cp.cuda.runtime.memGetInfo()[0]
         ):
-            n_clusters += n_devices
+            n_clusters = 1
+        else:
+            if overlap_factor is None:
+                overlap_factor = _DEFAULT_OVERLAP_FACTOR
+            graph_degree = max(algorithm_kwds.get("graph_degree", k), k)
+            host_row, device_row = _batched_bytes_per_row(n_features, k, graph_degree)
+            device_memory = min(
+                cp.cuda.runtime.getDeviceProperties(i)["totalGlobalMem"]
+                for i in range(n_devices)
+            )
+            rows_per_cluster = min(
+                _MAX_ROWS_PER_CLUSTER,
+                _MEMORY_FRACTION
+                * _available_host_memory()
+                / (n_devices * _CLUSTER_IMBALANCE * host_row),
+                _MEMORY_FRACTION * device_memory / (_CLUSTER_IMBALANCE * device_row),
+            )
+            n_clusters = n_devices * max(
+                1, math.ceil(n_obs * overlap_factor / (n_devices * rows_per_cluster))
+            )
+            while n_clusters <= overlap_factor:
+                n_clusters += n_devices
     if overlap_factor is None:
         overlap_factor = _default_overlap_factor(n_clusters)
         if n_clusters > 1:
@@ -70,7 +137,9 @@ def _all_neighbors_knn(
             "Please update your cuvs installation."
         )
     algo = algorithm_kwds.get("algo", "nn_descent")
-    n_clusters, overlap_factor = _all_neighbors_batching(algorithm_kwds)
+    n_clusters, overlap_factor = _all_neighbors_batching(algorithm_kwds, X.shape, k)
+    # batched builds read from host, unbatched ones from device
+    X = cp.asnumpy(X) if n_clusters > 1 else cp.asarray(X)
     use_host_output = (
         n_clusters > 1
         and parse_version(cuvs.__version__) >= _CUVS_HOST_OUTPUT_MIN_VERSION
@@ -99,7 +168,9 @@ def _all_neighbors_knn(
     elif algo == "nn_descent":
         from cuvs.neighbors import nn_descent
 
-        graph_degree = max(algorithm_kwds.get("graph_degree", 64), k)
+        # the cluster overlap recovers the recall of degree 64
+        default_degree = 64 if n_clusters == 1 else k
+        graph_degree = max(algorithm_kwds.get("graph_degree", default_degree), k)
         intermediate_graph_degree = algorithm_kwds.get(
             "intermediate_graph_degree", max(128, int(1.5 * graph_degree))
         )

@@ -84,18 +84,34 @@ def test_all_neighbors(algo):
 
 
 @pytest.mark.parametrize(
-    ("n_devices", "expected"),
-    [(1, (1, 1)), (2, (4, 2)), (3, (3, 2)), (4, (4, 2)), (8, (8, 3)), (16, (16, 4))],
+    ("n_devices", "shape", "host_memory", "expected"),
+    [
+        (1, (0, 0), 2e12, (1, 1)),
+        (2, (0, 0), 2e12, (4, 2)),
+        (3, (0, 0), 2e12, (3, 2)),
+        (4, (0, 0), 2e12, (4, 2)),
+        (8, (0, 0), 2e12, (8, 2)),
+        (16, (0, 0), 2e12, (16, 2)),
+        pytest.param(8, (100_000_000, 100), 2e12, (24, 2), id="100M-8gpu"),
+        pytest.param(8, (100_000_000, 100), 2e11, (72, 2), id="100M-8gpu-low-ram"),
+        pytest.param(1, (100_000_000, 100), 2e12, (20, 2), id="100M-1gpu"),
+    ],
 )
-def test_all_neighbors_batching_defaults(monkeypatch, n_devices, expected):
+def test_all_neighbors_batching_defaults(
+    monkeypatch, n_devices, shape, host_memory, expected
+):
     import cupy as cp
 
-    from rapids_singlecell.preprocessing._neighbors._algorithms._all_neighbors import (
-        _all_neighbors_batching,
-    )
+    from rapids_singlecell.preprocessing._neighbors._algorithms import _all_neighbors
 
     monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: n_devices)
-    n_clusters, overlap_factor = _all_neighbors_batching({})
+    # 80 GB GPUs, independent of the test machine
+    monkeypatch.setattr(
+        cp.cuda.runtime, "getDeviceProperties", lambda i: {"totalGlobalMem": 80e9}
+    )
+    monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (78e9, 80e9))
+    monkeypatch.setattr(_all_neighbors, "_available_host_memory", lambda: host_memory)
+    n_clusters, overlap_factor = _all_neighbors._all_neighbors_batching({}, shape, 15)
     assert (n_clusters, overlap_factor) == expected
     assert n_clusters == 1 or overlap_factor < n_clusters
 

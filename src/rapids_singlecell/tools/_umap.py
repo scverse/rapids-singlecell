@@ -4,11 +4,13 @@ from typing import TYPE_CHECKING, Literal
 
 import cuml.internals.logger as logger
 import cupy as cp
+import cupyx
 import numpy as np
 from cuml.manifold.umap import find_ab_params, simplicial_set_embedding
 from cupyx.scipy import sparse
 from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
+from scipy import sparse as sc_sparse
 
 from rapids_singlecell._compat import _rng_kwargs
 from rapids_singlecell._keys import _embedding_keys
@@ -28,6 +30,31 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 _InitPos = Literal["auto", "spectral", "random", "paga"]
+
+_H2D_CHUNK = 1 << 28  # indices per host-to-device copy
+
+
+def _device_coo(graph) -> sparse.coo_matrix:
+    """Canonical device COO, expanded on the GPU for a host CSR."""
+    if not (
+        sc_sparse.issparse(graph)
+        and graph.format == "csr"
+        and graph.has_canonical_format
+    ):
+        return sparse.coo_matrix(graph)
+    row = cp.zeros(graph.nnz, dtype=cp.int32)
+    starts = cp.asarray(graph.indptr[1:-1])
+    cupyx.scatter_add(row, starts[starts < graph.nnz], 1)
+    cp.cumsum(row, out=row)
+    col = cp.empty(graph.nnz, dtype=cp.int32)
+    for start in range(0, graph.nnz, _H2D_CHUNK):
+        col[start : start + _H2D_CHUNK] = cp.asarray(
+            graph.indices[start : start + _H2D_CHUNK]
+        )
+    data = cp.asarray(graph.data, dtype=cp.float32)
+    coo = sparse.coo_matrix((data, (row, col)), shape=graph.shape)
+    coo.has_canonical_format = True
+    return coo
 
 
 @_accepts_legacy_random_state(0)
@@ -101,6 +128,7 @@ def umap(
         Random seed or :class:`~numpy.random.Generator` used by the random
         number generator.
         The superseded `random_state` argument is still accepted.
+        `rng=None` runs unseeded, which is faster but not reproducible.
     a
         More specific parameters controlling the embedding. If `None` these
         values are set automatically as determined by `min_dist` and
@@ -135,6 +163,8 @@ def umap(
             UMAP parameters `a`, `b`, and `random_state` (if specified).
     """
 
+    # a seed forces cuML's slower deterministic optimizer
+    unseeded = rng is None or (isinstance(rng, _LegacyRng) and rng.arg is None)
     rng = np.random.default_rng(rng)
 
     adata = adata.copy() if copy else adata
@@ -189,7 +219,7 @@ def umap(
         # from `graph` alone, so we pass a placeholder instead of materializing
         # the representation on the GPU.
         data=cp.zeros((n_obs, 1), dtype=cp.float32),
-        graph=sparse.coo_matrix(neighbors["connectivities"]),
+        graph=_device_coo(neighbors["connectivities"]),
         n_components=n_components,
         initial_alpha=alpha,
         a=a,
@@ -197,7 +227,7 @@ def umap(
         negative_sample_rate=negative_sample_rate,
         n_epochs=n_epochs,
         init=init_coords,
-        random_state=_legacy_random_state(rng, always_state=True),
+        random_state=None if unseeded else _legacy_random_state(rng, always_state=True),
     )
     logger.set_level(logger_level)
     X_umap = cp.asarray(X_umap).get()
