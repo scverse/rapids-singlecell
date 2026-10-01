@@ -26,13 +26,26 @@ class GraphBuilder[CoordT, GraphMatrixT](ABC):
 
     Implement :meth:`build_graph` and :meth:`uns_params`; :meth:`build` applies
     the postprocessors in order. Override :meth:`combine` to support libraries.
+
+    Parameters
+    ----------
+    transform
+        Transform setting stored on the builder: ``None``, ``"spectral"``, or
+        ``"cosine"``. Subclasses or postprocessors implement its effect.
+    set_diag
+        Diagonal setting stored on the builder for use by subclasses.
+    percentile
+        Distance percentile setting stored on the builder for use by subclasses
+        or postprocessors. ``None`` disables percentile pruning.
+    postprocessors
+        Ordered callables taking connectivity and distance matrices and returning
+        the processed pair. Custom builders control which steps are applied.
     """
 
     def __init__(
         self,
         transform: str | None = None,
-        *,
-        set_diag: bool = False,
+        set_diag: bool = False,  # noqa: FBT001, FBT002
         percentile: float | None = None,
         postprocessors: Sequence[GraphPostprocessor[GraphMatrixT]] = (),
     ) -> None:
@@ -42,7 +55,19 @@ class GraphBuilder[CoordT, GraphMatrixT](ABC):
         self._postprocessors = list(postprocessors)
 
     def build(self, coords: CoordT) -> tuple[GraphMatrixT, GraphMatrixT]:
-        """Construct a graph and apply its postprocessors."""
+        """Construct a graph and apply its postprocessors.
+
+        Parameters
+        ----------
+        coords
+            Spatial coordinates accepted by the builder. CSR builders accept a
+            dense array of shape ``(n_obs, n_dims)``, converted to finite float32.
+
+        Returns
+        -------
+        connectivities, distances
+            Graph matrices in observation order; CSR builders return CuPy CSR.
+        """
         adj, dst = self.build_graph(coords)
         for postprocessor in self.postprocessors():
             adj, dst = postprocessor(adj, dst)
@@ -50,31 +75,82 @@ class GraphBuilder[CoordT, GraphMatrixT](ABC):
 
     @abstractmethod
     def build_graph(self, coords: CoordT) -> tuple[GraphMatrixT, GraphMatrixT]:
-        """Construct raw adjacency and distance matrices."""
+        """Construct raw adjacency and distance matrices.
+
+        Parameters
+        ----------
+        coords
+            Coordinates in the format supported by this builder.
+
+        Returns
+        -------
+        connectivities, distances
+            Raw graph matrices before postprocessing.
+        """
 
     def postprocessors(self) -> Sequence[GraphPostprocessor[GraphMatrixT]]:
-        """Return processing steps for the raw adjacency and distances."""
+        """Return processing steps for the raw adjacency and distances.
+
+        Returns
+        -------
+        Sequence of callables
+            Steps applied in order to the connectivity and distance matrices.
+        """
         return self._postprocessors
 
     @abstractmethod
     def uns_params(self) -> dict[str, Any]:
-        """Return graph parameters to store in ``adata.uns``."""
+        """Return graph parameters to store in ``adata.uns``.
+
+        Returns
+        -------
+        dict
+            Serializable graph-construction parameters.
+        """
 
     def combine(
         self, mats: Sequence[tuple[GraphMatrixT, GraphMatrixT]], ixs: Sequence[int]
     ) -> tuple[GraphMatrixT, GraphMatrixT]:
-        """Combine per-library graphs in original observation order."""
+        """Combine per-library graphs in original observation order.
+
+        Parameters
+        ----------
+        mats
+            Connectivity/distance pairs for each library.
+        ixs
+            Original observation indices in concatenated library order.
+
+        Returns
+        -------
+        connectivities, distances
+            Combined matrices reordered to match the input observations.
+        """
         raise NotImplementedError("This graph builder does not support `library_key`.")
 
 
 class GraphBuilderCSR(GraphBuilder[cp.ndarray, cp_sparse.csr_matrix], ABC):
-    """CuPy CSR strategy that builds from finite float32 coordinates."""
+    """CuPy CSR strategy that builds from finite float32 coordinates.
+
+    Parameters
+    ----------
+    transform
+        Transform setting stored on the builder: ``None``, ``"spectral"``, or
+        ``"cosine"``. Subclasses or postprocessors implement its effect.
+    set_diag
+        Diagonal setting stored on the builder for use by subclasses.
+    percentile
+        Distance percentile setting stored on the builder for use by subclasses
+        or postprocessors. ``None`` disables percentile pruning.
+    postprocessors
+        Ordered callables taking connectivity and distance matrices and returning
+        the processed pair. Custom builders control which steps are applied.
+    """
 
     def build(self, coords: cp.ndarray) -> CSRPair:
         return super().build(_validate_coordinates(coords))
 
     def combine(self, mats: Sequence[CSRPair], ixs: Sequence[int]) -> CSRPair:
-        adj, dst = (cp_sparse.block_diag(m, format="csr") for m in zip(*mats))
+        adj, dst = (_block_diag(m) for m in zip(*mats))
         ixs = cp.asarray(ixs)
         if bool((cp.diff(ixs) < 0).any()):
             order = cp.argsort(ixs)
@@ -123,16 +199,34 @@ class _SpatialBuilder(GraphBuilderCSR):
 
 
 class KNNBuilder(_SpatialBuilder):
-    """Connect each observation to its ``n_neighs`` nearest other observations."""
+    """Connect each observation to its ``n_neighs`` nearest other observations.
+
+    Parameters
+    ----------
+    n_neighs
+        Number of nearest other observations. Must be smaller than the number
+        of observations in each library when using a kNN base graph.
+    transform
+        Connectivity transform: ``None``, ``"spectral"`` (normalization by column
+        degrees), or ``"cosine"`` (similarity between connectivity rows). Applied
+        after pruning and adding the requested diagonal; distances are unchanged.
+    set_diag
+        Whether to set connectivity self-loops before transforming the graph.
+        Distance diagonals are zero; cosine can create connectivity self-loops
+        even when this is ``False``.
+    percentile
+        Prune edges above this distance percentile (0 to 100) independently
+        per library, after radius pruning. Stored zeros, including the diagonal,
+        contribute to the percentile. ``None`` disables percentile pruning.
+    """
 
     _parameters = ("n_neighs",)
 
     def __init__(
         self,
         n_neighs: int = 6,
-        *,
         transform: str | None = None,
-        set_diag: bool = False,
+        set_diag: bool = False,  # noqa: FBT001, FBT002
         percentile: float | None = None,
     ) -> None:
         self.n_neighs = _count(n_neighs, "n_neighs")
@@ -143,16 +237,34 @@ class KNNBuilder(_SpatialBuilder):
 
 
 class RadiusBuilder(_SpatialBuilder):
-    """Connect observations within a radius or an inclusive ``(min, max)`` interval."""
+    """Connect observations within a radius or an inclusive ``(min, max)`` interval.
+
+    Parameters
+    ----------
+    radius
+        Maximum inclusive Euclidean distance, or an inclusive ``(min, max)``
+        interval.
+    transform
+        Connectivity transform: ``None``, ``"spectral"`` (normalization by column
+        degrees), or ``"cosine"`` (similarity between connectivity rows). Applied
+        after pruning and adding the requested diagonal; distances are unchanged.
+    set_diag
+        Whether to set connectivity self-loops before transforming the graph.
+        Distance diagonals are zero; cosine can create connectivity self-loops
+        even when this is ``False``.
+    percentile
+        Prune edges above this distance percentile (0 to 100) independently
+        per library, after radius pruning. Stored zeros, including the diagonal,
+        contribute to the percentile. ``None`` disables percentile pruning.
+    """
 
     _parameters = ("radius",)
 
     def __init__(
         self,
         radius: float | tuple[float, float],
-        *,
         transform: str | None = None,
-        set_diag: bool = False,
+        set_diag: bool = False,  # noqa: FBT001, FBT002
         percentile: float | None = None,
     ) -> None:
         self.radius = _radius(radius)
@@ -165,16 +277,34 @@ class RadiusBuilder(_SpatialBuilder):
 
 
 class DelaunayBuilder(_SpatialBuilder):
-    """Connect Delaunay neighbors; a scalar ``radius`` prunes to ``(0, radius)``."""
+    """Connect Delaunay neighbors; a scalar ``radius`` prunes to ``(0, radius)``.
+
+    Parameters
+    ----------
+    radius
+        Optional distance cutoff. A scalar means ``(0, radius)``; a pair
+        specifies an inclusive interval. ``None`` keeps all Delaunay edges.
+    transform
+        Connectivity transform: ``None``, ``"spectral"`` (normalization by column
+        degrees), or ``"cosine"`` (similarity between connectivity rows). Applied
+        after pruning and adding the requested diagonal; distances are unchanged.
+    set_diag
+        Whether to set connectivity self-loops before transforming the graph.
+        Distance diagonals are zero; cosine can create connectivity self-loops
+        even when this is ``False``.
+    percentile
+        Prune edges above this distance percentile (0 to 100) independently
+        per library, after radius pruning. Stored zeros, including the diagonal,
+        contribute to the percentile. ``None`` disables percentile pruning.
+    """
 
     _parameters = ("radius",)
 
     def __init__(
         self,
         radius: float | tuple[float, float] | None = None,
-        *,
         transform: str | None = None,
-        set_diag: bool = False,
+        set_diag: bool = False,  # noqa: FBT001, FBT002
         percentile: float | None = None,
     ) -> None:
         self.radius = None if radius is None else _radius(radius)
@@ -187,7 +317,27 @@ class DelaunayBuilder(_SpatialBuilder):
 
 
 class GridBuilder(_SpatialBuilder):
-    """Build a lattice graph whose distances count shortest directed grid hops."""
+    """Build a lattice graph whose distances count shortest directed grid hops.
+
+    Parameters
+    ----------
+    n_neighs
+        Number of nearest other observations. Must be smaller than the number
+        of observations in each library when using a kNN base graph.
+    n_rings
+        Number of grid hops to include. Distances count shortest directed hops.
+    delaunay
+        Use Delaunay edges as the grid base instead of kNN edges filtered to
+        distances below 1.3 times the per-library median.
+    transform
+        Connectivity transform: ``None``, ``"spectral"`` (normalization by column
+        degrees), or ``"cosine"`` (similarity between connectivity rows). Applied
+        after pruning and adding the requested diagonal; distances are unchanged.
+    set_diag
+        Whether to set connectivity self-loops before transforming the graph.
+        Distance diagonals are zero; cosine can create connectivity self-loops
+        even when this is ``False``.
+    """
 
     _coord_type = "grid"
     _parameters = ("n_neighs", "n_rings", "delaunay")
@@ -195,11 +345,10 @@ class GridBuilder(_SpatialBuilder):
     def __init__(
         self,
         n_neighs: int = 6,
-        *,
         n_rings: int = 1,
-        delaunay: bool = False,
+        delaunay: bool = False,  # noqa: FBT001, FBT002
         transform: str | None = None,
-        set_diag: bool = False,
+        set_diag: bool = False,  # noqa: FBT001, FBT002
     ) -> None:
         self.n_neighs = _count(n_neighs, "n_neighs")
         self.n_rings = _count(n_rings, "n_rings")
@@ -230,17 +379,24 @@ class GridBuilder(_SpatialBuilder):
                 visited = visited + frontier
             dst = dst + frontier * float(ring)
         if rings:
-            dst.setdiag(float(self.set_diag))
+            dst.setdiag(cp.asarray(self.set_diag, dtype=dst.dtype))
             dst.eliminate_zeros()
             adj = dst.copy()
             adj.data[:] = 1.0
-        dst.setdiag(0.0)
+        dst.setdiag(cp.asarray(0, dtype=dst.dtype))
         return adj, dst
 
 
 @dataclass(frozen=True)
 class DistanceIntervalPostprocessor:
-    """Prune distances outside an inclusive interval, keeping the adjacency diagonal."""
+    """Prune distances outside an inclusive interval, keeping the adjacency diagonal.
+
+    Parameters
+    ----------
+    interval
+        Inclusive pair of nonnegative Euclidean distance bounds. Bounds are
+        sorted before use. The connectivity diagonal is preserved.
+    """
 
     interval: tuple[float, float]
 
@@ -260,6 +416,12 @@ class PercentilePostprocessor:
     """Prune distances above a percentile of all stored distances, including zeros.
 
     Given per-observation library ``codes``, each library uses its own percentile.
+
+    Parameters
+    ----------
+    percentile
+        Distance percentile (0 to 100) above which edges are pruned. Stored
+        zeros, including the diagonal, contribute to the percentile.
     """
 
     percentile: float
@@ -288,7 +450,15 @@ class PercentilePostprocessor:
 
 @dataclass(frozen=True)
 class TransformPostprocessor:
-    """Remove stored zeros, then apply a spectral or cosine connectivity transform."""
+    """Remove stored zeros, then apply a spectral or cosine connectivity transform.
+
+    Parameters
+    ----------
+    transform
+        Connectivity transform: ``None``, ``"spectral"`` (normalization by column
+        degrees), or ``"cosine"`` (similarity between connectivity rows). Stored
+        zeros are removed from both matrices; distance values are unchanged.
+    """
 
     transform: str | None = None
 
@@ -313,6 +483,24 @@ class TransformPostprocessor:
         adj.sort_indices()
         dst.sort_indices()
         return adj, dst
+
+
+def _block_diag(mats: Sequence[CSR]) -> CSR:
+    """Combine square CSR blocks without CuPy's unavailable block_diag API."""
+    sizes = np.cumsum([0, *(m.shape[0] for m in mats)])
+    offsets = np.cumsum([0, *(m.nnz for m in mats)])
+    data = cp.concatenate([m.data for m in mats])
+    # CuPy CSR stores int32 indices; Python-int offsets keep that dtype.
+    indices = cp.concatenate([m.indices + int(start) for m, start in zip(mats, sizes)])
+    indptr = cp.concatenate(
+        [
+            *(m.indptr[:-1] + int(start) for m, start in zip(mats, offsets)),
+            cp.asarray(offsets[-1:], dtype=cp.int32),
+        ]
+    )
+    return cp_sparse.csr_matrix(
+        (data, indices, indptr), shape=(int(sizes[-1]), int(sizes[-1]))
+    )
 
 
 def _prune(adj: CSR, dst: CSR, outside: cp.ndarray, *, keep_diagonal=False) -> CSRPair:

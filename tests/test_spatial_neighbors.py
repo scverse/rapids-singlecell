@@ -326,3 +326,55 @@ def test_invalid_input_does_not_write(method, kwargs, coords):
     with pytest.raises(ValueError):
         _call(method, adata, **kwargs)
     assert not adata.obsp and not adata.uns
+
+
+@pytest.mark.parametrize(
+    "name,args,kwargs",
+    [
+        (
+            "KNNBuilder",
+            (3, "cosine", True, 80),
+            {"n_neighs": 3, "transform": "cosine", "set_diag": True, "percentile": 80},
+        ),
+        (
+            "RadiusBuilder",
+            (2.0, "spectral", True, 90),
+            {
+                "radius": 2.0,
+                "transform": "spectral",
+                "set_diag": True,
+                "percentile": 90,
+            },
+        ),
+        (
+            "DelaunayBuilder",
+            (None, "cosine", False, 75),
+            {
+                "radius": None,
+                "transform": "cosine",
+                "set_diag": False,
+                "percentile": 75,
+            },
+        ),
+        (
+            "GridBuilder",
+            (3, 2, False, "spectral", True),
+            {
+                "n_neighs": 3,
+                "n_rings": 2,
+                "delaunay": False,
+                "transform": "spectral",
+                "set_diag": True,
+            },
+        ),
+    ],
+)
+def test_builder_positional_arguments(name, args, kwargs):
+    builder = getattr(rsc.gr.neighbors, name)
+    coords = np.random.default_rng(4).normal(size=(16, 2)).astype(np.float32)
+    positional, keyword = builder(*args), builder(**kwargs)
+    assert positional.uns_params() == keyword.uns_params()
+    for actual, expected in zip(
+        positional.build(coords), keyword.build(coords), strict=True
+    ):
+        np.testing.assert_allclose(actual.toarray().get(), expected.toarray().get())

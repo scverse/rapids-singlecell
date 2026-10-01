@@ -64,6 +64,7 @@ docs = [
     "scverse-misc[sphinx]>=0.1.3",
     "dask",
     "pytest",
+    "spatialdata>=0.7.2",
 ]
 test-minimal = [
     "pytest",
@@ -80,6 +81,7 @@ test-minimal = [
 ]
 test = [
     "igraph",
+    "spatialdata>=0.7.2",
     { include-group = "test-minimal" },
 ]
 

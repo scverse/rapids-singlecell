@@ -137,8 +137,8 @@ def test_csr_assembly_storage_gaps_and_stream(edges, n, dtype, set_diag):
         ones = cp.ones(len(rows), dtype=cp.float32)
         expected_adj = cp_sparse.csr_matrix((ones, (rows, cols)), shape=(n, n))
         expected_dst = cp_sparse.csr_matrix((values, (rows, cols)), shape=(n, n))
-        expected_adj.setdiag(1 if set_diag else 0)
-        expected_dst.setdiag(0)
+        expected_adj.setdiag(cp.asarray(set_diag, dtype=expected_adj.dtype))
+        expected_dst.setdiag(cp.asarray(0, dtype=expected_dst.dtype))
     stream.synchronize()
     pairs = (adj, expected_adj), (dst, expected_dst), (adjacency, expected_adj)
     for actual, expected in pairs:

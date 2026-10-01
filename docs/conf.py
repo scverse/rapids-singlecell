@@ -122,6 +122,7 @@ intersphinx_mapping = {
     "cugraph": ("https://docs.rapids.ai/api/cugraph/stable/", None),
     "scanpy": ("https://scanpy.scverse.org/en/stable/", None),
     "squidpy": ("https://squidpy.readthedocs.io/en/stable/", None),
+    "spatialdata": ("https://spatialdata.scverse.org/en/stable/", None),
     "pertpy": ("https://pertpy.scverse.org/en/stable/", None),
     "seaborn": ("https://seaborn.pydata.org/", None),
     "decoupler": ("https://decoupler.readthedocs.io/en/latest/", None),

@@ -15,16 +15,19 @@ from rapids_singlecell._utils import (
     parse_device_ids,
 )
 
+from ._spatial_data import _extract_adata
 from ._utils import _assert_categorical_obs, _assert_spatial_basis
 
 if TYPE_CHECKING:
     from anndata import AnnData
+    from spatialdata import SpatialData
 
 
 def co_occurrence(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     cluster_key: str,
     *,
+    table_key: str | None = None,
     spatial_key: str = "spatial",
     interval: int | np.ndarray | cp.ndarray = 50,
     multi_gpu: bool | list[int] | str | None = None,
@@ -36,7 +39,10 @@ def co_occurrence(
     Parameters
     ----------
     adata
-        Annotated data object.
+        Annotated data matrix or a SpatialData object containing the selected table.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        All reads and writes use this table; ignored for AnnData input.
     cluster_key
         Key for the cluster labels.
     spatial_key
@@ -65,6 +71,7 @@ def co_occurrence(
         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_co_occurrence']['interval']`` - the distance thresholds
           computed at ``interval``.
     """
+    adata = _extract_adata(adata, table_key=table_key)
 
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
