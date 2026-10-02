@@ -194,3 +194,6 @@ date,project,total,last_30_days
 2026-09-30,rapids-singlecell,293603,4548
 2026-09-30,rapids-singlecell-cu12,14784,1164
 2026-09-30,rapids-singlecell-cu13,13365,1011
+2026-10-01,rapids-singlecell,293732,4536
+2026-10-01,rapids-singlecell-cu12,14811,1120
+2026-10-01,rapids-singlecell-cu13,13390,968
