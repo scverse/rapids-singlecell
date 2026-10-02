@@ -145,13 +145,13 @@ def neighbors(
 
         * 'algo': The algorithm to use. Valid options are: 'ivf_pq' and 'nn_descent'. Default is 'nn_descent'. `ivf_pq` is restricted to the `euclidean` and `sqeuclidean` metrics; use `nn_descent` for `cosine` and `inner_product`.
 
-        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 on a single GPU and the smallest multiple of the device count greater than `overlap_factor` otherwise.
+        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 if the data fits on a single GPU, otherwise sized to the data and free memory (e.g. 24 for 100M cells on 8 GPUs).
 
-        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 for an unbatched build and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` otherwise. Lower values are faster but lose neighbors at cluster boundaries.
+        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 unbatched, 2 with automatic `n_clusters` and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` otherwise. Lower values are faster but lose neighbors at cluster boundaries.
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)). Only available for `ivf_pq` algorithm.
 
-        * 'graph_degree': The degree of the graph nn-descent builds before selecting the final `n_neighbors`. Default is 64, raised to `n_neighbors` if larger. Only available for `nn_descent` algorithm.
+        * 'graph_degree': The degree of the graph nn-descent builds before selecting the final `n_neighbors`. Default is 64 unbatched and `n_neighbors` batched, raised to `n_neighbors` if smaller. Only available for `nn_descent` algorithm.
 
         * 'intermediate_graph_degree': The degree of the intermediate graph. Default is `max(128, int(1.5 * graph_degree))`, following the recommended `>= 1.5 * graph_degree`. A smaller user-supplied value is raised to `graph_degree`. Only available for `nn_descent` algorithm.
 
@@ -212,7 +212,7 @@ def neighbors(
         )
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-    X_contiguous = _check_neighbors_X(X, algorithm, algorithm_kwds)
+    X_contiguous = _check_neighbors_X(X, algorithm)
     _check_metrics(algorithm, metric)
 
     knn_indices, knn_dist = KNN_ALGORITHMS[algorithm](
@@ -410,7 +410,7 @@ def bbknn(
         adata._init_as_actual(adata.copy())
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
-    X_contiguous = _check_neighbors_X(X, algorithm, algorithm_kwds)
+    X_contiguous = _check_neighbors_X(X, algorithm)
     _check_metrics(algorithm, metric)
 
     n_obs = adata.shape[0]
