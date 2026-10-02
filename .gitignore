@@ -8,7 +8,6 @@ __pycache__/
 test-data/
 .vscode/
 PanGPA.log
-cufile.log
 
 # Distribution / packaging
 /dist/

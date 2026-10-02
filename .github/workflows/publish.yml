@@ -105,11 +105,9 @@ jobs:
               f'version = "{version}"',
           )
 
-          # Rename matching extras to "rapids" and "io", remove the others
+          # Rename matching extra to "rapids", remove the other
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
           text = remove_toml_array(text, f"rapids-cu{other}")
-          text = text.replace(f'io-cu{cuda} = [', 'io = [')
-          text = remove_toml_array(text, f"io-cu{other}")
 
           # Set CUDA architectures (replace "native" with CI target archs)
           text = text.replace(

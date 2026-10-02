@@ -123,16 +123,6 @@ You can select CUDA-X Data Science dependencies with the `rapids-cu12` or `rapid
 [uv] pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
 ```
 
-#### Reading data straight into GPU memory (optional)
-
-For out-of-core analysis, {mod}`rapids_singlecell.io` can read zarr data straight into GPU memory and decompress it there,
-using KvikIO and nvCOMP (see {doc}`out_of_core`). Install them with the `io` extra:
-
-```bash
-[uv] pip install 'rapids-singlecell-cu13[io]'  # CUDA wheels
-[uv] pip install 'rapids-singlecell[io-cu13]'  # or [io-cu12]
-```
-
 ```{note}
 Building from source requires the CUDA toolkit (nvcc) and CMake >= 3.24 to be available in your environment.
 The nvcc/CUDAToolkit found during the build should match the CUDA major runtime version used by CUDA-X Data Science and CuPy in or linked to the environment.
