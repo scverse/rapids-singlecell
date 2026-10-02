@@ -15,8 +15,12 @@ from scverse_misc import Deprecation, deprecated
 import rapids_singlecell as rsc
 from rapids_singlecell._keys import _embedding_keys
 
+from ._spatial_data import _extract_adata
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from spatialdata import SpatialData
 
 
 __all__ = [
@@ -47,8 +51,9 @@ def _normalize_resolutions(
 
 
 def calculate_niche_neighborhood(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
+    table_key: str | None = None,
     groups: str,
     resolutions: float | Sequence[float],
     n_neighbors: int = 15,
@@ -74,7 +79,10 @@ def calculate_niche_neighborhood(
     Parameters
     ----------
     adata
-        Annotated data matrix.
+        Annotated data matrix or a SpatialData object containing the selected table.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        All reads and writes use this table; ignored for AnnData input.
     groups
         Column in ``adata.obs`` with cell-type labels.
     resolutions
@@ -100,8 +108,10 @@ def calculate_niche_neighborhood(
         Column in ``adata.obs`` identifying samples. If given, niches are computed
         per sample and labels are prefixed with ``lib=<id>_``.
     inplace
-        Write the niche columns to ``adata``. If ``False``, return a modified copy.
+        Write the niche columns to ``adata`` (the selected table for SpatialData).
+        If ``False``, return a modified AnnData copy of that table.
     """
+    adata = _extract_adata(adata, table_key=table_key)
     resolutions = _normalize_resolutions(resolutions)
     _check_key(adata, spatial_connectivities_key)
     if groups is None:
@@ -138,8 +148,9 @@ def calculate_niche_neighborhood(
 
 
 def calculate_niche_utag(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
+    table_key: str | None = None,
     resolutions: float | Sequence[float],
     n_neighbors: int = 15,
     spatial_connectivities_key: str = "spatial_connectivities",
@@ -160,7 +171,10 @@ def calculate_niche_utag(
     Parameters
     ----------
     adata
-        Annotated data matrix.
+        Annotated data matrix or a SpatialData object containing the selected table.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        All reads and writes use this table; ignored for AnnData input.
     resolutions
         Resolution(s) for leiden. A label column is written for each value.
     n_neighbors
@@ -176,8 +190,10 @@ def calculate_niche_utag(
         Column in ``adata.obs`` identifying samples. If given, niches are computed
         per sample and labels are prefixed with ``lib=<id>_``.
     inplace
-        Write the niche columns to ``adata``. If ``False``, return a modified copy.
+        Write the niche columns to ``adata`` (the selected table for SpatialData).
+        If ``False``, return a modified AnnData copy of that table.
     """
+    adata = _extract_adata(adata, table_key=table_key)
     resolutions = _normalize_resolutions(resolutions)
     _check_key(adata, spatial_connectivities_key)
     if n_neighbors < 1:
@@ -200,8 +216,9 @@ def calculate_niche_utag(
 
 
 def calculate_niche_cellcharter(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
+    table_key: str | None = None,
     distance: int = 3,
     aggregation: Literal["mean", "variance"] = "mean",
     random_state: int = 42,
@@ -225,7 +242,10 @@ def calculate_niche_cellcharter(
     Parameters
     ----------
     adata
-        Annotated data matrix.
+        Annotated data matrix or a SpatialData object containing the selected table.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        All reads and writes use this table; ignored for AnnData input.
     distance
         Number of n-hop neighborhoods to include.
     aggregation
@@ -250,8 +270,10 @@ def calculate_niche_cellcharter(
         Column in ``adata.obs`` identifying samples. If given, niches are computed
         per sample and labels are prefixed with ``lib=<id>_``.
     inplace
-        Write the niche columns to ``adata``. If ``False``, return a modified copy.
+        Write the niche columns to ``adata`` (the selected table for SpatialData).
+        If ``False``, return a modified AnnData copy of that table.
     """
+    adata = _extract_adata(adata, table_key=table_key)
     if use_rep is None:
         _check_key(adata, spatial_connectivities_key)
     if distance < 0:
@@ -302,8 +324,9 @@ def calculate_niche_cellcharter(
     )
 )
 def calculate_niche(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
+    table_key: str | None = None,
     flavor: Literal["neighborhood", "utag", "cellcharter"],
     groups: str | None = None,
     n_neighbors: int = 15,
@@ -336,13 +359,16 @@ def calculate_niche(
         - :func:`~rapids_singlecell.gr.calculate_niche_cellcharter`
 
     The spatial graph in ``adata.obsp[spatial_connectivities_key]`` must be
-    precomputed (e.g. via :func:`squidpy.gr.spatial_neighbors`), except for
+    precomputed (e.g. via :func:`~rapids_singlecell.gr.spatial_neighbors_knn`), except for
     ``flavor="cellcharter"`` when ``use_rep`` is provided.
 
     Parameters
     ----------
     adata
-        Annotated data matrix.
+        Annotated data matrix or a SpatialData object containing the selected table.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        All reads and writes use this table; ignored for AnnData input.
     flavor
         - ``"neighborhood"`` cluster cell-type frequency profiles among spatial neighbors
           :cite:p:`monkeybread`.
@@ -389,12 +415,14 @@ def calculate_niche(
     random_state
         Random seed for the GMM (``flavor="cellcharter"`` only).
     inplace
-        Write the niche columns to ``adata``. If ``False``, return a modified copy.
+        Write the niche columns to ``adata`` (the selected table for SpatialData).
+        If ``False``, return a modified AnnData copy of that table.
     copy
         Deprecated alias for ``inplace``; ``copy=True`` is ``inplace=False``.
     kwargs
         Accepts the removed ``gmm_init`` argument, which is ignored with a warning.
     """
+    adata = _extract_adata(adata, table_key=table_key)
     if flavor not in FLAVORS:
         raise ValueError(
             f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'."
@@ -525,7 +553,7 @@ def _check_key(adata: AnnData, key: str) -> None:
     if key not in adata.obsp:
         raise KeyError(
             f"'{key}' not found in `adata.obsp`. "
-            "Compute it first with `squidpy.gr.spatial_neighbors`."
+            "Compute it first with `rapids_singlecell.gr.spatial_neighbors_knn`."
         )
 
 
