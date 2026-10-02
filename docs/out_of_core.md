@@ -3,7 +3,111 @@
 Process datasets larger than GPU memory by chunking work with Dask while keeping arrays on the GPU via CuPy. Chunking also mitigates the CuPy sparse limit of `.nnz ≤ 2**31-1` by operating on smaller blocks.
 
 
-## Start a Dask CUDA cluster
+## Quick start
+
+{func}`rapids_singlecell.dask.start_cluster` starts a local Dask cluster with one worker per GPU and settings that work out of the box,
+and returns a regular Dask {class}`~distributed.Client` for it;
+and {func}`rapids_singlecell.io.read_lazy` loads an AnnData zarr store with `X` as a Dask array of GPU chunks:
+
+```python
+import rapids_singlecell as rsc
+
+client = rsc.dask.start_cluster()  # all visible GPUs
+adata = rsc.io.read_lazy("data.zarr")  # uses the cluster
+
+rsc.pp.calculate_qc_metrics(adata)
+rsc.pp.normalize_total(adata, target_sum=1e4)
+rsc.pp.log1p(adata)
+rsc.pp.highly_variable_genes(adata, flavor="cell_ranger", n_top_genes=2000)
+adata = adata[:, adata.var["highly_variable"]].copy()
+adata.X = adata.X.persist()  # keep the (much smaller) HVG matrix in GPU memory
+
+rsc.pp.scale(adata, zero_center=False, max_value=10)
+adata.X = adata.X.persist()
+rsc.pp.pca(adata, n_comps=100)
+adata.obsm["X_pca"] = rsc.get.X_to_CPU(adata.obsm["X_pca"]).compute()
+
+rsc.pp.neighbors(adata)
+rsc.tl.umap(adata)
+...
+client.close()  # once you no longer need the cluster
+client.cluster.close()
+```
+
+* {func}`~rapids_singlecell.dask.start_cluster` uses 4 threads per worker, UCX if available (else TCP), and an RMM pool per worker
+  that grows to at most 75% of its GPU, which leaves room for this process (e.g. the PCA) on the same GPU.
+  It warns if a GPU is already busy (e.g. with another cluster). Every setting can be overridden,
+  and the cluster stays usable for anything else you do with Dask.
+  For capacity over speed, pass `rmm_managed_memory=True`; it then uses TCP, as UCX does not support managed memory.
+* {func}`~rapids_singlecell.io.read_lazy` picks the chunk size (`chunks="auto"`) and, if possible,
+  opens `X` to be read straight into GPU memory (see below). It needs no client:
+  like any Dask array, `X` is computed on the cluster you started.
+* Persist after steps that shrink the data: without it, every later step recomputes its input from disk
+  (e.g. {func}`~rapids_singlecell.pp.pca` reads it twice). After filtering cells, also call
+  `adata.X.compute_chunk_sizes()` if the chunk sizes became unknown (see "Persist and chunk sizes" below).
+
+In a script (rather than a notebook), start the cluster under `if __name__ == "__main__":`.
+Dask starts its workers by running the script again; without the guard, the workers fail to start
+and {func}`~rapids_singlecell.dask.start_cluster` raises an error after about a minute.
+
+The rest of this page shows how to set up the same things yourself.
+
+## Reading data straight into GPU memory
+
+By default, the compressed chunks of `X` are decompressed on the CPU and then copied to the GPU.
+With [KvikIO](https://docs.rapids.ai/api/kvikio/stable/) and [nvCOMP](https://developer.nvidia.com/nvcomp) installed,
+they are read straight into GPU memory and decompressed there:
+
+```bash
+pip install 'rapids-singlecell[io-cu13]'  # or [io-cu12]; `rapids-singlecell-cu13[io]` for the CUDA wheels
+```
+
+zarr then finds a codec pipeline that reads into GPU memory, `rapids_singlecell_zarr.KvikioCodecPipeline`,
+which {func}`~rapids_singlecell.io.enable` switches on. It works with any store, and the GPU decodes chunks that are
+zstd-compressed (or uncompressed), ideally small (nvCOMP decodes every chunk with one thread block) and in shards
+(few files per read). Other chunks, e.g. blosc-compressed ones like in most existing stores, are decompressed on the CPU
+and copied to the GPU, with the codec pipeline zarr was configured with before (e.g. [zarrs](https://zarrs-python.readthedocs.io)),
+or else zarr's fast fused pipeline.
+{func}`~rapids_singlecell.io.check` tells you whether a store is ready,
+and {func}`~rapids_singlecell.io.convert_zarr` rewrites it with the same content:
+
+```python
+# versions, GPUDirect Storage status, and what to change in the store
+rsc.io.check("data.zarr")
+# zstd, 256 KiB chunks in shards, uint16 indices for < 65,536 genes
+rsc.io.convert_zarr("data.zarr", "data_gpu.zarr")
+```
+
+{func}`~rapids_singlecell.dask.start_cluster` switches GPU reads on for its workers.
+With your own cluster, call `rsc.io.enable(client)`, and everything else stays plain Dask and anndata:
+
+```python
+cluster = LocalCUDACluster(...)
+client = Client(cluster)
+rsc.io.enable(client)  # the workers read zarr chunks into GPU memory
+
+f = zarr.open_group("data_gpu.zarr", mode="r")
+adata = ad.AnnData(
+    X=read_elem_lazy(f["X"], chunks=(100_000, -1), meta=cpx.csr_matrix((0, 0))),
+    obs=ad.io.read_elem(f["obs"]),
+    var=ad.io.read_elem(f["var"]),
+)
+```
+
+Without a cluster, `rsc.io.enable()` switches GPU reads on for this process.
+Both take effect right away; used as a context manager (`with rsc.io.enable(client): ...`),
+they are undone at the end of the block, on the workers too.
+
+GPU reads work with or without [GPUDirect Storage](https://docs.nvidia.com/gpudirect-storage/) (GDS):
+without it, KvikIO reads through the page cache and a bounce buffer, which is still fast for cached data.
+
+For example, on an 11.4 million cell atlas (19.5 billion non-zeros) on two GPUs, the steps from
+{func}`~rapids_singlecell.pp.calculate_qc_metrics` to {func}`~rapids_singlecell.pp.pca` above took 26 s with GPU reads
+(100,000 cells per chunk), and about 95 s decompressing on the CPU (20,000 cells per chunk, the fastest setting there),
+with the subsetting improvements of [anndata#2675](https://github.com/scverse/anndata/pull/2675) and
+[anndata#2676](https://github.com/scverse/anndata/pull/2676).
+
+## Start a Dask CUDA cluster yourself
 
 Choose one of these presets:
 
@@ -46,12 +150,16 @@ client = Client(cluster)
 ```
 
 ### Notes
-* `threads_per_worker=1` is recommended for GPU workloads. More threads can be faster but often increase temporary allocations, causing VRAM spikes/overflows; some dask-cuda releases also showed leaks with multi-threaded workers. With row chunks around ~20,000, 4–5 threads can still work on many GPUs.
+* `threads_per_worker=1` uses the least GPU memory. More threads overlap reading chunks with computing on them, which is faster,
+  but increase temporary allocations, which can cause VRAM spikes/overflows; some dask-cuda releases also showed leaks with multi-threaded workers.
+  {func}`~rapids_singlecell.dask.start_cluster` uses 4, which worked well in benchmarks; lower it if workers run out of memory.
 * For capacity over speed, enable RMM managed memory (see {doc}`memory_management`). For highest peer-to-peer (NVLink) performance, prefer the RMM pool allocator and avoid managed memory.
 * Multi-GPU transport: use UCX (`protocol="ucx"`) to enable NVLink. UCX typically uses more memory; TCP is more stable but slower.
 * UCX is not compatible with CUDA managed memory. For UCX/NVLink, disable managed memory. TCP can be used with managed memory.
 
 ## Loading AnnData lazily from Zarr (from the multi-GPU notebook)
+
+{func}`rapids_singlecell.io.read_lazy` does this for you. To do it yourself:
 
 Load `AnnData` from a Zarr store with dense or CSR-encoded `X` as a Dask array, and `obs/var` read eagerly. Chunk by rows, keeping all genes in each chunk.
 
@@ -106,7 +214,7 @@ X_gpu = adata.X.compute()
 ## Persist and chunk sizes
 
 - Persist after major transformations or filtering to materialize results in worker memory and shorten later graphs.
-- Recompute chunk sizes to help Dask plan evenly across workers.
+- Recompute chunk sizes after filtering cells (when they become unknown, `nan`) to help Dask plan evenly across workers.
 
 ```python
 # After filtering or transformations
@@ -155,7 +263,7 @@ supported.
 ## Troubleshooting
 
 - CUDA OOM while running: reduce chunk size, enable RMM managed memory, or filter earlier.
-- VRAM spikes or leaks: set `threads_per_worker=1`; limit task concurrency; consider TCP instead of UCX; restart workers to clear allocator state if needed.
+- VRAM spikes or leaks: lower `threads_per_worker` (down to 1); limit task concurrency; consider TCP instead of UCX; restart workers to clear allocator state if needed.
 
 ## References
 
