@@ -17,6 +17,8 @@ readme = { file = "README.md", content-type = "text/markdown" }
 dynamic = [ "version" ]
 scripts.rapids-singlecell-install-skills = "rapids_singlecell_skills.install:main"
 scripts.rapids-singlecell-check-kernel = "rapids_singlecell_skills.kernel:main"
+# lets zarr find `rapids_singlecell_zarr.KvikioCodecPipeline` in every process
+entry-points."zarr.codec_pipeline".kvikio = "rapids_singlecell_zarr:KvikioCodecPipeline"
 
 dependencies = [
     "anndata>=0.12.14",
@@ -32,6 +34,8 @@ dependencies = [
     "statsmodels>=0.12.0",
     "scikit-image",
     "docrep",
+    # the codec pipeline zarr loads through the entry point builds on zarr ≥ 3.3
+    "zarr>=3.3",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +46,9 @@ rapids-cu13 = [
     "cugraph-cu13>=25.12",
     "cuvs-cu13>=25.12",
 ]
+# reading zarr straight into GPU memory (`rapids_singlecell.io`)
+io-cu13 = [ "kvikio-cu13>=26.4", "nvidia-nvcomp-cu13>=5.2" ]
+io-cu12 = [ "kvikio-cu12>=26.4", "nvidia-nvcomp-cu12>=5.2" ]
 rapids-cu12 = [
     "cupy-cuda12x[ctk]>=14",
     "cudf-cu12>=25.12",
@@ -156,7 +163,12 @@ local_scheme = "node-and-date"
 version-file = "src/rapids_singlecell/_version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = [ "src/rapids_singlecell", "src/rapids_singlecell_skills", "src/testing" ]
+packages = [
+    "src/rapids_singlecell",
+    "src/rapids_singlecell_skills",
+    "src/rapids_singlecell_zarr",
+    "src/testing",
+]
 exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
 
 [tool.hatch.build.targets.wheel.hooks.scikit-build]
