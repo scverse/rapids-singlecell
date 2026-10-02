@@ -8,6 +8,7 @@
 
 installation.md
 usage_principles.md
+agent_skill.md
 api/index.md
 tutorials.md
 release-notes/index.md
