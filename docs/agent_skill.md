@@ -2,8 +2,7 @@
 # Agent skill
 
 Every release ships a version-matched, model-neutral analysis skill for coding agents.
-It teaches the agent the rapids-singlecell API, GPU memory setup, and current best practices
-for QC, clustering, annotation, pseudobulk DE, perturbation screens, and spatial analysis.
+It teaches the agent the rapids-singlecell API and current best practices.
 
 ```{warning}
 The agent skill is new and experimental.
