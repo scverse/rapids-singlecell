@@ -9,3 +9,11 @@ from ._niche import (
     calculate_niche_neighborhood,
     calculate_niche_utag,
 )
+from ._spatial_neighbors import (
+    SpatialNeighborsResult,
+    spatial_neighbors_delaunay,
+    spatial_neighbors_from_builder,
+    spatial_neighbors_grid,
+    spatial_neighbors_knn,
+    spatial_neighbors_radius,
+)

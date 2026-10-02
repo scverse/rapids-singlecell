@@ -52,6 +52,7 @@ __all__ = [
     "_rank_stream_cuda",
     "_scale_cuda",
     "_sparse2dense_cuda",
+    "_spatial_cuda",
     "_spca_cuda",
     "_viper_cuda",
     "_wilcoxon_binned_cuda",

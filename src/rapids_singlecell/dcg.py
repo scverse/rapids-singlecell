@@ -8,6 +8,7 @@ from .decoupler_gpu import (
     ora,
     query_set,
     ulm,
+    viper,
     waggr,
     zscore,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "ora",
     "query_set",
     "ulm",
+    "viper",
     "waggr",
     "zscore",
 ]
