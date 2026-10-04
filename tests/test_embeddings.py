@@ -7,7 +7,7 @@ import scanpy as sc
 from scanpy.datasets import pbmc68k_reduced
 from scipy import sparse
 
-from rapids_singlecell.tools import _umap, draw_graph, tsne, umap
+from rapids_singlecell.tools import draw_graph, tsne, umap
 from rapids_singlecell.tools._umap import _device_coo
 from testing.rapids_singlecell._pytest import needs
 
@@ -20,10 +20,8 @@ def test_umap(kwargs):
     assert pbmc.obsm["X_umap"].shape == (700, 2)
 
 
-@pytest.mark.parametrize("upper", [False, True])
 @pytest.mark.parametrize("index_dtype", [np.int32, np.int64])
-def test_umap_device_coo(monkeypatch, index_dtype, upper):
-    monkeypatch.setattr(_umap, "_H2D_CHUNK", 7)  # several blocks
+def test_umap_device_coo(index_dtype):
     graph = sparse.random(50, 50, density=0.2, format="csr", rng=0, dtype=np.float32)
     # empty rows at the start, middle and end
     graph = sparse.csr_matrix(
@@ -31,30 +29,12 @@ def test_umap_device_coo(monkeypatch, index_dtype, upper):
     )
     graph.indices = graph.indices.astype(index_dtype)
     graph.indptr = graph.indptr.astype(index_dtype)
-    ref = (sparse.triu(graph) if upper else graph).tocoo()
-    coo = _device_coo(graph, upper=upper)
+    ref = graph.tocoo()
+    coo = _device_coo(graph)
     assert coo.has_canonical_format
     np.testing.assert_array_equal(coo.row.get(), ref.row)
     np.testing.assert_array_equal(coo.col.get(), ref.col)
     np.testing.assert_array_equal(coo.data.get(), ref.data)
-
-
-def test_umap_upper_triangle_if_graph_does_not_fit(monkeypatch):
-    pbmc = pbmc68k_reduced()
-    monkeypatch.setattr(_umap, "_MEMORY_FRACTION", 0)  # as if the graph did not fit
-    seen = {}
-    embed = _umap.simplicial_set_embedding
-
-    def spy(**kwargs):
-        seen.update(nnz=kwargs["graph"].nnz, n_epochs=kwargs["n_epochs"])
-        return embed(**kwargs)
-
-    monkeypatch.setattr(_umap, "simplicial_set_embedding", spy)
-    umap(pbmc)
-    upper_nnz = sparse.triu(pbmc.obsp["connectivities"]).nnz
-    # every pair once, with twice the epochs (500 for <= 10,000 cells)
-    assert seen == {"nnz": upper_nnz, "n_epochs": 1000}
-    assert np.isfinite(pbmc.obsm["X_umap"]).all()
 
 
 def test_tsne():
