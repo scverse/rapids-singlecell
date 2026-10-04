@@ -10,7 +10,6 @@ from cuml.manifold.umap import find_ab_params, simplicial_set_embedding
 from cupyx.scipy import sparse
 from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
-from scipy import sparse as sc_sparse
 
 from rapids_singlecell._compat import _rng_kwargs
 from rapids_singlecell._keys import _embedding_keys
@@ -24,24 +23,31 @@ from rapids_singlecell._utils._random import (
     _LegacyRng,
 )
 
-from ._utils import _validate_init_pos
+from ._utils import _is_canonical_csr, _is_symmetric, _validate_init_pos
 
 if TYPE_CHECKING:
     from anndata import AnnData
+    from scipy import sparse as sc_sparse
 
 _InitPos = Literal["auto", "spectral", "random", "paga"]
 
 _H2D_CHUNK = 1 << 28  # indices per host-to-device copy
+# GPU memory the embedding needs per graph entry: the graph is held twice
+# (here and in cuML) plus cuML's per-edge working arrays (measured: ~37 bytes)
+_BYTES_PER_GRAPH_ENTRY = 40
+# Share of the free GPU memory the full graph may take; above it, the upper triangle is used
+_MEMORY_FRACTION = 0.8
 
 
-def _device_coo(graph) -> sparse.coo_matrix:
-    """Canonical device COO, expanded on the GPU for a host CSR."""
-    if not (
-        sc_sparse.issparse(graph)
-        and graph.format == "csr"
-        and graph.has_canonical_format
-    ):
+def _device_coo(graph, *, upper: bool = False) -> sparse.coo_matrix:
+    """Canonical device COO, expanded on the GPU for a host CSR.
+
+    With `upper`, only the upper triangle of a canonical host CSR.
+    """
+    if not _is_canonical_csr(graph):
         return sparse.coo_matrix(graph)
+    if upper:
+        return _device_upper_coo(graph)
     row = cp.zeros(graph.nnz, dtype=cp.int32)
     starts = cp.asarray(graph.indptr[1:-1])
     cupyx.scatter_add(row, starts[starts < graph.nnz], 1)
@@ -52,6 +58,41 @@ def _device_coo(graph) -> sparse.coo_matrix:
             graph.indices[start : start + _H2D_CHUNK]
         )
     data = cp.asarray(graph.data, dtype=cp.float32)
+    coo = sparse.coo_matrix((data, (row, col)), shape=graph.shape)
+    coo.has_canonical_format = True
+    return coo
+
+
+def _device_upper_coo(graph: sc_sparse.csr_matrix) -> sparse.coo_matrix:
+    """Device COO of the upper triangle of a canonical host CSR.
+
+    Filtered on the host in blocks of rows, so the device only ever holds the result.
+    """
+    indptr, n = graph.indptr, graph.shape[0]
+    starts = np.unique(
+        np.searchsorted(indptr, np.arange(0, graph.nnz, _H2D_CHUNK), side="right") - 1
+    )
+    blocks = list(zip(starts, [*starts[1:], n], strict=True))
+
+    def upper_mask(r0, r1):
+        s, e = indptr[r0], indptr[r1]
+        rows = np.repeat(
+            np.arange(r0, r1, dtype=np.int32), np.diff(indptr[r0 : r1 + 1])
+        )
+        return s, e, rows, graph.indices[s:e] >= rows
+
+    counts = [int(np.count_nonzero(upper_mask(r0, r1)[3])) for r0, r1 in blocks]
+    row = cp.empty(sum(counts), dtype=cp.int32)
+    col = cp.empty_like(row)
+    data = cp.empty(len(row), dtype=cp.float32)
+    offset = 0
+    for (r0, r1), count in zip(blocks, counts, strict=True):
+        s, e, rows, keep = upper_mask(r0, r1)
+        part = slice(offset, offset + count)
+        row[part].set(rows[keep])
+        col[part].set(graph.indices[s:e][keep].astype(np.int32))
+        data[part].set(graph.data[s:e][keep].astype(np.float32))
+        offset += count
     coo = sparse.coo_matrix((data, (row, col)), shape=graph.shape)
     coo.has_canonical_format = True
     return coo
@@ -186,10 +227,20 @@ def umap(
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
     stored_params = {"a": a, "b": b, **meta_random_state}
 
-    n_epochs = (
-        500 if maxiter is None else maxiter
-    )  # 0 is not a valid value for rapids, unlike original umap
     n_obs = adata.shape[0]
+    # like scanpy and umap-learn: fewer epochs suffice for larger datasets
+    n_epochs = (500 if n_obs <= 10_000 else 200) if maxiter is None else maxiter
+    graph = neighbors["connectivities"]
+    # A graph too large for the GPU is embedded from its upper triangle: every pair once,
+    # with twice the epochs for as many updates per pair (same quality, half the memory).
+    upper = (
+        _BYTES_PER_GRAPH_ENTRY * graph.nnz
+        > _MEMORY_FRACTION * cp.cuda.runtime.memGetInfo()[0]
+        and _is_canonical_csr(graph)
+        and _is_symmetric(graph)
+    )
+    if upper:
+        n_epochs *= 2
 
     match init_pos:
         case str() if init_pos in adata.obsm:
@@ -219,7 +270,7 @@ def umap(
         # from `graph` alone, so we pass a placeholder instead of materializing
         # the representation on the GPU.
         data=cp.zeros((n_obs, 1), dtype=cp.float32),
-        graph=_device_coo(neighbors["connectivities"]),
+        graph=_device_coo(graph, upper=upper),
         n_components=n_components,
         initial_alpha=alpha,
         a=a,
