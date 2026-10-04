@@ -14,6 +14,7 @@ import rapids_singlecell.preprocessing._harmony as harmony_module
 from rapids_singlecell.preprocessing._harmony import (
     _SUPPRESS_PENALTY,
     _compute_lambda_kb,
+    _correction,
     _correction_multi,
     _solve_spd_batched,
 )
@@ -62,6 +63,7 @@ def test_harmony_multikey_marginal_codes_and_theta():
     )
 
     codes, n_levels = _get_batch_codes(obs, ["batch", "sex"])
+    codes = cp.asnumpy(codes)
 
     np.testing.assert_array_equal(n_levels, np.array([5, 2], dtype=np.int32))
     np.testing.assert_array_equal(codes[:, 0], np.array([0, 1, 2, 3, 4, 0]))
@@ -278,6 +280,72 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
         )
 
 
+def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
+    """Harmony correction with an explicit intercept + one-hot design matrix;
+    pruned levels (lambda at the sentinel) are dropped from each solve."""
+    n_cells = X.shape[0]
+    design = np.zeros((n_cells, n_batches + 1), dtype=X.dtype)
+    design[:, 0] = 1
+    for column in cats.reshape(n_cells, -1).T:
+        design[np.arange(n_cells), column + 1] = 1
+    expected = X.copy()
+    for cluster in range(R.shape[1]):
+        active = lambda_kb[:, cluster] < X.dtype.type(_SUPPRESS_PENALTY)
+        retained = np.flatnonzero(np.concatenate(([True], active)))
+        weighted_design = R[:, cluster, None] * design
+        gram = design.T @ weighted_design
+        gram[1:, 1:] += np.diag(np.where(active, lambda_kb[:, cluster], 0))
+        W = np.zeros((n_batches + 1, X.shape[1]), dtype=X.dtype)
+        W[retained] = np.linalg.solve(
+            gram[np.ix_(retained, retained)], (weighted_design.T @ X)[retained]
+        )
+        W[0] = 0
+        expected -= R[:, cluster, None] * (design @ W)
+    return expected
+
+
+@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize(
+    ("method", "normalize"),
+    [("batched", False), ("batched", True), ("fast", False)],
+)
+def test_harmony_correction_matches_dense_design(dtype, method, normalize):
+    rng = np.random.default_rng(734)
+    n_batches, n_pcs, n_clusters = 4, 5, 3
+    np_dtype = np.dtype(dtype)
+    # Cells sorted by batch; batch 2 is empty.
+    cats_np = np.sort(rng.choice([0, 1, 3], size=40)).astype(np.int32)
+    X_np = rng.normal(size=(40, n_pcs)).astype(np_dtype)
+    R_np = rng.random(size=(40, n_clusters)).astype(np_dtype)
+    R_np /= R_np.sum(axis=1, keepdims=True)
+    O_np = np.zeros((n_batches, n_clusters), dtype=np_dtype)
+    np.add.at(O_np, cats_np, R_np)
+    lambda_np = rng.uniform(0.2, 1.0, size=O_np.shape).astype(np_dtype)
+    lambda_np[2] = np_dtype.type(_SUPPRESS_PENALTY)
+    lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
+
+    result = _correction(
+        cp.asarray(X_np),
+        R=cp.asarray(R_np),
+        O=cp.asarray(O_np),
+        lambda_kb=cp.asarray(lambda_np),
+        correction_method=method,
+        cats=cp.asarray(cats_np),
+        n_batches=n_batches,
+        cat_offsets=cp.asarray(
+            np.searchsorted(cats_np, np.arange(n_batches + 1)), dtype=cp.int32
+        ),
+        cell_indices=cp.arange(40, dtype=cp.int32),
+        normalize=normalize,
+    )
+
+    expected = _dense_design_correction(X_np, R_np, cats_np, lambda_np, n_batches)
+    if normalize:
+        expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    atol = 2e-5 if dtype == cp.float32 else 1e-11
+    cp.testing.assert_allclose(result, cp.asarray(expected), atol=atol, rtol=atol)
+
+
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("n_covariates", [2, 3, 4])
 def test_harmony_multikey_correction_matches_dense_design(
@@ -321,7 +389,7 @@ def test_harmony_multikey_correction_matches_dense_design(
         [level for level, _ in marginal], np.arange(n_batches + 1)
     ).astype(np.int32)
 
-    def correct():
+    def correct(normalize=False):
         return _correction_multi(
             cp.asarray(X_np),
             cp.asarray(R_np),
@@ -335,34 +403,12 @@ def test_harmony_multikey_correction_matches_dense_design(
             marginal_joint_indices=cp.asarray(
                 [joint for _, joint in marginal], dtype=cp.int32
             ),
+            normalize=normalize,
         )
 
     result = correct()
 
-    design = np.zeros((n_cells, n_batches + 1), dtype=np_dtype)
-    design[:, 0] = 1
-    for covariate in range(n_covariates):
-        design[np.arange(n_cells), cats_np[:, covariate] + 1] = 1
-
-    expected = X_np.copy()
-    for cluster in range(n_clusters):
-        active = lambda_np[:, cluster] < np_dtype.type(_SUPPRESS_PENALTY)
-        retained = np.concatenate(([True], active))
-        weighted_design = R_np[:, cluster, None] * design
-        gram = design.T @ weighted_design
-        gram[1:, 1:] += np.diag(
-            np.where(active, lambda_np[:, cluster], np_dtype.type(0))
-        )
-        rhs = weighted_design.T @ X_np
-
-        W = np.zeros((n_batches + 1, n_pcs), dtype=np_dtype)
-        retained_indices = np.flatnonzero(retained)
-        W[retained] = np.linalg.solve(
-            gram[np.ix_(retained_indices, retained_indices)], rhs[retained]
-        )
-        W[0] = 0
-        expected -= R_np[:, cluster, None] * (design @ W)
-
+    expected = _dense_design_correction(X_np, R_np, cats_np, lambda_np, n_batches)
     atol = 2e-5 if dtype == cp.float32 else 1e-11
     cp.testing.assert_allclose(result, cp.asarray(expected), atol=atol, rtol=atol)
 
@@ -374,6 +420,10 @@ def test_harmony_multikey_correction_matches_dense_design(
 
     chunked = correct()
     cp.testing.assert_allclose(chunked, cp.asarray(expected), atol=atol, rtol=atol)
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    cp.testing.assert_allclose(
+        correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol
+    )
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

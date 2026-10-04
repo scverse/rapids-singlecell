@@ -1,19 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import cupy as cp
 import numpy as np
+import pandas as pd
 
 from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
-
-if TYPE_CHECKING:
-    import pandas as pd
-
-# Column-sum heuristic thresholds (rows x cols regions)
-_COLSUM_COLS_SMALL = 200
-_COLSUM_ROWS_MEDIUM = 20_000
-_COLSUM_ROWS_LARGE = 100_000
 
 
 def _validate_output_buffer(
@@ -49,34 +40,40 @@ def _normalize_cp(X: cp.ndarray, *, out: cp.ndarray | None = None) -> cp.ndarray
 
 def _get_batch_codes(
     batch_mat: pd.DataFrame, batch_key: str | list[str]
-) -> tuple[np.ndarray, np.ndarray]:
-    """Encode each batch variable into a disjoint range of marginal codes."""
+) -> tuple[cp.ndarray, np.ndarray]:
+    """Encode each batch variable into a disjoint range of marginal codes
+    (device ``int32``, one column per variable)."""
     keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
     if not keys:
         raise ValueError("batch_key must contain at least one column name")
 
-    codes = np.empty((len(batch_mat), len(keys)), dtype=np.int32)
+    codes = cp.empty((len(batch_mat), len(keys)), dtype=cp.int32)
     n_levels = np.empty(len(keys), dtype=np.int32)
     offset = 0
 
     for covariate, key in enumerate(keys):
-        batch_vec = batch_mat[key].astype("category")
-        local_codes = batch_vec.cat.codes.to_numpy(dtype=np.int32, copy=False)
-        if np.any(local_codes < 0):
+        batch_vec = batch_mat[key]
+        if not isinstance(batch_vec.dtype, pd.CategoricalDtype):
+            batch_vec = batch_vec.astype("category")
+        # Upload the compact pandas codes; widen and offset on the GPU.
+        local_codes = cp.asarray(batch_vec.cat.codes.to_numpy())
+        if len(local_codes) and int(local_codes.min()) < 0:
             raise ValueError(f"Batch variable {key!r} contains missing values")
 
         n_categories = batch_vec.cat.categories.size
         n_levels[covariate] = n_categories
-        codes[:, covariate] = local_codes + offset
+        codes[:, covariate] = local_codes.astype(cp.int32) + offset
         offset += n_categories
 
     return codes, n_levels
 
 
 def _factorize_joint_codes(
-    batch_codes: np.ndarray, n_levels: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Factorize marginal category tuples in lexicographic order."""
+    batch_codes: np.ndarray | cp.ndarray, n_levels: np.ndarray
+) -> tuple[np.ndarray | cp.ndarray, np.ndarray | cp.ndarray]:
+    """Factorize marginal category tuples in lexicographic order, on the
+    device of ``batch_codes``."""
+    xp = cp.get_array_module(batch_codes)
     levels = np.asarray(n_levels, dtype=np.int64)
     if batch_codes.ndim != 2 or batch_codes.shape[1] != levels.size:
         raise ValueError("Batch codes and category levels have incompatible shapes")
@@ -86,28 +83,28 @@ def _factorize_joint_codes(
         joint_cardinality *= int(level)
         if joint_cardinality > np.iinfo(np.int64).max:
             joint_cats, joint_codes = np.unique(
-                batch_codes, axis=0, return_inverse=True
+                cp.asnumpy(batch_codes), axis=0, return_inverse=True
             )
-            return joint_cats, np.asarray(joint_codes).reshape(-1)
+            return xp.asarray(joint_cats), xp.asarray(joint_codes).reshape(-1)
 
     offsets = np.empty(levels.size, dtype=np.int64)
     offsets[0] = 0
     if levels.size > 1:
         np.cumsum(levels[:-1], out=offsets[1:])
 
-    linear_codes = batch_codes[:, 0].astype(np.int64) - offsets[0]
+    linear_codes = batch_codes[:, 0].astype(xp.int64) - int(offsets[0])
     for covariate in range(1, levels.size):
-        linear_codes *= levels[covariate]
-        linear_codes += batch_codes[:, covariate] - offsets[covariate]
+        linear_codes *= int(levels[covariate])
+        linear_codes += batch_codes[:, covariate] - int(offsets[covariate])
 
-    observed_codes, joint_codes = np.unique(linear_codes, return_inverse=True)
-    joint_cats = np.empty((observed_codes.size, levels.size), dtype=np.int32)
+    observed_codes, joint_codes = xp.unique(linear_codes, return_inverse=True)
+    joint_cats = xp.empty((observed_codes.size, levels.size), dtype=xp.int32)
     remainder = observed_codes.copy()
     for covariate in range(levels.size - 1, -1, -1):
-        joint_cats[:, covariate] = remainder % levels[covariate]
-        remainder //= levels[covariate]
-    joint_cats += offsets.astype(np.int32)
-    return joint_cats, joint_codes
+        joint_cats[:, covariate] = remainder % int(levels[covariate])
+        remainder //= int(levels[covariate])
+    joint_cats += xp.asarray(offsets.astype(np.int32))
+    return joint_cats, joint_codes.reshape(-1)
 
 
 def _stratified_sample_indices(

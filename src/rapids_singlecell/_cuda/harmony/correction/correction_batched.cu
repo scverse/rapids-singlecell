@@ -130,9 +130,9 @@ static void apply_multi_impl(const T* X, const T* R, int ld_r, const T* W_all,
         cudaMemsetAsync(Z, 0, (size_t)n_cells * n_pcs * sizeof(T), stream);
     }
     if (!finish) return;
-    add_rows_normalize_kernel<T>
-        <<<strided_grid((long long)n_cells * 32, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-           stream>>>(X, Z, n_cells, n_pcs, normalize);
+    add_rows_normalize<T>(X, Z, n_cells, n_pcs, normalize,
+                          strided_grid((long long)n_cells * 32, BLOCK_DIM_1D),
+                          stream);
     CUDA_CHECK_LAST_ERROR(add_rows_normalize_kernel);
 }
 
@@ -229,9 +229,9 @@ static void correction_batched_impl(
                 "cublas_gemm(correction apply)");
         }
     }
-    add_rows_normalize_kernel<T>
-        <<<strided_grid((long long)n_cells * 32, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-           stream>>>(X, Z, n_cells, n_pcs, normalize);
+    add_rows_normalize<T>(X, Z, n_cells, n_pcs, normalize,
+                          strided_grid((long long)n_cells * 32, BLOCK_DIM_1D),
+                          stream);
     CUDA_CHECK_LAST_ERROR(add_rows_normalize_kernel);
 }
 

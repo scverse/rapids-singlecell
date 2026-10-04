@@ -199,15 +199,12 @@ def harmonize(
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates = int(n_levels.size)
     n_batches = int(n_levels.sum())
-    batch_counts = np.bincount(batch_codes.ravel(), minlength=n_batches)
-    N_b = cp.asarray(batch_counts, dtype=Z.dtype)
+    N_b = cp.bincount(batch_codes.ravel(), minlength=n_batches).astype(Z.dtype)
     Pr_b = (N_b.reshape(-1, 1) / n_cells).astype(Z.dtype)
 
     # Keep the established one-dimensional layout for one covariate. Multiple
     # covariates use a cell-major matrix of disjoint marginal category codes.
-    cats = cp.asarray(
-        batch_codes[:, 0] if n_covariates == 1 else batch_codes, dtype=cp.int32
-    )
+    cats = batch_codes[:, 0] if n_covariates == 1 else batch_codes
     order = None
     joint_cats = None
     joint_codes = None
@@ -215,11 +212,9 @@ def harmonize(
     marginal_joint_offsets = None
     marginal_joint_indices = None
     if n_covariates > 1:
-        joint_cats_host, joint_codes_host = _factorize_joint_codes(
-            batch_codes, n_levels
-        )
-        joint_cats = cp.asarray(joint_cats_host, dtype=cp.int32)
-        joint_codes = cp.asarray(joint_codes_host, dtype=cp.int32)
+        joint_cats, joint_codes = _factorize_joint_codes(batch_codes, n_levels)
+        joint_cats = joint_cats.astype(cp.int32, copy=False)
+        joint_codes = joint_codes.astype(cp.int32, copy=False)
         n_joint_categories = joint_cats.shape[0]
         marginal_joint_offsets, flat_joint_indices = _create_category_index_mapping(
             joint_cats.ravel(), n_batches
@@ -242,9 +237,10 @@ def harmonize(
     del keys
     Z = _sorted_device_copy(Z, order)
     cats = cats[order]
-    group_offsets, cell_indices = _create_category_index_mapping(
-        groups[order], n_groups
-    )
+    # Sorted groups: offsets from the group sizes, cells in order.
+    group_offsets = cp.zeros(n_groups + 1, dtype=cp.int32)
+    group_offsets[1:] = cp.cumsum(cp.bincount(groups, minlength=n_groups))
+    cell_indices = cp.arange(n_cells, dtype=cp.int32)
     if n_covariates > 1:
         joint_codes = joint_codes[order]
         joint_offsets = group_offsets
