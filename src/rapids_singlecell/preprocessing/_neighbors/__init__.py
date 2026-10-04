@@ -251,7 +251,11 @@ def neighbors(
         metric=metric,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
-        connectivities = _large_coo_to_host_csr(connectivities)
+        connectivities = (
+            _large_coo_to_host_csr(connectivities)
+            if connectivities.format == "coo"  # gauss and jaccard return CSR
+            else connectivities.get().tocsr()
+        )
     else:
         connectivities = connectivities.tocsr().get()
 
