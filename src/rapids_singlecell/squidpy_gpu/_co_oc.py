@@ -9,6 +9,7 @@ from cuml.metrics import pairwise_distances
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copies_on_device,
     _copy_to_device,
     _create_category_index_mapping,
     _split_pairs,
@@ -396,10 +397,10 @@ def _co_occurrence_gpu(
                 streams[data["device_id"]].synchronize()
 
     # Phase 4: Aggregate counts on the input device
-    with cp.cuda.Device(source_device_id):
+    parts = [data["counts"] for data in device_data if data is not None]
+    with _copies_on_device(parts, source_device_id) as local:
         counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
-        for data in device_data:
-            if data is not None:
-                counts += _copy_to_device(data["counts"], source_device_id)
+        for part in local:
+            counts += part
 
     return counts, True

@@ -6,7 +6,11 @@ import cupy as cp
 from cupyx.scipy import sparse
 
 from rapids_singlecell._cuda import _autocorr_cuda as _ac
-from rapids_singlecell._utils import _copy_to_device, parse_device_ids
+from rapids_singlecell._utils import (
+    _copies_on_device,
+    _copy_to_device,
+    parse_device_ids,
+)
 
 from ._utils import _check_precision_issues
 
@@ -153,8 +157,8 @@ def _run_permutations_dense(
                 streams[dd["device_id"]].synchronize()
 
     # Phase 3: Gather results on the input device and cut to exact size
-    with cp.cuda.Device(source_device):
-        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
+    perms = [dd["perms"] for dd in device_data]
+    with _copies_on_device(perms, source_device) as all_perms:
         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
 
     return gearys_C_permutations
@@ -323,8 +327,8 @@ def _run_permutations_sparse(
                 streams[dd["device_id"]].synchronize()
 
     # Phase 3: Gather results on the input device and cut to exact size
-    with cp.cuda.Device(source_device):
-        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
+    perms = [dd["perms"] for dd in device_data]
+    with _copies_on_device(perms, source_device) as all_perms:
         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
 
     return gearys_C_permutations

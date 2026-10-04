@@ -15,6 +15,7 @@ import pandas as pd
 from rapids_singlecell._cuda import _edistance_cuda as _ed
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copies_on_device,
     _copy_to_device,
     _split_pairs,
 )
@@ -787,13 +788,6 @@ class EDistanceMetric(BaseMetric):
         # Split pairs across devices with load balancing
         pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
 
-        # Track which flat indices each device handles
-        chunk_offsets = []
-        offset = 0
-        for chunk_left, _ in pair_chunks:
-            chunk_offsets.append(offset)
-            offset += len(chunk_left)
-
         # Phase 1: Create streams and start async data transfer to all devices
         streams = {}
         device_data = []
@@ -888,14 +882,12 @@ class EDistanceMetric(BaseMetric):
                 with cp.cuda.Device(data["device_id"]):
                     cp.cuda.Stream.null.synchronize()
 
-        # Phase 4: Aggregate on the input device
-        with cp.cuda.Device(result_device):
+        # Phase 4: Gather on the input device (chunks are consecutive pair ranges)
+        sums = [data["sums"] for data in device_data if data is not None]
+        with _copies_on_device(sums, result_device) as parts:
             total_sums = cp.zeros(n_total_pairs, dtype=embedding.dtype)
-            for i, data in enumerate(device_data):
-                if data is not None:
-                    sums = _copy_to_device(data["sums"], result_device)
-                    start = chunk_offsets[i]
-                    total_sums[start : start + len(sums)] = sums
+            if parts:
+                cp.concatenate(parts, out=total_sums)
 
         return total_sums
 
