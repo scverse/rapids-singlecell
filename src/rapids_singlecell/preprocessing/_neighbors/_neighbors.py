@@ -131,6 +131,26 @@ def _build_sparse_distances(
     return distances.get()
 
 
+def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
+    """Host CSR of a GPU COO matrix with too many entries for CuPy's 32-bit CSR.
+
+    The graphs cuML builds are sorted by row and column, so only the row pointers
+    have to be computed (on the GPU), instead of converting billions of entries on the host.
+    """
+    row, col = coo.row, coo.col
+    canonical = (row[1:] > row[:-1]) | ((row[1:] == row[:-1]) & (col[1:] > col[:-1]))
+    if not bool(cp.all(canonical)):
+        return coo.get().tocsr()
+    del canonical
+    indptr = cp.zeros(coo.shape[0] + 1, dtype=cp.int64)
+    cp.cumsum(cp.bincount(row, minlength=coo.shape[0]), out=indptr[1:])
+    csr = sc_sparse.csr_matrix(
+        (coo.data.get(), col.get(), indptr.get()), shape=coo.shape
+    )
+    csr.has_canonical_format = True
+    return csr
+
+
 def _get_connectivities_umap(
     knn_indices: cp.ndarray,
     knn_dist: cp.ndarray,
