@@ -5,6 +5,8 @@
 
 #include <climits>
 
+#include "../storage.cuh"
+
 constexpr int SCATTER_TILE_ROWS = 1024;
 constexpr int SCATTER_SCAN_THREADS = 256;
 constexpr int SCATTER_MAX_ENTRIES = 1 << 26;
@@ -46,7 +48,8 @@ __global__ void scatter_category_offsets_kernel(const int* sorted_categories,
 }
 
 __global__ void scatter_tile_offsets_kernel(const int* offsets,
-                                            int n_categories, int* tiles) {
+                                            int n_categories, int* tiles,
+                                            int tile_rows = SCATTER_TILE_ROWS) {
     using Scan = cub::BlockScan<int, SCATTER_SCAN_THREADS>;
     __shared__ typename Scan::TempStorage scratch;
     int total = 0;
@@ -56,8 +59,7 @@ __global__ void scatter_tile_offsets_kernel(const int* offsets,
         int length = category < n_categories
                          ? offsets[category + 1] - offsets[category]
                          : 0;
-        int count =
-            length / SCATTER_TILE_ROWS + (length % SCATTER_TILE_ROWS != 0);
+        int count = length / tile_rows + (length % tile_rows != 0);
         int prefix, aggregate;
         Scan(scratch).ExclusiveSum(count, prefix, aggregate);
         if (category < n_categories) tiles[category] = total + prefix;
@@ -80,8 +82,8 @@ __device__ int scatter_tile_category(int tile, int n_categories,
     return lo;
 }
 
-template <typename T>
-__global__ void scatter_tiles_kernel(const T* values, int n_cols,
+template <typename T, typename V = T>
+__global__ void scatter_tiles_kernel(const V* values, int n_cols,
                                      int n_categories, const int* indices,
                                      const int* offsets, const int* tiles,
                                      T* partial) {
@@ -98,7 +100,7 @@ __global__ void scatter_tiles_kernel(const T* values, int n_cols,
     if (col < n_cols)
         for (long long pos = (long long)start + threadIdx.y; pos < end;
              pos += 8)
-            sum += values[(size_t)indices[pos] * n_cols + col];
+            sum += from_storage<T>(values[(size_t)indices[pos] * n_cols + col]);
     sums[threadIdx.y][threadIdx.x] = sum;
     __syncthreads();
     if (threadIdx.y == 0 && col < n_cols) {
@@ -216,14 +218,14 @@ static size_t scatter_temp_bytes(int n_rows, int n_cols, int n_categories,
            scatter_sort_temp_bytes(n_entries, n_categories);
 }
 
-template <typename T>
-static void scatter_reduce_tiles(const T* values, int n_entries, int n_cols,
+template <typename T, typename V = T>
+static void scatter_reduce_tiles(const V* values, int n_entries, int n_cols,
                                  int n_categories, const int* indices,
                                  const int* offsets, const int* tiles,
                                  T* partial, int switcher, T* out,
                                  cudaStream_t stream) {
     size_t max_tiles = scatter_max_tiles(n_entries, n_categories);
-    scatter_tiles_kernel<T>
+    scatter_tiles_kernel<T, V>
         <<<max_tiles*((n_cols + 31) / 32), dim3(32, 8), 0, stream>>>(
             values, n_cols, n_categories, indices, offsets, tiles, partial);
     CUDA_CHECK_LAST_ERROR(scatter_tiles_kernel);
