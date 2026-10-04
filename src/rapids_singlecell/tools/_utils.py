@@ -272,9 +272,6 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
     return mean
 
 
-_SYMMETRY_SAMPLE = 10_000  # graph entries checked for a mirrored entry
-
-
 def _is_canonical_csr(graph) -> bool:
     return (
         cpu_sparse.issparse(graph)
@@ -284,14 +281,12 @@ def _is_canonical_csr(graph) -> bool:
 
 
 def _is_symmetric(graph: cpu_sparse.csr_matrix) -> bool:
-    """Whether a canonical CSR graph is symmetric, judged from a sample of its entries."""
-    pos = np.random.default_rng(0).integers(
-        0, graph.nnz, min(_SYMMETRY_SAMPLE, graph.nnz)
+    """Whether a canonical CSR graph equals its transpose (built in linear time, canonical too)."""
+    if graph.shape[0] != graph.shape[1]:
+        return False
+    t = graph.transpose().tocsr()
+    return (
+        np.array_equal(graph.indptr, t.indptr)
+        and np.array_equal(graph.indices, t.indices)
+        and np.array_equal(graph.data, t.data)
     )
-    rows = np.searchsorted(graph.indptr, pos, side="right") - 1
-    for row, col, value in zip(rows, graph.indices[pos], graph.data[pos], strict=True):
-        start, stop = graph.indptr[col], graph.indptr[col + 1]
-        i = start + np.searchsorted(graph.indices[start:stop], row)
-        if i == stop or graph.indices[i] != row or graph.data[i] != value:
-            return False
-    return True

@@ -59,10 +59,19 @@ def _upper_suffices(adjacency) -> bool:
     )
 
 
+def _summed_csr(adjacency):
+    """`adjacency` as CSR with duplicate entries summed into one edge weight (input unchanged)."""
+    adjacency = adjacency.tocsr()
+    if not adjacency.has_canonical_format:
+        adjacency = adjacency.copy()
+        adjacency.sum_duplicates()
+    return adjacency
+
+
 def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
     from cugraph import Graph
 
-    adjacency = adjacency.tocsr()
+    adjacency = _summed_csr(adjacency)
     xp = cp if isinstance(adjacency.indptr, cp.ndarray) else np
     n = adjacency.shape[0]
     sources = xp.repeat(xp.arange(n, dtype=np.int64), xp.diff(adjacency.indptr))
@@ -120,7 +129,7 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
 
     client = default_client()
     workers = list(client.nthreads())
-    adjacency = adjacency.tocsr()
+    adjacency = _summed_csr(adjacency)
     rows = np.repeat(
         np.arange(adjacency.shape[0], dtype=np.int32), np.diff(adjacency.indptr)
     )

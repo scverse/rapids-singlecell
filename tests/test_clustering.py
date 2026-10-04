@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from scanpy.datasets import pbmc68k_reduced
+from scipy import sparse
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools import _clustering
@@ -47,6 +49,11 @@ def test_create_graph_upper_triangle(adata_neighbors, monkeypatch):
     monkeypatch.setattr(_clustering, "_upper_suffices", lambda adjacency: False)
     full = _create_graph(conn)
     assert upper.number_of_edges() == full.number_of_edges()
+    one_way = sparse.csr_matrix(np.array([[0, 0, 0], [1, 0, 1], [0, 1, 0]], float))
+    assert not _clustering._upper_suffices(one_way)
+    # duplicate entries are summed into one weight
+    dup = sparse.csr_matrix(([2.0, 3.0, 5.0], [1, 1, 0], [0, 2, 3]), shape=(2, 2))
+    assert _create_graph(dup).view_edge_list()["weight"].to_arrow().to_pylist() == [5]
 
 
 @pytest.mark.parametrize("key", ["leiden", "louvain"])
