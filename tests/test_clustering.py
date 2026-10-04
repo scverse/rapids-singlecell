@@ -4,6 +4,7 @@ import pytest
 from scanpy.datasets import pbmc68k_reduced
 
 import rapids_singlecell as rsc
+from rapids_singlecell.tools import _clustering
 from rapids_singlecell.tools._clustering import _create_graph
 
 
@@ -37,6 +38,15 @@ def test_create_graph_dtype(adata_neighbors, dtype):
     g = _create_graph(adata_neighbors.obsp["connectivities"], dtype, use_weights=True)
     df = g.view_edge_list()
     assert df.weight.dtype == dtype
+
+
+def test_create_graph_upper_triangle(adata_neighbors, monkeypatch):
+    conn = adata_neighbors.obsp["connectivities"]
+    assert _clustering._upper_suffices(conn)
+    upper = _create_graph(conn)
+    monkeypatch.setattr(_clustering, "_upper_suffices", lambda adjacency: False)
+    full = _create_graph(conn)
+    assert upper.number_of_edges() == full.number_of_edges()
 
 
 @pytest.mark.parametrize("key", ["leiden", "louvain"])

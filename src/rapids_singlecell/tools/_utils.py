@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cupy as cp
+import numpy as np
 import scipy.sparse as cpu_sparse
 from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 
@@ -269,3 +270,28 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
             mask = cp.ones(X.shape[1], dtype=cp.bool_)
         mean = cp.nanmean(X[:, mask], axis=axis, dtype=cp.float64)
     return mean
+
+
+_SYMMETRY_SAMPLE = 10_000  # graph entries checked for a mirrored entry
+
+
+def _is_canonical_csr(graph) -> bool:
+    return (
+        cpu_sparse.issparse(graph)
+        and graph.format == "csr"
+        and graph.has_canonical_format
+    )
+
+
+def _is_symmetric(graph: cpu_sparse.csr_matrix) -> bool:
+    """Whether a canonical CSR graph is symmetric, judged from a sample of its entries."""
+    pos = np.random.default_rng(0).integers(
+        0, graph.nnz, min(_SYMMETRY_SAMPLE, graph.nnz)
+    )
+    rows = np.searchsorted(graph.indptr, pos, side="right") - 1
+    for row, col, value in zip(rows, graph.indices[pos], graph.data[pos], strict=True):
+        start, stop = graph.indptr[col], graph.indptr[col + 1]
+        i = start + np.searchsorted(graph.indices[start:stop], row)
+        if i == stop or graph.indices[i] != row or graph.data[i] != value:
+            return False
+    return True
