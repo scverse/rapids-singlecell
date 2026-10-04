@@ -18,8 +18,6 @@ from rapids_singlecell.preprocessing._harmony import (
     _solve_spd_batched,
 )
 from rapids_singlecell.preprocessing._harmony._helper import (
-    _choose_colsum_algo_heuristic,
-    _colsum_heuristic,
     _factorize_joint_codes,
     _get_batch_codes,
     _get_theta_array,
@@ -306,20 +304,40 @@ def test_harmony_multikey_correction_matches_dense_design(
     lambda_np = rng.uniform(0.2, 1.0, size=O_np.shape).astype(np_dtype)
     lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
 
+    # The correction expects cells sorted by joint category.
     joint_cats_np, joint_codes_np = np.unique(cats_np, axis=0, return_inverse=True)
-    cats = cp.asarray(cats_np, dtype=cp.int32)
-
-    result = _correction_multi(
-        cp.asarray(X_np),
-        cp.asarray(R_np),
-        O=cp.asarray(O_np),
-        lambda_kb=cp.asarray(lambda_np),
-        cats=cats,
-        n_batches=n_batches,
-        n_covariates=n_covariates,
-        joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
-        joint_codes=cp.asarray(joint_codes_np, dtype=cp.int32),
+    order = np.argsort(joint_codes_np, kind="stable")
+    cats_np, X_np, R_np = cats_np[order], X_np[order], R_np[order]
+    joint_codes_np = joint_codes_np[order]
+    joint_O_np = np.zeros((len(joint_cats_np), n_clusters), dtype=np_dtype)
+    np.add.at(joint_O_np, joint_codes_np, R_np)
+    joint_offsets = np.searchsorted(
+        joint_codes_np, np.arange(len(joint_cats_np) + 1)
+    ).astype(np.int32)
+    marginal = sorted(
+        (level, joint) for joint, levels in enumerate(joint_cats_np) for level in levels
     )
+    marginal_offsets = np.searchsorted(
+        [level for level, _ in marginal], np.arange(n_batches + 1)
+    ).astype(np.int32)
+
+    def correct():
+        return _correction_multi(
+            cp.asarray(X_np),
+            cp.asarray(R_np),
+            O=cp.asarray(O_np),
+            lambda_kb=cp.asarray(lambda_np),
+            joint_O=cp.asarray(joint_O_np),
+            n_batches=n_batches,
+            joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
+            joint_offsets=cp.asarray(joint_offsets),
+            marginal_joint_offsets=cp.asarray(marginal_offsets),
+            marginal_joint_indices=cp.asarray(
+                [joint for _, joint in marginal], dtype=cp.int32
+            ),
+        )
+
+    result = correct()
 
     design = np.zeros((n_cells, n_batches + 1), dtype=np_dtype)
     design[:, 0] = 1
@@ -354,17 +372,7 @@ def test_harmony_multikey_correction_matches_dense_design(
         lambda **_kwargs: 1,
     )
 
-    chunked = _correction_multi(
-        cp.asarray(X_np),
-        cp.asarray(R_np),
-        O=cp.asarray(O_np),
-        lambda_kb=cp.asarray(lambda_np),
-        cats=cats,
-        n_batches=n_batches,
-        n_covariates=n_covariates,
-        joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
-        joint_codes=cp.asarray(joint_codes_np, dtype=cp.int32),
-    )
+    chunked = correct()
     cp.testing.assert_allclose(chunked, cp.asarray(expected), atol=atol, rtol=atol)
 
 
@@ -522,35 +530,6 @@ def test_harmony_integrate(correction_method):
         max_iter_harmony=1,
     )
     assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
-
-
-@pytest.mark.parametrize("algo", ["columns", "atomics", "gemm"])
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64, cp.int32])
-def test_colsum_algo(algo, dtype):
-    # Int32 testing for correctness of the algorithm
-    if dtype == cp.int32:
-        X = cp.random.randint(0, 10, size=(20, 10), dtype=dtype)
-    else:
-        X = cp.random.randn(20, 10, dtype=dtype)
-    algo_func = _choose_colsum_algo_heuristic(X.shape[0], X.shape[1], algo)
-    algo_out = algo_func(X)
-    cupy_out = X.sum(axis=0)
-    if dtype == cp.int32:
-        cp.testing.assert_array_equal(algo_out, cupy_out)
-    elif dtype == cp.float32:
-        cp.testing.assert_allclose(algo_out, cupy_out, atol=1e-5)
-    else:
-        cp.testing.assert_allclose(algo_out, cupy_out)
-
-
-@pytest.mark.parametrize("compute_capability", ["100", "80"])
-def test_choose_colsum_algo(compute_capability):
-    # Test that the choose_colsum_algo function returns the correct algorithm
-    # for the given shape of the matrix
-    for rows in np.arange(1000, 300000, 1000):
-        for columns in np.arange(10, 5000, 50):
-            algo = _colsum_heuristic(rows, columns, compute_capability)
-            assert algo in ["columns", "gemm"]
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
@@ -781,5 +760,98 @@ def test_harmony_integrate_repeats_bitwise(
         )
         outputs.append(adata.obsm["X_pca_harmony"])
     assert outputs[0].dtype == dtype
+    assert np.isfinite(outputs[0]).all()
+    assert outputs[0].tobytes() == outputs[1].tobytes()
+
+
+def _integrate(dtype=np.float32, *, X_pca=None, **kwargs):
+    adata = _repeatability_adata(np.float32)
+    if X_pca is not None:
+        adata.obsm["X_pca"] = X_pca
+    rsc.pp.harmony_integrate(
+        adata, "batch", dtype=dtype, rng=734, n_clusters=7, max_iter_harmony=2, **kwargs
+    )
+    return adata.obsm["X_pca_harmony"]
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_bfloat16_assignments():
+    reference = _integrate()
+    if all(
+        module.cutile_bf16_available(17, 7)
+        for module in (
+            harmony_module._clustering_cuda,
+            harmony_module._correction_batched_cuda,
+        )
+    ):
+        first, second = _integrate("bfloat16"), _integrate("bfloat16")
+        assert first.dtype == np.float32
+        assert first.tobytes() == second.tobytes()
+        assert _get_measure(first, reference, "L2") < 2e-2
+    else:
+        with pytest.warns(UserWarning, match="dtype='bfloat16'"):
+            fallback = _integrate("bfloat16")
+        assert fallback.tobytes() == reference.tobytes()
+
+
+@pytest.mark.parametrize("chunk", [0, -2, 1.5])
+def test_harmony_shuffle_chunk_size_rejects_invalid(chunk):
+    with pytest.raises(ValueError, match="shuffle_chunk_size"):
+        _integrate(shuffle_chunk_size=chunk)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_shuffle_chunk_size():
+    exact = _integrate(shuffle_chunk_size=1)
+    assert exact.tobytes() == _integrate(shuffle_chunk_size=1).tobytes()
+    assert exact.tobytes() != _integrate(shuffle_chunk_size=8).tobytes()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_host_input_matches_device_input():
+    host = _repeatability_adata(np.float32).obsm["X_pca"]
+    assert (
+        _integrate(X_pca=host).tobytes() == _integrate(X_pca=cp.asarray(host)).tobytes()
+    )
+    host[3, 2] = np.nan
+    with pytest.raises(ValueError, match="NaN"):
+        _integrate(X_pca=host)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_bfloat16_falls_back_to_float32(monkeypatch):
+    monkeypatch.setattr(
+        harmony_module._clustering_cuda, "cutile_bf16_available", lambda *_: False
+    )
+    with pytest.warns(UserWarning, match="dtype='bfloat16'"):
+        fallback = _integrate("bfloat16")
+    assert fallback.tobytes() == _integrate().tobytes()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("key", ["batch", ["batch", "second"]])
+def test_harmony_general_assignment_matches_fused(monkeypatch, key):
+    def run():
+        adata = _repeatability_adata(np.float32)
+        rsc.pp.harmony_integrate(adata, key, rng=734, n_clusters=7, max_iter_harmony=2)
+        return adata.obsm["X_pca_harmony"]
+
+    fused = run()
+    monkeypatch.setattr(harmony_module, "_FORCE_GENERAL_ASSIGNMENT", True)
+    general = run()
+    assert _get_measure(general, fused, "L2") < 1e-4
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("key", ["batch", ["batch", "second"]])
+def test_harmony_many_clusters(key):
+    # More than 128 clusters take the general kernel in two sweeps.
+    outputs = []
+    for _ in range(2):
+        adata = _repeatability_adata(np.float32)
+        rsc.pp.harmony_integrate(
+            adata, key, rng=734, n_clusters=300, max_iter_harmony=2
+        )
+        outputs.append(adata.obsm["X_pca_harmony"])
     assert np.isfinite(outputs[0]).all()
     assert outputs[0].tobytes() == outputs[1].tobytes()

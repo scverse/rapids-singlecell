@@ -109,6 +109,14 @@ jobs:
           text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
           text = remove_toml_array(text, f"rapids-cu{other}")
 
+          # CUDA 13: export the Harmony cuTile kernels (dtype="bfloat16") at
+          # build time; tileiras comes with the pip CUDA toolkit. Build-only.
+          if cuda == "13":
+              text = text.replace(
+                  '    "nanobind>=2.0.0",\n',
+                  '    "nanobind>=2.0.0",\n    "cuda-tile[tileiras]>=1.6",\n',
+              )
+
           # Set CUDA architectures (replace "native" with CI target archs)
           text = text.replace(
               'CMAKE_CUDA_ARCHITECTURES = "native"',
@@ -119,7 +127,7 @@ jobs:
 
           # Verify
           for line in path.read_text().splitlines():
-              if "name" in line or "rapids" in line.lower() or "CUDA_ARCH" in line:
+              if any(k in line for k in ("name", "CUDA_ARCH", "cuda-tile")) or "rapids" in line.lower():
                   print(line)
           SCRIPT
 

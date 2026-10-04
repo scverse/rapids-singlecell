@@ -5,9 +5,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from rapids_singlecell._cuda import _harmony_colsum_cuda as _colsum_cuda
 from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
-from rapids_singlecell._cuda import _harmony_outer_cuda as _outer_cuda
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -16,48 +14,6 @@ if TYPE_CHECKING:
 _COLSUM_COLS_SMALL = 200
 _COLSUM_ROWS_MEDIUM = 20_000
 _COLSUM_ROWS_LARGE = 100_000
-
-
-def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
-    """
-    Normalize rows of a matrix using an optimized kernel with shared memory and warp shuffle.
-
-    Parameters
-    ----------
-    X
-        Input 2D array.
-
-    Returns
-    -------
-    Row-normalized 2D array.
-    """
-    assert X.ndim == 2, "Input must be a 2D array."
-
-    rows, cols = X.shape
-
-    _normalize_cuda.normalize(
-        X,
-        rows=rows,
-        cols=cols,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-    return X
-
-
-def _outer_cp(
-    E: cp.ndarray, Pr_b: cp.ndarray, R_sum: cp.ndarray, switcher: int
-) -> None:
-    n_cats, n_pcs = E.shape
-
-    _outer_cuda.outer(
-        E,
-        Pr_b=Pr_b,
-        R_sum=R_sum,
-        n_cats=n_cats,
-        n_pcs=n_pcs,
-        switcher=switcher,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
 
 
 def _validate_output_buffer(
@@ -73,32 +29,22 @@ def _validate_output_buffer(
         raise ValueError(f"{operation} output must be C-contiguous")
 
 
-def _normalize_cp(
-    X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None
-) -> cp.ndarray:
-    """
-    Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`.
-    """
-    if p == 2:
-        X = cp.ascontiguousarray(X)
-        if out is None:
-            out = cp.empty_like(X)
-        else:
-            _validate_output_buffer(X, out, operation="Normalization")
-        rows, cols = X.shape
-        _normalize_cuda.l2_row_normalize(
-            X,
-            dst=out,
-            n_rows=rows,
-            n_cols=cols,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-        return out
-
+def _normalize_cp(X: cp.ndarray, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """L2-normalize the rows of ``X`` (into ``out`` when given)."""
+    X = cp.ascontiguousarray(X)
+    if out is None:
+        out = cp.empty_like(X)
     else:
-        if out is not None and out is not X:
-            raise ValueError("An output buffer is only supported for L2 normalization")
-        return _normalize_cp_p1(X)
+        _validate_output_buffer(X, out, operation="Normalization")
+    rows, cols = X.shape
+    _normalize_cuda.l2_row_normalize(
+        X,
+        dst=out,
+        n_rows=rows,
+        n_cols=cols,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    return out
 
 
 def _get_batch_codes(
@@ -197,15 +143,17 @@ def _stratified_sample_indices(
             order = np.lexsort((tie_break, -remainders[eligible]))
             quotas[eligible[order[:leftover]]] += 1
 
-    picks = []
-    for start, size, quota in zip(offsets[:-1], sizes, quotas, strict=True):
-        start, size, quota = int(start), int(size), int(quota)
-        if quota == 0:
-            continue
-        picks.append(start + rng.choice(size, quota, replace=False))
-
-    selected = cell_indices[cp.asarray(np.concatenate(picks))]
-    return selected[cp.asarray(rng.permutation(n_target))]
+    # Sort each stratum's cells by a seeded random key on the GPU and keep the
+    # first `quota`: a uniform draw without replacement.
+    gpu_rng = cp.random.default_rng(int(rng.integers(2**63)))
+    strata = cp.searchsorted(
+        cp.asarray(offsets[1:]), cp.arange(n_cells), side="right"
+    ).astype(cp.float64)
+    order = cp.argsort(strata + gpu_rng.random(n_cells))
+    starts = offsets[:-1] - np.concatenate([[0], np.cumsum(quotas)[:-1]])
+    picks = np.repeat(starts, quotas) + np.arange(n_target)
+    selected = cell_indices[order[cp.asarray(picks)]]
+    return selected[cp.argsort(gpu_rng.random(n_target))]
 
 
 def _get_theta_array(
@@ -240,54 +188,3 @@ def _get_theta_array(
         f"Theta array size ({theta_array.size}) must match the number of batch "
         f"variables ({n_covariates}) or categorical levels ({n_categories})"
     )
-
-
-def _column_sum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column of the 2D, C-contiguous float32 array A.
-    Returns a 1D float32 cupy array of length A.shape[1].
-    """
-    rows, cols = X.shape
-    if not X.flags.c_contiguous:
-        return X.sum(axis=0)
-
-    out = cp.zeros(cols, dtype=X.dtype)
-
-    _colsum_cuda.colsum(
-        X,
-        out=out,
-        rows=rows,
-        cols=cols,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-    return out
-
-
-def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column with cuBLAS GEMM
-    """
-    return X.T @ cp.ones(X.shape[0], dtype=X.dtype)
-
-
-def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> callable:
-    """Choose a deterministic column reduction from the shape and device."""
-    if algo in {"atomics", "benchmark"}:
-        algo = None
-    if algo is None:
-        cc = cp.cuda.Device().compute_capability
-        algo = _colsum_heuristic(rows, cols, cc)
-    if algo == "columns":
-        return _column_sum
-    return _gemm_colsum
-
-
-# TODO: Make this more robust
-def _colsum_heuristic(rows: int, cols: int, compute_capability: str) -> str:
-    is_data_center = compute_capability in ["100", "90"]
-    if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_MEDIUM:
-        return "columns"
-    if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_LARGE and is_data_center:
-        return "columns"
-    return "gemm"
