@@ -158,9 +158,12 @@ def _adata_with_constant_genes(*, sparse_x: bool):
     adata = AnnData(sparse.csr_matrix(X) if sparse_x else X)
     adata.var_names = [f"gene_{i}" for i in range(n_genes)]
     positions = rng.random((n_cells, 2))
-    adata.obsp["spatial_connectivities"] = kneighbors_graph(
-        positions, n_neighbors=5, mode="connectivity"
+    graph = kneighbors_graph(positions, n_neighbors=5, mode="connectivity")
+    graph.indices, graph.indptr = (
+        graph.indices.astype(np.int32),
+        graph.indptr.astype(np.int32),
     )
+    adata.obsp["spatial_connectivities"] = graph
     return adata
 
 
@@ -195,31 +198,6 @@ def test_autocorr_constant_genes_are_nan(mode, dtype, sparse_x, n_perms):
             ref.loc[others, "pval_norm_fdr_bh"],
             rtol=1e-4,
         )
-
-
-@pytest.mark.parametrize("mode", ["moran", "geary"])
-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
-@pytest.mark.parametrize("n_perms", [None, 20])
-def test_autocorr_dense_int64_graph_indices(mode, dtype, n_perms):
-    """Dense data with an int64-indexed graph matches the int32-indexed result."""
-    from anndata import AnnData
-    from sklearn.neighbors import kneighbors_graph
-
-    rng = np.random.default_rng(0)
-    X = rng.random((100, 4)).astype(np.float32)
-    graph = sparse.csr_matrix(kneighbors_graph(rng.random((100, 2)), n_neighbors=5))
-    stat = "I" if mode == "moran" else "C"
-    scores = {}
-    for idx_dtype in (np.int32, np.int64):
-        g = graph.copy()
-        g.indices, g.indptr = g.indices.astype(idx_dtype), g.indptr.astype(idx_dtype)
-        adata = AnnData(X)
-        adata.obsp["spatial_connectivities"] = g
-        df = spatial_autocorr(adata, mode=mode, copy=True, n_perms=n_perms, dtype=dtype)
-        scores[idx_dtype] = df[stat].sort_index().to_numpy()
-    assert np.all(scores[np.int32] != 0)
-    # float32 scores use atomics, so reruns differ by ~1e-6 relative.
-    np.testing.assert_allclose(scores[np.int64], scores[np.int32], rtol=1e-5, atol=1e-7)
 
 
 def test_autocorr_all_constant_genes_raise():

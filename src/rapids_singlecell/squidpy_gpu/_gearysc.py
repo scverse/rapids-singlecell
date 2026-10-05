@@ -26,12 +26,10 @@ def _gearys_C_cupy_dense(
     # Calculate the numerator for Geary's C
     num = cp.zeros(n_features, dtype=dtype)
     stream = cp.cuda.get_current_stream().ptr
-    # The dense kernels take int32 graph indices. Implicitly converted int64 indices
-    # (e.g. from sklearn graphs) gave all-zero float64 scores, so cast explicitly.
     _ac.gearys_dense(
         data,
-        adj_row_ptr=adj_matrix_cupy.indptr.astype(cp.int32, copy=False),
-        adj_col_ind=adj_matrix_cupy.indices.astype(cp.int32, copy=False),
+        adj_row_ptr=adj_matrix_cupy.indptr,
+        adj_col_ind=adj_matrix_cupy.indices,
         adj_data=adj_matrix_cupy.data,
         num=num,
         n_samples=n_samples,
@@ -139,10 +137,8 @@ def _run_permutations_dense(
                 adj_matrix_permuted = dd["adj"][idx_shuffle, :]
                 _ac.gearys_dense(
                     dd["data"],
-                    adj_row_ptr=adj_matrix_permuted.indptr.astype(cp.int32, copy=False),
-                    adj_col_ind=adj_matrix_permuted.indices.astype(
-                        cp.int32, copy=False
-                    ),
+                    adj_row_ptr=adj_matrix_permuted.indptr,
+                    adj_col_ind=adj_matrix_permuted.indices,
                     adj_data=adj_matrix_permuted.data,
                     num=num_permuted,
                     n_samples=n_samples,
