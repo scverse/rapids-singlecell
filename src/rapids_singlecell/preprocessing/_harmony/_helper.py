@@ -113,7 +113,11 @@ def _stratified_sample_indices(
     n_target: int,
     rng: np.random.Generator,
 ) -> cp.ndarray:
-    """Draw exactly ``n_target`` cells while representing every observed stratum."""
+    """Draw exactly ``n_target`` cells while representing every observed stratum.
+
+    ``cell_indices`` lists each stratum's cells in a seeded random order (as
+    Harmony sorts them), so its first ``quota`` cells are a uniform draw.
+    """
     offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
     sizes = np.diff(offsets)
     nonempty = np.flatnonzero(sizes)
@@ -140,17 +144,8 @@ def _stratified_sample_indices(
             order = np.lexsort((tie_break, -remainders[eligible]))
             quotas[eligible[order[:leftover]]] += 1
 
-    # Sort each stratum's cells by a seeded random key on the GPU and keep the
-    # first `quota`: a uniform draw without replacement.
-    gpu_rng = cp.random.default_rng(int(rng.integers(2**63)))
-    strata = cp.searchsorted(
-        cp.asarray(offsets[1:]), cp.arange(n_cells), side="right"
-    ).astype(cp.float64)
-    order = cp.argsort(strata + gpu_rng.random(n_cells))
     starts = offsets[:-1] - np.concatenate([[0], np.cumsum(quotas)[:-1]])
-    picks = np.repeat(starts, quotas) + np.arange(n_target)
-    selected = cell_indices[order[cp.asarray(picks)]]
-    return selected[cp.argsort(gpu_rng.random(n_target))]
+    return cell_indices[cp.asarray(np.repeat(starts, quotas) + np.arange(n_target))]
 
 
 def _get_theta_array(
