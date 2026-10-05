@@ -368,6 +368,15 @@ def harmonize(
             n_first=int(n_levels[0]),
         )
     tile_partials = workspace.get("tile_partials")
+    # The update blocks are drawn once, before the large arrays exist.
+    _draw_blocks(
+        joint_codes if n_covariates > 1 else cats,
+        n_groups=n_groups,
+        block_size=block_size,
+        seed=kernel_seed,
+        shuffle_chunk=shuffle_chunk_size,
+        workspace=workspace,
+    )
     R, E, O, objectives_harmony = _initialize_clusters(
         Z_norm,
         n_clusters=n_clusters,
@@ -404,7 +413,7 @@ def harmonize(
             n_covariates=n_covariates,
             n_joint_categories=n_joint_categories,
             kernel_seed=kernel_seed + i * 1000003,
-            partition=i == 0,
+            count_blocks=i == 0,
             shuffle_chunk_size=shuffle_chunk_size,
             stabilized_penalty=stabilized_penalty,
             workspace=workspace,
@@ -565,6 +574,38 @@ def _fused_assign_smem_bytes(n_pcs: int, n_clusters: int, itemsize: int) -> int:
     return (pcs * _FUSED_MAX_CLUSTERS + 8 * 8 * pcs + 8 * n_clusters) * itemsize
 
 
+def _draw_blocks(
+    groups: cp.ndarray,
+    *,
+    n_groups: int,
+    block_size: int,
+    seed: int,
+    shuffle_chunk: int,
+    workspace: dict,
+    n_blocks: int = 0,
+) -> None:
+    """Draw the update blocks of a harmonize call into the workspace's
+    ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here)."""
+    n = groups.size
+    _clustering_cuda.draw_blocks(
+        groups,
+        idx_list=workspace["idx_list"],
+        block_cat_offsets=workspace["block_cat_offsets"],
+        idx_list_alt=cp.empty(n, dtype=cp.int32),
+        sort_keys=cp.empty(n, dtype=cp.uint32),
+        sort_keys_alt=cp.empty(n, dtype=cp.uint32),
+        cub_temp=cp.empty(
+            _clustering_cuda.get_cub_sort_temp_bytes(n_cells=n), dtype=cp.uint8
+        ),
+        n_groups=n_groups,
+        block_size=block_size,
+        n_blocks=n_blocks,
+        seed=seed & 0xFFFFFFFF,
+        shuffle_chunk=shuffle_chunk,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+
+
 def _initialize_clusters(
     Z_norm: cp.ndarray,
     *,
@@ -655,6 +696,15 @@ def _allocate_clustering_workspace(
     (with counts in ``O_joint``) for several keys."""
     itemsize = np.dtype(dtype).itemsize
     n_blocks = -(-n_cells // block_size)
+    counts_bytes = n_blocks * n_groups * n_clusters * itemsize
+    if counts_bytes > 1 << 30:
+        warnings.warn(
+            f"Harmony keeps {counts_bytes / 2**30:.1f} GiB of cluster counts for "
+            f"{n_blocks} update blocks x {n_groups} batch groups; a larger "
+            "block_proportion needs less.",
+            UserWarning,
+            stacklevel=4,
+        )
     n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
     # About four assignment tiles per SM, plus one partial tile per group.
     n_tiles = 4 * n_sm + n_groups + 1
@@ -662,12 +712,6 @@ def _allocate_clustering_workspace(
         "Y": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         "idx_list": cp.empty(n_cells, dtype=cp.int32),
-        "idx_list_alt": cp.empty(n_cells, dtype=cp.int32),
-        "sort_keys": cp.empty(n_cells, dtype=cp.uint32),
-        "sort_keys_alt": cp.empty(n_cells, dtype=cp.uint32),
-        "cub_temp": cp.empty(
-            _clustering_cuda.get_cub_sort_temp_bytes(n_cells=n_cells), dtype=cp.uint8
-        ),
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
         "obj_scalar": cp.empty(1, dtype=dtype),
         "last_obj": cp.zeros(1, dtype=dtype),
@@ -733,7 +777,7 @@ def _clustering(
     kernel_seed: int,
     shuffle_chunk_size: int,
     stabilized_penalty: bool,
-    partition: bool = True,
+    count_blocks: bool = True,
     workspace: dict,
 ) -> None:
     """
@@ -763,7 +807,7 @@ def _clustering(
         seed=kernel_seed & 0xFFFFFFFF,
         stabilized=stabilized_penalty,
         shuffle_chunk=shuffle_chunk_size,
-        partition=partition,
+        count_blocks=count_blocks,
         stream=cp.cuda.get_current_stream().ptr,
         handle=cp.cuda.device.get_cublas_handle(),
     )
