@@ -104,7 +104,7 @@ def umap(
         The number of dimensions of the embedding.
     maxiter
         The number of iterations (epochs) of the optimization. Called `n_epochs`
-        in the original UMAP.
+        in the original UMAP. Defaults to 500 for up to 10,000 cells, else 200.
     alpha
         The initial learning rate for the embedding optimization.
     negative_sample_rate
@@ -186,10 +186,9 @@ def umap(
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
     stored_params = {"a": a, "b": b, **meta_random_state}
 
-    n_epochs = (
-        500 if maxiter is None else maxiter
-    )  # 0 is not a valid value for rapids, unlike original umap
     n_obs = adata.shape[0]
+    # like scanpy and umap-learn: fewer epochs suffice for larger datasets
+    n_epochs = (500 if n_obs <= 10_000 else 200) if maxiter is None else maxiter
 
     match init_pos:
         case str() if init_pos in adata.obsm:
