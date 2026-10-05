@@ -3,6 +3,7 @@
 
 Every release ships a version-matched, model-neutral analysis skill for coding agents.
 It teaches the agent the rapids-singlecell API and current best practices.
+It guides GPU single-cell and spatial analyses from QC to pseudobulk, pathway, perturbation and spatial statistics, and GPU and RMM setup.
 
 ```{warning}
 The agent skill is new and experimental.
@@ -48,6 +49,8 @@ rapids-singlecell-install-skills --dest /other/skills/rapids-singlecell
 | `--force` | Replace a differing copy, e.g. after upgrading rapids-singlecell |
 | `--print-path` | Print the location of the bundled skill |
 
+The agent looks up the installed API with `python -m rapids_singlecell_skills.api`, so run it in the same environment as rapids-singlecell.
+
 ## 2. Check the GPU environment
 
 Before starting Jupyter, verify RMM, GPU/CUDA execution, the RSC import, native extensions, and a representative RSC kernel:
@@ -57,7 +60,7 @@ rapids-singlecell-check-kernel
 rapids-singlecell-check-kernel --mode managed  # planned oversubscription
 ```
 
-The preflight is disposable, so configure RMM again at the start of the notebook.
+The preflight is disposable, so configure RMM again at the start of the notebook or script.
 
 ## Bootstrap from a standalone skill
 
