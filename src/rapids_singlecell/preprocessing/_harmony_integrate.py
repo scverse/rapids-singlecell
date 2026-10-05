@@ -176,6 +176,8 @@ def harmony_integrate(
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
+        The blocks are drawn once per call and visited in a rotating order
+        (the reference implementations redraw them every iteration).
     shuffle_chunk_size
         Cells are assigned to the random update blocks in runs of this many
         neighbouring cells of the same batch, so the GPU writes contiguous rows.

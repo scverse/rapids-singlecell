@@ -744,3 +744,10 @@ __global__ void subtract_kernel(T* __restrict__ out,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] -= values[i];
 }
+
+template <typename T>
+__global__ void add_kernel(T* __restrict__ out, const T* __restrict__ values,
+                           int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += values[i];
+}

@@ -392,6 +392,7 @@ def harmonize(
             n_covariates=n_covariates,
             n_joint_categories=n_joint_categories,
             kernel_seed=kernel_seed + i * 1000003,
+            partition=i == 0,
             shuffle_chunk_size=shuffle_chunk_size,
             stabilized_penalty=stabilized_penalty,
             workspace=workspace,
@@ -622,8 +623,8 @@ def _allocate_clustering_workspace(
         "block_cat_offsets": cp.empty(
             n_blocks * n_groups + 1 + n_groups + 1, dtype=cp.int32
         ),
-        # Double-buffered block hold-out counts.
-        "holdout_counts": cp.empty((2, n_groups, n_clusters), dtype=dtype),
+        # Each block's counts in O (the blocks are fixed per harmonize call).
+        "block_counts": cp.empty((n_blocks, n_groups, n_clusters), dtype=dtype),
         "assign_partial": cp.empty(n_tiles * n_clusters, dtype=dtype),
     }
     if n_covariates > 1:
@@ -667,6 +668,7 @@ def _clustering(
     kernel_seed: int,
     shuffle_chunk_size: int,
     stabilized_penalty: bool,
+    partition: bool = True,
     workspace: dict,
 ) -> None:
     """
@@ -696,6 +698,7 @@ def _clustering(
         seed=kernel_seed & 0xFFFFFFFF,
         stabilized=stabilized_penalty,
         shuffle_chunk=shuffle_chunk_size,
+        partition=partition,
         stream=cp.cuda.get_current_stream().ptr,
         handle=cp.cuda.device.get_cublas_handle(),
     )

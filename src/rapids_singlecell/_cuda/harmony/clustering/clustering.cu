@@ -105,7 +105,7 @@ struct ClusteringArgs {
     uint8_t* scatter_workspace;
     T* objective_partials;
     int* block_cat_offsets;  // n_blocks x groups + 1, then one block's tiles
-    T* holdout_counts;       // 2 x groups x K
+    T* block_counts;         // blocks x groups x K: each block's counts in O
     T* assign_partial;       // assignment tile column sums
     size_t assign_partial_size;
     float* tile_partials;  // bfloat16: cuTile R^T Z partials
@@ -130,48 +130,10 @@ struct ClusteringArgs {
     int shuffle_chunk;  // cells per shuffled run
     cudaStream_t stream;
     cublasHandle_t handle;
+    bool partition;  // draw the blocks and their counts (first call)
 };
 
 // ---------- Clustering loop ----------
-
-// Side stream with double-buffered hold-out counts: `held` marks a buffer as
-// filled, `used` as consumed by the main stream.
-struct HoldoutStream {
-    cudaStream_t stream = nullptr;
-    cudaEvent_t ready = nullptr, held[2] = {}, used[2] = {};
-    bool pending_use[2] = {false, false};
-    HoldoutStream() {
-        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-                   "hold-out stream");
-        for (cudaEvent_t* e : {&ready, &held[0], &held[1], &used[0], &used[1]})
-            cuda_check(cudaEventCreateWithFlags(e, cudaEventDisableTiming),
-                       "hold-out event");
-    }
-    ~HoldoutStream() {
-        cudaStreamSynchronize(stream);
-        for (cudaEvent_t e : {ready, held[0], held[1], used[0], used[1]})
-            cudaEventDestroy(e);
-        cudaStreamDestroy(stream);
-    }
-    void record_ready(cudaStream_t main) {
-        cudaEventRecord(ready, main);
-        cudaStreamWaitEvent(stream, ready, 0);
-    }
-    void begin_holdout(int buffer) {
-        if (pending_use[buffer]) cudaStreamWaitEvent(stream, used[buffer], 0);
-        pending_use[buffer] = false;
-    }
-    void end_holdout(int buffer) {
-        cudaEventRecord(held[buffer], stream);
-    }
-    void wait_holdout(int buffer, cudaStream_t main) {
-        cudaStreamWaitEvent(main, held[buffer], 0);
-    }
-    void release_holdout(int buffer, cudaStream_t main) {
-        cudaEventRecord(used[buffer], main);
-        pending_use[buffer] = true;
-    }
-};
 
 // Same iteration as the general loop, without the N x K similarity matrix,
 // block gathers or column sums: each block is held out of O and added back by
@@ -328,8 +290,8 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         throw std::invalid_argument(
             "fused clustering assign_partial is too small");
 
-    if (!a.holdout_counts)
-        throw std::invalid_argument("fused clustering requires holdout_counts");
+    if (!a.block_counts)
+        throw std::invalid_argument("fused clustering needs block_counts");
     int ob_total = n_groups * a.n_clusters;
     auto marginal_counts = [&]() {
         if (multi)
@@ -337,30 +299,18 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                 a.O_joint, a.marginal_joint_offsets, a.marginal_joint_indices,
                 a.O, a.n_batches, a.n_clusters, n_sm, a.stream);
     };
-    HoldoutStream side;
-    std::vector<T> objectives;
-    constexpr int WINDOW_SIZE = 3;
-    for (int iter = 0; iter < a.max_iter; iter++) {
-        if constexpr (std::is_same_v<RT, __nv_bfloat16>)
-            cuda_check(harmony_cutile::rtz(R, a.Z_norm, a.n_cells, a.n_clusters,
-                                           a.n_pcs, a.tile_partials, a.Y,
-                                           a.n_pcs, a.stream),
-                       "cuTile centroids");
-        else
-            cublas_check_status(
-                cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, a.n_pcs,
-                               a.n_clusters, a.n_cells, &one, a.Z_norm, a.n_pcs,
-                               R, a.n_clusters, &zero, a.Y, a.n_pcs),
-                "cublas_gemm(centroids)");
-        l2_row_normalize_kernel<T>
-            <<<a.n_clusters, warp_aligned_bdim(a.n_pcs), 0, a.stream>>>(
-                a.Y, a.Y_norm, a.n_clusters, a.n_pcs);
-        CUDA_CHECK_LAST_ERROR(l2_row_normalize_kernel);
-
-        // Shuffle, then order each block's cells by category (stable).
+    auto block_rows = [&](int blk) {
+        return std::max(0,
+                        std::min(a.block_size, a.n_cells - blk * a.block_size));
+    };
+    if (a.partition) {
+        // The blocks are drawn once per harmonize call: shuffle in runs of
+        // cells, order each block's cells by category (stable), and keep each
+        // block's counts, so later passes hold a block out without re-reading
+        // R or re-sorting.
         pcg_hash_kernel<<<grid_1d(a.n_cells, n_sm), BLOCK_DIM_1D, 0,
                           a.stream>>>(a.sort_keys, a.idx_list, a.n_cells,
-                                      a.seed + iter, a.shuffle_chunk);
+                                      a.seed, a.shuffle_chunk);
         CUDA_CHECK_LAST_ERROR(pcg_hash_kernel);
         cuda_check(cub::DeviceRadixSort::SortPairs(
                        a.cub_temp, cub_temp_bytes, a.sort_keys, a.sort_keys_alt,
@@ -381,39 +331,50 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
             reinterpret_cast<const int*>(a.sort_keys_alt), a.n_cells, n_keys,
             a.block_cat_offsets);
         CUDA_CHECK_LAST_ERROR(scatter_category_offsets_kernel);
-
-        // Hold-outs read only their own block's rows, so they run ahead on
-        // the side stream while earlier blocks are assigned; the main stream
-        // applies them to O in block order.
-        side.record_ready(a.stream);
-        auto holdout = [&](int blk) {
-            T* H = a.holdout_counts + (size_t)(blk & 1) * ob_total;
-            side.begin_holdout(blk & 1);
-            cudaMemsetAsync(H, 0, ob_total * sizeof(T), side.stream);
+        cudaMemsetAsync(a.block_counts, 0,
+                        (size_t)n_blocks * ob_total * sizeof(T), a.stream);
+        for (int blk = 0; blk < n_blocks; ++blk) {
             const int* offsets = a.block_cat_offsets + (size_t)blk * n_groups;
             scatter_tile_offsets_kernel<<<1, SCATTER_SCAN_THREADS, 0,
-                                          side.stream>>>(offsets, n_groups,
-                                                         tiles);
+                                          a.stream>>>(offsets, n_groups, tiles);
             CUDA_CHECK_LAST_ERROR(scatter_tile_offsets_kernel);
-            scatter_reduce_tiles<T>(
-                R, std::min(a.block_size, a.n_cells - blk * a.block_size),
-                a.n_clusters, n_groups, a.idx_list, offsets, tiles, partial, 1,
-                H, side.stream);
-            side.end_holdout(blk & 1);
-        };
-        for (int blk = 0; blk < std::min(2, n_blocks); ++blk) holdout(blk);
-        for (int blk = 0; blk < n_blocks; ++blk) {
-            int pos = blk * a.block_size;
-            int bs = std::min(a.block_size, a.n_cells - pos);
+            if (block_rows(blk) > 0)
+                scatter_reduce_tiles<T>(
+                    R, block_rows(blk), a.n_clusters, n_groups, a.idx_list,
+                    offsets, tiles, partial, 1,
+                    a.block_counts + (size_t)blk * ob_total, a.stream);
+        }
+    }
+    std::vector<T> objectives;
+    constexpr int WINDOW_SIZE = 3;
+    for (int iter = 0; iter < a.max_iter; iter++) {
+        if constexpr (std::is_same_v<RT, __nv_bfloat16>)
+            cuda_check(harmony_cutile::rtz(R, a.Z_norm, a.n_cells, a.n_clusters,
+                                           a.n_pcs, a.tile_partials, a.Y,
+                                           a.n_pcs, a.stream),
+                       "cuTile centroids");
+        else
+            cublas_check_status(
+                cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, a.n_pcs,
+                               a.n_clusters, a.n_cells, &one, a.Z_norm, a.n_pcs,
+                               R, a.n_clusters, &zero, a.Y, a.n_pcs),
+                "cublas_gemm(centroids)");
+        l2_row_normalize_kernel<T>
+            <<<a.n_clusters, warp_aligned_bdim(a.n_pcs), 0, a.stream>>>(
+                a.Y, a.Y_norm, a.n_clusters, a.n_pcs);
+        CUDA_CHECK_LAST_ERROR(l2_row_normalize_kernel);
+
+        // Blocks in a rotated order; each is held out of O with its stored
+        // counts and added back with its new ones.
+        int shift = (int)((a.seed + (unsigned)iter) % (unsigned)n_blocks);
+        int blocks_1d = (ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
+        for (int step = 0; step < n_blocks; ++step) {
+            int blk = (step + shift) % n_blocks;
             const int* offsets = a.block_cat_offsets + (size_t)blk * n_groups;
-            side.wait_holdout(blk & 1, a.stream);
-            subtract_kernel<T><<<(ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
-                                 BLOCK_DIM_1D, 0, a.stream>>>(
-                O_group, a.holdout_counts + (size_t)(blk & 1) * ob_total,
-                ob_total);
+            T* stored = a.block_counts + (size_t)blk * ob_total;
+            subtract_kernel<T><<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
+                O_group, stored, ob_total);
             CUDA_CHECK_LAST_ERROR(subtract_kernel);
-            side.release_holdout(blk & 1, a.stream);
-            if (blk + 2 < n_blocks) holdout(blk + 2);
             marginal_counts();
             penalty_from_counts(a.O, a.Pr_b, a.theta, a.E, a.penalty,
                                 a.n_batches, a.n_clusters, a.stabilized,
@@ -425,12 +386,17 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                                    n_groups, a.n_clusters, a.group_penalty);
                 CUDA_CHECK_LAST_ERROR(joint_log_penalty_kernel);
             }
-            fused_assign_pass(a.Z_norm, a.Y_norm, group_penalty, a.idx_list,
-                              offsets, bs, n_groups, assign_tiles,
-                              a.assign_partial, assign_capacity, R,
-                              a.objective_partials, O_group, term, a.sigma,
-                              a.n_pcs, a.n_clusters, a.stream, multi,
-                              a.y_t_general, a.col_workspace, a.force_general);
+            cudaMemsetAsync(stored, 0, ob_total * sizeof(T), a.stream);
+            if (block_rows(blk) > 0)
+                fused_assign_pass(
+                    a.Z_norm, a.Y_norm, group_penalty, a.idx_list, offsets,
+                    block_rows(blk), n_groups, assign_tiles, a.assign_partial,
+                    assign_capacity, R, a.objective_partials, stored, term,
+                    a.sigma, a.n_pcs, a.n_clusters, a.stream, multi,
+                    a.y_t_general, a.col_workspace, a.force_general);
+            add_kernel<T><<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
+                O_group, stored, ob_total);
+            CUDA_CHECK_LAST_ERROR(add_kernel);
         }
         marginal_counts();
         penalty_from_counts(a.O, a.Pr_b, a.theta, a.E, (T*)nullptr, a.n_batches,
@@ -497,7 +463,7 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<uint8_t, Device> scatter_workspace,
            gpu_array_c<T, Device> objective_partials,
            gpu_array_c<int, Device> block_cat_offsets,
-           gpu_array_c<T, Device> holdout_counts,
+           gpu_array_c<T, Device> block_counts,
            gpu_array_c<T, Device> assign_partial,
            std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
            Opt tile_partials, Ints joint_codes, Ints joint_cats,
@@ -507,7 +473,7 @@ static void register_clustering_loop(nb::module_& m) {
            int n_batches, int n_covariates, int n_joint_categories, int n_first,
            int block_size, double sigma, double tol, int max_iter,
            unsigned int seed, bool stabilized, int shuffle_chunk,
-           std::uintptr_t stream, std::uintptr_t handle) {
+           std::uintptr_t stream, std::uintptr_t handle, bool partition) {
             auto ptr = [](auto& a) { return a ? a->data() : nullptr; };
             ClusteringArgs<T> a{
                 Z_norm.data(),
@@ -538,7 +504,7 @@ static void register_clustering_loop(nb::module_& m) {
                 scatter_workspace.data(),
                 objective_partials.data(),
                 block_cat_offsets.data(),
-                holdout_counts.data(),
+                block_counts.data(),
                 assign_partial.data(),
                 assign_partial.size(),
                 tile_partials ? reinterpret_cast<float*>(tile_partials->data())
@@ -562,6 +528,7 @@ static void register_clustering_loop(nb::module_& m) {
                 std::max(1, shuffle_chunk),
                 (cudaStream_t)stream,
                 (cublasHandle_t)handle,
+                partition,
             };
             fused_clustering_loop_impl(a);
         },
@@ -569,7 +536,7 @@ static void register_clustering_loop(nb::module_& m) {
         "theta"_a, "Y"_a, "Y_norm"_a, "idx_list"_a, "idx_list_alt"_a,
         "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a, "penalty"_a,
         "obj_scalar"_a, "last_obj"_a, "scatter_workspace"_a,
-        "objective_partials"_a, "block_cat_offsets"_a, "holdout_counts"_a,
+        "objective_partials"_a, "block_cat_offsets"_a, "block_counts"_a,
         "assign_partial"_a, "R_bf16"_a = nb::none(),
         "tile_partials"_a = nb::none(), "joint_codes"_a = nb::none(),
         "joint_cats"_a = nb::none(), "marginal_joint_offsets"_a = nb::none(),
@@ -579,7 +546,7 @@ static void register_clustering_loop(nb::module_& m) {
         "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a = 1,
         "n_joint_categories"_a = 0, "n_first"_a = 0, "block_size"_a, "sigma"_a,
         "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a, "shuffle_chunk"_a = 1,
-        "stream"_a = 0, "handle"_a);
+        "stream"_a = 0, "handle"_a, "partition"_a = true);
 }
 
 template <typename T, typename Device>
