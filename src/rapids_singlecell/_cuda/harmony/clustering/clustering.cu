@@ -70,6 +70,44 @@ static inline void materialize_marginal_from_joint(
     CUDA_CHECK_LAST_ERROR(materialize_marginal_from_joint_kernel);
 }
 
+// ---------- Update blocks ----------
+
+// The update blocks of a harmonize call: cells shuffled in runs of `chunk`,
+// cut into blocks of `block_size`, each block's cells ordered by group
+// (stable). idx_list holds the cells in that order, block_cat_offsets the CSR
+// over keys block * n_groups + group.
+static void draw_blocks(const int* group_codes, int n_cells, int n_groups,
+                        int block_size, int n_blocks, unsigned int seed,
+                        int chunk, int* idx_list, int* block_cat_offsets,
+                        int* idx_list_alt, unsigned int* keys,
+                        unsigned int* keys_alt, uint8_t* cub_temp,
+                        size_t cub_bytes, cudaStream_t stream) {
+    int device, n_sm;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device);
+    if (n_blocks < 1) n_blocks = (n_cells + block_size - 1) / block_size;
+    int n_keys = n_blocks * n_groups;
+    pcg_hash_kernel<<<grid_1d(n_cells, n_sm), BLOCK_DIM_1D, 0, stream>>>(
+        keys, idx_list, n_cells, seed, std::max(1, chunk));
+    CUDA_CHECK_LAST_ERROR(pcg_hash_kernel);
+    cuda_check(cub::DeviceRadixSort::SortPairs(cub_temp, cub_bytes, keys,
+                                               keys_alt, idx_list, idx_list_alt,
+                                               n_cells, 0, 32, stream),
+               "cub radix sort");
+    block_category_keys_kernel<<<grid_1d(n_cells, n_sm), BLOCK_DIM_1D, 0,
+                                 stream>>>(idx_list_alt, group_codes, keys,
+                                           n_cells, block_size, n_groups);
+    CUDA_CHECK_LAST_ERROR(block_category_keys_kernel);
+    cuda_check(cub::DeviceRadixSort::SortPairs(
+                   cub_temp, cub_bytes, keys, keys_alt, idx_list_alt, idx_list,
+                   n_cells, 0, scatter_category_bits(n_keys), stream),
+               "cub block-category sort");
+    scatter_category_offsets_kernel<<<(n_keys + 127) / 128, 128, 0, stream>>>(
+        reinterpret_cast<const int*>(keys_alt), n_cells, n_keys,
+        block_cat_offsets);
+    CUDA_CHECK_LAST_ERROR(scatter_category_offsets_kernel);
+}
+
 // ---------- Clustering arguments ----------
 
 template <typename T>
@@ -95,10 +133,6 @@ struct ClusteringArgs {
     T* Y;
     T* Y_norm;
     int* idx_list;
-    int* idx_list_alt;
-    unsigned int* sort_keys;
-    unsigned int* sort_keys_alt;
-    uint8_t* cub_temp;
     T* penalty;
     T* obj_scalar;
     T* last_obj;
@@ -130,7 +164,7 @@ struct ClusteringArgs {
     int shuffle_chunk;  // cells per shuffled run
     cudaStream_t stream;
     cublasHandle_t handle;
-    bool partition;  // draw the blocks and their counts (first call)
+    bool count_blocks;  // first call: fill block_counts from R
 };
 
 // ---------- Clustering loop ----------
@@ -254,7 +288,6 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         throw std::invalid_argument(
             "fused clustering requires block_cat_offsets");
 
-    size_t cub_temp_bytes = get_cub_sort_temp_bytes(a.n_cells);
     cublasHandle_t handle = a.handle;
     cublas_check_status(cublasSetStream(handle, a.stream), "cublasSetStream");
     T term = T(-2) / a.sigma;
@@ -277,7 +310,6 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
     const T* group_penalty = multi ? a.group_penalty : a.penalty;
     int n_blocks = (a.n_cells + a.block_size - 1) / a.block_size;
     int n_keys = n_blocks * n_groups;
-    int key_bits = scatter_category_bits(n_keys);
     int* tiles = reinterpret_cast<int*>(a.scatter_workspace);
     T* partial = reinterpret_cast<T*>(a.scatter_workspace +
                                       scatter_grouped_int_bytes(n_groups));
@@ -303,34 +335,10 @@ static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         return std::max(0,
                         std::min(a.block_size, a.n_cells - blk * a.block_size));
     };
-    if (a.partition) {
-        // The blocks are drawn once per harmonize call: shuffle in runs of
-        // cells, order each block's cells by category (stable), and keep each
-        // block's counts, so later passes hold a block out without re-reading
-        // R or re-sorting.
-        pcg_hash_kernel<<<grid_1d(a.n_cells, n_sm), BLOCK_DIM_1D, 0,
-                          a.stream>>>(a.sort_keys, a.idx_list, a.n_cells,
-                                      a.seed, a.shuffle_chunk);
-        CUDA_CHECK_LAST_ERROR(pcg_hash_kernel);
-        cuda_check(cub::DeviceRadixSort::SortPairs(
-                       a.cub_temp, cub_temp_bytes, a.sort_keys, a.sort_keys_alt,
-                       a.idx_list, a.idx_list_alt, a.n_cells, 0, 32, a.stream),
-                   "cub radix sort");
-        block_category_keys_kernel<<<grid_1d(a.n_cells, n_sm), BLOCK_DIM_1D, 0,
-                                     a.stream>>>(a.idx_list_alt, group_codes,
-                                                 a.sort_keys, a.n_cells,
-                                                 a.block_size, n_groups);
-        CUDA_CHECK_LAST_ERROR(block_category_keys_kernel);
-        cuda_check(
-            cub::DeviceRadixSort::SortPairs(
-                a.cub_temp, cub_temp_bytes, a.sort_keys, a.sort_keys_alt,
-                a.idx_list_alt, a.idx_list, a.n_cells, 0, key_bits, a.stream),
-            "cub block-category sort");
-        scatter_category_offsets_kernel<<<(n_keys + 127) / 128, 128, 0,
-                                          a.stream>>>(
-            reinterpret_cast<const int*>(a.sort_keys_alt), a.n_cells, n_keys,
-            a.block_cat_offsets);
-        CUDA_CHECK_LAST_ERROR(scatter_category_offsets_kernel);
+    if (a.count_blocks) {
+        // The blocks (drawn once per harmonize call, see draw_blocks) keep
+        // their counts, so later passes hold a block out without re-reading
+        // R.
         cudaMemsetAsync(a.block_counts, 0,
                         (size_t)n_blocks * ob_total * sizeof(T), a.stream);
         for (int blk = 0; blk < n_blocks; ++blk) {
@@ -454,10 +462,6 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<const int, Device> cats,
            gpu_array_c<const T, Device> theta, gpu_array_c<T, Device> Y,
            gpu_array_c<T, Device> Y_norm, gpu_array_c<int, Device> idx_list,
-           gpu_array_c<int, Device> idx_list_alt,
-           gpu_array_c<unsigned int, Device> sort_keys,
-           gpu_array_c<unsigned int, Device> sort_keys_alt,
-           gpu_array_c<uint8_t, Device> cub_temp,
            gpu_array_c<T, Device> penalty, gpu_array_c<T, Device> obj_scalar,
            gpu_array_c<T, Device> last_obj,
            gpu_array_c<uint8_t, Device> scatter_workspace,
@@ -473,7 +477,7 @@ static void register_clustering_loop(nb::module_& m) {
            int n_batches, int n_covariates, int n_joint_categories, int n_first,
            int block_size, double sigma, double tol, int max_iter,
            unsigned int seed, bool stabilized, int shuffle_chunk,
-           std::uintptr_t stream, std::uintptr_t handle, bool partition) {
+           std::uintptr_t stream, std::uintptr_t handle, bool count_blocks) {
             auto ptr = [](auto& a) { return a ? a->data() : nullptr; };
             ClusteringArgs<T> a{
                 Z_norm.data(),
@@ -494,10 +498,6 @@ static void register_clustering_loop(nb::module_& m) {
                 Y.data(),
                 Y_norm.data(),
                 idx_list.data(),
-                idx_list_alt.data(),
-                sort_keys.data(),
-                sort_keys_alt.data(),
-                cub_temp.data(),
                 penalty.data(),
                 obj_scalar.data(),
                 last_obj.data(),
@@ -528,25 +528,24 @@ static void register_clustering_loop(nb::module_& m) {
                 std::max(1, shuffle_chunk),
                 (cudaStream_t)stream,
                 (cublasHandle_t)handle,
-                partition,
+                count_blocks,
             };
             fused_clustering_loop_impl(a);
         },
         "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "cats"_a,
-        "theta"_a, "Y"_a, "Y_norm"_a, "idx_list"_a, "idx_list_alt"_a,
-        "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a, "penalty"_a,
-        "obj_scalar"_a, "last_obj"_a, "scatter_workspace"_a,
-        "objective_partials"_a, "block_cat_offsets"_a, "block_counts"_a,
-        "assign_partial"_a, "R_bf16"_a = nb::none(),
-        "tile_partials"_a = nb::none(), "joint_codes"_a = nb::none(),
-        "joint_cats"_a = nb::none(), "marginal_joint_offsets"_a = nb::none(),
+        "theta"_a, "Y"_a, "Y_norm"_a, "idx_list"_a, "penalty"_a, "obj_scalar"_a,
+        "last_obj"_a, "scatter_workspace"_a, "objective_partials"_a,
+        "block_cat_offsets"_a, "block_counts"_a, "assign_partial"_a,
+        "R_bf16"_a = nb::none(), "tile_partials"_a = nb::none(),
+        "joint_codes"_a = nb::none(), "joint_cats"_a = nb::none(),
+        "marginal_joint_offsets"_a = nb::none(),
         "marginal_joint_indices"_a = nb::none(), "O_joint"_a = nb::none(),
         "group_penalty"_a = nb::none(), "y_t_general"_a = nb::none(),
         "col_workspace"_a = nb::none(), "force_general"_a = false, "n_cells"_a,
         "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a = 1,
         "n_joint_categories"_a = 0, "n_first"_a = 0, "block_size"_a, "sigma"_a,
         "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a, "shuffle_chunk"_a = 1,
-        "stream"_a = 0, "handle"_a, "partition"_a = true);
+        "stream"_a = 0, "handle"_a, "count_blocks"_a = true);
 }
 
 template <typename T, typename Device>
@@ -773,6 +772,28 @@ static void register_fused_initialize(nb::module_& m) {
 
 template <typename Device>
 void register_bindings(nb::module_& m) {
+    m.def(
+        "draw_blocks",
+        [](gpu_array_c<const int, Device> group_codes,
+           gpu_array_c<int, Device> idx_list,
+           gpu_array_c<int, Device> block_cat_offsets,
+           gpu_array_c<int, Device> idx_list_alt,
+           gpu_array_c<unsigned int, Device> sort_keys,
+           gpu_array_c<unsigned int, Device> sort_keys_alt,
+           gpu_array_c<uint8_t, Device> cub_temp, int n_groups, int block_size,
+           int n_blocks, unsigned int seed, int shuffle_chunk,
+           std::uintptr_t stream) {
+            draw_blocks(group_codes.data(), (int)group_codes.size(), n_groups,
+                        block_size, n_blocks, seed, shuffle_chunk,
+                        idx_list.data(), block_cat_offsets.data(),
+                        idx_list_alt.data(), sort_keys.data(),
+                        sort_keys_alt.data(), cub_temp.data(), cub_temp.size(),
+                        (cudaStream_t)stream);
+        },
+        "group_codes"_a, nb::kw_only(), "idx_list"_a, "block_cat_offsets"_a,
+        "idx_list_alt"_a, "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a,
+        "n_groups"_a, "block_size"_a, "n_blocks"_a = 0, "seed"_a,
+        "shuffle_chunk"_a = 1, "stream"_a = 0);
     m.def(
         "cutile_bf16_available",
         [](int n_pcs, int n_clusters) {
