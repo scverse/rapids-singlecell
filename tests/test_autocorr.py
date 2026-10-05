@@ -145,6 +145,31 @@ def test_autocorr_dtype_parameter():
     )
 
 
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("n_perms", [None, 20])
+def test_autocorr_dense_int64_graph_indices(mode, dtype, n_perms):
+    """Dense data with an int64-indexed graph matches the int32-indexed result."""
+    from anndata import AnnData
+    from sklearn.neighbors import kneighbors_graph
+
+    rng = np.random.default_rng(0)
+    X = rng.random((100, 4)).astype(np.float32)
+    graph = sparse.csr_matrix(kneighbors_graph(rng.random((100, 2)), n_neighbors=5))
+    stat = "I" if mode == "moran" else "C"
+    scores = {}
+    for idx_dtype in (np.int32, np.int64):
+        g = graph.copy()
+        g.indices, g.indptr = g.indices.astype(idx_dtype), g.indptr.astype(idx_dtype)
+        adata = AnnData(X)
+        adata.obsp["spatial_connectivities"] = g
+        df = spatial_autocorr(adata, mode=mode, copy=True, n_perms=n_perms, dtype=dtype)
+        scores[idx_dtype] = df[stat].sort_index().to_numpy()
+    assert np.all(scores[np.int32] != 0)
+    # float32 scores use atomics, so reruns differ by ~1e-6 relative.
+    np.testing.assert_allclose(scores[np.int64], scores[np.int32], rtol=1e-5, atol=1e-7)
+
+
 def test_autocorr_float32_nan_raises_error():
     """Test that float32 nan/inf raises an error with helpful message."""
     from anndata import AnnData
