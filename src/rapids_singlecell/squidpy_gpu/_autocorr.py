@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import (
     TYPE_CHECKING,
     Literal,
@@ -48,6 +49,16 @@ def _to_cupy(vals, *, use_sparse: bool, dtype):
     if not sparse_gpu.isspmatrix(vals):
         vals = sparse_gpu.csr_matrix(vals.tocsr(), dtype=dtype)
     return _sparse_to_dense(vals, order="C")
+
+
+def _constant_features(data) -> np.ndarray:
+    """Mask of features whose value is the same in every observation."""
+    if sparse_gpu.issparse(data):
+        col_max = data.max(axis=0).toarray().ravel()
+        col_min = data.min(axis=0).toarray().ravel()
+    else:
+        col_max, col_min = data.max(axis=0), data.min(axis=0)
+    return cp.asnumpy(col_max == col_min)
 
 
 def spatial_autocorr(
@@ -122,7 +133,9 @@ def spatial_autocorr(
     Returns
     -------
             DataFrame containing the autocorrelation scores, p-values, and corrected p-values for each gene. \
-            If `copy` is False, the results are stored in `adata.uns` and None is returned.
+            If `copy` is False, the results are stored in `adata.uns` and None is returned. \
+            Genes that are constant across observations have no defined score; they get NaN \
+            statistics and p-values, are left out of the multiple-testing correction, and trigger a warning.
     """
     adata = _extract_adata(adata, table_key=table_key)
     if genes is None:
@@ -177,6 +190,31 @@ def spatial_autocorr(
 
     data = _to_cupy(vals, use_sparse=use_sparse, dtype=compute_dtype)
 
+    # A constant gene has zero variance, so its statistic is 0/0. Score the other
+    # genes and report NaN for these, as squidpy does, instead of failing.
+    genes = np.asarray(genes)
+    constant = _constant_features(data)
+    if constant.all():
+        raise ValueError(
+            "Every selected gene is constant across observations, "
+            "so spatial autocorrelation is undefined."
+        )
+    if constant.any():
+        names = ", ".join(map(str, genes[constant][:10]))
+        more = f" and {constant.sum() - 10} more" if constant.sum() > 10 else ""
+        warnings.warn(
+            f"{constant.sum()} gene(s) are constant across observations, "
+            f"so their scores and p-values are NaN: {names}{more}.",
+            UserWarning,
+            stacklevel=2,
+        )
+        keep = cp.flatnonzero(cp.asarray(~constant))
+        # The kernels expect CSR or a C-contiguous array; column indexing gives neither.
+        if sparse_gpu.issparse(data):
+            data = data[:, keep].tocsr()
+        else:
+            data = cp.ascontiguousarray(data[:, keep])
+
     # Run full computation
     score, score_perms = _run_autocorr(data, adj_matrix_cupy, mode, n_perms, multi_gpu)
 
@@ -199,7 +237,7 @@ def spatial_autocorr(
     with np.errstate(divide="ignore"):
         pval_results = _p_value_calc(score, sims=score_perms, weights=g, params=params)
 
-    df = pd.DataFrame({params["stat"]: score, **pval_results}, index=genes)
+    df = pd.DataFrame({params["stat"]: score, **pval_results}, index=genes[~constant])
 
     if corr_method is not None:
         for pv in filter(lambda x: "pval" in x, df.columns):
@@ -208,6 +246,7 @@ def spatial_autocorr(
             )
             df[f"{pv}_{corr_method}"] = pvals_adj
 
+    df = df.reindex(genes)  # constant genes come back as NaN rows
     df.sort_values(by=params["stat"], ascending=params["ascending"], inplace=True)
     if copy:
         return df

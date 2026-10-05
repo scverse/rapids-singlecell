@@ -145,36 +145,98 @@ def test_autocorr_dtype_parameter():
     )
 
 
-def test_autocorr_float32_nan_raises_error():
-    """Test that float32 nan/inf raises an error with helpful message."""
+def _adata_with_constant_genes(*, sparse_x: bool):
+    """Random data where gene_0 is all zeros and gene_1 is a nonzero constant."""
     from anndata import AnnData
-
-    # Create data with a constant gene (zero variance) that causes nan in float32
-    np.random.seed(42)
-    n_cells = 100
-    n_genes = 5
-
-    X = np.random.rand(n_cells, n_genes).astype(np.float32)
-    # Make one gene constant - this will cause division by zero (nan)
-    X[:, 0] = 1.0
-
-    adata = AnnData(X)
-    adata.var_names = [f"gene_{i}" for i in range(n_genes)]
-
-    # Create simple connectivity
     from sklearn.neighbors import kneighbors_graph
 
-    positions = np.random.rand(n_cells, 2)
-    adj = kneighbors_graph(positions, n_neighbors=5, mode="connectivity")
-    adata.obsp["spatial_connectivities"] = adj
+    rng = np.random.default_rng(42)
+    n_cells, n_genes = 100, 6
+    X = rng.random((n_cells, n_genes)).astype(np.float32)
+    X[:, 0] = 0.0
+    X[:, 1] = 1.0
+    adata = AnnData(sparse.csr_matrix(X) if sparse_x else X)
+    adata.var_names = [f"gene_{i}" for i in range(n_genes)]
+    positions = rng.random((n_cells, 2))
+    adata.obsp["spatial_connectivities"] = kneighbors_graph(
+        positions, n_neighbors=5, mode="connectivity"
+    )
+    return adata
 
-    # Run with float32 - should raise error suggesting float64
-    with pytest.raises(ValueError, match="float64"):
-        spatial_autocorr(adata, mode="moran", copy=True, n_perms=None)
 
-    # With float64, should also raise error (for constant genes) but with bug report message
-    with pytest.raises(ValueError, match="bug report"):
-        spatial_autocorr(adata, mode="moran", copy=True, n_perms=None, dtype=np.float64)
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("sparse_x", [True, False])
+@pytest.mark.parametrize("n_perms", [None, 20])
+def test_autocorr_constant_genes_are_nan(mode, dtype, sparse_x, n_perms):
+    """Constant genes get NaN rows and a warning; the other genes are unaffected."""
+    adata = _adata_with_constant_genes(sparse_x=sparse_x)
+    stat = "I" if mode == "moran" else "C"
+
+    with pytest.warns(UserWarning, match=r"2 gene\(s\) are constant.*gene_0, gene_1"):
+        df = spatial_autocorr(adata, mode=mode, copy=True, n_perms=n_perms, dtype=dtype)
+
+    assert set(df.index) == set(adata.var_names)
+    assert df.loc[["gene_0", "gene_1"]].isna().all().all()
+    others = [f"gene_{i}" for i in range(2, 6)]
+    assert np.isfinite(df.loc[others, stat]).all()
+    assert df.index[-2:].isin(["gene_0", "gene_1"]).all()  # NaN rows sort last
+
+    # Scores and corrected p-values match a run without the constant genes.
+    ref = spatial_autocorr(
+        adata[:, others].copy(), mode=mode, copy=True, n_perms=None, dtype=dtype
+    )
+    np.testing.assert_allclose(
+        df.loc[others, stat], ref.loc[others, stat], rtol=1e-5, atol=1e-7
+    )
+    if n_perms is None:
+        np.testing.assert_allclose(
+            df.loc[others, "pval_norm_fdr_bh"],
+            ref.loc[others, "pval_norm_fdr_bh"],
+            rtol=1e-4,
+        )
+
+
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("n_perms", [None, 20])
+def test_autocorr_dense_int64_graph_indices(mode, dtype, n_perms):
+    """Dense data with an int64-indexed graph matches the int32-indexed result."""
+    from anndata import AnnData
+    from sklearn.neighbors import kneighbors_graph
+
+    rng = np.random.default_rng(0)
+    X = rng.random((100, 4)).astype(np.float32)
+    graph = sparse.csr_matrix(kneighbors_graph(rng.random((100, 2)), n_neighbors=5))
+    stat = "I" if mode == "moran" else "C"
+    scores = {}
+    for idx_dtype in (np.int32, np.int64):
+        g = graph.copy()
+        g.indices, g.indptr = g.indices.astype(idx_dtype), g.indptr.astype(idx_dtype)
+        adata = AnnData(X)
+        adata.obsp["spatial_connectivities"] = g
+        df = spatial_autocorr(adata, mode=mode, copy=True, n_perms=n_perms, dtype=dtype)
+        scores[idx_dtype] = df[stat].sort_index().to_numpy()
+    assert np.all(scores[np.int32] != 0)
+    # float32 scores use atomics, so reruns differ by ~1e-6 relative.
+    np.testing.assert_allclose(scores[np.int64], scores[np.int32], rtol=1e-5, atol=1e-7)
+
+
+def test_autocorr_all_constant_genes_raise():
+    adata = _adata_with_constant_genes(sparse_x=True)
+    with pytest.raises(ValueError, match="Every selected gene is constant"):
+        spatial_autocorr(adata, genes=["gene_0", "gene_1"], mode="moran", copy=True)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "match"), [(np.float32, "dtype=np.float64"), (np.float64, "bug report")]
+)
+def test_check_precision_issues_messages(dtype, match):
+    """The guard still raises for nan/inf that is not explained by constant genes."""
+    from rapids_singlecell.squidpy_gpu._utils import _check_precision_issues
+
+    with pytest.raises(ValueError, match=match):
+        _check_precision_issues(cp.array([0.1, cp.nan], dtype=dtype), dtype)
 
 
 @pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="Requires >= 2 GPUs")
