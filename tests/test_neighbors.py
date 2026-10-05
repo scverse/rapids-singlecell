@@ -158,6 +158,19 @@ def test_ivf_algorithm_kwds(algo):
     )
 
 
+def test_ivfflat_batched_search(monkeypatch):
+    from rapids_singlecell.preprocessing._neighbors import _helper
+
+    adata = pbmc68k_reduced()
+    # all lists probed: exact, so independent of the index's clustering
+    kwds = {"n_lists": 10, "n_probes": 10}
+    neighbors(adata, n_neighbors=15, algorithm="ivfflat", algorithm_kwds=kwds)
+    ref = adata.obsp["distances"].copy()
+    monkeypatch.setattr(_helper, "_MAX_QUERY_VALUES", 50 * 100)  # batches of 100 cells
+    neighbors(adata, n_neighbors=15, algorithm="ivfflat", algorithm_kwds=kwds)
+    assert (adata.obsp["distances"] != ref).nnz == 0
+
+
 @pytest.mark.parametrize("algo", ["nn_descent", "ivfpq"])
 def test_indices_approx_nn(algo):
     adata = pbmc68k_reduced()

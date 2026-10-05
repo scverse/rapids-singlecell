@@ -24,6 +24,7 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
+    _large_coo_to_host_csr,
     _Metrics,
 )
 from rapids_singlecell.tools._utils import _choose_representation
@@ -147,7 +148,7 @@ def neighbors(
 
         * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 if the data fits on a single GPU, otherwise sized to the data and free memory (e.g. 24 for 100M cells on 8 GPUs).
 
-        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 unbatched, 2 with automatic `n_clusters` and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` otherwise. Lower values are faster but lose neighbors at cluster boundaries.
+        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 unbatched, 2 with automatic `n_clusters` or clusters of at least 20,000 cells, and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` for smaller ones. Lower values are faster but lose neighbors at cluster boundaries.
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)). Only available for `ivf_pq` algorithm.
 
@@ -224,6 +225,8 @@ def neighbors(
         algorithm_kwds=algorithm_kwds,
     )
     knn_dist = _fix_self_distances(knn_dist, metric)
+    # free the GPU copy of the representation: the connectivities need the memory for large data
+    del X, X_contiguous
 
     params = dict(
         n_neighbors=n_neighbors,
@@ -248,7 +251,11 @@ def neighbors(
         metric=metric,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
-        connectivities = connectivities.get().tocsr()
+        connectivities = (
+            _large_coo_to_host_csr(connectivities)
+            if connectivities.format == "coo"  # gauss and jaccard return CSR
+            else connectivities.get().tocsr()
+        )
     else:
         connectivities = connectivities.tocsr().get()
 
