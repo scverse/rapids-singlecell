@@ -15,7 +15,7 @@ import pandas as pd
 from rapids_singlecell._cuda import _edistance_cuda as _ed
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
-    _copies_on_device,
+    _concat_on_device,
     _copy_to_device,
     _split_pairs,
 )
@@ -884,12 +884,10 @@ class EDistanceMetric(BaseMetric):
 
         # Phase 4: Gather on the input device (chunks are consecutive pair ranges)
         sums = [data["sums"] for data in device_data if data is not None]
-        with _copies_on_device(sums, result_device) as parts:
-            total_sums = cp.zeros(n_total_pairs, dtype=embedding.dtype)
-            if parts:
-                cp.concatenate(parts, out=total_sums)
-
-        return total_sums
+        if sums:
+            return _concat_on_device(sums, result_device)
+        with cp.cuda.Device(result_device):
+            return cp.zeros(n_total_pairs, dtype=embedding.dtype)
 
     def _pairwise_means(
         self,

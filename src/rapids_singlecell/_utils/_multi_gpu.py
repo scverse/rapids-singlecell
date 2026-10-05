@@ -107,6 +107,41 @@ def _copies_on_device(arrays: Sequence[cp.ndarray], device: int):
             cp.cuda.get_current_stream().synchronize()
 
 
+def _sum_on_device(arrays: list[cp.ndarray], device: int) -> cp.ndarray:
+    """Sum ``arrays`` on ``device``, accumulating in place into one already there.
+
+    Consumes the inputs. Remote arrays are copied one at a time, so the peak is
+    the output plus one copy.
+    """
+    total = None
+    for array in sorted(arrays, key=lambda a: a.device.id != device):
+        with _copies_on_device([array], device) as (part,):
+            if total is None:
+                total = part
+            else:
+                total += part
+        del part  # release before the next copy
+    return total
+
+
+def _concat_on_device(
+    arrays: list[cp.ndarray], device: int, axis: int = 0
+) -> cp.ndarray:
+    """Concatenate ``arrays`` on ``device``, holding one cross-device copy at a time."""
+    shape = list(arrays[0].shape)
+    shape[axis] = sum(array.shape[axis] for array in arrays)
+    with cp.cuda.Device(device):
+        out = cp.empty(shape, dtype=arrays[0].dtype)
+    start = 0
+    for array in arrays:
+        stop = start + array.shape[axis]
+        with _copies_on_device([array], device) as (part,):
+            out[(slice(None),) * axis + (slice(start, stop),)] = part
+        del part  # release before the next copy
+        start = stop
+    return out
+
+
 def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
     """Parse multi_gpu parameter into a list of device IDs.
 

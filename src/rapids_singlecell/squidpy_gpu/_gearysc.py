@@ -7,7 +7,7 @@ from cupyx.scipy import sparse
 
 from rapids_singlecell._cuda import _autocorr_cuda as _ac
 from rapids_singlecell._utils import (
-    _copies_on_device,
+    _concat_on_device,
     _copy_to_device,
     parse_device_ids,
 )
@@ -158,8 +158,7 @@ def _run_permutations_dense(
 
     # Phase 3: Gather results on the input device and cut to exact size
     perms = [dd["perms"] for dd in device_data]
-    with _copies_on_device(perms, source_device) as all_perms:
-        gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
+    gearys_C_permutations = _concat_on_device(perms, source_device)[:n_permutations]
 
     return gearys_C_permutations
 
@@ -328,8 +327,7 @@ def _run_permutations_sparse(
 
     # Phase 3: Gather results on the input device and cut to exact size
     perms = [dd["perms"] for dd in device_data]
-    with _copies_on_device(perms, source_device) as all_perms:
-        gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
+    gearys_C_permutations = _concat_on_device(perms, source_device)[:n_permutations]
 
     return gearys_C_permutations
 

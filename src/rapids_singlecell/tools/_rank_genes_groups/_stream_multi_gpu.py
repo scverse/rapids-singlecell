@@ -17,7 +17,11 @@ import numpy as np
 import scipy.sparse as sp
 
 from rapids_singlecell._cuda import _rank_stream_cuda as _rss
-from rapids_singlecell._utils import _copies_on_device, parse_device_ids
+from rapids_singlecell._utils import (
+    _concat_on_device,
+    _sum_on_device,
+    parse_device_ids,
+)
 
 if TYPE_CHECKING:
     from ._core import _RankGenes
@@ -72,19 +76,6 @@ def _shard_view(X, b0: int, b1: int):
     shard.indices = indices
     shard.indptr = indptr
     return shard
-
-
-def _sum_to_device(parts: list[cp.ndarray], device_id: int) -> cp.ndarray:
-    with _copies_on_device(parts, device_id) as local:
-        total = local[0].copy()
-        for part in local[1:]:
-            total += part
-    return total
-
-
-def _concat_to_device(parts: list[cp.ndarray], device_id: int, axis: int) -> cp.ndarray:
-    with _copies_on_device(parts, device_id) as local:
-        return cp.concatenate(local, axis=axis)
 
 
 def _host_aggr_data(data: np.ndarray) -> np.ndarray:
@@ -168,17 +159,17 @@ def stream_planes_multi(
     # Gather onto the caller's device so downstream stats math stays local.
     dev0 = cp.cuda.Device().id
     if col_shard:
-        sums = _concat_to_device([s[0] for s in shards], dev0, axis=1)
-        sqsums = _concat_to_device([s[1] for s in shards], dev0, axis=1)
+        sums = _concat_on_device([s[0] for s in shards], dev0, axis=1)
+        sqsums = _concat_on_device([s[1] for s in shards], dev0, axis=1)
         counts = (
-            _concat_to_device([s[2] for s in shards], dev0, axis=1)
+            _concat_on_device([s[2] for s in shards], dev0, axis=1)
             if comp_pts
             else None
         )
     else:
-        sums = _sum_to_device([s[0] for s in shards], dev0)
-        sqsums = _sum_to_device([s[1] for s in shards], dev0)
-        counts = _sum_to_device([s[2] for s in shards], dev0) if comp_pts else None
+        sums = _sum_on_device([s[0] for s in shards], dev0)
+        sqsums = _sum_on_device([s[1] for s in shards], dev0)
+        counts = _sum_on_device([s[2] for s in shards], dev0) if comp_pts else None
     return sums, sqsums, counts
 
 
@@ -265,24 +256,24 @@ def run_binned_hist_multi(
 
     home = cp.cuda.Device().id
     if col_shard:
-        hist = _concat_to_device([s[0] for s in shards], home, axis=0)
+        hist = _concat_on_device([s[0] for s in shards], home, axis=0)
         gsum = (
-            _concat_to_device([s[1] for s in shards], home, axis=1)
+            _concat_on_device([s[1] for s in shards], home, axis=1)
             if accumulate_means
             else None
         )
         gnnz = (
-            _concat_to_device([s[2] for s in shards], home, axis=1)
+            _concat_on_device([s[2] for s in shards], home, axis=1)
             if accumulate_means and comp_pts
             else None
         )
     else:
-        hist = _sum_to_device([s[0] for s in shards], home)
+        hist = _sum_on_device([s[0] for s in shards], home)
         gsum = (
-            _sum_to_device([s[1] for s in shards], home) if accumulate_means else None
+            _sum_on_device([s[1] for s in shards], home) if accumulate_means else None
         )
         gnnz = (
-            _sum_to_device([s[2] for s in shards], home)
+            _sum_on_device([s[2] for s in shards], home)
             if accumulate_means and comp_pts
             else None
         )
