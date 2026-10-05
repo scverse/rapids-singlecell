@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
@@ -39,6 +40,7 @@ _FUSED_MAX_PCS = 128
 # Tests: route every shape through the general assignment kernel.
 _FORCE_GENERAL_ASSIGNMENT = False
 _UPLOAD_BYTES = 1 << 28
+_UPLOAD_THREADS = 8
 
 # Each flavor inherits the stopping rules of the implementation it reproduces:
 # harmony2 follows harmonypy 2.0.0 / harmony 2.0.5 (R), harmony1 follows
@@ -486,22 +488,75 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
 
 
 def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
-    """``Z[order]`` on the GPU. Host input is uploaded in chunks and placed
-    directly, so no unsorted device copy is kept."""
+    """``Z[order]`` on the GPU. Host input is staged in pinned chunks by
+    several threads while the previous chunk is copied, and placed directly,
+    so no unsorted device copy is kept."""
     if isinstance(Z, cp.ndarray):
         return Z[order]
+    n, d = Z.shape
+    rows = max(1, _UPLOAD_BYTES // (d * Z.itemsize))
     out = cp.empty(Z.shape, dtype=Z.dtype)
     position = cp.empty_like(order)
     position[order] = cp.arange(order.size)
-    rows = max(1, _UPLOAD_BYTES // (Z.shape[1] * Z.dtype.itemsize))
-    for begin in range(0, Z.shape[0], rows):
-        end = min(begin + rows, Z.shape[0])
-        out[position[begin:end]] = cp.asarray(Z[begin:end])
+    stream = cp.cuda.get_current_stream()
+    slots = [
+        [_pinned(rows, d, Z.dtype), cp.empty((rows, d), dtype=Z.dtype), None]
+        for _ in range(2)
+    ]
+    with ThreadPoolExecutor(_UPLOAD_THREADS) as pool:
+        for j, a in enumerate(range(0, n, rows)):
+            b = min(n, a + rows)
+            host, staged, done = slots[j % 2]
+            if done is not None:
+                done.synchronize()  # the slot's previous chunk is placed
+            _parallel_copy(pool, host[: b - a], Z[a:b])
+            staged[: b - a].set(host[: b - a], stream=stream)
+            out[position[a:b]] = staged[: b - a]
+            slots[j % 2][2] = stream.record()
     if cp.isnan(out).any():
         raise ValueError(
             "Input data contains NaN values. Please handle these before running harmony_integrate."
         )
     return out
+
+
+def _pinned(rows: int, d: int, dtype) -> np.ndarray:
+    """A (rows, d) host array in pinned memory (CuPy caches these blocks)."""
+    dtype = np.dtype(dtype)
+    memory = cp.cuda.alloc_pinned_memory(rows * d * dtype.itemsize)
+    return np.frombuffer(memory, dtype, rows * d).reshape(rows, d)
+
+
+def _parallel_copy(pool: ThreadPoolExecutor, dst: np.ndarray, src: np.ndarray) -> None:
+    """``dst[...] = src`` by several threads (host memory bound)."""
+    cuts = np.linspace(0, len(src), _UPLOAD_THREADS + 1, dtype=np.int64)
+    list(pool.map(lambda a, b: np.copyto(dst[a:b], src[a:b]), cuts[:-1], cuts[1:]))
+
+
+def _download(src: cp.ndarray, out: np.ndarray) -> None:
+    """``out[...] = src`` through pinned chunks: the next chunk is copied from
+    the GPU while host threads move the previous one into ``out``."""
+    n, d = src.shape
+    rows = max(1, _UPLOAD_BYTES // (d * src.itemsize))
+    stream = cp.cuda.get_current_stream()
+    hosts = [_pinned(rows, d, src.dtype) for _ in range(2)]
+    with ThreadPoolExecutor(_UPLOAD_THREADS) as pool:
+
+        def drain(chunk, a, b, done):
+            done.synchronize()
+            _parallel_copy(pool, out[a:b], chunk)
+
+        pending = None
+        for j, a in enumerate(range(0, n, rows)):
+            b = min(n, a + rows)
+            chunk = hosts[j % 2][: b - a]
+            src[a:b].get(stream=stream, out=chunk, blocking=False)
+            ready = (chunk, a, b, stream.record())
+            if pending is not None:
+                drain(*pending)
+            pending = ready
+        if pending is not None:
+            drain(*pending)
 
 
 def _fused_assign_smem_bytes(n_pcs: int, n_clusters: int, itemsize: int) -> int:

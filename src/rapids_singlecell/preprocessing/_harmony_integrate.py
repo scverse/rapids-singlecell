@@ -205,7 +205,7 @@ def harmony_integrate(
     if bfloat16:
         dtype = np.float32
 
-    from ._harmony import harmonize
+    from ._harmony import _download, harmonize
 
     # Resolve flavor into internal flags
     if flavor not in {"harmony1", "harmony2"}:
@@ -310,4 +310,5 @@ def harmony_integrate(
     )
 
     prefault.join()
-    adata.obsm[adjusted_basis] = harmony_out.get(out=host_out)
+    _download(harmony_out, host_out)
+    adata.obsm[adjusted_basis] = host_out
