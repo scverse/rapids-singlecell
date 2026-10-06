@@ -27,10 +27,14 @@ _DEVICE_ATTRS_CACHE: dict[int, dict] = {}
 
 _CANARY = np.arange(1, 9, dtype=np.float64)
 _CANARY_POISON = -_CANARY
+# Stream-ordered pools (e.g. RMM's CudaAsyncMemoryResource) reject generic
+# cross-device copies with "invalid argument".
+_CUDA_ERROR_INVALID_VALUE = 1
 _CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217
 _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED = 705
 _CUDA_ERROR_TOO_MANY_PEERS = 711
 _PEER_ERRORS = {
+    _CUDA_ERROR_INVALID_VALUE,
     _CUDA_ERROR_PEER_ACCESS_UNSUPPORTED,
     _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED,
     _CUDA_ERROR_TOO_MANY_PEERS,
@@ -50,9 +54,7 @@ def _peer_copy_works(destination: int, source: int) -> bool:
             expected = cp.asarray(_CANARY, blocking=True)
         with cp.cuda.Device(destination):
             actual = cp.asarray(_CANARY_POISON, blocking=True)
-            with cp.cuda.Stream(non_blocking=True) as stream:
-                cp.copyto(actual, expected)
-                stream.synchronize()
+            _copy_to_device_p2p(expected, destination, out=actual)
             actual = cp.asnumpy(actual)
     except cp.cuda.runtime.CUDARuntimeError as error:
         if error.status in _PEER_ERRORS:
@@ -61,16 +63,34 @@ def _peer_copy_works(destination: int, source: int) -> bool:
     return bool(np.array_equal(actual, _CANARY))
 
 
-def _copy_to_device_p2p(array: cp.ndarray, destination: int) -> cp.ndarray:
-    """Copy an array directly to another GPU."""
+def _copy_to_device_p2p(
+    array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None
+) -> cp.ndarray:
+    """Copy an array directly to another GPU (into ``out`` if given)."""
     # The copy runs on the destination stream; make it wait for the work that
     # produced ``array`` on the source stream (cudaMemcpyAsync does not).
+    # cudaMemcpyPeerAsync also works for stream-ordered pool memory, which
+    # CuPy's generic cross-device copies reject.
     with cp.cuda.Device(array.device.id):
+        source = cp.ascontiguousarray(array)
         ready = cp.cuda.Event(block=False, disable_timing=True)
         ready.record()
     with cp.cuda.Device(destination):
-        cp.cuda.get_current_stream().wait_event(ready)
-        return cp.asarray(array)
+        stream = cp.cuda.get_current_stream()
+        stream.wait_event(ready)
+        if out is None:
+            out = cp.empty(array.shape, dtype=array.dtype)
+        cp.cuda.runtime.memcpyPeerAsync(
+            out.data.ptr,
+            destination,
+            source.data.ptr,
+            source.device.id,
+            source.nbytes,
+            stream.ptr,
+        )
+        if source is not array:
+            stream.synchronize()  # the contiguous temporary must outlive it
+        return out
 
 
 def _copy_to_device_via_host(array: cp.ndarray, destination: int) -> cp.ndarray:

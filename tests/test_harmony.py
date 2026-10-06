@@ -1026,3 +1026,46 @@ def test_harmony_many_clusters(key, dtype):
         outputs.append(adata.obsm["X_pca_harmony"])
     assert np.isfinite(outputs[0]).all()
     assert outputs[0].tobytes() == outputs[1].tobytes()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize(
+    ("key", "dtype"),
+    [("batch", "float32"), ("batch", "bfloat16"), (["batch", "second"], "float64")],
+)
+def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype):
+    # Every sum is exact and the blocks and segments follow the global cell
+    # order, so two GPUs give the bits of one.
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires two GPUs")
+    import rapids_singlecell.preprocessing._harmony._multi_gpu as multi_gpu_module
+
+    rng = np.random.default_rng(3)
+    n_cells = 20_000
+    obs = pd.DataFrame(
+        {"batch": rng.integers(0, 5, n_cells), "second": rng.integers(0, 3, n_cells)},
+        index=np.arange(n_cells).astype(str),
+    )
+    X = rng.standard_normal((n_cells, 17)) + obs["batch"].to_numpy()[:, None]
+
+    def run(device_input=False, **kwargs):
+        adata = ad.AnnData(obs=obs.astype("category"), obsm={"X_pca": X.copy()})
+        if device_input:
+            adata.obsm["X_pca"] = cp.asarray(X)
+        rsc.pp.harmony_integrate(
+            adata,
+            key,
+            dtype=dtype,
+            rng=734,
+            n_clusters=20,
+            max_iter_harmony=3,
+            **kwargs,
+        )
+        return adata.obsm["X_pca_harmony"]
+
+    one = run()
+    assert run(multi_gpu=[0, 1]).tobytes() == one.tobytes()
+    assert run(multi_gpu=[0, 1], device_input=True).tobytes() == one.tobytes()
+    # Without validated peer copies everything moves through the host.
+    monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)
+    assert run(multi_gpu=[0, 1]).tobytes() == one.tobytes()
