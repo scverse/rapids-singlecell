@@ -154,10 +154,9 @@ __global__ void kd_search(const T* points, const T* tree, const int* index,
             if constexpr (knn) {
                 if (kd_before(distance, column, best[size - 1],
                               best_columns[size - 1])) {
-                    int slot = size - 1;
-                    // Memory shifts, loading columns only on ties; registers
-                    // need fixed indices, so they bubble below.
-                    if constexpr (MAXK == 0)
+                    if constexpr (MAXK == 0) {
+                        // Memory shifts, loading columns only on ties.
+                        int slot = size - 1;
                         for (; slot > 0 && (distance < best[slot - 1] ||
                                             (distance == best[slot - 1] &&
                                              column < best_columns[slot - 1]));
@@ -165,16 +164,22 @@ __global__ void kd_search(const T* points, const T* tree, const int* index,
                             best[slot] = best[slot - 1];
                             best_columns[slot] = best_columns[slot - 1];
                         }
-                    best[slot] = distance;
-                    best_columns[slot] = column;
+                        best[slot] = distance;
+                        best_columns[slot] = column;
+                    } else {
+                        // Registers need fixed indices: carry the new pair
+                        // down the sorted list (CUDA 12.2 drops the distance
+                        // of a store-then-bubble insertion).
+                        T carry = distance;
+                        C carry_column = column;
 #pragma unroll
-                    for (int j = MAXK - 1; j > 0; --j)
-                        if (kd_before(best[j], best_columns[j], best[j - 1],
-                                      best_columns[j - 1])) {
-                            cuda::std::swap(best[j], best[j - 1]);
-                            cuda::std::swap(best_columns[j],
-                                            best_columns[j - 1]);
-                        }
+                        for (int j = 0; j < MAXK; ++j)
+                            if (kd_before(carry, carry_column, best[j],
+                                          best_columns[j])) {
+                                cuda::std::swap(carry, best[j]);
+                                cuda::std::swap(carry_column, best_columns[j]);
+                            }
+                    }
                     limit = best[size - 1];
                 }
             } else if (distance <= radius ||
