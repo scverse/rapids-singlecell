@@ -12,7 +12,7 @@
 - `rapids-singlecell-check-kernel` runs in a disposable process.
   `--mode managed` checks the oversubscription route.
 - Fix import, ABI, driver and GPU visibility failures before starting Jupyter.
-  The notebook must still configure RMM itself.
+  The notebook or script must still configure RMM itself.
 
 ## Kernel-less execution
 

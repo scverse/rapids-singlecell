@@ -1,6 +1,6 @@
 ---
 name: rapids-singlecell
-description: "GPU single-cell and spatial analysis with rapids-singlecell (rsc), the GPU port of scanpy with parts of squidpy, pertpy and decoupler. Use for QC, doublets, normalization, HVGs, PCA, integration, neighbors, clustering, UMAP, markers, annotation, pseudobulk DE, pathway scoring, CRISPR screens, spatial statistics and niches, out-of-core or multi-GPU runs, and GPU runtime setup."
+description: "Read before writing any rapids-singlecell code (`import rapids_singlecell as rsc`) or running scanpy-, squidpy-, decoupler- or pertpy-style analysis on a GPU. Covers QC, doublets, normalization, HVGs, PCA, integration, clustering, UMAP, markers, annotation, pseudobulk DE, pathway scoring, CRISPR screens, spatial statistics and niches, out-of-core or multi-GPU runs, and GPU setup. rsc differs from scanpy in where data live and in defaults."
 ---
 
 # rapids-singlecell
@@ -9,7 +9,7 @@ description: "GPU single-cell and spatial analysis with rapids-singlecell (rsc),
 `rsc.gr`, `rsc.ptg` and `rsc.dcg` port parts of squidpy, pertpy and decoupler.
 Compute with rapids-singlecell (rsc), plot with `sc.pl`/`sq.pl`/`dc.pl`, and leave rsc only for the gaps listed below.
 
-## Before the notebook
+## Before you start
 
 Run once in a shell:
 
@@ -19,16 +19,17 @@ python -m rapids_singlecell_skills.api map --options  # every public rsc symbol 
 ```
 
 The map reflects the installed version.
+Narrow tasks can map one namespace with `--namespace pp`.
 Do not fetch the docs website or read rsc source to discover the API.
 For one detail, run `python -m rapids_singlecell_skills.api describe rsc.pp.neighbors --parameter algorithm`.
 If either command fails, read [references/setup.md](references/setup.md).
 
-## First cell
+## Setup code
 
 ```python
 import rmm
 
-rmm.reinitialize(pool_allocator=True)  # before any GPU array, once per kernel
+rmm.reinitialize(pool_allocator=True)  # before any GPU array, once per process
 import cupy as cp
 from rmm.allocators.cupy import rmm_cupy_allocator
 
@@ -63,6 +64,23 @@ Cross-tabulate sample against condition, because a batch nested in condition can
 For spatial data, read [references/spatial.md](references/spatial.md) first, because its QC and normalization replace QC, doublet scoring and normalization below.
 
 ```python
+import pandas as pd
+from scipy.stats import median_abs_deviation
+
+
+def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
+    def mads(col: str) -> pd.Series:
+        g = obs.groupby(by, observed=True)[col]
+        return (obs[col] - g.transform("median")) / g.transform(median_abs_deviation)
+
+    return (
+        (mads("log1p_total_counts").abs() > 5)
+        | (mads("log1p_n_genes_by_counts").abs() > 5)
+        | ((mads("pct_counts_mt") > 3) & (obs["pct_counts_mt"] > 8))
+    )
+```
+
+```python
 adata.layers["counts"] = adata.X.copy()  # host copy of raw counts
 rsc.get.anndata_to_GPU(adata)
 adata.var["mt"] = adata.var_names.str.startswith(("MT-", "mt-"))
@@ -80,23 +98,6 @@ rsc.pp.neighbors(adata, use_rep="X_pca_harmony")  # "X_pca" without integration
 rsc.tl.leiden(adata, resolution=[0.25, 0.5, 1.0, 2.0])  # one graph, keys leiden_<res>
 rsc.tl.umap(adata)
 rsc.tl.rank_genes_groups(adata, "leiden_1.0", method="wilcoxon", pts=True)
-```
-
-```python
-import pandas as pd
-from scipy.stats import median_abs_deviation
-
-
-def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
-    def mads(col: str) -> pd.Series:
-        g = obs.groupby(by, observed=True)[col]
-        return (obs[col] - g.transform("median")) / g.transform(median_abs_deviation)
-
-    return (
-        (mads("log1p_total_counts").abs() > 5)
-        | (mads("log1p_n_genes_by_counts").abs() > 5)
-        | ((mads("pct_counts_mt") > 3) & (obs["pct_counts_mt"] > 8))
-    )
 ```
 
 ## Defaults that override old tutorials
@@ -141,22 +142,28 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
 | Pseudobulk DE | PyDESeq2 on `rsc.get.aggregate` output |
 | Pathway resources and plots | decoupler `dc.op`, `dc.pl`, scoring with `rsc.dcg` |
 | Cell-cell communication across samples | LIANA+ |
-| Physical spatial graph | squidpy |
+| Neighborhood enrichment | squidpy |
 | Condition & perturbation analysis | pertpy |
 
 Never replace a missing rsc capability with a silent CPU reimplementation.
 For CRISPR screens and perturbation distances, read [references/perturbation.md](references/perturbation.md).
 
-## Notebook and deliverables
+## Deliverables
 
-- One stage per cell, under about 25 lines.
-  Plot right after the computation it shows, then interpret in a short markdown cell.
-- Write the analysis in the notebook itself and never paste standalone scripts into cells.
-- Record package versions at the end of the notebook with `session_info2`.
-- While developing, save a checkpoint AnnData after preprocessing and test new stages against it instead of re-executing the whole notebook after every edit.
-- Execute top to bottom in a fresh kernel with `jupyter nbconvert --to notebook --execute --inplace` and read every output.
+Use a notebook for multi-step workflows or when asked.
+Otherwise a small script artifact is fine.
+
 - Check outputs against data scale.
   Hundreds of clusters, clusters near cell count, or figures of hundreds of megapixels mean stop and fix.
 - Follow requested choices unless the data or design make them invalid.
   In that case, show the evidence and propose an alternative.
+
+In a notebook:
+
+- One stage per cell, under about 25 lines.
+  Plot right after the computation it shows, then interpret in a short markdown cell.
+- Never paste standalone scripts into notebook cells.
+- Record package versions at the end of the notebook with `session_info2`.
+- While developing, test new stages against a checkpoint AnnData saved after preprocessing instead of re-executing the whole notebook.
+- Execute top to bottom in a fresh kernel with `jupyter nbconvert --to notebook --execute --inplace` and read every output.
 - Deliver the executed notebook, the final AnnData, and a short markdown report of findings, evidence and limitations.

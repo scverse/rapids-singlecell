@@ -53,10 +53,10 @@ rsc.pp.log1p(adata)
 ## Physical graph
 
 ```python
-sq.gr.spatial_neighbors_delaunay(adata, library_key="sample", percentile=99)
+rsc.gr.spatial_neighbors_delaunay(adata, library_key="sample", percentile=99)
 ```
 
-- If `api map` lists a spatial-neighbors builder in `rsc.gr`, use it with the same arguments instead.
+- `rsc.gr.spatial_neighbors_knn` and, for Visium spot grids, `rsc.gr.spatial_neighbors_grid` take the same `library_key`.
 - Build one graph per sample (`library_key`), prune long Delaunay edges with `percentile`, and check the degree distribution and isolated cells.
 - The physical graph lives in `obsp["spatial_connectivities"]`, separate from the expression graph in `obsp["connectivities"]`.
   `rsc.gr` functions move it to the GPU themselves.
