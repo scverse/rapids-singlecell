@@ -9,19 +9,25 @@ from dask.array import Array as DaskArray
 
 from ._multi_gpu import (
     _calculate_blocks_per_pair,
+    _concat_on_device,
+    _copies_on_device,
     _copy_to_device,
     _create_category_index_mapping,
     _get_device_attrs,
     _split_pairs,
+    _sum_on_device,
     parse_device_ids,
 )
 
 __all__ = [
     "_calculate_blocks_per_pair",
+    "_concat_on_device",
+    "_copies_on_device",
     "_copy_to_device",
     "_create_category_index_mapping",
     "_get_device_attrs",
     "_split_pairs",
+    "_sum_on_device",
     "parse_device_ids",
 ]
 

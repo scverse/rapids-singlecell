@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import weakref
+
 import cupy as cp
 import numpy as np
 import pandas as pd
 import pytest
 from anndata import AnnData
 
+from rapids_singlecell._utils import _multi_gpu
 from rapids_singlecell.pertpy_gpu import Distance, MeanVar
+from rapids_singlecell.pertpy_gpu._metrics import _wasserstein
 from rapids_singlecell.pertpy_gpu._metrics._sinkhorn import (
     finalize,
     make_state,
@@ -822,3 +826,41 @@ def test_distance_wasserstein_multi_gpu_contrast_matches_single() -> None:
     np.testing.assert_allclose(
         r2["wasserstein"].values, r1["wasserstein"].values, rtol=1e-5, atol=1e-5
     )
+
+
+@requires_2_gpus
+def test_distance_wasserstein_multi_gpu_copies_outlive_their_consumers(
+    monkeypatch,
+) -> None:
+    """Cross-device copies must stay alive until the GPU work using them is done.
+
+    Releasing a peer copy while the scatter reading it is still queued can fault
+    (``cudaErrorLaunchFailure``). Queue GPU work behind every copy, so a copy that
+    is released too early is caught with its marker event still pending. The
+    F-ordered embedding exercises the contiguity conversion before the copies.
+    """
+    copy_to_device = _multi_gpu._copy_to_device
+    held, released = [], []
+
+    def delayed_copy(array, destination):
+        copied = copy_to_device(array, destination)
+        if copied is not array:
+            with cp.cuda.Device(destination):
+                busy = cp.ones((4096, 4096), dtype=cp.float32)
+                # Held: freeing device memory (cudaFree) would wait for the matmul.
+                held.append((busy, busy @ busy))
+                event = cp.cuda.Event(block=False, disable_timing=True)
+                event.record()
+            weakref.finalize(copied, lambda: released.append(event.done))
+        return copied
+
+    monkeypatch.setattr(_multi_gpu, "_copy_to_device", delayed_copy)
+    monkeypatch.setattr(_wasserstein, "_copy_to_device", delayed_copy)
+    adata = _make_grouped_adata(n_groups=8, cells_per_group=40, n_features=10, seed=11)
+    adata.obsm["X_pca"] = np.asfortranarray(adata.obsm["X_pca"])
+    distance = Distance(metric="wasserstein")
+    df1 = distance.pairwise(adata, groupby="group", multi_gpu=False)
+    df2 = distance.pairwise(adata, groupby="group", multi_gpu=[0, 1])
+    assert released
+    assert all(released)
+    np.testing.assert_allclose(df2.values, df1.values, rtol=1e-5, atol=1e-5)

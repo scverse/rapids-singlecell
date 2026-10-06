@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import tomllib
+from importlib import resources
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from types import ModuleType
@@ -104,9 +105,8 @@ def test_facades_export_every_public_callable(facade: str, package: str) -> None
 
 
 def test_api_index_finds_explicit_method_preferences() -> None:
-    notes_path = ROOT / "src" / "rapids_singlecell_skills" / "api_notes.toml"
-    with notes_path.open("rb") as handle:
-        entries = tomllib.load(handle)["entries"]
+    notes = resources.files("rapids_singlecell_skills").joinpath("api_notes.toml")
+    entries = tomllib.loads(notes.read_text(encoding="utf-8"))["entries"]
 
     hvg_index = entries["pp.highly_variable_genes"]["index"]
     assert "poisson gene selection" in hvg_index["keywords"]
