@@ -31,6 +31,9 @@ function(add_nb_cuda_module target src)
         ${src}
     )
     target_link_libraries(${target} PRIVATE CUDA::cudart)
+    set_target_properties(${target} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+    )
     install(TARGETS ${target} LIBRARY DESTINATION rapids_singlecell/_cuda)
     # Generate type stubs at install time (for wheel installs)
     nanobind_add_stub(${target}_stub
