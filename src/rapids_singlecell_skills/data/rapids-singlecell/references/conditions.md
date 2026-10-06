@@ -48,6 +48,8 @@ for ct in pb.obs["cell_type"].unique():
 
 - Load resources with decoupler: `dc.op.progeny(organism=..., top=500)` for pathways, `dc.op.collectri(organism=...)` for TFs, `dc.op.hallmark(organism=...)` for gene sets.
 - For condition contrasts, score the DE statistic rather than cells: `dc.mt.ulm(results[ct][["stat"]].T, net)` returns scores and p-values per source.
+- For a gene list such as significant DE genes, `rsc.dcg.query_set(genes, net, background=tested_genes)` runs over-representation per set.
+  Pass the genes that were tested as `background`, not the whole genome.
 - Per-cell scores are for display: `rsc.dcg.ulm(adata, net)` writes `obsm["score_ulm"]` and `rsc.dcg.aucell` suits unweighted gene sets.
   View them with `dc.pp.get_obsm(adata, "score_ulm")` and `sc.pl`.
 - Rank-based per-cell scores (AUCell) lose or flip signal in case-control comparisons, so do not test conditions on them.
