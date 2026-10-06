@@ -2263,6 +2263,8 @@ def _assert_multi_gpu_wilcoxon_equal(actual, expected):
     expected_result = expected.uns["rank_genes_groups"]
     np.testing.assert_array_equal(actual_result["names"], expected_result["names"])
     for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
+        if field not in expected_result:
+            continue
         for group in expected_result[field].dtype.names:
             np.testing.assert_allclose(
                 np.asarray(actual_result[field][group], dtype=float),
@@ -2484,6 +2486,7 @@ def test_wilcoxon_ovo_exact_tier_boundaries_match_scanpy(boundary):
 
 
 @pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.filterwarnings("error::cupy._util.PerformanceWarning")  # no peer access
 @pytest.mark.parametrize(
     ("reference", "route"),
     [
@@ -2520,3 +2523,33 @@ def test_wilcoxon_device_source_gpu_differs_from_caller(reference, route):
         assert cp.cuda.Device().id == caller_device
 
     _assert_multi_gpu_wilcoxon_equal(multi, single)
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
+@pytest.mark.filterwarnings("error::cupy._util.PerformanceWarning")  # no peer access
+@pytest.mark.parametrize("fmt", ["cupy_csr", "cupy_dense"])
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        ("t-test", {"pts": True}),
+        ("t-test_overestim_var", {"reference": "1"}),
+        ("wilcoxon", {"mean_in_log_space": False}),
+        ("wilcoxon_binned", {"pts": True}),
+        ("logreg", {}),
+    ],
+)
+def test_rank_genes_groups_runs_on_the_data_gpu(fmt, method, kwargs):
+    # Kernels must run on the GPU holding X: rsc kernels cannot read another
+    # GPU's memory, and CuPy's implicit peer access faults on some nodes.
+    # logreg copies its cells to the caller's GPU instead, where cuML is bound.
+    expected_device = 0 if method == "logreg" else 1
+    expected = _make_multi_gpu_wilcoxon_adata(fmt, source_device=expected_device)
+    actual = _make_multi_gpu_wilcoxon_adata(fmt, source_device=1)
+    kwargs = {"method": method, "use_raw": False, "multi_gpu": False, **kwargs}
+    with cp.cuda.Device(expected_device):
+        rsc.tl.rank_genes_groups(expected, "group", **kwargs)
+    with cp.cuda.Device(0):
+        rsc.tl.rank_genes_groups(actual, "group", **kwargs)
+        assert cp.cuda.Device().id == 0
+    if not (method == "logreg" and fmt == "cupy_csr"):  # cuML CSR fits vary
+        _assert_multi_gpu_wilcoxon_equal(actual, expected)
