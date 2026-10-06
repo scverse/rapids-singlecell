@@ -185,6 +185,8 @@ Install the version-matched analysis skill for Claude Code, Codex, and other age
 and check the GPU environment before starting.
 ````
 
+See the {ref}`agent skill guide <agent-skill>` for installation, kernel checks, and usage.
+
 (container-deprecation)=
 ## Docker
 

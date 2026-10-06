@@ -3,7 +3,6 @@
 
 Every release ships a version-matched, model-neutral analysis skill for coding agents.
 It teaches the agent the rapids-singlecell API and current best practices.
-It guides GPU single-cell and spatial analyses from QC to pseudobulk, pathway, perturbation and spatial statistics, and GPU and RMM setup.
 
 ```{warning}
 The agent skill is new and experimental.
