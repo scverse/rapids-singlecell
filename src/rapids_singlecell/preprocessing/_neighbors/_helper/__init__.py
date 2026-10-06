@@ -115,6 +115,22 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
     return True
 
 
+# cuVS IVF searches return wrong neighbors for queries beyond the 2**32nd value of one query array
+_MAX_QUERY_VALUES = 2**31
+
+
+def _batched_search(search, Y: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+    """``search(Y)`` (returning distances, neighbors), in batches of queries small enough for cuVS."""
+    rows = max(1, _MAX_QUERY_VALUES // Y.shape[1])
+    parts = [search(Y[start : start + rows]) for start in range(0, Y.shape[0], rows)]
+    if len(parts) == 1:
+        return parts[0]
+    return (
+        cp.concatenate([cp.asarray(d) for d, _ in parts]),
+        cp.concatenate([cp.asarray(n) for _, n in parts]),
+    )
+
+
 def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:
     """Ensure zero self-distances for all definitionally applicable metrics.
 

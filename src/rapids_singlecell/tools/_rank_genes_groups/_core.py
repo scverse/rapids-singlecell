@@ -17,6 +17,8 @@ from rapids_singlecell.get._aggregated import Aggregate
 from ._utils import (
     EPS,
     _canonicalize_sparse,
+    _data_device,
+    _on_data_device,
     _select_groups,
     _sparse_has_negative,
 )
@@ -186,6 +188,7 @@ class _RankGenes:
         cats = cp.asarray(codes, dtype=cp.int32)
         return aggr_host_planes(self.X, cats, n_cats, comp_pts=self.comp_pts)
 
+    @_on_data_device
     def _basic_stats(self) -> None:
         """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
         original_X = self.X
@@ -247,6 +250,7 @@ class _RankGenes:
 
         return t_test(self, method)
 
+    @_on_data_device
     def wilcoxon_binned(
         self,
         *,
@@ -302,12 +306,13 @@ class _RankGenes:
         if method in {"wilcoxon", "wilcoxon_binned"}:
             # Fast paths rank each stored coordinate once, so they must see
             # scanpy's summed duplicate view even when no sign scan is needed.
-            self.X = _canonicalize_sparse(self.X)
-            needs_signed_fallback = method == "wilcoxon_binned" or (
-                self.ireference is not None and sp.issparse(self.X)
-            )
-            if needs_signed_fallback:
-                self._sparse_negative_fallback = _sparse_has_negative(self.X)
+            with _data_device(self.X):
+                self.X = _canonicalize_sparse(self.X)
+                needs_signed_fallback = method == "wilcoxon_binned" or (
+                    self.ireference is not None and sp.issparse(self.X)
+                )
+                if needs_signed_fallback:
+                    self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
             # Host input streams (no full copy); device / Dask move to the GPU.
             if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
