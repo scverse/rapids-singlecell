@@ -293,8 +293,8 @@ class TestDeviceCopy:
 
         monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", cannot_access)
         monkeypatch.setattr(
-            cp,
-            "copyto",
+            cp.cuda.runtime,
+            "memcpyPeerAsync",
             lambda *_: pytest.fail("a non-P2P pair must not run the canary"),
         )
 
@@ -307,7 +307,7 @@ class TestDeviceCopy:
         if cp.cuda.runtime.getDeviceCount() < 2:
             pytest.skip("requires two GPUs")
         monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
-        monkeypatch.setattr(cp, "copyto", lambda *_: None)
+        monkeypatch.setattr(cp.cuda.runtime, "memcpyPeerAsync", lambda *_: None)
 
         assert not _multi_gpu._peer_copy_works(1, 0)
 
