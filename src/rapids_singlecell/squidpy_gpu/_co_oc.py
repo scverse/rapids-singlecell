@@ -12,6 +12,7 @@ from rapids_singlecell._utils import (
     _copy_to_device,
     _create_category_index_mapping,
     _split_pairs,
+    _sum_on_device,
     parse_device_ids,
 )
 
@@ -396,10 +397,8 @@ def _co_occurrence_gpu(
                 streams[data["device_id"]].synchronize()
 
     # Phase 4: Aggregate counts on the input device
+    parts = [data["counts"] for data in device_data if data is not None]
+    if parts:
+        return _sum_on_device(parts, source_device_id), True
     with cp.cuda.Device(source_device_id):
-        counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
-        for data in device_data:
-            if data is not None:
-                counts += _copy_to_device(data["counts"], source_device_id)
-
-    return counts, True
+        return cp.zeros((k, k, l_val), dtype=cp.uint64), True

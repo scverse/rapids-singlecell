@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -17,6 +19,27 @@ EPS = 1e-9
 MIN_GROUP_SIZE_WARNING = 25
 SPARSE_NEGATIVE_SCAN_MIN_ITEMS = 64_000_000
 SPARSE_NEGATIVE_SCAN_MAX_WORKERS = 64
+
+
+def _data_device(X):
+    """Enter the GPU holding ``X`` (no-op for host / Dask input), so kernels
+    never read another GPU's memory through implicit peer access."""
+    if isinstance(X, cp.ndarray):
+        return cp.cuda.Device(X.device.id)
+    if cpsp.issparse(X):
+        return cp.cuda.Device(X.data.device.id)
+    return nullcontext()
+
+
+def _on_data_device(method):
+    """Run a ``_RankGenes`` method on the GPU holding ``self.X``."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with _data_device(self.X):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _sparse_has_negative(X) -> bool:

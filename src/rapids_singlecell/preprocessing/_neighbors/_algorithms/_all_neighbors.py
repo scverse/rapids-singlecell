@@ -30,12 +30,17 @@ _CLUSTER_IMBALANCE = 2  # largest / average cluster size
 _MEMORY_FRACTION = 0.5  # share of free memory a build may use
 # cuVS nn-descent overflows int32 indices (rows x 32 samples) beyond this many rows
 _NN_DESCENT_MAX_ROWS = 2**31 // 32
+# Clusters this large keep their recall with the default overlap (measured on 0.2-10M cells:
+# within 0.001 of the log2 rule, at 2-3x the speed); only smaller ones need more.
+_MIN_CLUSTER_ROWS = 20_000
 
 
-def _default_overlap_factor(n_clusters: int) -> int:
+def _default_overlap_factor(n_clusters: int, n_obs: int = 0) -> int:
     """Overlap needed to hold recall as the dataset is split into more clusters."""
     if n_clusters <= 1:
         return 1
+    if n_obs * _DEFAULT_OVERLAP_FACTOR / n_clusters >= _MIN_CLUSTER_ROWS:
+        return _DEFAULT_OVERLAP_FACTOR
     return max(2, math.ceil(math.log2(n_clusters)))
 
 
@@ -114,7 +119,7 @@ def _all_neighbors_batching(
             while n_clusters <= overlap_factor:
                 n_clusters += n_devices
     if overlap_factor is None:
-        overlap_factor = _default_overlap_factor(n_clusters)
+        overlap_factor = _default_overlap_factor(n_clusters, shape[0])
         if n_clusters > 1:
             overlap_factor = min(overlap_factor, n_clusters - 1)
     if n_clusters > 1 and overlap_factor >= n_clusters:

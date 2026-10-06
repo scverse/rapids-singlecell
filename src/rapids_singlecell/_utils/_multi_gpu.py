@@ -12,10 +12,15 @@ Used by: co_occurrence, edistance, and future multi-GPU functions.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import cache
+from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 # Cache for device attributes per device (lazy initialization)
 _DEVICE_ATTRS_CACHE: dict[int, dict] = {}
@@ -84,6 +89,57 @@ def _copy_to_device(array: cp.ndarray, destination: int) -> cp.ndarray:
     if _peer_copy_works(destination, source):
         return _copy_to_device_p2p(array, destination)
     return _copy_to_device_via_host(array, destination)
+
+
+@contextmanager
+def _copies_on_device(arrays: Sequence[cp.ndarray], device: int):
+    """Copy ``arrays`` to ``device``, keeping the copies alive while they are used.
+
+    Releasing a cross-device copy before the work consuming it has finished can
+    fault (``cudaErrorLaunchFailure``), so the current stream of ``device`` is
+    synchronized before the copies are dropped. Use the copies inside the block.
+    """
+    with cp.cuda.Device(device):
+        copies = [_copy_to_device(array, device) for array in arrays]
+        try:
+            yield copies
+        finally:
+            cp.cuda.get_current_stream().synchronize()
+
+
+def _sum_on_device(arrays: list[cp.ndarray], device: int) -> cp.ndarray:
+    """Sum ``arrays`` on ``device``, accumulating in place into one already there.
+
+    Consumes the inputs. Remote arrays are copied one at a time, so the peak is
+    the output plus one copy.
+    """
+    total = None
+    for array in sorted(arrays, key=lambda a: a.device.id != device):
+        with _copies_on_device([array], device) as (part,):
+            if total is None:
+                total = part
+            else:
+                total += part
+        del part  # release before the next copy
+    return total
+
+
+def _concat_on_device(
+    arrays: list[cp.ndarray], device: int, axis: int = 0
+) -> cp.ndarray:
+    """Concatenate ``arrays`` on ``device``, holding one cross-device copy at a time."""
+    shape = list(arrays[0].shape)
+    shape[axis] = sum(array.shape[axis] for array in arrays)
+    with cp.cuda.Device(device):
+        out = cp.empty(shape, dtype=arrays[0].dtype)
+    start = 0
+    for array in arrays:
+        stop = start + array.shape[axis]
+        with _copies_on_device([array], device) as (part,):
+            out[(slice(None),) * axis + (slice(start, stop),)] = part
+        del part  # release before the next copy
+        start = stop
+    return out
 
 
 def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:

@@ -123,6 +123,8 @@ def test_all_neighbors_batching_overrides():
 
     assert _all_neighbors_batching({"n_clusters": 16}) == (16, 4)
     assert _all_neighbors_batching({"n_clusters": 8, "overlap_factor": 2}) == (8, 2)
+    # large clusters keep the default overlap
+    assert _all_neighbors_batching({"n_clusters": 44}, (100_000_000, 50), 15) == (44, 2)
     # The default overlap is capped at n_clusters - 1, so small explicit cluster
     # counts stay usable instead of tripping the guard below.
     assert _all_neighbors_batching({"n_clusters": 2}) == (2, 1)
