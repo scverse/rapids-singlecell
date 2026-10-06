@@ -14,13 +14,9 @@ from rapids_singlecell._cuda import (
 from rapids_singlecell._cuda import (
     _harmony_correction_cuda as _corr,
 )
-from rapids_singlecell._cuda import (
-    _harmony_normalize_cuda as _norm,
-)
-from rapids_singlecell._utils import _create_category_index_mapping
 
 pytestmark = pytest.mark.skipif(
-    _norm is None or _cl is None or _corr is None,
+    _cl is None or _corr is None,
     reason="Harmony CUDA modules not available",
 )
 
@@ -39,7 +35,7 @@ def test_l2_row_normalize(dtype, n_rows, n_cols, in_place):
     expected = src.copy()
     dst = src if in_place else cp.empty_like(src)
 
-    _norm.l2_row_normalize(src, dst=dst, n_rows=n_rows, n_cols=n_cols)
+    _cl.l2_row_normalize(src, dst=dst)
     cp.cuda.Device().synchronize()
 
     # Reference: L2 row normalize
@@ -58,7 +54,7 @@ def test_l2_row_normalize_zero_row(dtype):
     src[1, :] = 1.0  # only middle row is non-zero
     dst = cp.empty_like(src)
 
-    _norm.l2_row_normalize(src, dst=dst, n_rows=3, n_cols=10)
+    _cl.l2_row_normalize(src, dst=dst)
     cp.cuda.Device().synchronize()
 
     assert not cp.any(cp.isnan(dst))
@@ -68,55 +64,28 @@ def test_l2_row_normalize_zero_row(dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("switcher", [0, 1])
-@pytest.mark.parametrize("n_covariates,grouped", [(1, False), (1, True), (4, False)])
 @pytest.mark.parametrize("n_rows,n_categories", [(2305, 13), (2049, 9000)])
-def test_scatter_add(dtype, switcher, n_covariates, grouped, *, n_rows, n_categories):
+def test_scatter_add(dtype, n_rows, n_categories):
     n_cols = 17
     rng = np.random.default_rng(734)
     values_host = rng.normal(size=(n_rows, n_cols)).astype(dtype)
-    categories_host = np.arange(n_rows * n_covariates, dtype=np.int32).reshape(
-        n_rows, n_covariates
-    ) % (n_categories - 1)
-    categories_host[:2100, 0] = 0
+    categories_host = np.arange(n_rows, dtype=np.int32) % (n_categories - 1)
+    categories_host[:2100] = 0
     expected = np.zeros((n_categories, n_cols), dtype=np.float64)
-    np.add.at(
-        expected,
-        categories_host.ravel(),
-        np.repeat(values_host.astype(np.float64), n_covariates, axis=0)
-        * (1 if switcher else -1),
-    )
+    np.add.at(expected, categories_host, values_host.astype(np.float64))
     values, categories = cp.asarray(values_host), cp.asarray(categories_host)
-    category_offsets = cell_indices = None
-    if grouped:
-        category_offsets, cell_indices = _create_category_index_mapping(
-            categories.ravel(), n_categories
-        )
     workspace_bytes = _cl.get_scatter_temp_bytes(
         n_rows=n_rows,
         n_cols=n_cols,
         n_categories=n_categories,
-        n_covariates=n_covariates,
         itemsize=np.dtype(dtype).itemsize,
-        grouped=grouped,
     )
     workspace = cp.empty(workspace_bytes, dtype=cp.uint8)
     outputs = []
     for _ in range(2):
         out = cp.zeros((n_categories, n_cols), dtype=dtype)
         scatter_add = partial(
-            _cl.scatter_add,
-            values,
-            categories=categories,
-            category_offsets=category_offsets,
-            cell_indices=cell_indices,
-            out=out,
-            workspace=workspace,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            n_categories=n_categories,
-            n_covariates=n_covariates,
-            switcher=switcher,
+            _cl.scatter_add, values, categories=categories, out=out, workspace=workspace
         )
         scatter_add()
         outputs.append(out.copy())
@@ -276,6 +245,52 @@ def test_kmeans_closest(dtype):
     cp.testing.assert_allclose(closest, expected, rtol=1e-5)
 
 
+# ---------- update blocks ----------
+
+
+def test_draw_blocks_split_invariant():
+    # A cell's block depends only on its global position: drawing two shards
+    # (split at a unit boundary) gives the blocks of drawing all cells, and
+    # every full unit deals the same number of cells to every block.
+    rng = cp.random.default_rng(3)
+    n, n_groups, n_blocks, chunk = 5000, 4, 7, 8
+    unit = n_blocks * chunk * 5
+    groups = cp.sort(rng.integers(0, n_groups, n)).astype(cp.int32)
+
+    def blocks(first, last):
+        m = last - first
+        idx = cp.empty(m, cp.int32)
+        offsets = cp.empty(n_blocks * n_groups + 1, cp.int32)
+        _cl.draw_blocks(
+            groups[first:last],
+            idx_list=idx,
+            block_cat_offsets=offsets,
+            idx_list_alt=cp.empty(m, cp.int32),
+            sort_keys=cp.empty(m, cp.uint32),
+            sort_keys_alt=cp.empty(m, cp.uint32),
+            cub_temp=cp.empty(_cl.get_cub_sort_temp_bytes(n_cells=m), cp.uint8),
+            n_groups=n_groups,
+            n_blocks=n_blocks,
+            unit=unit,
+            seed=11,
+            shuffle_chunk=chunk,
+            first=first,
+        )
+        key = cp.repeat(cp.arange(n_blocks * n_groups), cp.diff(offsets).tolist())
+        cp.testing.assert_array_equal(key % n_groups, groups[first:last][idx])
+        out = cp.empty(m, cp.int32)
+        out[idx] = key // n_groups
+        return out
+
+    full = blocks(0, n)
+    cp.testing.assert_array_equal(
+        full, cp.concatenate([blocks(0, 2 * unit), blocks(2 * unit, n)])
+    )
+    whole = n // unit * unit
+    per_unit = cp.bincount(cp.arange(whole) // unit * n_blocks + full[:whole])
+    assert (per_unit == unit // n_blocks).all()
+
+
 # ---------- fused initialization (assignment kernels) ----------
 
 
@@ -283,43 +298,67 @@ def test_kmeans_closest(dtype):
     "n_clusters,force_general", [(7, False), (7, True), (300, True)]
 )
 def test_fused_initialize_matches_reference(n_clusters, force_general):
-    # One unpenalized assignment pass: R is the softmax of -2/sigma (1 - z.y),
-    # O its per-batch column sums, E = Pr_b x column sums, plus the objective.
+    # One unpenalized assignment pass over the update blocks: R is the
+    # softmax of -2/sigma (1 - z.y), O its per-batch column sums,
+    # E = Pr_b x column sums, plus the objective.
     rng = cp.random.default_rng(7)
-    n_cells, n_pcs, n_batches, sigma = 3000, 50, 3, 0.1
+    n_cells, n_pcs, n_batches, sigma, block_size = 3000, 50, 3, 0.1, 700
     Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
     Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
     Y = Z[:n_clusters] + 0.1
     Y = (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).astype(cp.float32)
     cats = cp.sort(rng.integers(0, n_batches, n_cells)).astype(cp.int32)
-    offsets = cp.searchsorted(cats, cp.arange(n_batches + 1)).astype(cp.int32)
     Pr_b = (cp.bincount(cats, minlength=n_batches) / n_cells).astype(cp.float32)
     theta = cp.full(n_batches, 2.0, dtype=cp.float32)
-    n_tiles = 64 + n_batches + 1
+    n_blocks = -(-n_cells // block_size)
+    n_tiles = 4 * cp.cuda.Device().attributes["MultiProcessorCount"] + n_batches + 1
+    idx_list = cp.empty(n_cells, cp.int32)
+    block_cat_offsets = cp.empty(n_blocks * n_batches + n_batches + 2, cp.int32)
+    _cl.draw_blocks(
+        cats,
+        idx_list=idx_list,
+        block_cat_offsets=block_cat_offsets,
+        idx_list_alt=cp.empty(n_cells, cp.int32),
+        sort_keys=cp.empty(n_cells, cp.uint32),
+        sort_keys_alt=cp.empty(n_cells, cp.uint32),
+        cub_temp=cp.empty(_cl.get_cub_sort_temp_bytes(n_cells=n_cells), cp.uint8),
+        n_groups=n_batches,
+        n_blocks=n_blocks,
+        unit=n_cells,
+        seed=3,
+    )
     R = cp.empty((n_cells, n_clusters), cp.float32)
-    O = cp.zeros((n_batches, n_clusters), cp.float32)
+    O = cp.empty((n_batches, n_clusters), cp.float32)
     E = cp.empty_like(O)
     stride = -(-n_clusters // 128) * 128
-    objective = _cl.fused_initialize(
+    objective = _cl.clustering_loop(
         Z,
-        Y_norm=Y,
-        cat_offsets=offsets,
         R=R,
-        O=O,
         E=E,
+        O=O,
         Pr_b=Pr_b,
         theta=theta,
-        tiles=cp.empty(n_batches + 1, cp.int32),
-        assign_partial=cp.empty(n_tiles * n_clusters, cp.float32),
-        objective_partials=cp.empty(
-            n_cells + _cl.OBJECTIVE_REDUCE_BLOCKS + 1, cp.float32
-        ),
-        obj_scalar=cp.empty(1, cp.float32),
-        sigma=sigma,
-        stabilized=True,
+        Y_norm=Y,
+        idx_list=idx_list,
+        penalty=cp.empty_like(O),
+        objective_partials=cp.empty(n_cells + 8, cp.float32),
+        block_cat_offsets=block_cat_offsets,
+        block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
+        seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
+        y_scale=cp.empty(1, cp.float64),
+        y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
         y_t_general=cp.empty((52, stride), cp.float32),
-        col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.float32),
+        col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),
         force_general=force_general,
+        n_cells=n_cells,
+        n_pcs=n_pcs,
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        n_blocks=n_blocks,
+        sigma=sigma,
+        max_iter=0,
+        stabilized=True,
+        initialize=True,
     )
     sim = Z.astype(cp.float64) @ Y.T.astype(cp.float64)
     w = cp.exp(-2 / sigma * (1 - sim))

@@ -90,9 +90,8 @@ def harmony_integrate(
         precision is needed; it can be slower on GPUs with reduced
         double-precision throughput. ``"bfloat16"`` computes in float32 but
         stores the soft cluster assignments in bfloat16, which is faster and
-        needs a third less memory. It requires the CUDA 13 build and a GPU of
-        compute capability 8.0 or newer and falls back to float32 with a
-        warning otherwise.
+        needs a third less memory. It needs one batch key and the batched
+        correction and falls back to float32 with a warning otherwise.
     flavor
         Which version of the Harmony algorithm to use.
         ``"harmony2"`` (default) enables the stabilized diversity penalty,

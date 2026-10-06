@@ -4,11 +4,10 @@
 #include <stdint.h>
 #include <type_traits>
 
-// Materialize marginal observed counts from the persistent joint-code table.
-// `marginal_joint_offsets` / `marginal_joint_indices` are a CSR mapping from
-// each marginal category to the joint categories that contain it. One thread
-// owns one (marginal category, cluster) output and reduces its joint list in a
-// fixed order, so this stage needs neither atomics nor a preceding memset.
+#include "../storage.cuh"
+
+// Marginal counts from the joint-category counts: each (category, cluster)
+// sums its joint categories (CSR `marginal_joint_*`) in a fixed order.
 template <typename T>
 __global__ void materialize_marginal_from_joint_kernel(
     const T* __restrict__ joint_values,
@@ -18,104 +17,47 @@ __global__ void materialize_marginal_from_joint_kernel(
     size_t total = (size_t)n_batches * n_clusters;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (size_t)blockDim.x * gridDim.x) {
-        int batch = (int)(i / n_clusters);
-        int cluster = (int)(i % n_clusters);
-        int begin = marginal_joint_offsets[batch];
-        int end = marginal_joint_offsets[batch + 1];
-
+        int batch = (int)(i / n_clusters), cluster = (int)(i % n_clusters);
         T sum = T(0);
-        for (int position = begin; position < end; ++position) {
-            int joint = marginal_joint_indices[position];
-            sum += joint_values[(size_t)joint * n_clusters + cluster];
-        }
+        for (int p = marginal_joint_offsets[batch];
+             p < marginal_joint_offsets[batch + 1]; ++p)
+            sum += joint_values[(size_t)marginal_joint_indices[p] * n_clusters +
+                                cluster];
         marginal[i] = sum;
     }
 }
 
+// a[cat + 1, pc0 .. pc0 + 1] = sum over the category's cells of v * bias; one
+// block per (category, pair of PCs).
 template <typename T>
 __global__ void scatter_add_kernel_with_bias_block(
     const T* __restrict__ v, const int* __restrict__ cat_offsets,
     const int* __restrict__ cell_indices, int n_cells, int n_pcs, int n_batches,
     T* __restrict__ a, const T* __restrict__ bias) {
-    using VecPC = typename std::conditional<std::is_same<T, float>::value,
-                                            float2, double2>::type;
+    using VecPC = std::conditional_t<std::is_same_v<T, float>, float2, double2>;
     int pairs = (n_pcs + 1) / 2;
-    int block_idx = blockIdx.x;
-    if (block_idx >= n_batches * pairs) return;
-
-    int cat = block_idx / pairs + 1;
-    int pc_pair = block_idx % pairs;
-
-    int pc0 = pc_pair * 2;
-    int pc1 = pc0 + 1;
-    bool has_pc1 = (pc1 < n_pcs);
-
-    T acc0 = T(0);
-    T acc1 = T(0);
-
-    int start_idx = cat_offsets[cat - 1];
-    int end_idx = cat_offsets[cat];
-
-    for (int i = start_idx + threadIdx.x; i < end_idx; i += blockDim.x) {
-        int cell_idx = cell_indices[i];
-        size_t in_index = static_cast<size_t>(cell_idx) * n_pcs + pc0;
-        const T* ptr = v + in_index;
-        T bb = __ldg(bias + cell_idx);
-        if (has_pc1 && (((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0)) {
+    if ((int)blockIdx.x >= n_batches * pairs) return;
+    int cat = blockIdx.x / pairs + 1, pc0 = blockIdx.x % pairs * 2;
+    bool has_pc1 = pc0 + 1 < n_pcs;
+    T acc0 = T(0), acc1 = T(0);
+    for (int i = cat_offsets[cat - 1] + threadIdx.x; i < cat_offsets[cat];
+         i += blockDim.x) {
+        int cell = cell_indices[i];
+        const T* ptr = v + (size_t)cell * n_pcs + pc0;
+        T bb = __ldg(bias + cell);
+        if (has_pc1 && ((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0) {
             VecPC vv = *(const VecPC*)ptr;
-            acc0 += (T)vv.x * bb;
-            acc1 += (T)vv.y * bb;
+            acc0 += vv.x * bb;
+            acc1 += vv.y * bb;
         } else {
             acc0 += ptr[0] * bb;
             if (has_pc1) acc1 += ptr[1] * bb;
         }
     }
-
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc0 += __shfl_down_sync(0xffffffff, acc0, offset);
-        if (has_pc1) acc1 += __shfl_down_sync(0xffffffff, acc1, offset);
-    }
-
-    __shared__ float2 s_f[32];
-    __shared__ double2 s_d[32];
-    if (std::is_same<T, float>::value) {
-        if ((threadIdx.x & 31) == 0)
-            s_f[threadIdx.x >> 5] = make_float2((float)acc0, (float)acc1);
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            float2 val = (threadIdx.x < (blockDim.x >> 5))
-                             ? s_f[threadIdx.x]
-                             : make_float2(0.f, 0.f);
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                val.x += __shfl_down_sync(0xffffffff, val.x, off);
-                val.y += __shfl_down_sync(0xffffffff, val.y, off);
-            }
-            if (threadIdx.x == 0) {
-                int out_base = cat * n_pcs + pc0;
-                a[out_base] = (T)val.x;
-                if (has_pc1) a[out_base + 1] = (T)val.y;
-            }
-        }
-    } else {
-        if ((threadIdx.x & 31) == 0)
-            s_d[threadIdx.x >> 5] = make_double2((double)acc0, (double)acc1);
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            double2 val = (threadIdx.x < (blockDim.x >> 5))
-                              ? s_d[threadIdx.x]
-                              : make_double2(0.0, 0.0);
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                val.x += __shfl_down_sync(0xffffffff, val.x, off);
-                val.y += __shfl_down_sync(0xffffffff, val.y, off);
-            }
-            if (threadIdx.x == 0) {
-                int out_base = cat * n_pcs + pc0;
-                a[out_base] = (T)val.x;
-                if (has_pc1) a[out_base + 1] = (T)val.y;
-            }
-        }
+    acc0 = block_sum(acc0);
+    acc1 = block_sum(acc1);
+    if (threadIdx.x == 0) {
+        a[cat * n_pcs + pc0] = acc0;
+        if (has_pc1) a[cat * n_pcs + pc0 + 1] = acc1;
     }
 }

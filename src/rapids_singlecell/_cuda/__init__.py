@@ -29,7 +29,6 @@ __all__ = [
     "_harmony_clustering_cuda",
     "_harmony_correction_batched_cuda",
     "_harmony_correction_cuda",
-    "_harmony_normalize_cuda",
     "_hvg_cuda",
     "_jaccard_cuda",
     "_kde_cuda",

@@ -4,7 +4,7 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 
-from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
+from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
 
 
 def _validate_output_buffer(
@@ -27,13 +27,8 @@ def _normalize_cp(X: cp.ndarray, *, out: cp.ndarray | None = None) -> cp.ndarray
         out = cp.empty_like(X)
     else:
         _validate_output_buffer(X, out, operation="Normalization")
-    rows, cols = X.shape
-    _normalize_cuda.l2_row_normalize(
-        X,
-        dst=out,
-        n_rows=rows,
-        n_cols=cols,
-        stream=cp.cuda.get_current_stream().ptr,
+    _clustering_cuda.l2_row_normalize(
+        X, dst=out, stream=cp.cuda.get_current_stream().ptr
     )
     return out
 

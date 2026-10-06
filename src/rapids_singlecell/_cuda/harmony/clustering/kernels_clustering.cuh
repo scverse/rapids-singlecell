@@ -1,24 +1,58 @@
 #pragma once
 
 #include <cub/block/block_scan.cuh>
+#include <algorithm>
 #include <cmath>
 #include <cuda_runtime.h>
 
 #include "../storage.cuh"
 
-// ---- PCG hash for random shuffle keys ----
+// ---- Update blocks (see draw_blocks) ----
+// PCG hash of each run's global index (`first` + local run), local run index.
 __global__ void pcg_hash_kernel(unsigned int* __restrict__ out,
                                 int* __restrict__ indices, int n,
-                                unsigned int seed, int chunk = 1) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+                                unsigned int first, unsigned int seed) {
     int stride = blockDim.x * gridDim.x;
-    for (int i = idx; i < n; i += stride) {
-        unsigned int state = static_cast<unsigned int>(i / chunk) ^ seed;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        unsigned int state = (first + (unsigned int)i) ^ seed;
         state = state * 747796405u + 2891336453u;
         unsigned int word =
             ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
         out[i] = (word >> 22u) ^ word;
         indices[i] = i;
+    }
+}
+
+// keys[j] = unit of run runs[j].
+__global__ void run_unit_kernel(const int* __restrict__ runs,
+                                unsigned int* __restrict__ keys, int n,
+                                int unit_runs) {
+    int stride = blockDim.x * gridDim.x;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < n; j += stride)
+        keys[j] = runs[j] / unit_runs;
+}
+
+// Runs sorted by (unit, hash) are dealt to the blocks in turn within each
+// unit: run_block[runs[j]] = (rank in its unit) % n_blocks.
+__global__ void deal_runs_kernel(const int* __restrict__ runs,
+                                 unsigned int* __restrict__ run_block, int n,
+                                 int unit_runs, int n_blocks) {
+    int stride = blockDim.x * gridDim.x;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < n; j += stride)
+        run_block[runs[j]] = (j % unit_runs) % n_blocks;
+}
+
+// keys[i] = block * n_groups + group of cell i; cells[i] = i.
+__global__ void block_category_keys_kernel(const unsigned int* run_block,
+                                           const int* groups,
+                                           unsigned int* keys, int* cells,
+                                           int n_cells, int chunk,
+                                           int n_groups) {
+    int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_cells;
+         i += stride) {
+        keys[i] = run_block[i / chunk] * n_groups + groups[i];
+        cells[i] = i;
     }
 }
 
@@ -28,40 +62,12 @@ constexpr int KMEANS_WEIGHT_THREADS = 256;
 template <typename T>
 __global__ void kmeans_weight_tiles_kernel(const T* values, double* totals,
                                            int n_rows) {
-    __shared__ double partial[KMEANS_WEIGHT_THREADS];
-    int tid = threadIdx.x;
     size_t start = (size_t)blockIdx.x * KMEANS_WEIGHT_TILE_ROWS;
     double sum = 0;
-    for (int j = tid; j < KMEANS_WEIGHT_TILE_ROWS; j += KMEANS_WEIGHT_THREADS)
+    for (int j = threadIdx.x; j < KMEANS_WEIGHT_TILE_ROWS; j += blockDim.x)
         if (start + j < n_rows) sum += (double)values[start + j];
-    partial[tid] = sum;
-    __syncthreads();
-    for (int step = KMEANS_WEIGHT_THREADS / 2; step; step >>= 1) {
-        if (tid < step) partial[tid] += partial[tid + step];
-        __syncthreads();
-    }
-    if (tid == 0) totals[blockIdx.x] = partial[0];
-}
-
-template <typename T>
-__device__ T objective_block_sum(T value, bool broadcast = true) {
-    __shared__ T warp_sums[32];
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_down_sync(0xffffffff, value, offset);
-    if (lane == 0) warp_sums[warp] = value;
-    __syncthreads();
-    value = threadIdx.x < (blockDim.x >> 5) ? warp_sums[lane] : T(0);
-    if (warp == 0)
-        for (int offset = 16; offset > 0; offset >>= 1)
-            value += __shfl_down_sync(0xffffffff, value, offset);
-    if (!broadcast) return value;
-    if (threadIdx.x == 0) warp_sums[0] = value;
-    __syncthreads();
-    value = warp_sums[0];
-    __syncthreads();
-    return value;
+    sum = block_sum(sum);
+    if (threadIdx.x == 0) totals[blockIdx.x] = sum;
 }
 
 // First index whose running sum of `values` exceeds `target`, scanning
@@ -107,7 +113,7 @@ __global__ void kmeans_select_center_kernel(const T* X, const T* weights,
     double total = 0;
     for (int tile = threadIdx.x; tile < n_tiles; tile += blockDim.x)
         total += totals[tile];
-    total = objective_block_sum<double>(total);
+    total = block_sum(total);
     if (threadIdx.x == 0) total_s = total, choice = cluster % n_rows;
     __syncthreads();
     total = total_s;
@@ -142,74 +148,107 @@ __global__ void kmeans_select_center_kernel(const T* X, const T* weights,
             X[(size_t)choice * n_cols + col];
 }
 
+// ---- Exact fixed-point sums ----
+// Sums over cells go through int64 fixed point: value * 2^s rounded to an
+// integer, with s from a global bound so the sum cannot overflow. Integer
+// addition is exact, so a sum does not depend on tiling, launch shape or how
+// cells are split across GPUs.
 template <typename T>
-__global__ void objective_reduce_kernel(const T* partial, int n_rows, T* out) {
-    T sum = T(0);
-    size_t i = threadIdx.x;
-    for (; i + 3 * blockDim.x < n_rows; i += 4 * blockDim.x) {
-        T first = partial[i], second = partial[i + blockDim.x],
-          third = partial[i + 2 * blockDim.x],
-          fourth = partial[i + 3 * blockDim.x];
-        sum = (((sum + first) + second) + third) + fourth;
+__device__ __forceinline__ long long to_fixed(T value, T scale) {
+    if constexpr (sizeof(T) == 4)
+        return __float2ll_rn(value * scale);
+    else
+        return __double2ll_rn(value * scale);
+}
+
+// Assignment value in [0, 1] to fixed point; float32 counts use at most 31
+// fractional bits, so the conversion is 32-bit.
+template <typename T>
+__device__ __forceinline__ long long count_to_fixed(T value, T scale) {
+    if constexpr (sizeof(T) == 4)
+        return __float2uint_rn(value * scale);
+    else
+        return __double2ll_rn(value * scale);
+}
+
+// Largest s with bound * 2^s < 2^62.
+inline int fixed_shift(double bound) {
+    return 62 - (int)std::ceil(std::log2(std::max(bound, 1.0)));
+}
+
+// acc += fixed-point sum of the per-cell objective terms.
+template <typename T>
+__global__ void objective_fixed_kernel(const T* __restrict__ partial,
+                                       long long n_rows, T scale,
+                                       unsigned long long* acc) {
+    long long sum = 0;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n_rows; i += (long long)gridDim.x * blockDim.x)
+        sum += to_fixed(partial[i], scale);
+    sum = warp_sum(sum);
+    if ((threadIdx.x & 31) == 0) atomicAdd(acc, (unsigned long long)sum);
+}
+
+// Cluster counts per group, kept exactly: `total` (fixed point) is O over all
+// cells. Optionally folds a block's new counts in (total += new - stored,
+// stored = new), then writes total minus the held-out block's counts `hold`
+// to `out` in T and zeroes `clear` (the next assignment's counts).
+template <typename T>
+__global__ void update_counts_kernel(long long* total, long long* fold_stored,
+                                     const long long* fold_new,
+                                     const long long* hold, long long* clear,
+                                     double inv_scale, T* __restrict__ out,
+                                     int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    long long t = total[i];
+    if (fold_new) {
+        long long v = fold_new[i];
+        t += v - fold_stored[i];
+        fold_stored[i] = v;
+        total[i] = t;
     }
-    for (; i < n_rows; i += blockDim.x) sum += partial[i];
-    sum = objective_block_sum(sum, false);
-    if (threadIdx.x == 0) *out = sum;
+    if (hold) t -= hold[i];
+    out[i] = (T)((double)t * inv_scale);
+    if (clear) clear[i] = 0;
 }
 
-constexpr int OBJECTIVE_REDUCE_BLOCKS = 1024;
-
-// Fixed-shape two-stage sum: deterministic for a given n_rows.
-template <typename T>
-__global__ void objective_stage_kernel(const T* partial, long long n_rows,
-                                       T* stage) {
-    long long chunk = (n_rows + gridDim.x - 1) / gridDim.x;
-    long long begin = blockIdx.x * chunk;
-    long long end = min(n_rows, begin + chunk);
-    T sum = T(0);
-    for (long long i = begin + threadIdx.x; i < end; i += blockDim.x)
-        sum += partial[i];
-    sum = objective_block_sum(sum, false);
-    if (threadIdx.x == 0) stage[blockIdx.x] = sum;
+// total = sum of the n_blocks block counts (n values each).
+__global__ void sum_blocks_kernel(const long long* __restrict__ blocks,
+                                  int n_blocks, long long* __restrict__ total,
+                                  int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    long long t = 0;
+    for (int b = 0; b < n_blocks; ++b) t += blocks[(size_t)b * n + i];
+    total[i] = t;
 }
 
-// ---- Fused single-covariate clustering (no similarity matrix) ----
+// ---- Assignment (no similarity matrix) ----
 constexpr int FUSED_MAX_CLUSTER_SLOTS = 4;  // K <= 128
 constexpr int FUSED_THREADS = 256;
-
-// Block slot of position j and the cell's category, packed into one sort key.
-// Sorting by it keeps the exact block sizes of the shuffle and groups each
-// block's cells by category for the tiled scatter.
-__global__ void block_category_keys_kernel(const int* perm, const int* cats,
-                                           unsigned int* keys, int n_cells,
-                                           int block_size, int n_batches) {
-    int stride = blockDim.x * gridDim.x;
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < n_cells;
-         j += stride)
-        keys[j] = (unsigned int)(j / block_size) * n_batches + cats[perm[j]];
-}
 
 // E and the penalty from the held-out counts; R_sum is the column sum of O.
 // One CTA per cluster reduces its column in a fixed tree, then each thread
 // fills its batches. `penalty` may be null to update E only.
-template <typename T, bool Stabilized>
+template <typename T>
 __global__ void penalty_from_counts_kernel(const T* O, const T* Pr_b,
                                            const T* theta, T* E, T* penalty,
                                            int n_batches, int n_clusters,
-                                           int n_first) {
+                                           int n_first, bool stabilized) {
     // Each cell counts once per batch key: the cluster total sums the levels
     // of the first key only.
     int k = blockIdx.x;
     T r_sum = T(0);
     for (int b = threadIdx.x; b < n_first; b += blockDim.x)
         r_sum += O[(size_t)b * n_clusters + k];
-    r_sum = objective_block_sum(r_sum);
+    r_sum = block_sum(r_sum);
     for (int b = threadIdx.x; b < n_batches; b += blockDim.x) {
         size_t i = (size_t)b * n_clusters + k;
         T e = Pr_b[b] * r_sum;
         E[i] = e;
         if (penalty) {
-            T denom = Stabilized ? (O[i] + e + T(1)) : (O[i] + T(1));
+            T denom = stabilized ? (O[i] + e + T(1)) : (O[i] + T(1));
             penalty[i] = pow((e + T(1)) / denom, theta[b]);
         }
     }
@@ -220,9 +259,8 @@ __global__ void penalty_from_counts_kernel(const T* O, const T* Pr_b,
 // clusters: similarities to the normalized centroids (staged in shared
 // memory, PCs padded to a multiple of four), penalized soft assignment
 // written to R in place, and the cell's distance + entropy objective term.
-// The tile's new column sums are reduced in a fixed order into
-// `tile_partial`, laid out as scatter_tiles_kernel's partials, so
-// scatter_finish_kernel adds them to O.
+// The tile's new column sums (fixed point) are added to its group's `counts`;
+// integer atomics are exact, so the order does not matter.
 constexpr int FUSED_ROWS = 8;
 constexpr int FUSED_CLUSTER_STRIDE = 32 * FUSED_MAX_CLUSTER_SLOTS;
 
@@ -234,26 +272,9 @@ template <typename T>
 size_t fused_assign_smem_bytes(int n_pcs, int n_clusters) {
     int warps = FUSED_THREADS / 32, pcs = fused_padded_pcs(n_pcs);
     return ((size_t)pcs * FUSED_CLUSTER_STRIDE +
-            (size_t)warps * FUSED_ROWS * pcs + (size_t)warps * n_clusters) *
-           sizeof(T);
-}
-
-// The fused kernel holds at most 128 clusters, prefetches at most 128 PCs and
-// keeps its centroids in shared memory; other shapes use
-// fused_assign_general_kernel.
-inline bool fused_assign_fits(int n_pcs, int n_clusters, size_t smem) {
-    int device = 0, limit = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                           device);
-    return n_clusters <= FUSED_CLUSTER_STRIDE && n_pcs <= 128 &&
-           smem <= (size_t)limit;
-}
-
-// Padded cluster count of the general kernel's centroid buffer.
-__host__ __device__ inline int fused_cluster_stride(int n_clusters) {
-    return (n_clusters + FUSED_CLUSTER_STRIDE - 1) / FUSED_CLUSTER_STRIDE *
-           FUSED_CLUSTER_STRIDE;
+            (size_t)warps * FUSED_ROWS * pcs) *
+               sizeof(T) +
+           (size_t)warps * n_clusters * sizeof(long long);
 }
 
 template <typename T>
@@ -265,6 +286,42 @@ __device__ inline void load4(const T* p, T (&v)[4]) {
         double2 a = reinterpret_cast<const double2*>(p)[0];
         double2 b = reinterpret_cast<const double2*>(p)[1];
         v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y;
+    }
+}
+
+// dst (pcs x stride) = src (n x d)^T, zero padded; thread t0 handles
+// elements t0, t0 + step, ...
+template <typename T>
+__device__ __forceinline__ void transpose_padded(const T* src, T* dst, int n,
+                                                 int d, int pcs, int stride,
+                                                 int t0, int step) {
+    for (int t = t0; t < pcs * stride; t += step) {
+        int j = t / stride, k = t % stride;
+        dst[t] = j < d && k < n ? src[(size_t)k * d + j] : T(0);
+    }
+}
+
+// acc[r][q] = f(acc[r][q], x, c) over the padded columns d, x = rows[r][d]
+// (FUSED_ROWS rows staged `pcs` apart) and c = cols_t[d][k0 + q].
+template <typename T, typename F>
+__device__ __forceinline__ void tile_products(
+    const T* rows, const T* cols_t, int pcs, int k0,
+    T (&acc)[FUSED_ROWS][FUSED_MAX_CLUSTER_SLOTS], F f) {
+    for (int d = 0; d < pcs; d += 4) {
+        T c[4][FUSED_MAX_CLUSTER_SLOTS];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            load4(cols_t + (size_t)(d + j) * FUSED_CLUSTER_STRIDE + k0, c[j]);
+#pragma unroll
+        for (int r = 0; r < FUSED_ROWS; ++r) {
+            T x[4];
+            load4(rows + r * pcs + d, x);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int q = 0; q < FUSED_MAX_CLUSTER_SLOTS; ++q)
+                    acc[r][q] = f(acc[r][q], x[j], c[j][q]);
+        }
     }
 }
 
@@ -281,13 +338,13 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                         const int* __restrict__ offsets,
                         const int* __restrict__ tiles, int n_categories,
                         int tile_rows, RT* __restrict__ R,
-                        T* __restrict__ partial, T* __restrict__ tile_partial,
-                        T term, T sigma, int n_pcs, int n_clusters) {
-    int tile = blockIdx.x;
+                        T* __restrict__ partial,
+                        unsigned long long* __restrict__ counts, T term,
+                        T sigma, T count_scale, int n_pcs, int n_clusters) {
+    int tile = blockIdx.x, start, end;
     if (tile >= tiles[n_categories]) return;
-    int category = scatter_tile_category(tile, n_categories, tiles);
-    int start = offsets[category] + (tile - tiles[category]) * tile_rows;
-    int end = start + min(tile_rows, offsets[category + 1] - start);
+    int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
+                                     tile_rows, start, end);
 
     constexpr int S = FUSED_MAX_CLUSTER_SLOTS;
     int pcs = fused_padded_pcs(n_pcs);
@@ -296,15 +353,14 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     T* y_t = reinterpret_cast<T*>(smem_raw);  // pcs x FUSED_CLUSTER_STRIDE
     T* z_s = y_t + (size_t)pcs * FUSED_CLUSTER_STRIDE;  // warps x ROWS x pcs
-    T* col_sums = z_s + (size_t)n_warps * FUSED_ROWS * pcs;  // warps x K
-    for (int t = threadIdx.x; t < pcs * FUSED_CLUSTER_STRIDE; t += blockDim.x) {
-        int d = t / FUSED_CLUSTER_STRIDE, k = t % FUSED_CLUSTER_STRIDE;
-        y_t[t] =
-            d < n_pcs && k < n_clusters ? Y_norm[(size_t)k * n_pcs + d] : T(0);
-    }
+    long long* col_sums = reinterpret_cast<long long*>(
+        z_s + (size_t)n_warps * FUSED_ROWS * pcs);  // warps x K
+    transpose_padded(Y_norm, y_t, n_clusters, n_pcs, pcs, FUSED_CLUSTER_STRIDE,
+                     threadIdx.x, blockDim.x);
     T* z_w = z_s + (size_t)warp * FUSED_ROWS * pcs;
     int k0 = 4 * lane;  // this lane's clusters k0 .. k0 + 3
-    T pen[S], log_pen[S], col[S] = {};
+    T pen[S], log_pen[S];
+    long long col[S] = {};
 #pragma unroll
     for (int q = 0; q < S; ++q) {
         int k = k0 + q;
@@ -355,21 +411,8 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
         __syncwarp();
         if (base + stride < end) prefetch(base + stride);
         T dots[FUSED_ROWS][S] = {};
-        for (int d = 0; d < pcs; d += 4) {
-            T y[4][S];
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                load4(y_t + (size_t)(d + j) * FUSED_CLUSTER_STRIDE + k0, y[j]);
-#pragma unroll
-            for (int r = 0; r < FUSED_ROWS; ++r) {
-                T z[4];
-                load4(z_w + r * pcs + d, z);
-#pragma unroll
-                for (int j = 0; j < 4; ++j)
-#pragma unroll
-                    for (int q = 0; q < S; ++q) dots[r][q] += z[j] * y[j][q];
-            }
-        }
+        tile_products(z_w, y_t, pcs, k0, dots,
+                      [](T acc, T z, T y) { return acc + z * y; });
 #pragma unroll
         for (int r = 0; r < FUSED_ROWS; ++r) {
             if (r >= rows) break;  // warp-uniform
@@ -383,10 +426,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                     if (k0 + q < n_clusters)
                         shift =
                             max(shift, term * (T(1) - dots[r][q]) + log_pen[q]);
-#pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    shift =
-                        max(shift, __shfl_xor_sync(0xffffffff, shift, offset));
+                shift = warp_max(shift);
             }
 #pragma unroll
             for (int q = 0; q < S; ++q) {
@@ -401,9 +441,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                                   : T(0);
                 sum += vals[q];
             }
-#pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                sum += __shfl_xor_sync(0xffffffff, sum, offset);
+            sum = warp_sum(sum);
             T inv = T(1) / sum, log_sum = log(sum);
             T distance = T(0), entropy = T(0);
             RT* row = R + (size_t)cell[r] * n_clusters;
@@ -416,7 +454,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                     RT stored = to_storage<RT>(value);
                     row[k] = stored;
                     value = from_storage<T>(stored);
-                    col[q] += value;
+                    col[q] += count_to_fixed(value, count_scale);
                     distance += value * T(2) * (T(1) - dots[r][q]);
                     // log(value) = log of the unnormalized weight - log(sum)
                     if constexpr (LOG_PEN)
@@ -427,10 +465,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                                             log_pen[q] - log_sum);
                 }
             }
-            T total = distance + sigma * entropy;
-#pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                total += __shfl_xor_sync(0xffffffff, total, offset);
+            T total = warp_sum(distance + sigma * entropy);
             if (lane == 0) partial[cell[r]] = total;
         }
     }
@@ -439,9 +474,10 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
         if (k0 + q < n_clusters) col_sums[warp * n_clusters + k0 + q] = col[q];
     __syncthreads();
     for (int k = threadIdx.x; k < n_clusters; k += blockDim.x) {
-        T sum = T(0);
+        long long sum = 0;
         for (int w = 0; w < n_warps; ++w) sum += col_sums[w * n_clusters + k];
-        tile_partial[(size_t)tile * n_clusters + k] = sum;
+        atomicAdd(counts + (size_t)category * n_clusters + k,
+                  (unsigned long long)sum);
     }
 }
 
@@ -458,20 +494,20 @@ __global__ void fused_assign_general_kernel(
     const T* __restrict__ penalty, const int* __restrict__ idx,
     const int* __restrict__ offsets, const int* __restrict__ tiles,
     int n_categories, int tile_rows, RT* __restrict__ R,
-    T* __restrict__ partial, T* __restrict__ tile_partial,
-    T* __restrict__ col_ws, T term, T sigma, int n_pcs, int n_clusters) {
-    int tile = blockIdx.x;
+    T* __restrict__ partial, unsigned long long* __restrict__ counts,
+    long long* __restrict__ col_ws, T term, T sigma, T count_scale, int n_pcs,
+    int n_clusters) {
+    int tile = blockIdx.x, start, end;
     if (tile >= tiles[n_categories]) return;
-    int category = scatter_tile_category(tile, n_categories, tiles);
-    int start = offsets[category] + (tile - tiles[category]) * tile_rows;
-    int end = start + min(tile_rows, offsets[category + 1] - start);
+    int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
+                                     tile_rows, start, end);
     constexpr int S = FUSED_MAX_CLUSTER_SLOTS;
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int n_warps = blockDim.x >> 5;
     int n_chunks =
         (n_clusters + FUSED_CLUSTER_STRIDE - 1) / FUSED_CLUSTER_STRIDE;
-    T* cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
-    for (int k = lane; k < n_clusters; k += 32) cols[k] = T(0);
+    long long* cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
+    for (int k = lane; k < n_clusters; k += 32) cols[k] = 0;
     const T* pen_row =
         penalty ? penalty + (size_t)category * n_clusters : nullptr;
 
@@ -503,17 +539,6 @@ __global__ void fused_assign_general_kernel(
             }
         }
     };
-    auto warp_max = [](T v) {
-        for (int offset = 16; offset > 0; offset >>= 1)
-            v = max(v, __shfl_xor_sync(0xffffffff, v, offset));
-        return v;
-    };
-    auto warp_sum = [](T v) {
-        for (int offset = 16; offset > 0; offset >>= 1)
-            v += __shfl_xor_sync(0xffffffff, v, offset);
-        return v;
-    };
-
     for (int base = start + warp * FUSED_ROWS; base < end;
          base += n_warps * FUSED_ROWS) {
         int cell[FUSED_ROWS];
@@ -558,7 +583,7 @@ __global__ void fused_assign_general_kernel(
                     RT stored = to_storage<RT>(value);
                     row[k] = stored;
                     value = from_storage<T>(stored);
-                    cols[k] += value;
+                    cols[k] += count_to_fixed(value, count_scale);
                     distance[r] += value * T(2) * om[r][q];
                     entropy[r] += value * (lw[r][q] - row_max[r] - log_sum);
                 }
@@ -572,10 +597,11 @@ __global__ void fused_assign_general_kernel(
     }
     __syncthreads();
     for (int k = threadIdx.x; k < n_clusters; k += blockDim.x) {
-        T sum = T(0);
+        long long sum = 0;
         for (int w = 0; w < n_warps; ++w)
             sum += col_ws[((size_t)tile * n_warps + w) * n_clusters + k];
-        tile_partial[(size_t)tile * n_clusters + k] = sum;
+        atomicAdd(counts + (size_t)category * n_clusters + k,
+                  (unsigned long long)sum);
     }
 }
 
@@ -584,13 +610,9 @@ template <typename T>
 __global__ void transpose_centroids_kernel(const T* Y_norm, T* y_t, int n_pcs,
                                            int pcs, int n_clusters,
                                            int k_stride) {
-    for (long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         t < (long long)pcs * k_stride;
-         t += (long long)blockDim.x * gridDim.x) {
-        int d = (int)(t / k_stride), k = (int)(t % k_stride);
-        y_t[t] =
-            d < n_pcs && k < n_clusters ? Y_norm[(size_t)k * n_pcs + d] : T(0);
-    }
+    transpose_padded(Y_norm, y_t, n_clusters, n_pcs, pcs, k_stride,
+                     blockIdx.x * blockDim.x + threadIdx.x,
+                     blockDim.x * gridDim.x);
 }
 
 // Log penalty of every joint category: the sum of its levels' log penalties.
@@ -625,7 +647,7 @@ __global__ void objective_diversity_kernel(const T* O, const T* E,
         diversity += sigma * theta[i / n_clusters] * O[i] *
                      log(numerator / (E[i] + T(1)));
     }
-    diversity = objective_block_sum(diversity, false);
+    diversity = block_sum(diversity);
     if (threadIdx.x == 0) *out = diversity;
 }
 
@@ -646,12 +668,8 @@ __global__ void kmeans_assign_kernel(const T* __restrict__ X,
     T* c_t = reinterpret_cast<T*>(smem_raw);  // cols x FUSED_CLUSTER_STRIDE
     T* x_w = c_t + (size_t)cols * FUSED_CLUSTER_STRIDE +
              (size_t)warp * FUSED_ROWS * cols;
-    for (int t = threadIdx.x; t < cols * FUSED_CLUSTER_STRIDE;
-         t += blockDim.x) {
-        int d = t / FUSED_CLUSTER_STRIDE, k = t % FUSED_CLUSTER_STRIDE;
-        c_t[t] = d < n_cols && k < n_clusters ? centers[(size_t)k * n_cols + d]
-                                              : T(0);
-    }
+    transpose_padded(centers, c_t, n_clusters, n_cols, cols,
+                     FUSED_CLUSTER_STRIDE, threadIdx.x, blockDim.x);
     __syncthreads();
     int k0 = 4 * lane;
     long long stride = (long long)gridDim.x * n_warps * FUSED_ROWS;
@@ -666,24 +684,10 @@ __global__ void kmeans_assign_kernel(const T* __restrict__ X,
                                         : T(0);
         __syncwarp();
         T dist[FUSED_ROWS][S] = {};
-        for (int d = 0; d < cols; d += 4) {
-            T c[4][S];
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                load4(c_t + (size_t)(d + j) * FUSED_CLUSTER_STRIDE + k0, c[j]);
-#pragma unroll
-            for (int r = 0; r < FUSED_ROWS; ++r) {
-                T x[4];
-                load4(x_w + r * cols + d, x);
-#pragma unroll
-                for (int j = 0; j < 4; ++j)
-#pragma unroll
-                    for (int q = 0; q < S; ++q) {
-                        T delta = x[j] - c[j][q];
-                        dist[r][q] += delta * delta;
-                    }
-            }
-        }
+        tile_products(x_w, c_t, cols, k0, dist, [](T acc, T x, T c) {
+            T delta = x - c;
+            return acc + delta * delta;
+        });
 #pragma unroll
         for (int r = 0; r < FUSED_ROWS; ++r) {
             if (r >= rows) break;  // warp-uniform
@@ -731,23 +735,22 @@ __global__ void kmeans_closest_kernel(const T* __restrict__ X,
             T delta = X[(size_t)i * n_cols + d] - center[d];
             sum += delta * delta;
         }
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        sum = warp_sum(sum);
         if (lane == 0 && sum < closest[i]) closest[i] = sum;
     }
 }
 
+// dst = src with rows scaled to unit L2 norm (scale capped at 1e12); one
+// block of whole warps per row, src == dst allowed.
 template <typename T>
-__global__ void subtract_kernel(T* __restrict__ out,
-                                const T* __restrict__ values, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] -= values[i];
-}
-
-template <typename T>
-__global__ void add_kernel(T* __restrict__ out, const T* __restrict__ values,
-                           int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] += values[i];
+__global__ void l2_row_normalize_kernel(const T* src, T* dst, int n_cols) {
+    const T* s = src + (size_t)blockIdx.x * n_cols;
+    T* d = dst + (size_t)blockIdx.x * n_cols;
+    T acc = T(0);
+    for (int col = threadIdx.x; col < n_cols; col += blockDim.x)
+        acc += s[col] * s[col];
+    T scale = rsqrt(block_sum(acc));
+    if (scale > T(1e12)) scale = T(1e12);
+    for (int col = threadIdx.x; col < n_cols; col += blockDim.x)
+        d[col] = s[col] * scale;
 }

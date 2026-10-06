@@ -16,6 +16,7 @@ from rapids_singlecell.preprocessing._harmony import (
     _compute_lambda_kb,
     _correction,
     _correction_multi,
+    _segments,
     _solve_spd_batched,
 )
 from rapids_singlecell.preprocessing._harmony._helper import (
@@ -323,6 +324,8 @@ def test_harmony_correction_matches_dense_design(dtype, method, normalize):
     lambda_np = rng.uniform(0.2, 1.0, size=O_np.shape).astype(np_dtype)
     lambda_np[2] = np_dtype.type(_SUPPRESS_PENALTY)
     lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
+    offsets = np.searchsorted(cats_np, np.arange(n_batches + 1)).astype(np.int32)
+    bounds = (np.diff(offsets) * np.abs(X_np).max()).tolist()
 
     result = _correction(
         cp.asarray(X_np),
@@ -332,11 +335,10 @@ def test_harmony_correction_matches_dense_design(dtype, method, normalize):
         correction_method=method,
         cats=cp.asarray(cats_np),
         n_batches=n_batches,
-        cat_offsets=cp.asarray(
-            np.searchsorted(cats_np, np.arange(n_batches + 1)), dtype=cp.int32
-        ),
+        cat_offsets=cp.asarray(offsets),
         cell_indices=cp.arange(40, dtype=cp.int32),
         normalize=normalize,
+        segments=(*_segments(offsets), bounds),
     )
 
     expected = _dense_design_correction(X_np, R_np, cats_np, lambda_np, n_batches)
@@ -398,7 +400,10 @@ def test_harmony_multikey_correction_matches_dense_design(
             joint_O=cp.asarray(joint_O_np),
             n_batches=n_batches,
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
-            joint_offsets=cp.asarray(joint_offsets),
+            segments=(
+                *_segments(joint_offsets),
+                (np.diff(joint_offsets) * np.abs(X_np).max()).tolist(),
+            ),
             marginal_joint_offsets=cp.asarray(marginal_offsets),
             marginal_joint_indices=cp.asarray(
                 [joint for _, joint in marginal], dtype=cp.int32
@@ -821,34 +826,22 @@ def test_harmony_integrate_repeats_bitwise(
     assert outputs[0].tobytes() == outputs[1].tobytes()
 
 
-def _integrate(dtype=np.float32, *, X_pca=None, **kwargs):
+def _integrate(dtype=np.float32, *, X_pca=None, key="batch", **kwargs):
     adata = _repeatability_adata(np.float32)
     if X_pca is not None:
         adata.obsm["X_pca"] = X_pca
     rsc.pp.harmony_integrate(
-        adata, "batch", dtype=dtype, rng=734, n_clusters=7, max_iter_harmony=2, **kwargs
+        adata, key, dtype=dtype, rng=734, n_clusters=7, max_iter_harmony=2, **kwargs
     )
     return adata.obsm["X_pca_harmony"]
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 def test_harmony_bfloat16_assignments():
-    reference = _integrate()
-    if all(
-        module.cutile_bf16_available(17, 7)
-        for module in (
-            harmony_module._clustering_cuda,
-            harmony_module._correction_batched_cuda,
-        )
-    ):
-        first, second = _integrate("bfloat16"), _integrate("bfloat16")
-        assert first.dtype == np.float32
-        assert first.tobytes() == second.tobytes()
-        assert _get_measure(first, reference, "L2") < 2e-2
-    else:
-        with pytest.warns(UserWarning, match="dtype='bfloat16'"):
-            fallback = _integrate("bfloat16")
-        assert fallback.tobytes() == reference.tobytes()
+    first, second = _integrate("bfloat16"), _integrate("bfloat16")
+    assert first.dtype == np.float32
+    assert first.tobytes() == second.tobytes()
+    assert _get_measure(first, _integrate(), "L2") < 2e-2
 
 
 @pytest.mark.parametrize("chunk", [0, -2, 1.5])
@@ -876,13 +869,11 @@ def test_harmony_host_input_matches_device_input():
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_bfloat16_falls_back_to_float32(monkeypatch):
-    monkeypatch.setattr(
-        harmony_module._clustering_cuda, "cutile_bf16_available", lambda *_: False
-    )
+def test_harmony_bfloat16_falls_back_to_float32():
+    key = ["batch", "second"]  # bfloat16 assignments need one batch key
     with pytest.warns(UserWarning, match="dtype='bfloat16'"):
-        fallback = _integrate("bfloat16")
-    assert fallback.tobytes() == _integrate().tobytes()
+        fallback = _integrate("bfloat16", key=key)
+    assert fallback.tobytes() == _integrate(key=key).tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -900,14 +891,17 @@ def test_harmony_general_assignment_matches_fused(monkeypatch, key):
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-@pytest.mark.parametrize("key", ["batch", ["batch", "second"]])
-def test_harmony_many_clusters(key):
+@pytest.mark.parametrize(
+    ("key", "dtype"),
+    [("batch", "float32"), ("batch", "bfloat16"), (["batch", "second"], "float32")],
+)
+def test_harmony_many_clusters(key, dtype):
     # More than 128 clusters take the general kernel in two sweeps.
     outputs = []
     for _ in range(2):
         adata = _repeatability_adata(np.float32)
         rsc.pp.harmony_integrate(
-            adata, key, rng=734, n_clusters=300, max_iter_harmony=2
+            adata, key, dtype=dtype, rng=734, n_clusters=300, max_iter_harmony=2
         )
         outputs.append(adata.obsm["X_pca_harmony"])
     assert np.isfinite(outputs[0]).all()

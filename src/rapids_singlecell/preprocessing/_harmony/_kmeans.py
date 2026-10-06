@@ -160,10 +160,6 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
             categories=labels,
             out=sums,
             workspace=workspace,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            n_categories=n_clusters,
-            switcher=1,
             stream=cp.cuda.get_current_stream().ptr,
         )
         cp.divide(sums, counts[:, None], out=centers)
