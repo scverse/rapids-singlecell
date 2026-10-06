@@ -116,24 +116,32 @@ __global__ void csr_extract_dense_kernel(const T* __restrict__ data,
     }
 }
 
-// CSR identity-mapped rows -> dense F-order; tolerates UNSORTED indices (full
-// row scan, no binary search). One block per row. Output must be pre-zeroed.
-template <typename T>
-__global__ void csr_extract_dense_identity_rows_unsorted_kernel(
-    const T* __restrict__ data, const int* __restrict__ indices,
+// Compact CSR rows -> pre-zeroed dense F-order tile. The compact row order is
+// already the output order, and sorted indices let each thread inspect only
+// the requested column interval instead of rescanning the full row per tile.
+template <typename T, typename IndexT = int>
+__global__ void csr_extract_dense_identity_rows_kernel(
+    const T* __restrict__ data, const IndexT* __restrict__ indices,
     const int* __restrict__ indptr, T* __restrict__ out, int n_target,
     int col_start, int col_stop) {
-    int row = blockIdx.x;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_target) return;
 
-    int rs = indptr[row];
-    int re = indptr[row + 1];
+    int lo = indptr[row];
+    int hi = indptr[row + 1];
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (indices[mid] < col_start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
 
-    for (int p = rs + threadIdx.x; p < re; p += blockDim.x) {
-        int c = indices[p];
-        if (c >= col_start && c < col_stop) {
-            out[(long long)(c - col_start) * n_target + row] = data[p];
-        }
+    int row_end = indptr[row + 1];
+    for (int p = lo; p < row_end; p++) {
+        int col = (int)indices[p];
+        if (col >= col_stop) break;
+        out[(long long)(col - col_start) * n_target + row] = data[p];
     }
 }
 

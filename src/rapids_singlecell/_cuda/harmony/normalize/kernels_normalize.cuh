@@ -3,10 +3,9 @@
 #include <cuda_runtime.h>
 
 // ---- L2 row normalize ----
-// One block per row. Writes to separate output buffer.
+// One block per row. Supports src == dst; all reads finish before writes begin.
 template <typename T>
-__global__ void l2_row_normalize_kernel(const T* __restrict__ src,
-                                        T* __restrict__ dst, int n_rows,
+__global__ void l2_row_normalize_kernel(const T* src, T* dst, int n_rows,
                                         int n_cols) {
     int row = blockIdx.x;
     if (row >= n_rows) return;

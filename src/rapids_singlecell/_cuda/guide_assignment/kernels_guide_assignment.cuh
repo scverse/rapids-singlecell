@@ -136,7 +136,7 @@ __global__ void assign_threshold_dense_kernel(
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
         float count =
             load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
-        assignments[valid_idx * n_cells + cell] =
+        assignments[static_cast<long long>(valid_idx) * n_cells + cell] =
             has_threshold && count >= guide_threshold;
     }
 }
@@ -206,7 +206,7 @@ __global__ void fit_assign_dense_kernel(
             guide_threshold = NAN;
         }
         for (int cell = tid; cell < n_cells; cell += blockDim.x) {
-            assignments[guide * n_cells + cell] = false;
+            assignments[static_cast<long long>(guide) * n_cells + cell] = false;
         }
         return;
     }
@@ -360,7 +360,7 @@ __global__ void fit_assign_dense_kernel(
     for (int cell = tid; cell < n_cells; cell += blockDim.x) {
         float count =
             load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
-        assignments[guide * n_cells + cell] =
+        assignments[static_cast<long long>(guide) * n_cells + cell] =
             has_threshold && count >= guide_threshold;
     }
 }

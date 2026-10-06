@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 
 from rapids_singlecell.preprocessing._neighbors._helper import (
+    _batched_search,
     _compute_nlist,
     _cuvs_switch,
 )
@@ -50,7 +51,9 @@ def _ivf_flat_knn(
 
     # Create SearchParams with nprobes if provided
     search_params = ivf_flat.SearchParams(n_probes=n_probes)
-    distances, neighbors = ivf_flat.search(search_params, index, Y, k, **search_kwargs)
+    distances, neighbors = _batched_search(
+        lambda q: ivf_flat.search(search_params, index, q, k, **search_kwargs), Y
+    )
 
     if resources is not None:
         resources.sync()

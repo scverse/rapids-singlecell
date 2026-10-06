@@ -1,8 +1,9 @@
-[![Stars](https://img.shields.io/github/stars/scverse/rapids_singlecell?style=flat&logo=GitHub&color=blue)](https://github.com/scverse/rapids_singlecell/stargazers)
+[![Stars](https://img.shields.io/github/stars/scverse/rapids-singlecell?style=flat&logo=GitHub&color=blue)](https://github.com/scverse/rapids-singlecell)
 [![PyPI](https://img.shields.io/pypi/v/rapids-singlecell?logo=PyPI)](https://pypi.org/project/rapids-singlecell)
-[![Downloads](https://static.pepy.tech/badge/rapids-singlecell)](https://pepy.tech/project/rapids-singlecell)
-[![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.readthedocs.io/en/latest/?badge=latest)
-[![CI-Pass](https://github.com/scverse/rapids_singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids_singlecell/actions/workflows/test-gpu.yml)
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-total.json)](https://pypi.org/project/rapids-singlecell)
+[![Downloads/month](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fscverse%2Frapids-singlecell%2Fdownload-stats%2Fbadge-month.json)](https://pypi.org/project/rapids-singlecell)
+[![Documentation Status](https://readthedocs.org/projects/rapids-singlecell/badge/?version=latest)](https://rapids-singlecell.scverse.org/)
+[![CI-Pass](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml/badge.svg)](https://github.com/scverse/rapids-singlecell/actions/workflows/test-gpu.yml)
 [![codecov](https://codecov.io/gh/scverse/rapids-singlecell/graph/badge.svg?token=PFHJEQD94X)](https://codecov.io/gh/scverse/rapids-singlecell)
 [![Chat](https://img.shields.io/badge/zulip-join_chat-%2367b08f.svg)](https://scverse.zulipchat.com)
 
@@ -11,15 +12,30 @@
 
 rapids-singlecell provides GPU-accelerated single-cell analysis with an AnnData-first API.
 It is largely compatible with Scanpy and includes selected functionality from Squidpy, decoupler, and pertpy.
-Computations use CuPy and NVIDIA RAPIDS for performance on large datasets.
+Computations use CuPy and NVIDIA CUDA-X Data Science (formerly RAPIDS) for performance on large datasets.
 
 - **GPU acceleration**: Common single-cell workflows on `AnnData` run on the GPU.
 - **Ecosystem compatibility**: Works with Scanpy APIs; includes pieces from Squidpy, decoupler, and pertpy.
 - **Simple installation**: Available via Conda and PyPI.
+- **Version-matched agent skill**: Released pip packages include an analysis skill for Codex, Claude, and other agents.
+
+## Agent skill
+
+Released packages include the matching model-neutral analysis skill:
+
+```bash
+rapids-singlecell-install-skills --agent codex
+rapids-singlecell-install-skills --agent claude
+rapids-singlecell-install-skills --agent claude-science  # or: --agent agents
+rapids-singlecell-check-kernel                    # before starting Jupyter
+```
+
+Use `--dest /path/to/skills/rapids-singlecell` for another agent.
+See the [installation guide](https://rapids-singlecell.readthedocs.io/en/latest/installation.html#agent-skill) for installation and preflight details.
 
 ## Documentation
 
-For more information please have a look through the [documentation](https://rapids-singlecell.readthedocs.io/en/latest/)
+For more information please have a look through the [documentation](https://rapids-singlecell.scverse.org/)
 
 ## Citation
 

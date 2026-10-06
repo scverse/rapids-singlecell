@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import warnings
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,15 @@ from natsort import natsorted
 from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 
+from rapids_singlecell._keys import _resolve_obsm_key
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _LegacyRng,
+    _seed_from_rng,
+)
+
 from ._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -20,7 +30,7 @@ if TYPE_CHECKING:
     from scipy import sparse
 
 
-def _check_dtype(dtype: str | np.dtype | cp.dtype) -> str | np.dtype | cp.dtype:
+def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
     if isinstance(dtype, str):
         if dtype not in ["float32", "float64"]:
             raise ValueError("dtype must be one of ['float32', 'float64']")
@@ -100,29 +110,38 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
     ddf = dd.from_map(mapper, pairs, meta=meta).to_backend("cudf").persist()
     import cugraph.dask.comms.comms as Comms
 
-    Comms.initialize(p2p=True)
-    g = Graph()
-    if use_weights:
-        g.from_dask_cudf_edgelist(
-            ddf,
-            source="src",
-            destination="dst",
-            weight="weight",
-        )
-    else:
-        g.from_dask_cudf_edgelist(
-            ddf,
-            source="src",
-            destination="dst",
-        )
+    try:
+        Comms.initialize(p2p=True)
+        g = Graph()
+        if use_weights:
+            g.from_dask_cudf_edgelist(
+                ddf,
+                source="src",
+                destination="dst",
+                weight="weight",
+            )
+        else:
+            g.from_dask_cudf_edgelist(
+                ddf,
+                source="src",
+                destination="dst",
+            )
+    except BaseException:
+        # A worker dying mid-handshake leaves cugraph's global communicator
+        # half-initialized; tear it down (best effort) so later calls don't
+        # fail with "already initialized".
+        with contextlib.suppress(Exception):
+            Comms.destroy()
+        raise
     return g
 
 
+@_accepts_legacy_random_state(0)
 def leiden(
     adata: AnnData,
     resolution: float | list[float] = 1.0,
     *,
-    random_state: int | None = 0,
+    rng: SeedLike | RNGLike | None = None,
     theta: float = 1.0,
     restrict_to: tuple[str, Sequence[str]] | None = None,
     key_added: str = "leiden",
@@ -131,7 +150,7 @@ def leiden(
     use_weights: bool = True,
     neighbors_key: str | None = None,
     obsp: str | None = None,
-    dtype: str | np.dtype | cp.dtype = np.float32,
+    dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
     copy: bool = False,
 ) -> AnnData | None:
@@ -151,8 +170,10 @@ def leiden(
             (called gamma in the modularity formula). Higher values lead to
             more clusters. If a list of values is provided, the Leiden algorithm will be run for each value in the list.
 
-        random_state
-            Change the initialization of the optimization. Defaults to 0.
+        rng
+            Random seed or :class:`~numpy.random.Generator` changing the
+            initialization of the optimization. Defaults to 0.
+            The superseded `random_state` argument is still accepted.
 
         theta
             Called theta in the Leiden algorithm, this is used to scale modularity
@@ -202,6 +223,9 @@ def leiden(
     """
     # Adjacency graph
 
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+
     adata = adata.copy() if copy else adata
 
     dtype = _check_dtype(dtype)
@@ -230,50 +254,58 @@ def leiden(
     else:
         resolutions = resolution
     modularities = []
-    for resolution in resolutions:
-        leiden_parts, modularity = culeiden(
-            g,
-            resolution=resolution,
-            random_state=random_state,
-            theta=theta,
-            max_iter=n_iterations,
-        )
-        if use_dask:
-            leiden_parts = leiden_parts.to_backend("pandas").compute()
-        else:
-            leiden_parts = leiden_parts.to_pandas()
-        modularities.append(modularity)
-
-        # Format output
-        groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-        key_added_to_use = key_added
-        if restrict_to is not None:
-            if key_added == "leiden":
-                key_added_to_use += "_R"
-            groups = rename_groups(
-                adata,
-                key_added=key_added_to_use,
-                restrict_key=restrict_key,
-                restrict_categories=restrict_categories,
-                restrict_indices=restrict_indices,
-                groups=groups,
+    try:
+        for resolution in resolutions:
+            leiden_parts, modularity = culeiden(
+                g,
+                resolution=resolution,
+                # cuGraph's leiden is seeded, so draw the seed right here
+                random_state=_seed_from_rng(rng),
+                theta=theta,
+                max_iter=n_iterations,
             )
-        if len(resolutions) > 1:
-            key_added_to_use += f"_{resolution}"
+            if use_dask:
+                leiden_parts = leiden_parts.to_backend("pandas").compute()
+            else:
+                leiden_parts = leiden_parts.to_pandas()
+            modularities.append(modularity)
 
-        adata.obs[key_added_to_use] = pd.Categorical(
-            values=groups.astype("U"),
-            categories=natsorted(map(str, np.unique(groups))),
-        )
-    if use_dask:
-        import cugraph.dask.comms.comms as Comms
+            # Format output
+            groups = (
+                leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
+            )
+            key_added_to_use = key_added
+            if restrict_to is not None:
+                if key_added == "leiden":
+                    key_added_to_use += "_R"
+                groups = rename_groups(
+                    adata,
+                    key_added=key_added_to_use,
+                    restrict_key=restrict_key,
+                    restrict_categories=restrict_categories,
+                    restrict_indices=restrict_indices,
+                    groups=groups,
+                )
+            if len(resolutions) > 1:
+                key_added_to_use += f"_{resolution}"
 
-        Comms.destroy()
+            adata.obs[key_added_to_use] = pd.Categorical(
+                values=groups.astype("U"),
+                categories=natsorted(map(str, np.unique(groups))),
+            )
+    finally:
+        # Always tear down the raft/NCCL comms, even if clustering raised, so a
+        # single failure can't leak the global cugraph communicator and make
+        # every later dask clustering call fail with "already initialized".
+        if use_dask:
+            import cugraph.dask.comms.comms as Comms
+
+            Comms.destroy()
     # store information on the clustering parameters
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
         "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
-        "random_state": random_state,
+        **meta_random_state,
         "n_iterations": n_iterations,
     }
     adata.uns[key_added]["modularity"] = (
@@ -294,7 +326,7 @@ def louvain(
     use_weights: bool = True,
     neighbors_key: int | None = None,
     obsp: str | None = None,
-    dtype: str | np.dtype | cp.dtype = np.float32,
+    dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
     copy: bool = False,
 ) -> AnnData | None:
@@ -389,44 +421,51 @@ def louvain(
     else:
         resolutions = resolution
     modularities = []
-    for resolution in resolutions:
-        louvain_parts, modularity = culouvain(
-            g,
-            resolution=resolution,
-            max_level=n_iterations,
-            threshold=threshold,
-        )
-        if use_dask:
-            louvain_parts = louvain_parts.to_backend("pandas").compute()
-        else:
-            louvain_parts = louvain_parts.to_pandas()
-        modularities.append(modularity)
-
-        # Format output
-        groups = louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-        key_added_to_use = key_added
-        if restrict_to is not None:
-            if key_added == "louvain":
-                key_added_to_use += "_R"
-            groups = rename_groups(
-                adata,
-                key_added=key_added_to_use,
-                restrict_key=restrict_key,
-                restrict_categories=restrict_categories,
-                restrict_indices=restrict_indices,
-                groups=groups,
+    try:
+        for resolution in resolutions:
+            louvain_parts, modularity = culouvain(
+                g,
+                resolution=resolution,
+                max_level=n_iterations,
+                threshold=threshold,
             )
-        if len(resolutions) > 1:
-            key_added_to_use += f"_{resolution}"
+            if use_dask:
+                louvain_parts = louvain_parts.to_backend("pandas").compute()
+            else:
+                louvain_parts = louvain_parts.to_pandas()
+            modularities.append(modularity)
 
-        adata.obs[key_added_to_use] = pd.Categorical(
-            values=groups.astype("U"),
-            categories=natsorted(map(str, np.unique(groups))),
-        )
-    if use_dask:
-        import cugraph.dask.comms.comms as Comms
+            # Format output
+            groups = (
+                louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
+            )
+            key_added_to_use = key_added
+            if restrict_to is not None:
+                if key_added == "louvain":
+                    key_added_to_use += "_R"
+                groups = rename_groups(
+                    adata,
+                    key_added=key_added_to_use,
+                    restrict_key=restrict_key,
+                    restrict_categories=restrict_categories,
+                    restrict_indices=restrict_indices,
+                    groups=groups,
+                )
+            if len(resolutions) > 1:
+                key_added_to_use += f"_{resolution}"
 
-        Comms.destroy()
+            adata.obs[key_added_to_use] = pd.Categorical(
+                values=groups.astype("U"),
+                categories=natsorted(map(str, np.unique(groups))),
+            )
+    finally:
+        # Always tear down the raft/NCCL comms, even if clustering raised, so a
+        # single failure can't leak the global cugraph communicator and make
+        # every later dask clustering call fail with "already initialized".
+        if use_dask:
+            import cugraph.dask.comms.comms as Comms
+
+            Comms.destroy()
     adata.uns[key_added] = {}
     adata.uns[key_added]["params"] = {
         "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
@@ -439,6 +478,7 @@ def louvain(
     return adata if copy else None
 
 
+@_accepts_legacy_random_state(42)
 def kmeans(
     adata: AnnData,
     n_clusters: int = 8,
@@ -446,7 +486,7 @@ def kmeans(
     *,
     use_rep: str = "X_pca",
     n_init: int = 1,
-    random_state: float = 42,
+    rng: SeedLike | RNGLike | None = None,
     key_added: str = "kmeans",
     copy: bool = False,
     **kwargs,
@@ -464,14 +504,15 @@ def kmeans(
             Use this many PCs. If `n_pcs==0` use `.X` if `use_rep is None`.
         use_rep
             Use the indicated representation. `'X'` or any key for `.obsm` is valid.
-            If None, the representation is chosen automatically: For .n_vars < 50, .X
-            is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-            computed with default parameters or `n_pcs` if present.
+            Either spelling of the PCA key resolves to whichever one the data
+            actually uses, so the default works under any
+            ``rapids_singlecell.settings.preset``.
         n_init
             Number of initializations to run the KMeans algorithm
-        random_state
-            if you want results to be the same when you restart Python, select a
-            state. Default is 42.
+        rng
+            Random seed or :class:`~numpy.random.Generator`; fix it if you want
+            results to be the same when you restart Python. Default is 42.
+            The superseded `random_state` argument is still accepted.
         key_added
             `adata.obs` key under which to add the cluster labels.
         copy
@@ -480,13 +521,20 @@ def kmeans(
             Additional keyword arguments for KMeans.
 
     """
+    rng = np.random.default_rng(rng)
+
     from cuml.cluster import KMeans
 
     adata = adata.copy() if copy else adata
+    use_rep = _resolve_obsm_key(adata, use_rep)
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
 
     kmeans_out = KMeans(
-        n_clusters=n_clusters, n_init=n_init, random_state=random_state, **kwargs
+        # cuML's KMeans is seeded, so draw the seed right here
+        n_clusters=n_clusters,
+        n_init=n_init,
+        random_state=_seed_from_rng(rng),
+        **kwargs,
     ).fit(X)
     groups = kmeans_out.labels_
 

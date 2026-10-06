@@ -10,14 +10,13 @@ import pandas as pd
 from anndata import AnnData
 from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
-from scanpy.get import _get_obs_rep
 from scipy.sparse import csr_matrix, issparse
 from tqdm.auto import tqdm
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.decoupler_gpu._helper._docs import docs
 from rapids_singlecell.decoupler_gpu._helper._log import _log
-from rapids_singlecell.preprocessing._utils import _check_use_raw
+from rapids_singlecell.preprocessing._utils import _check_use_raw, _sparse_to_dense
 
 DataType = Union[  # noqa: UP007
     AnnData, pd.DataFrame, cudf.DataFrame, tuple[np.ndarray, np.ndarray, np.ndarray]
@@ -33,6 +32,26 @@ getnnz_0 = cp.ElementwiseKernel(
     """,
     "get_nnz_0",
 )
+
+
+def _mat_to_array(mat, *, dense=True):
+    """Convert to float32 on the GPU, optionally retaining sparse storage."""
+    if issparse(mat):
+        mat = mat.astype(np.float32, copy=False)
+    if issparse(mat) or cp_issparse(mat):
+        mat = cp_csr_matrix(mat, dtype=np.float32)
+        return _sparse_to_dense(mat) if dense else mat
+    if isinstance(mat, np.ndarray | cp.ndarray):
+        return cp.asarray(mat, dtype=cp.float32)
+    raise ValueError(f"Unsupported matrix type: {type(mat)}")
+
+
+def _get_batch(mat, srt, end, *, dense=True):
+    """Slice before converting so backed input stays bounded by batch size."""
+    if isinstance(mat, tuple):
+        mat, msk_col = mat
+        return _mat_to_array(mat[srt:end, :], dense=dense)[:, msk_col]
+    return _mat_to_array(mat[srt:end, :], dense=dense)
 
 
 def _validate_mat(
@@ -76,11 +95,6 @@ def _validate_mat(
             msk_col = msk_col.get()
         col = col[~msk_col]
         mat = mat[:, ~msk_col]
-    # Check for repeated features
-    assert not np.any(col[1:] == col[:-1]), (
-        "mat contains repeated feature names, please make them unique"
-    )
-
     # Check for empty samples
     if isinstance(mat, csr_matrix):
         msk_row = mat.getnnz(axis=1) == 0
@@ -195,6 +209,10 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
         r = data.index.to_numpy(dtype="U")
         c = data.columns.to_numpy(dtype="U")
     elif isinstance(data, AnnData):
+        # Import lazily to avoid loading ``rapids_singlecell.get`` while the
+        # preprocessing package is still being initialized.
+        from rapids_singlecell.get import _get_obs_rep
+
         use_raw = _check_use_raw(data, layer, use_raw=raw)
         m = _get_obs_rep(data, layer=layer, use_raw=raw)
         c = (
@@ -234,6 +252,7 @@ def extract(
     verbose: bool = False,
     bsize: int = 250_000,
     pre_load: bool = False,
+    materialize: bool = False,
 ) -> (
     tuple[DataType_matrix, np.ndarray, np.ndarray]
     | tuple[tuple[DataType_matrix, np.ndarray], np.ndarray, np.ndarray]
@@ -249,6 +268,8 @@ def extract(
     %(empty)s
     %(verbose)s
     %(pre_load)s
+    materialize
+        Compute Dask input before validation for observation-global methods.
 
     Returns
     -------
@@ -256,7 +277,13 @@ def extract(
     """
     # Extract
     mat, row, col = _extract(data, layer=layer, raw=raw, pre_load=pre_load)
+    # Global transforms must validate and filter before shuffling features,
+    # just as for an equivalent in-memory matrix.
+    if materialize and isinstance(mat, DaskArray):
+        mat = mat.compute()
     # Validate
+    if not pd.Index(col).is_unique:
+        raise ValueError("mat contains repeated feature names, please make them unique")
     isbacked = hasattr(data, "isbacked") and data.isbacked
     mat_tuple: (
         tuple[np.ndarray, np.ndarray, np.ndarray]

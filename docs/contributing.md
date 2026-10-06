@@ -6,33 +6,27 @@
 
 - NVIDIA GPU with CUDA support
 - [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
-- A RAPIDS environment (e.g., conda `rapids-26.04` or pip-installed RAPIDS)
-- **CUDA toolkit ≥ 12.9, or ≤ 12.5, for building from source** (see note below)
+- A CUDA-X Data Science environment (e.g., conda `rapids-26.08` or pip-installed CUDA-X Data Science)
+- CUDA toolkit for building from source
 
-```{important}
-**On RAPIDS 26.04, building from source needs CUDA ≥ 12.9 (or ≤ 12.5) on CUDA 12.**
-RAPIDS 26.04 ships CCCL 3.3.0, which references the `cudaDevAttrHostNumaMemoryPoolsSupported`
-device attribute whenever the toolkit is ≥ 12.6, but NVIDIA only added that enum in
-CUDA 12.9. So compiling the RMM/CCCL-using kernels (the Wilcoxon scratch allocator)
-against a **CUDA 12.6–12.8** toolkit fails with
-`error: the global scope has no "cudaDevAttrHostNumaMemoryPoolsSupported"`.
-
-This is an upstream CCCL guard bug, **fixed in CCCL > 3.3.0 (RAPIDS ≥ 26.06)** — so
-the gap only affects RAPIDS 26.04. CUDA 13.x is unaffected. If you're on RAPIDS 26.04
-+ CUDA 12.6–12.8, either build with CUDA ≥ 12.9 (or ≤ 12.5), upgrade to RAPIDS ≥ 26.06,
-or just use the **prebuilt wheel** (`pip install rapids-singlecell-cu12`) — wheels are
-built on CUDA 12.2 (below the guard), so the enum is never referenced and they run fine
-on any CUDA 12.x runtime, including 12.6–12.8. The build emits an actionable error in
-this range; override only if your toolkit defines the enum with `-DRSC_SKIP_CUDA_VERSION_CHECK=ON`.
+```{note}
+Building the CUDA extensions needs only nvcc and the CUDA toolkit — no CUDA-X Data Science C++
+package is required. Kernels use a CuPy-backed scratch allocator instead of RMM, and
+the `cub/` headers come from the toolkit's own bundled CCCL, so nothing links
+`librmm` or `librapids_logger`.
 ```
 
 ### Clone and install
 
 ```bash
-git clone https://github.com/scverse/rapids_singlecell.git
-cd rapids_singlecell
-(uv) pip install -e ".[test]"
+git clone --recurse-submodules https://github.com/scverse/rapids-singlecell.git
+cd rapids-singlecell
+hatch env create hatch-test.stable-13
 ```
+
+The documentation notebooks live in a Git submodule. If the repository was
+already cloned without `--recurse-submodules`, initialize them with
+`git submodule update --init` before building the documentation.
 
 The editable install compiles the CUDA kernels for your local GPU architecture.
 After the install, compiled `.so` modules and `.pyi` type stubs are placed in `src/rapids_singlecell/_cuda/`.
@@ -71,7 +65,7 @@ rapids_singlecell/
 │       └── py.typed             # PEP 561 marker (gitignored, auto-generated)
 ├── tests/                       # pytest test suite
 ├── docs/                        # Sphinx documentation
-├── docker/                      # Docker and CI build images
+├── docker/                      # Docker container recipes
 ├── conda/                       # Conda environment files
 ├── CMakeLists.txt               # CMake build for CUDA extensions
 └── pyproject.toml               # Project metadata and build config
@@ -90,7 +84,7 @@ We accept pull requests using any of the following:
 - **nanobind/CUDA C++** extensions
 
 Please **do not** introduce JAX or PyTorch as dependencies.
-The project is built on the RAPIDS/CuPy stack and we want to keep the dependency footprint "minimal".
+The project is built on CUDA-X Data Science and CuPy and we want to keep the dependency footprint "minimal".
 
 The most important thing is a **correct, tested implementation**.
 Performance optimization and porting to nanobind C++ (if needed) can happen in follow-up PRs or directly on your branch by the maintainers.
@@ -114,15 +108,16 @@ Each kernel module lives in its own subdirectory under `src/rapids_singlecell/_c
 The shared header `nb_types.h` provides type aliases used across all modules:
 
 ```cpp
-cuda_array<T>                  // no contiguity constraint
-cuda_array_c<T>                // C-contiguous (row-major)
-cuda_array_f<T>                // F-contiguous (column-major)
-cuda_array_contig<T, Contig>   // parameterized contiguity
+gpu_array<T, Device>                  // no contiguity constraint
+gpu_array_c<T, Device>                // C-contiguous (row-major)
+gpu_array_f<T, Device>                // F-contiguous (column-major)
+gpu_array_contig<T, Device, Contig>    // parameterized contiguity
 ```
 
 Choose the appropriate alias based on how the kernel accesses data.
-Use `cuda_array_f` for kernels that index column-by-column (e.g., `data + col * n_rows`), and `cuda_array_c` for row-major access.
+Use `gpu_array_f` for kernels that index column-by-column (e.g., `data + col * n_rows`), and `gpu_array_c` for row-major access.
 nanobind will reject arrays with the wrong memory layout at runtime.
+Template the binding registration function on `Device` and use `REGISTER_GPU_BINDINGS` to register it for both `nb::device::cuda` and `nb::device::cuda_managed` arrays.
 
 ### Adding a new kernel
 
@@ -140,8 +135,8 @@ nanobind will reject arrays with the wrong memory layout at runtime.
        "_your_module_cuda",
    ]
    ```
-   This registers the module for lazy loading — imports return `None` instead of raising `ImportError` when the compiled extension is unavailable (e.g., docs builds without a GPU).
-6. Rebuild: `uv pip install -e .`
+   This registers the module for lazy loading — imports return `None` when the compiled extension is absent (e.g., docs builds without a GPU). Errors loading an installed extension are propagated.
+6. Rebuild: `[uv] pip install -e .`
 
 The `add_nb_cuda_module` helper automatically handles:
 - Stable ABI + LTO compilation
@@ -156,10 +151,11 @@ The `add_nb_cuda_module` helper automatically handles:
 - Use `nb::kw_only()` to separate data arguments from configuration arguments
 - Accept `std::uintptr_t stream` as the last parameter (default `0`) to support stream-based execution
 - Keep kernel logic in `.cuh` headers, bindings in `.cu` files
-- **Import `_cuda` modules via `rapids_singlecell._cuda`**. The `_cuda` package uses lazy loading with automatic `ImportError` handling — if the compiled extension is unavailable (e.g., docs builds without a GPU), the import returns `None` instead of raising an error:
+- **Import `_cuda` modules via `rapids_singlecell._cuda`**. The `_cuda` package uses lazy loading — if the compiled extension is absent (e.g., docs builds without a GPU), the import returns `None`. Errors loading an installed extension, such as missing shared libraries, are propagated:
 
   ```python
   from rapids_singlecell._cuda import _my_module_cuda as _my
+
 
   def my_function(adata):
       # _my is either the real module or None
@@ -174,26 +170,26 @@ The `add_nb_cuda_module` helper automatically handles:
 
 The project uses [hatch](https://hatch.pypa.io/) to manage test environments. The test matrix is defined in `hatch.toml` with two axes:
 
-- **`cuda`**: `12` or `13` — selects the matching RAPIDS/CuPy packages
+- **`cuda`**: `12` or `13` — selects the matching CUDA-X Data Science and CuPy packages
 - **`deps`**: `stable`, `dev`, or `rapids_prerelease` — controls Python version and dependency sources
 
 | `deps` | Python | Description |
 |---|---|---|
 | `stable` | 3.12 | Released versions of all dependencies |
 | `dev` | 3.14 | Upstream `main` branches of anndata and scanpy |
-| `rapids_prerelease` | 3.14 | RAPIDS nightly wheels |
+| `rapids_prerelease` | 3.14 | CUDA-X Data Science nightly wheels |
 
 To run the test suite against a specific matrix combination:
 
 ```bash
 # Run stable tests with CUDA 13
-(uvx) hatch run hatch-test.stable-13:run
+[uvx] hatch run hatch-test.stable-13:run
 
 # Run stable tests with CUDA 12
-(uvx) hatch run hatch-test.stable-12:run
+[uvx] hatch run hatch-test.stable-12:run
 
 # Run dev tests (upstream anndata/scanpy) with CUDA 13
-(uvx) hatch run hatch-test.dev-13:run
+[uvx] hatch run hatch-test.dev-13:run
 ```
 
 ### Running individual tests
@@ -202,15 +198,15 @@ For quick iteration during development, you can pass specific test paths:
 
 ```bash
 # Run a specific test file
-(uvx) hatch run hatch-test.stable-13:run tests/path/to/test.py -v
+[uvx] hatch run hatch-test.stable-13:run tests/path/to/test.py -v
 
 # Run a specific test
-(uvx) hatch run hatch-test.stable-13:run tests/path/to/test.py::test_name -v
+[uvx] hatch run hatch-test.stable-13:run tests/path/to/test.py::test_name -v
 ```
 
 ```{important}
 Always set a timeout when running tests with new CUDA kernels, as they may hang on launch failures.
-Tests have a default 120-second timeout configured in `pyproject.toml`.
+Tests have a default 60-second per-test timeout configured in `pyproject.toml`.
 ```
 
 ### Test guidelines
@@ -219,16 +215,23 @@ Tests have a default 120-second timeout configured in `pyproject.toml`.
 - **GPU shared memory limits** vary across devices (e.g., T4 has 64KB per block). Kernels should query device limits at runtime rather than using fixed parameters.
 - Use `pytest.importorskip` for optional dependencies in tests.
 
+### GPU CI
+
+GPU tests run on every push to `main`.
+On pull requests, they run only after a maintainer adds the `run-gpu-ci` label, which is removed automatically once the run is triggered.
+Pull requests that cannot affect GPU code, such as documentation or CI changes, can carry the `skip-gpu-ci` label instead, which reports the GPU checks as passed without running them.
+`run-gpu-ci` takes precedence when both labels are set.
+
 ## Building documentation
 
 ```bash
-(uvx) hatch run docs:build
+[uvx] hatch run docs:build
 ```
 
 To build without compiling CUDA extensions (e.g., on a machine without a GPU):
 
 ```bash
-CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" (uvx) hatch run docs:build
+CMAKE_ARGS="-DRSC_BUILD_EXTENSIONS=OFF" [uvx] hatch run docs:build
 ```
 
 The built docs are in `docs/_build/html/`.
@@ -251,11 +254,11 @@ Wheels are built via [cibuildwheel](https://cibuildwheel.pypa.io/) in GitHub Act
 The CI renames the package and adjusts optional dependencies per CUDA version using an inline Python script in `publish.yml`.
 
 Each wheel contains:
-- Compiled `.abi3.so` modules (stable ABI, one wheel per platform for all Python 3.12+ versions)
+- Compiled `.abi3.so` modules (stable ABI, one wheel per platform and CUDA variant for supported Python versions)
 - `.pyi` type stubs for IDE support
 - `py.typed` PEP 561 marker
 
-Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via `wheel.exclude` in `pyproject.toml`.
+Source files (`.cu`, `.cuh`, `.h`) are excluded from wheels via Hatchling's wheel target configuration in `pyproject.toml`.
 They are included in the source distribution for self-compilation.
 
 ### CUDA architectures
@@ -267,28 +270,31 @@ Source builds (`pip install rapids-singlecell`) compile for the local GPU archit
 
 ### Docker containers
 
-The `docker/` directory contains two types of Dockerfiles:
+The project-provided containers will be deprecated in a future release. Automated
+builds and publication continue for now; no deprecation date has been set.
+See {ref}`container-deprecation` for migration options.
 
-**User-facing containers** (for running rapids-singlecell):
+The `docker/` directory contains the following recipes:
 
 | File | Purpose |
 |---|---|
-| `Dockerfile.deps` | Base image with conda RAPIDS environment + pip dependencies. Uses `nvidia/cuda:*-devel` for CUDA toolkit access. |
+| `Dockerfile.deps` | Base image with conda CUDA-X Data Science environment + pip dependencies. Uses `nvidia/cuda:*-devel` for CUDA toolkit access. |
 | `Dockerfile` | Final image that builds on `rapids-singlecell-deps` and compiles rapids-singlecell from source for all supported GPU architectures. |
 
-These are built by `docker-push.sh`, which strips the `rapids-singlecell` pip line from the conda environment file and builds both images in sequence.
+The `.github/workflows/docker.yml` workflow builds these images using the repository as the `source` build context and passes the package version through `RSC_VERSION`.
+It removes the `rapids-singlecell` pip entry from the conda environment file before building the dependency image and publishes images on releases.
 
-**CI manylinux images** (for building PyPI wheels):
+### CI manylinux images
 
-| File | Purpose |
-|---|---|
-| `manylinux_2_28_x86_64_cuda12.2.Dockerfile` | x86_64 build image with CUDA 12.2 toolkit |
-| `manylinux_2_28_aarch64_cuda12.2.Dockerfile` | aarch64 build image with CUDA 12.2 toolkit |
-| `manylinux_2_28_x86_64_cuda13.0.Dockerfile` | x86_64 build image with CUDA 13.0 toolkit |
-| `manylinux_2_28_aarch64_cuda13.0.Dockerfile` | aarch64 build image with CUDA 13.0 toolkit |
+The planned container deprecation does not affect wheel builds. Wheels are built by
+cibuildwheel against prebuilt manylinux + CUDA images published at
+`quay.io/manylinux_cuda/manylinux_2_28_<arch>_cuda<ver>`. `publish.yml` selects the image
+per matrix entry via `cibw_image`.
 
-These are based on `quay.io/pypa/manylinux_2_28` and only install the CUDA toolkit packages needed for compilation (nvcc, cudart, cublas, cusparse).
-They are used by cibuildwheel in `publish.yml` to produce portable wheels.
+These images ship nvcc, cudart, and cublas (plus gcc-toolset-12 on the CUDA 12.2 image,
+since nvcc on 12.2 requires GCC 12 or older). The remaining libraries rapids-singlecell
+links against (cusolver, cusparse, and nvJitLink) are installed at build time via
+`CIBW_BEFORE_ALL` in `publish.yml`.
 
 ### Release process
 

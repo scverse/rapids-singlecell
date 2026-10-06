@@ -1,12 +1,15 @@
 #!/bin/bash
+# These images will be deprecated in a future release; see README.md in this directory.
 set -euxo pipefail
 
+echo "Notice: project-provided container images will be deprecated in a future release. See docker/README.md." >&2
+
 docker_account=scverse
-rapids_version=26.04
+rapids_version=26.08
 
 declare -A cuda_versions=(
-    [cu12]="12.8.0"
-    [cu13]="13.1.0"
+    [cu12]="12.9.1"
+    [cu13]="13.3.0"
 )
 
 declare -A cuda_archs=(

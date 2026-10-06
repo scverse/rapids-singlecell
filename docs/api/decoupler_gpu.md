@@ -12,7 +12,12 @@
 
     dcg.mlm
     dcg.ulm
+    dcg.viper
     dcg.aucell
+    dcg.gsea
+    dcg.gsva
+    dcg.ora
+    dcg.query_set
     dcg.waggr
     dcg.zscore
 ```

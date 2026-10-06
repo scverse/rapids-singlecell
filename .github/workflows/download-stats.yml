@@ -1,0 +1,60 @@
+# Collects PyPI downloads for rapids-singlecell, -cu12 and -cu13 and publishes
+# the combined numbers as shields.io endpoint badges on the `download-stats`
+# branch, so the README can show one number for the whole project.
+
+name: Download stats
+
+on:
+  schedule:
+    # The upstream dataset publishes a day late on a schedule we do not know,
+    # so poll twice a day rather than guess the hour. A run that finds nothing
+    # new is a no-op. Odd minutes off the hour avoid the Actions scheduling
+    # backlog that builds up at :00.
+    - cron: "37 7 * * *"
+    - cron: "37 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: download-stats
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # Never run on forks: the push would fail and the numbers are repo-specific.
+    if: github.repository == 'scverse/rapids-singlecell'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check out (or create) the download-stats branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth 1 origin download-stats; then
+            git worktree add stats-branch FETCH_HEAD
+            git -C stats-branch switch -c download-stats
+          else
+            git worktree add --detach stats-branch
+            git -C stats-branch switch --orphan download-stats
+          fi
+
+      - name: Collect download numbers
+        run: python ci/download_stats.py --output-dir stats-branch
+
+      - name: Commit and push
+        working-directory: stats-branch
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No change in download numbers."
+            exit 0
+          fi
+          git commit -m "chore: update download stats"
+          git push origin download-stats

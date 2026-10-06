@@ -9,6 +9,8 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 import anndata  # noqa
 import fast_array_utils  # noqa
+from docutils import nodes
+from docutils.parsers.rst import roles
 
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
@@ -29,7 +31,7 @@ title = "GPU accelerated single cell analysis"
 author = info["Author"]
 copyright = f"{datetime.now():%Y}, {author}"
 version = info["Version"]
-repository_url = "https://github.com/scverse/rapids_singlecell"
+repository_url = "https://github.com/scverse/rapids-singlecell"
 
 # The full version, including alpha/beta/rc tags
 release = info["Version"]
@@ -62,6 +64,7 @@ extensions = [
     "sphinx_copybutton",
     "nbsphinx",
     "scanpydoc",
+    "scverse_misc.sphinx_ext",
     "sphinx.ext.linkcode",
     "sphinx_tabs.tabs",
     "sphinxext.opengraph",
@@ -108,7 +111,7 @@ source_suffix = {
 }
 
 intersphinx_mapping = {
-    "anndata": ("https://anndata.readthedocs.io/en/latest/", None),
+    "anndata": ("https://anndata.scverse.org/en/stable/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "scipy": ("https://docs.scipy.org/doc/scipy/", None),
     "cupy": ("https://docs.cupy.dev/en/stable/", None),
@@ -117,9 +120,10 @@ intersphinx_mapping = {
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "cudf": ("https://docs.rapids.ai/api/cudf/stable/", None),
     "cugraph": ("https://docs.rapids.ai/api/cugraph/stable/", None),
-    "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
+    "scanpy": ("https://scanpy.scverse.org/en/stable/", None),
     "squidpy": ("https://squidpy.readthedocs.io/en/stable/", None),
-    "pertpy": ("https://pertpy.readthedocs.io/en/stable/", None),
+    "spatialdata": ("https://spatialdata.scverse.org/en/stable/", None),
+    "pertpy": ("https://pertpy.scverse.org/en/stable/", None),
     "seaborn": ("https://seaborn.pydata.org/", None),
     "decoupler": ("https://decoupler.readthedocs.io/en/latest/", None),
     "rmm": ("https://docs.rapids.ai/api/rmm/stable/", None),
@@ -138,6 +142,18 @@ exclude_patterns = [
     "._*",
     "*.ipynb_checkpoints",
     "release-notes/blank.md",
+]
+
+# These DOI records are valid, but their publishers reject automated link checks.
+linkcheck_ignore = [
+    r"https://doi\.org/10\.1002/spe\.4380211102",
+    r"https://doi\.org/10\.1073/pnas\.0500334102",
+    r"https://doi\.org/10\.1093/bioinformatics/btv325",
+    r"https://doi\.org/10\.1093/bioinformatics/btw777",
+    r"https://doi\.org/10\.1093/bioadv/vbac016",
+    r"https://doi\.org/10\.1093/bioinformatics/bty1044",
+    r"https://doi\.org/10\.1093/bioinformatics/btz625",
+    r"https://doi\.org/10\.1177/10943420231179699",
 ]
 
 
@@ -164,6 +180,11 @@ ogp_image = "_static/logo_RTD.svg"
 
 qualname_overrides = {
     "numpy.bool_": "numpy.bool",  # Since numpy 2, numpy.bool is the canonical dtype
+    # Since numpy 2.5, NDArray is a TypeAliasType defined in numpy._typing._array_like,
+    # so a subscripted NDArray[...] reports that private module and sphinx-autodoc-typehints
+    # builds the target as <annotation module>.<type qualname> -- a name numpy does not
+    # document. Same treatment as anndata gives the pre-2.5 spelling of this alias.
+    "numpy._typing._array_like.GenericAlias": ("py:data", "numpy.typing.NDArray"),
 }
 
 nitpick_ignore = [
@@ -174,6 +195,11 @@ nitpick_ignore = [
     ("py:class", "anndata._core.views.ArrayView"),
     ("py:class", "anndata._core.raw.Raw"),
     ("py:class", "scanpy._utils.Empty"),
+    ("py:class", "rapids_singlecell._settings.Default"),
+    *[
+        ("py:class", f"rapids_singlecell._settings.{cls}Preset")
+        for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes"]
+    ],
     ("py:data", "typing.Union"),
     ("py:class", "cuml.linear_model.LogisticRegression"),
     *[
@@ -186,7 +212,8 @@ nitpick_ignore = [
 
 def setup(app: Sphinx) -> None:
     """App setup hook."""
-    app.warningiserror = True
+    app.add_role("small", roles.GenericRole("small", nodes.inline))
+    app.add_role("smaller", roles.GenericRole("smaller", nodes.inline))
     app.add_config_value(
         "recommonmark_config",
         default={
@@ -202,6 +229,6 @@ def setup(app: Sphinx) -> None:
 
 # extlinks config
 extlinks = {
-    "issue": ("https://github.com/scverse/rapids_singlecell/issues/%s", "issue%s"),
-    "pr": ("https://github.com/scverse/rapids_singlecell/pull/%s", "pr%s"),
+    "issue": ("https://github.com/scverse/rapids-singlecell/issues/%s", "issue%s"),
+    "pr": ("https://github.com/scverse/rapids-singlecell/pull/%s", "pr%s"),
 }

@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 from cupyx.scipy import sparse
-from scanpy.get import _get_obs_rep
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell.get import _get_obs_rep
 
 from ._utils import _check_gpu_X
 
@@ -26,7 +26,7 @@ def calculate_qc_metrics(
     layer: str = None,
 ) -> None:
     """\
-    Calculates basic qc Parameters :cite:p:`McCarthy2017`.
+    Calculate basic quality-control metrics :cite:p:`McCarthy2017`.
 
     Calculates number of genes per cell (n_genes) and number of counts per cell (n_counts).
     Loosely based on calculate_qc_metrics from scanpy :cite:p:`Wolf2018`. Updates :attr:`~anndata.AnnData.obs` and :attr:`~anndata.AnnData.var`  with columns with qc data.
@@ -41,7 +41,7 @@ def calculate_qc_metrics(
             The kind of thing the variables are.
         qc_vars
             Keys for boolean columns of :attr:`~anndata.AnnData.var` which identify variables you could want to control for (e.g. Mito).
-            Run flag_gene_family first
+            Create these boolean columns before calculating QC metrics.
         log1p
             Set to `False` to skip computing `log1p` transformed annotations.
         layer

@@ -1,6 +1,6 @@
 # pertpy-GPU: `ptg`
 
-[pertpy](https://pertpy.readthedocs.io) provides tools for perturbation analysis {cite}`Heumos2025`.
+{doc}`pertpy <pertpy:index>` provides tools for perturbation analysis {cite}`Heumos2025`.
 {mod}`rapids_singlecell.ptg` accelerates some of these methods.
 
 ```{eval-rst}
@@ -93,15 +93,38 @@
 
         ~Mixscape.perturbation_signature
         ~Mixscape.mixscape
-        ~Mixscape.mixscale
         ~Mixscape.lda
 
     .. automethod:: perturbation_signature
         :no-index:
     .. automethod:: mixscape
         :no-index:
-    .. automethod:: mixscale
-        :no-index:
     .. automethod:: lda
+        :no-index:
+```
+
+## Mixscale
+
+```{eval-rst}
+.. autosummary::
+    :toctree: generated
+
+    Mixscale
+```
+
+```{eval-rst}
+.. autoclass:: Mixscale
+    :no-index:
+
+    .. rubric:: Methods
+
+    .. autosummary::
+
+        ~Mixscale.perturbation_signature
+        ~Mixscale.mixscale
+
+    .. automethod:: perturbation_signature
+        :no-index:
+    .. automethod:: mixscale
         :no-index:
 ```

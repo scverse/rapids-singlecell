@@ -1,6 +1,6 @@
 # scanpy-GPU
 
-These functions offer accelerated near drop-in replacements for common tools provided by [`scanpy`](https://scanpy.readthedocs.io/en/stable/api/index.html) {cite}`Wolf2018`.
+These functions offer accelerated near drop-in replacements for common tools provided by {doc}`scanpy <scanpy:api/index>` {cite}`Wolf2018`.
 
 ## Preprocessing `pp`
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
@@ -20,13 +20,12 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.filter_genes
    pp.normalize_total
    pp.log1p
+   pp.sqrt
    pp.highly_variable_genes
    pp.regress_out
    pp.scale
    pp.pca
    pp.normalize_pearson_residuals
-   pp.flag_gene_family
-   pp.filter_highly_variable
 ```
 
 ### Batch effect correction
@@ -80,6 +79,15 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
     tl.embedding_density
 ```
 
+### Data integration
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+
+    tl.ingest
+```
+
 ### Clustering
 
 ```{eval-rst}
@@ -88,7 +96,6 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 
     tl.louvain
     tl.leiden
-    tl.kmeans
 ```
 
 ### Gene scores, Cell cycle

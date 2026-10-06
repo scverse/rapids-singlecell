@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import product
 from typing import (
+    TYPE_CHECKING,
     Literal,
 )
 
@@ -14,7 +15,11 @@ from cupyx.scipy import sparse
 from cupyx.scipy.sparse import issparse as cpissparse
 from scipy.sparse import csc_matrix, issparse
 
+from ._spatial_data import _extract_adata
 from ._utils import _assert_categorical_obs, _create_sparse_df
+
+if TYPE_CHECKING:
+    from spatialdata import SpatialData
 
 SOURCE = "source"
 TARGET = "target"
@@ -118,9 +123,10 @@ def _check_tuple_needles(needles, haystack, *, msg: str, reraise: bool = True):
 
 
 def ligrec(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     cluster_key: str,
     *,
+    table_key: str | None = None,
     clusters: list | None = None,
     interactions: pd.DataFrame | Mapping | Sequence | None = None,
     complex_policy: Literal["min", "all"] = "min",
@@ -143,7 +149,10 @@ def ligrec(
     Parameters
     ----------
         adata
-            Annotated data object.
+            Annotated data matrix or a SpatialData object containing the selected table.
+        table_key
+            Key in ``SpatialData.tables``; required for SpatialData input.
+            All reads and writes use this table; ignored for AnnData input.
 
         cluster_key
             Key in :attr:`~anndata.AnnData.obs` where clustering is stored.
@@ -233,6 +242,7 @@ def ligrec(
     interacting components was 0 or it didn't pass the threshold percentage of \
     cells being expressed within a given cluster.
     """
+    adata = _extract_adata(adata, table_key=table_key)
     # Get and Check interactions
     if interactions is None:
         interactions = _get_interactions(
@@ -433,7 +443,6 @@ def ligrec(
         dtype=np.uint32,
     )
 
-    data["clusters"] = cat.rename_categories(cluster_mapper)
     # much faster than applymap (tested on 1M interactions)
     interactions_ = np.vectorize(lambda g: gene_mapper[g])(interactions.values)
 
@@ -443,7 +452,7 @@ def ligrec(
         data_cp = cp.array(mat)
 
     # Convert the 'clusters' column to a CuPy array
-    clusters = cp.array(data["clusters"].values, dtype=cp.int32)
+    clusters = cp.array(cat.codes.values, dtype=cp.int32)
 
     # Find the unique clusters and the number of clusters
     unique_clusters = cp.unique(clusters)

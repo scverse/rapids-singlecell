@@ -113,6 +113,30 @@ def test_scale_simple(dtype):
     )
 
 
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_scale_promotes_dense_integers(dtype):
+    adata = AnnData(cp.array(X_original, dtype=dtype))
+
+    rsc.pp.scale(adata)
+
+    assert adata.X.dtype == cp.float64
+    cp.testing.assert_allclose(adata.X, X_centered_original)
+
+
+def test_scale_obsm_does_not_write_var_statistics():
+    adata = AnnData(cp.ones((3, 4), dtype=cp.float32))
+    adata.obsm["X_embedding"] = cp.array([[1, 2], [2, 4], [3, 6]], dtype=cp.float32)
+
+    rsc.pp.scale(adata, obsm="X_embedding")
+
+    cp.testing.assert_allclose(
+        adata.obsm["X_embedding"],
+        cp.array([[-1, -1], [0, 0], [1, 1]], dtype=cp.float32),
+    )
+    assert "mean" not in adata.var
+    assert "std" not in adata.var
+
+
 @pytest.mark.parametrize(
     "typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
 )
@@ -130,6 +154,7 @@ def test_mask(typ):
     )
 
 
+@pytest.mark.parametrize("use_array", [False, True])
 @pytest.mark.parametrize(
     "typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
 )
@@ -146,13 +171,19 @@ def test_mask(typ):
         ),
     ],
 )
-def test_scale(*, typ, dtype, mask_obs, X, X_centered, X_scaled):
+def test_scale(*, use_array, typ, dtype, mask_obs, X, X_centered, X_scaled):
     # test AnnData arguments
     # test scaling with default zero_center == True
     adata = AnnData(typ(X, dtype=dtype))
     adata0 = rsc.get.anndata_to_GPU(adata, copy=True)
-    rsc.pp.scale(adata0, mask_obs=mask_obs)
-    cp.testing.assert_allclose(cp_csr_matrix(adata0.X).toarray(), X_centered)
+    if use_array:
+        # feeding the matrix directly should match feeding the AnnData
+        out = rsc.pp.scale(adata0.X, mask_obs=mask_obs)
+        result = out.toarray() if hasattr(out, "toarray") else out
+    else:
+        rsc.pp.scale(adata0, mask_obs=mask_obs)
+        result = cp_csr_matrix(adata0.X).toarray()
+    cp.testing.assert_allclose(result, X_centered)
     """
     # test scaling with explicit zero_center == True
     adata1 = rsc.get.anndata_to_GPU(adata, copy=True)

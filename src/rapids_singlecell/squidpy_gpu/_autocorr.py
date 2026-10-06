@@ -16,12 +16,14 @@ from rapids_singlecell.preprocessing._utils import _sparse_to_dense
 
 from ._gearysc import _gearys_C_cupy
 from ._moransi import _morans_I_cupy
+from ._spatial_data import _extract_adata
 from ._utils import _p_value_calc
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+    from spatialdata import SpatialData
 
 
 def _to_cupy(vals, *, use_sparse: bool, dtype):
@@ -49,8 +51,9 @@ def _to_cupy(vals, *, use_sparse: bool, dtype):
 
 
 def spatial_autocorr(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     *,
+    table_key: str | None = None,
     connectivity_key: str = "spatial_connectivities",
     genes: str | Sequence[str] | None = None,
     mode: Literal["moran", "geary"] = "moran",
@@ -79,7 +82,10 @@ def spatial_autocorr(
     Parameters
     ----------
         adata
-            Annotated data matrix.
+            Annotated data matrix or a SpatialData object containing the selected table.
+        table_key
+            Key in ``SpatialData.tables``; required for SpatialData input.
+            All reads and writes use this table; ignored for AnnData input.
         connectivity_key
             Key of the connectivity matrix in `adata.obsp`, by default "spatial_connectivities".
         genes
@@ -107,7 +113,7 @@ def spatial_autocorr(
             GPU selection for permutation tests:
             - None: Use all GPUs if available (default)
             - True: Use all available GPUs
-            - False: Use only GPU 0
+            - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
         copy
@@ -118,6 +124,7 @@ def spatial_autocorr(
             DataFrame containing the autocorrelation scores, p-values, and corrected p-values for each gene. \
             If `copy` is False, the results are stored in `adata.uns` and None is returned.
     """
+    adata = _extract_adata(adata, table_key=table_key)
     if genes is None:
         if "highly_variable" in adata.var:
             genes = adata[:, adata.var["highly_variable"]].var_names.values

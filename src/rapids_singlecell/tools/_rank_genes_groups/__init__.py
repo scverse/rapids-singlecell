@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import sys
-from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
+from scverse_misc import Deprecation, deprecated
+
+from rapids_singlecell._settings import Default, resolve_default, settings
 
 from ._core import _RankGenes
 
@@ -21,31 +22,31 @@ type _Method = Literal[
 ]
 
 
+def _matrix_to_records(
+    values: np.ndarray, group_names: Iterable[object], dtype: str | np.dtype
+) -> np.ndarray:
+    field_dtype = np.dtype(dtype)
+    record_dtype = np.dtype(
+        [(str(group_name), field_dtype) for group_name in group_names]
+    )
+    if values.shape[1] == 0:
+        return np.empty(0, dtype=record_dtype)
+    record_matrix = np.ascontiguousarray(values.T, dtype=field_dtype)
+    # Reinterpret rows as records; the returned view retains its backing matrix.
+    return np.ndarray(values.shape[1], dtype=record_dtype, buffer=record_matrix)
+
+
 def _array_result_to_records(
     arrays: dict[str, object], field: str, dtype: str | np.dtype
 ) -> np.ndarray:
-    group_names = tuple(str(name) for name in arrays["group_names"])
-    values = np.asarray(arrays[field])
-    out = np.empty(
-        values.shape[1],
-        dtype=[(group_name, np.dtype(dtype)) for group_name in group_names],
-    )
-    for row, group_name in enumerate(group_names):
-        out[group_name] = values[row]
-    return out
+    return _matrix_to_records(np.asarray(arrays[field]), arrays["group_names"], dtype)
 
 
 def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
-    group_names = tuple(str(name) for name in arrays["group_names"])
-    var_names = np.asarray(arrays["var_names"])
+    var_names = np.asarray(arrays["var_names"], dtype=object)
     gene_indices = np.asarray(arrays["gene_indices"], dtype=np.intp)
-    out = np.empty(
-        gene_indices.shape[1],
-        dtype=[(group_name, object) for group_name in group_names],
-    )
-    for row, group_name in enumerate(group_names):
-        out[group_name] = var_names[gene_indices[row]]
-    return out
+    values = np.take(var_names, gene_indices)
+    return _matrix_to_records(values, arrays["group_names"], np.dtype(object))
 
 
 def rank_genes_groups(
@@ -60,13 +61,17 @@ def rank_genes_groups(
     rankby_abs: bool = False,
     pts: bool = False,
     key_added: str | None = None,
-    method: _Method | None = None,
+    method: _Method | Default | None = Default(("rank_genes_groups", "method")),
     corr_method: _CorrMethod = "benjamini-hochberg",
     tie_correct: bool = False,
     use_continuity: bool = False,
     return_u_values: bool = False,
     layer: str | None = None,
+    mean_in_log_space: bool | Default = Default(
+        ("rank_genes_groups", "mean_in_log_space")
+    ),
     chunk_size: int | None = None,
+    multi_gpu: bool | list[int] | str | None = None,
     n_bins: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
     skip_empty_groups: bool = False,
@@ -76,10 +81,10 @@ def rank_genes_groups(
     Rank genes for characterizing groups using GPU acceleration.
 
     Log1p/log-normalized data is expected for biologically meaningful log fold
-    changes. In-memory sparse ``wilcoxon`` inputs with explicit negative values
-    use sign-safe dense ranking in the CUDA sparse streamers, materializing
-    bounded dense tiles inside the nanobind path. Dense inputs are ranked
-    directly and support any sign.
+    changes. Exact sparse ``wilcoxon`` versus rest ranks signed stored values
+    and implicit zeros directly. Sparse ``wilcoxon`` with an explicit reference
+    uses sign-safe dense ranking in bounded CUDA streamer tiles. Dense inputs
+    are ranked directly and support any sign.
     (``wilcoxon_binned`` rejects negative Dask sparse input, which it cannot
     bin correctly.)
 
@@ -156,11 +161,27 @@ def rank_genes_groups(
         approximation using the selected tie and continuity settings.
     layer
         Key from `adata.layers` whose value will be used to perform tests on.
+    mean_in_log_space
+        Whether to calculate statistics from mean-log values (`True`) or from
+        the mean after applying the inverse log1p transform (`False`). The
+        latter is more accurate in the presence of outliers. The Scanpy 1
+        preset defaults to `True`; the Scanpy 2 preview defaults to `False`.
     chunk_size
         Number of genes to process at once for `'wilcoxon'` and
         `'wilcoxon_binned'`. Default is 512 for `'wilcoxon'`. For
         `'wilcoxon_binned'` the default is sized dynamically based on
         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
+    multi_gpu
+        GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
+        and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
+        visible GPUs for host input and device OVO, while device OVR stays on
+        its input-owning GPU. For the streaming t-test/binned paths, ``None``
+        and ``False`` use the current GPU. ``True`` uses all visible GPUs, and a
+        list or comma-separated string selects device IDs. Streaming multi-GPU
+        is host-only: CSR/dense input is sharded by cell rows, CSC by gene
+        columns, and results are gathered on the current device. Device-resident
+        t-test/binned input runs on its owning GPU. On small host inputs the
+        sharding overhead can make multi-GPU slower than a single GPU.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000
@@ -207,6 +228,9 @@ def rank_genes_groups(
     `adata.uns['rank_genes_groups' | key_added]['pts_rest']`
         Fraction of cells expressing genes in rest. Only if `pts=True` and `reference='rest'`.
     """
+    method = resolve_default(method)
+    mean_in_log_space = resolve_default(mean_in_log_space)
+
     if corr_method not in {"benjamini-hochberg", "bonferroni"}:
         msg = "corr_method must be either 'benjamini-hochberg' or 'bonferroni'."
         raise ValueError(msg)
@@ -219,7 +243,7 @@ def rank_genes_groups(
         raise TypeError(msg)
 
     if method is None:
-        method = "t-test"
+        method = settings.preset.rank_genes_groups.method
 
     if method not in {
         "logreg",
@@ -236,6 +260,18 @@ def rank_genes_groups(
 
     if return_u_values and method != "wilcoxon":
         msg = "return_u_values is only supported for method='wilcoxon'."
+        raise ValueError(msg)
+
+    if (
+        multi_gpu is not None
+        and multi_gpu is not False
+        and method
+        not in {"wilcoxon", "t-test", "t-test_overestim_var", "wilcoxon_binned"}
+    ):
+        msg = (
+            "multi_gpu is only supported for method in {'wilcoxon', 't-test', "
+            "'t-test_overestim_var', 'wilcoxon_binned'}."
+        )
         raise ValueError(msg)
 
     if chunk_size is not None and chunk_size <= 0:
@@ -258,6 +294,7 @@ def rank_genes_groups(
                 msg = f"mask_var has wrong shape: {mask_var_array.shape[0]} != {adata.n_vars}"
                 raise ValueError(msg)
 
+    adata.strings_to_categoricals()
     test_obj = _RankGenes(
         adata,
         groups,
@@ -279,10 +316,12 @@ def rank_genes_groups(
         corr_method=corr_method,
         n_genes_user=n_genes_user,
         rankby_abs=rankby_abs,
+        mean_in_log_space=mean_in_log_space,
         tie_correct=tie_correct,
         use_continuity=use_continuity,
         return_u_values=return_u_values,
         chunk_size=chunk_size,
+        multi_gpu=multi_gpu,
         n_bins=n_bins,
         bin_range=bin_range,
         **kwds,
@@ -295,6 +334,7 @@ def rank_genes_groups(
         "use_raw": use_raw,
         "layer": layer,
         "corr_method": corr_method,
+        "mean_in_log_space": mean_in_log_space,
     }
     if method == "wilcoxon":
         params["tie_correct"] = tie_correct
@@ -323,20 +363,7 @@ def rank_genes_groups(
     return None
 
 
-if TYPE_CHECKING:
-    from warnings import deprecated
-else:
-    if sys.version_info >= (3, 13):
-        from warnings import deprecated as _deprecated
-    else:
-        from typing_extensions import deprecated as _deprecated
-    deprecated = partial(_deprecated, category=FutureWarning)
-
-
-@deprecated(
-    "rank_genes_groups_logreg is deprecated. "
-    "Use rank_genes_groups(method='logreg') instead."
-)
+@deprecated(Deprecation("0.14.1", "Use `rank_genes_groups(method='logreg')` instead."))
 def rank_genes_groups_logreg(
     adata: AnnData,
     groupby: str,

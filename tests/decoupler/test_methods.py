@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import cupy as cp
 import cupyx.scipy.sparse as csps
 import numpy as np
@@ -8,6 +10,117 @@ import pytest
 import scipy.sparse as sps
 
 import rapids_singlecell.decoupler_gpu as dc
+
+
+@pytest.mark.parametrize(
+    "name,default_bsize,batch_on,dense",
+    [
+        ("ulm", 5000, "rows", True),
+        ("mlm", 5000, "rows", True),
+        ("aucell", 100, "rows", True),
+        ("gsea", 100, "rows", True),
+        ("ora", 250_000, "rows", True),
+        ("gsva", 250_000, "backed", False),
+    ],
+)
+@pytest.mark.parametrize("bsize", [None, 2])
+@pytest.mark.parametrize("positional", [False, True])
+def test_standard_method_execution_defaults(
+    name, default_bsize, batch_on, dense, bsize, *, positional, monkeypatch
+):
+    from unittest.mock import Mock
+
+    from rapids_singlecell.decoupler_gpu._helper import _Method
+
+    method = getattr(dc, name)
+    assert type(method) is _Method.Method
+    assert type(method._method) is _Method.MethodMeta
+    assert method.__doc__ == method.func.__doc__
+    params = inspect.signature(method).parameters
+    assert params["bsize"].default == default_bsize
+    for param in ("data", "net", "tmin", "raw", "empty", "bsize", "verbose"):
+        assert params[param].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+    pd.testing.assert_frame_equal(method.meta(), method._method.meta())
+    assert method.meta().columns.tolist() == [
+        "name",
+        "desc",
+        "stype",
+        "weight",
+        "test",
+        "limits",
+        "reference",
+    ]
+    runner = Mock(return_value=object())
+    monkeypatch.setattr(_Method, "_run", runner)
+    data, net = object(), object()
+    kwargs = {} if bsize is None else {"bsize": bsize}
+    if positional:
+        args = (data, net, 5, False, True)
+        if bsize is not None:
+            args += (bsize, False)
+        result = method(*args, layer="signal")
+    else:
+        result = method(data, net, layer="signal", **kwargs)
+    assert result is runner.return_value
+    runner.assert_called_once()
+    forwarded = runner.call_args.kwargs
+    assert forwarded["data"] is data
+    assert forwarded["net"] is net
+    assert forwarded["name"] == name
+    assert forwarded["func"] is method.func
+    assert forwarded["bsize"] == (default_bsize if bsize is None else bsize)
+    assert forwarded["batch_on"] == batch_on
+    assert forwarded["dense"] is dense
+    assert forwarded["layer"] == "signal"
+
+
+@pytest.mark.parametrize("batch_on", ["rows", "backed"])
+@pytest.mark.parametrize("backed", [False, True])
+def test_generic_method_batch_policy_preserves_sparse(batch_on, backed, tmp_path):
+    from anndata import AnnData, read_h5ad
+
+    from rapids_singlecell.decoupler_gpu._helper._Method import Method, MethodMeta
+
+    batches = []
+
+    def record_batch(mat, **kwargs):
+        assert csps.isspmatrix_csr(mat)
+        batches.append(mat.shape[0])
+        return np.ones((mat.shape[0], 1)), None
+
+    method = Method(
+        MethodMeta(
+            name="probe",
+            desc="Batch policy probe",
+            func=record_batch,
+            stype="numerical",
+            adj=False,
+            weight=False,
+            test=False,
+            limits=(0, 1),
+            reference="",
+        ),
+        default_bsize=2,
+        batch_on=batch_on,
+        dense=False,
+    )
+    adata = AnnData(
+        sps.csr_matrix(np.arange(1, 16, dtype=np.float32).reshape(5, 3)),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    net = pd.DataFrame({"source": ["set", "set"], "target": ["g0", "g1"]})
+    if backed:
+        path = tmp_path / "batch_policy.h5ad"
+        adata.write_h5ad(path)
+        adata = read_h5ad(path, backed="r")
+    try:
+        assert method(adata, net, tmin=0) is None
+        assert batches == ([2, 2, 1] if backed or batch_on == "rows" else [5])
+        assert adata.obsm["score_probe"].shape == (5, 1)
+        assert "padj_probe" not in adata.obsm
+    finally:
+        if backed:
+            adata.file.close()
 
 
 class TestMLM:

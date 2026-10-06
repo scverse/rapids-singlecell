@@ -14,8 +14,6 @@ from rapids_singlecell._compat import DaskArray
 if TYPE_CHECKING:
     from anndata import AnnData
 
-    from rapids_singlecell._utils import AnyRandom
-
 
 def _sparse_to_dense(X: spmatrix, order: Literal["C", "F"] | None = None) -> cp.ndarray:
     if order is None:
@@ -42,6 +40,7 @@ def _sparse_to_dense(X: spmatrix, order: Literal["C", "F"] | None = None) -> cp.
         minor=minor,
         c_switch=switcher,
         max_nnz=max_nnz,
+        stream=cp.cuda.get_current_stream().ptr,
     )
     return dense
 
@@ -286,6 +285,11 @@ def _check_nonnegative_integers(X):
 def _check_gpu_X(X, *, require_cf=False, allow_dask=False, allow_csc=True):
     if isinstance(X, DaskArray):
         if allow_dask:
+            if X.numblocks[1] != 1:
+                raise ValueError(
+                    "Dask arrays must be chunked only along observations. "
+                    "Rechunk with `X.rechunk({1: -1})`."
+                )
             return _check_gpu_X(X._meta, allow_csc=False)
         else:
             raise TypeError(
@@ -330,9 +334,3 @@ def _check_use_raw(adata: AnnData, layer: str | None, *, use_raw: None | bool) -
     if layer is not None:
         return False
     return adata.raw is not None
-
-
-def get_random_state(seed: AnyRandom) -> np.random.RandomState:
-    if isinstance(seed, np.random.RandomState):
-        return seed
-    return np.random.RandomState(seed)

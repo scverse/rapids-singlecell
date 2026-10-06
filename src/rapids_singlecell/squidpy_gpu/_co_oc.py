@@ -9,21 +9,26 @@ from cuml.metrics import pairwise_distances
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copy_to_device,
     _create_category_index_mapping,
     _split_pairs,
+    _sum_on_device,
     parse_device_ids,
 )
 
+from ._spatial_data import _extract_adata
 from ._utils import _assert_categorical_obs, _assert_spatial_basis
 
 if TYPE_CHECKING:
     from anndata import AnnData
+    from spatialdata import SpatialData
 
 
 def co_occurrence(
-    adata: AnnData,
+    adata: AnnData | SpatialData,
     cluster_key: str,
     *,
+    table_key: str | None = None,
     spatial_key: str = "spatial",
     interval: int | np.ndarray | cp.ndarray = 50,
     multi_gpu: bool | list[int] | str | None = None,
@@ -35,7 +40,10 @@ def co_occurrence(
     Parameters
     ----------
     adata
-        Annotated data object.
+        Annotated data matrix or a SpatialData object containing the selected table.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        All reads and writes use this table; ignored for AnnData input.
     cluster_key
         Key for the cluster labels.
     spatial_key
@@ -47,7 +55,7 @@ def co_occurrence(
         GPU selection:
         - None: Use all GPUs if available (default)
         - True: Use all available GPUs
-        - False: Use only GPU 0
+        - False: Use only the current GPU
         - list[int]: Use specific GPU IDs (e.g., [0, 2])
         - str: Comma-separated GPU IDs (e.g., "0,2")
     copy
@@ -64,6 +72,7 @@ def co_occurrence(
         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_co_occurrence']['interval']`` - the distance thresholds
           computed at ``interval``.
     """
+    adata = _extract_adata(adata, table_key=table_key)
 
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
@@ -322,14 +331,14 @@ def _co_occurrence_gpu(
                     dev_cat_offsets = cat_offsets
                     dev_cell_indices = cell_indices
                 else:
-                    dev_spatial = cp.asarray(spatial)
-                    dev_thresholds = cp.asarray(thresholds)
-                    dev_cat_offsets = cp.asarray(cat_offsets)
-                    dev_cell_indices = cp.asarray(cell_indices)
+                    dev_spatial = _copy_to_device(spatial, device_id)
+                    dev_thresholds = _copy_to_device(thresholds, device_id)
+                    dev_cat_offsets = _copy_to_device(cat_offsets, device_id)
+                    dev_cell_indices = _copy_to_device(cell_indices, device_id)
 
                 # Copy pair indices to this device
-                dev_pair_left = cp.asarray(chunk_left)
-                dev_pair_right = cp.asarray(chunk_right)
+                dev_pair_left = _copy_to_device(chunk_left, device_id)
+                dev_pair_right = _copy_to_device(chunk_right, device_id)
 
                 # Initialize local counts array
                 dev_counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
@@ -387,12 +396,9 @@ def _co_occurrence_gpu(
             with cp.cuda.Device(data["device_id"]):
                 streams[data["device_id"]].synchronize()
 
-    # Phase 4: Aggregate counts on first device
-    with cp.cuda.Device(device_ids[0]):
-        counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
-        for data in device_data:
-            if data is not None:
-                dev0_counts = cp.asarray(data["counts"])
-                counts += dev0_counts
-
-    return counts, True
+    # Phase 4: Aggregate counts on the input device
+    parts = [data["counts"] for data in device_data if data is not None]
+    if parts:
+        return _sum_on_device(parts, source_device_id), True
+    with cp.cuda.Device(source_device_id):
+        return cp.zeros((k, k, l_val), dtype=cp.uint64), True

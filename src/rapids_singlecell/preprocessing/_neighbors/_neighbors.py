@@ -10,6 +10,7 @@ from cupyx.scipy import sparse as cp_sparse
 from scipy import sparse as sc_sparse
 
 from rapids_singlecell._utils import _get_logger_level
+from rapids_singlecell._utils._random import _seed_from_rng
 from rapids_singlecell.preprocessing._neighbors._algorithms._all_neighbors import (
     _all_neighbors_knn,
 )
@@ -28,8 +29,6 @@ from rapids_singlecell.preprocessing._neighbors._algorithms._mg_ivfpq import (
 from rapids_singlecell.preprocessing._neighbors._algorithms._nn_descent import (
     _nn_descent_knn,
 )
-
-AnyRandom = None | int | np.random.RandomState
 
 _Algorithms = Literal[
     "brute",
@@ -132,16 +131,40 @@ def _build_sparse_distances(
     return distances.get()
 
 
+def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
+    """Host CSR of a GPU COO matrix with too many entries for CuPy's 32-bit CSR.
+
+    The graphs cuML builds are sorted by row and column, so only the row pointers
+    have to be computed (on the GPU), instead of converting billions of entries on the host.
+    """
+    row, col = coo.row, coo.col
+    canonical = (row[1:] > row[:-1]) | ((row[1:] == row[:-1]) & (col[1:] > col[:-1]))
+    if not bool(cp.all(canonical)):
+        return coo.get().tocsr()
+    del canonical
+    indptr = cp.zeros(coo.shape[0] + 1, dtype=cp.int64)
+    cp.cumsum(cp.bincount(row, minlength=coo.shape[0]), out=indptr[1:])
+    csr = sc_sparse.csr_matrix(
+        (coo.data.get(), col.get(), indptr.get()), shape=coo.shape
+    )
+    csr.has_canonical_format = True
+    return csr
+
+
 def _get_connectivities_umap(
     knn_indices: cp.ndarray,
     knn_dist: cp.ndarray,
     *,
     n_obs: int,
     n_neighbors: int,
-    random_state: AnyRandom,
-    metric: str,
+    rng: np.random.Generator,
 ) -> cp_sparse.coo_matrix:
-    """UMAP fuzzy simplicial set connectivities."""
+    """UMAP fuzzy simplicial set connectivities.
+
+    The graph is built from the precomputed ``knn_indices``/``knn_dist``, so the
+    metric is never recomputed here. Forwarding it would only make cuML reject
+    the metrics it does not know itself, such as ``inner_product``.
+    """
     set_op_mix_ratio = 1.0
     local_connectivity = 1.0
 
@@ -150,8 +173,8 @@ def _get_connectivities_umap(
     connectivities = fuzzy_simplicial_set(
         X_conn,
         n_neighbors,
-        random_state,
-        metric=metric,
+        # cuML seeds its fuzzy simplicial set, so draw the seed right here
+        _seed_from_rng(rng),
         knn_indices=knn_indices,
         knn_dists=knn_dist,
         set_op_mix_ratio=set_op_mix_ratio,
@@ -231,25 +254,23 @@ def _get_connectivities_jaccard(
     -------
     Symmetric CSR connectivity matrix.
     """
-    k_no_self = n_neighbors - 1
+    from rapids_singlecell._cuda._jaccard_cuda import jaccard_shared_counts
 
-    # Binary adjacency (self excluded)
-    rows_adj = cp.repeat(cp.arange(n_obs, dtype=cp.int32), k_no_self)
-    cols_adj = knn_indices[:, 1:].ravel()
-    data_adj = cp.ones(n_obs * k_no_self, dtype=cp.float32)
-    adjacency = cp_sparse.csr_matrix(
-        (data_adj, (rows_adj, cols_adj)), shape=(n_obs, n_obs)
+    knn = cp.ascontiguousarray(knn_indices, dtype=cp.int32)
+
+    # Jaccard weight per KNN entry (i -> j), straight from the KNN lists
+    # (no replicated adjacency matrix, so no int32 nnz overflow).
+    jaccard_vals = cp.empty(n_obs * n_neighbors, dtype=cp.float32)
+    jaccard_shared_counts(
+        knn,
+        n_obs=n_obs,
+        k=n_neighbors,
+        jaccard_vals=jaccard_vals,
+        stream=cp.cuda.get_current_stream().ptr,
     )
 
-    # For each directed KNN edge (i->j), compute shared neighbor count
-    i_idx = rows_adj
-    j_idx = cols_adj
-    rows_i = adjacency[i_idx]
-    rows_j = adjacency[j_idx]
-    shared = cp.asarray(rows_i.multiply(rows_j).sum(axis=1)).ravel()
-
-    # Jaccard: |N(i) & N(j)| / (2*(k-1) - |N(i) & N(j)|)
-    jaccard_vals = shared / (2 * k_no_self - shared)
+    i_idx = cp.repeat(cp.arange(n_obs, dtype=cp.int32), n_neighbors)
+    j_idx = knn.ravel()
 
     # Filter zeros and build sparse matrix
     mask = jaccard_vals != 0
@@ -263,15 +284,46 @@ def _get_connectivities_jaccard(
     return W
 
 
+def _inner_product_distances(
+    knn_indices: cp.ndarray,
+    similarities: cp.ndarray,
+    *,
+    batch_codes: cp.ndarray | None = None,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Prepare row-local score gaps with one self-neighbor for graph weighting."""
+    n_obs, k = knn_indices.shape
+    self_indices = cp.arange(n_obs, dtype=knn_indices.dtype)[:, None]
+    scores = cp.where(knn_indices == self_indices, -cp.inf, similarities)
+    if batch_codes is not None:
+        # Replace self within its own batch, preserving BBKNN's batch balance.
+        same_batch = batch_codes[knn_indices] == batch_codes[:, None]
+        replace = cp.argmin(cp.where(same_batch, scores, cp.inf), axis=1)
+        scores[cp.arange(n_obs), replace] = -cp.inf
+    order = cp.argsort(-scores, axis=1)[:, : k - 1]
+    indices = cp.take_along_axis(knn_indices, order, axis=1)
+    scores = cp.take_along_axis(scores, order, axis=1)
+    gaps = scores[:, :1] - scores
+    if k > 1:
+        # A positive offset keeps UMAP's rho on the best nonself neighbor;
+        # using the local span preserves score differences without a global shift.
+        span = gaps[:, -1:]
+        gaps += cp.where(span > 0, span, 1)
+    return (
+        cp.concatenate((self_indices, indices), axis=1),
+        cp.concatenate((cp.zeros((n_obs, 1), dtype=similarities.dtype), gaps), axis=1),
+    )
+
+
 def _calc_connectivities(
     knn_indices: cp.ndarray,
     knn_dist: cp.ndarray,
     *,
     n_obs: int,
     n_neighbors: int,
-    random_state: AnyRandom,
-    metric: str,
+    rng: np.random.Generator,
     method: Literal["umap", "gauss", "jaccard"] = "umap",
+    metric: _Metrics = "euclidean",
+    batch_codes: cp.ndarray | None = None,
 ) -> cp_sparse.spmatrix:
     """Compute connectivities from KNN arrays.
 
@@ -285,17 +337,23 @@ def _calc_connectivities(
         Number of observations.
     n_neighbors
         Number of nearest neighbors.
-    random_state
-        Random seed (passed through to UMAP fuzzy simplicial set).
-    metric
-        Distance metric name.
+    rng
+        Random generator (a seed is drawn for the UMAP fuzzy simplicial set).
     method
         Method for computing connectivities.
+    metric
+        Search metric; inner-product similarities are converted for weighting.
+    batch_codes
+        Per-cell batch codes for preserving BBKNN's self-neighbor allocation.
 
     Returns
     -------
     CuPy sparse matrix on GPU.
     """
+    if metric == "inner_product" and method != "jaccard":
+        knn_indices, knn_dist = _inner_product_distances(
+            knn_indices, knn_dist, batch_codes=batch_codes
+        )
     if method == "gauss":
         return _get_connectivities_gauss(
             knn_indices,
@@ -313,6 +371,5 @@ def _calc_connectivities(
         knn_dist,
         n_obs=n_obs,
         n_neighbors=n_neighbors,
-        random_state=random_state,
-        metric=metric,
+        rng=rng,
     )

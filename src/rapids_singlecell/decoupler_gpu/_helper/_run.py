@@ -11,14 +11,18 @@ from anndata import AnnData
 from tqdm.auto import tqdm
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.decoupler_gpu._helper._data import extract
+from rapids_singlecell.decoupler_gpu._helper._data import (
+    _get_batch,
+    _mat_to_array,
+    extract,
+)
 from rapids_singlecell.decoupler_gpu._helper._log import _log
 from rapids_singlecell.decoupler_gpu._helper._net import adjmat, idxmat, prune
 from rapids_singlecell.decoupler_gpu._helper._pv import fdr_bh_axis1
-from rapids_singlecell.preprocessing._utils import _sparse_to_dense
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Literal
 
     from rapids_singlecell.decoupler_gpu._helper._data import DataType
 
@@ -49,43 +53,6 @@ def _return(
         return es, pv
 
 
-def _get_batch(mat, srt, end):
-    if sps.issparse(mat):
-        bmat = csps.csr_matrix(mat[srt:end])
-        bmat = _sparse_to_dense(bmat)
-    elif csps.issparse(mat):
-        bmat = _sparse_to_dense(mat[srt:end])
-    elif isinstance(mat, np.ndarray):
-        bmat = cp.array(mat[srt:end, :])
-    elif isinstance(mat, cp.ndarray):
-        bmat = mat[srt:end, :]
-    else:
-        bmat, msk_col = mat
-        bmat = bmat[srt:end, :]
-        if sps.issparse(bmat):
-            bmat = csps.csr_matrix(bmat)
-            bmat = _sparse_to_dense(bmat)
-        else:
-            bmat = cp.array(bmat)
-        bmat = bmat[:, msk_col]
-    return bmat.astype(cp.float32)
-
-
-def _mat_to_array(mat):
-    if sps.issparse(mat):
-        mat = csps.csr_matrix(mat)
-        mat = _sparse_to_dense(mat)
-    elif csps.issparse(mat):
-        mat = _sparse_to_dense(mat)
-    elif isinstance(mat, np.ndarray):
-        mat = cp.array(mat)
-    elif isinstance(mat, cp.ndarray):
-        mat = mat
-    else:
-        raise ValueError(f"Unsupported matrix type: {type(mat)}")
-    return mat.astype(cp.float32)
-
-
 def _run_dask_adj(
     func: Callable,
     mat: DaskArray,
@@ -93,6 +60,7 @@ def _run_dask_adj(
     *,
     test: bool,
     verbose: bool = False,
+    dense: bool = True,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Dask execution for adj=True methods - each chunk = one batch."""
@@ -106,7 +74,7 @@ def _run_dask_adj(
     def process_chunk(chunk, adjm, block_info=None):
         # Convert to GPU inside chunk
         adjm_gpu = cp.array(adjm, dtype=cp.float32)
-        chunk_gpu = _mat_to_array(chunk) if not isinstance(chunk, cp.ndarray) else chunk
+        chunk_gpu = _mat_to_array(chunk, dense=dense)
         es, pv = func(chunk_gpu, adjm_gpu, verbose=False, **kwargs)
         # Free GPU memory
         del chunk_gpu, adjm_gpu
@@ -143,9 +111,10 @@ def _run_dask_idx(
     offsets_cpu: np.ndarray,
     *,
     verbose: bool = False,
+    dense: bool = True,
     **kwargs,
-) -> tuple[np.ndarray, None]:
-    """Dask execution for adj=False methods (AUCell) - each chunk = one batch."""
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Dask execution for indexed feature sets - each chunk = one batch."""
     import dask
 
     # Wrap arrays in delayed to avoid serializing per-task
@@ -158,8 +127,8 @@ def _run_dask_idx(
         cnct_gpu = cp.array(cnct, dtype=cp.int32)
         starts_gpu = cp.array(starts, dtype=cp.int32)
         offsets_gpu = cp.array(offsets, dtype=cp.int32)
-        chunk_gpu = _mat_to_array(chunk) if not isinstance(chunk, cp.ndarray) else chunk
-        es, _ = func(
+        chunk_gpu = _mat_to_array(chunk, dense=dense)
+        es, pv = func(
             chunk_gpu,
             cnct=cnct_gpu,
             starts=starts_gpu,
@@ -170,7 +139,7 @@ def _run_dask_idx(
         # Free GPU memory
         del chunk_gpu, cnct_gpu, starts_gpu, offsets_gpu
         cp.get_default_memory_pool().free_all_blocks()
-        return es
+        return es, pv
 
     # Create delayed tasks for each row block
     # Rechunk to ensure all features are in one chunk per row block
@@ -186,9 +155,8 @@ def _run_dask_idx(
         tasks.append(task)
 
     _log("dask - computing batches", level="info", verbose=verbose)
-    results = dask.compute(*tasks)
-    computed = np.vstack(results)
-    return computed, None
+    es, pv = zip(*dask.compute(*tasks), strict=True)
+    return np.vstack(es), np.vstack(pv) if pv[0] is not None else None
 
 
 def _run(
@@ -207,6 +175,8 @@ def _run(
     verbose: bool = False,
     pre_load: bool = False,
     adj_pv_gpu: bool = False,
+    batch_on: Literal["rows", "backed"] = "rows",
+    dense: bool = True,
     **kwargs,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | AnnData | None:
     _log(f"{name} - Running {name}", level="info", verbose=verbose)
@@ -219,9 +189,12 @@ def _run(
         verbose=verbose,
         bsize=bsize,
         pre_load=pre_load,
+        materialize=batch_on == "backed",
     )
     issparse = sps.issparse(mat) or csps.issparse(mat)
     isbacked = isinstance(mat, tuple)
+    if batch_on == "backed" and not isbacked:
+        bsize = obs.size
     is_dask = isinstance(mat, DaskArray) or (
         isinstance(mat, tuple) and isinstance(mat[0], DaskArray)
     )
@@ -235,7 +208,7 @@ def _run(
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
             adjm_cpu = adjm  # Keep as numpy for Dask path
             es, pv = _run_dask_adj(
-                func, mat, adjm_cpu, test=test, verbose=verbose, **kwargs
+                func, mat, adjm_cpu, test=test, verbose=verbose, dense=dense, **kwargs
             )
             es = pd.DataFrame(es, index=obs, columns=sources)
         # Handle batches for sparse/backed data
@@ -249,15 +222,15 @@ def _run(
                 else:
                     batch_verbose = False
                 srt, end = i * bsize, i * bsize + bsize
-                bmat = _get_batch(mat, srt, end)
+                bmat = _get_batch(mat, srt, end, dense=dense)
                 bes, bpv = func(bmat, adjm, verbose=batch_verbose, **kwargs)
                 es.append(bes)
                 pv.append(bpv)
-            es = np.vstack(es)
+            es = es[0] if len(es) == 1 else np.vstack(es)
             es = pd.DataFrame(es, index=obs, columns=sources)
         else:
             adjm = cp.array(adjm, dtype=cp.float32)
-            mat = _mat_to_array(mat)
+            mat = _mat_to_array(mat, dense=dense)
             es, pv = func(mat, adjm, verbose=verbose, **kwargs)
             es = pd.DataFrame(es, index=obs, columns=sources)
     else:
@@ -266,7 +239,7 @@ def _run(
         if is_dask:
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
             es, pv = _run_dask_idx(
-                func, mat, cnct, starts, offsets, verbose=verbose, **kwargs
+                func, mat, cnct, starts, offsets, verbose=verbose, dense=dense, **kwargs
             )
             es = pd.DataFrame(es, index=obs, columns=sources)
         else:
@@ -277,7 +250,7 @@ def _run(
             es, pv = [], []
             for i in tqdm(range(nbatch), disable=not verbose):
                 srt, end = i * bsize, i * bsize + bsize
-                bmat = _get_batch(mat, srt, end)
+                bmat = _get_batch(mat, srt, end, dense=dense)
                 if i == 0 and verbose:
                     batch_verbose = True
                 else:
@@ -292,7 +265,7 @@ def _run(
                 )
                 es.append(bes)
                 pv.append(bpv)
-            es = np.vstack(es)
+            es = es[0] if len(es) == 1 else np.vstack(es)
             es = pd.DataFrame(es, index=obs, columns=sources)
     # Handle pvals and FDR correction
     if test:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,8 @@ import pandas as pd
 from rapids_singlecell._cuda import _edistance_cuda as _ed
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _concat_on_device,
+    _copy_to_device,
     _split_pairs,
 )
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
@@ -100,16 +103,17 @@ def _build_csr_source(embedding_raw, selector) -> _CSRData:
 
 
 def _materialize_source(embedding_raw, selector):
-    """Materialize the subset as a dense cupy array (dense input) or a
+    """Materialize the subset as a C-contiguous CuPy array (dense input) or a
     :class:`_CSRData` bundle (sparse input).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``.
     """
     if _is_sparse(embedding_raw):
         return _build_csr_source(embedding_raw, selector)
-    if selector is None:
-        return cp.asarray(embedding_raw)
-    return cp.asarray(embedding_raw[selector])
+    if selector is not None:
+        embedding_raw = embedding_raw[selector]
+    # Dense kernels index rows as embedding[row * n_features + feature].
+    return cp.asarray(embedding_raw, order="C")
 
 
 class EDistanceMetric(BaseMetric):
@@ -205,7 +209,7 @@ class EDistanceMetric(BaseMetric):
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
             - True: Use all available GPUs
-            - False: Use only GPU 0
+            - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
 
@@ -288,7 +292,7 @@ class EDistanceMetric(BaseMetric):
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
             - True: Use all available GPUs
-            - False: Use only GPU 0
+            - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
 
@@ -409,7 +413,7 @@ class EDistanceMetric(BaseMetric):
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
             - True: Use all available GPUs
-            - False: Use only GPU 0
+            - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
 
@@ -457,7 +461,7 @@ class EDistanceMetric(BaseMetric):
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
             - True: Use all available GPUs
-            - False: Use only GPU 0
+            - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
 
@@ -502,11 +506,19 @@ class EDistanceMetric(BaseMetric):
         k = len(cond_to_idx)
         # Look up cell indices from the groupby
         group_cells: list[np.ndarray] = [None] * k  # type: ignore[list-item]
+        missing: list[tuple] = []
         for key, idx in cond_to_idx.items():
             lookup_key = key[0] if len(key) == 1 else key
             cell_idx = group_indices.get(lookup_key)
+            if cell_idx is None:
+                missing.append(key)
             group_cells[idx] = (
                 cell_idx if cell_idx is not None else np.array([], dtype=np.intp)
+            )
+        if missing:
+            warnings.warn(
+                f"No cells found for {missing}; their contrasts are NaN.",
+                stacklevel=2,
             )
         # Build cat_offsets and cell_indices, subsetting the embedding
         # to only the referenced cells for memory efficiency
@@ -526,10 +538,10 @@ class EDistanceMetric(BaseMetric):
             embedding = _materialize_source(embedding_raw, original_indices)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         elif len(original_indices) < int(len(embedding_raw) * 0.7):
-            embedding = cp.asarray(embedding_raw[original_indices])
+            embedding = _materialize_source(embedding_raw, original_indices)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         else:
-            embedding = cp.asarray(embedding_raw)
+            embedding = _materialize_source(embedding_raw, None)
             cell_indices = cp.array(original_indices, dtype=cp.int32)
 
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
@@ -771,16 +783,10 @@ class EDistanceMetric(BaseMetric):
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
 
         is_sparse = isinstance(embedding, _CSRData)
+        result_device = cat_offsets.device.id
 
         # Split pairs across devices with load balancing
         pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
-
-        # Track which flat indices each device handles
-        chunk_offsets = []
-        offset = 0
-        for chunk_left, _ in pair_chunks:
-            chunk_offsets.append(offset)
-            offset += len(chunk_left)
 
         # Phase 1: Create streams and start async data transfer to all devices
         streams = {}
@@ -793,28 +799,26 @@ class EDistanceMetric(BaseMetric):
                 continue
 
             n_chunk_pairs = len(chunk_left)
-            # cp.asarray is a no-op when the array already lives on the current
-            # device (the source arrays are on the first device) and copies it
-            # across otherwise, so the same call handles every device.
+            # Reuse local arrays; route remote copies through P2P or host memory.
             with cp.cuda.Device(device_id):
                 streams[device_id] = cp.cuda.Stream(non_blocking=True)
 
                 with streams[device_id]:
                     data = {
-                        "off": cp.asarray(cat_offsets),
-                        "idx": cp.asarray(cell_indices),
-                        "pair_left": cp.asarray(chunk_left),
-                        "pair_right": cp.asarray(chunk_right),
+                        "off": _copy_to_device(cat_offsets, device_id),
+                        "idx": _copy_to_device(cell_indices, device_id),
+                        "pair_left": _copy_to_device(chunk_left, device_id),
+                        "pair_right": _copy_to_device(chunk_right, device_id),
                         "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
                         "n_pairs": n_chunk_pairs,
                         "device_id": device_id,
                     }
                     if is_sparse:
-                        data["data"] = cp.asarray(embedding.data)
-                        data["indices"] = cp.asarray(embedding.indices)
-                        data["indptr"] = cp.asarray(embedding.indptr)
+                        data["data"] = _copy_to_device(embedding.data, device_id)
+                        data["indices"] = _copy_to_device(embedding.indices, device_id)
+                        data["indptr"] = _copy_to_device(embedding.indptr, device_id)
                     else:
-                        data["emb"] = cp.asarray(embedding)
+                        data["emb"] = _copy_to_device(embedding, device_id)
                     device_data.append(data)
 
         # Phase 2: Synchronize data transfers, then launch kernels
@@ -836,15 +840,10 @@ class EDistanceMetric(BaseMetric):
                 blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
 
                 if is_sparse:
-                    # int64 indptr -> _i64 binding; int32 -> default.
-                    if data["indptr"].dtype == cp.int64:
-                        kernel = _ed.compute_distances_sparse_i64
-                    else:
-                        kernel = _ed.compute_distances_sparse
-                    kernel(
-                        data["data"],
-                        data["indices"],
+                    _ed.compute_distances_sparse(
                         data["indptr"],
+                        data["indices"],
+                        data["data"],
                         data["off"],
                         data["idx"],
                         data["pair_left"],
@@ -883,16 +882,12 @@ class EDistanceMetric(BaseMetric):
                 with cp.cuda.Device(data["device_id"]):
                     cp.cuda.Stream.null.synchronize()
 
-        # Phase 4: Aggregate on GPU 0
-        with cp.cuda.Device(device_ids[0]):
-            total_sums = cp.zeros(n_total_pairs, dtype=embedding.dtype)
-            for i, data in enumerate(device_data):
-                if data is not None:
-                    sums = cp.asarray(data["sums"])
-                    start = chunk_offsets[i]
-                    total_sums[start : start + len(sums)] = sums
-
-        return total_sums
+        # Phase 4: Gather on the input device (chunks are consecutive pair ranges)
+        sums = [data["sums"] for data in device_data if data is not None]
+        if sums:
+            return _concat_on_device(sums, result_device)
+        with cp.cuda.Device(result_device):
+            return cp.zeros(n_total_pairs, dtype=embedding.dtype)
 
     def _pairwise_means(
         self,
@@ -1138,8 +1133,8 @@ class EDistanceMetric(BaseMetric):
             )
             all_results.append(pairwise_means.get())
 
-        # Compute statistics on first GPU
-        with cp.cuda.Device(device_ids[0]):
+        # Compute statistics on the input device
+        with cp.cuda.Device(cat_offsets.device.id):
             bootstrap_stack = cp.array(all_results)  # [n_bootstrap, k, k]
             means = cp.mean(bootstrap_stack, axis=0)
             variances = cp.var(bootstrap_stack, axis=0)
@@ -1219,8 +1214,8 @@ class EDistanceMetric(BaseMetric):
             all_cross.append(cross_means.get())
             all_diag.append(diag_means.get())
 
-        # Compute statistics on first GPU
-        with cp.cuda.Device(device_ids[0]):
+        # Compute statistics on the input device
+        with cp.cuda.Device(cat_offsets.device.id):
             cross_stack = cp.array(all_cross)
             diag_stack = cp.array(all_diag)
             cross_mean = cp.mean(cross_stack, axis=0)
@@ -1266,8 +1261,10 @@ class EDistanceMetric(BaseMetric):
         if total_cells == 0:
             return cat_offsets, cell_indices
 
-        # Generate random floats for all cells at once
-        random_floats = rng.random(total_cells, dtype=cp.float32)
+        # Generate random integers for all cells at once
+        random_ints = rng.integers(
+            0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64
+        )
 
         # cp.repeat requires list for repeats - small transfer (k integers)
         group_sizes_list = group_sizes_gpu.get().tolist()
@@ -1275,8 +1272,8 @@ class EDistanceMetric(BaseMetric):
         # Expand group sizes to per-cell (each cell knows its group's size)
         cell_group_sizes = cp.repeat(group_sizes_gpu, group_sizes_list)
 
-        # Scale random floats to local indices within each group
-        bootstrap_local_idx = (random_floats * cell_group_sizes).astype(cp.int32)
+        # Reduce to local indices within each group
+        bootstrap_local_idx = random_ints % cell_group_sizes
 
         # Convert local indices to global indices by adding group offsets
         cell_group_offsets = cp.repeat(cat_offsets[:-1], group_sizes_list)

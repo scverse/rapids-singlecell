@@ -70,7 +70,7 @@ class TestComputeEigen:
     def test_shapes(self, adata):
         conn = _load_connectivities(adata)
         tsym, _Z = _compute_transitions(conn)
-        evals, evecs = _compute_eigen(tsym, n_comps=15)
+        evals, evecs = _compute_eigen(tsym, n_comps=15, rng=np.random.default_rng(0))
 
         assert evals.shape == (15,)
         assert evecs.shape == (700, 15)
@@ -78,7 +78,9 @@ class TestComputeEigen:
     def test_decreasing_order(self, adata):
         conn = _load_connectivities(adata)
         tsym, _Z = _compute_transitions(conn)
-        evals, _evecs = _compute_eigen(tsym, n_comps=10, sort="decrease")
+        evals, _evecs = _compute_eigen(
+            tsym, n_comps=10, sort="decrease", rng=np.random.default_rng(0)
+        )
 
         evals_np = evals.get()
         assert np.all(evals_np[:-1] >= evals_np[1:])
@@ -86,7 +88,7 @@ class TestComputeEigen:
     def test_transitions_required(self, adata):
         """_compute_eigen needs a valid matrix, not None."""
         with pytest.raises((TypeError, ValueError, AttributeError)):
-            _compute_eigen(None, n_comps=15)
+            _compute_eigen(None, n_comps=15, rng=np.random.default_rng(0))
 
 
 class TestDiffmap:

@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, get_args
+from warnings import warn
 
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+    _LegacyRng,
+)
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
@@ -14,10 +21,10 @@ from rapids_singlecell.preprocessing._neighbors._helper import (
 )
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     KNN_ALGORITHMS,
-    AnyRandom,
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
+    _large_coo_to_host_csr,
     _Metrics,
 )
 from rapids_singlecell.tools._utils import _choose_representation
@@ -31,14 +38,17 @@ _Algorithms_bbknn = Literal[
     "brute", "cagra", "ivfflat", "ivfpq", "mg_ivfflat", "mg_ivfpq"
 ]
 
+_DEFAULT_SEED = 0
 
+
+@_accepts_legacy_random_state(_DEFAULT_SEED)
 def neighbors(
     adata: AnnData,
     n_neighbors: int = 15,
     n_pcs: int | None = None,
     *,
     use_rep: str | None = None,
-    random_state: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
     algorithm: _Algorithms = "brute",
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
@@ -68,10 +78,12 @@ def neighbors(
     use_rep
         Use the indicated representation. `'X'` or any key for `.obsm` is valid.
         If None, the representation is chosen automatically: For .n_vars < 50, .X
-        is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-        computed with default parameters or `n_pcs` if present.
-    random_state
-        A numpy random seed.
+        is used, otherwise the PCA embedding, under whichever key the active
+        ``rapids_singlecell.settings.preset`` uses. If no PCA embedding is
+        present, it's computed with default parameters or `n_pcs` if present.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
     algorithm
         The query algorithm to use. Valid options are:
             `'brute'`
@@ -103,6 +115,8 @@ def neighbors(
         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
     metric
         A known metric's name or a callable that returns a distance.
+        For ``inner_product``, ``distances`` stores raw similarities; UMAP and
+        Gaussian weighting use positive score gaps, with self at distance zero.
     metric_kwds
         Options for the metric.
     method
@@ -130,15 +144,17 @@ def neighbors(
 
         For `all_neighbors` algorithm, the following parameters can be specified:
 
-        * 'algo': The algorithm to use. Valid options are: 'ivf_pq' and 'nn_descent'. Default is 'nn_descent'.
+        * 'algo': The algorithm to use. Valid options are: 'ivf_pq' and 'nn_descent'. Default is 'nn_descent'. `ivf_pq` is restricted to the `euclidean` and `sqeuclidean` metrics; use `nn_descent` for `cosine` and `inner_product`.
 
-        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is number of GPUs.
+        * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 if the data fits on a single GPU, otherwise sized to the data and free memory (e.g. 24 for 100M cells on 8 GPUs).
 
-        * 'overlap_factor': Number of clusters each point is assigned to (must be < n_clusters). Default is 1.
+        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 unbatched, 2 with automatic `n_clusters` or clusters of at least 20,000 cells, and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` for smaller ones. Lower values are faster but lose neighbors at cluster boundaries.
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)). Only available for `ivf_pq` algorithm.
 
-        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is None. It is recommended to set it to `>= 1.5 * n_neighbors`. Only available for `nn_descent` algorithm.
+        * 'graph_degree': The degree of the graph nn-descent builds before selecting the final `n_neighbors`. Default is 64 unbatched and `n_neighbors` batched, raised to `n_neighbors` if smaller. Only available for `nn_descent` algorithm.
+
+        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is `max(128, int(1.5 * graph_degree))`, following the recommended `>= 1.5 * graph_degree`. A smaller user-supplied value is raised to `graph_degree`. Only available for `nn_descent` algorithm.
 
         For `mg_ivfflat` and `mg_ivfpq` algorithms, the following parameters can be specified:
 
@@ -174,6 +190,17 @@ def neighbors(
             neighbors.
 
     """
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+    if method != "umap" and meta_random_state.get("random_state") != _DEFAULT_SEED:
+        # `random_state` different from default (or any `rng`) was passed, but
+        # only the UMAP connectivities are randomized.
+        warn(
+            f"Parameter `rng`/`random_state` ignored if `method={method!r}`.",
+            UserWarning,
+        )
+        meta_random_state.pop("random_state", None)
+
     adata = adata.copy() if copy else adata
 
     if adata.is_view:
@@ -198,11 +225,13 @@ def neighbors(
         algorithm_kwds=algorithm_kwds,
     )
     knn_dist = _fix_self_distances(knn_dist, metric)
+    # free the GPU copy of the representation: the connectivities need the memory for large data
+    del X, X_contiguous
 
     params = dict(
         n_neighbors=n_neighbors,
         method="rapids",
-        random_state=random_state,
+        **meta_random_state,
         metric=metric,
         **({"metric_kwds": metric_kwds} if metric_kwds else {}),
         **({"algorithm_kwds": algorithm_kwds} if algorithm_kwds else {}),
@@ -217,12 +246,16 @@ def neighbors(
         knn_dist,
         n_obs=n_obs,
         n_neighbors=n_neighbors,
-        random_state=random_state,
-        metric=metric,
+        rng=rng,
         method=method,
+        metric=metric,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
-        connectivities = connectivities.get().tocsr()
+        connectivities = (
+            _large_coo_to_host_csr(connectivities)
+            if connectivities.format == "coo"  # gauss and jaccard return CSR
+            else connectivities.get().tocsr()
+        )
     else:
         connectivities = connectivities.tocsr().get()
 
@@ -246,6 +279,7 @@ def neighbors(
     return adata if copy else None
 
 
+@_accepts_legacy_random_state(_DEFAULT_SEED)
 def bbknn(
     adata: AnnData,
     neighbors_within_batch: int = 3,
@@ -253,7 +287,7 @@ def bbknn(
     *,
     batch_key: str | None = None,
     use_rep: str | None = None,
-    random_state: AnyRandom = 0,
+    rng: SeedLike | RNGLike | None = None,
     algorithm: _Algorithms_bbknn = "brute",
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
@@ -279,13 +313,16 @@ def bbknn(
         of a symmetrical matrix of connectivities.
     n_pcs
         Use this many PCs. If `n_pcs==0` and `use_rep is None`, use `.X`.
+    batch_key
+        Key in `adata.obs` containing the batch labels to balance. Required.
     use_rep
         Use the indicated representation. `'X'` or any key for `.obsm` is valid.
         If `None`, the representation is chosen automatically: For `.n_vars < 50`, `.X`
         is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
         computed with default parameters or `n_pcs` if present.
-    random_state
-        A numpy random seed.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
     algorithm
         The query algorithm to use. Valid options are:
 
@@ -307,6 +344,8 @@ def bbknn(
         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
     metric
         A known metric's name or a callable that returns a distance.
+        For ``inner_product``, ``distances`` stores raw similarities; graph
+        weighting uses positive score gaps, with self at distance zero.
     metric_kwds
         Options for the metric.
     algorithm_kwds
@@ -359,6 +398,9 @@ def bbknn(
     connectivities and distances.
     """
 
+    rng = np.random.default_rng(rng)
+    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
+
     if batch_key is None:
         raise ValueError("Please provide a batch key to perform batch-balanced KNN.")
 
@@ -410,10 +452,12 @@ def bbknn(
     # Sort each row so neighbors are ordered closest-first across all batches.
     # fuzzy_simplicial_set uses the first non-zero distance per row as the
     # local-connectivity rho; unsorted input collapses sigma and weights.
-    order = cp.argsort(knn_dist, axis=1)
+    # ``inner_product`` stores similarities, so larger is closer.
+    order = cp.argsort(-knn_dist if metric == "inner_product" else knn_dist, axis=1)
     row_idx = cp.arange(n_obs)[:, None]
     knn_dist = knn_dist[row_idx, order]
     knn_indices = knn_indices[row_idx, order]
+    knn_dist = _fix_self_distances(knn_dist, metric)
 
     if trim is None:
         trim = 10 * total_neighbors
@@ -421,7 +465,7 @@ def bbknn(
     params = dict(
         n_neighbors=total_neighbors,
         method="rapids",
-        random_state=random_state,
+        **meta_random_state,
         metric=metric,
         trim=trim,
         **({"metric_kwds": metric_kwds} if metric_kwds else {}),
@@ -436,8 +480,11 @@ def bbknn(
         knn_dist,
         n_obs=n_obs,
         n_neighbors=total_neighbors,
-        random_state=random_state,
+        rng=rng,
         metric=metric,
+        batch_codes=cp.asarray(np.searchsorted(unique_batches, batch_array))
+        if metric == "inner_product"
+        else None,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
         connectivities = connectivities.get().tocsr()

@@ -3,9 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import cupyx.scipy.sparse as cpsp
 import numpy as np
 
 from rapids_singlecell._compat import DaskArray, _meta_dense
+from rapids_singlecell._utils import _copy_to_device
+
+from ._utils import _data_device
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -21,7 +25,16 @@ def logreg(rg: _RankGenes, **kwds) -> list[tuple[int, NDArray, None]]:
 
     n_groups = len(rg.groups_order)
     selected = rg.group_codes < n_groups
-    X = rg.X[selected, :]
+    device = cp.cuda.Device().id
+    with _data_device(rg.X):
+        X = rg.X[selected, :]
+    # cuML binds its per-thread handle to the first GPU it runs on, so fit on
+    # the caller's GPU instead of moving to the data.
+    if isinstance(X, cp.ndarray):
+        X = _copy_to_device(X, device)
+    elif cpsp.issparse(X) and X.data.device.id != device:
+        arrays = (X.data, X.indices, X.indptr)
+        X = type(X)(tuple(_copy_to_device(a, device) for a in arrays), shape=X.shape)
     codes = rg.group_codes[selected]
 
     # Encode multinomial classes in original category order for cuML softmax.

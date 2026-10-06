@@ -6,10 +6,19 @@
 #include <string>
 #include <vector>
 
-// Shared RMM-backed device scratch (link rmm::rmm via add_rmm_cuda_module).
-// Allocates from the current RMM resource, sharing CuPy/RAPIDS's pool.
+// Shared device scratch backed by a Python-supplied (CuPy) allocator, injected
+// at import via _set_scratch_allocator (see register_scratch_allocator). Keeps
+// temporaries on the caller's current device resource (RMM pool / UVM aware)
+// without linking librmm's per-release-versioned C++ ABI.
 void* rmm_allocate(size_t bytes);
 void rmm_deallocate(void* ptr, size_t bytes);
+
+// Register the _set_scratch_allocator binding on a module (call from
+// NB_MODULE).
+namespace nanobind {
+class module_;
+}
+void register_scratch_allocator(nanobind::module_& m);
 
 // fraction * cudaMemGetInfo free; never trial-probe a pool.
 // Probing ratchets RMM pools and can starve cudaStreamCreate.

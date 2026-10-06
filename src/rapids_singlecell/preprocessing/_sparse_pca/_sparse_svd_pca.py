@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
     from cupyx.scipy.sparse import spmatrix
 
+    from rapids_singlecell._utils._random import RNGLike, SeedLike
+
 SVDSolver = Literal["lanczos", "randomized"]
 
 
@@ -52,8 +54,8 @@ class PCA_sparse_svd:
     n_iter
         Number of power iterations for randomized SVD. Higher values improve
         accuracy for matrices with slowly decaying singular values. Default is 2.
-    random_state
-        Random state for reproducibility.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
     """
 
     def __init__(
@@ -64,14 +66,14 @@ class PCA_sparse_svd:
         zero_center: bool = True,
         n_oversamples: int = 10,
         n_iter: int | None = None,
-        random_state: int | None = 0,
+        rng: SeedLike | RNGLike | None = None,
     ) -> None:
         self.n_components = n_components
         self.svd_solver = svd_solver
         self.zero_center = zero_center
         self.n_oversamples = n_oversamples
         self.n_iter = n_iter
-        self.random_state = random_state
+        self.rng = rng
 
     def fit(self, X: spmatrix) -> Self:
         """
@@ -140,7 +142,7 @@ class PCA_sparse_svd:
             return lanczos_svd(
                 X_op,
                 k=self.n_components_,
-                random_state=self.random_state,
+                rng=self.rng,
             )
         elif self.svd_solver == "randomized":
             n_iter = self.n_iter if self.n_iter is not None else 2
@@ -149,7 +151,7 @@ class PCA_sparse_svd:
                 k=self.n_components_,
                 n_oversamples=self.n_oversamples,
                 n_iter=n_iter,
-                random_state=self.random_state,
+                rng=self.rng,
             )
         else:
             raise ValueError(

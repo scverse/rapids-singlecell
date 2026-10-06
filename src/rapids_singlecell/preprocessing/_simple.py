@@ -154,9 +154,8 @@ def filter_genes(
             print(msg)
 
     if isinstance(data, AnnData) and inplace:
-        data.var["n_counts"] = sums_genes.get()
-
-        data.var["n_cells"] = n_cells_per_gene.get()
+        col = "n_counts" if (min_cells is None and max_cells is None) else "n_cells"
+        data.var[col] = number_per_gene.get()
         data._inplace_subset_var(gene_subset.get())
     else:
         return gene_subset.get(), number_per_gene.get()
@@ -295,8 +294,8 @@ def filter_cells(
             print(msg)
 
     if isinstance(data, AnnData) and inplace:
-        data.obs["n_counts"] = sums_cells.get()
-        data.obs["n_genes"] = n_genes_per_cell.get()
+        col = "n_counts" if (min_genes is None and max_genes is None) else "n_genes"
+        data.obs[col] = number_per_cell.get()
         data._inplace_subset_obs(cell_subset.get())
     else:
         return cell_subset.get(), number_per_cell.get()

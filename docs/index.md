@@ -1,11 +1,3 @@
-```{eval-rst}
-.. role:: small
-```
-
-```{eval-rst}
-.. role:: smaller
-```
-
 ```{include} basic.md
 ```
 
@@ -16,6 +8,7 @@
 
 installation.md
 usage_principles.md
+agent_skill.md
 api/index.md
 tutorials.md
 release-notes/index.md
@@ -28,6 +21,7 @@ references.md
 :maxdepth: 1
 
 memory_management.md
+gpu_configuration.md
 out_of_core.md
 ```
 
@@ -45,6 +39,6 @@ contributing.md
 :maxdepth: 1
 
 acknowledgements.md
-GitHub <https://github.com/scverse/rapids_singlecell>
+GitHub <https://github.com/scverse/rapids-singlecell>
 Discourse <https://discourse.scverse.org/c/help/rsc/48>
 ```

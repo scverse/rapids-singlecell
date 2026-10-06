@@ -6,7 +6,7 @@ orphan: true
 
 Sample notebooks for the rapids-singlecell package.
 
-To get the datasets for the notebooks, please use [this notebook](https://github.com/scverse/rapids_singlecell-notebooks/blob/main/00_DO_FIRST.ipynb).
+To get the datasets for the notebooks, run the [data download notebook](https://github.com/scverse/rapids-singlecell-tutorials/blob/main/00_DO_FIRST.ipynb).
 
 ```{toctree}
 :maxdepth: 1
@@ -19,4 +19,5 @@ notebooks/05_pertpy
 notebooks/06_out-of-core
 notebooks/07_multi_gpu
 notebooks/brain_1M
+notebooks/ligrec_benchmark
 ```

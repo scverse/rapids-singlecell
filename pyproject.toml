@@ -1,13 +1,11 @@
 [build-system]
 requires = [
-    "scikit-build-core>=0.10",
+    "hatchling",
+    "scikit-build-core[hatchling]>=1.0.1",
+    "hatch-vcs",
     "nanobind>=2.0.0",
-    "setuptools-scm>=8",
-    # Wilcoxon links librmm at build time; generic isolated builds use CUDA 12.
-    # 25.12+ provides the resource-ref API and flat RMM header path we use.
-    "librmm-cu12>=25.12",
 ]
-build-backend = "scikit_build_core.build"
+build-backend = "hatchling.build"
 
 [project]
 name = "rapids-singlecell"
@@ -17,17 +15,19 @@ license = { file = "LICENSE" }
 authors = [ { name = "Severin Dicks" } ]
 readme = { file = "README.md", content-type = "text/markdown" }
 dynamic = [ "version" ]
+scripts.rapids-singlecell-install-skills = "rapids_singlecell_skills.install:main"
+scripts.rapids-singlecell-check-kernel = "rapids_singlecell_skills.kernel:main"
 
 dependencies = [
-    "anndata>=0.10.0",
+    "anndata>=0.12.14",
     "scanpy>=1.10.0",
-    "numpy>=1.17.0",
-    "scipy>=1.4",
+    "scverse-misc[settings]>=0.1.3",
+    "numpy>=1.26",
+    "scipy!=1.17.0,>=1.12",
     "pandas",
     "natsort",
     "scikit-misc>=0.1.3",
     "scikit-learn",
-    "matplotlib>=3.4",
     "tqdm",
     "statsmodels>=0.12.0",
     "scikit-image",
@@ -36,23 +36,22 @@ dependencies = [
 
 [project.optional-dependencies]
 rapids-cu13 = [
-    "cupy-cuda13x",
+    "cupy-cuda13x[ctk]>=14",
     "cudf-cu13>=25.12",
     "cuml-cu13>=25.12",
     "cugraph-cu13>=25.12",
     "cuvs-cu13>=25.12",
-    "librmm-cu13>=25.12",
 ]
 rapids-cu12 = [
-    "cupy-cuda12x",
+    "cupy-cuda12x[ctk]>=14",
     "cudf-cu12>=25.12",
     "cuml-cu12>=25.12",
     "cugraph-cu12>=25.12",
     "cuvs-cu12>=25.12",
-    "librmm-cu12>=25.12",
 ]
 
-doc = [
+[dependency-groups]
+docs = [
     "sphinx>=4.5.0",
     "sphinx-copybutton",
     "nbsphinx>=0.8.12",
@@ -62,8 +61,10 @@ doc = [
     "sphinxext-opengraph",
     "sphinxcontrib.bibtex",
     "scanpydoc[typehints,theme]>=0.9.4",
+    "scverse-misc[sphinx]>=0.1.3",
     "dask",
     "pytest",
+    "spatialdata>=0.7.2",
 ]
 test-minimal = [
     "pytest",
@@ -79,8 +80,9 @@ test-minimal = [
     "fast-array-utils",
 ]
 test = [
-    "rapids_singlecell[test-minimal]",
     "igraph",
+    "spatialdata>=0.7.2",
+    { include-group = "test-minimal" },
 ]
 
 dev = [
@@ -89,7 +91,7 @@ dev = [
 ]
 
 [project.urls]
-Documentation = "https://rapids-singlecell.readthedocs.io"
+Documentation = "https://rapids-singlecell.scverse.org/"
 Source = "https://github.com/scverse/rapids_singlecell"
 
 [tool.ruff]
@@ -143,34 +145,39 @@ markers = [
     "array_api: array-API tests (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
 ]
 
-[tool.setuptools_scm]
-write_to = "src/rapids_singlecell/_version.py"
-# Optional but useful:
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
 version_scheme = "guess-next-dev"
 local_scheme = "node-and-date"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/rapids_singlecell/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = [ "src/rapids_singlecell", "src/rapids_singlecell_skills", "src/testing" ]
+exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
+
+[tool.hatch.build.targets.wheel.hooks.scikit-build]
 
 [tool.scikit-build]
 # Use limited ABI wheels (one wheel for all Python minor versions on one platform)
 wheel.py-api = "cp312"
-wheel.packages = [ "src/rapids_singlecell", "src/testing" ]
-wheel.exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
 cmake.version = ">=3.24"
 cmake.build-type = "Release"
 ninja.version = ">=1.10"
-experimental = false
 # Default: use native arch for source builds (auto-detect user's GPU)
 # CI overrides via SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES env var
 cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
 build-dir = "build"
-metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
-sdist.include = [ "src/rapids_singlecell/_version.py" ]
 
 # Use abi3audit to catch issues with Limited API wheels
 [tool.cibuildwheel.linux]
-# Exclude CUDA/RAPIDS runtime libs provided by dependency wheels.
+# Exclude CUDA runtime libs provided by dependency wheels.
 # Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
 repair-wheel-command = [
-    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' --exclude librmm.so --exclude librapids_logger.so -w {dest_dir} {wheel}",
+    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}",
     "pipx run abi3audit --strict --report {wheel}",
 ]
 [tool.cibuildwheel.macos]

@@ -1,4 +1,8 @@
 #include <cuda_runtime.h>
+#include <nanobind/stl/optional.h>
+#include <algorithm>
+#include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include "../../nb_types.h"
@@ -7,12 +11,191 @@
 #include "../scatter/kernels_scatter.cuh"
 #include "../../cublas_helpers.cuh"
 #include "kernels_correction_fast.cuh"
+#include "kernels_correction_multi.cuh"
 
 using namespace nb::literals;
 
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_BLOCK_DIM = 256;
 constexpr int BLOCK_DIM_1D = 256;
+constexpr int MULTI_RHS_BLOCK_DIM = 256;
+constexpr int MAX_JOINT_PARTS = 32;
+constexpr int JOINT_ROWS_PER_PART = 1024;
+
+template <typename T>
+static void prepare_multi_impl(
+    const T* X, const T* R, const T* O, const int* joint_codes,
+    const int* joint_cats, const int* joint_offsets,
+    const int* joint_cell_indices, const int* marginal_joint_offsets,
+    const int* marginal_joint_indices, const T* lambda_kb,
+    const uint8_t* active, int n_cells, int n_pcs, int n_clusters,
+    int n_batches, int n_covariates, int n_joint_categories,
+    // workspace/output
+    T* gram, T* rhs, T* joint_O, T* joint_rhs, T* joint_rhs_partials,
+    const int* joint_tile_offsets, size_t max_tiles, cudaStream_t stream,
+    cublasHandle_t handle) {
+    if (n_covariates < 2)
+        throw std::invalid_argument(
+            "prepare_multi requires at least two covariates");
+
+    int nb1 = n_batches + 1;
+    size_t joint_elements = (size_t)n_joint_categories * n_clusters;
+    size_t gram_elements = (size_t)n_clusters * nb1 * nb1;
+    size_t rhs_elements = (size_t)n_clusters * nb1 * n_pcs;
+
+    cudaMemsetAsync(joint_O, 0, joint_elements * sizeof(T), stream);
+    cudaMemsetAsync(gram, 0, gram_elements * sizeof(T), stream);
+    cudaMemsetAsync(rhs, 0, rhs_elements * sizeof(T), stream);
+
+    if (n_cells > 0 && n_clusters > 0) {
+        // Reuse joint_rhs before its values are computed. At most D partials
+        // per (joint, cluster) fit in that existing J-by-K-by-D buffer.
+        long long target_rows =
+            std::max(1LL, (long long)n_joint_categories * JOINT_ROWS_PER_PART);
+        int n_parts =
+            std::min(std::min(MAX_JOINT_PARTS, std::max(1, n_pcs)),
+                     (int)std::max(1LL, ((long long)n_cells + target_rows - 1) /
+                                            target_rows));
+        size_t blocks =
+            (size_t)n_joint_categories * ((n_clusters + 31) / 32) * n_parts;
+        T* partial = n_parts == 1 ? joint_O : joint_rhs;
+        joint_observed_kernel<T>
+            <<<strided_grid((long long)blocks * BLOCK_DIM_1D, BLOCK_DIM_1D),
+               BLOCK_DIM_1D, 0, stream>>>(R, joint_offsets, joint_cell_indices,
+                                          partial, n_clusters,
+                                          n_joint_categories, n_parts);
+        CUDA_CHECK_LAST_ERROR(joint_observed_kernel);
+        if (n_parts > 1) {
+            finish_joint_observed_kernel<T>
+                <<<strided_grid((long long)joint_elements, BLOCK_DIM_1D),
+                   BLOCK_DIM_1D, 0, stream>>>(partial, joint_O, joint_elements,
+                                              n_parts);
+            CUDA_CHECK_LAST_ERROR(finish_joint_observed_kernel);
+        }
+    }
+
+    if (n_clusters > 0) {
+        initialize_multi_gram_kernel<T>
+            <<<n_clusters, MAX_BLOCK_DIM, 0, stream>>>(
+                O, lambda_kb, active, joint_O, gram, n_batches, n_clusters,
+                n_joint_categories);
+        CUDA_CHECK_LAST_ERROR(initialize_multi_gram_kernel);
+    }
+
+    if (joint_elements > 0) {
+        dim3 grid(
+            strided_grid((long long)n_batches * n_clusters, BLOCK_DIM_1D));
+        dim3 block(BLOCK_DIM_1D);
+        if (n_covariates == 2) {
+            add_joint_cross_kernel<T, 2><<<grid, block, 0, stream>>>(
+                joint_O, joint_cats, marginal_joint_offsets,
+                marginal_joint_indices, active, gram, n_covariates, n_batches,
+                n_clusters);
+        } else if (n_covariates == 3) {
+            add_joint_cross_kernel<T, 3><<<grid, block, 0, stream>>>(
+                joint_O, joint_cats, marginal_joint_offsets,
+                marginal_joint_indices, active, gram, n_covariates, n_batches,
+                n_clusters);
+        } else {
+            add_joint_cross_kernel<T, 0><<<grid, block, 0, stream>>>(
+                joint_O, joint_cats, marginal_joint_offsets,
+                marginal_joint_indices, active, gram, n_covariates, n_batches,
+                n_clusters);
+        }
+        CUDA_CHECK_LAST_ERROR(add_joint_cross_kernel);
+    }
+
+    cublas_check_status(cublasSetStream(handle, stream), "cublasSetStream");
+    T one = T(1), zero = T(0);
+
+    // Intercept rows for all clusters: rhs[:, 0, :] = R.T @ X.
+    if (n_cells > 0 && n_pcs > 0 && n_clusters > 0) {
+        cublas_check_status(
+            cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, n_pcs, n_clusters,
+                           n_cells, &one, X, n_pcs, R, n_clusters, &zero, rhs,
+                           nb1 * n_pcs),
+            "cublas_gemm(prepare_multi intercept rhs)");
+    }
+
+    // Compute each observed joint row once, then deterministically gather the
+    // much smaller joint result into all marginal category rows.
+    size_t joint_rhs_elements = joint_elements * n_pcs;
+    if (joint_rhs_elements > 0) {
+        if (joint_rhs_partials != nullptr) {
+            size_t blocks =
+                max_tiles *
+                ((n_clusters + JOINT_RHS_CLUSTER_LANES - 1) /
+                 JOINT_RHS_CLUSTER_LANES) *
+                ((n_pcs + JOINT_RHS_PC_LANES - 1) / JOINT_RHS_PC_LANES);
+            joint_rhs_partials_kernel<T>
+                <<<strided_grid((long long)blocks, 1),
+                   dim3(JOINT_RHS_PC_LANES, JOINT_RHS_ROW_LANES), 0, stream>>>(
+                    X, R, joint_offsets, joint_cell_indices, joint_cats, active,
+                    joint_tile_offsets, joint_rhs_partials, n_pcs, n_clusters,
+                    n_joint_categories, n_covariates, max_tiles);
+            CUDA_CHECK_LAST_ERROR(joint_rhs_partials_kernel);
+            finish_joint_rhs_kernel<T>
+                <<<strided_grid((long long)joint_rhs_elements, BLOCK_DIM_1D),
+                   BLOCK_DIM_1D, 0, stream>>>(
+                    joint_rhs_partials, joint_tile_offsets, joint_rhs, n_pcs,
+                    n_clusters, joint_rhs_elements);
+            CUDA_CHECK_LAST_ERROR(finish_joint_rhs_kernel);
+        } else {
+            size_t blocks = joint_elements * ((n_pcs + 1) / 2);
+            if (blocks > (size_t)max_grid_dim_x())
+                throw std::invalid_argument(
+                    "prepare_multi joint RHS grid exceeds the CUDA grid-x "
+                    "limit");
+            segmented_joint_rhs_kernel<T>
+                <<<(unsigned int)blocks, MULTI_RHS_BLOCK_DIM, 0, stream>>>(
+                    X, R, joint_offsets, joint_cell_indices, joint_cats, active,
+                    joint_rhs, n_pcs, n_clusters, n_joint_categories,
+                    n_covariates);
+            CUDA_CHECK_LAST_ERROR(segmented_joint_rhs_kernel);
+        }
+    }
+
+    size_t marginal_rhs_elements = (size_t)n_batches * n_clusters * n_pcs;
+    if (marginal_rhs_elements > 0) {
+        marginal_from_joint_rhs_kernel<T>
+            <<<strided_grid((long long)marginal_rhs_elements, BLOCK_DIM_1D),
+               BLOCK_DIM_1D, 0, stream>>>(joint_rhs, marginal_joint_offsets,
+                                          marginal_joint_indices, active, rhs,
+                                          n_pcs, n_clusters, n_batches);
+        CUDA_CHECK_LAST_ERROR(marginal_from_joint_rhs_kernel);
+    }
+}
+
+template <typename T>
+static void apply_multi_impl(const T* X, const T* R, const T* W_all,
+                             const int* cats, int n_cells, int n_pcs,
+                             int n_clusters, int n_batches, int n_covariates,
+                             bool initialize_output, T* Z,
+                             cudaStream_t stream) {
+    if (n_covariates < 2)
+        throw std::invalid_argument(
+            "apply_multi requires at least two covariates");
+
+    size_t work = (size_t)n_cells * n_pcs;
+    if (work == 0) return;
+
+    dim3 grid(strided_grid((long long)work, BLOCK_DIM_1D));
+    dim3 block(BLOCK_DIM_1D);
+    if (n_covariates == 2) {
+        apply_multi_correction_kernel<T, 2><<<grid, block, 0, stream>>>(
+            X, R, W_all, cats, Z, n_cells, n_pcs, n_clusters, n_batches,
+            n_covariates, initialize_output);
+    } else if (n_covariates == 3) {
+        apply_multi_correction_kernel<T, 3><<<grid, block, 0, stream>>>(
+            X, R, W_all, cats, Z, n_cells, n_pcs, n_clusters, n_batches,
+            n_covariates, initialize_output);
+    } else {
+        apply_multi_correction_kernel<T, 0><<<grid, block, 0, stream>>>(
+            X, R, W_all, cats, Z, n_cells, n_pcs, n_clusters, n_batches,
+            n_covariates, initialize_output);
+    }
+    CUDA_CHECK_LAST_ERROR(apply_multi_correction_kernel);
+}
 
 template <typename T>
 static void correction_batched_impl(
@@ -21,8 +204,12 @@ static void correction_batched_impl(
     int n_clusters, int n_batches,
     // workspace
     T* Z, T* inv_mats, T* Phi_t_diag_R_X_all, T* W_all, T* g_factor,
-    T* g_P_row0, T* X_sorted, T* R_sorted, cudaStream_t stream,
-    cublasHandle_t handle) {
+    T* g_P_row0, T* X_batch, T* R_batch, int batch_chunk_size,
+    cudaStream_t stream, cublasHandle_t handle) {
+    if (batch_chunk_size < 1)
+        throw std::invalid_argument(
+            "correction_batched requires positive batch scratch capacity");
+
     int nb1 = n_batches + 1;
 
     // Step 1: Z = X.copy()
@@ -58,21 +245,6 @@ static void correction_batched_impl(
                        Phi_t_diag_R_X_all, nb1 * n_pcs),
         "cublas_gemm(correction_batched row0)");
 
-    // Gather X and R into batch-sorted order
-    {
-        size_t n_x = (size_t)n_cells * n_pcs;
-        gather_rows_kernel<T>
-            <<<strided_grid((long long)n_x, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-               stream>>>(X, cell_indices, X_sorted, n_cells, n_pcs);
-        CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
-
-        size_t n_r = (size_t)n_cells * n_clusters;
-        gather_rows_kernel<T>
-            <<<strided_grid((long long)n_r, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-               stream>>>(R, cell_indices, R_sorted, n_cells, n_clusters);
-        CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
-    }
-
     // Copy cat_offsets to host for batch loop
     std::vector<int> h_offsets(n_batches + 1);
     cudaMemcpyAsync(h_offsets.data(), cat_offsets,
@@ -80,23 +252,53 @@ static void correction_batched_impl(
                     cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    // Rows 1..n_batches: per-batch GEMMs on sorted data
+    // Rows 1..n_batches: gather one bounded category chunk at a time, then use
+    // the established dense GEMM. This retains the fast arrowhead path without
+    // materializing full N-by-D and N-by-K sorted copies.
     for (int b = 0; b < n_batches; b++) {
         int start = h_offsets[b];
         int end = h_offsets[b + 1];
         int n_batch_cells = end - start;
         if (n_batch_cells == 0) continue;
 
-        const T* X_batch = X_sorted + (size_t)start * n_pcs;
-        const T* R_batch = R_sorted + (size_t)start * n_clusters;
         T* C_ptr = Phi_t_diag_R_X_all + (b + 1) * n_pcs;
+        if (n_batch_cells == n_cells) {
+            cublas_check_status(
+                cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, n_pcs,
+                               n_clusters, n_cells, &one, X, n_pcs, R,
+                               n_clusters, &zero, C_ptr, nb1 * n_pcs),
+                "cublas_gemm(correction_batched full category)");
+            continue;
+        }
 
-        // result[:,b+1,:] = R_batch.T @ X_batch (same N,T trick as row 0)
-        cublas_check_status(
-            cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, n_pcs, n_clusters,
-                           n_batch_cells, &one, X_batch, n_pcs, R_batch,
-                           n_clusters, &zero, C_ptr, nb1 * n_pcs),
-            "cublas_gemm(correction_batched per-batch)");
+        bool first_chunk = true;
+        for (int chunk_start = start; chunk_start < end;
+             chunk_start += batch_chunk_size) {
+            int chunk_cells = std::min(batch_chunk_size, end - chunk_start);
+            const int* chunk_indices = cell_indices + chunk_start;
+
+            size_t n_x = (size_t)chunk_cells * n_pcs;
+            gather_rows_kernel<T>
+                <<<strided_grid((long long)n_x, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+                   stream>>>(X, chunk_indices, X_batch, chunk_cells, n_pcs);
+            CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+
+            size_t n_r = (size_t)chunk_cells * n_clusters;
+            gather_rows_kernel<T><<<strided_grid((long long)n_r, BLOCK_DIM_1D),
+                                    BLOCK_DIM_1D, 0, stream>>>(
+                R, chunk_indices, R_batch, chunk_cells, n_clusters);
+            CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+
+            // result[:,b+1,:] += R_batch.T @ X_batch. The first chunk
+            // overwrites the zeroed row; later chunks accumulate in order.
+            const T* beta = first_chunk ? &zero : &one;
+            cublas_check_status(
+                cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, n_pcs,
+                               n_clusters, chunk_cells, &one, X_batch, n_pcs,
+                               R_batch, n_clusters, beta, C_ptr, nb1 * n_pcs),
+                "cublas_gemm(correction_batched per-batch chunk)");
+            first_chunk = false;
+        }
     }
 
     // Step 4: W_all = inv_mats @ Phi_t_diag_R_X_all (strided batched GEMM)
@@ -145,22 +347,92 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<T, Device> Z, gpu_array_c<T, Device> inv_mats,
            gpu_array_c<T, Device> Phi_t_diag_R_X_all,
            gpu_array_c<T, Device> W_all, gpu_array_c<T, Device> g_factor,
-           gpu_array_c<T, Device> g_P_row0, gpu_array_c<T, Device> X_sorted,
-           gpu_array_c<T, Device> R_sorted, std::uintptr_t stream,
-           std::uintptr_t handle) {
+           gpu_array_c<T, Device> g_P_row0, gpu_array_c<T, Device> X_batch,
+           gpu_array_c<T, Device> R_batch, int batch_chunk_size,
+           std::uintptr_t stream, std::uintptr_t handle) {
             correction_batched_impl<T>(
                 X.data(), R.data(), O.data(), cats.data(), cat_offsets.data(),
                 cell_indices.data(), lambda_kb.data(), n_cells, n_pcs,
                 n_clusters, n_batches, Z.data(), inv_mats.data(),
                 Phi_t_diag_R_X_all.data(), W_all.data(), g_factor.data(),
-                g_P_row0.data(), X_sorted.data(), R_sorted.data(),
-                (cudaStream_t)stream, (cublasHandle_t)handle);
+                g_P_row0.data(), X_batch.data(), R_batch.data(),
+                batch_chunk_size, (cudaStream_t)stream, (cublasHandle_t)handle);
         },
         "X"_a, nb::kw_only(), "R"_a, "O"_a, "cats"_a, "cat_offsets"_a,
         "cell_indices"_a, "lambda_kb"_a, "n_cells"_a, "n_pcs"_a, "n_clusters"_a,
         "n_batches"_a, "Z"_a, "inv_mats"_a, "Phi_t_diag_R_X_all"_a, "W_all"_a,
-        "g_factor"_a, "g_P_row0"_a, "X_sorted"_a, "R_sorted"_a, "stream"_a = 0,
-        "handle"_a);
+        "g_factor"_a, "g_P_row0"_a, "X_batch"_a, "R_batch"_a,
+        "batch_chunk_size"_a, "stream"_a = 0, "handle"_a);
+
+    m.def(
+        "prepare_multi",
+        [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> R,
+           gpu_array_c<const T, Device> O,
+           gpu_array_c<const int, Device> joint_codes,
+           gpu_array_c<const int, Device> joint_cats,
+           gpu_array_c<const int, Device> joint_offsets,
+           gpu_array_c<const int, Device> joint_cell_indices,
+           gpu_array_c<const int, Device> marginal_joint_offsets,
+           gpu_array_c<const int, Device> marginal_joint_indices,
+           gpu_array_c<const T, Device> lambda_kb,
+           gpu_array_c<const uint8_t, Device> active, int n_cells, int n_pcs,
+           int n_clusters, int n_batches, int n_covariates,
+           int n_joint_categories, gpu_array_c<T, Device> gram,
+           gpu_array_c<T, Device> rhs, gpu_array_c<T, Device> joint_O,
+           gpu_array_c<T, Device> joint_rhs,
+           std::optional<gpu_array_c<T, Device>> joint_rhs_partials,
+           std::optional<gpu_array_c<const int, Device>> joint_tile_offsets,
+           std::uintptr_t stream, std::uintptr_t handle) {
+            if (joint_rhs_partials.has_value() !=
+                joint_tile_offsets.has_value())
+                throw std::invalid_argument(
+                    "prepare_multi requires both joint RHS scratch arrays");
+            if (joint_rhs_partials &&
+                (joint_rhs_partials->ndim() != 3 ||
+                 joint_rhs_partials->shape(1) != (size_t)n_clusters ||
+                 joint_rhs_partials->shape(2) != (size_t)n_pcs ||
+                 joint_tile_offsets->ndim() != 1 ||
+                 joint_tile_offsets->shape(0) !=
+                     (size_t)n_joint_categories + 1))
+                throw std::invalid_argument(
+                    "prepare_multi joint RHS scratch shape mismatch");
+            prepare_multi_impl<T>(
+                X.data(), R.data(), O.data(), joint_codes.data(),
+                joint_cats.data(), joint_offsets.data(),
+                joint_cell_indices.data(), marginal_joint_offsets.data(),
+                marginal_joint_indices.data(), lambda_kb.data(), active.data(),
+                n_cells, n_pcs, n_clusters, n_batches, n_covariates,
+                n_joint_categories, gram.data(), rhs.data(), joint_O.data(),
+                joint_rhs.data(),
+                joint_rhs_partials ? joint_rhs_partials->data() : nullptr,
+                joint_tile_offsets ? joint_tile_offsets->data() : nullptr,
+                joint_rhs_partials ? joint_rhs_partials->shape(0) : 0,
+                (cudaStream_t)stream, (cublasHandle_t)handle);
+        },
+        "X"_a, nb::kw_only(), "R"_a, "O"_a, "joint_codes"_a, "joint_cats"_a,
+        "joint_offsets"_a, "joint_cell_indices"_a, "marginal_joint_offsets"_a,
+        "marginal_joint_indices"_a, "lambda_kb"_a, "active_mask"_a, "n_cells"_a,
+        "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a,
+        "n_joint_categories"_a, "gram"_a, "rhs"_a, "joint_O"_a, "joint_rhs"_a,
+        "joint_rhs_partials"_a = nb::none(),
+        "joint_tile_offsets"_a = nb::none(), "stream"_a = 0, "handle"_a);
+
+    m.def(
+        "apply_multi",
+        [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> R,
+           gpu_array_c<const T, Device> W_all,
+           gpu_array_c<const int, Device> cats, int n_cells, int n_pcs,
+           int n_clusters, int n_batches, int n_covariates,
+           bool initialize_output, gpu_array_c<T, Device> Z,
+           std::uintptr_t stream) {
+            apply_multi_impl<T>(X.data(), R.data(), W_all.data(), cats.data(),
+                                n_cells, n_pcs, n_clusters, n_batches,
+                                n_covariates, initialize_output, Z.data(),
+                                (cudaStream_t)stream);
+        },
+        "X"_a, nb::kw_only(), "R"_a, "W_all"_a, "cats"_a, "n_cells"_a,
+        "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a,
+        "initialize_output"_a, "Z"_a, "stream"_a = 0);
 }
 
 template <typename Device>
@@ -170,5 +442,6 @@ void register_bindings(nb::module_& m) {
 }
 
 NB_MODULE(_harmony_correction_batched_cuda, m) {
+    m.attr("JOINT_RHS_TILE_ROWS") = nb::int_(JOINT_RHS_TILE_ROWS);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

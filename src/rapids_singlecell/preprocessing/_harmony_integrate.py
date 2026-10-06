@@ -6,40 +6,51 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 
+from rapids_singlecell._keys import _harmony_obsm_key, _resolve_obsm_key
+from rapids_singlecell._utils._random import (
+    RNGLike,
+    SeedLike,
+    _accepts_legacy_random_state,
+)
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
     from ._harmony import COLSUM_ALGO
 
 
+@_accepts_legacy_random_state(0)
 def harmony_integrate(
     adata: AnnData,
     key: str | list[str],
     *,
     basis: str = "X_pca",
-    adjusted_basis: str = "X_pca_harmony",
-    dtype: type = np.float64,
+    adjusted_basis: str | None = None,
+    dtype: type = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
     max_iter_harmony: int = 10,
-    max_iter_clustering: int = 200,
-    tol_harmony: float = 1e-4,
-    tol_clustering: float = 1e-5,
+    max_iter_clustering: int | None = None,
+    tol_harmony: float | None = None,
+    tol_clustering: float | None = None,
     sigma: float = 0.1,
     theta: float | int | list[float] | np.ndarray | cp.ndarray = 2.0,
     tau: int = 0,
     ridge_lambda: float = 1.0,
     alpha: float = 0.2,
     batch_prune_threshold: float | None = 1e-5,
-    correction_method: Literal["fast", "original", "batched"] | None = None,
+    correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     block_proportion: float = 0.05,
-    random_state: int = 0,
+    rng: SeedLike | RNGLike | None = None,
     verbose: bool = False,
 ) -> None:
     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
 
-    This GPU-accelerated implementation is based on the harmony-pytorch package.
+    This GPU-accelerated implementation was originally based on the
+    harmony-pytorch package. Multiple batch variables now follow the
+    per-covariate formulation described in the Harmony papers: each key is
+    modeled separately instead of combining all keys into one joint category.
     As Harmony works by adjusting the principal components,
     this function should be run after performing PCA but before computing the neighbor graph.
 
@@ -57,14 +68,25 @@ def harmony_integrate(
         The annotated data matrix.
     key
         The key(s) of the column(s) in ``adata.obs`` that differentiate(s) among experiments/batches.
-        When multiple keys are provided, a combined batch variable is created from all columns.
+        Multiple keys are modeled as separate batch variables, with one active
+        categorical level per variable and cell.
+        To retain the joint-combination behavior of earlier releases, combine
+        the desired columns into one categorical column and pass that single key.
     basis
         The name of the field in ``adata.obsm`` where the PCA table is stored.
+        Either spelling of the PCA key resolves to whichever one the data
+        actually uses, so the default works under any
+        ``rapids_singlecell.settings.preset``.
     adjusted_basis
-        The name of the field in ``adata.obsm`` where the adjusted PCA table will be stored.
+        The name of the field in ``adata.obsm`` where the adjusted PCA table will be
+        stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows
+        the naming of the basis it corrected (``"X_pca"`` gives
+        ``"X_pca_harmony"``, ``"pca"`` gives ``"pca_harmony"``).
     dtype
-        The data type to use for Harmony computation.
-        If you use 32-bit you may experience numerical instability.
+        The data type used for initialization and Harmony computation.
+        Defaults to ``numpy.float32``. Use ``numpy.float64`` when additional
+        precision is needed; it can be slower on GPUs with reduced
+        double-precision throughput.
     flavor
         Which version of the Harmony algorithm to use.
         ``"harmony2"`` (default) enables the stabilized diversity penalty,
@@ -80,12 +102,16 @@ def harmony_integrate(
         (each consisting of a clustering step followed by a correction step).
     max_iter_clustering
         Maximum iterations for the clustering step within each Harmony iteration.
+        If ``None``, uses the value of the reference implementation for the chosen
+        ``flavor``: ``4`` for ``"harmony2"``, ``200`` for ``"harmony1"``.
     tol_harmony
         Convergence tolerance for the Harmony objective function.
         The algorithm stops when the relative change in objective falls below this value.
+        If ``None``, ``1e-2`` for ``"harmony2"`` and ``1e-4`` for ``"harmony1"``.
     tol_clustering
         Convergence tolerance for the clustering step within each
         Harmony iteration.
+        If ``None``, ``1e-3`` for ``"harmony2"`` and ``1e-5`` for ``"harmony1"``.
     sigma
         Width of the soft-clustering kernel.
         Controls the entropy of cluster assignments:
@@ -97,8 +123,10 @@ def harmony_integrate(
         to contain a balanced representation of all batches.
         Higher values (e.g. ``4``) produce more aggressive mixing;
         lower values (e.g. ``0.5``) allow more batch-specific clusters.
-        Set to ``0`` to disable batch correction entirely.
-        A list can be provided to set different weights per batch variable.
+        Set to ``0`` to disable the diversity penalty for a batch variable.
+        A scalar is applied to every key. A sequence may contain one value per
+        key, expanded over that key's categorical levels, or one value per
+        categorical level across all keys.
     tau
         Discounting factor on ``theta``.
         When ``tau > 0``,
@@ -109,6 +137,7 @@ def harmony_integrate(
         Ridge regression regularization for the correction step.
         Larger values produce more conservative (smaller) corrections,
         preventing over-fitting.
+        Must be finite and greater than zero.
         Only used with ``flavor="harmony1"``.
     alpha
         Scaling factor for the dynamic per-cluster-per-batch ridge regularization.
@@ -124,22 +153,33 @@ def harmony_integrate(
         Set to ``None`` to disable pruning.
     correction_method
         Method for the correction step.
-        ``"original"`` uses per-cluster ridge regression with explicit matrix inversion.
         ``"fast"`` uses a precomputed factorization that avoids the full inversion,
         which can be faster for datasets with many batches.
         ``"batched"`` processes all clusters simultaneously (fastest but requires more memory).
-        If ``None`` (default), automatically selects ``"batched"`` unless
-        the workspace would exceed 1 GB, in which case ``"fast"`` is used.
+        With one key, ``None`` automatically selects ``"batched"`` unless its
+        workspace would exceed 1 GiB, in which case ``"fast"`` is used.
+        Multiple keys always use the exact general-design solve because the
+        arrowhead optimization applies only to one batch variable; clusters are
+        processed in workspace-bounded chunks when needed. For multiple keys,
+        use ``None`` or ``"batched"``; passing ``"fast"`` emits a warning and
+        uses the exact solve.
     colsum_algo
         Algorithm for column sums.
         If ``None``, chosen automatically.
-        If ``"benchmark"``, benchmarks all algorithms.
+        The legacy ``"atomics"`` and ``"benchmark"`` values use automatic
+        deterministic selection.
     block_proportion
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
-    random_state
-        Random seed for reproducibility.
+    rng
+        Random seed or :class:`~numpy.random.Generator` for reproducibility.
+        The superseded `random_state` argument is still accepted.
+        Sequential calls with identical inputs, parameters, and integer seed
+        are bitwise reproducible on the same hardware and software stack in
+        float32 and float64. Initialization uses k-means++ and fixed-order
+        Lloyd reductions. Results may differ across GPU architectures or
+        CUDA versions; concurrent CUDA streams are outside this guarantee.
     verbose
         Whether to print benchmarking and convergence information.
 
@@ -149,6 +189,8 @@ def harmony_integrate(
     containing principal components adjusted by Harmony
     such that different experiments are integrated.
     """
+    rng = np.random.default_rng(rng)
+
     from ._harmony import harmonize
 
     # Resolve flavor into internal flags
@@ -178,6 +220,10 @@ def harmony_integrate(
                 UserWarning,
                 stacklevel=2,
             )
+
+    basis = _resolve_obsm_key(adata, basis)
+    if adjusted_basis is None:
+        adjusted_basis = _harmony_obsm_key(basis)
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:
@@ -239,7 +285,7 @@ def harmony_integrate(
         tau=tau,
         correction_method=correction_method,
         colsum_algo=colsum_algo,
-        random_state=random_state,
+        rng=rng,
         stabilized_penalty=stabilized_penalty,
         dynamic_lambda=dynamic_lambda,
         alpha=alpha,

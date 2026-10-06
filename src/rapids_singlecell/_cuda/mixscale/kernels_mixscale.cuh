@@ -137,7 +137,7 @@ __global__ void mixscale_project_score_kernel(
     }
     __syncthreads();
 
-    // 5. control-cell projection stats: mean, population std (ddof=0).
+    // 5. control-cell projection stats: mean, sample std (ddof=1).
     {
         double snt = 0, snt2 = 0;
         for (int cell = tid; cell < n; cell += blockDim.x) {
@@ -151,6 +151,7 @@ __global__ void mixscale_project_score_kernel(
         if (tid == 0) {
             double mean = out[0] / n_nt;
             double var = out[1] / n_nt - mean * mean;
+            var = (n_nt > 1.0) ? var * n_nt / (n_nt - 1.0) : 0.0;
             double sd = sqrt(fmax(var, 0.0));
             s_ntmean = mean;
             s_ntstd = (sd == 0.0) ? 1.0 : sd;  // pertpy: nt_std == 0 -> 1

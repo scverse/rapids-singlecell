@@ -7,7 +7,6 @@ from rapids_singlecell._cuda import _aucell_cuda as _au
 from rapids_singlecell.decoupler_gpu._helper._docs import docs
 from rapids_singlecell.decoupler_gpu._helper._log import _log
 from rapids_singlecell.decoupler_gpu._helper._Method import Method, MethodMeta
-from rapids_singlecell.decoupler_gpu._helper._run import _run
 
 
 def rank_rows_desc(x: cp.ndarray) -> cp.ndarray:
@@ -125,41 +124,6 @@ def _func_aucell(
     return es.get(), None
 
 
-class AucellMethod(Method):
-    """Custom Method class for aucell with bsize=100 as default."""
-
-    def __call__(
-        self,
-        data,
-        net,
-        *,
-        tmin: int | float = 5,
-        raw: bool = False,
-        empty: bool = True,
-        bsize: int | float = 100,  # Default batch size of 100
-        verbose: bool = False,
-        pre_load: bool = False,
-        n_up: int | float | None = None,
-        **kwargs,
-    ):
-        return _run(
-            name=self.name,
-            func=self.func,
-            adj=self.adj,
-            test=self.test,
-            data=data,
-            net=net,
-            tmin=tmin,
-            raw=raw,
-            empty=empty,
-            bsize=bsize,
-            verbose=verbose,
-            pre_load=pre_load,
-            n_up=n_up,
-            **kwargs,
-        )
-
-
 _aucell = MethodMeta(
     name="aucell",
     desc="AUCell",
@@ -171,4 +135,4 @@ _aucell = MethodMeta(
     limits=(0, 1),
     reference="https://doi.org/10.1038/nmeth.4463",
 )
-aucell = AucellMethod(_method=_aucell)
+aucell = Method(_method=_aucell, default_bsize=100)

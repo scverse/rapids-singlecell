@@ -1,3 +1,27 @@
 from __future__ import annotations
 
-from .decoupler_gpu import *
+from .decoupler_gpu import (
+    aucell,
+    gsea,
+    gsva,
+    mlm,
+    ora,
+    query_set,
+    ulm,
+    viper,
+    waggr,
+    zscore,
+)
+
+__all__ = [
+    "aucell",
+    "gsea",
+    "gsva",
+    "mlm",
+    "ora",
+    "query_set",
+    "ulm",
+    "viper",
+    "waggr",
+    "zscore",
+]

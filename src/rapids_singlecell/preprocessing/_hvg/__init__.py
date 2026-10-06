@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 from ._cutoffs import _Cutoffs
@@ -37,7 +38,7 @@ def highly_variable_genes(
     min_disp: float = 0.5,
     max_disp: float = np.inf,
     n_top_genes: int = None,
-    flavor: flavors = "seurat",
+    flavor: flavors | Default = Default(("highly_variable_genes", "flavor")),
     n_bins: int = 20,
     span: float = 0.3,
     check_values: bool = True,
@@ -103,11 +104,11 @@ def highly_variable_genes(
             Only used if `flavor='seurat_v3'` or `'pearson_residuals'`.
         theta
             The negative binomial overdispersion parameter `theta` for Pearson residuals.
-            Higher values correspond to less overdispersion (`var = mean + mean^2/theta`), and `theta=np.Inf` corresponds to a Poisson model.
+            Higher values correspond to less overdispersion (`var = mean + mean^2/theta`), and `theta=np.inf` corresponds to a Poisson model.
         clip
             Only used if `flavor='pearson_residuals'`. Determines if and how residuals are clipped:
                 * If `None`, residuals are clipped to the interval `[-sqrt(n_obs), sqrt(n_obs)]`, where `n_obs` is the number of cells in the dataset (default behavior).
-                * If any scalar `c`, residuals are clipped to the interval `[-c, c]`. Set `clip=np.Inf` for no clipping.
+                * If any scalar `c`, residuals are clipped to the interval `[-c, c]`. Set `clip=np.inf` for no clipping.
         chunksize
             If `'poisson_gene_selection'`, this dertermines how many genes are processed at
             once. Choosing a smaller value will reduce the required memory.
@@ -145,6 +146,8 @@ def highly_variable_genes(
             `highly_variable_intersection` : bool
                 If batch_key is given, this denotes the genes that are highly variable in all batches
     """
+    flavor = resolve_default(flavor)
+
     if batch_key is not None:
         _sanitize_column(adata, batch_key)
 

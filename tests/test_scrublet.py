@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import cupy as cp
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sparse
 from anndata import AnnData, concat
 from anndata.tests.helpers import assert_equal
+from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import coo_matrix
 from numpy.testing import assert_allclose, assert_array_equal
 
 import rapids_singlecell as rsc
+from rapids_singlecell.preprocessing._scrublet.sparse_utils import subsample_counts
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -82,6 +85,44 @@ def test_scrublet_batched():
     merged = concat(split)
 
     pd.testing.assert_frame_equal(adata.obs[merged.obs.columns], merged.obs)
+
+
+@pytest.mark.parametrize("copy", [False, True])
+def test_scrublet_batched_preserves_obs(monkeypatch, copy):
+    """Batch concatenation must preserve metadata and align results by cell."""
+    from rapids_singlecell.preprocessing import _scrublet
+
+    adata = AnnData(np.ones((4, 3)))
+    adata.obs["batch"] = pd.Categorical(
+        ["b", "a", "b", "a"], categories=["b", "a", "unused"], ordered=True
+    )
+    adata.obs["cell_type"] = pd.Categorical(
+        ["T", "B", "T", "B"], categories=["B", "T", "unused"]
+    )
+    adata.obs["count"] = pd.array([1, None, 3, 4], dtype="Int64")
+    original_obs = adata.obs.copy(deep=True)
+
+    def fake_call_doublets(adata_obs, **kwargs):
+        scores = adata_obs.obs_names.astype(int).to_numpy() / 10
+        adata_obs.obs["doublet_score"] = scores
+        adata_obs.obs["predicted_doublet"] = scores > 0.15
+        adata_obs.uns["scrublet"] = {}
+        return adata_obs
+
+    monkeypatch.setattr(_scrublet, "_scrublet_call_doublets", fake_call_doublets)
+    result = rsc.pp.scrublet(
+        adata, adata_sim=adata.copy(), batch_key="batch", copy=copy, verbose=False
+    )
+    if copy:
+        pd.testing.assert_frame_equal(adata.obs, original_obs)
+    else:
+        assert result is None
+        result = adata
+
+    pd.testing.assert_frame_equal(result.obs[original_obs.columns], original_obs)
+    assert_allclose(result.obs["doublet_score"], [0, 0.1, 0.2, 0.3])
+    assert_array_equal(result.obs["predicted_doublet"], [False, False, True, True])
+    assert result.uns["scrublet"]["batches"].keys() == {"a", "b"}
 
 
 def _preprocess_for_scrublet(adata: AnnData) -> AnnData:
@@ -227,3 +268,36 @@ def test_scrublet_simulate_doublets():
         adata_sim.obsm["doublet_parents"],
         np.array([[13, 132], [106, 43], [152, 3], [160, 103]]),
     )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_subsample_counts_uses_seeded_gpu_rng(dtype):
+    rate = 0.6
+    counts = cp.asarray([[4, 0, 2, 1], [0, 3, 0, 5], [1, 1, 6, 0]], dtype=dtype)
+    matrix = cp_sparse.csr_matrix(counts)
+    original_totals = matrix.sum(axis=1).ravel()
+
+    expected_host_rng = np.random.default_rng(17)
+    seed = int(expected_host_rng.integers(0, 2**32))
+    expected_gpu_rng = cp.random.default_rng(seed)
+    expected = matrix.copy()
+    expected.data = expected_gpu_rng.binomial(
+        cp.round(expected.data).astype(np.int64), rate
+    ).astype(dtype, copy=False)
+    expected_current_totals = expected.sum(axis=1).ravel()
+    expected_unsampled_totals = expected_gpu_rng.binomial(
+        cp.round(original_totals - expected_current_totals).astype(np.int64), rate
+    ).astype(dtype, copy=False)
+
+    rng = np.random.default_rng(17)
+    actual, actual_totals = subsample_counts(
+        matrix.copy(), rate=rate, original_totals=original_totals, rng=rng
+    )
+
+    cp.testing.assert_array_equal(actual.toarray(), expected.toarray())
+    cp.testing.assert_array_equal(
+        actual_totals, expected_current_totals + expected_unsampled_totals
+    )
+    assert actual.dtype == dtype
+    assert actual_totals.dtype == dtype
+    assert rng.integers(0, 2**32) == expected_host_rng.integers(0, 2**32)
