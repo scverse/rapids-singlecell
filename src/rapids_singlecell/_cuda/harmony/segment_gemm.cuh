@@ -53,7 +53,8 @@ inline Plan make_plan(int D, int K, int sT, int sR) {
     if (sT == 8)
         for (int td : {8, 10, 5, 4})
             if (cdiv(D, td) * td < best) best = cdiv(D, td) * td, p.td = td;
-    for (auto [td, tk] : {std::pair{8, 8}, {16, 4}, {10, 4}, {10, 8}}) {
+    constexpr int configs[][2] = {{8, 8}, {16, 4}, {10, 4}, {10, 8}};
+    for (auto [td, tk] : configs) {
         const long long n = (long long)cdiv(D, td) * cdiv(K, tk);
         if (sT == 8 || n > kThreads || (td * tk == 80 && best < 1e300))
             continue;
