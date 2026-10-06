@@ -9,102 +9,86 @@
 #include <stdexcept>
 #include <vector>
 
-#include "../../cublas_helpers.cuh"
 #include "../../nb_types.h"
 
-#include "../normalize/kernels_normalize.cuh"
 #include "../scatter/kernels_scatter.cuh"
 #include "../scatter/kernels_scatter_reduce.cuh"
-#include "../cutile/cutile_runtime.cuh"
+#include "../segment_gemm.cuh"
 #include "kernels_clustering.cuh"
 
 using namespace nb::literals;
 
-constexpr unsigned WARP_SIZE = 32;
-constexpr unsigned MAX_BLOCK_DIM = 256;
 constexpr int BLOCK_DIM_1D = 256;
-constexpr int MAX_BLOCK_DIM_1D = 1024;
-constexpr int BLOCKS_PER_SM = 8;
 
-// ---------- Launch helpers ----------
-
-// 1D grid size capped at BLOCKS_PER_SM blocks/SM
-static inline int grid_1d(long long n, int n_sm) {
-    long long blocks = (n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
-    return std::max(1, std::min(n_sm * BLOCKS_PER_SM,
-                                (int)std::min<long long>(blocks, INT_MAX)));
-}
-
-// Block dim rounded up to nearest warp, capped at MAX_BLOCK_DIM
-static inline unsigned warp_aligned_bdim(unsigned n) {
-    return std::min(
-        MAX_BLOCK_DIM,
-        std::max(WARP_SIZE, (n + WARP_SIZE - 1u) / WARP_SIZE * WARP_SIZE));
-}
-
-// ---------- CUB temp-storage query ----------
-
-static size_t get_cub_sort_temp_bytes(int n_cells) {
-    size_t bytes = 0;
-    auto* du = reinterpret_cast<unsigned int*>(1);
-    auto* di = reinterpret_cast<int*>(1);
-    cudaError_t status = cub::DeviceRadixSort::SortPairs(
-        nullptr, bytes, du, du, di, di, n_cells, 0, 32);
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string("cub sort temp query failed: ") +
-                                 cudaGetErrorString(status));
-    }
-    return bytes;
+static int device_attribute(cudaDeviceAttr attribute) {
+    int device, value;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&value, attribute, device);
+    return value;
 }
 
 template <typename T>
-static inline void materialize_marginal_from_joint(
-    const T* O_joint, const int* marginal_joint_offsets,
-    const int* marginal_joint_indices, T* O, int n_batches, int n_clusters,
-    int n_sm, cudaStream_t stream) {
-    long long total = (long long)n_batches * n_clusters;
-    materialize_marginal_from_joint_kernel<T>
-        <<<grid_1d(total, n_sm), BLOCK_DIM_1D, 0, stream>>>(
-            O_joint, marginal_joint_offsets, marginal_joint_indices, O,
-            n_batches, n_clusters);
-    CUDA_CHECK_LAST_ERROR(materialize_marginal_from_joint_kernel);
+static void l2_row_normalize(const T* src, T* dst, int n_rows, int n_cols,
+                             cudaStream_t stream) {
+    int threads = std::clamp((n_cols + 31) / 32 * 32, 32, 256);
+    l2_row_normalize_kernel<T>
+        <<<n_rows, threads, 0, stream>>>(src, dst, n_cols);
+    CUDA_CHECK_LAST_ERROR(l2_row_normalize_kernel);
 }
 
 // ---------- Update blocks ----------
 
-// The update blocks of a harmonize call: cells shuffled in runs of `chunk`,
-// cut into blocks of `block_size`, each block's cells ordered by group
-// (stable). idx_list holds the cells in that order, block_cat_offsets the CSR
-// over keys block * n_groups + group.
-static void draw_blocks(const int* group_codes, int n_cells, int n_groups,
-                        int block_size, int n_blocks, unsigned int seed,
+// The update blocks of a harmonize call. The cells (sorted by group) are cut
+// into runs of `chunk` cells and units of `unit` cells; within each unit the
+// runs are ranked by a hash of their global index and dealt to the blocks in
+// turn. Every block takes the same share of every unit, and a cell's block
+// depends only on its global position (`first` + local index; `first` a
+// multiple of `unit`), not on how the cells are split across GPUs. idx_list
+// holds the cells by block, then group, in position order; block_cat_offsets
+// the CSR over keys block * n_groups + group.
+static void draw_blocks(const int* group_codes, int n_cells, long long first,
+                        int n_groups, int n_blocks, int unit, unsigned int seed,
                         int chunk, int* idx_list, int* block_cat_offsets,
                         int* idx_list_alt, unsigned int* keys,
                         unsigned int* keys_alt, uint8_t* cub_temp,
                         size_t cub_bytes, cudaStream_t stream) {
-    int device, n_sm;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device);
-    if (n_blocks < 1) n_blocks = (n_cells + block_size - 1) / block_size;
+    if (unit % chunk || first % unit)
+        throw std::invalid_argument(
+            "draw_blocks: unit must divide the shard "
+            "start and be a multiple of chunk");
+    int n_runs = (n_cells + chunk - 1) / chunk, unit_runs = unit / chunk;
+    int n_units = (n_runs + unit_runs - 1) / unit_runs;
     int n_keys = n_blocks * n_groups;
-    pcg_hash_kernel<<<grid_1d(n_cells, n_sm), BLOCK_DIM_1D, 0, stream>>>(
-        keys, idx_list, n_cells, seed, std::max(1, chunk));
+    auto sort = [&](unsigned int* k_in, unsigned int* k_out, int* v_in,
+                    int* v_out, int n, int bits) {
+        cuda_check(
+            cub::DeviceRadixSort::SortPairs(cub_temp, cub_bytes, k_in, k_out,
+                                            v_in, v_out, n, 0, bits, stream),
+            "cub radix sort");
+    };
+    int run_grid = strided_grid(n_runs, BLOCK_DIM_1D);
+    // Runs by (unit, hash): two stable sorts.
+    pcg_hash_kernel<<<run_grid, BLOCK_DIM_1D, 0, stream>>>(
+        keys, idx_list, n_runs, (unsigned int)(first / chunk), seed);
     CUDA_CHECK_LAST_ERROR(pcg_hash_kernel);
-    cuda_check(cub::DeviceRadixSort::SortPairs(cub_temp, cub_bytes, keys,
-                                               keys_alt, idx_list, idx_list_alt,
-                                               n_cells, 0, 32, stream),
-               "cub radix sort");
-    block_category_keys_kernel<<<grid_1d(n_cells, n_sm), BLOCK_DIM_1D, 0,
-                                 stream>>>(idx_list_alt, group_codes, keys,
-                                           n_cells, block_size, n_groups);
+    sort(keys, keys_alt, idx_list, idx_list_alt, n_runs, 32);
+    run_unit_kernel<<<run_grid, BLOCK_DIM_1D, 0, stream>>>(idx_list_alt, keys,
+                                                           n_runs, unit_runs);
+    CUDA_CHECK_LAST_ERROR(run_unit_kernel);
+    sort(keys, keys_alt, idx_list_alt, idx_list, n_runs,
+         scatter_category_bits(n_units));
+    deal_runs_kernel<<<run_grid, BLOCK_DIM_1D, 0, stream>>>(
+        idx_list, keys, n_runs, unit_runs, n_blocks);
+    CUDA_CHECK_LAST_ERROR(deal_runs_kernel);
+    // Cells by (block, group), stable, so each run stays in position order.
+    block_category_keys_kernel<<<strided_grid(n_cells, BLOCK_DIM_1D),
+                                 BLOCK_DIM_1D, 0, stream>>>(
+        keys, group_codes, keys_alt, idx_list_alt, n_cells, chunk, n_groups);
     CUDA_CHECK_LAST_ERROR(block_category_keys_kernel);
-    cuda_check(cub::DeviceRadixSort::SortPairs(
-                   cub_temp, cub_bytes, keys, keys_alt, idx_list_alt, idx_list,
-                   n_cells, 0, scatter_category_bits(n_keys), stream),
-               "cub block-category sort");
+    sort(keys_alt, keys, idx_list_alt, idx_list, n_cells,
+         scatter_category_bits(n_keys));
     scatter_category_offsets_kernel<<<(n_keys + 127) / 128, 128, 0, stream>>>(
-        reinterpret_cast<const int*>(keys_alt), n_cells, n_keys,
-        block_cat_offsets);
+        reinterpret_cast<const int*>(keys), n_cells, n_keys, block_cat_offsets);
     CUDA_CHECK_LAST_ERROR(scatter_category_offsets_kernel);
 }
 
@@ -117,94 +101,87 @@ struct ClusteringArgs {
     const T* Z_norm;
     T* R;
     __nv_bfloat16* R_bf16;  // bfloat16 assignments instead of R
-    T* E;
-    T* O;
-    const T* Pr_b;
-    const int* cats;
-    const T* theta;
-    const int* joint_codes;  // several keys: joint category per cell
-    const int* joint_cats;   // several keys: J x n_covariates levels
-    const int* marginal_joint_offsets;
-    const int* marginal_joint_indices;
+    T *E, *O;
+    const T *Pr_b, *theta;
+    const int* joint_cats;  // several keys: J x n_covariates levels
+    const int *marginal_joint_offsets, *marginal_joint_indices;
     T* O_joint;        // several keys: counts per joint category
     T* group_penalty;  // several keys: J x K log penalties
 
     // Workspace
-    T* Y;
-    T* Y_norm;
+    T* Y_norm;  // centroids, normalized in place
     int* idx_list;
     T* penalty;
-    T* obj_scalar;
-    T* last_obj;
-    uint8_t* scatter_workspace;
-    T* objective_partials;
+    T* objective_partials;   // n_cells, then objective scratch
     int* block_cat_offsets;  // n_blocks x groups + 1, then one block's tiles
-    T* block_counts;         // blocks x groups x K: each block's counts in O
-    T* assign_partial;       // assignment tile column sums
-    size_t assign_partial_size;
-    float* tile_partials;  // bfloat16: cuTile R^T Z partials
-    T* y_t_general;        // general assignment: transposed centroids
-    T* col_workspace;      // general assignment: per-warp column sums
-    bool force_general;    // tests: general assignment for every shape
+    // (n_blocks + 3) x groups x K fixed-point counts: each block's, O's, and
+    // two slots of new block counts.
+    long long* block_counts;
+    const int* seg_start;  // centroid segments (see segment_gemm.cuh)
+    int n_seg;
+    double* y_scale;           // centroid fixed-point scale (1)
+    long long* y_acc;          // centroid sums: limbs x K x D
+    T* y_t_general;            // general assignment: transposed centroids
+    long long* col_workspace;  // general assignment: per-warp column sums
+    bool force_general;        // tests: general assignment for every shape
 
-    // Dimensions
     int n_cells;
-    int n_pcs;
-    int n_clusters;
-    int n_batches;
-    int n_covariates;
-    int n_joint_categories;
+    long long n_total;  // cells over all GPUs (fixed-point bounds)
+    int n_pcs, n_clusters, n_batches, n_covariates, n_joint_categories;
     int n_first;  // levels of the first batch key
-    int block_size;
-    T sigma;
-    T tol;
+    int n_blocks;
+    T sigma, tol;
     int max_iter;
     unsigned int seed;
     bool stabilized;
-    int shuffle_chunk;  // cells per shuffled run
     cudaStream_t stream;
-    cublasHandle_t handle;
-    bool count_blocks;  // first call: fill block_counts from R
+    bool initialize;  // unpenalized assignment from Y_norm instead of the loop
 };
 
 // ---------- Clustering loop ----------
 
-// Same iteration as the general loop, without the N x K similarity matrix,
-// block gathers or column sums: each block is held out of O and added back by
-// the deterministic tiled scatter reading R in place, and one warp per cell
-// computes similarities, assignments and the objective terms.
+// Fixed-point scales (see to_fixed) from global bounds: R values <= 1, so a
+// count is at most n_total; a cell's objective term is at most
+// 4 + sigma log K in magnitude.
 template <typename T>
-static void penalty_from_counts(const T* O, const T* Pr_b, const T* theta, T* E,
-                                T* penalty, int n_batches, int n_clusters,
-                                bool stabilized, cudaStream_t stream,
-                                int n_first = 0) {
-    if (n_first < 1) n_first = n_batches;
-    if (stabilized)
-        penalty_from_counts_kernel<T, true><<<n_clusters, 256, 0, stream>>>(
-            O, Pr_b, theta, E, penalty, n_batches, n_clusters, n_first);
-    else
-        penalty_from_counts_kernel<T, false><<<n_clusters, 256, 0, stream>>>(
-            O, Pr_b, theta, E, penalty, n_batches, n_clusters, n_first);
-    CUDA_CHECK_LAST_ERROR(penalty_from_counts_kernel);
-}
+struct FixedScales {
+    T count, objective;
+    double count_inv, objective_inv;
+    FixedScales(long long n_total, double sigma, int n_clusters) {
+        int c = std::min(fixed_shift((double)n_total + 1),
+                         sizeof(T) == 4 ? 31 : 62);
+        int o = fixed_shift(
+            (double)n_total *
+            (5.0 + std::abs(sigma) * std::log(std::max(n_clusters, 2))));
+        count = (T)std::ldexp(1.0, c), count_inv = std::ldexp(1.0, -c);
+        objective = (T)std::ldexp(1.0, o), objective_inv = std::ldexp(1.0, -o);
+    }
+};
 
-// One assignment pass over the cells `idx[offsets[0] .. offsets[n_batches])`
-// (identity when idx is null) grouped by category: writes R and the per-cell
-// objective terms and adds the new counts to O. Tiles are sized so at most
-// `capacity` (+ one partial tile per category) fit `assign_partial`.
-template <typename T, typename RT = T>
-static void fused_assign_pass(
-    const T* Z_norm, const T* Y_norm, const T* penalty, const int* idx,
-    const int* offsets, int n_rows, int n_batches, int* tiles,
-    T* assign_partial, long long capacity, RT* R, T* objective_partials, T* O,
-    T term, T sigma, int n_pcs, int n_clusters, cudaStream_t stream,
-    bool log_pen = false, T* y_t_general = nullptr, T* col_workspace = nullptr,
-    bool force_general = false) {
+// One assignment pass over the cells `idx_list[offsets[0] ..
+// offsets[n_groups])` grouped by category: writes R and the per-cell objective
+// terms, and adds the exact (fixed-point) counts per category to `counts`.
+// Tiles: about ASSIGN_TILES_PER_SM per SM (more when fused tiles reach their
+// 384-row cap), plus one partial tile per category.
+constexpr int ASSIGN_TILES_PER_SM = 4;
+
+template <typename T, typename RT>
+static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
+                              const T* penalty, bool log_pen,
+                              const int* offsets, int n_rows, int n_groups,
+                              int* tiles, int n_sm, long long* counts,
+                              T count_scale) {
+    int n_pcs = a.n_pcs, n_clusters = a.n_clusters;
+    cudaStream_t stream = a.stream;
     size_t smem = fused_assign_smem_bytes<T>(n_pcs, n_clusters);
-    // Shapes beyond the fused kernel (more than 128 clusters, or centroids
-    // beyond shared memory) take the general kernel.
-    bool general = force_general || !fused_assign_fits(n_pcs, n_clusters, smem);
-    if (general && (!y_t_general || !col_workspace))
+    // The fused kernel holds at most 128 clusters, prefetches at most 128 PCs
+    // and keeps its centroids in shared memory; other shapes take the general
+    // kernel.
+    bool general =
+        a.force_general || n_clusters > FUSED_CLUSTER_STRIDE || n_pcs > 128 ||
+        smem >
+            (size_t)device_attribute(cudaDevAttrMaxSharedMemoryPerBlockOptin);
+    if (general && (!a.y_t_general || !a.col_workspace))
         throw std::invalid_argument(
             "this shape needs the general assignment workspace");
     int z_slots = (fused_padded_pcs(n_pcs) + 31) / 32;
@@ -222,229 +199,229 @@ static void fused_assign_pass(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem),
             "fused assign shared memory");
     long long rows_per_warp = FUSED_ROWS * (FUSED_THREADS / 32);
+    long long capacity = (long long)ASSIGN_TILES_PER_SM * n_sm;
     long long tile_rows = (n_rows + capacity - 1) / capacity;
     tile_rows = std::max(rows_per_warp, (tile_rows + rows_per_warp - 1) /
                                             rows_per_warp * rows_per_warp);
+    if (!general) tile_rows = std::min(tile_rows, 384LL);
     scatter_tile_offsets_kernel<<<1, SCATTER_SCAN_THREADS, 0, stream>>>(
-        offsets, n_batches, tiles, (int)tile_rows);
+        offsets, n_groups, tiles, (int)tile_rows);
     CUDA_CHECK_LAST_ERROR(scatter_tile_offsets_kernel);
     size_t max_tiles = std::min<size_t>(
-        n_rows, (n_rows + tile_rows - 1) / tile_rows + n_batches);
+        n_rows, (n_rows + tile_rows - 1) / tile_rows + n_groups);
+    T term = T(-2) / a.sigma;
+    auto* ucounts = reinterpret_cast<unsigned long long*>(counts);
     if (general) {
         int pcs = fused_padded_pcs(n_pcs);
-        int k_stride = fused_cluster_stride(n_clusters);
+        int k_stride = (n_clusters + FUSED_CLUSTER_STRIDE - 1) /
+                       FUSED_CLUSTER_STRIDE * FUSED_CLUSTER_STRIDE;
         transpose_centroids_kernel<T>
             <<<(pcs * k_stride + 255) / 256, 256, 0, stream>>>(
-                Y_norm, y_t_general, n_pcs, pcs, n_clusters, k_stride);
+                a.Y_norm, a.y_t_general, n_pcs, pcs, n_clusters, k_stride);
         CUDA_CHECK_LAST_ERROR(transpose_centroids_kernel);
         auto general_kernel = log_pen
                                   ? fused_assign_general_kernel<T, RT, true>
                                   : fused_assign_general_kernel<T, RT, false>;
         general_kernel<<<max_tiles, FUSED_THREADS, 0, stream>>>(
-            Z_norm, y_t_general, k_stride, penalty, idx, offsets, tiles,
-            n_batches, (int)tile_rows, R, objective_partials, assign_partial,
-            col_workspace, term, sigma, n_pcs, n_clusters);
+            a.Z_norm, a.y_t_general, k_stride, penalty, a.idx_list, offsets,
+            tiles, n_groups, (int)tile_rows, R, a.objective_partials, ucounts,
+            a.col_workspace, term, a.sigma, count_scale, n_pcs, n_clusters);
     } else {
         kernel<<<max_tiles, FUSED_THREADS, smem, stream>>>(
-            Z_norm, Y_norm, penalty, idx, offsets, tiles, n_batches,
-            (int)tile_rows, R, objective_partials, assign_partial, term, sigma,
-            n_pcs, n_clusters);
+            a.Z_norm, a.Y_norm, penalty, a.idx_list, offsets, tiles, n_groups,
+            (int)tile_rows, R, a.objective_partials, ucounts, term, a.sigma,
+            count_scale, n_pcs, n_clusters);
     }
     CUDA_CHECK_LAST_ERROR(fused_assign_kernel);
-    scatter_finish_kernel<T>
-        <<<std::min((size_t)n_batches, max_tiles) * ((n_clusters + 31) / 32),
-           dim3(32, 8), 0, stream>>>(assign_partial, n_clusters, n_batches,
-                                     tiles, 1, O);
-    CUDA_CHECK_LAST_ERROR(scatter_finish_kernel);
 }
 
-// Objective from the per-cell terms of the last pass plus the diversity term.
+// Objective: exact fixed-point sum of the per-cell terms of the last pass,
+// plus the diversity term. Scratch: the 8 values after the per-cell terms.
 template <typename T>
-static T fused_objective(const T* objective_partials, long long n_cells,
-                         T* stage, const T* O, const T* E, const T* theta,
-                         T sigma, int n_batches, int n_clusters,
-                         bool stabilized, T* obj_scalar, cudaStream_t stream) {
-    objective_stage_kernel<T><<<OBJECTIVE_REDUCE_BLOCKS, 256, 0, stream>>>(
-        objective_partials, n_cells, stage);
-    CUDA_CHECK_LAST_ERROR(objective_stage_kernel);
+static double fused_objective(const ClusteringArgs<T>& a,
+                              const FixedScales<T>& scales) {
+    cudaStream_t stream = a.stream;
+    auto* acc = reinterpret_cast<unsigned long long*>(
+        (reinterpret_cast<uintptr_t>(a.objective_partials + a.n_cells) + 15) &
+        ~uintptr_t(15));
+    T* diversity = reinterpret_cast<T*>(acc + 1);
+    cudaMemsetAsync(acc, 0, sizeof(*acc), stream);
+    if (a.n_cells > 0)
+        objective_fixed_kernel<T>
+            <<<std::min((a.n_cells + 255) / 256, 4096), 256, 0, stream>>>(
+                a.objective_partials, a.n_cells, scales.objective, acc);
+    CUDA_CHECK_LAST_ERROR(objective_fixed_kernel);
     objective_diversity_kernel<T>
-        <<<1, 256, 0, stream>>>(O, E, theta, sigma, n_batches, n_clusters,
-                                stabilized, stage + OBJECTIVE_REDUCE_BLOCKS);
+        <<<1, 256, 0, stream>>>(a.O, a.E, a.theta, a.sigma, a.n_batches,
+                                a.n_clusters, a.stabilized, diversity);
     CUDA_CHECK_LAST_ERROR(objective_diversity_kernel);
-    objective_reduce_kernel<T>
-        <<<1, 256, 0, stream>>>(stage, OBJECTIVE_REDUCE_BLOCKS + 1, obj_scalar);
-    CUDA_CHECK_LAST_ERROR(objective_reduce_kernel);
-    T host_obj;
-    cuda_check(cudaMemcpyAsync(&host_obj, obj_scalar, sizeof(T),
-                               cudaMemcpyDeviceToHost, stream),
+    struct {
+        long long acc;
+        T diversity;
+    } host;
+    cuda_check(cudaMemcpyAsync(&host, acc, sizeof(host), cudaMemcpyDeviceToHost,
+                               stream),
                "objective copy");
     cuda_check(cudaStreamSynchronize(stream), "objective synchronization");
-    return host_obj;
+    return (double)host.acc * scales.objective_inv + (double)host.diversity;
 }
 
+// Returns the last objective (0 without one).
 template <typename T, typename RT>
-static void fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
-    if (!a.block_cat_offsets)
-        throw std::invalid_argument(
-            "fused clustering requires block_cat_offsets");
-
-    cublasHandle_t handle = a.handle;
-    cublas_check_status(cublasSetStream(handle, a.stream), "cublasSetStream");
-    T term = T(-2) / a.sigma;
-    T one = T(1), zero = T(0);
-    int device;
-    cudaGetDevice(&device);
-    int n_sm;
-    cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device);
+static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
+    int n_sm = device_attribute(cudaDevAttrMultiProcessorCount);
     // Cells are grouped by batch (one key) or joint category (several keys).
     // Several keys keep counts per joint category and rebuild the marginal O.
     bool multi = a.n_covariates > 1;
-    if (multi && (!a.joint_codes || !a.joint_cats || !a.O_joint ||
-                  !a.marginal_joint_offsets || !a.marginal_joint_indices ||
-                  !a.group_penalty))
+    if (multi && (!a.joint_cats || !a.O_joint || !a.marginal_joint_offsets ||
+                  !a.marginal_joint_indices || !a.group_penalty))
         throw std::invalid_argument(
             "fused clustering with several keys needs the joint arrays");
     int n_groups = multi ? a.n_joint_categories : a.n_batches;
-    const int* group_codes = multi ? a.joint_codes : a.cats;
     T* O_group = multi ? a.O_joint : a.O;
     const T* group_penalty = multi ? a.group_penalty : a.penalty;
-    int n_blocks = (a.n_cells + a.block_size - 1) / a.block_size;
-    int n_keys = n_blocks * n_groups;
-    int* tiles = reinterpret_cast<int*>(a.scatter_workspace);
-    T* partial = reinterpret_cast<T*>(a.scatter_workspace +
-                                      scatter_grouped_int_bytes(n_groups));
+    int n_blocks = a.n_blocks;
     // Assignment tiles are sized to the block so small blocks still fill the
     // GPU; their tile offsets follow the block's category offsets.
-    int* assign_tiles = a.block_cat_offsets + (size_t)n_keys + 1;
-    long long assign_capacity =
-        (long long)(a.assign_partial_size / a.n_clusters) - n_groups - 1;
-    if (!a.assign_partial || assign_capacity < 1)
-        throw std::invalid_argument(
-            "fused clustering assign_partial is too small");
+    int* assign_tiles = a.block_cat_offsets + (size_t)n_blocks * n_groups + 1;
 
-    if (!a.block_counts)
-        throw std::invalid_argument("fused clustering needs block_counts");
+    // Counts are exact fixed-point sums (see to_fixed): each block's, and O
+    // over all cells, which changes by a block's new minus stored counts.
+    FixedScales<T> scales(a.n_total, a.sigma, a.n_clusters);
+    std::vector<double> objectives;
+    // Centroid sums: 2 (float32) or 3 limbs of 30 bits; |Z_norm|, R <= 1.
+    int y_limbs = sizeof(T) == 4 ? 2 : 3;
+    size_t kd = (size_t)a.n_clusters * a.n_pcs;
+    double y_scale =
+        harmony_segments::scale_for_bound((double)a.n_total, y_limbs);
+    cudaMemcpyAsync(a.y_scale, &y_scale, sizeof(double), cudaMemcpyHostToDevice,
+                    a.stream);
     int ob_total = n_groups * a.n_clusters;
-    auto marginal_counts = [&]() {
-        if (multi)
-            materialize_marginal_from_joint<T>(
-                a.O_joint, a.marginal_joint_offsets, a.marginal_joint_indices,
-                a.O, a.n_batches, a.n_clusters, n_sm, a.stream);
+    int blocks_1d = (ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
+    auto stored = [&](int blk) {
+        return a.block_counts + (size_t)blk * ob_total;
     };
-    auto block_rows = [&](int blk) {
-        return std::max(0,
-                        std::min(a.block_size, a.n_cells - blk * a.block_size));
+    long long* total = stored(n_blocks);
+    auto slot = [&](int step) { return stored(n_blocks + 1 + (step & 1)); };
+    // O = total after folding in `fold`'s new counts, minus block `hold`'s;
+    // zeroes `clear`.
+    auto update_counts = [&](int fold, const long long* fresh, int hold,
+                             long long* clear) {
+        update_counts_kernel<T><<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
+            total, fresh ? stored(fold) : nullptr, fresh,
+            hold < 0 ? nullptr : stored(hold), clear, scales.count_inv, O_group,
+            ob_total);
+        CUDA_CHECK_LAST_ERROR(update_counts_kernel);
+        if (!multi) return;
+        materialize_marginal_from_joint_kernel<T>
+            <<<strided_grid((long long)a.n_batches * a.n_clusters,
+                            BLOCK_DIM_1D),
+               BLOCK_DIM_1D, 0, a.stream>>>(a.O_joint, a.marginal_joint_offsets,
+                                            a.marginal_joint_indices, a.O,
+                                            a.n_batches, a.n_clusters);
+        CUDA_CHECK_LAST_ERROR(materialize_marginal_from_joint_kernel);
     };
-    if (a.count_blocks) {
-        // The blocks (drawn once per harmonize call, see draw_blocks) keep
-        // their counts, so later passes hold a block out without re-reading
-        // R.
+    // E (and the penalty unless null) from the full O.
+    auto penalty_from_counts = [&](T* penalty) {
+        penalty_from_counts_kernel<T><<<a.n_clusters, 256, 0, a.stream>>>(
+            a.O, a.Pr_b, a.theta, a.E, penalty, a.n_batches, a.n_clusters,
+            a.n_first, a.stabilized);
+        CUDA_CHECK_LAST_ERROR(penalty_from_counts_kernel);
+    };
+    // Block b's cells are idx_list[starts[b] .. starts[b + 1]).
+    std::vector<int> starts(n_blocks + 1);
+    cuda_check(
+        cudaMemcpy2DAsync(starts.data(), sizeof(int), a.block_cat_offsets,
+                          n_groups * sizeof(int), sizeof(int), n_blocks + 1,
+                          cudaMemcpyDeviceToHost, a.stream),
+        "block starts copy");
+    cuda_check(cudaStreamSynchronize(a.stream), "block starts copy");
+    auto assign = [&](int blk, const T* penalty, bool log_pen,
+                      long long* counts) {
+        if (starts[blk + 1] == starts[blk]) return;
+        fused_assign_pass(a, R, penalty, log_pen,
+                          a.block_cat_offsets + (size_t)blk * n_groups,
+                          starts[blk + 1] - starts[blk], n_groups, assign_tiles,
+                          n_sm, counts, scales.count);
+    };
+    // E from the full O, then the objective.
+    auto objective = [&](bool evaluate) {
+        penalty_from_counts(nullptr);
+        if (evaluate) objectives.push_back(fused_objective(a, scales));
+    };
+    if (a.initialize) {
+        // Unpenalized assignment of every block from the k-means centroids.
         cudaMemsetAsync(a.block_counts, 0,
-                        (size_t)n_blocks * ob_total * sizeof(T), a.stream);
-        for (int blk = 0; blk < n_blocks; ++blk) {
-            const int* offsets = a.block_cat_offsets + (size_t)blk * n_groups;
-            scatter_tile_offsets_kernel<<<1, SCATTER_SCAN_THREADS, 0,
-                                          a.stream>>>(offsets, n_groups, tiles);
-            CUDA_CHECK_LAST_ERROR(scatter_tile_offsets_kernel);
-            if (block_rows(blk) > 0)
-                scatter_reduce_tiles<T>(
-                    R, block_rows(blk), a.n_clusters, n_groups, a.idx_list,
-                    offsets, tiles, partial, 1,
-                    a.block_counts + (size_t)blk * ob_total, a.stream);
-        }
+                        (size_t)(n_blocks + 3) * ob_total * sizeof(long long),
+                        a.stream);
+        for (int blk = 0; blk < n_blocks; ++blk)
+            assign(blk, nullptr, false, stored(blk));
+        sum_blocks_kernel<<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
+            a.block_counts, n_blocks, total, ob_total);
+        CUDA_CHECK_LAST_ERROR(sum_blocks_kernel);
+        update_counts(-1, nullptr, -1, nullptr);
+        objective(true);
     }
-    std::vector<T> objectives;
     constexpr int WINDOW_SIZE = 3;
     for (int iter = 0; iter < a.max_iter; iter++) {
-        if constexpr (std::is_same_v<RT, __nv_bfloat16>)
-            cuda_check(harmony_cutile::rtz(R, a.Z_norm, a.n_cells, a.n_clusters,
-                                           a.n_pcs, a.tile_partials, a.Y,
-                                           a.n_pcs, a.stream),
-                       "cuTile centroids");
-        else
-            cublas_check_status(
-                cublas_gemm<T>(handle, CUBLAS_OP_N, CUBLAS_OP_T, a.n_pcs,
-                               a.n_clusters, a.n_cells, &one, a.Z_norm, a.n_pcs,
-                               R, a.n_clusters, &zero, a.Y, a.n_pcs),
-                "cublas_gemm(centroids)");
-        l2_row_normalize_kernel<T>
-            <<<a.n_clusters, warp_aligned_bdim(a.n_pcs), 0, a.stream>>>(
-                a.Y, a.Y_norm, a.n_clusters, a.n_pcs);
-        CUDA_CHECK_LAST_ERROR(l2_row_normalize_kernel);
+        // Centroids Y = Z_norm^T R, exact over the segments.
+        cudaMemsetAsync(a.y_acc, 0, y_limbs * kd * sizeof(long long), a.stream);
+        cuda_check(
+            harmony_segments::segment_rtz(
+                a.Z_norm, R, a.n_pcs, a.n_clusters, a.n_clusters, a.seg_start,
+                nullptr, a.n_seg, a.y_scale, a.y_acc, y_limbs, a.stream),
+            "centroids");
+        cuda_check(harmony_segments::finalize_rtz(
+                       a.y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_scale,
+                       a.Y_norm, 0, a.n_pcs, a.stream),
+                   "centroids");
+        l2_row_normalize(a.Y_norm, a.Y_norm, a.n_clusters, a.n_pcs, a.stream);
 
-        // Blocks in a rotated order; each is held out of O with its stored
-        // counts and added back with its new ones.
+        // Blocks in a rotated order, each assigned against O without its
+        // stored counts. A block's new counts enter O one block late (before
+        // the block after next), the same on any number of GPUs, where their
+        // exchange overlaps the next assignment.
         int shift = (int)((a.seed + (unsigned)iter) % (unsigned)n_blocks);
-        int blocks_1d = (ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
+        auto block = [&](int step) { return (step + shift) % n_blocks; };
         for (int step = 0; step < n_blocks; ++step) {
-            int blk = (step + shift) % n_blocks;
-            const int* offsets = a.block_cat_offsets + (size_t)blk * n_groups;
-            T* stored = a.block_counts + (size_t)blk * ob_total;
-            subtract_kernel<T><<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
-                O_group, stored, ob_total);
-            CUDA_CHECK_LAST_ERROR(subtract_kernel);
-            marginal_counts();
-            penalty_from_counts(a.O, a.Pr_b, a.theta, a.E, a.penalty,
-                                a.n_batches, a.n_clusters, a.stabilized,
-                                a.stream, a.n_first);
+            int fold = step - 2;
+            update_counts(fold < 0 ? -1 : block(fold),
+                          fold < 0 ? nullptr : slot(fold), block(step),
+                          slot(step));
+            penalty_from_counts(a.penalty);
             if (multi) {
                 joint_log_penalty_kernel<T>
-                    <<<grid_1d((long long)ob_total, n_sm), BLOCK_DIM_1D, 0,
+                    <<<strided_grid(ob_total, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
                        a.stream>>>(a.penalty, a.joint_cats, a.n_covariates,
                                    n_groups, a.n_clusters, a.group_penalty);
                 CUDA_CHECK_LAST_ERROR(joint_log_penalty_kernel);
             }
-            cudaMemsetAsync(stored, 0, ob_total * sizeof(T), a.stream);
-            if (block_rows(blk) > 0)
-                fused_assign_pass(
-                    a.Z_norm, a.Y_norm, group_penalty, a.idx_list, offsets,
-                    block_rows(blk), n_groups, assign_tiles, a.assign_partial,
-                    assign_capacity, R, a.objective_partials, stored, term,
-                    a.sigma, a.n_pcs, a.n_clusters, a.stream, multi,
-                    a.y_t_general, a.col_workspace, a.force_general);
-            add_kernel<T><<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
-                O_group, stored, ob_total);
-            CUDA_CHECK_LAST_ERROR(add_kernel);
+            assign(block(step), group_penalty, multi, slot(step));
         }
-        marginal_counts();
-        penalty_from_counts(a.O, a.Pr_b, a.theta, a.E, (T*)nullptr, a.n_batches,
-                            a.n_clusters, a.stabilized, a.stream, a.n_first);
+        for (int fold = std::max(0, n_blocks - 2); fold < n_blocks; ++fold)
+            update_counts(block(fold), slot(fold), -1, nullptr);
 
         // Objective: per-cell terms from the assignment pass plus diversity.
         // The first convergence decision needs WINDOW_SIZE + 1 objectives;
         // when the budget ends there anyway, only the last one is used.
-        if (a.max_iter > WINDOW_SIZE + 1 || iter + 1 == a.max_iter) {
-            objectives.push_back(
-                fused_objective(a.objective_partials, a.n_cells,
-                                a.objective_partials + a.n_cells, a.O, a.E,
-                                a.theta, a.sigma, a.n_batches, a.n_clusters,
-                                a.stabilized, a.obj_scalar, a.stream));
-
-            if (static_cast<int>(objectives.size()) >= WINDOW_SIZE + 1) {
-                T obj_old = T(0), obj_new = T(0);
-                for (int i = 0; i < WINDOW_SIZE; i++) {
-                    obj_old += objectives[objectives.size() - 2 - i];
-                    obj_new += objectives[objectives.size() - 1 - i];
-                }
-                if ((obj_old - obj_new) < a.tol * std::abs(obj_old)) break;
+        objective(a.max_iter > WINDOW_SIZE + 1 || iter + 1 == a.max_iter);
+        if (static_cast<int>(objectives.size()) >= WINDOW_SIZE + 1) {
+            double obj_old = 0, obj_new = 0;
+            for (int i = 0; i < WINDOW_SIZE; i++) {
+                obj_old += objectives[objectives.size() - 2 - i];
+                obj_new += objectives[objectives.size() - 1 - i];
             }
+            if ((obj_old - obj_new) < a.tol * std::abs(obj_old)) break;
         }
     }
-    T final_obj = objectives.empty() ? T(0) : objectives.back();
-    cudaMemcpyAsync(a.last_obj, &final_obj, sizeof(T), cudaMemcpyHostToDevice,
-                    a.stream);
-    cudaStreamSynchronize(a.stream);
+    return objectives.empty() ? 0.0 : (double)(T)objectives.back();
 }
 
 template <typename T>
-static void fused_clustering_loop_impl(const ClusteringArgs<T>& a) {
+static double fused_clustering_loop_impl(const ClusteringArgs<T>& a) {
     if (!a.R_bf16) return fused_clustering_loop_body(a, a.R);
-    if constexpr (std::is_same_v<T, float>) {
-        if (!a.tile_partials)
-            throw std::invalid_argument(
-                "bfloat16 assignments need tile_partials");
+    if constexpr (std::is_same_v<T, float>)
         return fused_clustering_loop_body(a, a.R_bf16);
-    }
     throw std::invalid_argument("bfloat16 assignments require float32");
 }
 
@@ -459,97 +436,98 @@ static void register_clustering_loop(nb::module_& m) {
         [](gpu_array_c<const T, Device> Z_norm, gpu_array_c<T, Device> R,
            gpu_array_c<T, Device> E, gpu_array_c<T, Device> O,
            gpu_array_c<const T, Device> Pr_b,
-           gpu_array_c<const int, Device> cats,
-           gpu_array_c<const T, Device> theta, gpu_array_c<T, Device> Y,
-           gpu_array_c<T, Device> Y_norm, gpu_array_c<int, Device> idx_list,
-           gpu_array_c<T, Device> penalty, gpu_array_c<T, Device> obj_scalar,
-           gpu_array_c<T, Device> last_obj,
-           gpu_array_c<uint8_t, Device> scatter_workspace,
+           gpu_array_c<const T, Device> theta, gpu_array_c<T, Device> Y_norm,
+           gpu_array_c<int, Device> idx_list, gpu_array_c<T, Device> penalty,
            gpu_array_c<T, Device> objective_partials,
            gpu_array_c<int, Device> block_cat_offsets,
-           gpu_array_c<T, Device> block_counts,
-           gpu_array_c<T, Device> assign_partial,
-           std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
-           Opt tile_partials, Ints joint_codes, Ints joint_cats,
+           gpu_array_c<long long, Device> block_counts,
+           gpu_array_c<const int, Device> seg_start,
+           gpu_array_c<double, Device> y_scale,
+           gpu_array_c<long long, Device> y_acc,
+           std::optional<gpu_array_c<uint16_t, Device>> R_bf16, Ints joint_cats,
            Ints marginal_joint_offsets, Ints marginal_joint_indices,
-           Opt O_joint, Opt group_penalty, Opt y_t_general, Opt col_workspace,
-           bool force_general, int n_cells, int n_pcs, int n_clusters,
-           int n_batches, int n_covariates, int n_joint_categories, int n_first,
-           int block_size, double sigma, double tol, int max_iter,
-           unsigned int seed, bool stabilized, int shuffle_chunk,
-           std::uintptr_t stream, std::uintptr_t handle, bool count_blocks) {
+           Opt O_joint, Opt group_penalty, Opt y_t_general,
+           std::optional<gpu_array_c<long long, Device>> col_workspace,
+           bool force_general, int n_cells, long long n_total, int n_pcs,
+           int n_clusters, int n_batches, int n_covariates,
+           int n_joint_categories, int n_first, int n_blocks, double sigma,
+           double tol, int max_iter, unsigned int seed, bool stabilized,
+           std::uintptr_t stream, bool initialize) {
+            int n_groups = n_covariates > 1 ? n_joint_categories : n_batches;
+            size_t max_tiles =
+                (size_t)ASSIGN_TILES_PER_SM *
+                    device_attribute(cudaDevAttrMultiProcessorCount) +
+                n_groups + 1;
+            if (block_counts.size() <
+                    (size_t)(n_blocks + 3) * n_groups * n_clusters ||
+                objective_partials.size() < (size_t)n_cells + 8 ||
+                y_acc.size() < (size_t)3 * n_clusters * n_pcs ||
+                (col_workspace &&
+                 col_workspace->size() <
+                     max_tiles * (FUSED_THREADS / 32) * n_clusters))
+                throw std::invalid_argument(
+                    "clustering workspace is too small");
             auto ptr = [](auto& a) { return a ? a->data() : nullptr; };
-            ClusteringArgs<T> a{
-                Z_norm.data(),
-                R.data(),
-                R_bf16 ? reinterpret_cast<__nv_bfloat16*>(R_bf16->data())
-                       : nullptr,
-                E.data(),
-                O.data(),
-                Pr_b.data(),
-                cats.data(),
-                theta.data(),
-                ptr(joint_codes),
-                ptr(joint_cats),
-                ptr(marginal_joint_offsets),
-                ptr(marginal_joint_indices),
-                ptr(O_joint),
-                ptr(group_penalty),
-                Y.data(),
-                Y_norm.data(),
-                idx_list.data(),
-                penalty.data(),
-                obj_scalar.data(),
-                last_obj.data(),
-                scatter_workspace.data(),
-                objective_partials.data(),
-                block_cat_offsets.data(),
-                block_counts.data(),
-                assign_partial.data(),
-                assign_partial.size(),
-                tile_partials ? reinterpret_cast<float*>(tile_partials->data())
-                              : nullptr,
-                ptr(y_t_general),
-                ptr(col_workspace),
-                force_general,
-                n_cells,
-                n_pcs,
-                n_clusters,
-                n_batches,
-                n_covariates,
-                n_joint_categories,
-                n_first,
-                block_size,
-                static_cast<T>(sigma),
-                static_cast<T>(tol),
-                max_iter,
-                seed,
-                stabilized,
-                std::max(1, shuffle_chunk),
-                (cudaStream_t)stream,
-                (cublasHandle_t)handle,
-                count_blocks,
-            };
-            fused_clustering_loop_impl(a);
+            auto* r_bf16 = reinterpret_cast<__nv_bfloat16*>(ptr(R_bf16));
+            ClusteringArgs<T> a{Z_norm.data(),
+                                R.data(),
+                                r_bf16,
+                                E.data(),
+                                O.data(),
+                                Pr_b.data(),
+                                theta.data(),
+                                ptr(joint_cats),
+                                ptr(marginal_joint_offsets),
+                                ptr(marginal_joint_indices),
+                                ptr(O_joint),
+                                ptr(group_penalty),
+                                Y_norm.data(),
+                                idx_list.data(),
+                                penalty.data(),
+                                objective_partials.data(),
+                                block_cat_offsets.data(),
+                                block_counts.data(),
+                                seg_start.data(),
+                                (int)seg_start.size() - 1,
+                                y_scale.data(),
+                                y_acc.data(),
+                                ptr(y_t_general),
+                                ptr(col_workspace),
+                                force_general,
+                                n_cells,
+                                n_total > 0 ? n_total : n_cells,
+                                n_pcs,
+                                n_clusters,
+                                n_batches,
+                                n_covariates,
+                                n_joint_categories,
+                                n_first > 0 ? n_first : n_batches,
+                                n_blocks,
+                                (T)sigma,
+                                (T)tol,
+                                max_iter,
+                                seed,
+                                stabilized,
+                                (cudaStream_t)stream,
+                                initialize};
+            return fused_clustering_loop_impl(a);
         },
-        "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "cats"_a,
-        "theta"_a, "Y"_a, "Y_norm"_a, "idx_list"_a, "penalty"_a, "obj_scalar"_a,
-        "last_obj"_a, "scatter_workspace"_a, "objective_partials"_a,
-        "block_cat_offsets"_a, "block_counts"_a, "assign_partial"_a,
-        "R_bf16"_a = nb::none(), "tile_partials"_a = nb::none(),
-        "joint_codes"_a = nb::none(), "joint_cats"_a = nb::none(),
+        "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "theta"_a,
+        "Y_norm"_a, "idx_list"_a, "penalty"_a, "objective_partials"_a,
+        "block_cat_offsets"_a, "block_counts"_a, "seg_start"_a, "y_scale"_a,
+        "y_acc"_a, "R_bf16"_a = nb::none(), "joint_cats"_a = nb::none(),
         "marginal_joint_offsets"_a = nb::none(),
         "marginal_joint_indices"_a = nb::none(), "O_joint"_a = nb::none(),
         "group_penalty"_a = nb::none(), "y_t_general"_a = nb::none(),
         "col_workspace"_a = nb::none(), "force_general"_a = false, "n_cells"_a,
-        "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "n_covariates"_a = 1,
-        "n_joint_categories"_a = 0, "n_first"_a = 0, "block_size"_a, "sigma"_a,
-        "tol"_a, "max_iter"_a, "seed"_a, "stabilized"_a, "shuffle_chunk"_a = 1,
-        "stream"_a = 0, "handle"_a, "count_blocks"_a = true);
+        "n_total"_a = 0, "n_pcs"_a, "n_clusters"_a, "n_batches"_a,
+        "n_covariates"_a = 1, "n_joint_categories"_a = 0, "n_first"_a = 0,
+        "n_blocks"_a, "sigma"_a, "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0,
+        "stabilized"_a, "stream"_a = 0, "initialize"_a = false);
 }
 
 template <typename T, typename Device>
-static void register_kmeans_selection(nb::module_& m) {
+static void register_kmeans(nb::module_& m) {
     m.def(
         "select_kmeans_center",
         [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> weights,
@@ -558,8 +536,8 @@ static void register_kmeans_selection(nb::module_& m) {
            gpu_array_c<int, Device> n_draws, int cluster,
            std::uintptr_t stream) {
             int n_rows = (int)X.shape(0), n_cols = (int)X.shape(1);
-            int n_tiles = n_rows / KMEANS_WEIGHT_TILE_ROWS +
-                          (n_rows % KMEANS_WEIGHT_TILE_ROWS != 0);
+            int n_tiles = (n_rows + KMEANS_WEIGHT_TILE_ROWS - 1) /
+                          KMEANS_WEIGHT_TILE_ROWS;
             if (totals.size() < (size_t)n_tiles)
                 throw std::invalid_argument(
                     "k-means totals workspace is too small");
@@ -577,60 +555,23 @@ static void register_kmeans_selection(nb::module_& m) {
         },
         "X"_a, nb::kw_only(), "weights"_a, "uniforms"_a, "centers"_a,
         "totals"_a, "n_draws"_a, "cluster"_a, "stream"_a = 0);
-}
-
-template <typename T, typename Device>
-static void register_scatter(nb::module_& m) {
     m.def(
         "scatter_add",
         [](gpu_array_c<const T, Device> values,
            gpu_array_c<const int, Device> categories,
            gpu_array_c<T, Device> out, gpu_array_c<uint8_t, Device> workspace,
-           int n_rows, int n_cols, int n_categories, int n_covariates,
-           int switcher, std::uintptr_t stream,
-           std::optional<gpu_array_c<const int, Device>> category_offsets,
-           std::optional<gpu_array_c<const int, Device>> cell_indices) {
-            if (category_offsets.has_value() != cell_indices.has_value())
-                throw std::invalid_argument(
-                    "grouped scatter requires both category_offsets and "
-                    "cell_indices");
-            size_t required_bytes =
-                scatter_temp_bytes(n_rows, n_cols, n_categories, n_covariates,
-                                   sizeof(T), category_offsets.has_value());
-            if (workspace.size() < required_bytes)
+           std::uintptr_t stream) {
+            int n_rows = (int)values.shape(0), n_cols = (int)values.shape(1);
+            int n_categories = (int)out.shape(0);
+            if (workspace.size() <
+                scatter_temp_bytes(n_rows, n_cols, n_categories, sizeof(T)))
                 throw std::invalid_argument("scatter workspace is too small");
-            if (category_offsets) {
-                if (category_offsets->ndim() != 1 ||
-                    category_offsets->size() != (size_t)n_categories + 1 ||
-                    cell_indices->ndim() != 1 ||
-                    cell_indices->size() != (size_t)n_rows)
-                    throw std::invalid_argument(
-                        "grouped scatter CSR arrays have incorrect shapes");
-                int* tiles = reinterpret_cast<int*>(workspace.data());
-                T* partial = reinterpret_cast<T*>(
-                    workspace.data() + scatter_grouped_int_bytes(n_categories));
-                scatter_tile_offsets_kernel<<<1, SCATTER_SCAN_THREADS, 0,
-                                              (cudaStream_t)stream>>>(
-                    category_offsets->data(), n_categories, tiles);
-                CUDA_CHECK_LAST_ERROR(scatter_tile_offsets_kernel);
-                scatter_reduce_tiles(
-                    values.data(), n_rows, n_cols, n_categories,
-                    cell_indices->data(), category_offsets->data(), tiles,
-                    partial, switcher, out.data(), (cudaStream_t)stream);
-                return;
-            }
             scatter_reduce(values.data(), categories.data(), n_rows, n_cols,
-                           n_categories, n_covariates, switcher, out.data(),
-                           workspace.data(), (cudaStream_t)stream);
+                           n_categories, out.data(), workspace.data(),
+                           (cudaStream_t)stream);
         },
         "values"_a, nb::kw_only(), "categories"_a, "out"_a, "workspace"_a,
-        "n_rows"_a, "n_cols"_a, "n_categories"_a, "n_covariates"_a = 1,
-        "switcher"_a, "stream"_a = 0, "category_offsets"_a = nb::none(),
-        "cell_indices"_a = nb::none());
-}
-
-template <typename T, typename Device>
-static void register_kmeans_fused(nb::module_& m) {
+        "stream"_a = 0);
     m.def(
         "kmeans_assign",
         [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> centers,
@@ -638,29 +579,21 @@ static void register_kmeans_fused(nb::module_& m) {
            std::uintptr_t stream) {
             int n_rows = (int)X.shape(0), n_cols = (int)X.shape(1);
             int n_clusters = (int)centers.shape(0);
-            if (n_clusters > 32 * FUSED_MAX_CLUSTER_SLOTS)
+            if (n_clusters > FUSED_CLUSTER_STRIDE)
                 throw std::invalid_argument(
                     "kmeans_assign supports at most 128 clusters");
-            size_t smem =
-                ((size_t)fused_padded_pcs(n_cols) *
-                 (FUSED_CLUSTER_STRIDE + (FUSED_THREADS / 32) * FUSED_ROWS)) *
-                sizeof(T);
+            size_t smem = fused_assign_smem_bytes<T>(n_cols, 0);
             if (smem > 48 * 1024)
                 cuda_check(
                     cudaFuncSetAttribute(
                         kmeans_assign_kernel<T>,
                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem),
                     "kmeans assign shared memory");
-            int device, n_sm;
-            cudaGetDevice(&device);
-            cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount,
-                                   device);
-            long long groups =
-                ((long long)n_rows + FUSED_ROWS - 1) / FUSED_ROWS;
-            int grid = (int)std::max<long long>(
-                1, std::min<long long>(n_sm * 4,
-                                       (groups + FUSED_THREADS / 32 - 1) /
-                                           (FUSED_THREADS / 32)));
+            // FUSED_ROWS rows per warp, at most four CTAs per SM.
+            constexpr int rows = FUSED_ROWS * FUSED_THREADS / 32;
+            int grid = (int)std::clamp<long long>(
+                ((long long)n_rows + rows - 1) / rows, 1,
+                device_attribute(cudaDevAttrMultiProcessorCount) * 4);
             kmeans_assign_kernel<T>
                 <<<grid, FUSED_THREADS, smem, (cudaStream_t)stream>>>(
                     X.data(), centers.data(), labels.data(), minimum.data(),
@@ -681,93 +614,14 @@ static void register_kmeans_fused(nb::module_& m) {
             CUDA_CHECK_LAST_ERROR(kmeans_closest_kernel);
         },
         "X"_a, nb::kw_only(), "center"_a, "closest"_a, "stream"_a = 0);
-}
-
-template <typename T, typename Device>
-static void register_fused_initialize(nb::module_& m) {
     m.def(
-        "fused_initialize",
-        [](gpu_array_c<const T, Device> Z_norm,
-           gpu_array_c<const T, Device> Y_norm,
-           gpu_array_c<const int, Device> cat_offsets, gpu_array_c<T, Device> R,
-           gpu_array_c<T, Device> O, gpu_array_c<T, Device> E,
-           gpu_array_c<const T, Device> Pr_b,
-           gpu_array_c<const T, Device> theta, gpu_array_c<int, Device> tiles,
-           gpu_array_c<T, Device> assign_partial,
-           gpu_array_c<T, Device> objective_partials,
-           gpu_array_c<T, Device> obj_scalar, double sigma, bool stabilized,
-           std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
-           std::optional<gpu_array_c<T, Device>> O_joint,
-           std::optional<gpu_array_c<const int, Device>> marginal_joint_offsets,
-           std::optional<gpu_array_c<const int, Device>> marginal_joint_indices,
-           int n_first, std::optional<gpu_array_c<T, Device>> y_t_general,
-           std::optional<gpu_array_c<T, Device>> col_workspace,
-           bool force_general, std::uintptr_t stream) {
-            // Unpenalized soft assignment of every cell (cells sorted by
-            // category, so the batch offsets are the tile groups), O, E, and
-            // the initial objective. O must be zero on entry.
-            int n_cells = (int)Z_norm.shape(0), n_pcs = (int)Z_norm.shape(1);
-            int n_clusters = (int)Y_norm.shape(0);
-            // Groups are batches, or joint categories with O_joint (several
-            // keys).
-            int n_groups = (int)cat_offsets.size() - 1;
-            int n_batches = (int)O.shape(0);
-            if (O_joint && (!marginal_joint_offsets || !marginal_joint_indices))
-                throw std::invalid_argument(
-                    "fused_initialize with O_joint needs the marginal maps");
-
-            long long capacity =
-                (long long)(assign_partial.size() / n_clusters) - n_groups - 1;
-            if (capacity < 1 ||
-                objective_partials.size() <
-                    (size_t)n_cells + OBJECTIVE_REDUCE_BLOCKS + 1)
-                throw std::invalid_argument(
-                    "fused_initialize workspace too small");
-            auto s = (cudaStream_t)stream;
-            T term = T(-2) / T(sigma);
-            auto assign = [&](auto* R_out) {
-                fused_assign_pass<T>(
-                    Z_norm.data(), Y_norm.data(), nullptr, nullptr,
-                    cat_offsets.data(), n_cells, n_groups, tiles.data(),
-                    assign_partial.data(), capacity, R_out,
-                    objective_partials.data(),
-                    O_joint ? O_joint->data() : O.data(), term, T(sigma), n_pcs,
-                    n_clusters, s, false,
-                    y_t_general ? y_t_general->data() : nullptr,
-                    col_workspace ? col_workspace->data() : nullptr,
-                    force_general);
-            };
-            if (R_bf16)
-                assign(reinterpret_cast<__nv_bfloat16*>(R_bf16->data()));
-            else
-                assign(R.data());
-            if (O_joint) {
-                int device, n_sm;
-                cudaGetDevice(&device);
-                cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount,
-                                       device);
-                materialize_marginal_from_joint<T>(
-                    O_joint->data(), marginal_joint_offsets->data(),
-                    marginal_joint_indices->data(), O.data(), n_batches,
-                    n_clusters, n_sm, s);
-            }
-            penalty_from_counts<T>(O.data(), Pr_b.data(), theta.data(),
-                                   E.data(), nullptr, n_batches, n_clusters,
-                                   stabilized, s, n_first);
-            return (double)fused_objective<T>(
-                objective_partials.data(), n_cells,
-                objective_partials.data() + n_cells, O.data(), E.data(),
-                theta.data(), T(sigma), n_batches, n_clusters, stabilized,
-                obj_scalar.data(), s);
+        "l2_row_normalize",
+        [](gpu_array_c<const T, Device> src, gpu_array_c<T, Device> dst,
+           std::uintptr_t stream) {
+            l2_row_normalize(src.data(), dst.data(), (int)src.shape(0),
+                             (int)src.shape(1), (cudaStream_t)stream);
         },
-        "Z_norm"_a, nb::kw_only(), "Y_norm"_a, "cat_offsets"_a, "R"_a, "O"_a,
-        "E"_a, "Pr_b"_a, "theta"_a, "tiles"_a, "assign_partial"_a,
-        "objective_partials"_a, "obj_scalar"_a, "sigma"_a, "stabilized"_a,
-        "R_bf16"_a = nb::none(), "O_joint"_a = nb::none(),
-        "marginal_joint_offsets"_a = nb::none(),
-        "marginal_joint_indices"_a = nb::none(), "n_first"_a = 0,
-        "y_t_general"_a = nb::none(), "col_workspace"_a = nb::none(),
-        "force_general"_a = false, "stream"_a = 0);
+        "src"_a, nb::kw_only(), "dst"_a, "stream"_a = 0);
 }
 
 template <typename Device>
@@ -780,11 +634,11 @@ void register_bindings(nb::module_& m) {
            gpu_array_c<int, Device> idx_list_alt,
            gpu_array_c<unsigned int, Device> sort_keys,
            gpu_array_c<unsigned int, Device> sort_keys_alt,
-           gpu_array_c<uint8_t, Device> cub_temp, int n_groups, int block_size,
-           int n_blocks, unsigned int seed, int shuffle_chunk,
+           gpu_array_c<uint8_t, Device> cub_temp, int n_groups, int n_blocks,
+           int unit, unsigned int seed, int shuffle_chunk, long long first,
            std::uintptr_t stream) {
-            draw_blocks(group_codes.data(), (int)group_codes.size(), n_groups,
-                        block_size, n_blocks, seed, shuffle_chunk,
+            draw_blocks(group_codes.data(), (int)group_codes.size(), first,
+                        n_groups, n_blocks, unit, seed, shuffle_chunk,
                         idx_list.data(), block_cat_offsets.data(),
                         idx_list_alt.data(), sort_keys.data(),
                         sort_keys_alt.data(), cub_temp.data(), cub_temp.size(),
@@ -792,48 +646,26 @@ void register_bindings(nb::module_& m) {
         },
         "group_codes"_a, nb::kw_only(), "idx_list"_a, "block_cat_offsets"_a,
         "idx_list_alt"_a, "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a,
-        "n_groups"_a, "block_size"_a, "n_blocks"_a = 0, "seed"_a,
-        "shuffle_chunk"_a = 1, "stream"_a = 0);
-    m.def(
-        "cutile_bf16_available",
-        [](int n_pcs, int n_clusters) {
-            return harmony_cutile::available(n_pcs, n_clusters);
-        },
-        "n_pcs"_a, "n_clusters"_a,
-        "Whether bfloat16 assignments can run (CUDA 13 cuTile build, "
-        "supported GPU) for this embedding width and cluster count.");
-    m.def(
-        "cutile_partials_size",
-        [](int n_pcs) { return harmony_cutile::partials_size(n_pcs); },
-        "n_pcs"_a);
+        "n_groups"_a, "n_blocks"_a, "unit"_a, "seed"_a, "shuffle_chunk"_a = 1,
+        "first"_a = 0, "stream"_a = 0);
     m.def(
         "get_cub_sort_temp_bytes",
-        [](int n_cells) { return get_cub_sort_temp_bytes(n_cells); },
-        nb::kw_only(), "n_cells"_a);
+        [](int n_cells) { return sort_temp_bytes(n_cells, 32); }, nb::kw_only(),
+        "n_cells"_a);
     m.def(
         "get_scatter_temp_bytes",
-        [](int n_rows, int n_cols, int n_categories, int n_covariates,
-           int itemsize, bool grouped) {
-            return scatter_temp_bytes(n_rows, n_cols, n_categories,
-                                      n_covariates, itemsize, grouped);
+        [](int n_rows, int n_cols, int n_categories, int itemsize) {
+            return scatter_temp_bytes(n_rows, n_cols, n_categories, itemsize);
         },
         nb::kw_only(), "n_rows"_a, "n_cols"_a, "n_categories"_a,
-        "n_covariates"_a = 1, "itemsize"_a = 4, "grouped"_a = false);
-
+        "itemsize"_a = 4);
     register_clustering_loop<float, Device>(m);
     register_clustering_loop<double, Device>(m);
-    register_scatter<float, Device>(m);
-    register_scatter<double, Device>(m);
-    register_kmeans_selection<float, Device>(m);
-    register_kmeans_selection<double, Device>(m);
-    register_kmeans_fused<float, Device>(m);
-    register_kmeans_fused<double, Device>(m);
-    register_fused_initialize<float, Device>(m);
-    register_fused_initialize<double, Device>(m);
+    register_kmeans<float, Device>(m);
+    register_kmeans<double, Device>(m);
 }
 
 NB_MODULE(_harmony_clustering_cuda, m) {
     m.attr("KMEANS_WEIGHT_TILE_ROWS") = nb::int_(KMEANS_WEIGHT_TILE_ROWS);
-    m.attr("OBJECTIVE_REDUCE_BLOCKS") = nb::int_(OBJECTIVE_REDUCE_BLOCKS);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }
