@@ -47,6 +47,9 @@ def test_create_graph_upper_triangle(adata_neighbors, monkeypatch):
     assert _clustering._upper_suffices(conn)
     one_way = sparse.csr_matrix(np.array([[0, 0, 0], [1, 0, 1], [0, 1, 0]], float))
     assert not _clustering._upper_suffices(one_way)
+    skewed = conn.copy()
+    skewed.data[0] *= 2  # same structure, one weight differs from its mirror
+    assert not _clustering._upper_suffices(skewed)
     # duplicate entries are summed into one weight
     dup = sparse.csr_matrix(([2.0, 3.0, 5.0], [1, 1, 0], [0, 2, 3]), shape=(2, 2))
     assert _create_graph(dup).view_edge_list()["weight"].to_arrow().to_pylist() == [5]
