@@ -21,7 +21,7 @@ from rapids_singlecell._utils._random import (
     _seed_from_rng,
 )
 
-from ._utils import _choose_representation
+from ._utils import _choose_representation, _is_canonical_csr, _is_symmetric
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -42,15 +42,53 @@ def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
         raise ValueError("dtype must be one of ['float32', 'float64']")
 
 
+# cuDF columns hold at most this many rows
+_CUDF_MAX_ROWS = np.iinfo(np.int32).max
+
+
+def _upper_suffices(adjacency) -> bool:
+    """Whether cuGraph needs only the upper triangle of `adjacency`.
+
+    The graph is undirected, so cuGraph adds the reverse of every edge: for a symmetric
+    adjacency, the upper triangle gives the same graph (and clusters) in half the memory and time.
+    """
+    return (
+        not isinstance(adjacency.indptr, cp.ndarray)
+        and _is_canonical_csr(adjacency)
+        and _is_symmetric(adjacency)
+    )
+
+
+def _summed_csr(adjacency):
+    """`adjacency` as CSR with duplicate entries summed into one edge weight (input unchanged)."""
+    adjacency = adjacency.tocsr()
+    if not adjacency.has_canonical_format:
+        adjacency = adjacency.copy()
+        adjacency.sum_duplicates()
+    return adjacency
+
+
 def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
     from cugraph import Graph
 
-    sources, targets = adjacency.nonzero()
-    weights = adjacency[sources, targets]
-    vertices = list(range(adjacency.shape[0]))
-    if isinstance(weights, np.matrix):
-        weights = weights.A1
-    df = cudf.DataFrame({"source": sources, "destination": targets, "weights": weights})
+    adjacency = _summed_csr(adjacency)
+    xp = cp if isinstance(adjacency.indptr, cp.ndarray) else np
+    n = adjacency.shape[0]
+    sources = xp.repeat(xp.arange(n, dtype=np.int64), xp.diff(adjacency.indptr))
+    keep = adjacency.data != 0  # the stored non-zeros, like `adjacency.nonzero()`
+    # cuGraph's edge offsets exceed int32 for this many edges; int64 vertex ids switch them over
+    idx_dtype = np.int64 if int(keep.sum()) > _CUDF_MAX_ROWS else np.int32
+    if _upper_suffices(adjacency):
+        keep &= adjacency.indices >= sources
+    df = cudf.DataFrame(
+        {
+            "source": sources[keep].astype(idx_dtype),
+            "destination": adjacency.indices[keep].astype(idx_dtype),
+            "weights": adjacency.data[keep],
+        }
+    )
+    del sources, keep
+    vertices = cudf.Series(cp.arange(n, dtype=idx_dtype))
     df.weights = df.weights.astype(dtype)
     g = Graph()
     with warnings.catch_warnings():
@@ -73,41 +111,55 @@ def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
     return g
 
 
+def _edge_frame(arrays, dtype) -> cudf.DataFrame:
+    src, dst, weight = arrays
+    return cudf.DataFrame(
+        {
+            "src": src.astype(np.int64),
+            "dst": dst.astype(np.int64),
+            "weight": weight.astype(dtype),
+        }
+    )
+
+
 def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
-    import cudf
     import dask.dataframe as dd
     from cugraph import Graph
+    from distributed import default_client, wait
 
-    rows = np.repeat(np.arange(adjacency.shape[0]), np.diff(adjacency.indptr)).astype(
-        np.int32
+    client = default_client()
+    workers = list(client.nthreads())
+    adjacency = _summed_csr(adjacency)
+    rows = np.repeat(
+        np.arange(adjacency.shape[0], dtype=np.int32), np.diff(adjacency.indptr)
     )
-    cols = adjacency.indices
-    weights = adjacency.data
-
-    n_devices = cp.cuda.runtime.getDeviceCount()
-    chunksize = int((adjacency.nnz + n_devices - 1) / n_devices)
-
-    boundaries = list(range(0, adjacency.nnz, chunksize))
-    pairs = [(start, min(start + chunksize, adjacency.nnz)) for start in boundaries]
-
-    def mapper(pair):
-        start, end = pair
-        return cudf.DataFrame(
-            {
-                "src": rows[start:end].astype(np.int64),
-                "dst": cols[start:end].astype(np.int64),
-                "weight": weights[start:end].astype(dtype),
-            }
+    keep = adjacency.data != 0
+    if _upper_suffices(adjacency):
+        keep &= adjacency.indices >= rows
+    rows, cols, weights = rows[keep], adjacency.indices[keep], adjacency.data[keep]
+    del keep
+    # one partition per worker, sent straight to it (not through the scheduler)
+    bounds = np.linspace(0, len(rows), len(workers) + 1).astype(np.int64)
+    parts = []
+    for worker, start, stop in zip(workers, bounds[:-1], bounds[1:], strict=True):
+        [arrays] = client.scatter(
+            [(rows[start:stop], cols[start:stop], weights[start:stop])],
+            workers=[worker],
+            direct=True,
         )
-
-    # meta must match the actual columns
-    meta = {
-        "src": np.int64,
-        "dst": np.int64,
-        "weight": dtype,
-    }
-
-    ddf = dd.from_map(mapper, pairs, meta=meta).to_backend("cudf").persist()
+        parts.append(
+            client.submit(_edge_frame, arrays, dtype, workers=[worker], pure=False)
+        )
+    wait(parts)
+    del rows, cols, weights
+    meta = cudf.DataFrame(
+        {
+            "src": np.empty(0, np.int64),
+            "dst": np.empty(0, np.int64),
+            "weight": np.empty(0, dtype),
+        }
+    )
+    ddf = dd.from_delayed(parts, meta=meta, verify_meta=False)
     import cugraph.dask.comms.comms as Comms
 
     try:

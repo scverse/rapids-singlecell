@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import cupy as cp
+import numba as nb
+import numpy as np
 import scipy.sparse as cpu_sparse
 from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 
@@ -269,3 +271,33 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
             mask = cp.ones(X.shape[1], dtype=cp.bool_)
         mean = cp.nanmean(X[:, mask], axis=axis, dtype=cp.float64)
     return mean
+
+
+def _is_canonical_csr(graph) -> bool:
+    return (
+        cpu_sparse.issparse(graph)
+        and graph.format == "csr"
+        and graph.has_canonical_format
+    )
+
+
+def _is_symmetric(graph: cpu_sparse.csr_matrix) -> bool:
+    """Whether a canonical CSR graph equals its transpose."""
+    return graph.shape[0] == graph.shape[1] and not _count_unmirrored(
+        graph.indptr, graph.indices, graph.data
+    )
+
+
+@nb.njit(parallel=True, cache=True)
+def _count_unmirrored(indptr, indices, data):
+    """Rows holding an entry (i, j, w) without a matching (j, i, w); no transposed copy."""
+    count = 0
+    for i in nb.prange(len(indptr) - 1):
+        for k in range(indptr[i], indptr[i + 1]):
+            j = indices[k]
+            start, stop = indptr[j], indptr[j + 1]
+            pos = start + np.searchsorted(indices[start:stop], i)
+            if pos == stop or indices[pos] != i or data[pos] != data[k]:
+                count += 1
+                break
+    return count
