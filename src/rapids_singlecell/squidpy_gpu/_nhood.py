@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, NamedTuple
+
+import cupy as cp
+import numpy as np
+import pandas as pd
+from cupyx.scipy import sparse as sparse_gpu
+
+from rapids_singlecell._cuda import _nhood_cuda as _nh
+
+from ._spatial_data import _extract_adata
+from ._utils import _assert_categorical_obs
+
+if TYPE_CHECKING:
+    from anndata import AnnData
+    from spatialdata import SpatialData
+
+# Upper bound on the permuted-label buffer (n_batch * n_cells int32 values).
+_MAX_BATCH_LABELS = 1 << 26
+_MAX_BATCH = 128
+_FEISTEL_ROUNDS = 24
+
+
+class NhoodEnrichmentResult(NamedTuple):
+    """Result of :func:`~rapids_singlecell.gr.nhood_enrichment`."""
+
+    zscore: np.ndarray
+    counts: np.ndarray
+
+
+def _cluster_edges(
+    adata: AnnData, cluster_key: str, connectivity_key: str
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, int]:
+    """Edges of the connectivity graph restricted to cells with a cluster label.
+
+    Returns ``(rows, cols, data, labels, valid, n_cats)``; ``rows`` and ``cols``
+    index into the labelled cells and ``labels`` holds their cluster codes.
+    """
+    _assert_categorical_obs(adata, cluster_key)
+    if connectivity_key not in adata.obsp:
+        raise KeyError(
+            f"Spatial connectivity key `{connectivity_key}` not found in `adata.obsp`. "
+            "Please run `rapids_singlecell.gr.spatial_neighbors_*` first."
+        )
+    cats = adata.obs[cluster_key]
+    n_cats = len(cats.cat.categories)
+    codes = cp.asarray(cats.cat.codes.to_numpy(), dtype=cp.int32)
+    valid = codes >= 0
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        raise RuntimeError(
+            f"After removing NaNs in `adata.obs[{cluster_key!r}]`, none remain."
+        )
+
+    g = adata.obsp[connectivity_key]
+    if g.dtype.kind not in "bf":
+        # CuPy sparse has no integer dtypes; float64 keeps integer sums exact.
+        g = g.astype(np.float64)
+    g = sparse_gpu.csr_matrix(g).tocoo()
+    rows = g.row.astype(cp.int32, copy=False)
+    cols = g.col.astype(cp.int32, copy=False)
+    data = g.data
+    if n_valid < codes.shape[0]:
+        keep = valid[rows] & valid[cols]
+        remap = cp.cumsum(valid, dtype=cp.int32) - 1
+        rows, cols, data = remap[rows[keep]], remap[cols[keep]], data[keep]
+        codes = codes[valid]
+    return rows, cols, data, codes, valid, n_cats
+
+
+def _pair_counts(rows, cols, labels, k, weights=None) -> cp.ndarray:
+    """Sum of edges (or their weights) between every pair of clusters."""
+    bins = labels[rows].astype(cp.int64) * k + labels[cols]
+    return cp.bincount(bins, weights=weights, minlength=k * k).reshape(k, k)
+
+
+def interaction_matrix(
+    adata: AnnData | SpatialData,
+    cluster_key: str,
+    *,
+    table_key: str | None = None,
+    connectivity_key: str = "spatial_connectivities",
+    normalized: bool = False,
+    weights: bool = False,
+    copy: bool = False,
+) -> np.ndarray | None:
+    """
+    Compute the interaction matrix for clusters.
+
+    Counts the spatial graph edges between every pair of clusters. Cells
+    whose cluster label is missing are removed together with their edges.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix or a SpatialData object containing the selected table.
+    cluster_key
+        Key in :attr:`anndata.AnnData.obs` with categorical cluster labels.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        Ignored for AnnData input.
+    connectivity_key
+        Key in :attr:`anndata.AnnData.obsp` with the spatial connectivity graph.
+    normalized
+        If ``True``, each row is normalized to sum to 1.
+    weights
+        If ``True``, sum the edge weights instead of counting edges.
+    copy
+        If ``True``, return the interaction matrix instead of storing it.
+
+    Returns
+    -------
+    If ``copy = True``, returns the interaction matrix of shape ``(n_clusters, n_clusters)``.
+
+    Otherwise, modifies the ``adata`` with the following key:
+
+        - :attr:`anndata.AnnData.uns` ``['{cluster_key}_interactions']`` - the interaction matrix.
+    """
+    adata = _extract_adata(adata, table_key=table_key)
+    rows, cols, data, labels, _, k = _cluster_edges(
+        adata, cluster_key, connectivity_key
+    )
+    graph_dtype = adata.obsp[connectivity_key].dtype
+    dtype = (
+        int
+        if pd.api.types.is_bool_dtype(graph_dtype)
+        or pd.api.types.is_integer_dtype(graph_dtype)
+        else float
+    )
+    weights = data.astype(cp.float64) if weights else None
+    out = _pair_counts(rows, cols, labels, k, weights).get().astype(dtype)
+
+    if normalized:
+        out = out / out.sum(axis=1).reshape((-1, 1))
+
+    if copy:
+        return out
+    adata.uns[f"{cluster_key}_interactions"] = out
+
+
+def nhood_enrichment(
+    adata: AnnData | SpatialData,
+    cluster_key: str,
+    *,
+    table_key: str | None = None,
+    library_key: str | None = None,
+    connectivity_key: str = "spatial_connectivities",
+    n_perms: int = 1000,
+    seed: int | None = None,
+    copy: bool = False,
+) -> NhoodEnrichmentResult | None:
+    """
+    Compute neighborhood enrichment by permutation test.
+
+    Counts the spatial graph edges between every pair of clusters and compares
+    the counts with ``n_perms`` random permutations of the cluster labels.
+    All permutations are counted on the GPU in batches. Cells whose cluster
+    label is missing are removed together with their edges.
+
+    Parameters
+    ----------
+    adata
+        Annotated data matrix or a SpatialData object containing the selected table.
+    cluster_key
+        Key in :attr:`anndata.AnnData.obs` with categorical cluster labels.
+    table_key
+        Key in ``SpatialData.tables``; required for SpatialData input.
+        Ignored for AnnData input.
+    library_key
+        Key in :attr:`anndata.AnnData.obs` with categorical library labels.
+        If given, cluster labels are only permuted within each library.
+    connectivity_key
+        Key in :attr:`anndata.AnnData.obsp` with the spatial connectivity graph.
+    n_perms
+        Number of permutations for the permutation test.
+    seed
+        Random seed for the permutations.
+    copy
+        If ``True``, return the result instead of storing it.
+
+    Returns
+    -------
+    If ``copy = True``, returns a :class:`~rapids_singlecell.gr.NhoodEnrichmentResult`
+    with the z-score and the enrichment count.
+
+    Otherwise, modifies the ``adata`` with the following keys:
+
+        - :attr:`anndata.AnnData.uns` ``['{cluster_key}_nhood_enrichment']['zscore']`` - the enrichment z-score.
+        - :attr:`anndata.AnnData.uns` ``['{cluster_key}_nhood_enrichment']['count']`` - the enrichment count.
+    """
+    adata = _extract_adata(adata, table_key=table_key)
+    if n_perms <= 0:
+        raise ValueError(f"Expected `n_perms` to be positive, found `{n_perms}`.")
+    rows, cols, _, labels, valid, k = _cluster_edges(
+        adata, cluster_key, connectivity_key
+    )
+    if k <= 1:
+        raise ValueError(f"Expected at least `2` clusters, found `{k}`.")
+    n = labels.shape[0]
+
+    if library_key is None:
+        lib = cp.zeros(n, dtype=cp.int32)
+    else:
+        _assert_categorical_obs(adata, library_key)
+        lib = cp.asarray(adata.obs[library_key].cat.codes.to_numpy())[valid]
+    # Cells grouped by library code (-1 for NaN); labels move only within a group.
+    pos = cp.argsort(lib).astype(cp.int32)
+    group_off = cp.searchsorted(lib[pos], cp.arange(-1, int(lib.max()) + 2))
+    group_off = group_off.astype(cp.int32)
+
+    count = _pair_counts(rows, cols, labels, k).astype(cp.float64)
+    # Round keys of the Feistel cipher that permutes the labels on the GPU.
+    keys = cp.asarray(
+        np.random.default_rng(seed).integers(
+            0, 2**32, size=(n_perms, _FEISTEL_ROUNDS), dtype=np.uint32
+        )
+    )
+    batch = int(max(1, min(n_perms, _MAX_BATCH, _MAX_BATCH_LABELS // n)))
+    buf = cp.empty((batch, n), dtype=cp.int32)
+    # Accumulate perm - count, which keeps the variance numerically stable.
+    shift_sum = cp.zeros((k, k), dtype=cp.float64)
+    shift_sq = cp.zeros((k, k), dtype=cp.float64)
+    for start in range(0, n_perms, batch):
+        out = cp.zeros((min(batch, n_perms - start), k, k), dtype=cp.uint64)
+        _nh.permuted_counts(
+            rows,
+            cols,
+            labels,
+            pos,
+            group_off,
+            keys[start : start + batch],
+            buf=buf,
+            out=out,
+            k=k,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+        diff = out.astype(cp.float64) - count
+        shift_sum += diff.sum(axis=0)
+        shift_sq += (diff * diff).sum(axis=0)
+
+    mean_shift = shift_sum / n_perms
+    std = cp.sqrt(cp.maximum(shift_sq / n_perms - mean_shift * mean_shift, 0.0))
+    zscore = (-mean_shift / std).get()
+    count = count.get().astype(np.int64)
+
+    if copy:
+        return NhoodEnrichmentResult(zscore=zscore, counts=count)
+    adata.uns[f"{cluster_key}_nhood_enrichment"] = {"zscore": zscore, "count": count}
