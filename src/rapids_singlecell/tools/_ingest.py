@@ -179,10 +179,17 @@ def ingest(
             "neighbor parameters."
         )
 
+    need_representation = "umap" in embedding_methods or bool(obs_keys)
+    if "modalities" in neighbor_params and need_representation:
+        raise NotImplementedError(
+            f"`adata_ref.uns[{neighbors_key!r}]` is a multimodal graph from "
+            "`rsc.pp.wnn`, which `ingest` cannot map into. Compute single-modality "
+            "neighbors, e.g. `rsc.pp.neighbors(adata_ref, key_added='rna')`, and "
+            "pass `neighbors_key='rna'`."
+        )
     pca_output_key = _embedding_keys("pca").obsm
     umap_output_key = _embedding_keys("umap").obsm
     rep_key, n_rep_dims = _resolve_representation(adata_ref, neighbor_params)
-    need_representation = "umap" in embedding_methods or bool(obs_keys)
     need_pca = "pca" in embedding_methods or (
         need_representation and rep_key in _preset_obsm_names("pca")
     )
