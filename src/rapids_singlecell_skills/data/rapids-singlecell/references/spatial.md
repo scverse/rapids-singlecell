@@ -87,6 +87,7 @@ for k in range(5, 16):
 - `rsc.gr.spatial_autocorr(adata, mode="moran", copy=True)` scores HVGs by default and `genes=` any others.
   Rank genes by Moran's I, not p-values, and interpret within cell type at single-cell resolution.
 - `rsc.gr.co_occurrence(adata, cluster_key="cell_type", interval=...)` runs on the GPU.
+- `rsc.gr.ripley(adata, cluster_key="cell_type", mode="L")` computes Ripley's F, G or L on the GPU; simulations differ from squidpy for the same `rng`.
   Neighborhood enrichment has no rsc port, so use `sq.gr.nhood_enrichment` with `backend="threading"` when `n_jobs > 1`.
 - Read enrichment between cell types as co-compartmentalization and summarize it per sample.
 - `rsc.gr.ligrec` reads host `X` or `.raw`, so run it after `rsc.get.anndata_to_CPU`.

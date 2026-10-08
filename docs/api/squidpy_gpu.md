@@ -28,6 +28,7 @@
     gr.neighbors.TransformPostprocessor
     gr.spatial_autocorr
     gr.co_occurrence
+    gr.ripley
     gr.ligrec
     gr.calculate_niche
     gr.calculate_niche_neighborhood
