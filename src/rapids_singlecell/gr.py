@@ -3,13 +3,17 @@ from __future__ import annotations
 import sys
 
 from .squidpy_gpu import (
+    NhoodEnrichmentResult,
     SpatialNeighborsResult,
     calculate_niche_cellcharter,
     calculate_niche_neighborhood,
     calculate_niche_utag,
     co_occurrence,
+    interaction_matrix,
     ligrec,
     neighbors,
+    nhood_enrichment,
+    sepal,
     spatial_autocorr,
     spatial_neighbors_delaunay,
     spatial_neighbors_from_builder,
@@ -25,12 +29,16 @@ from .squidpy_gpu import (
 sys.modules[f"{__name__}.neighbors"] = neighbors
 
 __all__ = [
+    "NhoodEnrichmentResult",
     "SpatialNeighborsResult",
     "calculate_niche_cellcharter",
     "calculate_niche_neighborhood",
     "calculate_niche_utag",
     "co_occurrence",
+    "interaction_matrix",
     "ligrec",
+    "sepal",
+    "nhood_enrichment",
     "spatial_autocorr",
     "spatial_neighbors_delaunay",
     "spatial_neighbors_from_builder",
@@ -44,7 +52,9 @@ __deprecated_exports__ = {
 }
 
 # Public class members are part of the installed API contract used by agent tooling.
-# ``SpatialNeighborsResult`` is a plain ``NamedTuple`` with no public methods.
+# ``NhoodEnrichmentResult`` and ``SpatialNeighborsResult`` are plain ``NamedTuple``s
+# with no public methods.
 __api_members__: dict[str, list[str]] = {
+    "NhoodEnrichmentResult": [],
     "SpatialNeighborsResult": [],
 }
