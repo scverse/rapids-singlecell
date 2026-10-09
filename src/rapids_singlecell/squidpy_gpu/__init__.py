@@ -11,6 +11,7 @@ from ._niche import (
     calculate_niche_utag,
 )
 from ._ripley import ripley
+from ._sepal import sepal
 from ._spatial_neighbors import (
     SpatialNeighborsResult,
     spatial_neighbors_delaunay,

@@ -29,6 +29,7 @@
     gr.spatial_autocorr
     gr.co_occurrence
     gr.ripley
+    gr.sepal
     gr.interaction_matrix
     gr.nhood_enrichment
     gr.NhoodEnrichmentResult
