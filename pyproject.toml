@@ -78,6 +78,9 @@ test-minimal = [
     "bbknn",
     "decoupler",
     "fast-array-utils",
+    # beta without a numpy cap: uv backtracks into it and pairs it with numpy 2.5,
+    # which numba-cuda (still imported by cudf) can't import against
+    "numba!=0.63.0b1",
 ]
 test = [
     "igraph",

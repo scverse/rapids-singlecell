@@ -11,17 +11,17 @@ Download the matching file or run the commands below from a repository checkout.
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-conda env create -f conda/rsc_rapids_26.08_cuda13.yml
+conda env create -f conda/rsc_rapids_26.10_cuda13.yml
 # or
-mamba env create -f conda/rsc_rapids_26.08_cuda13.yml
+mamba env create -f conda/rsc_rapids_26.10_cuda13.yml
 ```
 *Python 3.14, CUDA 13.3*
 ````
 ````{tab-item} CUDA 12
 ```bash
-conda env create -f conda/rsc_rapids_26.08_cuda12.yml
+conda env create -f conda/rsc_rapids_26.10_cuda12.yml
 # or
-mamba env create -f conda/rsc_rapids_26.08_cuda12.yml
+mamba env create -f conda/rsc_rapids_26.10_cuda12.yml
 ```
 *Python 3.14, CUDA 12.9*
 ````
