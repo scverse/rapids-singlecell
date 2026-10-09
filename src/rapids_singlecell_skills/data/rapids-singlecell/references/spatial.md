@@ -89,6 +89,8 @@ for k in range(5, 16):
 - `rsc.gr.co_occurrence(adata, cluster_key="cell_type", interval=...)` runs on the GPU.
 - `rsc.gr.ripley(adata, cluster_key="cell_type", mode="L")` computes Ripley's F, G or L on the GPU; simulations differ from squidpy for the same `rng`.
   Neighborhood enrichment has no rsc port, so use `sq.gr.nhood_enrichment` with `backend="threading"` when `n_jobs > 1`.
+- `rsc.gr.nhood_enrichment(adata, cluster_key="cell_type", library_key="sample")` runs all permutations on the GPU.
+  `library_key` permutes labels only within each sample; cells without a label are dropped with their edges.
 - Read enrichment between cell types as co-compartmentalization and summarize it per sample.
 - `rsc.gr.ligrec` reads host `X` or `.raw`, so run it after `rsc.get.anndata_to_CPU`.
 - The default OmniPath network contains intracellular pairs (for example KIT to PIK3R1).
