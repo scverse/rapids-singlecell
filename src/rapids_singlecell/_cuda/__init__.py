@@ -41,6 +41,7 @@ __all__ = [
     "_mean_var_cuda",
     "_mixscale_cuda",
     "_nanmean_cuda",
+    "_nhood_cuda",
     "_nn_descent_cuda",
     "_norm_cuda",
     "_ora_cuda",
