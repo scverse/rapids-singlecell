@@ -222,9 +222,12 @@ def harmonize(
 
     rng = np.random.default_rng(rng)
     # Fault in the host output while the GPUs work; copying into touched pages
-    # is about twice as fast as into a fresh allocation.
+    # is about twice as fast as into a fresh allocation. An output sharing
+    # memory with the host input is left alone: the input is read later.
     prefault = None
-    if out is not None:
+    if out is not None and not (
+        isinstance(Z, np.ndarray) and np.may_share_memory(out, Z)
+    ):
         prefault = threading.Thread(target=out.fill, args=(0,), daemon=True)
         prefault.start()
     # Process batch information
@@ -587,12 +590,13 @@ def harmonize(
         _write_shards([r[0] for r in results], order, bounds, devices, out, peer=peer)
         return out
     Z_hat = results[0][0]
-    # Put the result back in input order.
-    result = cp.empty_like(Z_hat)
-    result[order] = Z_hat
-    if out is None:
-        return result
-    _download(result, out)
+    # Put the result back in input order, on its GPU.
+    with cp.cuda.Device(Z_hat.device.id):
+        result = cp.empty_like(Z_hat)
+        result[_copy(order, Z_hat.device.id, peer=peer)] = Z_hat
+        if out is None:
+            return result
+        _download(result, out)
     return out
 
 
@@ -607,15 +611,17 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
 def _upload_sorted(
     Z, order: cp.ndarray, bounds: list[int], devices: list[int], *, peer: bool
 ) -> list[cp.ndarray]:
-    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input is
-    sorted on the current GPU. Host input chunks holding a GPU's rows are
-    staged in pinned memory by several host threads while the previous chunk
-    is copied, then placed on the GPU (all GPUs at once), so no unsorted
-    device copy is kept."""
+    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input
+    shards are gathered on the current GPU. Host input chunks holding a GPU's
+    rows are staged in pinned memory by several host threads while the
+    previous chunk is copied, then placed on the GPU (all GPUs at once), so no
+    unsorted device copy is kept."""
     shards = list(itertools.pairwise(bounds))
     if isinstance(Z, cp.ndarray):
-        Z = _copy(Z, order.device.id, peer=peer)[order]
-        return [_copy(Z[lo:hi], d, peer=peer) for d, (lo, hi) in zip(devices, shards)]
+        Z = _copy(Z, order.device.id, peer=peer)
+        return [
+            _copy(Z[order[lo:hi]], d, peer=peer) for d, (lo, hi) in zip(devices, shards)
+        ]
     n, d = Z.shape
     rows = _staging_rows(n, d * Z.itemsize)
     n_chunks = -(-n // rows)

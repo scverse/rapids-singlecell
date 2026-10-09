@@ -1074,6 +1074,33 @@ def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype):
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmonize_into_its_input_and_on_another_gpu():
+    # out may be the host input; devices=[1] called from GPU 0 returns the
+    # result on GPU 1.
+    adata = _repeatability_adata(np.float32)
+    X, kwargs = adata.obsm["X_pca"], {"rng": 734, "n_clusters": 20}
+    ref = cp.asnumpy(harmony_module.harmonize(X, adata.obs, "batch", **kwargs))
+    Z = X.copy()
+    harmony_module.harmonize(Z, adata.obs, "batch", out=Z, **kwargs)
+    assert Z.tobytes() == ref.tobytes()
+    if cp.cuda.runtime.getDeviceCount() > 1:
+        with cp.cuda.Device(0):
+            other = harmony_module.harmonize(
+                X, adata.obs, "batch", devices=[1], **kwargs
+            )
+        assert other.device.id == 1
+        assert cp.asnumpy(other).tobytes() == ref.tobytes()
+
+
+def test_harmony_device_input_shards_hold_only_their_rows():
+    X = cp.random.default_rng(0).standard_normal((1000, 8), dtype=cp.float32)
+    order = cp.asarray(np.random.default_rng(1).permutation(1000))
+    parts = harmony_module._upload_sorted(X, order, [0, 400, 1000], [0, 0], peer=False)
+    assert all(p.data.mem.size < X.nbytes for p in parts)
+    assert (cp.concatenate(parts) == X[order]).all()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
 def test_harmony_threads_wait_for_the_callers_stream(monkeypatch):
     # The caller works on a non-blocking stream that a sleeping host callback
     # holds up before the upload targets and the centroids are written: the
