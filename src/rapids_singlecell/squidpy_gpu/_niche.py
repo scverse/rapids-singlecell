@@ -781,11 +781,31 @@ def _nhood_embedding(
 
 def _utag_embedding(adata: AnnData, *, key: str) -> cp.ndarray:
     """UTAG-smoothed expression, PCA-reduced."""
-    inner = AnnData(
-        X=_utag_features(adata, key), obs=pd.DataFrame(index=adata.obs_names.copy())
+    adj, X = _utag_operands(adata, key)
+    if not sparse_gpu.issparse(X):
+        inner = AnnData(X=adj @ X, obs=pd.DataFrame(index=adata.obs_names.copy()))
+        rsc.pp.pca(inner, key_added=None)
+        return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
+
+    # Sparse A @ X has ~mean-degree times the nnz of X (billions on large panels):
+    # run the PCA on the implicit, mean-centered operator A @ X instead.
+    from cupyx.scipy.sparse.linalg import LinearOperator
+
+    from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import lanczos_svd
+
+    n = X.shape[0]
+    adj_t, X_t = adj.T, X.T  # CSC views, no copies
+    mean = X_t @ (adj_t @ cp.ones(n, dtype=X.dtype)) / n
+    op = LinearOperator(
+        X.shape,
+        matvec=lambda v: adj @ (X @ v) - mean @ v,
+        rmatvec=lambda u: X_t @ (adj_t @ u) - mean * u.sum(),
+        matmat=lambda V: adj @ (X @ V) - (mean @ V)[None, :],
+        rmatmat=lambda U: X_t @ (adj_t @ U) - cp.outer(mean, U.sum(axis=0)),
+        dtype=X.dtype,
     )
-    rsc.pp.pca(inner, key_added=None)
-    return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
+    U, S, _ = lanczos_svd(op, k=min(rsc.settings.N_PCS, min(X.shape) - 1), rng=0)
+    return U * S
 
 
 def _cellcharter_embedding(
@@ -876,6 +896,14 @@ def _neighborhood_profile(
 
 def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matrix:
     """L1-row-normalize the spatial adjacency and propagate expression: D^-1 A @ X."""
+    adj, X = _utag_operands(adata, key)
+    return adj @ X
+
+
+def _utag_operands(
+    adata: AnnData, key: str
+) -> tuple[sparse_gpu.csr_matrix, cp.ndarray | sparse_gpu.csr_matrix]:
+    """L1-row-normalized spatial adjacency and float32 expression on the GPU."""
     from rapids_singlecell._cuda import _norm_cuda as _nc
 
     adj = rsc.get.X_to_GPU(adata.obsp[key]).copy()
@@ -889,12 +917,7 @@ def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matr
         stream=cp.cuda.get_current_stream().ptr,
     )
 
-    X = rsc.get.X_to_GPU(adata.X).astype(cp.float32)
-    if sparse_gpu.issparse(X):
-        out = adj @ X
-        return out.tocsr()
-    out = adj @ X
-    return out
+    return adj, rsc.get.X_to_GPU(adata.X).astype(cp.float32)
 
 
 def _cellcharter_features(
