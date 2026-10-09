@@ -845,11 +845,24 @@ def test_harmony_bfloat16_assignments():
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-@pytest.mark.parametrize(("n_clusters", "sigma"), [(7, 0.1), (7, 0.02), (300, 0.1)])
-def test_harmony_large_theta_stays_finite(monkeypatch, n_clusters, sigma):
+@pytest.mark.parametrize(
+    ("flavor", "theta", "n_clusters", "sigma", "kwargs"),
+    [
+        ("harmony2", 200.0, 7, 0.1, {}),
+        ("harmony2", 200.0, 7, 0.02, {}),
+        ("harmony2", 200.0, 300, 0.1, {}),
+        ("harmony1", 50.0, 20, 0.1, {}),
+        ("harmony1", 50.0, 20, 0.1, {"dtype": np.float64}),
+        ("harmony1", 300.0, 20, 0.1, {"correction_method": "fast"}),
+    ],
+)
+def test_harmony_large_theta_stays_finite(
+    monkeypatch, *, flavor, theta, n_clusters, sigma, kwargs
+):
     # theta=200 takes float32 penalties of evenly mixed batches to about
     # 0.5**200, far below the smallest float: log-space penalties keep the
     # assignments and the objective finite (sigma=0.02: shifted per row).
+    # harmony1 empties clusters entirely; they get no correction.
     objectives = []
     convergent = harmony_module._is_convergent_harmony
     monkeypatch.setattr(
@@ -861,11 +874,13 @@ def test_harmony_large_theta_stays_finite(monkeypatch, n_clusters, sigma):
     rsc.pp.harmony_integrate(
         adata,
         "batch",
-        theta=200.0,
+        flavor=flavor,
+        theta=theta,
         sigma=sigma,
         rng=734,
         n_clusters=n_clusters,
         max_iter_harmony=2,
+        **kwargs,
     )
     assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
     assert all(0 < o < 1e6 for o in objectives[-1])
@@ -891,8 +906,9 @@ def test_harmony_host_input_matches_device_input():
         _integrate(X_pca=host).tobytes() == _integrate(X_pca=cp.asarray(host)).tobytes()
     )
     host[3, 2] = np.nan
-    with pytest.raises(ValueError, match="NaN"):
-        _integrate(X_pca=host)
+    for X in (host, cp.asarray(host)):
+        with pytest.raises(ValueError, match="NaN"):
+            _integrate(X_pca=X)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

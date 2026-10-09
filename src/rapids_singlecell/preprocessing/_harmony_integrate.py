@@ -90,7 +90,8 @@ def harmony_integrate(
         precision is needed; it can be slower on GPUs with reduced
         double-precision throughput. ``"bfloat16"`` computes in float32 but
         stores the soft cluster assignments in bfloat16, which is faster and
-        needs a third less memory. It needs one batch key and the batched
+        halves their memory (about a quarter less GPU memory with 50
+        components). It needs one batch key and the batched
         correction and falls back to float32 with a warning otherwise.
     flavor
         Which version of the Harmony algorithm to use.
@@ -181,7 +182,8 @@ def harmony_integrate(
         Cells are assigned to the random update blocks in runs of this many
         neighbouring cells of the same batch, so the GPU writes contiguous rows.
         ``1`` assigns every cell independently, as the reference
-        implementations do. Used with one batch key; ignored otherwise.
+        implementations do. With several keys the runs are of the same joint
+        category.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -268,14 +270,13 @@ def harmony_integrate(
                     f"Could not convert input of type {type(input_data).__name__} to CuPy array: {str(e)}"
                 ) from e
 
-        # Verify array is valid
-        if isinstance(X, cp.ndarray) and cp.isnan(X).any():
-            raise ValueError(
-                "Input data contains NaN values. Please handle these before running harmony_integrate."
-            )
-
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
+    # NumPy input is checked during the upload, with the same error.
+    if isinstance(X, cp.ndarray) and cp.isnan(X).any():
+        raise ValueError(
+            "Input data contains NaN values. Please handle these before running harmony_integrate."
+        )
 
     # Fault in the host output while the GPU works; copying into touched pages
     # is about twice as fast as into a fresh allocation.

@@ -8,7 +8,7 @@
 // Closed form instead of an explicit inversion:
 //   factor[b] = 1 / (O_k[b] + lambda_kb[b,k])
 //   P_row0[b] = -factor[b] * O_k[b]
-//   c_inv = 1 / (N_k - sum(factor[b] * O_k[b]^2))
+//   c_inv = 1 / (N_k - sum(factor[b] * O_k[b]^2)), 0 for an empty cluster
 //   inv[0,0] = c_inv
 //   inv[0,j] = c_inv * P_row0[j-1], inv[i,0] = P_row0[i-1] * c_inv
 //   inv[i,j] = P_row0[i-1]*c_inv*P_row0[j-1] + factor[i-1]*delta(i,j)
@@ -40,7 +40,10 @@ __global__ void compute_inv_mats_kernel(const T* __restrict__ O,
         local_c_neg += f * o_val * o_val;
     }
     T Nk = block_sum(local_Nk);
-    T c_inv = T(1) / (Nk - block_sum(local_c_neg));
+    // An empty cluster (all counts 0, e.g. emptied by a large theta) has no
+    // intercept and gets no correction.
+    T c = Nk - block_sum(local_c_neg);
+    T c_inv = c > T(0) ? T(1) / c : T(0);
     for (int b = threadIdx.x; b < n_batches; b += blockDim.x)
         inv[(size_t)(b + 1) * nb1] = my_P_row0[b] * c_inv;
     __syncthreads();

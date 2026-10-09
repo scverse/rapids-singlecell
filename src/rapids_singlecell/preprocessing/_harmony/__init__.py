@@ -122,9 +122,9 @@ def harmonize(
         Proportion of block size in one update operation of clustering step.
 
     shuffle_chunk_size
-        Cells per run of neighbouring same-batch cells that move between
-        update blocks together (one batch key only). ``1`` shuffles every cell
-        independently.
+        Cells per run of neighbouring cells of the same batch (joint category
+        with several keys) that move between update blocks together. ``1``
+        shuffles every cell independently.
 
     theta
         Weight of the diversity penalty term. A scalar is broadcast to every
@@ -336,8 +336,7 @@ def harmonize(
     ):
         warnings.warn(
             "dtype='bfloat16' needs one batch key and the batched correction; "
-            "using float32 assignments instead (about 1.5x the assignment "
-            "memory).",
+            "using float32 assignments instead (twice the assignment memory).",
             UserWarning,
             stacklevel=3,
         )
