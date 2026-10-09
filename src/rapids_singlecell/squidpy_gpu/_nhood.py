@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, NamedTuple
 import cupy as cp
 import numpy as np
 import pandas as pd
-from cupyx.scipy import sparse as sparse_gpu
 
 from rapids_singlecell._cuda import _nhood_cuda as _nh
 
@@ -13,6 +12,7 @@ from ._spatial_data import _extract_adata
 from ._utils import _assert_categorical_obs
 
 if TYPE_CHECKING:
+    import numpy  # noqa: ICN001 (full name resolves in the docs)
     from anndata import AnnData
     from spatialdata import SpatialData
 
@@ -25,17 +25,20 @@ _FEISTEL_ROUNDS = 24
 class NhoodEnrichmentResult(NamedTuple):
     """Result of :func:`~rapids_singlecell.gr.nhood_enrichment`."""
 
-    zscore: np.ndarray
-    counts: np.ndarray
+    #: Enrichment z-scores, with shape ``(n_clusters, n_clusters)``.
+    zscore: numpy.ndarray
+    #: Edge counts between cluster pairs, with shape ``(n_clusters, n_clusters)``.
+    counts: numpy.ndarray
 
 
 def _cluster_edges(
-    adata: AnnData, cluster_key: str, connectivity_key: str
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, int]:
+    adata: AnnData, cluster_key: str, connectivity_key: str, *, weights: bool
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None, cp.ndarray, cp.ndarray, int]:
     """Edges of the connectivity graph restricted to cells with a cluster label.
 
     Returns ``(rows, cols, data, labels, valid, n_cats)``; ``rows`` and ``cols``
     index into the labelled cells and ``labels`` holds their cluster codes.
+    ``data`` holds the float64 edge weights if ``weights`` is set, else ``None``.
     """
     _assert_categorical_obs(adata, cluster_key)
     if connectivity_key not in adata.obsp:
@@ -54,17 +57,19 @@ def _cluster_edges(
         )
 
     g = adata.obsp[connectivity_key]
-    if g.dtype.kind not in "bf":
-        # CuPy sparse has no integer dtypes; float64 keeps integer sums exact.
-        g = g.astype(np.float64)
-    g = sparse_gpu.csr_matrix(g).tocoo()
-    rows = g.row.astype(cp.int32, copy=False)
-    cols = g.col.astype(cp.int32, copy=False)
-    data = g.data
+    if g.format != "csr":
+        g = g.tocsr()
+    # Only the sparsity pattern moves to the GPU; weights only when summed.
+    indptr = cp.asarray(g.indptr)
+    cols = cp.asarray(g.indices, dtype=cp.int32)
+    rows = cp.searchsorted(indptr, cp.arange(cols.size), side="right") - 1
+    rows = rows.astype(cp.int32)
+    data = cp.asarray(g.data, dtype=cp.float64) if weights else None
     if n_valid < codes.shape[0]:
         keep = valid[rows] & valid[cols]
         remap = cp.cumsum(valid, dtype=cp.int32) - 1
-        rows, cols, data = remap[rows[keep]], remap[cols[keep]], data[keep]
+        rows, cols = remap[rows[keep]], remap[cols[keep]]
+        data = None if data is None else data[keep]
         codes = codes[valid]
     return rows, cols, data, codes, valid, n_cats
 
@@ -119,7 +124,7 @@ def interaction_matrix(
     """
     adata = _extract_adata(adata, table_key=table_key)
     rows, cols, data, labels, _, k = _cluster_edges(
-        adata, cluster_key, connectivity_key
+        adata, cluster_key, connectivity_key, weights=weights
     )
     graph_dtype = adata.obsp[connectivity_key].dtype
     dtype = (
@@ -128,8 +133,7 @@ def interaction_matrix(
         or pd.api.types.is_integer_dtype(graph_dtype)
         else float
     )
-    weights = data.astype(cp.float64) if weights else None
-    out = _pair_counts(rows, cols, labels, k, weights).get().astype(dtype)
+    out = _pair_counts(rows, cols, labels, k, data).get().astype(dtype)
 
     if normalized:
         out = out / out.sum(axis=1).reshape((-1, 1))
@@ -193,7 +197,7 @@ def nhood_enrichment(
     if n_perms <= 0:
         raise ValueError(f"Expected `n_perms` to be positive, found `{n_perms}`.")
     rows, cols, _, labels, valid, k = _cluster_edges(
-        adata, cluster_key, connectivity_key
+        adata, cluster_key, connectivity_key, weights=False
     )
     if k <= 1:
         raise ValueError(f"Expected at least `2` clusters, found `{k}`.")
