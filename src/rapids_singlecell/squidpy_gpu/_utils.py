@@ -253,3 +253,11 @@ def _assert_categorical_obs(adata, key):
 def _assert_spatial_basis(adata, key: str) -> None:
     if key not in adata.obsm:
         raise KeyError(f"Spatial basis `{key}` not found in `adata.obsm`.")
+
+
+def _assert_connectivity_key(adata, key: str) -> None:
+    if key not in adata.obsp:
+        raise KeyError(
+            f"Spatial connectivity key `{key}` not found in `adata.obsp`. "
+            "Please run `rapids_singlecell.gr.spatial_neighbors_*` first."
+        )
