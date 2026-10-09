@@ -51,6 +51,7 @@ __all__ = [
     "_rank_stats_cuda",
     "_rank_stream_cuda",
     "_scale_cuda",
+    "_sepal_cuda",
     "_sparse2dense_cuda",
     "_spatial_cuda",
     "_spca_cuda",
