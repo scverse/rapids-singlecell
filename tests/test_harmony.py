@@ -844,6 +844,33 @@ def test_harmony_bfloat16_assignments():
     assert _get_measure(first, _integrate(), "L2") < 2e-2
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize(("n_clusters", "sigma"), [(7, 0.1), (7, 0.02), (300, 0.1)])
+def test_harmony_large_theta_stays_finite(monkeypatch, n_clusters, sigma):
+    # theta=200 takes float32 penalties of evenly mixed batches to about
+    # 0.5**200, far below the smallest float: log-space penalties keep the
+    # assignments and the objective finite (sigma=0.02: shifted per row).
+    objectives = []
+    convergent = harmony_module._is_convergent_harmony
+    monkeypatch.setattr(
+        harmony_module,
+        "_is_convergent_harmony",
+        lambda objs, tol: objectives.append(list(objs)) or convergent(objs, tol),
+    )
+    adata = _repeatability_adata(np.float32)
+    rsc.pp.harmony_integrate(
+        adata,
+        "batch",
+        theta=200.0,
+        sigma=sigma,
+        rng=734,
+        n_clusters=n_clusters,
+        max_iter_harmony=2,
+    )
+    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
+    assert all(0 < o < 1e6 for o in objectives[-1])
+
+
 @pytest.mark.parametrize("chunk", [0, -2, 1.5])
 def test_harmony_shuffle_chunk_size_rejects_invalid(chunk):
     with pytest.raises(ValueError, match="shuffle_chunk_size"):
@@ -866,6 +893,20 @@ def test_harmony_host_input_matches_device_input():
     host[3, 2] = np.nan
     with pytest.raises(ValueError, match="NaN"):
         _integrate(X_pca=host)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_small_host_input_stages_its_rows(monkeypatch):
+    # Pinned and GPU staging chunks hold at most the input's rows.
+    rows = []
+    pinned = harmony_module._pinned
+    monkeypatch.setattr(
+        harmony_module,
+        "_pinned",
+        lambda n, d, dtype: rows.append(n) or pinned(n, d, dtype),
+    )
+    _integrate(X_pca=_repeatability_adata(np.float32).obsm["X_pca"])
+    assert rows and max(rows) <= 480
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

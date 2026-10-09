@@ -228,7 +228,7 @@ __global__ void sum_blocks_kernel(const long long* __restrict__ blocks,
 constexpr int FUSED_MAX_CLUSTER_SLOTS = 4;  // K <= 128
 constexpr int FUSED_THREADS = 256;
 
-// E and the penalty from the held-out counts; R_sum is the column sum of O.
+// E and the log penalty from the held-out counts; R_sum is the column sum of O.
 // One CTA per cluster reduces its column in a fixed tree, then each thread
 // fills its batches. `penalty` may be null to update E only.
 template <typename T>
@@ -249,7 +249,7 @@ __global__ void penalty_from_counts_kernel(const T* O, const T* Pr_b,
         E[i] = e;
         if (penalty) {
             T denom = stabilized ? (O[i] + e + T(1)) : (O[i] + T(1));
-            penalty[i] = pow((e + T(1)) / denom, theta[b]);
+            penalty[i] = theta[b] * log((e + T(1)) / denom);  // log penalty
         }
     }
 }
@@ -328,9 +328,11 @@ __device__ __forceinline__ void tile_products(
 // ZQ = ceil(padded PCs / 32): Z values per lane and cell held in registers
 // while the next cells are prefetched.
 // Two CTAs per SM: the register cap pays for itself in latency hiding.
-// LOG_PEN: `penalty` holds log penalties (several batch keys, where the
-// product of penalties can overflow); rows are shifted by their maximum.
-template <typename T, typename RT, int ZQ, bool LOG_PEN>
+// `penalty` holds log penalties (null: none). The log weights are shifted by
+// the tile's largest log penalty, so none overflows and the row's best
+// cluster under that penalty keeps at least exp(2 term); below sigma = 1/15
+// each row is shifted by its own maximum instead.
+template <typename T, typename RT, int ZQ>
 __global__ void __launch_bounds__(FUSED_THREADS, 2)
     fused_assign_kernel(const T* __restrict__ Z, const T* __restrict__ Y_norm,
                         const T* __restrict__ penalty,
@@ -359,22 +361,17 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                      threadIdx.x, blockDim.x);
     T* z_w = z_s + (size_t)warp * FUSED_ROWS * pcs;
     int k0 = 4 * lane;  // this lane's clusters k0 .. k0 + 3
-    T pen[S], log_pen[S];
+    T log_pen[S], top = -INFINITY;
     long long col[S] = {};
 #pragma unroll
     for (int q = 0; q < S; ++q) {
-        int k = k0 + q;
-        // No penalty table (initialization): unit penalty.
-        T table = penalty && k < n_clusters
-                      ? penalty[(size_t)category * n_clusters + k]
-                      : T(LOG_PEN ? 0 : 1);
-        if constexpr (LOG_PEN) {
-            log_pen[q] = k < n_clusters ? table : T(0);
-        } else {
-            pen[q] = k < n_clusters ? table : T(0);
-            log_pen[q] = k < n_clusters ? log(pen[q]) : T(0);
-        }
+        log_pen[q] = penalty && k0 + q < n_clusters
+                         ? penalty[(size_t)category * n_clusters + k0 + q]
+                         : T(0);
+        if (k0 + q < n_clusters) top = max(top, log_pen[q]);
     }
+    top = warp_max(top);
+    bool row_shift = term < T(-30);
     __syncthreads();
 
     // The next cells' indices and Z values are loaded into registers while
@@ -418,8 +415,8 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
             if (r >= rows) break;  // warp-uniform
             T vals[S];
             T sum = T(0);
-            T shift = T(0);
-            if constexpr (LOG_PEN) {
+            T shift = top;
+            if (row_shift) {  // warp-uniform
                 shift = -INFINITY;
 #pragma unroll
                 for (int q = 0; q < S; ++q)
@@ -430,15 +427,10 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
             }
 #pragma unroll
             for (int q = 0; q < S; ++q) {
-                if constexpr (LOG_PEN)
-                    vals[q] = k0 + q < n_clusters
-                                  ? exp(term * (T(1) - dots[r][q]) +
-                                        log_pen[q] - shift)
-                                  : T(0);
-                else
-                    vals[q] = k0 + q < n_clusters
-                                  ? exp(term * (T(1) - dots[r][q])) * pen[q]
-                                  : T(0);
+                vals[q] =
+                    k0 + q < n_clusters
+                        ? exp(term * (T(1) - dots[r][q]) + log_pen[q] - shift)
+                        : T(0);
                 sum += vals[q];
             }
             sum = warp_sum(sum);
@@ -457,12 +449,8 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                     col[q] += count_to_fixed(value, count_scale);
                     distance += value * T(2) * (T(1) - dots[r][q]);
                     // log(value) = log of the unnormalized weight - log(sum)
-                    if constexpr (LOG_PEN)
-                        entropy += value * (term * (T(1) - dots[r][q]) +
-                                            log_pen[q] - shift - log_sum);
-                    else
-                        entropy += value * (term * (T(1) - dots[r][q]) +
-                                            log_pen[q] - log_sum);
+                    entropy += value * (term * (T(1) - dots[r][q]) +
+                                        log_pen[q] - shift - log_sum);
                 }
             }
             T total = warp_sum(distance + sigma * entropy);
@@ -488,7 +476,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
 // chunk a single sweep normalizes; otherwise a first sweep tracks each row's
 // maximum and sum online and a second sweep writes the normalized values.
 // Column sums go through per-warp scratch `col_ws` (tiles x warps x K).
-template <typename T, typename RT, bool LOG_PEN>
+template <typename T, typename RT>
 __global__ void fused_assign_general_kernel(
     const T* __restrict__ Z, const T* __restrict__ y_t, int k_stride,
     const T* __restrict__ penalty, const int* __restrict__ idx,
@@ -529,9 +517,7 @@ __global__ void fused_assign_general_kernel(
 #pragma unroll
         for (int q = 0; q < S; ++q) {
             int k = k0 + q;
-            T lp = !pen_row || k >= n_clusters ? T(0)
-                   : LOG_PEN                   ? pen_row[k]
-                                               : log(pen_row[k]);
+            T lp = !pen_row || k >= n_clusters ? T(0) : pen_row[k];
 #pragma unroll
             for (int r = 0; r < FUSED_ROWS; ++r) {
                 om[r][q] = T(1) - dots[r][q];
@@ -627,9 +613,9 @@ __global__ void joint_log_penalty_kernel(const T* penalty,
         long long j = i / n_clusters, k = i % n_clusters;
         T sum = T(0);
         for (int c = 0; c < n_covariates; ++c)
-            sum += log(
+            sum +=
                 penalty[(size_t)joint_cats[j * n_covariates + c] * n_clusters +
-                        k]);
+                        k];
         out[i] = sum;
     }
 }

@@ -499,7 +499,7 @@ def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
     if isinstance(Z, cp.ndarray):
         return Z[order]
     n, d = Z.shape
-    rows = max(1, _UPLOAD_BYTES // (d * Z.itemsize))
+    rows = max(1, min(n, _UPLOAD_BYTES // (d * Z.itemsize)))
     out = cp.empty(Z.shape, dtype=Z.dtype)
     position = cp.empty_like(order)
     position[order] = cp.arange(order.size)
@@ -542,7 +542,7 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
     """``out[...] = src`` through pinned chunks: the next chunk is copied from
     the GPU while host threads move the previous one into ``out``."""
     n, d = src.shape
-    rows = max(1, _UPLOAD_BYTES // (d * src.itemsize))
+    rows = max(1, min(n, _UPLOAD_BYTES // (d * src.itemsize)))
     stream = cp.cuda.get_current_stream()
     hosts = [_pinned(rows, d, src.dtype) for _ in range(2)]
     with ThreadPoolExecutor(_UPLOAD_THREADS) as pool:
