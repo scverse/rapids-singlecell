@@ -562,7 +562,9 @@ def harmonize(
     def guarded(rank: int):
         with cp.cuda.Device(devices[rank]):
             try:
-                return run(rank)
+                result = run(rank)
+                cp.cuda.get_current_stream().synchronize()  # read by other threads
+                return result
             except BaseException:
                 if comm is not None:
                     comm.abort()  # release the other GPUs' threads
@@ -571,6 +573,8 @@ def harmonize(
     if n_ranks == 1:
         results = [guarded(0)]
     else:
+        # The GPUs' threads read this thread's arrays on their own streams.
+        cp.cuda.get_current_stream().synchronize()
         with ThreadPoolExecutor(n_ranks) as pool:
             results = list(pool.map(guarded, range(n_ranks)))
         del comm, comm_buffers
@@ -633,6 +637,8 @@ def _upload_sorted(
         cp.where((position >= lo) & (position < hi), position - lo, hi - lo)
         for lo, hi in shards
     ]
+    # The upload threads read them on their own streams.
+    cp.cuda.get_current_stream().synchronize()
 
     def upload(rank, fill):
         lo, hi = shards[rank]
