@@ -176,6 +176,27 @@ def test_sepal_layer_raw_and_genes():
     assert one.iloc[0, 0] == ref.loc["g2", "sepal_score"]
 
 
+@pytest.mark.parametrize(
+    "to_graph",
+    [lambda g: g.astype(np.int64), lambda g: sparse_gpu.csr_matrix(g)],
+    ids=["int64", "cupy"],
+)
+def test_sepal_graph_types(to_graph):
+    adata = _grid("hex", 12, 10, holes=0.05, n_genes=3, seed=11)
+    ref = rsc.gr.sepal(adata, 6, copy=True)
+    key = "spatial_connectivities"
+    adata.obsp[key] = to_graph(adata.obsp[key])
+    pd.testing.assert_frame_equal(rsc.gr.sepal(adata, 6, copy=True), ref)
+
+
+def test_sepal_cupy_coordinates():
+    # far unsaturated cells use the coordinates
+    adata = _grid("square", 20, 20, holes=0.35, n_genes=3, seed=12)
+    ref = rsc.gr.sepal(adata, 4, copy=True)
+    adata.obsm["spatial"] = cp.asarray(adata.obsm["spatial"])
+    pd.testing.assert_frame_equal(rsc.gr.sepal(adata, 4, copy=True), ref)
+
+
 def test_sepal_highly_variable_and_uns():
     adata = _grid("square", 14, 12, holes=0.0, n_genes=6, seed=7)
     adata.var["highly_variable"] = [True, False, True, False, True, False]

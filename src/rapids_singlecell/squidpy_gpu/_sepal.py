@@ -124,8 +124,8 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
             genes = genes[adata.var["highly_variable"].values]
     genes = _assert_non_empty_sequence(genes, name="genes")
 
-    g = adata.obsp[connectivity_key]
-    g = sparse_gpu.csr_matrix(g) if not sparse_gpu.isspmatrix_csr(g) else g.copy()
+    # only the graph's structure is used; CuPy sparse needs a float dtype
+    g = sparse_gpu.csr_matrix(adata.obsp[connectivity_key].astype(np.float32))
     g.eliminate_zeros()
 
     degrees = cp.diff(g.indptr)
@@ -136,7 +136,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
         )
 
     spatial = cp.ascontiguousarray(
-        cp.asarray(np.asarray(adata.obsm[spatial_key])[:, :2], dtype=cp.float64)
+        cp.asarray(adata.obsm[spatial_key], dtype=cp.float64)[:, :2]
     )
     nbrs, ctr, n_sat = _compute_idxs(g, degrees, spatial, max_neighs)
 
