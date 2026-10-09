@@ -188,7 +188,7 @@ def _regress_out_continuous(X, adata, keys, batchsize):
             lr = LinearRegression(
                 fit_intercept=False, output_type="cupy", algorithm="svd"
             )
-            lr.fit(regressors, arr_batch, convert_dtype=True)
+            lr.fit(regressors, arr_batch)
             X[:, start_idx:stop_idx] = arr_batch - lr.predict(regressors)
 
     return X
