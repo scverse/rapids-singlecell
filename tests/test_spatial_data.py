@@ -167,6 +167,8 @@ _DOWNSTREAM = [
             "multi_gpu": False,
         },
     ),
+    ("interaction_matrix", {"cluster_key": "cluster", "weights": True}),
+    ("nhood_enrichment", {"cluster_key": "cluster", "n_perms": 20, "seed": 0}),
     (
         "ligrec",
         {
@@ -225,6 +227,15 @@ def test_downstream_spatialdata(sdata, name, kwargs, copy):
         b = expected if copy else reference.uns["cluster_co_occurrence"].values()
         for x, y in zip(a, b, strict=True):
             np.testing.assert_allclose(x, y)
+    elif name == "interaction_matrix":
+        a = actual if copy else table.uns["cluster_interactions"]
+        b = expected if copy else reference.uns["cluster_interactions"]
+        np.testing.assert_array_equal(a, b)
+    elif name == "nhood_enrichment":
+        a = actual if copy else table.uns["cluster_nhood_enrichment"].values()
+        b = expected if copy else reference.uns["cluster_nhood_enrichment"].values()
+        for x, y in zip(a, b, strict=True):
+            np.testing.assert_array_equal(x, y)
     else:
         a = actual if copy else table.uns["cluster_ligrec"]
         b = expected if copy else reference.uns["cluster_ligrec"]
