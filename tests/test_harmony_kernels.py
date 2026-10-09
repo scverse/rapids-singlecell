@@ -14,6 +14,7 @@ from rapids_singlecell._cuda import (
 from rapids_singlecell._cuda import (
     _harmony_correction_cuda as _corr,
 )
+from rapids_singlecell.preprocessing._harmony._kmeans import _fused_distances
 
 pytestmark = pytest.mark.skipif(
     _cl is None or _corr is None,
@@ -225,6 +226,8 @@ def test_compute_inv_mat_absent_batch(dtype):
 def test_kmeans_assign(dtype, n_clusters, n_cols):
     rng = cp.random.default_rng(3)
     X = rng.standard_normal((1000, n_cols)).astype(dtype)
+    if not _fused_distances(X, n_clusters):
+        pytest.skip("centers exceed this GPU's shared memory (k-means falls back)")
     centers = rng.standard_normal((n_clusters, n_cols)).astype(dtype)
     labels = cp.empty(1000, dtype=cp.int32)
     minimum = cp.empty(1000, dtype=dtype)
@@ -232,6 +235,22 @@ def test_kmeans_assign(dtype, n_clusters, n_cols):
     distances = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
     cp.testing.assert_array_equal(labels, distances.argmin(1))
     cp.testing.assert_allclose(minimum, distances.min(1), rtol=1e-5)
+
+
+def test_failed_launch_setup_leaves_no_stale_error():
+    # A shape beyond the GPU's shared memory raises, and the next kernel launch
+    # (checked with cudaGetLastError) does not inherit that error.
+    X = cp.ones((10, 600), cp.float64)
+    with pytest.raises(RuntimeError, match="shared memory"):
+        _cl.kmeans_assign(
+            X,
+            centers=cp.ones((128, 600), cp.float64),
+            labels=cp.empty(10, cp.int32),
+            minimum=cp.empty(10, cp.float64),
+        )
+    out = cp.empty_like(X)
+    _cl.l2_row_normalize(X, dst=out)
+    cp.testing.assert_allclose(out, X / cp.sqrt(600.0))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
