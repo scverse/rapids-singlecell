@@ -71,7 +71,8 @@ void register_tree(nb::module_& m) {
         "codes"_a.noconvert().none(), "segments"_a.noconvert(), "max_length"_a,
         "index"_a.noconvert(), "boxes"_a.noconvert(), "stream"_a);
     // k > 0 finds k nearest neighbors; k == 0 counts radius neighbors into
-    // offsets, or fills them if rows are given.
+    // offsets, or fills them if rows are given. External points query the
+    // trees without being in them.
     m.def(
         "tree_search",
         [](gpu_array_c<const T, Device> points,
@@ -80,7 +81,8 @@ void register_tree(nb::module_& m) {
            int k, double radius, gpu_array_c<long long, Device> offsets,
            gpu_array_c<long long, Device> rows,
            gpu_array_c<long long, Device> columns,
-           gpu_array_c<T, Device> distances, std::uintptr_t stream) {
+           gpu_array_c<T, Device> distances, std::uintptr_t stream,
+           bool external) {
             const int n = points.shape(0);
             const auto kernel = k > 32        ? kd_search<T, 0>
                                 : k > 16      ? kd_search<T, 32>
@@ -91,7 +93,8 @@ void register_tree(nb::module_& m) {
             kernel<<<(n + 127) / 128, 128, 0, (cudaStream_t)stream>>>(
                 points.data(), tree.data(), index.data(), boxes.data(),
                 segments.data(), codes.data(), n, points.shape(1), k, radius,
-                offsets.data(), rows.data(), columns.data(), distances.data());
+                offsets.data(), rows.data(), columns.data(), distances.data(),
+                external);
             CUDA_CHECK_LAST_ERROR(kd_search);
         },
         "points"_a.noconvert(), "tree"_a.noconvert(), "index"_a.noconvert(),
@@ -100,7 +103,8 @@ void register_tree(nb::module_& m) {
         "offsets"_a.noconvert().none(),
         "rows"_a.noconvert().none() = nb::none(),
         "columns"_a.noconvert().none() = nb::none(),
-        "distances"_a.noconvert().none() = nb::none(), "stream"_a);
+        "distances"_a.noconvert().none() = nb::none(), "stream"_a,
+        "external"_a = false);
     m.def(
         "library_percentile",
         [](gpu_array_c<const double, Device> index,

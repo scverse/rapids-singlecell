@@ -88,6 +88,8 @@ for k in range(5, 16):
   Rank genes by Moran's I, not p-values, and interpret within cell type at single-cell resolution.
 - `rsc.gr.sepal(adata, max_neighs=6)` scores spatially variable genes on Visium hexagonal (`6`) or square-grid (`4`) spot or bin graphs from `rsc.gr.spatial_neighbors_grid`; single-cell graphs are not regular grids.
 - `rsc.gr.co_occurrence(adata, cluster_key="cell_type", interval=...)` runs on the GPU.
+- `rsc.gr.ripley(adata, cluster_key="cell_type", mode="L")` computes Ripley's F, G or L on the GPU; simulations differ from squidpy for the same `rng`.
+  Neighborhood enrichment has no rsc port, so use `sq.gr.nhood_enrichment` with `backend="threading"` when `n_jobs > 1`.
 - `rsc.gr.nhood_enrichment(adata, cluster_key="cell_type", library_key="sample")` runs all permutations on the GPU.
   `library_key` permutes labels only within each sample; cells without a label are dropped with their edges.
 - Read enrichment between cell types as co-compartmentalization and summarize it per sample.
