@@ -163,10 +163,22 @@ def test_permuted_counts_kernel(k):
     lib = cp.asarray(rng.integers(0, 3, n))
     pos = cp.argsort(lib).astype(cp.int32)
     group_off = cp.searchsorted(lib[pos], cp.arange(4)).astype(cp.int32)
-    keys = cp.asarray(rng.integers(0, 2**32, (batch, 24), dtype=np.uint32))
+    seeds = cp.asarray(rng.integers(0, 2**64, batch, dtype=np.uint64))
     buf = cp.empty((batch, n), dtype=cp.int32)
     out = cp.zeros((batch, k, k), dtype=cp.uint64)
-    _nh.permuted_counts(rows, cols, labels, pos, group_off, keys, buf=buf, out=out, k=k)
+    # batch=3 runs two batches, the second one partial.
+    _nh.permuted_counts(
+        rows,
+        cols,
+        labels,
+        pos,
+        group_off,
+        seeds,
+        out=out,
+        k=k,
+        batch=3,
+        labels_out=buf,
+    )
     for b in range(batch):
         for g in range(3):
             cp.testing.assert_array_equal(
@@ -177,3 +189,35 @@ def test_permuted_counts_kernel(k):
         ).reshape(k, k)
         cp.testing.assert_array_equal(out[b], expected)
     assert not (buf[0] == buf[1]).all()
+
+
+@pytest.mark.parametrize("m", [2, 3, 4])
+def test_small_groups_are_shuffled_uniformly(m):
+    """Every permutation of a tiny library is equally likely (chi-square test)."""
+    from scipy.stats import chisquare
+
+    n_perms = 60_000
+    labels = cp.arange(m, dtype=cp.int32)
+    seeds = cp.asarray(
+        np.random.default_rng(m).integers(0, 2**64, n_perms, dtype=np.uint64)
+    )
+    buf = cp.empty((n_perms, m), dtype=cp.int32)
+    out = cp.zeros((n_perms, m, m), dtype=cp.uint64)
+    edge = cp.zeros(1, dtype=cp.int32)
+    _nh.permuted_counts(
+        edge,
+        edge,
+        labels,
+        labels,
+        cp.asarray([0, m], dtype=cp.int32),
+        seeds,
+        out=out,
+        k=m,
+        batch=4096,
+        labels_out=buf,
+    )
+    _, counts = np.unique(
+        (buf * m ** cp.arange(m)).sum(axis=1).get(), return_counts=True
+    )
+    assert counts.size == np.prod(np.arange(1, m + 1))
+    assert chisquare(counts).pvalue > 1e-4

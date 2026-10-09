@@ -16,10 +16,9 @@ if TYPE_CHECKING:
     from anndata import AnnData
     from spatialdata import SpatialData
 
-# Upper bound on the permuted-label buffer (n_batch * n_cells int32 values).
-_MAX_BATCH_LABELS = 1 << 26
+# Upper bound on n_batch * n_cells; the shuffle sorts 12-byte keys per label.
+_MAX_BATCH_LABELS = 1 << 23
 _MAX_BATCH = 128
-_FEISTEL_ROUNDS = 24
 
 
 class NhoodEnrichmentResult(NamedTuple):
@@ -214,38 +213,25 @@ def nhood_enrichment(
     group_off = group_off.astype(cp.int32)
 
     count = _pair_counts(rows, cols, labels, k).astype(cp.float64)
-    # Round keys of the Feistel cipher that permutes the labels on the GPU.
-    keys = cp.asarray(
-        np.random.default_rng(seed).integers(
-            0, 2**32, size=(n_perms, _FEISTEL_ROUNDS), dtype=np.uint32
-        )
+    # One SplitMix64 seed per permutation; the GPU shuffles by sorting its stream.
+    seeds = cp.asarray(
+        np.random.default_rng(seed).integers(0, 2**64, size=n_perms, dtype=np.uint64)
     )
-    batch = int(max(1, min(n_perms, _MAX_BATCH, _MAX_BATCH_LABELS // n)))
-    buf = cp.empty((batch, n), dtype=cp.int32)
-    # Accumulate perm - count, which keeps the variance numerically stable.
-    shift_sum = cp.zeros((k, k), dtype=cp.float64)
-    shift_sq = cp.zeros((k, k), dtype=cp.float64)
-    for start in range(0, n_perms, batch):
-        out = cp.zeros((min(batch, n_perms - start), k, k), dtype=cp.uint64)
-        _nh.permuted_counts(
-            rows,
-            cols,
-            labels,
-            pos,
-            group_off,
-            keys[start : start + batch],
-            buf=buf,
-            out=out,
-            k=k,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-        diff = out.astype(cp.float64) - count
-        shift_sum += diff.sum(axis=0)
-        shift_sq += (diff * diff).sum(axis=0)
-
-    mean_shift = shift_sum / n_perms
-    std = cp.sqrt(cp.maximum(shift_sq / n_perms - mean_shift * mean_shift, 0.0))
-    zscore = (-mean_shift / std).get()
+    perms = cp.zeros((n_perms, k, k), dtype=cp.uint64)
+    _nh.permuted_counts(
+        rows,
+        cols,
+        labels,
+        pos,
+        group_off,
+        seeds,
+        out=perms,
+        k=k,
+        batch=int(max(1, min(n_perms, _MAX_BATCH, _MAX_BATCH_LABELS // n))),
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    perms = perms.astype(cp.float64)
+    zscore = ((count - perms.mean(axis=0)) / perms.std(axis=0)).get()
     count = count.get().astype(np.int64)
 
     if copy:
