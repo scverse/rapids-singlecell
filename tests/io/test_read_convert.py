@@ -25,7 +25,15 @@ gpu_io = pytest.mark.skipif(not gpu_io_available(), reason="needs KvikIO and nvC
 
 def make_adata(fmt: str = "csr", n_obs: int = 500, n_vars: int = 300) -> ad.AnnData:
     rng = np.random.default_rng(0)
-    X = sparse.random(n_obs, n_vars, density=0.1, format=fmt, dtype=np.float32, rng=rng)
+    X = sparse.random(
+        n_obs,
+        n_vars,
+        density=0.1,
+        format="csr" if fmt == "dense" else fmt,
+        dtype=np.float32,
+        rng=rng,
+    )
+    X = X.toarray() if fmt == "dense" else X
     obs = pd.DataFrame(
         {"cell_type": pd.Categorical(rng.choice(["a", "b", "c"], n_obs))},
         index=[f"cell{i}" for i in range(n_obs)],
@@ -47,20 +55,25 @@ def convert(adata: ad.AnnData, tmp_path: Path) -> Path:
     return dst
 
 
-@pytest.mark.parametrize("fmt", ["csr", "csc"])
+@pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
 def test_convert_zarr(tmp_path, fmt):
     adata = make_adata(fmt)
     dst = convert(adata, tmp_path)
 
     converted = ad.io.read_zarr(dst)
-    assert (converted.X != adata.X).nnz == 0
     pd.testing.assert_frame_equal(converted.obs, adata.obs)
     pd.testing.assert_frame_equal(converted.var, adata.var)
 
     x = zarr.open_group(dst, mode="r")["X"]
-    assert x["indices"].dtype == np.uint16
-    assert x["data"].chunks == (256,)  # 1024 bytes of float32
-    assert x["data"].shards == (256 * 4,)
+    if fmt == "dense":
+        np.testing.assert_array_equal(converted.X, adata.X)
+        # a row (300 float32) is larger than a chunk (1024 bytes): rows in pieces of 256 values
+        assert x.chunks == (1, 256)
+    else:
+        assert (converted.X != adata.X).nnz == 0
+        assert x["indices"].dtype == np.uint16
+        assert x["data"].chunks == (256,)  # 1024 bytes of float32
+        assert x["data"].shards == (256 * 4,)
 
     store = check_store(dst)
     assert store["gpu_readable"]
@@ -68,12 +81,6 @@ def test_convert_zarr(tmp_path, fmt):
     original = check_store(tmp_path / "src.zarr")
     assert not original["gpu_readable"]
     assert any("cannot be decoded on the GPU" in p for p in original["problems"])
-
-
-def test_convert_zarr_needs_sparse_x(tmp_path):
-    ad.AnnData(np.ones((10, 5), dtype=np.float32)).write_zarr(tmp_path / "dense.zarr")
-    with pytest.raises(ValueError, match=r"must be a CSR or CSC matrix"):
-        rio.convert_zarr(tmp_path / "dense.zarr", tmp_path / "out.zarr")
 
 
 @gpu_io

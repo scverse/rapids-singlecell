@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 # A GPU with more memory than this already in use probably runs something else.
 _BUSY_FRACTION = 0.1
+# Initial pool of RMM's pool allocator (used with managed memory); the asynchronous one needs none.
+_POOL_SIZE = 0.2
 
 
 def start_cluster(
@@ -20,7 +22,7 @@ def start_cluster(
     *,
     threads_per_worker: int = 4,
     protocol: Literal["auto", "ucx", "tcp"] = "auto",
-    pool_size: float | str = 0.2,
+    pool_size: float | str = 0,
     max_pool_size: float | str = 0.75,
     gpu_reads: bool | Literal["auto"] = "auto",
     **cluster_kwargs,
@@ -42,9 +44,13 @@ def start_cluster(
     * One worker per GPU with `threads_per_worker` threads:
       a few threads overlap reading chunks with computing on them;
       more mainly increase memory use.
-    * Each worker allocates GPU memory from an RMM pool, starting at `pool_size` and growing
-      up to `max_pool_size` of the GPU, which leaves room for this process
-      (e.g. for the PCA) and for decompressing chunks on the GPU.
+    * Each worker allocates GPU memory with RMM's asynchronous allocator (``cudaMallocAsync``),
+      using at most `max_pool_size` of the GPU, which leaves room for this process
+      (e.g. for the PCA) and for decompressing chunks on the GPU. Workers keep the memory they used
+      for reuse; ``client.restart()`` releases it (and drops the data persisted on the workers),
+      e.g. before using the GPUs in this process.
+      Unlike RMM's pool allocator, it does not fragment with the large chunks of out-of-core work.
+      With CUDA managed memory (`rmm_managed_memory=True`), RMM's pool allocator is used.
     * UCX for communication between workers if available (`protocol="auto"`), else TCP.
       With CUDA managed memory (`rmm_managed_memory=True`), which UCX does not support, TCP.
     * If KvikIO and nvCOMP are installed, the workers read zarr chunks straight into
@@ -59,10 +65,12 @@ def start_cluster(
     protocol
         Communication protocol between workers.
     pool_size
-        Initial size of each worker's RMM pool: a fraction of the GPU memory (e.g. `0.2`),
-        a number of bytes, or a string like `"20GB"`.
+        GPU memory each worker reserves up front: a fraction of the GPU memory (e.g. `0.2`),
+        a number of bytes, or a string like `"20GB"`. By default nothing with the asynchronous
+        allocator, which is as fast without (idle workers then leave the GPU to this process),
+        and `0.2` with RMM's pool allocator.
     max_pool_size
-        Maximum size of each worker's RMM pool, in the same units as `pool_size`.
+        Maximum GPU memory each worker uses, in the same units as `pool_size`.
     gpu_reads
         Read zarr chunks straight into GPU memory on the workers. `"auto"` does if possible.
     **cluster_kwargs
@@ -93,10 +101,12 @@ def start_cluster(
         require_gpu_io()
     devices = _devices(gpus)
     _warn_if_busy(devices)
+    managed = cluster_kwargs.get("rmm_managed_memory", False)
+    # RMM's pool allocator fragments with large chunks; managed memory needs it
+    use_async = cluster_kwargs.setdefault("rmm_async", not managed)
     if protocol == "auto":
         # UCX does not work with CUDA managed memory
         ucx = find_spec("distributed_ucxx") is not None
-        managed = cluster_kwargs.get("rmm_managed_memory", False)
         protocol = "ucx" if ucx and not managed else "tcp"
     local_cluster = LocalCUDACluster(
         **(
@@ -106,7 +116,7 @@ def start_cluster(
         ),
         threads_per_worker=threads_per_worker,
         protocol=protocol,
-        rmm_pool_size=pool_size,
+        rmm_pool_size=pool_size or (None if use_async else _POOL_SIZE),
         rmm_maximum_pool_size=max_pool_size,
         rmm_allocator_external_lib_list=["cupy"],
         **cluster_kwargs,

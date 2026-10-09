@@ -26,6 +26,7 @@ rsc.pp.scale(adata, zero_center=False, max_value=10)
 adata.X = adata.X.persist()
 rsc.pp.pca(adata, n_comps=100)
 adata.obsm["X_pca"] = rsc.get.X_to_CPU(adata.obsm["X_pca"]).compute()
+client.restart()  # frees the workers' GPU memory for the steps in this process (and drops the persisted adata.X)
 
 rsc.pp.neighbors(adata)
 rsc.tl.umap(adata)
@@ -34,8 +35,8 @@ client.close()  # once you no longer need the cluster
 client.cluster.close()
 ```
 
-* {func}`~rapids_singlecell.dask.start_cluster` uses 4 threads per worker, UCX if available (else TCP), and an RMM pool per worker
-  that grows to at most 75% of its GPU, which leaves room for this process (e.g. the PCA) on the same GPU.
+* {func}`~rapids_singlecell.dask.start_cluster` uses 4 threads per worker, UCX if available (else TCP), and RMM's asynchronous allocator
+  (which does not fragment with large chunks), limited to 75% of each GPU, which leaves room for this process (e.g. the PCA) on the same GPU.
   It warns if a GPU is already busy (e.g. with another cluster). Every setting can be overridden,
   and the cluster stays usable for anything else you do with Dask.
   For capacity over speed, pass `rmm_managed_memory=True`; it then uses TCP, as UCX does not support managed memory.
