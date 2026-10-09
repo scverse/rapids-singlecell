@@ -11,17 +11,17 @@ Download the matching file or run the commands below from a repository checkout.
 `````{tab-set}
 ````{tab-item} CUDA 13
 ```bash
-conda env create -f conda/rsc_rapids_26.08_cuda13.yml
+conda env create -f conda/rsc_rapids_26.10_cuda13.yml
 # or
-mamba env create -f conda/rsc_rapids_26.08_cuda13.yml
+mamba env create -f conda/rsc_rapids_26.10_cuda13.yml
 ```
 *Python 3.14, CUDA 13.3*
 ````
 ````{tab-item} CUDA 12
 ```bash
-conda env create -f conda/rsc_rapids_26.08_cuda12.yml
+conda env create -f conda/rsc_rapids_26.10_cuda12.yml
 # or
-mamba env create -f conda/rsc_rapids_26.08_cuda12.yml
+mamba env create -f conda/rsc_rapids_26.10_cuda12.yml
 ```
 *Python 3.14, CUDA 12.9*
 ````
@@ -175,49 +175,17 @@ Use multiple architectures when building portable binaries (e.g., for a shared c
 The `-real` suffix generates device code only (no PTX fallback), which reduces binary size.
 ```
 
-(agent-skill)=
 ## Agent skill
 
-Released packages contain a matching model-neutral analysis skill.
-Copy it to an agent's personal skill directory after installing RSC:
+````{card} Use rapids-singlecell with coding agents
+:link: agent-skill
+:link-type: ref
 
-```bash
-rapids-singlecell-install-skills --agent codex
-rapids-singlecell-install-skills --agent claude
-rapids-singlecell-install-skills --agent claude-science
-rapids-singlecell-install-skills --agent agents
-rapids-singlecell-install-skills --dest /other/skills/rapids-singlecell
-```
+Install the version-matched analysis skill for Claude Code, Codex, and other agents,
+and check the GPU environment before starting.
+````
 
-`--check` compares the installed copy with the bundle in the active package.
-`--force` replaces a differing copy.
-`--print-path` prints the bundled source.
-For Claude Science, the installer resolves the active organization from `~/.claude-science/active-org.json`.
-
-```bash
-rapids-singlecell-install-skills --check --agent codex
-```
-
-Before starting Jupyter, verify RMM, GPU/CUDA execution, the RSC import, native extensions, and a representative RSC kernel:
-
-```bash
-rapids-singlecell-check-kernel
-rapids-singlecell-check-kernel --mode managed  # planned oversubscription
-```
-
-The preflight is disposable, so configure RMM again at the start of the notebook.
-
-### Bootstrap from a standalone skill
-
-If RSC is not installed, create a fresh environment from the matching canonical definition on `main`:
-
-- [CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda12.yml)
-- [CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda13.yml)
-
-```bash
-CONDA_CHANNEL_PRIORITY=flexible mamba env create --name rsc \
-  --file /path/to/rsc_rapids_26.08_cuda13.yml
-```
+See the {ref}`agent skill guide <agent-skill>` for installation, kernel checks, and usage.
 
 (container-deprecation)=
 ## Docker
