@@ -111,7 +111,7 @@ struct ClusteringArgs {
     // Workspace
     T* Y_norm;  // centroids, normalized in place
     int* idx_list;
-    T* penalty;
+    T* penalty;              // batches x K log penalties
     T* objective_partials;   // n_cells, then objective scratch
     int* block_cat_offsets;  // n_blocks x groups + 1, then one block's tiles
     // (n_blocks + 3) x groups x K fixed-point counts: each block's, O's, and
@@ -167,10 +167,9 @@ constexpr int ASSIGN_TILES_PER_SM = 4;
 
 template <typename T, typename RT>
 static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
-                              const T* penalty, bool log_pen,
-                              const int* offsets, int n_rows, int n_groups,
-                              int* tiles, int n_sm, long long* counts,
-                              T count_scale) {
+                              const T* penalty, const int* offsets, int n_rows,
+                              int n_groups, int* tiles, int n_sm,
+                              long long* counts, T count_scale) {
     int n_pcs = a.n_pcs, n_clusters = a.n_clusters;
     cudaStream_t stream = a.stream;
     size_t smem = fused_assign_smem_bytes<T>(n_pcs, n_clusters);
@@ -185,14 +184,10 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
         throw std::invalid_argument(
             "this shape needs the general assignment workspace");
     int z_slots = (fused_padded_pcs(n_pcs) + 31) / 32;
-    auto pick = [&](auto log_tag) {
-        constexpr bool L = decltype(log_tag)::value;
-        return z_slots == 1   ? fused_assign_kernel<T, RT, 1, L>
-               : z_slots == 2 ? fused_assign_kernel<T, RT, 2, L>
-               : z_slots == 3 ? fused_assign_kernel<T, RT, 3, L>
-                              : fused_assign_kernel<T, RT, 4, L>;
-    };
-    auto kernel = log_pen ? pick(std::true_type{}) : pick(std::false_type{});
+    auto kernel = z_slots == 1   ? fused_assign_kernel<T, RT, 1>
+                  : z_slots == 2 ? fused_assign_kernel<T, RT, 2>
+                  : z_slots == 3 ? fused_assign_kernel<T, RT, 3>
+                                 : fused_assign_kernel<T, RT, 4>;
     if (!general && smem > 48 * 1024)
         cuda_check(
             cudaFuncSetAttribute(
@@ -219,13 +214,12 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
             <<<(pcs * k_stride + 255) / 256, 256, 0, stream>>>(
                 a.Y_norm, a.y_t_general, n_pcs, pcs, n_clusters, k_stride);
         CUDA_CHECK_LAST_ERROR(transpose_centroids_kernel);
-        auto general_kernel = log_pen
-                                  ? fused_assign_general_kernel<T, RT, true>
-                                  : fused_assign_general_kernel<T, RT, false>;
-        general_kernel<<<max_tiles, FUSED_THREADS, 0, stream>>>(
-            a.Z_norm, a.y_t_general, k_stride, penalty, a.idx_list, offsets,
-            tiles, n_groups, (int)tile_rows, R, a.objective_partials, ucounts,
-            a.col_workspace, term, a.sigma, count_scale, n_pcs, n_clusters);
+        fused_assign_general_kernel<T, RT>
+            <<<max_tiles, FUSED_THREADS, 0, stream>>>(
+                a.Z_norm, a.y_t_general, k_stride, penalty, a.idx_list, offsets,
+                tiles, n_groups, (int)tile_rows, R, a.objective_partials,
+                ucounts, a.col_workspace, term, a.sigma, count_scale, n_pcs,
+                n_clusters);
     } else {
         kernel<<<max_tiles, FUSED_THREADS, smem, stream>>>(
             a.Z_norm, a.Y_norm, penalty, a.idx_list, offsets, tiles, n_groups,
@@ -336,10 +330,9 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                           cudaMemcpyDeviceToHost, a.stream),
         "block starts copy");
     cuda_check(cudaStreamSynchronize(a.stream), "block starts copy");
-    auto assign = [&](int blk, const T* penalty, bool log_pen,
-                      long long* counts) {
+    auto assign = [&](int blk, const T* penalty, long long* counts) {
         if (starts[blk + 1] == starts[blk]) return;
-        fused_assign_pass(a, R, penalty, log_pen,
+        fused_assign_pass(a, R, penalty,
                           a.block_cat_offsets + (size_t)blk * n_groups,
                           starts[blk + 1] - starts[blk], n_groups, assign_tiles,
                           n_sm, counts, scales.count);
@@ -355,7 +348,7 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                         (size_t)(n_blocks + 3) * ob_total * sizeof(long long),
                         a.stream);
         for (int blk = 0; blk < n_blocks; ++blk)
-            assign(blk, nullptr, false, stored(blk));
+            assign(blk, nullptr, stored(blk));
         sum_blocks_kernel<<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
             a.block_counts, n_blocks, total, ob_total);
         CUDA_CHECK_LAST_ERROR(sum_blocks_kernel);
@@ -396,7 +389,7 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                                    n_groups, a.n_clusters, a.group_penalty);
                 CUDA_CHECK_LAST_ERROR(joint_log_penalty_kernel);
             }
-            assign(block(step), group_penalty, multi, slot(step));
+            assign(block(step), group_penalty, slot(step));
         }
         for (int fold = std::max(0, n_blocks - 2); fold < n_blocks; ++fold)
             update_counts(block(fold), slot(fold), -1, nullptr);
