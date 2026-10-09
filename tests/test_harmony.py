@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import anndata as ad
 import cupy as cp
 import numpy as np
@@ -1069,3 +1071,58 @@ def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype):
     # Without validated peer copies everything moves through the host.
     monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)
     assert run(multi_gpu=[0, 1]).tobytes() == one.tobytes()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_threads_wait_for_the_callers_stream(monkeypatch):
+    # The caller works on a non-blocking stream that a sleeping host callback
+    # holds up before the upload targets and the centroids are written: the
+    # upload and GPU threads, on their own streams, must still read them. A
+    # memory pool keeps cudaFree from synchronizing the device, which would
+    # hide a missing wait.
+    devices = list(range(min(2, cp.cuda.runtime.getDeviceCount())))
+    rng = np.random.default_rng(11)
+    n_cells = 6000
+    obs = pd.DataFrame(
+        {"batch": rng.integers(0, 5, n_cells).astype(str)},
+        index=np.arange(n_cells).astype(str),
+    ).astype("category")
+    X = rng.standard_normal((n_cells, 17)).astype(np.float32)
+
+    def run(data):
+        adata = ad.AnnData(obs=obs, obsm={"X_pca": data.copy()})
+        rsc.pp.harmony_integrate(
+            adata,
+            "batch",
+            rng=734,
+            n_clusters=20,
+            max_iter_harmony=2,
+            multi_gpu=devices,
+        )
+        return adata.obsm["X_pca_harmony"]
+
+    def late(x):
+        held = cp.full_like(x, -1)  # what other streams see until the callback returns
+        cp.cuda.get_current_stream().launch_host_func(lambda _: time.sleep(0.2), None)
+        held[...] = x
+        return held
+
+    allocator = cp.cuda.get_allocator()
+    cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
+    try:
+        run(rng.standard_normal(X.shape).astype(np.float32))  # pools hold other rows
+        where, centroids = cp.where, harmony_module._kmeans_centroids
+        with monkeypatch.context() as m:
+            m.setattr(
+                cp, "where", lambda *a: late(where(*a)) if len(a) == 3 else where(*a)
+            )
+            m.setattr(
+                harmony_module,
+                "_kmeans_centroids",
+                lambda *a, **k: late(centroids(*a, **k)),
+            )
+            with cp.cuda.Stream(non_blocking=True):
+                result = run(X)
+        assert result.tobytes() == run(X).tobytes()
+    finally:
+        cp.cuda.set_allocator(allocator)
