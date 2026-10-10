@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 import warnings
 from typing import TYPE_CHECKING, Literal
 
@@ -45,6 +44,7 @@ def harmony_integrate(
     block_proportion: float = 0.05,
     shuffle_chunk_size: int = 8,
     rng: SeedLike | RNGLike | None = None,
+    multi_gpu: bool | list[int] | str | None = False,
     verbose: bool = False,
 ) -> None:
     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
@@ -191,6 +191,13 @@ def harmony_integrate(
         float32 and float64. Initialization uses k-means++ and fixed-order
         Lloyd reductions. Results may differ across GPU architectures or
         CUDA versions; concurrent CUDA streams are outside this guarantee.
+    multi_gpu
+        GPUs to split the cells across: ``True`` for all visible GPUs, a list
+        or comma-separated string of device ids, or ``False``/``None`` for the
+        current GPU. The result is bitwise identical to a run on one GPU of the
+        same model. The fast correction runs on one GPU; it is also chosen
+        for ``correction_method=None`` when the batched correction would need
+        more than 1 GiB of workspace.
     verbose
         Whether to print the number of iterations until convergence.
 
@@ -205,7 +212,9 @@ def harmony_integrate(
     if bfloat16:
         dtype = np.float32
 
-    from ._harmony import _download, harmonize
+    from rapids_singlecell._utils._multi_gpu import parse_device_ids
+
+    from ._harmony import harmonize
 
     # Resolve flavor into internal flags
     if flavor not in {"harmony1", "harmony2"}:
@@ -256,8 +265,9 @@ def harmony_integrate(
             # copy is kept. Harmony rejects NaN and infinite values.
             X = np.ascontiguousarray(input_data, dtype=dtype)
         elif isinstance(input_data, cp.ndarray):
-            # CuPy array: ensure correct dtype and layout with a copy
-            X = input_data.astype(dtype, order="C", copy=False)
+            # CuPy array: ensure correct dtype and layout, on its GPU
+            with cp.cuda.Device(input_data.device.id):
+                X = input_data.astype(dtype, order="C", copy=False)
         else:
             # Other array types: convert to NumPy first, then to CuPy
             try:
@@ -272,37 +282,38 @@ def harmony_integrate(
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
 
-    # Fault in the host output while the GPU works; copying into touched pages
-    # is about twice as fast as into a fresh allocation.
-    host_out = np.empty(X.shape, dtype=X.dtype)
-    prefault = threading.Thread(target=host_out.fill, args=(0,), daemon=True)
-    prefault.start()
-    harmony_out = harmonize(
-        X,
-        adata.obs,
-        key,
-        n_clusters=n_clusters,
-        max_iter_harmony=max_iter_harmony,
-        max_iter_clustering=max_iter_clustering,
-        tol_harmony=tol_harmony,
-        tol_clustering=tol_clustering,
-        ridge_lambda=ridge_lambda,
-        sigma=sigma,
-        block_proportion=block_proportion,
-        shuffle_chunk_size=shuffle_chunk_size,
-        theta=theta,
-        tau=tau,
-        correction_method=correction_method,
-        colsum_algo=colsum_algo,
-        rng=rng,
-        stabilized_penalty=stabilized_penalty,
-        dynamic_lambda=dynamic_lambda,
-        alpha=alpha,
-        batch_prune_threshold=batch_prune_threshold,
-        verbose=verbose,
-        bfloat16=bfloat16,
+    devices = (
+        [cp.cuda.Device().id]
+        if multi_gpu in (None, False)
+        else parse_device_ids(multi_gpu=multi_gpu)
     )
-
-    prefault.join()
-    _download(harmony_out, host_out)
+    host_out = np.empty(X.shape, dtype=X.dtype)
+    with cp.cuda.Device(devices[0]):
+        harmonize(
+            X,
+            adata.obs,
+            key,
+            n_clusters=n_clusters,
+            max_iter_harmony=max_iter_harmony,
+            max_iter_clustering=max_iter_clustering,
+            tol_harmony=tol_harmony,
+            tol_clustering=tol_clustering,
+            ridge_lambda=ridge_lambda,
+            sigma=sigma,
+            block_proportion=block_proportion,
+            shuffle_chunk_size=shuffle_chunk_size,
+            theta=theta,
+            tau=tau,
+            correction_method=correction_method,
+            colsum_algo=colsum_algo,
+            rng=rng,
+            stabilized_penalty=stabilized_penalty,
+            dynamic_lambda=dynamic_lambda,
+            alpha=alpha,
+            batch_prune_threshold=batch_prune_threshold,
+            verbose=verbose,
+            bfloat16=bfloat16,
+            devices=devices,
+            out=host_out,
+        )
     adata.obsm[adjusted_basis] = host_out

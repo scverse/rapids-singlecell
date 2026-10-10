@@ -1,6 +1,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/vector.h>
 
 #include <algorithm>
 #include <climits>
@@ -13,6 +14,7 @@
 
 #include "../scatter/kernels_scatter.cuh"
 #include "../scatter/kernels_scatter_reduce.cuh"
+#include "../comm.cuh"
 #include "../segment_gemm.cuh"
 #include "kernels_clustering.cuh"
 
@@ -136,6 +138,8 @@ struct ClusteringArgs {
     bool stabilized;
     cudaStream_t stream;
     bool initialize;  // unpenalized assignment from Y_norm instead of the loop
+    harmony_comm::Comm* comm;  // several GPUs: this one's rank, else null
+    int rank;
 };
 
 // ---------- Clustering loop ----------
@@ -264,6 +268,8 @@ static double fused_objective(const ClusteringArgs<T>& a,
         long long acc;
         T diversity;
     } host;
+    harmony_comm::allreduce(a.comm, a.rank, reinterpret_cast<long long*>(acc),
+                            1, stream);
     cuda_check(cudaMemcpyAsync(&host, acc, sizeof(host), cudaMemcpyDeviceToHost,
                                stream),
                "objective copy");
@@ -348,6 +354,39 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                           starts[blk + 1] - starts[blk], n_groups, assign_tiles,
                           n_sm, counts, scales.count);
     };
+    // Several GPUs: a block's new counts are summed on a side stream while
+    // the next block is assigned, and folded in once summed.
+    struct Side {
+        cudaStream_t stream = nullptr;
+        cudaEvent_t ready[2], summed[2];
+        ~Side() {
+            if (!stream) return;
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+            for (int s = 0; s < 2; ++s)
+                cudaEventDestroy(ready[s]), cudaEventDestroy(summed[s]);
+        }
+    } side;
+    if (a.comm) {
+        cuda_check(
+            cudaStreamCreateWithFlags(&side.stream, cudaStreamNonBlocking),
+            "exchange stream");
+        for (int s = 0; s < 2; ++s) {
+            cudaEventCreateWithFlags(&side.ready[s], cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&side.summed[s], cudaEventDisableTiming);
+        }
+    }
+    auto exchange = [&](int step) {
+        if (!a.comm) return;
+        cudaEventRecord(side.ready[step & 1], a.stream);
+        cudaStreamWaitEvent(side.stream, side.ready[step & 1]);
+        harmony_comm::allreduce(a.comm, a.rank, slot(step), ob_total,
+                                side.stream);
+        cudaEventRecord(side.summed[step & 1], side.stream);
+    };
+    auto summed = [&](int step) {
+        if (a.comm) cudaStreamWaitEvent(a.stream, side.summed[step & 1]);
+    };
     // E from the full O, then the objective.
     auto objective = [&](bool evaluate) {
         penalty_from_counts(nullptr);
@@ -361,6 +400,8 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                         a.stream);
         for (int blk = 0; blk < n_blocks; ++blk)
             assign(blk, nullptr, stored(blk));
+        harmony_comm::allreduce(a.comm, a.rank, a.block_counts,
+                                (size_t)n_blocks * ob_total, a.stream);
         sum_blocks_kernel<<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
             a.block_counts, n_blocks, total, ob_total);
         CUDA_CHECK_LAST_ERROR(sum_blocks_kernel);
@@ -376,6 +417,8 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                 a.Z_norm, R, a.n_pcs, a.n_clusters, a.n_clusters, a.seg_start,
                 nullptr, a.n_seg, a.y_scale, a.y_acc, y_limbs, a.stream),
             "centroids");
+        harmony_comm::allreduce(a.comm, a.rank, a.y_acc, y_limbs * kd,
+                                a.stream);
         cuda_check(harmony_segments::finalize_rtz(
                        a.y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_scale,
                        a.Y_norm, 0, a.n_pcs, a.stream),
@@ -391,6 +434,7 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         auto block = [&](int step) { return (step + shift) % n_blocks; };
         for (int step = 0; step < n_blocks; ++step) {
             int fold = step - 2;
+            if (fold >= 0) summed(fold);
             update_counts(fold < 0 ? -1 : block(fold),
                           fold < 0 ? nullptr : slot(fold), block(step),
                           slot(step));
@@ -403,9 +447,12 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                 CUDA_CHECK_LAST_ERROR(joint_log_penalty_kernel);
             }
             assign(block(step), group_penalty, slot(step));
+            exchange(step);
         }
-        for (int fold = std::max(0, n_blocks - 2); fold < n_blocks; ++fold)
+        for (int fold = std::max(0, n_blocks - 2); fold < n_blocks; ++fold) {
+            summed(fold);
             update_counts(block(fold), slot(fold), -1, nullptr);
+        }
 
         // Objective: per-cell terms from the assignment pass plus diversity.
         // The first convergence decision needs WINDOW_SIZE + 1 objectives;
@@ -458,7 +505,8 @@ static void register_clustering_loop(nb::module_& m) {
            int n_clusters, int n_batches, int n_covariates,
            int n_joint_categories, int n_first, int n_blocks, double sigma,
            double tol, int max_iter, unsigned int seed, bool stabilized,
-           std::uintptr_t stream, bool initialize) {
+           std::uintptr_t stream, bool initialize, std::uintptr_t comm,
+           int rank) {
             int n_groups = n_covariates > 1 ? n_joint_categories : n_batches;
             size_t max_tiles =
                 (size_t)ASSIGN_TILES_PER_SM *
@@ -518,13 +566,16 @@ static void register_clustering_loop(nb::module_& m) {
                                 seed,
                                 stabilized,
                                 (cudaStream_t)stream,
-                                initialize};
+                                initialize,
+                                (harmony_comm::Comm*)comm,
+                                rank};
             return fused_clustering_loop_impl(a);
         },
-        "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "theta"_a,
-        "Y_norm"_a, "idx_list"_a, "penalty"_a, "objective_partials"_a,
-        "block_cat_offsets"_a, "block_counts"_a, "seg_start"_a, "y_scale"_a,
-        "y_acc"_a, "R_bf16"_a = nb::none(), "joint_cats"_a = nb::none(),
+        nb::call_guard<nb::gil_scoped_release>(), "Z_norm"_a, nb::kw_only(),
+        "R"_a, "E"_a, "O"_a, "Pr_b"_a, "theta"_a, "Y_norm"_a, "idx_list"_a,
+        "penalty"_a, "objective_partials"_a, "block_cat_offsets"_a,
+        "block_counts"_a, "seg_start"_a, "y_scale"_a, "y_acc"_a,
+        "R_bf16"_a = nb::none(), "joint_cats"_a = nb::none(),
         "marginal_joint_offsets"_a = nb::none(),
         "marginal_joint_indices"_a = nb::none(), "O_joint"_a = nb::none(),
         "group_penalty"_a = nb::none(), "y_t"_a, "col_workspace"_a = nb::none(),
@@ -532,7 +583,7 @@ static void register_clustering_loop(nb::module_& m) {
         "n_clusters"_a, "n_batches"_a, "n_covariates"_a = 1,
         "n_joint_categories"_a = 0, "n_first"_a = 0, "n_blocks"_a, "sigma"_a,
         "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0, "stabilized"_a,
-        "stream"_a = 0, "initialize"_a = false);
+        "stream"_a = 0, "initialize"_a = false, "comm"_a = 0, "rank"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -680,5 +731,12 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_harmony_clustering_cuda, m) {
     m.attr("KMEANS_WEIGHT_TILE_ROWS") = nb::int_(KMEANS_WEIGHT_TILE_ROWS);
+    using harmony_comm::Comm;
+    nb::class_<Comm>(m, "Comm")
+        .def(nb::init<const std::vector<int>&, const std::vector<uintptr_t>&,
+                      size_t, bool>(),
+             "devices"_a, "buffers"_a, "capacity"_a, "peer"_a)
+        .def_prop_ro("handle", [](Comm& c) { return (uintptr_t)&c; })
+        .def("abort", [](Comm& c) { c.aborted = true; });
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }
