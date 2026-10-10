@@ -130,4 +130,8 @@ if (RSC_BUILD_EXTENSIONS)
   target_link_libraries(_harmony_correction_batched_cuda PRIVATE CUDA::cublas)
   # Wilcoxon binned histogram CUDA module
   add_nb_cuda_module(_wilcoxon_binned_cuda   src/rapids_singlecell/_cuda/wilcoxon_binned/wilcoxon_binned.cu)
+  # Native Leiden: one translation unit; --fmad=false module-wide (every fp op
+  # in a decision or output also uses explicit _rn intrinsics)
+  add_nb_cuda_module(_leiden_cuda           src/rapids_singlecell/_cuda/leiden/leiden.cu)
+  target_compile_options(_leiden_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
