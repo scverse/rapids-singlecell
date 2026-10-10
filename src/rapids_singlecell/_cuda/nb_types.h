@@ -24,6 +24,7 @@ inline void cuda_check_last_error(const char* kernel_name) {
 /// Failed calls surface with a clear label instead of corrupted output later.
 inline void cuda_check(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
+        cudaGetLastError();  // clear it, so later launch checks do not see it
         throw std::runtime_error(std::string(what) +
                                  " failed: " + cudaGetErrorString(err));
     }

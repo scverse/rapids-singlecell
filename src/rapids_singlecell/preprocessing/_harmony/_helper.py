@@ -1,63 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import cupy as cp
 import numpy as np
+import pandas as pd
 
-from rapids_singlecell._cuda import _harmony_colsum_cuda as _colsum_cuda
-from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
-from rapids_singlecell._cuda import _harmony_outer_cuda as _outer_cuda
-
-if TYPE_CHECKING:
-    import pandas as pd
-
-# Column-sum heuristic thresholds (rows x cols regions)
-_COLSUM_COLS_SMALL = 200
-_COLSUM_ROWS_MEDIUM = 20_000
-_COLSUM_ROWS_LARGE = 100_000
-
-
-def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
-    """
-    Normalize rows of a matrix using an optimized kernel with shared memory and warp shuffle.
-
-    Parameters
-    ----------
-    X
-        Input 2D array.
-
-    Returns
-    -------
-    Row-normalized 2D array.
-    """
-    assert X.ndim == 2, "Input must be a 2D array."
-
-    rows, cols = X.shape
-
-    _normalize_cuda.normalize(
-        X,
-        rows=rows,
-        cols=cols,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-    return X
-
-
-def _outer_cp(
-    E: cp.ndarray, Pr_b: cp.ndarray, R_sum: cp.ndarray, switcher: int
-) -> None:
-    n_cats, n_pcs = E.shape
-
-    _outer_cuda.outer(
-        E,
-        Pr_b=Pr_b,
-        R_sum=R_sum,
-        n_cats=n_cats,
-        n_pcs=n_pcs,
-        switcher=switcher,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
+from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
 
 
 def _validate_output_buffer(
@@ -73,64 +20,55 @@ def _validate_output_buffer(
         raise ValueError(f"{operation} output must be C-contiguous")
 
 
-def _normalize_cp(
-    X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None
-) -> cp.ndarray:
-    """
-    Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`.
-    """
-    if p == 2:
-        X = cp.ascontiguousarray(X)
-        if out is None:
-            out = cp.empty_like(X)
-        else:
-            _validate_output_buffer(X, out, operation="Normalization")
-        rows, cols = X.shape
-        _normalize_cuda.l2_row_normalize(
-            X,
-            dst=out,
-            n_rows=rows,
-            n_cols=cols,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-        return out
-
+def _normalize_cp(X: cp.ndarray, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """L2-normalize the rows of ``X`` (into ``out`` when given)."""
+    X = cp.ascontiguousarray(X)
+    if out is None:
+        out = cp.empty_like(X)
     else:
-        if out is not None and out is not X:
-            raise ValueError("An output buffer is only supported for L2 normalization")
-        return _normalize_cp_p1(X)
+        _validate_output_buffer(X, out, operation="Normalization")
+    _clustering_cuda.l2_row_normalize(
+        X, dst=out, stream=cp.cuda.get_current_stream().ptr
+    )
+    return out
 
 
 def _get_batch_codes(
     batch_mat: pd.DataFrame, batch_key: str | list[str]
-) -> tuple[np.ndarray, np.ndarray]:
-    """Encode each batch variable into a disjoint range of marginal codes."""
+) -> tuple[cp.ndarray, np.ndarray]:
+    """Encode each batch variable into a disjoint range of marginal codes
+    (device ``int32``, one column per variable)."""
     keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
     if not keys:
         raise ValueError("batch_key must contain at least one column name")
 
-    codes = np.empty((len(batch_mat), len(keys)), dtype=np.int32)
+    codes = cp.empty((len(batch_mat), len(keys)), dtype=cp.int32)
     n_levels = np.empty(len(keys), dtype=np.int32)
     offset = 0
 
     for covariate, key in enumerate(keys):
-        batch_vec = batch_mat[key].astype("category")
-        local_codes = batch_vec.cat.codes.to_numpy(dtype=np.int32, copy=False)
-        if np.any(local_codes < 0):
+        batch_vec = batch_mat[key]
+        if not isinstance(batch_vec.dtype, pd.CategoricalDtype):
+            batch_vec = batch_vec.astype("category")
+        # Upload the compact pandas codes; widen and offset on the GPU.
+        local_codes = cp.asarray(batch_vec.cat.codes.to_numpy())
+        if len(local_codes) and int(local_codes.min()) < 0:
             raise ValueError(f"Batch variable {key!r} contains missing values")
 
         n_categories = batch_vec.cat.categories.size
         n_levels[covariate] = n_categories
-        codes[:, covariate] = local_codes + offset
+        codes[:, covariate] = local_codes.astype(cp.int32) + offset
         offset += n_categories
 
     return codes, n_levels
 
 
 def _factorize_joint_codes(
-    batch_codes: np.ndarray, n_levels: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Factorize marginal category tuples in lexicographic order."""
+    batch_codes: np.ndarray | cp.ndarray, n_levels: np.ndarray
+) -> tuple[np.ndarray | cp.ndarray, np.ndarray | cp.ndarray]:
+    """Factorize marginal category tuples in lexicographic order, on the
+    device of ``batch_codes``."""
+    xp = cp.get_array_module(batch_codes)
     levels = np.asarray(n_levels, dtype=np.int64)
     if batch_codes.ndim != 2 or batch_codes.shape[1] != levels.size:
         raise ValueError("Batch codes and category levels have incompatible shapes")
@@ -140,28 +78,28 @@ def _factorize_joint_codes(
         joint_cardinality *= int(level)
         if joint_cardinality > np.iinfo(np.int64).max:
             joint_cats, joint_codes = np.unique(
-                batch_codes, axis=0, return_inverse=True
+                cp.asnumpy(batch_codes), axis=0, return_inverse=True
             )
-            return joint_cats, np.asarray(joint_codes).reshape(-1)
+            return xp.asarray(joint_cats), xp.asarray(joint_codes).reshape(-1)
 
     offsets = np.empty(levels.size, dtype=np.int64)
     offsets[0] = 0
     if levels.size > 1:
         np.cumsum(levels[:-1], out=offsets[1:])
 
-    linear_codes = batch_codes[:, 0].astype(np.int64) - offsets[0]
+    linear_codes = batch_codes[:, 0].astype(xp.int64) - int(offsets[0])
     for covariate in range(1, levels.size):
-        linear_codes *= levels[covariate]
-        linear_codes += batch_codes[:, covariate] - offsets[covariate]
+        linear_codes *= int(levels[covariate])
+        linear_codes += batch_codes[:, covariate] - int(offsets[covariate])
 
-    observed_codes, joint_codes = np.unique(linear_codes, return_inverse=True)
-    joint_cats = np.empty((observed_codes.size, levels.size), dtype=np.int32)
+    observed_codes, joint_codes = xp.unique(linear_codes, return_inverse=True)
+    joint_cats = xp.empty((observed_codes.size, levels.size), dtype=xp.int32)
     remainder = observed_codes.copy()
     for covariate in range(levels.size - 1, -1, -1):
-        joint_cats[:, covariate] = remainder % levels[covariate]
-        remainder //= levels[covariate]
-    joint_cats += offsets.astype(np.int32)
-    return joint_cats, joint_codes
+        joint_cats[:, covariate] = remainder % int(levels[covariate])
+        remainder //= int(levels[covariate])
+    joint_cats += xp.asarray(offsets.astype(np.int32))
+    return joint_cats, joint_codes.reshape(-1)
 
 
 def _stratified_sample_indices(
@@ -170,7 +108,11 @@ def _stratified_sample_indices(
     n_target: int,
     rng: np.random.Generator,
 ) -> cp.ndarray:
-    """Draw exactly ``n_target`` cells while representing every observed stratum."""
+    """Draw exactly ``n_target`` cells while representing every observed stratum.
+
+    ``cell_indices`` lists each stratum's cells in a seeded random order (as
+    Harmony sorts them), so its first ``quota`` cells are a uniform draw.
+    """
     offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
     sizes = np.diff(offsets)
     nonempty = np.flatnonzero(sizes)
@@ -197,15 +139,8 @@ def _stratified_sample_indices(
             order = np.lexsort((tie_break, -remainders[eligible]))
             quotas[eligible[order[:leftover]]] += 1
 
-    picks = []
-    for start, size, quota in zip(offsets[:-1], sizes, quotas, strict=True):
-        start, size, quota = int(start), int(size), int(quota)
-        if quota == 0:
-            continue
-        picks.append(start + rng.choice(size, quota, replace=False))
-
-    selected = cell_indices[cp.asarray(np.concatenate(picks))]
-    return selected[cp.asarray(rng.permutation(n_target))]
+    starts = offsets[:-1] - np.concatenate([[0], np.cumsum(quotas)[:-1]])
+    return cell_indices[cp.asarray(np.repeat(starts, quotas) + np.arange(n_target))]
 
 
 def _get_theta_array(
@@ -240,54 +175,3 @@ def _get_theta_array(
         f"Theta array size ({theta_array.size}) must match the number of batch "
         f"variables ({n_covariates}) or categorical levels ({n_categories})"
     )
-
-
-def _column_sum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column of the 2D, C-contiguous float32 array A.
-    Returns a 1D float32 cupy array of length A.shape[1].
-    """
-    rows, cols = X.shape
-    if not X.flags.c_contiguous:
-        return X.sum(axis=0)
-
-    out = cp.zeros(cols, dtype=X.dtype)
-
-    _colsum_cuda.colsum(
-        X,
-        out=out,
-        rows=rows,
-        cols=cols,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-
-    return out
-
-
-def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column with cuBLAS GEMM
-    """
-    return X.T @ cp.ones(X.shape[0], dtype=X.dtype)
-
-
-def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> callable:
-    """Choose a deterministic column reduction from the shape and device."""
-    if algo in {"atomics", "benchmark"}:
-        algo = None
-    if algo is None:
-        cc = cp.cuda.Device().compute_capability
-        algo = _colsum_heuristic(rows, cols, cc)
-    if algo == "columns":
-        return _column_sum
-    return _gemm_colsum
-
-
-# TODO: Make this more robust
-def _colsum_heuristic(rows: int, cols: int, compute_capability: str) -> str:
-    is_data_center = compute_capability in ["100", "90"]
-    if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_MEDIUM:
-        return "columns"
-    if cols < _COLSUM_COLS_SMALL and rows < _COLSUM_ROWS_LARGE and is_data_center:
-        return "columns"
-    return "gemm"

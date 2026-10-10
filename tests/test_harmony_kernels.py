@@ -12,39 +12,16 @@ from rapids_singlecell._cuda import (
     _harmony_clustering_cuda as _cl,
 )
 from rapids_singlecell._cuda import (
-    _harmony_colsum_cuda as _colsum,
-)
-from rapids_singlecell._cuda import (
     _harmony_correction_cuda as _corr,
 )
-from rapids_singlecell._cuda import (
-    _harmony_normalize_cuda as _norm,
-)
-from rapids_singlecell._cuda import (
-    _harmony_pen_cuda as _pen,
-)
-from rapids_singlecell._cuda import (
-    _harmony_scatter_cuda as _scatter,
-)
-from rapids_singlecell._utils import _create_category_index_mapping
+from rapids_singlecell.preprocessing._harmony._kmeans import _fused_distances
 
 pytestmark = pytest.mark.skipif(
-    _norm is None
-    or _pen is None
-    or _scatter is None
-    or _colsum is None
-    or _cl is None
-    or _corr is None,
+    _cl is None or _corr is None,
     reason="Harmony CUDA modules not available",
 )
 
 DTYPES = [np.float32, np.float64]
-
-
-def _random_idx(n_src, n_dst, seed=42):
-    """Generate random unique indices using NumPy (CuPy Generator lacks choice)."""
-    idx_np = np.random.default_rng(seed).choice(n_src, size=n_dst, replace=False)
-    return cp.asarray(idx_np, dtype=cp.int32)
 
 
 # ---------- l2_row_normalize ----------
@@ -59,7 +36,7 @@ def test_l2_row_normalize(dtype, n_rows, n_cols, in_place):
     expected = src.copy()
     dst = src if in_place else cp.empty_like(src)
 
-    _norm.l2_row_normalize(src, dst=dst, n_rows=n_rows, n_cols=n_cols)
+    _cl.l2_row_normalize(src, dst=dst)
     cp.cuda.Device().synchronize()
 
     # Reference: L2 row normalize
@@ -78,7 +55,7 @@ def test_l2_row_normalize_zero_row(dtype):
     src[1, :] = 1.0  # only middle row is non-zero
     dst = cp.empty_like(src)
 
-    _norm.l2_row_normalize(src, dst=dst, n_rows=3, n_cols=10)
+    _cl.l2_row_normalize(src, dst=dst)
     cp.cuda.Device().synchronize()
 
     assert not cp.any(cp.isnan(dst))
@@ -87,326 +64,29 @@ def test_l2_row_normalize_zero_row(dtype):
     cp.testing.assert_array_equal(dst[2], cp.zeros(10, dtype=dtype))
 
 
-# ---------- penalty_kernel ----------
-
-
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_batches,n_clusters", [(3, 20), (10, 100), (1, 5)])
-@pytest.mark.parametrize("stabilized", [True, False])
-def test_penalty(dtype, n_batches, n_clusters, stabilized):
-    rng = cp.random.default_rng(123)
-    E = rng.random((n_batches, n_clusters), dtype=dtype) * 10
-    O = rng.random((n_batches, n_clusters), dtype=dtype) * 10
-    theta = rng.random(n_batches, dtype=dtype) * 2 + 0.5
-    penalty = cp.empty_like(E)
-
-    _pen.penalty(
-        E,
-        O=O,
-        theta=theta,
-        penalty=penalty,
-        n_batches=n_batches,
-        n_clusters=n_clusters,
-        stabilized=stabilized,
-    )
-    cp.cuda.Device().synchronize()
-
-    # Reference
-    denom = (O + E + 1) if stabilized else (O + 1)
-    expected = cp.power(
-        (E + 1) / denom,
-        theta[:, None],
-    )
-
-    atol = 1e-5 if dtype == np.float32 else 1e-10
-    cp.testing.assert_allclose(penalty, expected, atol=atol, rtol=1e-4)
-
-
-# ---------- fused_pen_norm_kernel_int ----------
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_rows,n_cols", [(200, 50), (50, 100)])
-def test_fused_pen_norm_int(dtype, n_rows, n_cols):
-    rng = cp.random.default_rng(99)
-    n_batches = 3
-
-    similarities = rng.random((n_rows, n_cols), dtype=dtype)
-    penalty = rng.random((n_batches, n_cols), dtype=dtype) + 0.1
-    cats = rng.integers(0, n_batches, size=n_rows).astype(cp.int32)
-    idx_in = cp.arange(n_rows, dtype=cp.int32)  # identity permutation
-    R_out = cp.empty((n_rows, n_cols), dtype=dtype)
-    term = float(dtype(-2) / dtype(0.1))  # native Python float for nanobind
-
-    _pen.fused_pen_norm_int(
-        similarities,
-        penalty=penalty,
-        cats=cats,
-        idx_in=idx_in,
-        R_out=R_out,
-        term=term,
-        n_rows=n_rows,
-        n_cols=n_cols,
-    )
-    cp.cuda.Device().synchronize()
-
-    # Reference: exp(term * (1 - sim)) * penalty[cat], then row-normalize
-    sim_gathered = similarities[idx_in]
-    raw = cp.exp(dtype(term) * (1 - sim_gathered)) * penalty[cats]
-    expected = raw / raw.sum(axis=1, keepdims=True)
-
-    atol = 1e-5 if dtype == np.float32 else 1e-10
-    cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-4)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_fused_pen_norm_int_with_permutation(dtype):
-    """Test with non-identity permutation to verify idx_in gather."""
-    n_rows, n_cols, n_batches = 100, 30, 4
-    rng = cp.random.default_rng(77)
-
-    similarities = rng.random((200, n_cols), dtype=dtype)  # larger source
-    penalty = rng.random((n_batches, n_cols), dtype=dtype) + 0.1
-    cats = rng.integers(0, n_batches, size=n_rows).astype(cp.int32)
-    idx_in = _random_idx(200, n_rows, seed=77)
-    R_out = cp.empty((n_rows, n_cols), dtype=dtype)
-    term = float(dtype(-20.0))
-
-    _pen.fused_pen_norm_int(
-        similarities,
-        penalty=penalty,
-        cats=cats,
-        idx_in=idx_in,
-        R_out=R_out,
-        term=term,
-        n_rows=n_rows,
-        n_cols=n_cols,
-    )
-    cp.cuda.Device().synchronize()
-
-    sim_gathered = similarities[idx_in]
-    raw = cp.exp(dtype(term) * (1 - sim_gathered)) * penalty[cats]
-    expected = raw / raw.sum(axis=1, keepdims=True)
-
-    atol = 1e-5 if dtype == np.float32 else 1e-10
-    cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-4)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_covariates", [2, 3, 4])
-def test_fused_pen_norm_multi_int(dtype, n_covariates):
-    """Marginal penalty factors multiply across batch variables."""
-    n_rows, n_cols = 80, 64
-    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
-    offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
-    rng = cp.random.default_rng(734)
-
-    similarities = rng.random((n_rows + 13, n_cols), dtype=dtype)
-    penalty = rng.random((int(levels.sum()), n_cols), dtype=dtype) + 0.2
-    local_codes = cp.stack(
-        [rng.integers(0, int(level), size=n_rows) for level in levels], axis=1
-    ).astype(cp.int32)
-    cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
-    idx_in = _random_idx(n_rows + 13, n_rows, seed=734)
-    R_out = cp.empty((n_rows, n_cols), dtype=dtype)
-    term = -7.0
-
-    _pen.fused_pen_norm_int(
-        similarities,
-        penalty=penalty,
-        cats=cats,
-        idx_in=idx_in,
-        R_out=R_out,
-        term=term,
-        n_rows=n_rows,
-        n_cols=n_cols,
-        n_covariates=n_covariates,
-    )
-    cp.cuda.Device().synchronize()
-
-    raw = cp.exp(dtype(term) * (1 - similarities[idx_in]))
-    for covariate in range(n_covariates):
-        raw *= penalty[cats[:, covariate]]
-    expected = raw / raw.sum(axis=1, keepdims=True)
-
-    atol = 1e-5 if dtype == np.float32 else 1e-10
-    cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-4)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_covariates", [2, 3, 4])
-def test_fused_pen_norm_multi_int_avoids_product_overflow(dtype, n_covariates):
-    """Large finite marginal factors are normalized without overflow."""
-    n_rows, n_cols = 7, 19
-    levels = np.full(n_covariates, 2, dtype=np.int32)
-    offsets = np.arange(n_covariates, dtype=np.int32) * 2
-    rng = cp.random.default_rng(735)
-
-    similarities = rng.random((n_rows, n_cols), dtype=dtype)
-    scale = dtype(1e30 if dtype == np.float32 else 1e200)
-    relative = rng.uniform(0.5, 1.0, size=(int(levels.sum()), n_cols)).astype(dtype)
-    penalty = scale * relative
-    local_codes = cp.stack(
-        [rng.integers(0, int(level), size=n_rows) for level in levels], axis=1
-    ).astype(cp.int32)
-    cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
-    idx_in = cp.arange(n_rows, dtype=cp.int32)
-    R_out = cp.empty((n_rows, n_cols), dtype=dtype)
-    term = -7.0
-
-    _pen.fused_pen_norm_int(
-        similarities,
-        penalty=penalty,
-        cats=cats,
-        idx_in=idx_in,
-        R_out=R_out,
-        term=term,
-        n_rows=n_rows,
-        n_cols=n_cols,
-        n_covariates=n_covariates,
-    )
-    cp.cuda.Device().synchronize()
-
-    log_raw = dtype(term) * (1 - similarities)
-    for covariate in range(n_covariates):
-        log_raw += cp.log(penalty[cats[:, covariate]])
-    log_raw -= log_raw.max(axis=1, keepdims=True)
-    expected = cp.exp(log_raw)
-    expected /= expected.sum(axis=1, keepdims=True)
-
-    assert bool(cp.isfinite(R_out).all())
-    cp.testing.assert_allclose(R_out.sum(axis=1), 1, atol=1e-6, rtol=1e-6)
-    atol = 1e-5 if dtype == np.float32 else 1e-12
-    cp.testing.assert_allclose(R_out, expected, atol=atol, rtol=1e-5)
-
-
-# ---------- gather_rows ----------
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_rows,n_cols", [(100, 50), (500, 20)])
-def test_gather_rows(dtype, n_rows, n_cols):
-    rng = cp.random.default_rng(42)
-    src = rng.standard_normal((n_rows * 2, n_cols), dtype=dtype)
-    idx = _random_idx(n_rows * 2, n_rows)
-    dst = cp.empty((n_rows, n_cols), dtype=dtype)
-
-    _scatter.gather_rows(src, idx=idx, dst=dst, n_rows=n_rows, n_cols=n_cols)
-    cp.cuda.Device().synchronize()
-
-    expected = src[idx]
-    cp.testing.assert_array_equal(dst, expected)
-
-
-# ---------- scatter_rows ----------
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n_rows,n_cols", [(100, 50), (500, 20)])
-def test_scatter_rows(dtype, n_rows, n_cols):
-    rng = cp.random.default_rng(42)
-    src = rng.standard_normal((n_rows, n_cols), dtype=dtype)
-    idx_np = np.arange(n_rows, dtype=np.int32)
-    np.random.default_rng(42).shuffle(idx_np)
-    idx = cp.asarray(idx_np)
-    dst = cp.zeros((n_rows, n_cols), dtype=dtype)
-
-    _scatter.scatter_rows(src, idx=idx, dst=dst, n_rows=n_rows, n_cols=n_cols)
-    cp.cuda.Device().synchronize()
-
-    expected = cp.zeros_like(dst)
-    expected[idx] = src
-    cp.testing.assert_array_equal(dst, expected)
-
-
-# ---------- gather_int ----------
-
-
-@pytest.mark.parametrize("n", [100, 10000])
-def test_gather_int(n):
-    rng = cp.random.default_rng(42)
-    src = rng.integers(0, 1000, size=n * 2).astype(cp.int32)
-    idx = _random_idx(n * 2, n)
-    dst = cp.empty(n, dtype=cp.int32)
-
-    _scatter.gather_int(src, idx=idx, dst=dst, n=n)
-    cp.cuda.Device().synchronize()
-
-    expected = src[idx]
-    cp.testing.assert_array_equal(dst, expected)
-
-
-# ---------- colsum ----------
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("rows", [0, 1, 257, 4096])
-def test_colsum_columns_multiple_cols_per_block(dtype, rows):
-    rng = cp.random.default_rng(123)
-    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
-    cols = n_sm * 8 + 17
-    x = rng.standard_normal((rows, cols), dtype=dtype)
-    out = cp.zeros(cols, dtype=dtype)
-
-    _colsum.colsum(x, out=out, rows=rows, cols=cols)
-    cp.cuda.Device().synchronize()
-
-    atol = 5e-4 if dtype == np.float32 else 1e-12
-    rtol = 1e-4 if dtype == np.float32 else 1e-5
-    expected_np = cp.asnumpy(x).sum(axis=0)
-    cp.testing.assert_allclose(out, cp.asarray(expected_np), atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("switcher", [0, 1])
-@pytest.mark.parametrize("n_covariates,grouped", [(1, False), (1, True), (4, False)])
 @pytest.mark.parametrize("n_rows,n_categories", [(2305, 13), (2049, 9000)])
-def test_scatter_add(dtype, switcher, n_covariates, grouped, *, n_rows, n_categories):
+def test_scatter_add(dtype, n_rows, n_categories):
     n_cols = 17
     rng = np.random.default_rng(734)
     values_host = rng.normal(size=(n_rows, n_cols)).astype(dtype)
-    categories_host = np.arange(n_rows * n_covariates, dtype=np.int32).reshape(
-        n_rows, n_covariates
-    ) % (n_categories - 1)
-    categories_host[:2100, 0] = 0
+    categories_host = np.arange(n_rows, dtype=np.int32) % (n_categories - 1)
+    categories_host[:2100] = 0
     expected = np.zeros((n_categories, n_cols), dtype=np.float64)
-    np.add.at(
-        expected,
-        categories_host.ravel(),
-        np.repeat(values_host.astype(np.float64), n_covariates, axis=0)
-        * (1 if switcher else -1),
-    )
+    np.add.at(expected, categories_host, values_host.astype(np.float64))
     values, categories = cp.asarray(values_host), cp.asarray(categories_host)
-    category_offsets = cell_indices = None
-    if grouped:
-        category_offsets, cell_indices = _create_category_index_mapping(
-            categories.ravel(), n_categories
-        )
     workspace_bytes = _cl.get_scatter_temp_bytes(
         n_rows=n_rows,
         n_cols=n_cols,
         n_categories=n_categories,
-        n_covariates=n_covariates,
         itemsize=np.dtype(dtype).itemsize,
-        grouped=grouped,
     )
     workspace = cp.empty(workspace_bytes, dtype=cp.uint8)
     outputs = []
     for _ in range(2):
         out = cp.zeros((n_categories, n_cols), dtype=dtype)
         scatter_add = partial(
-            _cl.scatter_add,
-            values,
-            categories=categories,
-            category_offsets=category_offsets,
-            cell_indices=cell_indices,
-            out=out,
-            workspace=workspace,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            n_categories=n_categories,
-            n_covariates=n_covariates,
-            switcher=switcher,
+            _cl.scatter_add, values, categories=categories, out=out, workspace=workspace
         )
         scatter_add()
         outputs.append(out.copy())
@@ -439,74 +119,6 @@ def test_select_kmeans_center_totals_workspace(dtype):
     _cl.select_kmeans_center(X, totals=totals, **kwargs)
     cp.testing.assert_array_equal(centers[0], X[-1])
     assert int(n_draws[0]) == 1
-
-
-# ---------- compute_objective ----------
-
-
-def _compute_objective_reference(R, similarities, *, O, E, theta, sigma, stabilized):
-    """Pure CuPy reference for the three-term harmony objective."""
-    # K-means error: sum(R[i] * 2 * (1 - sim[i]))
-    kmeans_err = float(cp.sum(R * 2 * (1 - similarities)))
-
-    # Entropy: sigma * sum(x_norm * log(x_norm + eps))
-    R_norm = R / R.sum(axis=1, keepdims=True)
-    entropy = float(sigma * cp.sum(R_norm * cp.log(R_norm + 1e-12)))
-
-    # Diversity
-    numer = (O + E + 1) if stabilized else (O + 1)
-    diversity = float(sigma * cp.sum(theta[:, None] * O * cp.log(numer / (E + 1))))
-
-    return kmeans_err + entropy + diversity
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize(
-    "n_cells,n_clusters,n_batches", [(500, 20, 3), (1000, 100, 10), (200, 5, 2)]
-)
-@pytest.mark.parametrize("stabilized", [True, False])
-def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
-    rng = cp.random.default_rng(42)
-
-    # R must be non-negative (cluster assignments)
-    R = rng.random((n_cells, n_clusters), dtype=dtype) + 0.01
-    similarities = rng.random((n_cells, n_clusters), dtype=dtype)
-    O = rng.random((n_batches, n_clusters), dtype=dtype) * 10 + 0.1
-    E = rng.random((n_batches, n_clusters), dtype=dtype) * 10 + 0.1
-    theta = rng.random(n_batches, dtype=dtype) * 2
-    sigma = 0.1
-
-    obj_scalar = cp.zeros(1, dtype=dtype)
-    compute_objective = partial(
-        _cl.compute_objective,
-        R,
-        similarities=similarities,
-        O=O,
-        E=E,
-        theta=theta,
-        sigma=float(sigma),
-        obj_scalar=obj_scalar,
-        n_cells=n_cells,
-        n_clusters=n_clusters,
-        n_batches=n_batches,
-        stabilized=stabilized,
-        objective_partials=cp.empty(n_cells, dtype=dtype),
-    )
-    with pytest.raises(
-        ValueError, match="objective_partials must hold at least n_cells elements"
-    ):
-        compute_objective(objective_partials=cp.empty(n_cells - 1, dtype=dtype))
-    result = compute_objective()
-
-    expected = _compute_objective_reference(
-        R, similarities, O=O, E=E, theta=theta, sigma=sigma, stabilized=stabilized
-    )
-
-    rtol = 1e-5 if dtype == np.float32 else 1e-10
-    np.testing.assert_allclose(result, expected, rtol=rtol)
-
-
-# ---- compute_inv_mat: correctness against CuPy reference ----
 
 
 def _inv_mat_reference(O_col, lambda_col, dtype):
@@ -567,41 +179,6 @@ def test_compute_inv_mat(n_batches, n_clusters, dtype):
         cp.testing.assert_allclose(inv_mat, expected, atol=atol, rtol=1e-5)
 
 
-# ---------- edge cases: absent batches (O=0) ----------
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("stabilized", [True, False])
-def test_penalty_absent_batch(dtype, stabilized):
-    """Penalty kernel stays finite when some O entries are zero."""
-    n_batches, n_clusters = 4, 10
-    rng = cp.random.default_rng(42)
-    E = rng.random((n_batches, n_clusters), dtype=dtype) * 10
-    O = rng.random((n_batches, n_clusters), dtype=dtype) * 10
-    O[0, 0] = 0
-    O[2, 5] = 0
-    theta = rng.random(n_batches, dtype=dtype) * 2 + 0.5
-    penalty = cp.empty_like(E)
-
-    _pen.penalty(
-        E,
-        O=O,
-        theta=theta,
-        penalty=penalty,
-        n_batches=n_batches,
-        n_clusters=n_clusters,
-        stabilized=stabilized,
-    )
-    cp.cuda.Device().synchronize()
-
-    assert cp.all(cp.isfinite(penalty)), "Penalty has non-finite values with O=0"
-
-    denom = (O + E + 1) if stabilized else (O + 1)
-    expected = cp.power((E + 1) / denom, theta[:, None])
-    atol = 1e-5 if dtype == np.float32 else 1e-10
-    cp.testing.assert_allclose(penalty, expected, atol=atol, rtol=1e-4)
-
-
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 def test_compute_inv_mat_absent_batch(dtype):
     """compute_inv_mat stays finite when O=0 and lambda_kb is large (pruned)."""
@@ -639,3 +216,180 @@ def test_compute_inv_mat_absent_batch(dtype):
         expected = _inv_mat_reference(O[:, k], lambda_kb[:, k], dtype)
         atol = 1e-6 if dtype == cp.float32 else 1e-12
         cp.testing.assert_allclose(inv_mat, expected, atol=atol, rtol=1e-5)
+
+
+# ---------- k-means initialization kernels ----------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("n_clusters,n_cols", [(1, 3), (37, 50), (128, 64)])
+def test_kmeans_assign(dtype, n_clusters, n_cols):
+    rng = cp.random.default_rng(3)
+    X = rng.standard_normal((1000, n_cols)).astype(dtype)
+    if not _fused_distances(X, n_clusters):
+        pytest.skip("centers exceed this GPU's shared memory (k-means falls back)")
+    centers = rng.standard_normal((n_clusters, n_cols)).astype(dtype)
+    labels = cp.empty(1000, dtype=cp.int32)
+    minimum = cp.empty(1000, dtype=dtype)
+    _cl.kmeans_assign(X, centers=centers, labels=labels, minimum=minimum)
+    distances = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
+    cp.testing.assert_array_equal(labels, distances.argmin(1))
+    cp.testing.assert_allclose(minimum, distances.min(1), rtol=1e-5)
+
+
+def test_failed_launch_setup_leaves_no_stale_error():
+    # A shape beyond the GPU's shared memory raises, and the next kernel launch
+    # (checked with cudaGetLastError) does not inherit that error.
+    X = cp.ones((10, 600), cp.float64)
+    with pytest.raises(RuntimeError, match="shared memory"):
+        _cl.kmeans_assign(
+            X,
+            centers=cp.ones((128, 600), cp.float64),
+            labels=cp.empty(10, cp.int32),
+            minimum=cp.empty(10, cp.float64),
+        )
+    out = cp.empty_like(X)
+    _cl.l2_row_normalize(X, dst=out)
+    cp.testing.assert_allclose(out, X / cp.sqrt(600.0))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_kmeans_closest(dtype):
+    rng = cp.random.default_rng(4)
+    X = rng.standard_normal((777, 21)).astype(dtype)
+    center = rng.standard_normal(21).astype(dtype)
+    closest = rng.random(777).astype(dtype) * 40
+    expected = cp.minimum(closest, ((X - center) ** 2).sum(1))
+    _cl.kmeans_closest(X, center=center, closest=closest)
+    cp.testing.assert_allclose(closest, expected, rtol=1e-5)
+
+
+# ---------- update blocks ----------
+
+
+def test_draw_blocks_split_invariant():
+    # A cell's block depends only on its global position: drawing two shards
+    # (split at a unit boundary) gives the blocks of drawing all cells, and
+    # every full unit deals the same number of cells to every block.
+    rng = cp.random.default_rng(3)
+    n, n_groups, n_blocks, chunk = 5000, 4, 7, 8
+    unit = n_blocks * chunk * 5
+    groups = cp.sort(rng.integers(0, n_groups, n)).astype(cp.int32)
+
+    def blocks(first, last):
+        m = last - first
+        idx = cp.empty(m, cp.int32)
+        offsets = cp.empty(n_blocks * n_groups + 1, cp.int32)
+        _cl.draw_blocks(
+            groups[first:last],
+            idx_list=idx,
+            block_cat_offsets=offsets,
+            idx_list_alt=cp.empty(m, cp.int32),
+            sort_keys=cp.empty(m, cp.uint32),
+            sort_keys_alt=cp.empty(m, cp.uint32),
+            cub_temp=cp.empty(_cl.get_cub_sort_temp_bytes(n_cells=m), cp.uint8),
+            n_groups=n_groups,
+            n_blocks=n_blocks,
+            unit=unit,
+            seed=11,
+            shuffle_chunk=chunk,
+            first=first,
+        )
+        key = cp.repeat(cp.arange(n_blocks * n_groups), cp.diff(offsets).tolist())
+        cp.testing.assert_array_equal(key % n_groups, groups[first:last][idx])
+        out = cp.empty(m, cp.int32)
+        out[idx] = key // n_groups
+        return out
+
+    full = blocks(0, n)
+    cp.testing.assert_array_equal(
+        full, cp.concatenate([blocks(0, 2 * unit), blocks(2 * unit, n)])
+    )
+    whole = n // unit * unit
+    per_unit = cp.bincount(cp.arange(whole) // unit * n_blocks + full[:whole])
+    assert (per_unit == unit // n_blocks).all()
+
+
+# ---------- fused initialization (assignment kernels) ----------
+
+
+@pytest.mark.parametrize(
+    "n_clusters,force_general", [(7, False), (7, True), (300, True)]
+)
+@pytest.mark.parametrize("n_pcs", [50, 1023])
+def test_fused_initialize_matches_reference(n_clusters, force_general, n_pcs):
+    # One unpenalized assignment pass over the update blocks: R is the
+    # softmax of -2/sigma (1 - z.y), O its per-batch column sums,
+    # E = Pr_b x column sums, plus the objective.
+    rng = cp.random.default_rng(7)
+    n_cells, n_batches, sigma, block_size = 3000, 3, 0.1, 700
+    Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
+    Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
+    Y = Z[:n_clusters] + 0.1
+    Y = (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).astype(cp.float32)
+    cats = cp.sort(rng.integers(0, n_batches, n_cells)).astype(cp.int32)
+    Pr_b = (cp.bincount(cats, minlength=n_batches) / n_cells).astype(cp.float32)
+    theta = cp.full(n_batches, 2.0, dtype=cp.float32)
+    n_blocks = -(-n_cells // block_size)
+    n_tiles = 4 * cp.cuda.Device().attributes["MultiProcessorCount"] + n_batches + 1
+    idx_list = cp.empty(n_cells, cp.int32)
+    block_cat_offsets = cp.empty(n_blocks * n_batches + n_batches + 2, cp.int32)
+    _cl.draw_blocks(
+        cats,
+        idx_list=idx_list,
+        block_cat_offsets=block_cat_offsets,
+        idx_list_alt=cp.empty(n_cells, cp.int32),
+        sort_keys=cp.empty(n_cells, cp.uint32),
+        sort_keys_alt=cp.empty(n_cells, cp.uint32),
+        cub_temp=cp.empty(_cl.get_cub_sort_temp_bytes(n_cells=n_cells), cp.uint8),
+        n_groups=n_batches,
+        n_blocks=n_blocks,
+        unit=n_cells,
+        seed=3,
+    )
+    R = cp.empty((n_cells, n_clusters), cp.float32)
+    O = cp.empty((n_batches, n_clusters), cp.float32)
+    E = cp.empty_like(O)
+    stride = -(-n_clusters // 128) * 128
+    objective = _cl.clustering_loop(
+        Z,
+        R=R,
+        E=E,
+        O=O,
+        Pr_b=Pr_b,
+        theta=theta,
+        Y_norm=Y,
+        idx_list=idx_list,
+        penalty=cp.empty_like(O),
+        objective_partials=cp.empty(n_cells + 8, cp.float32),
+        block_cat_offsets=block_cat_offsets,
+        block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
+        seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
+        y_scale=cp.empty(1, cp.float64),
+        y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
+        y_t=cp.empty((-(-n_pcs // 4) * 4, stride), cp.float32),
+        col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),
+        force_general=force_general,
+        n_cells=n_cells,
+        n_pcs=n_pcs,
+        n_clusters=n_clusters,
+        n_batches=n_batches,
+        n_blocks=n_blocks,
+        sigma=sigma,
+        max_iter=0,
+        stabilized=True,
+        initialize=True,
+    )
+    sim = Z.astype(cp.float64) @ Y.T.astype(cp.float64)
+    w = cp.exp(-2 / sigma * (1 - sim))
+    R_ref = w / w.sum(1, keepdims=True)
+    cp.testing.assert_allclose(R, R_ref, rtol=1e-4, atol=1e-6)
+    O_ref = cp.stack([R_ref[cats == b].sum(0) for b in range(n_batches)])
+    cp.testing.assert_allclose(O, O_ref, rtol=1e-4)
+    E_ref = Pr_b[:, None].astype(cp.float64) * R_ref.sum(0)[None, :]
+    cp.testing.assert_allclose(E, E_ref, rtol=1e-4)
+    distance = (R_ref * 2 * (1 - sim)).sum()
+    entropy = (R_ref * cp.log(R_ref)).sum()
+    diversity = sigma * 2.0 * (O_ref * cp.log((O_ref + E_ref + 1) / (E_ref + 1))).sum()
+    expected = float(distance + sigma * entropy + diversity)
+    assert objective == pytest.approx(expected, rel=1e-4)
