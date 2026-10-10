@@ -3,13 +3,15 @@
 // Fused Harmony correction apply: for every cell i of a segment of group g,
 //   z_d = X_id - sum_k R_ik W[g * w_group_stride + k * w_k_stride + d]
 // (one fma chain over k = 0, 1, ..., K - 1 from 0), then optionally
-// z *= min(rsqrt(sum_d z_d^2), 1e12) summed as add_rows_normalize_kernel does
-// (lane l: fma chain over z_l^2, z_{l+32}^2, ...; xor butterfly 16 .. 1; the
-// same bits for float with nvcc 13.4). Each element depends only on its row
+// z *= min(rsqrt(sum_d z_d^2), 1e12) (lane l: fma chain over z_l^2,
+// z_{l+32}^2, ...; xor butterfly 16 .. 1; the same order for D <= 256 in
+// registers and D > 256 in a second pass). Each element depends only on its row
 // and W[g]: results do not depend on how rows are split into segments, shards
 // or CTAs, nor on the launch configuration. CTAs take runs of row tiles of one
 // segment; R tiles are staged in shared memory by cp.async, W[g] stays there
-// (in k chunks when it does not fit; partial sums then wait in Z).
+// (in k chunks when it does not fit; partial sums then wait in Z). Callers
+// chunk clusters the same way: a call without `finish` leaves the sums in Z,
+// and one with `resume` continues them (the same bits for the same W).
 
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
@@ -74,7 +76,8 @@ __global__ void __launch_bounds__(NT)
                       long long wgs, int D, int K,
                       const int* __restrict__ seg_start,
                       const int* __restrict__ seg_group, bool normalize,
-                      T* __restrict__ Z, int kc, int v) {
+                      bool resume, bool finish, T* __restrict__ Z, int kc,
+                      int v) {
     constexpr int RM = SLOTS < 8 ? 4 : 2, TM = 8 * RM, DW = 32 * SLOTS;
     constexpr bool CONV = !std::is_same_v<T, RT>;
     static_assert(!CONV || std::is_same_v<T, float> &&
@@ -98,8 +101,8 @@ __global__ void __launch_bounds__(NT)
     for (int d0 = 0; d0 < D; d0 += DW)
         for (int k0 = 0; k0 < K4; k0 += kc) {
             const int kn = min(kc, K4 - k0), wn = min(WS, D - d0);
-            const bool first = !CHUNKED || k0 == 0,
-                       last = !CHUNKED || k0 + kn == K4;
+            const bool first = (!CHUNKED || k0 == 0) && !resume,
+                       last = (!CHUNKED || k0 + kn == K4) && finish;
             __syncthreads();  // previous chunk done with ws and the stages
             for (int i = threadIdx.x; i < kn * wn; i += NT) {
                 int k = i / wn, d = i - k * wn;
@@ -188,7 +191,7 @@ __global__ void __launch_bounds__(NT)
             }
         }
 
-    if (D > DW && normalize)  // rows this lane wrote, add_rows_normalize order
+    if (D > DW && normalize && finish)  // rows this lane wrote, same order
         for (int t = t0; t < t1; ++t)
             for (int j = 0, r = start + t * TM + warp * RM;
                  j < RM && r + j < end; ++j) {
@@ -214,8 +217,9 @@ auto kernel_for(int slots) {
 template <typename T, typename RT>
 cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
                    long long wgs, int D, int K, const int* seg_start,
-                   const int* seg_group, int n_seg, bool normalize, T* Z,
-                   int slots, int kc, size_t budget, cudaStream_t s) {
+                   const int* seg_group, int n_seg, bool normalize, bool resume,
+                   bool finish, T* Z, int slots, int kc, size_t budget,
+                   cudaStream_t s) {
     // shared T per cluster: 2 R stages (or 2 bfloat16 + widened), W column
     const int k4 = (K + 3) & ~3, dw = 32 * slots, ws = std::min(D, dw);
     const int per = 16 * (slots < 8 ? 4 : 2) + ws, slack = (dw - ws) * 4;
@@ -233,9 +237,9 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
     // widest copy dividing every R row start, length and stage row
     size_t a =
         reinterpret_cast<size_t>(R) | 16 | ((size_t)ldr | kc | K) * sizeof(RT);
-    kernel<<<n_seg * CPS, NT, smem, s>>>(X, R, ldr, W, wks, wgs, D, K,
-                                         seg_start, seg_group, normalize, Z, kc,
-                                         (int)(a & (~a + 1)));
+    kernel<<<n_seg * CPS, NT, smem, s>>>(
+        X, R, ldr, W, wks, wgs, D, K, seg_start, seg_group, normalize, resume,
+        finish, Z, kc, (int)(a & (~a + 1)));
     return cudaGetLastError();
 }
 
@@ -244,12 +248,15 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
 // Z (rows x D) for segments [seg_start[s], seg_start[s + 1]) (local rows) of
 // groups seg_group[s]; see the top of this file. R(i, k) = R[i * ldr + k]
 // (T, or bfloat16 with T = float; ldr >= K); W[g] is K x D with element
-// strides w_k_stride and w_group_stride. Z must not alias X, R or W.
+// strides w_k_stride and w_group_stride. Z must not alias X, R or W. resume:
+// Z holds the sums of earlier clusters; finish: Z = X - sums (normalized on
+// request), else Z = sums and X is not read.
 template <typename T, typename RT>
 cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
                        long long w_k_stride, long long w_group_stride, int D,
                        int K, const int* seg_start, const int* seg_group,
-                       int n_seg, bool normalize, T* Z, cudaStream_t s) {
+                       int n_seg, bool normalize, T* Z, cudaStream_t s,
+                       bool resume = false, bool finish = true) {
     if (D <= 0 || K <= 0 || ldr < K) return cudaErrorInvalidValue;
     if (reinterpret_cast<size_t>(R) % sizeof(RT))
         return cudaErrorMisalignedAddress;
@@ -262,7 +269,8 @@ cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
     // W resident if it fits, else in the largest chunks.
     const int slots = D <= 32 ? 1 : D <= 64 ? 2 : D <= 128 ? 4 : 8;
     return detail::launch(X, R, ldr, W, w_k_stride, w_group_stride, D, K,
-                          seg_start, seg_group, n_seg, normalize, Z, slots, K,
+                          seg_start, seg_group, n_seg, normalize, resume,
+                          finish, Z, slots, K,
                           std::min<size_t>(96 * 1024, optin), s);
 }
 

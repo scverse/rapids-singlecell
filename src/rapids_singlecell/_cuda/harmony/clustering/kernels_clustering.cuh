@@ -3,6 +3,8 @@
 #include <cub/block/block_scan.cuh>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <type_traits>
 #include <cuda_runtime.h>
 
 #include "../storage.cuh"
@@ -271,10 +273,10 @@ __host__ __device__ inline int fused_padded_pcs(int n_pcs) {
 template <typename T>
 size_t fused_assign_smem_bytes(int n_pcs, int n_clusters) {
     int warps = FUSED_THREADS / 32, pcs = fused_padded_pcs(n_pcs);
-    return ((size_t)pcs * FUSED_CLUSTER_STRIDE +
-            (size_t)warps * FUSED_ROWS * pcs) *
-               sizeof(T) +
-           (size_t)warps * n_clusters * sizeof(long long);
+    // The column sums reuse the staged rows once every warp is done.
+    return (size_t)pcs * FUSED_CLUSTER_STRIDE * sizeof(T) +
+           std::max((size_t)warps * FUSED_ROWS * pcs * sizeof(T),
+                    (size_t)warps * n_clusters * sizeof(long long));
 }
 
 template <typename T>
@@ -287,6 +289,15 @@ __device__ inline void load4(const T* p, T (&v)[4]) {
         double2 b = reinterpret_cast<const double2*>(p)[1];
         v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y;
     }
+}
+
+// p[0..3] = v in one store (bfloat16 or float); p 4-element aligned.
+template <typename T>
+__device__ inline void store4(T* p, const T (&v)[4]) {
+    using V = std::conditional_t<sizeof(T) == 2, uint2, float4>;
+    V u;
+    memcpy(&u, v, sizeof(u));
+    *reinterpret_cast<V*>(p) = u;
 }
 
 // dst (pcs x stride) = src (n x d)^T, zero padded; thread t0 handles
@@ -355,8 +366,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     T* y_t = reinterpret_cast<T*>(smem_raw);  // pcs x FUSED_CLUSTER_STRIDE
     T* z_s = y_t + (size_t)pcs * FUSED_CLUSTER_STRIDE;  // warps x ROWS x pcs
-    long long* col_sums = reinterpret_cast<long long*>(
-        z_s + (size_t)n_warps * FUSED_ROWS * pcs);  // warps x K
+    long long* col_sums = reinterpret_cast<long long*>(z_s);  // warps x K
     transpose_padded(Y_norm, y_t, n_clusters, n_pcs, pcs, FUSED_CLUSTER_STRIDE,
                      threadIdx.x, blockDim.x);
     T* z_w = z_s + (size_t)warp * FUSED_ROWS * pcs;
@@ -372,6 +382,10 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
     }
     top = warp_max(top);
     bool row_shift = term < T(-30);
+    // Rows of four-aligned clusters: one store per lane and row (bfloat16
+    // and float; for double the two stores cost more than they save).
+    bool vec_store = sizeof(RT) <= 4 && n_clusters % 4 == 0 &&
+                     reinterpret_cast<size_t>(R) % (4 * sizeof(RT)) == 0;
     __syncthreads();
 
     // The next cells' indices and Z values are loaded into registers while
@@ -437,15 +451,19 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
             T inv = T(1) / sum, log_sum = log(sum);
             T distance = T(0), entropy = T(0);
             RT* row = R + (size_t)cell[r] * n_clusters;
+            RT stored[S];
+#pragma unroll
+            for (int q = 0; q < S; ++q)
+                stored[q] = to_storage<RT>(vals[q] * inv);
+            if constexpr (sizeof(RT) <= 4)
+                if (vec_store && k0 < n_clusters) store4(row + k0, stored);
 #pragma unroll
             for (int q = 0; q < S; ++q) {
                 int k = k0 + q;
                 if (k < n_clusters) {
-                    T value = vals[q] * inv;
+                    if (!vec_store) row[k] = stored[q];
                     // Count the stored (possibly bfloat16) value.
-                    RT stored = to_storage<RT>(value);
-                    row[k] = stored;
-                    value = from_storage<T>(stored);
+                    T value = from_storage<T>(stored[q]);
                     col[q] += count_to_fixed(value, count_scale);
                     distance += value * T(2) * (T(1) - dots[r][q]);
                     // log(value) = log of the unnormalized weight - log(sum)
@@ -457,6 +475,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
             if (lane == 0) partial[cell[r]] = total;
         }
     }
+    __syncthreads();  // col_sums overlays the staged rows
 #pragma unroll
     for (int q = 0; q < S; ++q)
         if (k0 + q < n_clusters) col_sums[warp * n_clusters + k0 + q] = col[q];
@@ -496,6 +515,7 @@ __global__ void fused_assign_general_kernel(
         (n_clusters + FUSED_CLUSTER_STRIDE - 1) / FUSED_CLUSTER_STRIDE;
     long long* cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
     for (int k = lane; k < n_clusters; k += 32) cols[k] = 0;
+    __syncwarp();  // other lanes accumulate these columns
     const T* pen_row =
         penalty ? penalty + (size_t)category * n_clusters : nullptr;
 

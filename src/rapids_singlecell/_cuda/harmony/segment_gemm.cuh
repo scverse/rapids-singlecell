@@ -1,15 +1,16 @@
 // Deterministic, shard-invariant segmented product for Harmony (centroids
 // Z_norm^T R, correction RHS R_b^T X_b): acc[g] += fixed_point(sum over the
 // cells i of group g of A_i^T R_i), A (n x D) row-major, R (n x K) of row
-// stride ldr. Cells are sorted by group; a segment is a run of one group inside
-// one cell of a global grid of SEG cells (shards split at multiples of SEG and
-// pass their own segment tables). One CTA (per output tile) reduces a segment
-// in a fixed order in T: rows go in chunks of ch, each in nsplit slices of cps
-// rows; slice t accumulates its rows of every chunk in row order, then the
-// slice sums are added in order t = 0, 1, ...; (ch, cps) depend only on (D, K,
-// sizeof(T), sizeof(RT)). Segment partials are rounded once to fixed point and
-// added with exact integer atomics: acc is bitwise independent of launch order,
-// CTA count, GPU, ldr and of the shard split (int64 sum of the shards' acc).
+// stride ldr. Cells are sorted by group; segments are runs of one group cut at
+// multiples of SEG cells and of the shard unit (see _segments), so shards,
+// which split at unit multiples, pass their own segment tables. One CTA (per
+// output tile) reduces a segment in a fixed order in T: rows go in chunks of
+// ch, each in nsplit slices of cps rows; slice t accumulates its rows of every
+// chunk in row order, then the slice sums are added in order t = 0, 1, ...;
+// (ch, cps) depend only on (D, K, sizeof(T), sizeof(RT)). Segment partials
+// are rounded once to fixed point and added with exact integer atomics: acc is
+// bitwise independent of launch order, CTA count, GPU, ldr and of the shard
+// split (int64 sum of the shards' acc).
 #pragma once
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>

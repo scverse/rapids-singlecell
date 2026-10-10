@@ -310,14 +310,19 @@ def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
     ("method", "normalize"),
     [("batched", False), ("batched", True), ("fast", False)],
 )
-def test_harmony_correction_matches_dense_design(dtype, method, normalize):
+@pytest.mark.parametrize(
+    ("n_cells", "n_pcs", "n_clusters"), [(40, 5, 3), (3000, 50, 100), (3000, 300, 300)]
+)
+def test_harmony_correction_matches_dense_design(
+    dtype, *, method, normalize, n_cells, n_pcs, n_clusters
+):
     rng = np.random.default_rng(734)
-    n_batches, n_pcs, n_clusters = 4, 5, 3
+    n_batches = 4
     np_dtype = np.dtype(dtype)
     # Cells sorted by batch; batch 2 is empty.
-    cats_np = np.sort(rng.choice([0, 1, 3], size=40)).astype(np.int32)
-    X_np = rng.normal(size=(40, n_pcs)).astype(np_dtype)
-    R_np = rng.random(size=(40, n_clusters)).astype(np_dtype)
+    cats_np = np.sort(rng.choice([0, 1, 3], size=n_cells)).astype(np.int32)
+    X_np = rng.normal(size=(n_cells, n_pcs)).astype(np_dtype)
+    R_np = rng.random(size=(n_cells, n_clusters)).astype(np_dtype)
     R_np /= R_np.sum(axis=1, keepdims=True)
     O_np = np.zeros((n_batches, n_clusters), dtype=np_dtype)
     np.add.at(O_np, cats_np, R_np)
@@ -336,7 +341,7 @@ def test_harmony_correction_matches_dense_design(dtype, method, normalize):
         cats=cp.asarray(cats_np),
         n_batches=n_batches,
         cat_offsets=cp.asarray(offsets),
-        cell_indices=cp.arange(40, dtype=cp.int32),
+        cell_indices=cp.arange(n_cells, dtype=cp.int32),
         normalize=normalize,
         segments=(*_segments(offsets), bounds),
     )
@@ -423,7 +428,7 @@ def test_harmony_multikey_correction_matches_dense_design(
         lambda **_kwargs: 1,
     )
 
-    chunked = correct()
+    chunked = correct()  # chunks continue the sums in the output
     cp.testing.assert_allclose(chunked, cp.asarray(expected), atol=atol, rtol=atol)
     expected /= np.linalg.norm(expected, axis=1, keepdims=True)
     cp.testing.assert_allclose(
@@ -595,11 +600,8 @@ def test_harmony_integrate(correction_method):
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-@pytest.mark.parametrize("column", ["gemm", "columns", "atomics"])
 @pytest.mark.parametrize("correction_method", ["fast", "batched"])
-def test_harmony_integrate_reference(
-    adata_reference, *, dtype, column, correction_method
-):
+def test_harmony_integrate_reference(adata_reference, *, dtype, correction_method):
     """
     Test that Harmony integrate works.
     """
@@ -609,7 +611,7 @@ def test_harmony_integrate_reference(
         "donor",
         correction_method=correction_method,
         dtype=dtype,
-        colsum_algo=column,
+        colsum_algo="atomics",  # no effect, accepted for compatibility
         max_iter_harmony=20,
         flavor="harmony1",
     )
@@ -826,22 +828,30 @@ def test_harmony_integrate_repeats_bitwise(
     assert outputs[0].tobytes() == outputs[1].tobytes()
 
 
-def _integrate(dtype=np.float32, *, X_pca=None, key="batch", **kwargs):
+def _integrate(dtype=np.float32, *, X_pca=None, key="batch", n_clusters=7, **kwargs):
     adata = _repeatability_adata(np.float32)
     if X_pca is not None:
         adata.obsm["X_pca"] = X_pca
     rsc.pp.harmony_integrate(
-        adata, key, dtype=dtype, rng=734, n_clusters=7, max_iter_harmony=2, **kwargs
+        adata,
+        key,
+        dtype=dtype,
+        rng=734,
+        n_clusters=n_clusters,
+        max_iter_harmony=2,
+        **kwargs,
     )
     return adata.obsm["X_pca_harmony"]
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_bfloat16_assignments():
-    first, second = _integrate("bfloat16"), _integrate("bfloat16")
+@pytest.mark.parametrize("n_clusters", [7, 8])  # 8: four-value stores
+def test_harmony_bfloat16_assignments(n_clusters):
+    first = _integrate("bfloat16", n_clusters=n_clusters)
     assert first.dtype == np.float32
-    assert first.tobytes() == second.tobytes()
-    assert _get_measure(first, _integrate(), "L2") < 2e-2
+    assert first.tobytes() == _integrate("bfloat16", n_clusters=n_clusters).tobytes()
+    float32 = _integrate(n_clusters=n_clusters)
+    assert 0 < _get_measure(first, float32, "L2") < 2e-2
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -890,6 +900,8 @@ def test_harmony_large_theta_stays_finite(
 def test_harmony_shuffle_chunk_size_rejects_invalid(chunk):
     with pytest.raises(ValueError, match="shuffle_chunk_size"):
         _integrate(shuffle_chunk_size=chunk)
+    with pytest.raises(ValueError, match="colsum_algo"):
+        _integrate(colsum_algo="bogus")
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -897,18 +909,26 @@ def test_harmony_shuffle_chunk_size():
     exact = _integrate(shuffle_chunk_size=1)
     assert exact.tobytes() == _integrate(shuffle_chunk_size=1).tobytes()
     assert exact.tobytes() != _integrate(shuffle_chunk_size=8).tobytes()
+    assert (
+        _integrate(shuffle_chunk_size=8.0).tobytes()
+        == _integrate(shuffle_chunk_size=8).tobytes()
+    )
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_host_input_matches_device_input():
+def test_harmony_host_input_matches_device_input(monkeypatch):
     host = _repeatability_adata(np.float32).obsm["X_pca"]
-    assert (
-        _integrate(X_pca=host).tobytes() == _integrate(X_pca=cp.asarray(host)).tobytes()
-    )
-    host[3, 2] = np.nan
-    for X in (host, cp.asarray(host)):
-        with pytest.raises(ValueError, match="NaN"):
-            _integrate(X_pca=X)
+    device = _integrate(X_pca=cp.asarray(host))
+    assert _integrate(X_pca=host).tobytes() == device.tobytes()
+    # Small chunks: the upload and the download reuse their staging slots.
+    monkeypatch.setattr(harmony_module, "_UPLOAD_BYTES", 40 * host[0].nbytes)
+    assert _integrate(X_pca=host).tobytes() == device.tobytes()
+    for value in (np.nan, np.inf, -np.inf):
+        bad = host.copy()
+        bad[-1, 2] = value  # in the last chunk
+        for X in (bad, cp.asarray(bad)):
+            with pytest.raises(ValueError, match="NaN or infinite"):
+                _integrate(X_pca=X)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -933,12 +953,33 @@ def test_harmony_bfloat16_falls_back_to_float32():
     assert fallback.tobytes() == _integrate(key=key).tobytes()
 
 
+def test_harmony_fused_assignment_fits_128_pcs():
+    # The column sums reuse the staged rows: 128 PCs and 100 clusters fit the
+    # 99 KB of shared memory of sm_86 and newer GPUs.
+    assert harmony_module._fused_assign_smem_bytes(128, 100, 4) <= 99 * 1024
+
+
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-@pytest.mark.parametrize("key", ["batch", ["batch", "second"]])
-def test_harmony_general_assignment_matches_fused(monkeypatch, key):
+@pytest.mark.parametrize(
+    ("key", "n_pcs", "n_clusters"),
+    [
+        ("batch", 17, 7),
+        (["batch", "second"], 17, 7),
+        ("batch", 3, 128),
+        ("batch", 128, 100),
+    ],
+)
+def test_harmony_general_assignment_matches_fused(
+    monkeypatch, *, key, n_pcs, n_clusters
+):
+    X = np.random.default_rng(3).standard_normal((480, n_pcs)).astype(np.float32)
+
     def run():
         adata = _repeatability_adata(np.float32)
-        rsc.pp.harmony_integrate(adata, key, rng=734, n_clusters=7, max_iter_harmony=2)
+        adata.obsm["X_pca"] = X
+        rsc.pp.harmony_integrate(
+            adata, key, rng=734, n_clusters=n_clusters, max_iter_harmony=2
+        )
         return adata.obsm["X_pca_harmony"]
 
     fused = run()

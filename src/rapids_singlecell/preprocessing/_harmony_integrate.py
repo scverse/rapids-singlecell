@@ -180,10 +180,9 @@ def harmony_integrate(
         (the reference implementations redraw them every iteration).
     shuffle_chunk_size
         Cells are assigned to the random update blocks in runs of this many
-        neighbouring cells of the same batch, so the GPU writes contiguous rows.
-        ``1`` assigns every cell independently, as the reference
-        implementations do. With several keys the runs are of the same joint
-        category.
+        randomly chosen cells of the same batch (joint category with several
+        keys), so the GPU writes contiguous rows. ``1`` assigns every cell
+        independently, as the reference implementations do.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -193,7 +192,7 @@ def harmony_integrate(
         Lloyd reductions. Results may differ across GPU architectures or
         CUDA versions; concurrent CUDA streams are outside this guarantee.
     verbose
-        Whether to print benchmarking and convergence information.
+        Whether to print the number of iterations until convergence.
 
     Returns
     -------
@@ -253,8 +252,8 @@ def harmony_integrate(
     try:
         # Handle different array types
         if isinstance(input_data, np.ndarray):
-            # NumPy array: Harmony uploads it in chunks (checking for NaN on
-            # the GPU), so no unsorted device copy is kept.
+            # NumPy array: Harmony uploads it in chunks, so no unsorted device
+            # copy is kept. Harmony rejects NaN and infinite values.
             X = np.ascontiguousarray(input_data, dtype=dtype)
         elif isinstance(input_data, cp.ndarray):
             # CuPy array: ensure correct dtype and layout with a copy
@@ -272,11 +271,6 @@ def harmony_integrate(
 
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
-    # NumPy input is checked during the upload, with the same error.
-    if isinstance(X, cp.ndarray) and cp.isnan(X).any():
-        raise ValueError(
-            "Input data contains NaN values. Please handle these before running harmony_integrate."
-        )
 
     # Fault in the host output while the GPU works; copying into touched pages
     # is about twice as fast as into a fresh allocation.

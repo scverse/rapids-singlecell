@@ -40,7 +40,7 @@ _FUSED_MAX_CLUSTERS = 128
 _FUSED_MAX_PCS = 128
 # Tests: route every shape through the general assignment kernel.
 _FORCE_GENERAL_ASSIGNMENT = False
-_UPLOAD_BYTES = 1 << 28
+_UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
 _UPLOAD_THREADS = 8
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
 _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
@@ -178,7 +178,7 @@ def harmonize(
         assignments are used.
 
     verbose
-        Whether to print benchmarking results for the column sum algorithm and the number of iterations until convergence.
+        Whether to print the number of iterations until convergence.
 
     Returns
     -------
@@ -197,6 +197,15 @@ def harmonize(
     if tol_harmony is None:
         tol_harmony = stopping[2]
 
+    if max_iter_harmony < 1:
+        raise ValueError("max_iter_harmony must be >= 1")
+    if int(shuffle_chunk_size) != shuffle_chunk_size or shuffle_chunk_size < 1:
+        raise ValueError(
+            f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size}."
+        )
+    shuffle_chunk_size = int(shuffle_chunk_size)
+    if colsum_algo not in (None, "columns", "atomics", "gemm", "benchmark"):
+        raise ValueError(f"Unknown colsum_algo {colsum_algo!r}.")
     n_cells = Z.shape[0]
 
     rng = np.random.default_rng(rng)
@@ -240,23 +249,27 @@ def harmonize(
     order = cp.argsort(groups.astype(cp.float64) + keys)
     del keys
     Z = _sorted_device_copy(Z, order)
-    cats = cats[order]
+    # Exact right-hand side sums per group are bounded by n_g max|X|.
+    low, high = float(Z.min()), float(Z.max())
+    if not (math.isfinite(low) and math.isfinite(high)):
+        raise ValueError(
+            "Input data contains NaN or infinite values. Please handle these "
+            "before running harmony_integrate."
+        )
+    max_abs = max(high, -low)
+    # Only one batch key reads the batch codes (as the block draw's groups).
+    cats = cats[order] if n_covariates == 1 else None
     # Sorted groups: offsets from the group sizes, cells in order.
     group_offsets = cp.zeros(n_groups + 1, dtype=cp.int32)
     group_offsets[1:] = cp.cumsum(cp.bincount(groups, minlength=n_groups))
     cell_indices = cp.arange(n_cells, dtype=cp.int32)
     if n_covariates > 1:
         joint_codes = joint_codes[order]
+    del batch_codes, groups
     host_offsets = cp.asnumpy(group_offsets)
     Z_norm = _normalize_cp(Z)
 
     # Set up parameters
-    if max_iter_harmony < 1:
-        raise ValueError("max_iter_harmony must be >= 1")
-    if int(shuffle_chunk_size) != shuffle_chunk_size or shuffle_chunk_size < 1:
-        raise ValueError(
-            f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size}."
-        )
     if n_clusters is None:
         n_clusters = int(min(100, n_cells / 30))
         n_clusters = max(n_clusters, 2)
@@ -364,8 +377,6 @@ def harmonize(
         host_offsets, _block_layout(n_cells, n_blocks, shuffle_chunk_size)[1]
     )
     workspace["seg_start"] = seg_start
-    # Exact right-hand side sums per group are bounded by n_g max|X|.
-    max_abs = max(float(Z.max()), -float(Z.min()))
     segments = (seg_start, seg_group, (np.diff(host_offsets) * max_abs).tolist())
     # The update blocks are drawn once, before the large arrays exist.
     _draw_blocks(
@@ -376,6 +387,7 @@ def harmonize(
         shuffle_chunk=shuffle_chunk_size,
         workspace=workspace,
     )
+    joint_codes = None  # only the block draw reads them
     loop_args = {
         "Pr_b": Pr_b,
         "theta": theta_array,
@@ -396,6 +408,8 @@ def harmonize(
         bfloat16=bfloat16,
         loop_args=loop_args,
     )
+    if correction_method != "fast":  # the only later reader
+        cats = cell_indices = None
 
     # Main harmony iterations
     is_converged = False
@@ -476,7 +490,7 @@ def harmonize(
         )
     if order is not None:
         # Free the working set before allocating the output.
-        del R, workspace, Z
+        del R, workspace, loop_args, Z
         out = cp.empty_like(Z_hat)
         out[order] = Z_hat
         return out
@@ -498,7 +512,7 @@ def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
     if isinstance(Z, cp.ndarray):
         return Z[order]
     n, d = Z.shape
-    rows = max(1, min(n, _UPLOAD_BYTES // (d * Z.itemsize)))
+    rows = _staging_rows(n, d * Z.itemsize)
     out = cp.empty(Z.shape, dtype=Z.dtype)
     position = cp.empty_like(order)
     position[order] = cp.arange(order.size)
@@ -517,11 +531,15 @@ def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
             staged[: b - a].set(host[: b - a], stream=stream)
             out[position[a:b]] = staged[: b - a]
             slots[j % 2][2] = stream.record()
-    if cp.isnan(out).any():
-        raise ValueError(
-            "Input data contains NaN values. Please handle these before running harmony_integrate."
-        )
+    stream.synchronize()  # the staging slots are released on return
     return out
+
+
+def _staging_rows(n: int, row_bytes: int) -> int:
+    """Rows per pinned staging chunk: about 1/32 of the data, 64-256 MiB.
+    Pinning costs time on first use; every chunk costs a host sync."""
+    chunk = min(_UPLOAD_BYTES, max(_UPLOAD_BYTES >> 2, n * row_bytes >> 5))
+    return max(1, min(n, chunk // row_bytes))
 
 
 def _pinned(rows: int, d: int, dtype) -> np.ndarray:
@@ -541,7 +559,7 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
     """``out[...] = src`` through pinned chunks: the next chunk is copied from
     the GPU while host threads move the previous one into ``out``."""
     n, d = src.shape
-    rows = max(1, min(n, _UPLOAD_BYTES // (d * src.itemsize)))
+    rows = _staging_rows(n, d * src.itemsize)
     stream = cp.cuda.get_current_stream()
     hosts = [_pinned(rows, d, src.dtype) for _ in range(2)]
     with ThreadPoolExecutor(_UPLOAD_THREADS) as pool:
@@ -566,7 +584,9 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
 def _fused_assign_smem_bytes(n_pcs: int, n_clusters: int, itemsize: int) -> int:
     """Shared memory of the fused assignment kernel (see kernels_clustering.cuh)."""
     pcs = -(-n_pcs // 4) * 4
-    return (pcs * _FUSED_MAX_CLUSTERS + 8 * 8 * pcs) * itemsize + 8 * n_clusters * 8
+    return pcs * _FUSED_MAX_CLUSTERS * itemsize + max(
+        8 * 8 * pcs * itemsize, 8 * n_clusters * 8
+    )
 
 
 def _segments(
@@ -906,10 +926,8 @@ def _correction_multi(
     starts = range(0, n_clusters, chunk_size)
     stream = cp.cuda.get_current_stream().ptr
     Z = _correction_output(X, output)
-    # Each chunk subtracts its clusters' correction from the previous result;
-    # results alternate between two buffers so the last one lands in Z.
-    buffers = [Z, cp.empty_like(Z)] if len(starts) > 1 else [Z]
-    source = X
+    # Each chunk continues the sums of the earlier clusters in Z and the last
+    # one subtracts them from X, so no second buffer is needed.
     for i, cluster_start in enumerate(starts):
         chunk = slice(cluster_start, cluster_start + chunk_size)
         lambda_chunk = cp.ascontiguousarray(lambda_kb[:, chunk])
@@ -936,15 +954,16 @@ def _correction_multi(
             rhs=rhs,
             joint_rhs=joint_rhs,
             scales=cp.empty(n_joint_categories, dtype=cp.float64),
-            acc=cp.empty((n_joint_categories, 2, k, n_pcs), dtype=cp.int64),
+            acc=cp.empty(
+                (n_joint_categories, _limbs(X.dtype.itemsize), k, n_pcs), dtype=cp.int64
+            ),
             stream=stream,
         )
         W_all = _solve_spd_batched(gram, rhs)
         del gram, rhs
         last = i == len(starts) - 1
-        out = buffers[(len(starts) - 1 - i) % len(buffers)]
         _correction_batched_cuda.apply_multi(
-            source,
+            X,
             R=R_chunk,
             W_all=W_all,
             joint_cats=joint_cats,
@@ -953,10 +972,11 @@ def _correction_multi(
             seg_group=seg_group,
             normalize=normalize and last,
             W_joint=joint_rhs,
-            Z=out,
+            Z=Z,
+            resume=i > 0,
+            finish=last,
             stream=stream,
         )
-        source = out
     return Z
 
 
@@ -1052,7 +1072,7 @@ def _multi_correction_cluster_chunk_size(
     # sliced O, lambda, active mask and joint counts.
     per_cluster = (
         itemsize * (3 * nb1 * nb1 + 3 * nb1 * n_pcs + n_joint_categories * (n_pcs + 1))
-        + 16 * n_joint_categories * n_pcs  # exact joint sums: 2 int64 limbs
+        + 8 * _limbs(itemsize) * n_joint_categories * n_pcs  # exact joint sums
         + (2 * itemsize + 1) * n_batches
     )
     if per_cluster > _CORRECTION_WORKSPACE_LIMIT_BYTES:
@@ -1063,6 +1083,11 @@ def _multi_correction_cluster_chunk_size(
             "number of batch levels or embedding dimensions."
         )
     return max(1, min(n_clusters, _CORRECTION_WORKSPACE_LIMIT_BYTES // per_cluster))
+
+
+def _limbs(itemsize: int) -> int:
+    """int64 limbs of the exact right-hand side sums (segment_gemm.cuh)."""
+    return 1 if itemsize == 4 else 2
 
 
 def _correction_output(X: cp.ndarray, output: cp.ndarray | None = None) -> cp.ndarray:
@@ -1159,7 +1184,9 @@ def _correction_batched(
         g_factor=cp.empty((n_clusters, nb1 - 1), dtype=dtype),
         g_P_row0=cp.empty((n_clusters, nb1 - 1), dtype=dtype),
         scales=cp.empty(nb1 - 1, dtype=cp.float64),
-        rhs_acc=cp.empty((nb1 - 1, 2, n_clusters, n_pcs), dtype=cp.int64),
+        rhs_acc=cp.empty(
+            (nb1 - 1, _limbs(dtype.itemsize), n_clusters, n_pcs), dtype=cp.int64
+        ),
         normalize=normalize,
         stream=cp.cuda.get_current_stream().ptr,
         handle=cp.cuda.device.get_cublas_handle(),
