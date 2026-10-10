@@ -195,7 +195,9 @@ def harmony_integrate(
         GPUs to split the cells across: ``True`` for all visible GPUs, a list
         or comma-separated string of device ids, or ``False``/``None`` for the
         current GPU. The result is bitwise identical to a run on one GPU of the
-        same model. ``correction_method="fast"`` runs on one GPU.
+        same model. The fast correction runs on one GPU; it is also chosen
+        for ``correction_method=None`` when the batched correction would need
+        more than 1 GiB of workspace.
     verbose
         Whether to print the number of iterations until convergence.
 
@@ -263,8 +265,9 @@ def harmony_integrate(
             # copy is kept. Harmony rejects NaN and infinite values.
             X = np.ascontiguousarray(input_data, dtype=dtype)
         elif isinstance(input_data, cp.ndarray):
-            # CuPy array: ensure correct dtype and layout with a copy
-            X = input_data.astype(dtype, order="C", copy=False)
+            # CuPy array: ensure correct dtype and layout, on its GPU
+            with cp.cuda.Device(input_data.device.id):
+                X = input_data.astype(dtype, order="C", copy=False)
         else:
             # Other array types: convert to NumPy first, then to CuPy
             try:

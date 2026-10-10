@@ -107,13 +107,9 @@ __global__ void sum_ranks_kernel(const long long* __restrict__ recv,
     }
 }
 
-// data (n values on rank's GPU, stream-ordered) = its sum over the GPUs.
-// Every rank makes the same sequence of calls; without comm this is a no-op.
-inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
-                      cudaStream_t stream) {
-    if (!comm || comm->ranks.size() < 2 || n == 0) return;
-    if (n > comm->capacity)
-        throw std::invalid_argument("harmony comm: exchange too large");
+// One exchange of n <= capacity values (see allreduce).
+inline void exchange(Comm* comm, int rank, long long* data, size_t n,
+                     cudaStream_t stream) {
     auto& me = comm->ranks[rank];
     int slot = me.count++ & 1;
     // Every rank (this one too, possibly on another stream) must be done
@@ -141,6 +137,16 @@ inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
         me.recv[slot], data, n, comm->capacity, rank, (int)comm->ranks.size());
     Comm::check(cudaGetLastError());
     Comm::check(cudaEventRecord(me.read[slot], stream));
+}
+
+// data (n values on rank's GPU, stream-ordered) = its sum over the GPUs, in
+// exchanges of at most `capacity` values. Every rank makes the same sequence
+// of calls; without comm this is a no-op.
+inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
+                      cudaStream_t stream) {
+    if (!comm || comm->ranks.size() < 2) return;
+    for (size_t i = 0; i < n; i += comm->capacity)
+        exchange(comm, rank, data + i, std::min(comm->capacity, n - i), stream);
 }
 
 }  // namespace harmony_comm

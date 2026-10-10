@@ -4,7 +4,7 @@ import itertools
 import math
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
@@ -44,6 +44,7 @@ _FUSED_MAX_CLUSTERS = 128
 _FORCE_GENERAL_ASSIGNMENT = False
 _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
 _UPLOAD_THREADS = 8
+_COMM_VALUES = 1 << 22  # int64 values per exchange slot; larger sums go in pieces
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
 _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
 
@@ -369,7 +370,8 @@ def harmonize(
     devices = devices or [cp.cuda.Device().id]
     if len(devices) > 1 and n_covariates == 1 and correction_method != "batched":
         warnings.warn(
-            f"correction_method={correction_method!r} runs on one GPU.",
+            "The fast correction runs on one GPU (it is also chosen when the "
+            "batched correction's workspace would exceed 1 GiB).",
             UserWarning,
             stacklevel=3,
         )
@@ -413,8 +415,11 @@ def harmonize(
     comm = None
     if n_ranks > 1:
         # Exact int64 sums of block counts, centroids and right-hand sides.
-        capacity = max(n_blocks * n_groups, 2 * n_groups * n_pcs, 3 * n_pcs)
-        comm, comm_buffers = _comm(devices, capacity * n_clusters, peer=peer)
+        limbs = _limbs(dtype.itemsize)
+        capacity = max(n_blocks * n_groups, limbs * n_groups * n_pcs, 3 * n_pcs)
+        comm, comm_buffers = _comm(
+            devices, min(capacity * n_clusters, _COMM_VALUES), peer=peer
+        )
 
     def run(rank: int):
         # One GPU's shard; several GPUs run it in parallel threads.
@@ -422,6 +427,16 @@ def harmonize(
 
         def local(a):
             return _copy(a, devices[rank], peer=peer)
+
+        # The fast correction (one GPU, maybe not the current one) reads the
+        # batch codes and offsets.
+        codes = {
+            "cats": cats,
+            "cat_offsets": group_offsets,
+            "cell_indices": cell_indices,
+        }
+        if correction_method == "fast" and n_covariates == 1:
+            codes = {key: local(value) for key, value in codes.items()}
 
         X = parts[rank]
         Z_norm = _normalize_cp(X)
@@ -538,10 +553,8 @@ def harmonize(
                     O=O,
                     lambda_kb=lambda_kb,
                     correction_method=correction_method,
-                    cats=cats,
                     n_batches=n_batches,
-                    cat_offsets=group_offsets,
-                    cell_indices=cell_indices,
+                    **codes,
                     output=Z_norm,
                     normalize=normalize,
                     segments=segments,
@@ -557,14 +570,17 @@ def harmonize(
                     Z_norm = _normalize_cp(Z_hat, out=Z_hat)
         return Z_hat, is_converged, i
 
+    errors = []  # the first is the cause; the other GPUs then fail on the abort
+
     def guarded(rank: int):
         with cp.cuda.Device(devices[rank]):
             try:
                 result = run(rank)
                 cp.cuda.get_current_stream().synchronize()  # read by other threads
                 return result
-            except BaseException:
+            except BaseException as error:
                 if comm is not None:
+                    errors.append(error)
                     comm.abort()  # release the other GPUs' threads
                 raise
 
@@ -573,9 +589,21 @@ def harmonize(
     else:
         # The GPUs' threads read this thread's arrays on their own streams.
         cp.cuda.get_current_stream().synchronize()
-        with ThreadPoolExecutor(n_ranks) as pool:
-            results = list(pool.map(guarded, range(n_ranks)))
-        del comm, comm_buffers
+        pool = ThreadPoolExecutor(n_ranks)
+        futures = [pool.submit(guarded, rank) for rank in range(n_ranks)]
+        try:
+            wait(futures)
+        except BaseException:  # e.g. Ctrl-C: stop the GPU threads first
+            comm.abort()
+            wait(futures)
+            raise
+        finally:
+            pool.shutdown()
+            del comm, comm_buffers  # ~Comm synchronizes the GPUs first
+        if errors:
+            raise errors[0]
+        results = [future.result() for future in futures]
+        del futures
     _, is_converged, i = results[0]
     if is_converged and verbose:
         print(f"Harmony converged in {i + 1} iterations")
@@ -587,7 +615,9 @@ def harmonize(
     if prefault is not None:
         prefault.join()
     if n_ranks > 1:
-        _write_shards([r[0] for r in results], order, bounds, devices, out, peer=peer)
+        shards = [r[0] for r in results]
+        del results  # _write_shards releases the shards as it goes
+        _write_shards(shards, order, bounds, devices, out, peer=peer)
         return out
     Z_hat = results[0][0]
     # Put the result back in input order, on its GPU.
@@ -689,25 +719,27 @@ def _write_shards(
         lo, hi = shards[rank]
         with cp.cuda.Device(devices[rank]):
             rows = _copy(order[lo:hi], devices[rank], peer=peer)
+            values, results[rank] = results[rank], None
             parts = []
             for a, b in shards:
                 mine = cp.flatnonzero((rows >= a) & (rows < b))
-                parts.append((results[rank][mine], rows[mine] - a))
+                parts.append((values[mine], rows[mine] - a))
             cp.cuda.get_current_stream().synchronize()
             return parts
 
     def write(rank):
-        # This GPU's output rows: its own parts plus the other GPUs' (kept
-        # alive until they are placed), then one host copy.
+        # This GPU's output rows, gathering every GPU's part (each released
+        # once placed), then one host copy.
         a, b = shards[rank]
         with cp.cuda.Device(devices[rank]):
-            moved = [
-                [_copy(x, devices[rank], peer=peer) for x in parts[rank]]
-                for parts in split_parts
-            ]
             rows = cp.empty((b - a, out.shape[1]), dtype=out.dtype)
-            for values, positions in moved:
+            for parts in split_parts:
+                values, positions = (
+                    _copy(x, devices[rank], peer=peer) for x in parts[rank]
+                )
+                parts[rank] = None
                 rows[positions] = values
+                del values, positions
             _download(rows, out[a:b])
 
     with ThreadPoolExecutor(len(devices)) as pool:
