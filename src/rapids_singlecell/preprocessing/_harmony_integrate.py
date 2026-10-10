@@ -292,7 +292,7 @@ def harmony_integrate(
 
     devices = (
         [cp.cuda.Device().id]
-        if multi_gpu in (None, False)
+        if multi_gpu is None or multi_gpu is False
         else parse_device_ids(multi_gpu=multi_gpu)
     )
     host_out = np.empty(X.shape, dtype=X.dtype)
