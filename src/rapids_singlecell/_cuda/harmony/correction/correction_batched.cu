@@ -99,14 +99,15 @@ static void prepare_multi_impl(
 
 // Z = X - R_i W_joint[joint of i] (normalized on request) for the clusters of
 // R (column slice, row stride ldr); W_joint[j] sums the marginal rows of W_all
-// over the categories of joint j.
+// over the categories of joint j. resume / finish: see apply_rows.
 template <typename T>
 static void apply_multi_impl(const T* X, const T* R, int ldr, const T* W_all,
                              const int* joint_cats, int n_pcs, int n_clusters,
                              int n_batches, int n_covariates,
                              int n_joint_categories, const int* seg_start,
                              const int* seg_group, int n_seg, bool normalize,
-                             T* W_joint, T* Z, cudaStream_t stream) {
+                             bool resume, bool finish, T* W_joint, T* Z,
+                             cudaStream_t stream) {
     long long joint_size = (long long)n_clusters * n_pcs;
     joint_coefficients_kernel<T>
         <<<strided_grid(n_joint_categories * joint_size, BLOCK_DIM_1D),
@@ -114,10 +115,11 @@ static void apply_multi_impl(const T* X, const T* R, int ldr, const T* W_all,
                                       n_clusters, n_batches, n_covariates,
                                       n_joint_categories);
     CUDA_CHECK_LAST_ERROR(joint_coefficients_kernel);
-    cuda_check(harmony_apply::apply_rows(
-                   X, R, ldr, W_joint, n_pcs, joint_size, n_pcs, n_clusters,
-                   seg_start, seg_group, n_seg, normalize, Z, stream),
-               "multi-key apply");
+    cuda_check(
+        harmony_apply::apply_rows(X, R, ldr, W_joint, n_pcs, joint_size, n_pcs,
+                                  n_clusters, seg_start, seg_group, n_seg,
+                                  normalize, Z, stream, resume, finish),
+        "multi-key apply");
 }
 
 // Batched correction of cells sorted by batch, all clusters at once. The
@@ -262,7 +264,7 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const int, Device> seg_start,
            gpu_array_c<const int, Device> seg_group, bool normalize,
            gpu_array_c<T, Device> W_joint, gpu_array_c<T, Device> Z,
-           std::uintptr_t stream) {
+           bool resume, bool finish, std::uintptr_t stream) {
             if (R.ndim() != 2 || R.stride(1) != 1)
                 throw std::invalid_argument("R must have contiguous rows");
             apply_multi_impl<T>(
@@ -270,11 +272,12 @@ static void register_correction_batched(nb::module_& m) {
                 joint_cats.data(), (int)X.shape(1), (int)R.shape(1), n_batches,
                 (int)joint_cats.shape(1), (int)joint_cats.shape(0),
                 seg_start.data(), seg_group.data(), (int)seg_group.size(),
-                normalize, W_joint.data(), Z.data(), (cudaStream_t)stream);
+                normalize, resume, finish, W_joint.data(), Z.data(),
+                (cudaStream_t)stream);
         },
         "X"_a, nb::kw_only(), "R"_a, "W_all"_a, "joint_cats"_a, "n_batches"_a,
         "seg_start"_a, "seg_group"_a, "normalize"_a, "W_joint"_a, "Z"_a,
-        "stream"_a = 0);
+        "resume"_a = false, "finish"_a = true, "stream"_a = 0);
 }
 
 template <typename Device>
