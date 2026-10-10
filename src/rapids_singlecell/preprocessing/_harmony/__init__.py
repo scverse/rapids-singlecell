@@ -24,7 +24,7 @@ from ._helper import (
     _stratified_sample_indices,
     _validate_output_buffer,
 )
-from ._kmeans import _kmeans
+from ._kmeans import _FUSED_MAX_CLUSTERS, _kmeans
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,7 +38,6 @@ _SUPPRESS_PENALTY = 1e30
 _CORRECTION_WORKSPACE_LIMIT_BYTES = 1 << 30
 _KMEANS_MAX_ITER = 25
 _KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
-_FUSED_MAX_CLUSTERS = 128
 # Tests: route every shape through the general assignment kernel.
 _FORCE_GENERAL_ASSIGNMENT = False
 _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
@@ -124,8 +123,9 @@ def harmonize(
 
     shuffle_chunk_size
         Cells per run of neighbouring cells of the same batch (joint category
-        with several keys) that move between update blocks together. ``1``
-        shuffles every cell independently.
+        with several keys) that move between update blocks together. Every
+        block takes an equal share of each stretch of the batch-sorted cells.
+        ``1`` moves cells one at a time.
 
     theta
         Weight of the diversity penalty term. A scalar is broadcast to every
@@ -309,20 +309,21 @@ def harmonize(
             "correction_method='original' is deprecated and will be removed in "
             f"a future release. {replacement_message}",
             FutureWarning,
-            stacklevel=3,
+            stacklevel=4,
         )
         correction_method = replacement
-    if n_covariates > 1 and correction_method == "fast":
-        warnings.warn(
-            f"correction_method={correction_method!r} is ignored when multiple "
-            "batch keys are provided; using the exact general-design correction.",
-            UserWarning,
-            stacklevel=3,
-        )
+    if n_covariates > 1:
+        if correction_method == "fast":
+            warnings.warn(
+                f"correction_method={correction_method!r} is ignored when multiple "
+                "batch keys are provided; using the exact general-design correction.",
+                UserWarning,
+                stacklevel=4,
+            )
+        correction_method = "batched"  # several keys: the multi-key solve
 
-    # Multi-covariate correction uses its own exact cluster-chunked solve.
-    # For one covariate, retain the established arrowhead auto-selection.
-    if correction_method is None and n_covariates == 1:
+    # One key: the batched correction unless its workspace is too large.
+    if correction_method is None:
         # Right-hand sides, coefficients and their exact sums (_correction_batched).
         itemsize = Z.dtype.itemsize
         batched_bytes = (
@@ -345,7 +346,7 @@ def harmonize(
             "dtype='bfloat16' needs one batch key and the batched correction; "
             "using float32 assignments instead (twice the assignment memory).",
             UserWarning,
-            stacklevel=3,
+            stacklevel=4,
         )
         bfloat16 = False
     # Buffers for all Harmony iterations.
@@ -367,9 +368,8 @@ def harmonize(
             marginal_joint_indices=marginal_joint_indices,
             n_first=int(n_levels[0]),
         )
-    seg_start, seg_group = _segments(
-        host_offsets, _block_layout(n_cells, n_blocks, shuffle_chunk_size)[1]
-    )
+    chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
+    seg_start, seg_group = _segments(host_offsets, unit)
     workspace["seg_start"] = seg_start
     segments = (seg_start, seg_group, (np.diff(host_offsets) * max_abs).tolist())
     # The update blocks are drawn once, before the large arrays exist.
@@ -378,7 +378,8 @@ def harmonize(
         n_groups=n_groups,
         n_blocks=n_blocks,
         seed=kernel_seed,
-        shuffle_chunk=shuffle_chunk_size,
+        chunk=chunk,
+        unit=unit,
         workspace=workspace,
     )
     joint_codes = None  # only the block draw reads them
@@ -474,7 +475,7 @@ def harmonize(
         # Correction has overwritten the old normalization buffer.
         if normalize:
             Z_norm = Z_hat
-            if n_covariates == 1 and correction_method != "batched":
+            if correction_method != "batched":
                 Z_norm = _normalize_cp(Z_hat, out=Z_hat)
 
     if not is_converged:
@@ -589,7 +590,7 @@ def _segments(
 
 def _block_layout(n_total: int, n_blocks: int, shuffle_chunk: int) -> tuple[int, int]:
     """Shuffle runs and units of the block draw (see _draw_blocks): about
-    _BLOCK_UNITS units, each dealing the same cells to every block."""
+    _BLOCK_UNITS units, each dealing every block the same share."""
     chunk = max(1, min(shuffle_chunk, n_total // n_blocks))
     step = n_blocks * chunk
     return chunk, step * -(-n_total // (step * _BLOCK_UNITS))
@@ -601,19 +602,14 @@ def _draw_blocks(
     n_groups: int,
     n_blocks: int,
     seed: int,
-    shuffle_chunk: int,
+    chunk: int,
+    unit: int,
     workspace: dict,
-    n_total: int | None = None,
-    first: int = 0,
 ) -> None:
     """Draw the update blocks of a harmonize call into the workspace's
-    ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here).
-    ``groups`` are the cells ``first ..`` of ``n_total`` sorted cells; a
-    cell's block depends only on its position in all ``n_total``."""
+    ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here);
+    ``chunk`` and ``unit`` from _block_layout."""
     n = groups.size
-    chunk, unit = _block_layout(
-        n if n_total is None else n_total, n_blocks, shuffle_chunk
-    )
     _clustering_cuda.draw_blocks(
         groups,
         idx_list=workspace["idx_list"],
@@ -629,7 +625,6 @@ def _draw_blocks(
         unit=unit,
         seed=seed & 0xFFFFFFFF,
         shuffle_chunk=chunk,
-        first=first,
         stream=cp.cuda.get_current_stream().ptr,
     )
 
@@ -709,7 +704,7 @@ def _allocate_clustering_workspace(
             f"{n_blocks} update blocks x {n_groups} batch groups; a larger "
             "block_proportion needs less.",
             UserWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
     n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
     # Assignment tiles: four per SM, plus one partial tile per group.

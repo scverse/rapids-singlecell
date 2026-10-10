@@ -68,8 +68,7 @@ __device__ __forceinline__ T inv_norm(T sq) {
     return s > T(1e12) ? T(1e12) : s;
 }
 
-// CHUNKED: W in several k chunks (kc < K rounded up to 4)
-template <typename T, typename RT, int SLOTS, bool CHUNKED>
+template <typename T, typename RT, int SLOTS>
 __global__ void __launch_bounds__(NT)
     apply_rows_kernel(const T* __restrict__ X, const RT* __restrict__ R,
                       int ldr, const T* __restrict__ W, long long wks,
@@ -101,8 +100,8 @@ __global__ void __launch_bounds__(NT)
     for (int d0 = 0; d0 < D; d0 += DW)
         for (int k0 = 0; k0 < K4; k0 += kc) {
             const int kn = min(kc, K4 - k0), wn = min(WS, D - d0);
-            const bool first = (!CHUNKED || k0 == 0) && !resume,
-                       last = (!CHUNKED || k0 + kn == K4) && finish;
+            const bool first = k0 == 0 && !resume,
+                       last = k0 + kn == K4 && finish;
             __syncthreads();  // previous chunk done with ws and the stages
             for (int i = threadIdx.x; i < kn * wn; i += NT) {
                 int k = i / wn, d = i - k * wn;
@@ -203,12 +202,12 @@ __global__ void __launch_bounds__(NT)
             }
 }
 
-template <typename T, typename RT, bool CHUNKED>
+template <typename T, typename RT>
 auto kernel_for(int slots) {
-    return slots == 1   ? apply_rows_kernel<T, RT, 1, CHUNKED>
-           : slots == 2 ? apply_rows_kernel<T, RT, 2, CHUNKED>
-           : slots == 4 ? apply_rows_kernel<T, RT, 4, CHUNKED>
-                        : apply_rows_kernel<T, RT, 8, CHUNKED>;
+    return slots == 1   ? apply_rows_kernel<T, RT, 1>
+           : slots == 2 ? apply_rows_kernel<T, RT, 2>
+           : slots == 4 ? apply_rows_kernel<T, RT, 4>
+                        : apply_rows_kernel<T, RT, 8>;
 }
 
 // apply_rows with slots in {1, 2, 4, 8} (columns per lane / 32), W in chunks
@@ -228,8 +227,7 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
     if (kc <= 0) return cudaErrorInvalidValue;
     if (n_seg <= 0) return cudaSuccess;
     const size_t smem = ((size_t)per * kc + slack) * sizeof(T);
-    auto kernel = kc < k4 ? kernel_for<T, RT, true>(slots)
-                          : kernel_for<T, RT, false>(slots);
+    auto kernel = kernel_for<T, RT>(slots);
     if (smem > 48 * 1024 &&
         cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem))

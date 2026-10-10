@@ -464,12 +464,23 @@ static void register_clustering_loop(nb::module_& m) {
                 (size_t)ASSIGN_TILES_PER_SM *
                     device_attribute(cudaDevAttrMultiProcessorCount) +
                 n_groups + 1;
-            if (block_counts.size() <
-                    (size_t)(n_blocks + 3) * n_groups * n_clusters ||
-                objective_partials.size() < (size_t)n_cells + 8 ||
+            size_t cells = n_cells, kb = (size_t)n_batches * n_clusters,
+                   kg = (size_t)n_groups * n_clusters;
+            size_t k_stride = (n_clusters + FUSED_CLUSTER_STRIDE - 1) /
+                              FUSED_CLUSTER_STRIDE * FUSED_CLUSTER_STRIDE;
+            if (Z_norm.size() < cells * n_pcs ||
+                (R_bf16 ? R_bf16->size() : R.size()) < cells * n_clusters ||
+                idx_list.size() < cells || E.size() < kb || O.size() < kb ||
+                penalty.size() < kb ||
+                Y_norm.size() < (size_t)n_clusters * n_pcs ||
+                (O_joint && O_joint->size() < kg) ||
+                (group_penalty && group_penalty->size() < kg) ||
+                block_cat_offsets.size() <
+                    (size_t)n_blocks * n_groups + n_groups + 2 ||
+                block_counts.size() < (n_blocks + 3) * kg ||
+                objective_partials.size() < cells + 8 ||
                 y_acc.size() < (size_t)3 * n_clusters * n_pcs ||
-                y_t.size() < (size_t)fused_padded_pcs(n_pcs) *
-                                 ((n_clusters + 127) / 128 * 128) ||
+                y_t.size() < (size_t)fused_padded_pcs(n_pcs) * k_stride ||
                 reinterpret_cast<uintptr_t>(y_t.data()) % 16 ||
                 (col_workspace &&
                  col_workspace->size() <
