@@ -116,11 +116,14 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
     s0, s1, s2 = _g_moments(g)
     n = g.shape[0]
     s02 = s0 * s0
-    n2 = n * n
-    v_num = n2 * s1 - n * s2 + 3 * s02
-    v_den = (n - 1) * (n + 1) * s02
-
-    Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
+    if params["mode"] == "gearyC":
+        # Geary's C has its own normality variance (Cliff & Ord 1981; esda ``Geary``)
+        Vscore_norm = ((2 * s1 + s2) * (n - 1) - 4 * s02) / (2 * (n + 1) * s02)
+    else:
+        n2 = n * n
+        v_num = n2 * s1 - n * s2 + 3 * s02
+        v_den = (n - 1) * (n + 1) * s02
+        Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
     seScore_norm = Vscore_norm ** (1 / 2.0)
 
     z_norm = (score - params["expected"]) / seScore_norm
