@@ -583,8 +583,7 @@ static void register_clustering_loop(nb::module_& m) {
         "n_clusters"_a, "n_batches"_a, "n_covariates"_a = 1,
         "n_joint_categories"_a = 0, "n_first"_a = 0, "n_blocks"_a, "sigma"_a,
         "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0, "stabilized"_a,
-        "stream"_a = 0, "initialize"_a = false, "comm"_a = 0,
-        "rank"_a = 0);
+        "stream"_a = 0, "initialize"_a = false, "comm"_a = 0, "rank"_a = 0);
 }
 
 template <typename T, typename Device>
