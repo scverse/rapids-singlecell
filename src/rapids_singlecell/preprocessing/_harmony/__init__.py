@@ -37,7 +37,6 @@ _CORRECTION_WORKSPACE_LIMIT_BYTES = 1 << 30
 _KMEANS_MAX_ITER = 25
 _KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
 _FUSED_MAX_CLUSTERS = 128
-_FUSED_MAX_PCS = 128
 # Tests: route every shape through the general assignment kernel.
 _FORCE_GENERAL_ASSIGNMENT = False
 _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
@@ -581,14 +580,6 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
             drain(*pending)
 
 
-def _fused_assign_smem_bytes(n_pcs: int, n_clusters: int, itemsize: int) -> int:
-    """Shared memory of the fused assignment kernel (see kernels_clustering.cuh)."""
-    pcs = -(-n_pcs // 4) * 4
-    return pcs * _FUSED_MAX_CLUSTERS * itemsize + max(
-        8 * 8 * pcs * itemsize, 8 * n_clusters * 8
-    )
-
-
 def _segments(
     offsets: np.ndarray, unit: int = _SEGMENT
 ) -> tuple[cp.ndarray, cp.ndarray]:
@@ -717,7 +708,6 @@ def _allocate_clustering_workspace(
 ) -> dict:
     """Buffers of the clustering loop. Groups are batches, or joint categories
     (with counts in ``O_joint``) for several keys."""
-    itemsize = np.dtype(dtype).itemsize
     counts_bytes = n_blocks * n_groups * n_clusters * 8
     if counts_bytes > 1 << 30:
         warnings.warn(
@@ -749,15 +739,11 @@ def _allocate_clustering_workspace(
     if n_covariates > 1:
         workspace["O_joint"] = cp.zeros((n_groups, n_clusters), dtype=dtype)
         workspace["group_penalty"] = cp.empty((n_groups, n_clusters), dtype=dtype)
-    if _FORCE_GENERAL_ASSIGNMENT or not (
-        n_clusters <= _FUSED_MAX_CLUSTERS
-        and n_pcs <= _FUSED_MAX_PCS
-        and _fused_assign_smem_bytes(n_pcs, n_clusters, itemsize)
-        <= cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
-    ):
-        # General assignment: transposed centroids and per-warp column sums.
-        stride = -(-n_clusters // _FUSED_MAX_CLUSTERS) * _FUSED_MAX_CLUSTERS
-        workspace["y_t_general"] = cp.empty((-(-n_pcs // 4) * 4, stride), dtype=dtype)
+    # Centroids transposed: padded PCs x 128-cluster blocks.
+    stride = -(-n_clusters // _FUSED_MAX_CLUSTERS) * _FUSED_MAX_CLUSTERS
+    workspace["y_t"] = cp.empty((-(-n_pcs // 4) * 4, stride), dtype=dtype)
+    if _FORCE_GENERAL_ASSIGNMENT or n_clusters > _FUSED_MAX_CLUSTERS:
+        # General assignment: per-warp column sums.
         workspace["col_workspace"] = cp.empty(n_tiles * 8 * n_clusters, dtype=cp.int64)
         workspace["force_general"] = _FORCE_GENERAL_ASSIGNMENT
     return workspace

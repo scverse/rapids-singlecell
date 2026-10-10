@@ -316,12 +316,13 @@ def test_draw_blocks_split_invariant():
 @pytest.mark.parametrize(
     "n_clusters,force_general", [(7, False), (7, True), (300, True)]
 )
-def test_fused_initialize_matches_reference(n_clusters, force_general):
+@pytest.mark.parametrize("n_pcs", [50, 1023])
+def test_fused_initialize_matches_reference(n_clusters, force_general, n_pcs):
     # One unpenalized assignment pass over the update blocks: R is the
     # softmax of -2/sigma (1 - z.y), O its per-batch column sums,
     # E = Pr_b x column sums, plus the objective.
     rng = cp.random.default_rng(7)
-    n_cells, n_pcs, n_batches, sigma, block_size = 3000, 50, 3, 0.1, 700
+    n_cells, n_batches, sigma, block_size = 3000, 3, 0.1, 700
     Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
     Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
     Y = Z[:n_clusters] + 0.1
@@ -366,7 +367,7 @@ def test_fused_initialize_matches_reference(n_clusters, force_general):
         seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
         y_scale=cp.empty(1, cp.float64),
         y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
-        y_t_general=cp.empty((52, stride), cp.float32),
+        y_t=cp.empty((-(-n_pcs // 4) * 4, stride), cp.float32),
         col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),
         force_general=force_general,
         n_cells=n_cells,

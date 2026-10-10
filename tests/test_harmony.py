@@ -781,7 +781,7 @@ def test_harmony_unseeded_random_state():
     assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
 
 
-def _repeatability_adata(dtype):
+def _repeatability_adata(dtype, n_pcs=17):
     rng = np.random.default_rng(5102)
     n_cells = 480
     ordinal = np.arange(n_cells)
@@ -795,7 +795,7 @@ def _repeatability_adata(dtype):
             },
             index=ordinal.astype(str),
         ),
-        obsm={"X_pca": rng.standard_normal((n_cells, 17)).astype(dtype)},
+        obsm={"X_pca": rng.standard_normal((n_cells, n_pcs)).astype(dtype)},
     )
 
 
@@ -805,15 +805,16 @@ def _repeatability_adata(dtype):
 )
 @pytest.mark.parametrize("kmeans_cells_per_cluster", [5000, 1])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("n_pcs", [17, 300])
 def test_harmony_integrate_repeats_bitwise(
-    monkeypatch, key, kmeans_cells_per_cluster, dtype
+    monkeypatch, key, kmeans_cells_per_cluster, dtype, n_pcs
 ):
     monkeypatch.setattr(
         harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", kmeans_cells_per_cluster
     )
     outputs = []
     for _ in range(2):
-        adata = _repeatability_adata(dtype)
+        adata = _repeatability_adata(dtype, n_pcs)
         rsc.pp.harmony_integrate(
             adata,
             key,
@@ -953,12 +954,6 @@ def test_harmony_bfloat16_falls_back_to_float32():
     assert fallback.tobytes() == _integrate(key=key).tobytes()
 
 
-def test_harmony_fused_assignment_fits_128_pcs():
-    # The column sums reuse the staged rows: 128 PCs and 100 clusters fit the
-    # 99 KB of shared memory of sm_86 and newer GPUs.
-    assert harmony_module._fused_assign_smem_bytes(128, 100, 4) <= 99 * 1024
-
-
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize(
     ("key", "n_pcs", "n_clusters"),
@@ -967,6 +962,9 @@ def test_harmony_fused_assignment_fits_128_pcs():
         (["batch", "second"], 17, 7),
         ("batch", 3, 128),
         ("batch", 128, 100),
+        ("batch", 300, 100),
+        (["batch", "second"], 300, 7),
+        ("batch", 1023, 20),
     ],
 )
 def test_harmony_general_assignment_matches_fused(
@@ -986,6 +984,30 @@ def test_harmony_general_assignment_matches_fused(
     monkeypatch.setattr(harmony_module, "_FORCE_GENERAL_ASSIGNMENT", True)
     general = run()
     assert _get_measure(general, fused, "L2") < 1e-4
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_fused_tiles_of_several_groups(monkeypatch):
+    # 60k cells per batch in one block: tiles hold several groups of rows,
+    # and with resident centroids each warp only waits for its own rows.
+    n_cells = 120_000
+    obs = pd.DataFrame(
+        {"batch": pd.Categorical(np.arange(n_cells) % 2)},
+        index=np.arange(n_cells).astype(str),
+    )
+    X = np.random.default_rng(7).standard_normal((n_cells, 50)).astype(np.float32)
+
+    def run():
+        adata = ad.AnnData(obs=obs, obsm={"X_pca": X})
+        rsc.pp.harmony_integrate(
+            adata, "batch", rng=734, block_proportion=1.0, max_iter_harmony=1
+        )
+        return adata.obsm["X_pca_harmony"]
+
+    fused = run()
+    assert run().tobytes() == fused.tobytes()
+    monkeypatch.setattr(harmony_module, "_FORCE_GENERAL_ASSIGNMENT", True)
+    assert _get_measure(run(), fused, "L2") < 1e-4
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
