@@ -18,19 +18,3 @@ __global__ void harmony_correction_kernel(T* __restrict__ Z,
         Z[i] -= correction;
     }
 }
-
-// Row 0 of each cluster's right-hand side (R^T X over all cells) as the sum
-// of its per-batch rows. Layout (n_clusters, n_batches + 1, n_pcs).
-template <typename T>
-__global__ void sum_batch_rows_kernel(T* __restrict__ rhs, int n_batches,
-                                      int n_pcs, int n_clusters) {
-    int nb1 = n_batches + 1;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         i < (long long)n_clusters * n_pcs;
-         i += (long long)blockDim.x * gridDim.x) {
-        long long k = i / n_pcs, d = i % n_pcs;
-        T sum = T(0);
-        for (int b = 1; b < nb1; ++b) sum += rhs[(k * nb1 + b) * n_pcs + d];
-        rhs[k * nb1 * n_pcs + d] = sum;
-    }
-}

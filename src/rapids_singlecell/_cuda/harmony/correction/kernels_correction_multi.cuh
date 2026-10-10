@@ -5,13 +5,12 @@
 #include <stdint.h>
 #include <type_traits>
 
-template <typename T>
-__device__ __forceinline__ T warp_sum_multi_correction(T value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value += __shfl_down_sync(0xffffffff, value, offset);
-    return value;
-}
+#include "../storage.cuh"
+
+// The regression systems are assembled and solved in double from the joint
+// counts and the exact joint right-hand sides: every entry is a sum of the
+// same values, so the intercept and category rows stay consistent and a small
+// ridge lambda does not lose the solution to rounding.
 
 // Initialize the intercept, intercept/category, and within-covariate diagonal
 // entries of every regression Gram matrix.  All other entries are already
@@ -19,49 +18,40 @@ __device__ __forceinline__ T warp_sum_multi_correction(T value) {
 // which is algebraically equivalent to omitting that category from the solve
 // and then restoring a zero coefficient.
 template <typename T>
-__global__ void initialize_multi_gram_kernel(const T* __restrict__ O,
-                                             const T* __restrict__ lambda_kb,
-                                             const uint8_t* __restrict__ active,
-                                             const T* __restrict__ joint_O,
-                                             T* __restrict__ gram,
-                                             int n_batches, int n_clusters,
-                                             int n_joint_categories) {
+__global__ void initialize_multi_gram_kernel(
+    const T* __restrict__ lambda_kb, const uint8_t* __restrict__ active,
+    const T* __restrict__ joint_O,
+    const int* __restrict__ marginal_joint_offsets,
+    const int* __restrict__ marginal_joint_indices, double* __restrict__ gram,
+    int n_batches, int n_clusters, int n_joint_categories) {
     int cluster = blockIdx.x;
     if (cluster >= n_clusters) return;
 
     int nb1 = n_batches + 1;
-    T* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
-
-    T cluster_sum = T(0);
+    double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
+    auto count = [&](int joint) {
+        return (double)joint_O[(size_t)joint * n_clusters + cluster];
+    };
+    double total = 0;
     for (int joint = threadIdx.x; joint < n_joint_categories;
-         joint += blockDim.x) {
-        cluster_sum += joint_O[(size_t)joint * n_clusters + cluster];
-    }
-    cluster_sum = warp_sum_multi_correction(cluster_sum);
-
-    __shared__ T warp_sums[32];
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) warp_sums[warp] = cluster_sum;
-    __syncthreads();
-
-    if (warp == 0) {
-        int n_warps = (blockDim.x + 31) >> 5;
-        T block_sum = lane < n_warps ? warp_sums[lane] : T(0);
-        block_sum = warp_sum_multi_correction(block_sum);
-        if (lane == 0) cluster_gram[0] = block_sum;
-    }
+         joint += blockDim.x)
+        total += count(joint);
+    total = block_sum(total);
+    if (threadIdx.x == 0) cluster_gram[0] = total;
 
     for (int batch = threadIdx.x; batch < n_batches; batch += blockDim.x) {
         int row = batch + 1;
         size_t bk = (size_t)batch * n_clusters + cluster;
         if (active[bk] != 0) {
-            T observed = O[bk];
+            double observed = 0;
+            for (int position = marginal_joint_offsets[batch];
+                 position < marginal_joint_offsets[batch + 1]; ++position)
+                observed += count(marginal_joint_indices[position]);
             cluster_gram[row] = observed;
             cluster_gram[(size_t)row * nb1] = observed;
             cluster_gram[(size_t)row * nb1 + row] = observed + lambda_kb[bk];
         } else {
-            cluster_gram[(size_t)row * nb1 + row] = T(1);
+            cluster_gram[(size_t)row * nb1 + row] = 1;
         }
     }
 }
@@ -74,8 +64,8 @@ __global__ void add_joint_cross_kernel(
     const T* __restrict__ joint_O, const int* __restrict__ joint_cats,
     const int* __restrict__ marginal_joint_offsets,
     const int* __restrict__ marginal_joint_indices,
-    const uint8_t* __restrict__ active, T* __restrict__ gram, int n_covariates,
-    int n_batches, int n_clusters) {
+    const uint8_t* __restrict__ active, double* __restrict__ gram,
+    int n_covariates, int n_batches, int n_clusters) {
     size_t total = (size_t)n_batches * n_clusters;
     int nb1 = n_batches + 1;
 
@@ -85,7 +75,7 @@ __global__ void add_joint_cross_kernel(
         int cluster = (int)(idx % n_clusters);
         if (active[idx] == 0) continue;
         int row = batch + 1;
-        T* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
+        double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
         // The lower category owns each symmetric pair and visits its joint
         // categories in CSR order. No other thread writes either entry.
         for (int position = marginal_joint_offsets[batch];
@@ -104,7 +94,7 @@ __global__ void add_joint_cross_kernel(
                     active[(size_t)other_batch * n_clusters + cluster] == 0)
                     continue;
                 int col = other_batch + 1;
-                T updated = cluster_gram[(size_t)row * nb1 + col] + value;
+                double updated = cluster_gram[(size_t)row * nb1 + col] + value;
                 cluster_gram[(size_t)row * nb1 + col] = updated;
                 cluster_gram[(size_t)col * nb1 + row] = updated;
             }
