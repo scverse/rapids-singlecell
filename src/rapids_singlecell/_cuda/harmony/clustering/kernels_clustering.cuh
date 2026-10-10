@@ -257,26 +257,64 @@ __global__ void penalty_from_counts_kernel(const T* O, const T* Pr_b,
 }
 
 // One CTA per assignment tile (cells of one category within the block). Each
-// warp takes FUSED_ROWS cells at a time and each lane owns four consecutive
-// clusters: similarities to the normalized centroids (staged in shared
-// memory, PCs padded to a multiple of four), penalized soft assignment
-// written to R in place, and the cell's distance + entropy objective term.
-// The tile's new column sums (fixed point) are added to its group's `counts`;
-// integer atomics are exact, so the order does not matter.
+// warp holds FUSED_ROWS cells of a group and each lane four consecutive
+// clusters: similarities to the normalized centroids, penalized soft
+// assignment written to R in place, and the cell's distance + entropy
+// objective term. The tile's new column sums (fixed point) are added to its
+// group's `counts`; integer atomics are exact, so the order does not matter.
 constexpr int FUSED_ROWS = 8;
 constexpr int FUSED_CLUSTER_STRIDE = 32 * FUSED_MAX_CLUSTER_SLOTS;
+constexpr int FUSED_GROUP = FUSED_THREADS / 32 * FUSED_ROWS;
+// A group's cells and the transposed centroids reach shared memory
+// STREAM_BYTES of each row at a time, double buffered; the dot products stay
+// in registers across chunks. Any number of PCs fits in 48 KB (no opt-in).
+constexpr int STREAM_BYTES = 128;
+constexpr int STREAM_SMEM =
+    2 * (FUSED_GROUP + FUSED_CLUSTER_STRIDE) * STREAM_BYTES;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+constexpr int FUSED_CTAS = 1;  // 64 KB of shared memory hold one CTA
+#else
+constexpr int FUSED_CTAS = 2;  // float: the register cap pays for itself
+#endif
 
 __host__ __device__ inline int fused_padded_pcs(int n_pcs) {
     return (n_pcs + 3) / 4 * 4;
 }
 
+// Whether the centroids (padded PCs) fit in shared memory next to two row
+// stages: up to 64 float or 32 double PCs.
 template <typename T>
-size_t fused_assign_smem_bytes(int n_pcs, int n_clusters) {
-    int warps = FUSED_THREADS / 32, pcs = fused_padded_pcs(n_pcs);
-    // The column sums reuse the staged rows once every warp is done.
-    return (size_t)pcs * FUSED_CLUSTER_STRIDE * sizeof(T) +
-           std::max((size_t)warps * FUSED_ROWS * pcs * sizeof(T),
-                    (size_t)warps * n_clusters * sizeof(long long));
+__host__ __device__ inline bool fused_resident(int pcs) {
+    return (size_t)pcs * FUSED_CLUSTER_STRIDE +
+               2 * FUSED_GROUP * (STREAM_BYTES / sizeof(T)) <=
+           STREAM_SMEM / sizeof(T);
+}
+
+// V-byte word, and dst = V bytes at src (or zeros unless ok) by cp.async
+// (sm_80 on), which copy_wait waits for.
+template <int V>
+using Piece =
+    std::conditional_t<V == 16, int4, std::conditional_t<V == 8, int2, int> >;
+template <int V>
+__device__ __forceinline__ void copy_async(void* dst, const void* src,
+                                           bool ok) {
+#if __CUDA_ARCH__ >= 800
+    unsigned s = (unsigned)__cvta_generic_to_shared(dst), n = ok ? V : 0;
+    if constexpr (V == 16)  // 16 bytes bypass L1
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s),
+                     "l"(src), "r"(n)
+                     : "memory");
+    else
+        asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::"r"(s),
+                     "l"(src), "n"(V), "r"(n)
+                     : "memory");
+#endif
+}
+
+__device__ __forceinline__ void copy_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;" ::: "memory");
+#endif
 }
 
 template <typename T>
@@ -312,13 +350,13 @@ __device__ __forceinline__ void transpose_padded(const T* src, T* dst, int n,
     }
 }
 
-// acc[r][q] = f(acc[r][q], x, c) over the padded columns d, x = rows[r][d]
-// (FUSED_ROWS rows staged `pcs` apart) and c = cols_t[d][k0 + q].
+// acc[r][q] = f(acc[r][q], x, c) over the columns d < n (a multiple of four),
+// x = rows[r * pitch + d] and c = cols_t[d][k0 + q].
 template <typename T, typename F>
 __device__ __forceinline__ void tile_products(
-    const T* rows, const T* cols_t, int pcs, int k0,
+    const T* rows, int pitch, const T* cols_t, int n, int k0,
     T (&acc)[FUSED_ROWS][FUSED_MAX_CLUSTER_SLOTS], F f) {
-    for (int d = 0; d < pcs; d += 4) {
+    for (int d = 0; d < n; d += 4) {
         T c[4][FUSED_MAX_CLUSTER_SLOTS];
 #pragma unroll
         for (int j = 0; j < 4; ++j)
@@ -326,7 +364,7 @@ __device__ __forceinline__ void tile_products(
 #pragma unroll
         for (int r = 0; r < FUSED_ROWS; ++r) {
             T x[4];
-            load4(rows + r * pcs + d, x);
+            load4(rows + r * pitch + d, x);
 #pragma unroll
             for (int j = 0; j < 4; ++j)
 #pragma unroll
@@ -336,16 +374,17 @@ __device__ __forceinline__ void tile_products(
     }
 }
 
-// ZQ = ceil(padded PCs / 32): Z values per lane and cell held in registers
-// while the next cells are prefetched.
-// Two CTAs per SM: the register cap pays for itself in latency hiding.
+// Z pieces are V bytes; y_t holds the centroids transposed (padded PCs x
+// FUSED_CLUSTER_STRIDE, see transpose_centroids). Every dot product is one
+// chain over the PCs in order, as in tile_products, whatever the tiling.
 // `penalty` holds log penalties (null: none). The log weights are shifted by
 // the tile's largest log penalty, so none overflows and the row's best
 // cluster under that penalty keeps at least exp(2 term); below sigma = 1/15
 // each row is shifted by its own maximum instead.
-template <typename T, typename RT, int ZQ>
-__global__ void __launch_bounds__(FUSED_THREADS, 2)
-    fused_assign_kernel(const T* __restrict__ Z, const T* __restrict__ Y_norm,
+template <typename T, typename RT, int V>
+__global__ void __launch_bounds__(FUSED_THREADS,
+                                  sizeof(T) == 4 ? FUSED_CTAS : 1)
+    fused_assign_kernel(const T* __restrict__ Z, const T* __restrict__ y_t,
                         const T* __restrict__ penalty,
                         const int* __restrict__ idx,
                         const int* __restrict__ offsets,
@@ -359,17 +398,15 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
     int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
                                      tile_rows, start, end);
 
-    constexpr int S = FUSED_MAX_CLUSTER_SLOTS;
+    constexpr int S = FUSED_MAX_CLUSTER_SLOTS, TM = FUSED_GROUP;
+    constexpr int DC = STREAM_BYTES / sizeof(T), ZV = V / sizeof(T);
+    constexpr int STAGE = (TM + FUSED_CLUSTER_STRIDE) * DC;
     int pcs = fused_padded_pcs(n_pcs);
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int n_warps = blockDim.x >> 5;
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    T* y_t = reinterpret_cast<T*>(smem_raw);  // pcs x FUSED_CLUSTER_STRIDE
-    T* z_s = y_t + (size_t)pcs * FUSED_CLUSTER_STRIDE;  // warps x ROWS x pcs
-    long long* col_sums = reinterpret_cast<long long*>(z_s);  // warps x K
-    transpose_padded(Y_norm, y_t, n_clusters, n_pcs, pcs, FUSED_CLUSTER_STRIDE,
-                     threadIdx.x, blockDim.x);
-    T* z_w = z_s + (size_t)warp * FUSED_ROWS * pcs;
+    T* stages = reinterpret_cast<T*>(smem_raw);
+    long long* col_sums = reinterpret_cast<long long*>(smem_raw);  // warps x K
     int k0 = 4 * lane;  // this lane's clusters k0 .. k0 + 3
     T log_pen[S], top = -INFINITY;
     long long col[S] = {};
@@ -386,47 +423,117 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
     // and float; for double the two stores cost more than they save).
     bool vec_store = sizeof(RT) <= 4 && n_clusters % 4 == 0 &&
                      reinterpret_cast<size_t>(R) % (4 * sizeof(RT)) == 0;
-    __syncthreads();
 
-    // The next cells' indices and Z values are loaded into registers while
-    // the current cells are assigned, hiding the gather latency.
-    int next[FUSED_ROWS];
-    T z_next[FUSED_ROWS][ZQ];
-    auto prefetch = [&](int b) {
+    // Groups of TM cells take one step per chunk of DC PCs; a step's rows
+    // and centroids are staged while the previous step's products run. Up to
+    // 64 float (32 double) PCs the centroids stay in shared memory for the
+    // whole tile, and each step only waits for the warp's own rows. A lane
+    // copies the Z pieces at column zd of its warp's rows zr + j ZR.
+    int n_chunks = (pcs + DC - 1) / DC, n_groups = (end - start + TM - 1) / TM;
+    bool resident = fused_resident<T>(pcs);
+    T* y_s = stages + 2 * TM * DC;  // resident centroids after the row stages
+    auto rows_of = [&](int st) {
+        return stages + st * (resident ? TM * DC : STAGE);
+    };
+    auto cols_of = [&](int st, int c) -> const T* {
+        return resident ? y_s + (size_t)c * DC * FUSED_CLUSTER_STRIDE
+                        : rows_of(st) + TM * DC;
+    };
+    if (resident)  // the first step's barrier waits for these copies too
+        for (int e = threadIdx.x * 16 / sizeof(T);
+             e < pcs * FUSED_CLUSTER_STRIDE;
+             e += FUSED_THREADS * 16 / sizeof(T)) {
+#if __CUDA_ARCH__ >= 800
+            copy_async<16>(y_s + e, y_t + e, true);
+#else
+            *reinterpret_cast<Piece<16>*>(y_s + e) =
+                *reinterpret_cast<const Piece<16>*>(y_t + e);
+#endif
+        }
+    auto cell = [&](int p) { return p >= end ? -1 : idx ? idx[p] : p; };
+    constexpr int ZP = FUSED_ROWS * DC / (32 * ZV), ZR = 32 * ZV / DC;
+    int zr = warp * FUSED_ROWS + lane * ZV / DC, zd = lane * ZV % DC;
+    int z_cell[ZP];              // the loading group's cells (-1: none)
+    int lg = 0, lc = 0, ls = 0;  // the next load: group, chunk, buffer
+    // Before sm_80 a step's pieces wait in registers while the previous
+    // step's products run (fetch), then go to shared memory (store).
+#if __CUDA_ARCH__ >= 800
+    constexpr bool async = true;
+#else
+    constexpr bool async = false;
+#endif
+    constexpr int YP = STREAM_BYTES * FUSED_CLUSTER_STRIDE / FUSED_THREADS / 16;
+    Piece<16> y_reg[YP];
+    Piece<V> z_reg[ZP];
+    auto load = [&](bool fetch) {
+        if (lg == n_groups) return;
+        int d0 = lc * DC, d = d0 + zd;
+        T* z_s = rows_of(ls);
 #pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r) {
-            next[r] = b + r >= end ? -1 : idx ? idx[b + r] : b + r;
+        for (int i = 0; i < YP; ++i) {
+            int e = (threadIdx.x + i * FUSED_THREADS) * 16 / sizeof(T);
+            T* dst = z_s + TM * DC + e;
+            const T* src = y_t + (size_t)d0 * FUSED_CLUSTER_STRIDE + e;
+            if (resident || e >= min(DC, pcs - d0) * FUSED_CLUSTER_STRIDE)
+                break;
+            if (async)
+                copy_async<16>(dst, src, true);
+            else if (fetch)
+                y_reg[i] = *reinterpret_cast<const Piece<16>*>(src);
+            else
+                *reinterpret_cast<Piece<16>*>(dst) = y_reg[i];
+        }
 #pragma unroll
-            for (int q = 0; q < ZQ; ++q) {
-                int d = lane + 32 * q;
-                z_next[r][q] = next[r] >= 0 && d < n_pcs
-                                   ? Z[(size_t)next[r] * n_pcs + d]
-                                   : T(0);
-            }
+        for (int j = 0; j < ZP; ++j) {
+            if (lc == 0 && fetch)
+                z_cell[j] = cell(start + lg * TM + zr + j * ZR);
+            const T* src = Z + (size_t)max(z_cell[j], 0) * n_pcs + d;
+            T* dst = z_s + (zr + j * ZR) * DC + zd;
+            bool ok = z_cell[j] >= 0 && d < n_pcs;  // never straddles n_pcs
+            if (d >= pcs) continue;
+            if (async)
+                copy_async<V>(dst, src, ok);
+            else if (fetch)
+                z_reg[j] =
+                    ok ? *reinterpret_cast<const Piece<V>*>(src) : Piece<V>{};
+            else
+                *reinterpret_cast<Piece<V>*>(dst) = z_reg[j];
+        }
+        if (async || !fetch) {
+            ls ^= 1;
+            if (++lc == n_chunks) lc = 0, ++lg;
         }
     };
-    int stride = n_warps * FUSED_ROWS;
-    if (start + warp * FUSED_ROWS < end) prefetch(start + warp * FUSED_ROWS);
-    for (int base = start + warp * FUSED_ROWS; base < end; base += stride) {
-        int rows = min(FUSED_ROWS, end - base);
-        int cell[FUSED_ROWS];
-        __syncwarp();
+    load(true);
+    if (!async) load(false);
+    T dots[FUSED_ROWS][S];
+    for (int g = 0, stage = 0; g < n_groups; ++g) {
+        int base = start + g * TM + warp * FUSED_ROWS;
+        bool active = base < end;  // warp-uniform
+        int lane_cell = lane < FUSED_ROWS ? cell(base + lane) : -1;
 #pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r) {
-            cell[r] = next[r];
+        for (int r = 0; r < FUSED_ROWS; ++r)
 #pragma unroll
-            for (int q = 0; q < ZQ; ++q)
-                if (lane + 32 * q < pcs)
-                    z_w[r * pcs + lane + 32 * q] = z_next[r][q];
+            for (int q = 0; q < S; ++q) dots[r][q] = T(0);
+        for (int c = 0; c < n_chunks; ++c, stage ^= 1) {
+            copy_wait();
+            if (resident && (g | c))
+                __syncwarp();  // the warp's own rows landed
+            else
+                __syncthreads();  // this step landed; the other buffer is free
+            load(true);
+            if (active)
+                tile_products(rows_of(stage) + warp * FUSED_ROWS * DC, DC,
+                              cols_of(stage, c), min(DC, pcs - c * DC), k0,
+                              dots,
+                              [](T acc, T z, T y) { return acc + z * y; });
+            if (!async) load(false);
         }
-        __syncwarp();
-        if (base + stride < end) prefetch(base + stride);
-        T dots[FUSED_ROWS][S] = {};
-        tile_products(z_w, y_t, pcs, k0, dots,
-                      [](T acc, T z, T y) { return acc + z * y; });
+        if (!active) continue;
 #pragma unroll
         for (int r = 0; r < FUSED_ROWS; ++r) {
-            if (r >= rows) break;  // warp-uniform
+            int c = __shfl_sync(0xffffffff, lane_cell, r);
+            if (c < 0) break;  // warp-uniform
             T vals[S];
             T sum = T(0);
             T shift = top;
@@ -450,7 +557,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
             sum = warp_sum(sum);
             T inv = T(1) / sum, log_sum = log(sum);
             T distance = T(0), entropy = T(0);
-            RT* row = R + (size_t)cell[r] * n_clusters;
+            RT* row = R + (size_t)c * n_clusters;
             RT stored[S];
 #pragma unroll
             for (int q = 0; q < S; ++q)
@@ -472,10 +579,10 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
                 }
             }
             T total = warp_sum(distance + sigma * entropy);
-            if (lane == 0) partial[cell[r]] = total;
+            if (lane == 0) partial[c] = total;
         }
     }
-    __syncthreads();  // col_sums overlays the staged rows
+    __syncthreads();  // col_sums overlays the buffers
 #pragma unroll
     for (int q = 0; q < S; ++q)
         if (k0 + q < n_clusters) col_sums[warp * n_clusters + k0 + q] = col[q];
@@ -488,8 +595,7 @@ __global__ void __launch_bounds__(FUSED_THREADS, 2)
     }
 }
 
-// General assignment for shapes the fused kernel does not fit (more than 128
-// clusters, or centroids beyond shared memory): centroids are read from the
+// General assignment for more than 128 clusters: centroids are read from the
 // transposed global buffer `y_t` (padded PCs x `k_stride`), Z directly from
 // global memory, and clusters in chunks of FUSED_CLUSTER_STRIDE. With one
 // chunk a single sweep normalizes; otherwise a first sweep tracks each row's
@@ -690,7 +796,7 @@ __global__ void kmeans_assign_kernel(const T* __restrict__ X,
                                         : T(0);
         __syncwarp();
         T dist[FUSED_ROWS][S] = {};
-        tile_products(x_w, c_t, cols, k0, dist, [](T acc, T x, T c) {
+        tile_products(x_w, cols, c_t, cols, k0, dist, [](T acc, T x, T c) {
             T delta = x - c;
             return acc + delta * delta;
         });
