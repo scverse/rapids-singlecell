@@ -281,6 +281,13 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
         )
 
 
+@pytest.mark.parametrize("dtype", [np.float16, np.int32])
+def test_harmony_rejects_unsupported_dtype(dtype):
+    adata = _repeatability_adata(np.float32)
+    with pytest.raises(ValueError, match="dtype must be float32, float64"):
+        rsc.pp.harmony_integrate(adata, "batch", dtype=dtype)
+
+
 def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
     """Harmony correction with an explicit intercept + one-hot design matrix,
     in float64; pruned levels (lambda at the sentinel) are dropped from each
@@ -993,20 +1000,30 @@ def test_harmony_general_assignment_matches_fused(
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_fused_tiles_of_several_groups(monkeypatch):
-    # 60k cells per batch in one block: tiles hold several groups of rows,
-    # and with resident centroids each warp only waits for its own rows.
-    n_cells = 120_000
+@pytest.mark.parametrize(
+    ("dtype", "n_pcs"),
+    [("float32", 50), ("float32", 100), ("float64", 50), ("bfloat16", 50)],
+)
+def test_harmony_fused_tiles_of_several_groups(monkeypatch, dtype, n_pcs):
+    # One block of 160 cells per SM: assignment tiles hold two or three groups
+    # of 64 rows with one or two CTAs per SM (T4, float64: one), so warps run
+    # several groups, with resident (50 PCs) and streamed (100) centroids.
+    n_cells = 160 * cp.cuda.Device().attributes["MultiProcessorCount"]
     obs = pd.DataFrame(
         {"batch": pd.Categorical(np.arange(n_cells) % 2)},
         index=np.arange(n_cells).astype(str),
     )
-    X = np.random.default_rng(7).standard_normal((n_cells, 50)).astype(np.float32)
+    X = np.random.default_rng(7).standard_normal((n_cells, n_pcs))
 
     def run():
-        adata = ad.AnnData(obs=obs, obsm={"X_pca": X})
+        adata = ad.AnnData(obs=obs, obsm={"X_pca": X.astype(np.float32)})
         rsc.pp.harmony_integrate(
-            adata, "batch", rng=734, block_proportion=1.0, max_iter_harmony=1
+            adata,
+            "batch",
+            dtype=dtype,
+            rng=734,
+            block_proportion=1.0,
+            max_iter_harmony=1,
         )
         return adata.obsm["X_pca_harmony"]
 

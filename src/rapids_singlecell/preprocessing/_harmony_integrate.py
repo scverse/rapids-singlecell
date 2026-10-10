@@ -176,13 +176,15 @@ def harmony_integrate(
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
-        The blocks are drawn once per call and visited in a rotating order
-        (the reference implementations redraw them every iteration).
+        The blocks are drawn once per call, balanced across batches, and
+        visited in a rotating order (the reference implementations redraw
+        random blocks every iteration).
     shuffle_chunk_size
-        Cells are assigned to the random update blocks in runs of this many
-        randomly chosen cells of the same batch (joint category with several
-        keys), so the GPU writes contiguous rows. ``1`` assigns every cell
-        independently, as the reference implementations do.
+        Cells move between the update blocks in runs of this many neighbouring
+        cells of the same batch (joint category with several keys), in random
+        order within the batch, so the GPU writes contiguous rows. Every block
+        takes an equal share of each stretch of the batch-sorted cells, so the
+        blocks are balanced across batches. ``1`` moves cells one at a time.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -204,6 +206,9 @@ def harmony_integrate(
     bfloat16 = str(dtype) == "bfloat16" or getattr(dtype, "__name__", "") == "bfloat16"
     if bfloat16:
         dtype = np.float32
+    dtype = np.dtype(dtype)
+    if dtype not in (np.float32, np.float64):
+        raise ValueError(f"dtype must be float32, float64 or 'bfloat16', got {dtype}.")
 
     from ._harmony import _download, harmonize
 
@@ -219,20 +224,20 @@ def harmony_integrate(
             "ridge_lambda is ignored when flavor='harmony2'; "
             "use alpha to control regularization strength.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if flavor == "harmony1":
         if alpha != 0.2:
             warnings.warn(
                 "alpha is ignored when flavor='harmony1'; use ridge_lambda instead.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         if batch_prune_threshold != 1e-5:
             warnings.warn(
                 "batch_prune_threshold is ignored when flavor='harmony1'.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
     basis = _resolve_obsm_key(adata, basis)
