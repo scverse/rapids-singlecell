@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
 import cupy as cp
+import numpy as np
 import pytest
 
 from rapids_singlecell._utils import _multi_gpu, _split_pairs, parse_device_ids
@@ -291,6 +294,7 @@ class TestDeviceCopy:
         if cp.cuda.runtime.getDeviceCount() < 2:
             pytest.skip("requires two GPUs")
         monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", lambda *_: None)
         monkeypatch.setattr(cp.cuda.runtime, "memcpyPeerAsync", lambda *_: None)
 
         assert not _multi_gpu._peer_copy_works(1, 0)
@@ -332,3 +336,79 @@ class TestDeviceCopy:
 
         assert copied.device.id == 1
         assert copied.get().tolist() == list(range(8))
+
+    @pytest.mark.parametrize(
+        "copy", ["_copy_to_device_p2p", "_copy_to_device_via_host"]
+    )
+    @pytest.mark.parametrize(
+        "view",
+        [
+            lambda a: a,
+            cp.asfortranarray,
+            lambda a: a.T,
+            lambda a: a[::3],
+            lambda a: a[:, ::-1],
+            lambda a: a[:0],
+        ],
+        ids=["C", "F", "transposed", "strided", "reversed", "empty"],
+    )
+    def test_copies_keep_values_and_layout(self, copy, view):
+        if cp.cuda.runtime.getDeviceCount() < 2:
+            pytest.skip("requires two GPUs")
+        if copy == "_copy_to_device_p2p" and not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        with cp.cuda.Device(0):
+            source = view(cp.arange(60, dtype=cp.float32).reshape(12, 5))
+
+        copied = getattr(_multi_gpu, copy)(source, 1)
+
+        assert copied.device.id == 1
+        np.testing.assert_array_equal(copied.get(), source.get())
+        if source.flags.c_contiguous or source.flags.f_contiguous:
+            assert copied.flags.f_contiguous == source.flags.f_contiguous
+
+    def test_check_enables_peer_access(self, monkeypatch):
+        # The canary runs the direct path that later copies take.
+        if cp.cuda.runtime.getDeviceCount() < 2:
+            pytest.skip("requires two GPUs")
+        enable, enabled = cp.cuda.runtime.deviceEnablePeerAccess, []
+
+        def record(peer):
+            enabled.append((cp.cuda.Device().id, peer))
+            return enable(peer)
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", record)
+        if not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        assert enabled == [(1, 0), (0, 1)]
+
+    def test_peer_copy_orders_the_source_after_it(self):
+        # The source may be released right away: with the destination's stream
+        # held up, the source GPU reuses its pool block only after the copy.
+        if cp.cuda.runtime.getDeviceCount() < 2:
+            pytest.skip("requires two GPUs")
+        if not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        pool, previous = cp.cuda.MemoryPool(), cp.cuda.get_allocator()
+        cp.cuda.set_allocator(pool.malloc)  # stream-ordered block reuse
+        try:
+            n = 1 << 22
+            for device in (0, 1):  # loaded kernels and a pooled block
+                with cp.cuda.Device(device):
+                    cp.full(n, -1, dtype=cp.float32)
+                    cp.cuda.Device().synchronize()
+            with cp.cuda.Device(0):
+                source = cp.arange(n, dtype=cp.float32)
+                cp.cuda.Device().synchronize()
+            with cp.cuda.Device(1), cp.cuda.Stream(non_blocking=True) as stream:
+                stream.launch_host_func(lambda _: time.sleep(0.2), None)
+                copied = _multi_gpu._copy_to_device(source, 1)
+            del source
+            with cp.cuda.Device(0):
+                cp.full(n, -1, dtype=cp.float32)  # takes the source's block
+            with cp.cuda.Device(1):
+                cp.cuda.Device().synchronize()
+                assert bool((copied == cp.arange(n, dtype=cp.float32)).all())
+        finally:
+            cp.cuda.set_allocator(previous)
+            pool.free_all_blocks()

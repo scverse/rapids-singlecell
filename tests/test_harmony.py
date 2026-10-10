@@ -1414,22 +1414,31 @@ def _record_ranks(monkeypatch) -> list:
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize(
-    ("key", "n_pcs"), [("batch", 17), (["batch", "second"], 17), ("batch", 300)]
+    ("key", "n_pcs", "dtype", "n_clusters"),
+    [
+        ("batch", 17, np.float32, 7),
+        (["batch", "second"], 17, np.float32, 7),
+        (["batch", "second"], 17, np.float64, 7),  # wider exact sums
+        ("batch", 300, np.float32, 7),
+        (["batch", "second"], 17, np.float32, 300),  # cluster blocks
+    ],
 )
-def test_harmony_two_ranks_on_one_gpu(monkeypatch, key, n_pcs):
+def test_harmony_two_ranks_on_one_gpu(monkeypatch, key, n_pcs, dtype, n_clusters):
     # Two shards on one GPU run the exchanges and the shard I/O of multi_gpu
     # (one-GPU CI covers them) and give the bits of one.
-    adata = _repeatability_adata(np.float32, n_pcs)
+    import rapids_singlecell.preprocessing._harmony._multi_gpu as multi_gpu_module
+
+    adata = _repeatability_adata(dtype, n_pcs)
     ranks = _record_ranks(monkeypatch)
 
-    def run(devices, **kwargs):
-        out = np.empty_like(adata.obsm["X_pca"])
+    def run(devices, data=adata, **kwargs):
+        out = np.empty_like(data.obsm["X_pca"])
         harmony_module.harmonize(
-            adata.obsm["X_pca"],
-            adata.obs,
+            data.obsm["X_pca"],
+            data.obs,
             key,
             rng=734,
-            n_clusters=7,
+            n_clusters=n_clusters,
             max_iter_harmony=2,
             devices=devices,
             out=out,
@@ -1450,6 +1459,19 @@ def test_harmony_two_ranks_on_one_gpu(monkeypatch, key, n_pcs):
     else:  # 'fast' is ignored with several keys
         with pytest.warns(UserWarning, match="is ignored"):
             run([0, 0], correction_method="fast")
+        # Cluster chunks of the correction, each with its own exchange.
+        monkeypatch.setattr(
+            harmony_module, "_multi_correction_cluster_chunk_size", lambda **_: 2
+        )
+        assert run([0, 0]).tobytes() == run([0]).tobytes()
+    # Without peer copies (pinned host send slots), from input sorted by batch
+    # in several upload chunks, so that each shard skips the other's chunks.
+    monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)
+    monkeypatch.setattr(
+        harmony_module, "_UPLOAD_BYTES", 40 * adata.obsm["X_pca"][0].nbytes
+    )
+    by_batch = adata[np.argsort(adata.obs["batch"].to_numpy(), kind="stable")].copy()
+    assert run([0, 0], by_batch).tobytes() == run([0], by_batch).tobytes()
     # The last batch sorts into the last shard.
     X = adata.obsm["X_pca"]
     X[adata.obs["batch"].to_numpy() == 4, 0] = np.nan

@@ -368,6 +368,15 @@ def harmonize(
             stacklevel=4,
         )
         bfloat16 = False
+    counts_bytes = n_blocks * n_batches * n_clusters * 8  # every GPU keeps them
+    if counts_bytes > 1 << 30:
+        warnings.warn(
+            f"Harmony keeps {counts_bytes / 2**30:.1f} GiB of cluster counts for "
+            f"{n_blocks} update blocks x {n_batches} batch levels; a larger "
+            "block_proportion needs less.",
+            UserWarning,
+            stacklevel=4,
+        )
     devices = devices or [cp.cuda.Device().id]
     if len(devices) > 1 and correction_method != "batched":
         warnings.warn(
@@ -428,7 +437,7 @@ def harmonize(
             "cat_offsets": group_offsets,
             "cell_indices": cell_indices,
         }
-        if correction_method == "fast" and n_covariates == 1:
+        if correction_method == "fast":
             codes = {key: local(value) for key, value in codes.items()}
 
         X = parts[rank]
@@ -948,15 +957,6 @@ def _allocate_clustering_workspace(
 ) -> dict:
     """Buffers of the clustering loop. The tiles' groups are the batches, or
     one group for several keys; counts are kept per batch level."""
-    counts_bytes = n_blocks * n_batches * n_clusters * 8
-    if counts_bytes > 1 << 30:
-        warnings.warn(
-            f"Harmony keeps {counts_bytes / 2**30:.1f} GiB of cluster counts for "
-            f"{n_blocks} update blocks x {n_batches} batch levels; a larger "
-            "block_proportion needs less.",
-            UserWarning,
-            stacklevel=4,
-        )
     n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
     # Assignment tiles: four per SM, plus one partial tile per group.
     n_tiles = 4 * n_sm + n_groups + 1
