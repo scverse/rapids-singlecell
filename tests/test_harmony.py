@@ -264,8 +264,10 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
 
 
 def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
-    """Harmony correction with an explicit intercept + one-hot design matrix;
-    pruned levels (lambda at the sentinel) are dropped from each solve."""
+    """Harmony correction with an explicit intercept + one-hot design matrix,
+    in float64; pruned levels (lambda at the sentinel) are dropped from each
+    solve."""
+    X, R, lambda_kb = (np.asarray(a, dtype=np.float64) for a in (X, R, lambda_kb))
     n_cells = X.shape[0]
     design = np.zeros((n_cells, n_batches + 1), dtype=X.dtype)
     design[:, 0] = 1
@@ -293,7 +295,10 @@ def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
     [("batched", False), ("batched", True), ("fast", False)],
 )
 @pytest.mark.parametrize(
-    ("n_cells", "n_pcs", "n_clusters"), [(40, 5, 3), (3000, 50, 100), (3000, 300, 300)]
+    ("n_cells", "n_pcs", "n_clusters"),
+    # The large case has counts ~2e5 against lambda < 1 (harmony1-like): an
+    # explicit inverse loses the solution to cancellation there.
+    [(40, 5, 3), (3000, 50, 100), (3000, 300, 300), (1_500_000, 8, 2)],
 )
 def test_harmony_correction_matches_dense_design(
     dtype, *, method, normalize, n_cells, n_pcs, n_clusters
@@ -336,13 +341,17 @@ def test_harmony_correction_matches_dense_design(
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-@pytest.mark.parametrize("n_covariates", [2, 3, 4])
-def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, monkeypatch):
+@pytest.mark.parametrize(
+    ("n_covariates", "n_cells"), [(2, 31), (3, 31), (4, 31), (2, 1_000_000)]
+)
+def test_harmony_multikey_correction_matches_dense_design(
+    dtype, n_covariates, n_cells, monkeypatch
+):
     rng = np.random.default_rng(734)
     levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
     n_batches = int(levels.sum())
-    n_cells, n_pcs, n_clusters = 31, 5, 3
+    n_pcs, n_clusters = 5, 3
     np_dtype = np.dtype(dtype)
 
     local_codes = np.column_stack([rng.integers(0, level, size=n_cells) for level in levels]).astype(np.int32)
@@ -378,7 +387,6 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, m
         return _correction_multi(
             cp.asarray(X_np),
             cp.asarray(R_np),
-            O=cp.asarray(O_np),
             lambda_kb=cp.asarray(lambda_np),
             joint_O=cp.asarray(joint_O_np),
             n_batches=n_batches,

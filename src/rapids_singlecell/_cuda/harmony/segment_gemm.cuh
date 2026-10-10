@@ -339,8 +339,8 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
 }
 
 // out[g out_group_stride + k ld_out + d] = acc value of (g, k, d) as T. For the
-// correction RHS into Phi_t_diag_R_X_all (K, n_batches + 1, D) at row b + 1:
-// out = base + D, out_group_stride = D, ld_out = (n_batches + 1) D.
+// correction right-hand sides S (K, n_batches, D): out = S,
+// out_group_stride = D, ld_out = n_batches D.
 template <typename T>
 cudaError_t finalize_rtz(const long long* acc, int n_groups, int D, int K,
                          int limbs, const double* group_scale, T* out,

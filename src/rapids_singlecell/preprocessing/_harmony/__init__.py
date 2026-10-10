@@ -323,9 +323,14 @@ def harmonize(
     # Multi-covariate correction uses its own exact cluster-chunked solve.
     # For one covariate, retain the established arrowhead auto-selection.
     if correction_method is None and n_covariates == 1:
-        nb1 = n_batches + 1
-        inv_mats_bytes = n_clusters * nb1 * nb1 * Z.dtype.itemsize
-        correction_method = "batched" if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
+        # Right-hand sides, coefficients and their exact sums (_correction_batched).
+        itemsize = Z.dtype.itemsize
+        batched_bytes = (
+            n_clusters * n_batches * Z.shape[1] * (2 * itemsize + 8 * _limbs(itemsize))
+        )
+        correction_method = (
+            "batched" if batched_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
+        )
 
     # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
     # generator collapses into an integer here; the per-iteration offset keeps
@@ -436,7 +441,6 @@ def harmonize(
             Z_hat = _correction_multi(
                 Z,
                 R,
-                O=O,
                 lambda_kb=lambda_kb,
                 joint_O=workspace["O_joint"],
                 n_batches=n_batches,
@@ -871,7 +875,6 @@ def _correction_multi(
     X: cp.ndarray,
     R: cp.ndarray,
     *,
-    O: cp.ndarray,
     lambda_kb: cp.ndarray,
     joint_O: cp.ndarray,
     n_batches: int,
@@ -909,13 +912,13 @@ def _correction_multi(
         lambda_chunk = cp.ascontiguousarray(lambda_kb[:, chunk])
         R_chunk = R[:, chunk]
         k = R_chunk.shape[1]
-        joint_rhs = cp.empty((n_joint_categories, k, n_pcs), dtype=X.dtype)
-        gram = cp.empty((k, nb1, nb1), dtype=X.dtype)
-        rhs = cp.empty((k, nb1, n_pcs), dtype=X.dtype)
+        # Systems in double (see kernels_correction_multi.cuh).
+        joint_rhs = cp.empty((n_joint_categories, k, n_pcs), dtype=cp.float64)
+        gram = cp.empty((k, nb1, nb1), dtype=cp.float64)
+        rhs = cp.empty((k, nb1, n_pcs), dtype=cp.float64)
         _correction_batched_cuda.prepare_multi(
             X,
             R=R_chunk,
-            O=cp.ascontiguousarray(O[:, chunk]),
             joint_O=cp.ascontiguousarray(joint_O[:, chunk]),
             joint_cats=joint_cats,
             marginal_joint_offsets=marginal_joint_offsets,
@@ -935,8 +938,8 @@ def _correction_multi(
             ),
             stream=stream,
         )
-        W_all = _solve_spd_batched(gram, rhs)
-        del gram, rhs
+        W_all = _solve_spd_batched(gram, rhs).astype(X.dtype)
+        del gram, rhs, joint_rhs
         last = i == len(starts) - 1
         _correction_batched_cuda.apply_multi(
             X,
@@ -947,7 +950,7 @@ def _correction_multi(
             seg_start=seg_start,
             seg_group=seg_group,
             normalize=normalize and last,
-            W_joint=joint_rhs,
+            W_joint=cp.empty((n_joint_categories, k, n_pcs), dtype=X.dtype),
             Z=Z,
             resume=i > 0,
             finish=last,
@@ -1038,12 +1041,15 @@ def _multi_correction_cluster_chunk_size(
 ) -> int:
     """Choose a cluster chunk that keeps multi-key scratch below 1 GiB."""
     nb1 = n_batches + 1
-    # Gram and RHS with the solver's copies and output, joint products, and
-    # sliced O, lambda, active mask and joint counts.
+    # Double Gram and RHS with the solver's copies and output, the coefficients,
+    # joint right-hand sides (double) and coefficients, exact joint sums, and
+    # sliced lambda, active mask and joint counts.
     per_cluster = (
-        itemsize * (3 * nb1 * nb1 + 3 * nb1 * n_pcs + n_joint_categories * (n_pcs + 1))
-        + 8 * _limbs(itemsize) * n_joint_categories * n_pcs  # exact joint sums
-        + (2 * itemsize + 1) * n_batches
+        8 * (3 * nb1 * nb1 + 3 * nb1 * n_pcs)
+        + itemsize * nb1 * n_pcs
+        + n_joint_categories * ((8 + itemsize) * n_pcs + itemsize)
+        + 8 * _limbs(itemsize) * n_joint_categories * n_pcs
+        + (itemsize + 1) * n_batches
     )
     if per_cluster > _CORRECTION_WORKSPACE_LIMIT_BYTES:
         gib = per_cluster / _CORRECTION_WORKSPACE_LIMIT_BYTES
@@ -1088,13 +1094,6 @@ def _correction_fast(
     dtype = X.dtype
 
     Z = _correction_output(X, output)
-    inv_mat = cp.empty((nb1, nb1), dtype=dtype)
-    R_col = cp.empty(n_cells, dtype=dtype)
-    Phi_t_diag_R_X = cp.empty((nb1, n_pcs), dtype=dtype)
-    W = cp.empty((nb1, n_pcs), dtype=dtype)
-    g_factor = cp.empty(n_batches, dtype=dtype)
-    g_P_row0 = cp.empty(n_batches, dtype=dtype)
-
     _correction_cuda.correction_fast(
         X,
         R=R,
@@ -1108,14 +1107,10 @@ def _correction_fast(
         n_clusters=n_clusters,
         n_batches=n_batches,
         Z=Z,
-        inv_mat=inv_mat,
-        R_col=R_col,
-        Phi_t_diag_R_X=Phi_t_diag_R_X,
-        W=W,
-        g_factor=g_factor,
-        g_P_row0=g_P_row0,
+        R_col=cp.empty(n_cells, dtype=dtype),
+        S=cp.empty((nb1, n_pcs), dtype=dtype),
+        W=cp.empty((nb1, n_pcs), dtype=dtype),
         stream=cp.cuda.get_current_stream().ptr,
-        handle=cp.cuda.device.get_cublas_handle(),
     )
     return Z
 
@@ -1136,7 +1131,7 @@ def _correction_batched(
     plus the right-hand side bounds).
     """
     seg_start, seg_group, bounds = segments
-    n_pcs, n_clusters, nb1 = X.shape[1], R.shape[1], len(bounds) + 1
+    n_pcs, n_clusters, n_batches = X.shape[1], R.shape[1], len(bounds)
     dtype = X.dtype
     Z = _correction_output(X, output)
     _correction_batched_cuda.correction_batched(
@@ -1148,18 +1143,14 @@ def _correction_batched(
         seg_group=seg_group,
         bounds=bounds,
         Z=Z,
-        inv_mats=cp.empty((n_clusters, nb1, nb1), dtype=dtype),
-        Phi_t_diag_R_X_all=cp.empty((n_clusters, nb1, n_pcs), dtype=dtype),
-        W_all=cp.empty((n_clusters, nb1, n_pcs), dtype=dtype),
-        g_factor=cp.empty((n_clusters, nb1 - 1), dtype=dtype),
-        g_P_row0=cp.empty((n_clusters, nb1 - 1), dtype=dtype),
-        scales=cp.empty(nb1 - 1, dtype=cp.float64),
+        S=cp.empty((n_clusters, n_batches, n_pcs), dtype=dtype),
+        W=cp.empty((n_clusters, n_batches, n_pcs), dtype=dtype),
+        scales=cp.empty(n_batches, dtype=cp.float64),
         rhs_acc=cp.empty(
-            (nb1 - 1, _limbs(dtype.itemsize), n_clusters, n_pcs), dtype=cp.int64
+            (n_batches, _limbs(dtype.itemsize), n_clusters, n_pcs), dtype=cp.int64
         ),
         normalize=normalize,
         stream=cp.cuda.get_current_stream().ptr,
-        handle=cp.cuda.device.get_cublas_handle(),
     )
     return Z
 

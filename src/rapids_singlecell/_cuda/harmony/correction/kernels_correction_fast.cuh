@@ -4,59 +4,41 @@
 
 #include "../storage.cuh"
 
-// ---- Inverse of the (n_batches + 1)^2 correction matrix of a cluster ----
-// Closed form instead of an explicit inversion:
-//   factor[b] = 1 / (O_k[b] + lambda_kb[b,k])
-//   P_row0[b] = -factor[b] * O_k[b]
-//   c_inv = 1 / (N_k - sum(factor[b] * O_k[b]^2)), 0 for an empty cluster
-//   inv[0,0] = c_inv
-//   inv[0,j] = c_inv * P_row0[j-1], inv[i,0] = P_row0[i-1] * c_inv
-//   inv[i,j] = P_row0[i-1]*c_inv*P_row0[j-1] + factor[i-1]*delta(i,j)
-// O and lambda_kb are (n_batches, n_clusters) row-major. With cluster_k >= 0
-// one block computes that cluster (g_factor/g_P_row0: n_batches); otherwise
-// block k computes cluster k (n_clusters x n_batches workspace).
+// ---- Ridge coefficients of one batch key ----
+// The design [intercept, batch indicators] with ridge lambda_kb on the batch
+// terms has the arrowhead Gram [[N_k, O_k^T], [O_k, diag(O_k + lambda_k)]].
+// Eliminating the batch terms, with S_b = R_b^T X_b and
+// f_b = 1 / (O_kb + lambda_kb):
+//   beta0 = sum_b f_b lambda_kb S_b / sum_b f_b lambda_kb O_kb  (0 if empty)
+//   W_b   = f_b (S_b - O_kb beta0)
+// Unlike N_k - sum_b f_b O_kb^2 (the inverse's pivot), no term cancels at
+// large counts, so a fixed lambda stays accurate in float32. One thread per
+// (cluster, PC) of clusters k0 .. k0 + n_k - 1; S and W hold rows b of
+// cluster k at (k - k0) * cluster_stride + b * n_pcs. A cluster without cells
+// (all O_kb = 0) gets no correction.
 template <typename T>
-__global__ void compute_inv_mats_kernel(const T* __restrict__ O,
-                                        const T* __restrict__ lambda_kb,
-                                        T* __restrict__ inv_mats,
-                                        T* __restrict__ g_factor,
-                                        T* __restrict__ g_P_row0, int n_batches,
-                                        int n_clusters, int cluster_k = -1) {
-    int k = (cluster_k >= 0) ? cluster_k : blockIdx.x;
-    if (k >= n_clusters) return;
-    int nb1 = n_batches + 1;
-    T* inv = (cluster_k >= 0) ? inv_mats : inv_mats + (size_t)k * nb1 * nb1;
-    size_t ws = cluster_k >= 0 ? 0 : (size_t)k * n_batches;
-    T* my_factor = g_factor + ws;
-    T* my_P_row0 = g_P_row0 + ws;
-
-    T local_Nk = T(0), local_c_neg = T(0);
-    for (int b = threadIdx.x; b < n_batches; b += blockDim.x) {
-        T o_val = O[b * n_clusters + k];
-        T f = T(1) / (o_val + lambda_kb[b * n_clusters + k]);
-        my_factor[b] = f;
-        my_P_row0[b] = -f * o_val;
-        local_Nk += o_val;
-        local_c_neg += f * o_val * o_val;
+__global__ void ridge_coefficients_kernel(
+    const T* __restrict__ O, const T* __restrict__ lambda_kb,
+    const T* __restrict__ S, T* __restrict__ W, long long cluster_stride,
+    int n_batches, int n_clusters, int n_pcs, int k0, int n_k) {
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long long)n_k * n_pcs) return;
+    int k = k0 + (int)(t / n_pcs);
+    size_t base = (size_t)(k - k0) * cluster_stride + t % n_pcs;
+    double c = 0, num = 0;
+    for (int b = 0; b < n_batches; ++b) {
+        double o = O[(size_t)b * n_clusters + k];
+        double lam = lambda_kb[(size_t)b * n_clusters + k];
+        double w = lam / (o + lam);  // f_b lambda_kb
+        c += w * o;
+        num += w * S[base + (size_t)b * n_pcs];
     }
-    T Nk = block_sum(local_Nk);
-    // An empty cluster (all counts 0, e.g. emptied by a large theta) has no
-    // intercept and gets no correction.
-    T c = Nk - block_sum(local_c_neg);
-    T c_inv = c > T(0) ? T(1) / c : T(0);
-    for (int b = threadIdx.x; b < n_batches; b += blockDim.x)
-        inv[(size_t)(b + 1) * nb1] = my_P_row0[b] * c_inv;
-    __syncthreads();
-
-    for (int idx = threadIdx.x; idx < nb1 * nb1; idx += blockDim.x) {
-        int i = idx / nb1, j = idx % nb1;
-        if (i == 0) {
-            inv[idx] = j == 0 ? c_inv : c_inv * my_P_row0[j - 1];
-        } else if (j > 0) {
-            T val = inv[(size_t)i * nb1] * my_P_row0[j - 1];
-            if (i == j) val += my_factor[i - 1];
-            inv[idx] = val;
-        }
+    double beta0 = c > 0 ? num / c : 0;
+    for (int b = 0; b < n_batches; ++b) {
+        double o = O[(size_t)b * n_clusters + k];
+        double lam = lambda_kb[(size_t)b * n_clusters + k];
+        size_t i = base + (size_t)b * n_pcs;
+        W[i] = T((S[i] - o * beta0) / (o + lam));
     }
 }
 
