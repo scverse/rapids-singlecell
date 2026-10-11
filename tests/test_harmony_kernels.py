@@ -214,15 +214,21 @@ def test_draw_blocks_split_invariant():
 
 
 @pytest.mark.parametrize(
-    "n_clusters,force_general", [(7, False), (7, True), (300, True)]
+    "n_clusters,force_blocks,large",
+    [(7, False, False), (7, True, False), (300, True, False), (300, True, True)],
 )
 @pytest.mark.parametrize("n_pcs", [50, 1023])
-def test_fused_initialize_matches_reference(n_clusters, force_general, n_pcs):
+def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_pcs):
     # One unpenalized assignment pass over the update blocks: R is the
     # softmax of -2/sigma (1 - z.y), O its per-batch column sums,
-    # E = Pr_b x column sums, plus the objective.
+    # E = Pr_b x column sums, plus the objective. Large: one block of 384
+    # cells per tile slot, so tiles of six row groups, three cluster blocks.
+    if large and n_pcs > 50:
+        pytest.skip("the float64 reference is slow")
     rng = cp.random.default_rng(7)
-    n_cells, n_batches, sigma, block_size = 3000, 3, 0.1, 700
+    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
+    n_batches, sigma = 3, 0.1
+    n_cells, block_size = (384 * 4 * n_sm,) * 2 if large else (3000, 700)
     Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
     Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
     Y = Z[:n_clusters] + 0.1
@@ -231,7 +237,7 @@ def test_fused_initialize_matches_reference(n_clusters, force_general, n_pcs):
     Pr_b = (cp.bincount(cats, minlength=n_batches) / n_cells).astype(cp.float32)
     theta = cp.full(n_batches, 2.0, dtype=cp.float32)
     n_blocks = -(-n_cells // block_size)
-    n_tiles = 4 * cp.cuda.Device().attributes["MultiProcessorCount"] + n_batches + 1
+    n_tiles = 4 * n_sm + n_batches + 1
     idx_list = cp.empty(n_cells, cp.int32)
     block_cat_offsets = cp.empty(n_blocks * n_batches + n_batches + 2, cp.int32)
     _cl.draw_blocks(
@@ -269,7 +275,8 @@ def test_fused_initialize_matches_reference(n_clusters, force_general, n_pcs):
         y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
         y_t=cp.empty((-(-n_pcs // 4) * 4, stride), cp.float32),
         col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),
-        force_general=force_general,
+        dots_workspace=cp.empty(n_tiles * 64 * stride, cp.float32),
+        force_blocks=force_blocks,
         n_cells=n_cells,
         n_pcs=n_pcs,
         n_clusters=n_clusters,

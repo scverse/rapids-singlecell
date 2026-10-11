@@ -122,8 +122,10 @@ struct ClusteringArgs {
     double* y_scale;           // centroid fixed-point scale (1)
     long long* y_acc;          // centroid sums: limbs x K x D
     T* y_t;                    // centroids transposed (transpose_centroids)
-    long long* col_workspace;  // general assignment: per-warp column sums
-    bool force_general;        // tests: general assignment for every shape
+    long long* col_workspace;  // cluster blocks: per-warp column sums
+    T* dots_workspace;         // cluster blocks: dot products, 64 rows a tile
+    size_t dots_size;
+    bool force_blocks;  // tests: cluster blocks for every shape
 
     int n_cells;
     long long n_total;  // cells over all GPUs (fixed-point bounds)
@@ -161,11 +163,11 @@ struct FixedScales {
 // One assignment pass over the cells `idx_list[offsets[0] ..
 // offsets[n_groups])` grouped by category: writes R and the per-cell objective
 // terms, and adds the exact (fixed-point) counts per category to `counts`.
-// Tiles, plus one partial tile per category: general, about
-// ASSIGN_TILES_PER_SM per SM; fused, one wave while that is at most three
-// groups per tile, else three groups with resident centroids and two CTAs
-// per SM (one centroid load per tile) and one group otherwise (so the CTAs'
-// phases interleave).
+// Tiles, plus one partial tile per category: cluster blocks, about
+// ASSIGN_TILES_PER_SM per SM (the column-sum slices); otherwise one wave while
+// that is at most three groups per tile, else three groups with resident
+// centroids and two CTAs per SM (one centroid load per tile) and one group
+// otherwise (so the CTAs' phases interleave).
 constexpr int ASSIGN_TILES_PER_SM = 4;
 
 // y_t (padded PCs x 128-cluster blocks) = Y_norm^T, zero padded; once per
@@ -188,21 +190,21 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
                               long long* counts, T count_scale) {
     int n_pcs = a.n_pcs, n_clusters = a.n_clusters;
     cudaStream_t stream = a.stream;
-    // The fused kernel holds at most 128 clusters; more take the general one.
-    bool general = a.force_general || n_clusters > FUSED_CLUSTER_STRIDE;
-    if (general && !a.col_workspace)
-        throw std::invalid_argument(
-            "this shape needs the general assignment workspace");
+    int k_stride = (n_clusters + FUSED_CLUSTER_STRIDE - 1) /
+                   FUSED_CLUSTER_STRIDE * FUSED_CLUSTER_STRIDE;
+    // A warp holds 128 clusters; more go in cluster blocks (tests: any).
+    bool blocks = a.force_blocks || n_clusters > FUSED_CLUSTER_STRIDE;
     // Z pieces: the widest of 16, 8 and 4 bytes dividing a row and Z.
     size_t bits = reinterpret_cast<size_t>(a.Z_norm) | 16 | n_pcs * sizeof(T);
     size_t v = bits & (~bits + 1);
-    auto kernel = v == 16  ? fused_assign_kernel<T, RT, 16>
-                  : v == 8 ? fused_assign_kernel<T, RT, 8>
-                           : fused_assign_kernel<T, RT, sizeof(T)>;
+    auto kernel = blocks    ? fused_assign_kernel<T, RT, sizeof(T), true>
+                  : v == 16 ? fused_assign_kernel<T, RT, 16, false>
+                  : v == 8  ? fused_assign_kernel<T, RT, 8, false>
+                            : fused_assign_kernel<T, RT, sizeof(T), false>;
     long long capacity = (long long)ASSIGN_TILES_PER_SM * n_sm;
     long long granule = FUSED_GROUP;
     int per_sm = 1;
-    if (!general) {
+    if (!blocks) {
         cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                        &per_sm, kernel, FUSED_THREADS, STREAM_SMEM),
                    "fused assign occupancy");
@@ -212,7 +214,7 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
     }
     long long tile_rows = std::max(granule, (n_rows + capacity - 1) / capacity);
     tile_rows = (tile_rows + granule - 1) / granule * granule;
-    if (!general && tile_rows > 3 * FUSED_GROUP)
+    if (!blocks && tile_rows > 3 * FUSED_GROUP)
         tile_rows = per_sm > 1 && fused_resident<T>(fused_padded_pcs(n_pcs))
                         ? 3 * FUSED_GROUP
                         : FUSED_GROUP;
@@ -221,22 +223,17 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
     CUDA_CHECK_LAST_ERROR(scatter_tile_offsets_kernel);
     size_t max_tiles = std::min<size_t>(
         n_rows, (n_rows + tile_rows - 1) / tile_rows + n_groups);
+    if (blocks &&
+        (!a.col_workspace || a.dots_size < max_tiles * FUSED_GROUP * k_stride))
+        throw std::invalid_argument(
+            "this shape needs the cluster-block assignment workspace");
     T term = T(-2) / a.sigma;
     auto* ucounts = reinterpret_cast<unsigned long long*>(counts);
-    if (general) {
-        int k_stride = (n_clusters + FUSED_CLUSTER_STRIDE - 1) /
-                       FUSED_CLUSTER_STRIDE * FUSED_CLUSTER_STRIDE;
-        fused_assign_general_kernel<T, RT>
-            <<<max_tiles, FUSED_THREADS, 0, stream>>>(
-                a.Z_norm, a.y_t, k_stride, penalty, a.idx_list, offsets, tiles,
-                n_groups, (int)tile_rows, R, a.objective_partials, ucounts,
-                a.col_workspace, term, a.sigma, count_scale, n_pcs, n_clusters);
-    } else {
-        kernel<<<max_tiles, FUSED_THREADS, STREAM_SMEM, stream>>>(
-            a.Z_norm, a.y_t, penalty, a.idx_list, offsets, tiles, n_groups,
-            (int)tile_rows, R, a.objective_partials, ucounts, term, a.sigma,
-            count_scale, n_pcs, n_clusters);
-    }
+    kernel<<<max_tiles, FUSED_THREADS, STREAM_SMEM, stream>>>(
+        a.Z_norm, a.y_t, k_stride, penalty, a.idx_list, offsets, tiles,
+        n_groups, (int)tile_rows, R, a.objective_partials, ucounts,
+        a.dots_workspace, a.col_workspace, term, a.sigma, count_scale, n_pcs,
+        n_clusters);
     CUDA_CHECK_LAST_ERROR(fused_assign_kernel);
 }
 
@@ -454,11 +451,11 @@ static void register_clustering_loop(nb::module_& m) {
            Ints marginal_joint_offsets, Ints marginal_joint_indices,
            Opt O_joint, Opt group_penalty, gpu_array_c<T, Device> y_t,
            std::optional<gpu_array_c<long long, Device>> col_workspace,
-           bool force_general, int n_cells, long long n_total, int n_pcs,
-           int n_clusters, int n_batches, int n_covariates,
-           int n_joint_categories, int n_first, int n_blocks, double sigma,
-           double tol, int max_iter, unsigned int seed, bool stabilized,
-           std::uintptr_t stream, bool initialize) {
+           Opt dots_workspace, bool force_blocks, int n_cells,
+           long long n_total, int n_pcs, int n_clusters, int n_batches,
+           int n_covariates, int n_joint_categories, int n_first, int n_blocks,
+           double sigma, double tol, int max_iter, unsigned int seed,
+           bool stabilized, std::uintptr_t stream, bool initialize) {
             int n_groups = n_covariates > 1 ? n_joint_categories : n_batches;
             size_t max_tiles =
                 (size_t)ASSIGN_TILES_PER_SM *
@@ -513,7 +510,9 @@ static void register_clustering_loop(nb::module_& m) {
                                 y_acc.data(),
                                 y_t.data(),
                                 ptr(col_workspace),
-                                force_general,
+                                ptr(dots_workspace),
+                                dots_workspace ? dots_workspace->size() : 0,
+                                force_blocks,
                                 n_cells,
                                 n_total > 0 ? n_total : n_cells,
                                 n_pcs,
@@ -539,11 +538,11 @@ static void register_clustering_loop(nb::module_& m) {
         "marginal_joint_offsets"_a = nb::none(),
         "marginal_joint_indices"_a = nb::none(), "O_joint"_a = nb::none(),
         "group_penalty"_a = nb::none(), "y_t"_a, "col_workspace"_a = nb::none(),
-        "force_general"_a = false, "n_cells"_a, "n_total"_a = 0, "n_pcs"_a,
-        "n_clusters"_a, "n_batches"_a, "n_covariates"_a = 1,
-        "n_joint_categories"_a = 0, "n_first"_a = 0, "n_blocks"_a, "sigma"_a,
-        "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0, "stabilized"_a,
-        "stream"_a = 0, "initialize"_a = false);
+        "dots_workspace"_a = nb::none(), "force_blocks"_a = false, "n_cells"_a,
+        "n_total"_a = 0, "n_pcs"_a, "n_clusters"_a, "n_batches"_a,
+        "n_covariates"_a = 1, "n_joint_categories"_a = 0, "n_first"_a = 0,
+        "n_blocks"_a, "sigma"_a, "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0,
+        "stabilized"_a, "stream"_a = 0, "initialize"_a = false);
 }
 
 template <typename T, typename Device>

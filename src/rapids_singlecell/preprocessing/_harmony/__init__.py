@@ -38,8 +38,8 @@ _SUPPRESS_PENALTY = 1e30
 _CORRECTION_WORKSPACE_LIMIT_BYTES = 1 << 30
 _KMEANS_MAX_ITER = 25
 _KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
-# Tests: route every shape through the general assignment kernel.
-_FORCE_GENERAL_ASSIGNMENT = False
+# Tests: assign every shape in cluster blocks (as for more than 128 clusters).
+_FORCE_CLUSTER_BLOCKS = False
 _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
 _UPLOAD_THREADS = 8
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
@@ -739,10 +739,11 @@ def _allocate_clustering_workspace(
     # Centroids transposed: padded PCs x 128-cluster blocks.
     stride = -(-n_clusters // _FUSED_MAX_CLUSTERS) * _FUSED_MAX_CLUSTERS
     workspace["y_t"] = cp.empty((-(-n_pcs // 4) * 4, stride), dtype=dtype)
-    if _FORCE_GENERAL_ASSIGNMENT or n_clusters > _FUSED_MAX_CLUSTERS:
-        # General assignment: per-warp column sums.
+    if _FORCE_CLUSTER_BLOCKS or n_clusters > _FUSED_MAX_CLUSTERS:
+        # Cluster blocks: per-warp column sums, a group's dot products per tile.
         workspace["col_workspace"] = cp.empty(n_tiles * 8 * n_clusters, dtype=cp.int64)
-        workspace["force_general"] = _FORCE_GENERAL_ASSIGNMENT
+        workspace["dots_workspace"] = cp.empty(n_tiles * 64 * stride, dtype=dtype)
+        workspace["force_blocks"] = _FORCE_CLUSTER_BLOCKS
     return workspace
 
 

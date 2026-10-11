@@ -375,24 +375,29 @@ __device__ __forceinline__ void tile_products(
 }
 
 // Z pieces are V bytes; y_t holds the centroids transposed (padded PCs x
-// FUSED_CLUSTER_STRIDE, see transpose_centroids). Every dot product is one
-// chain over the PCs in order, as in tile_products, whatever the tiling.
-// `penalty` holds log penalties (null: none). The log weights are shifted by
-// the tile's largest log penalty, so none overflows and the row's best
-// cluster under that penalty keeps at least exp(2 term); below sigma = 1/15
-// each row is shifted by its own maximum instead.
-template <typename T, typename RT, int V>
+// k_stride, see transpose_centroids). Every dot product is one chain over the
+// PCs in order, as in tile_products, whatever the tiling. `penalty` holds log
+// penalties (null: none). The log weights are shifted by the tile's largest
+// log penalty, so none overflows and the row's best cluster under that
+// penalty keeps at least exp(2 term); below sigma = 1/15 each row is shifted
+// by its own maximum instead.
+// BLOCKS (more than 128 clusters): each group takes the clusters in blocks of
+// FUSED_CLUSTER_STRIDE, its rows and the block's centroids streamed as above,
+// and stores the dot products in `dots_ws` (tiles x FUSED_GROUP rows x
+// k_stride); then each row is normalized from them. Column sums go through
+// per-warp slices of `col_ws` (tiles x warps x K). One block gives the bits of
+// the single-block path.
+template <typename T, typename RT, int V, bool BLOCKS>
 __global__ void __launch_bounds__(FUSED_THREADS,
                                   sizeof(T) == 4 ? FUSED_CTAS : 1)
-    fused_assign_kernel(const T* __restrict__ Z, const T* __restrict__ y_t,
-                        const T* __restrict__ penalty,
-                        const int* __restrict__ idx,
-                        const int* __restrict__ offsets,
-                        const int* __restrict__ tiles, int n_categories,
-                        int tile_rows, RT* __restrict__ R,
-                        T* __restrict__ partial,
-                        unsigned long long* __restrict__ counts, T term,
-                        T sigma, T count_scale, int n_pcs, int n_clusters) {
+    fused_assign_kernel(
+        const T* __restrict__ Z, const T* __restrict__ y_t, int k_stride,
+        const T* __restrict__ penalty, const int* __restrict__ idx,
+        const int* __restrict__ offsets, const int* __restrict__ tiles,
+        int n_categories, int tile_rows, RT* __restrict__ R,
+        T* __restrict__ partial, unsigned long long* __restrict__ counts,
+        T* __restrict__ dots_ws, long long* __restrict__ col_ws, T term,
+        T sigma, T count_scale, int n_pcs, int n_clusters) {
     int tile = blockIdx.x, start, end;
     if (tile >= tiles[n_categories]) return;
     int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
@@ -407,15 +412,24 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     extern __shared__ __align__(16) unsigned char smem_raw[];
     T* stages = reinterpret_cast<T*>(smem_raw);
     long long* col_sums = reinterpret_cast<long long*>(smem_raw);  // warps x K
-    int k0 = 4 * lane;  // this lane's clusters k0 .. k0 + 3
+    int k0 = 4 * lane;  // this lane's clusters k0 .. k0 + 3 of each block
+    const T* pen_row =
+        penalty ? penalty + (size_t)category * n_clusters : nullptr;
+    auto lp = [&](int k) { return pen_row ? pen_row[k] : T(0); };
     T log_pen[S], top = -INFINITY;
     long long col[S] = {};
+    long long* cols = nullptr;  // BLOCKS: this warp's column sums
+    if constexpr (BLOCKS) {
+        for (int k = lane; k < n_clusters; k += 32) top = max(top, lp(k));
+        cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
+        for (int k = lane; k < n_clusters; k += 32) cols[k] = 0;
+        __syncwarp();  // other lanes accumulate these columns
+    } else {
 #pragma unroll
-    for (int q = 0; q < S; ++q) {
-        log_pen[q] = penalty && k0 + q < n_clusters
-                         ? penalty[(size_t)category * n_clusters + k0 + q]
-                         : T(0);
-        if (k0 + q < n_clusters) top = max(top, log_pen[q]);
+        for (int q = 0; q < S; ++q) {
+            log_pen[q] = k0 + q < n_clusters ? lp(k0 + q) : T(0);
+            if (k0 + q < n_clusters) top = max(top, log_pen[q]);
+        }
     }
     top = warp_max(top);
     bool row_shift = term < T(-30);
@@ -430,7 +444,8 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     // whole tile, and each step only waits for the warp's own rows. A lane
     // copies the Z pieces at column zd of its warp's rows zr + j ZR.
     int n_chunks = (pcs + DC - 1) / DC, n_groups = (end - start + TM - 1) / TM;
-    bool resident = fused_resident<T>(pcs);
+    int n_blocks = BLOCKS ? k_stride / FUSED_CLUSTER_STRIDE : 1;
+    bool resident = !BLOCKS && fused_resident<T>(pcs);
     T* y_s = stages + 2 * TM * DC;  // resident centroids after the row stages
     auto rows_of = [&](int st) {
         return stages + st * (resident ? TM * DC : STAGE);
@@ -453,8 +468,9 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     auto cell = [&](int p) { return p >= end ? -1 : idx ? idx[p] : p; };
     constexpr int ZP = FUSED_ROWS * DC / (32 * ZV), ZR = 32 * ZV / DC;
     int zr = warp * FUSED_ROWS + lane * ZV / DC, zd = lane * ZV % DC;
-    int z_cell[ZP];              // the loading group's cells (-1: none)
-    int lg = 0, lc = 0, ls = 0;  // the next load: group, chunk, buffer
+    int z_cell[ZP];                      // the loading group's cells (-1: none)
+    int lg = 0, lb = 0, lc = 0, ls = 0;  // the next load: group, cluster
+                                         // block, chunk, buffer
     // Before sm_80 a step's pieces wait in registers while the previous
     // step's products run (fetch), then go to shared memory (store).
 #if __CUDA_ARCH__ >= 800
@@ -474,6 +490,9 @@ __global__ void __launch_bounds__(FUSED_THREADS,
             int e = (threadIdx.x + i * FUSED_THREADS) * 16 / sizeof(T);
             T* dst = z_s + TM * DC + e;
             const T* src = y_t + (size_t)d0 * FUSED_CLUSTER_STRIDE + e;
+            if constexpr (BLOCKS)  // rows of cluster block lb in y_t
+                src = y_t + (size_t)(d0 + e / FUSED_CLUSTER_STRIDE) * k_stride +
+                      lb * FUSED_CLUSTER_STRIDE + e % FUSED_CLUSTER_STRIDE;
             if (resident || e >= min(DC, pcs - d0) * FUSED_CLUSTER_STRIDE)
                 break;
             if (async)
@@ -485,7 +504,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
         }
 #pragma unroll
         for (int j = 0; j < ZP; ++j) {
-            if (lc == 0 && fetch)
+            if ((lc | lb) == 0 && fetch)
                 z_cell[j] = cell(start + lg * TM + zr + j * ZR);
             const T* src = Z + (size_t)max(z_cell[j], 0) * n_pcs + d;
             T* dst = z_s + (zr + j * ZR) * DC + zd;
@@ -501,7 +520,10 @@ __global__ void __launch_bounds__(FUSED_THREADS,
         }
         if (async || !fetch) {
             ls ^= 1;
-            if (++lc == n_chunks) lc = 0, ++lg;
+            if (++lc == n_chunks) {
+                lc = 0;
+                if (!BLOCKS || ++lb == n_blocks) lb = 0, ++lg;
+            }
         }
     };
     load(true);
@@ -511,207 +533,160 @@ __global__ void __launch_bounds__(FUSED_THREADS,
         int base = start + g * TM + warp * FUSED_ROWS;
         bool active = base < end;  // warp-uniform
         int lane_cell = lane < FUSED_ROWS ? cell(base + lane) : -1;
+        for (int b = 0; b < n_blocks; ++b) {
 #pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r)
+            for (int r = 0; r < FUSED_ROWS; ++r)
 #pragma unroll
-            for (int q = 0; q < S; ++q) dots[r][q] = T(0);
-        for (int c = 0; c < n_chunks; ++c, stage ^= 1) {
-            copy_wait();
-            if (resident && (g | c))
-                __syncwarp();  // the warp's own rows landed
-            else
-                __syncthreads();  // this step landed; the other buffer is free
-            load(true);
-            if (active)
-                tile_products(rows_of(stage) + warp * FUSED_ROWS * DC, DC,
-                              cols_of(stage, c), min(DC, pcs - c * DC), k0,
-                              dots,
-                              [](T acc, T z, T y) { return acc + z * y; });
-            if (!async) load(false);
+                for (int q = 0; q < S; ++q) dots[r][q] = T(0);
+            for (int c = 0; c < n_chunks; ++c, stage ^= 1) {
+                copy_wait();
+                if (resident && (g | c))
+                    __syncwarp();  // the warp's own rows landed
+                else
+                    __syncthreads();  // this step landed; the other buffer
+                                      // is free
+                load(true);
+                if (active)
+                    tile_products(rows_of(stage) + warp * FUSED_ROWS * DC, DC,
+                                  cols_of(stage, c), min(DC, pcs - c * DC), k0,
+                                  dots,
+                                  [](T acc, T z, T y) { return acc + z * y; });
+                if (!async) load(false);
+            }
+            if constexpr (BLOCKS)
+                for (int r = 0; r < FUSED_ROWS && active; ++r) {
+                    if (base + r >= end) break;  // warp-uniform
+                    T* row =
+                        dots_ws +
+                        (size_t)(tile * TM + warp * FUSED_ROWS + r) * k_stride +
+                        b * FUSED_CLUSTER_STRIDE + k0;
+#pragma unroll
+                    for (int q = 0; q < S; ++q) row[q] = dots[r][q];
+                }
         }
         if (!active) continue;
+        if constexpr (BLOCKS) {
+            for (int r = 0; r < FUSED_ROWS; ++r) {
+                int c = __shfl_sync(0xffffffff, lane_cell, r);
+                if (c < 0) break;  // warp-uniform
+                const T* drow =
+                    dots_ws +
+                    (size_t)(tile * TM + warp * FUSED_ROWS + r) * k_stride;
+                auto logit = [&](int k) {
+                    return term * (T(1) - drow[k]) + lp(k);
+                };
+                T shift = top;
+                if (row_shift) {  // warp-uniform
+                    shift = -INFINITY;
+                    for (int k = k0; k < n_clusters; k += FUSED_CLUSTER_STRIDE)
 #pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r) {
-            int c = __shfl_sync(0xffffffff, lane_cell, r);
-            if (c < 0) break;  // warp-uniform
-            T vals[S];
-            T sum = T(0);
-            T shift = top;
-            if (row_shift) {  // warp-uniform
-                shift = -INFINITY;
+                        for (int q = 0; q < S; ++q)
+                            if (k + q < n_clusters)
+                                shift = max(shift, logit(k + q));
+                    shift = warp_max(shift);
+                }
+                T sum = T(0);
+                for (int k = k0; k < n_clusters; k += FUSED_CLUSTER_STRIDE)
+#pragma unroll
+                    for (int q = 0; q < S; ++q)
+                        if (k + q < n_clusters)
+                            sum += exp(logit(k + q) - shift);
+                sum = warp_sum(sum);
+                T inv = T(1) / sum, log_sum = log(sum);
+                T distance = T(0), entropy = T(0);
+                RT* row = R + (size_t)c * n_clusters;
+                for (int k = k0; k < n_clusters; k += FUSED_CLUSTER_STRIDE) {
+                    RT stored[S];
+#pragma unroll
+                    for (int q = 0; q < S; ++q)
+                        stored[q] = to_storage<RT>(
+                            k + q < n_clusters ? exp(logit(k + q) - shift) * inv
+                                               : T(0));
+                    if constexpr (sizeof(RT) <= 4)
+                        if (vec_store) store4(row + k, stored);
+#pragma unroll
+                    for (int q = 0; q < S; ++q) {
+                        if (k + q >= n_clusters) break;
+                        if (!vec_store) row[k + q] = stored[q];
+                        T value = from_storage<T>(stored[q]);
+                        cols[k + q] += count_to_fixed(value, count_scale);
+                        T om = T(1) - drow[k + q];
+                        distance += value * T(2) * om;
+                        entropy +=
+                            value * (term * om + lp(k + q) - shift - log_sum);
+                    }
+                }
+                T total = warp_sum(distance + sigma * entropy);
+                if (lane == 0) partial[c] = total;
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < FUSED_ROWS; ++r) {
+                int c = __shfl_sync(0xffffffff, lane_cell, r);
+                if (c < 0) break;  // warp-uniform
+                T vals[S];
+                T sum = T(0);
+                T shift = top;
+                if (row_shift) {  // warp-uniform
+                    shift = -INFINITY;
+#pragma unroll
+                    for (int q = 0; q < S; ++q)
+                        if (k0 + q < n_clusters)
+                            shift = max(
+                                shift, term * (T(1) - dots[r][q]) + log_pen[q]);
+                    shift = warp_max(shift);
+                }
+#pragma unroll
+                for (int q = 0; q < S; ++q) {
+                    vals[q] = k0 + q < n_clusters
+                                  ? exp(term * (T(1) - dots[r][q]) +
+                                        log_pen[q] - shift)
+                                  : T(0);
+                    sum += vals[q];
+                }
+                sum = warp_sum(sum);
+                T inv = T(1) / sum, log_sum = log(sum);
+                T distance = T(0), entropy = T(0);
+                RT* row = R + (size_t)c * n_clusters;
+                RT stored[S];
 #pragma unroll
                 for (int q = 0; q < S; ++q)
-                    if (k0 + q < n_clusters)
-                        shift =
-                            max(shift, term * (T(1) - dots[r][q]) + log_pen[q]);
-                shift = warp_max(shift);
-            }
-#pragma unroll
-            for (int q = 0; q < S; ++q) {
-                vals[q] =
-                    k0 + q < n_clusters
-                        ? exp(term * (T(1) - dots[r][q]) + log_pen[q] - shift)
-                        : T(0);
-                sum += vals[q];
-            }
-            sum = warp_sum(sum);
-            T inv = T(1) / sum, log_sum = log(sum);
-            T distance = T(0), entropy = T(0);
-            RT* row = R + (size_t)c * n_clusters;
-            RT stored[S];
-#pragma unroll
-            for (int q = 0; q < S; ++q)
-                stored[q] = to_storage<RT>(vals[q] * inv);
-            if constexpr (sizeof(RT) <= 4)
-                if (vec_store && k0 < n_clusters) store4(row + k0, stored);
-#pragma unroll
-            for (int q = 0; q < S; ++q) {
-                int k = k0 + q;
-                if (k < n_clusters) {
-                    if (!vec_store) row[k] = stored[q];
-                    // Count the stored (possibly bfloat16) value.
-                    T value = from_storage<T>(stored[q]);
-                    col[q] += count_to_fixed(value, count_scale);
-                    distance += value * T(2) * (T(1) - dots[r][q]);
-                    // log(value) = log of the unnormalized weight - log(sum)
-                    entropy += value * (term * (T(1) - dots[r][q]) +
-                                        log_pen[q] - shift - log_sum);
-                }
-            }
-            T total = warp_sum(distance + sigma * entropy);
-            if (lane == 0) partial[c] = total;
-        }
-    }
-    __syncthreads();  // col_sums overlays the buffers
-#pragma unroll
-    for (int q = 0; q < S; ++q)
-        if (k0 + q < n_clusters) col_sums[warp * n_clusters + k0 + q] = col[q];
-    __syncthreads();
-    for (int k = threadIdx.x; k < n_clusters; k += blockDim.x) {
-        long long sum = 0;
-        for (int w = 0; w < n_warps; ++w) sum += col_sums[w * n_clusters + k];
-        atomicAdd(counts + (size_t)category * n_clusters + k,
-                  (unsigned long long)sum);
-    }
-}
-
-// General assignment for more than 128 clusters: centroids are read from the
-// transposed global buffer `y_t` (padded PCs x `k_stride`), Z directly from
-// global memory, and clusters in chunks of FUSED_CLUSTER_STRIDE. With one
-// chunk a single sweep normalizes; otherwise a first sweep tracks each row's
-// maximum and sum online and a second sweep writes the normalized values.
-// Column sums go through per-warp scratch `col_ws` (tiles x warps x K).
-template <typename T, typename RT>
-__global__ void fused_assign_general_kernel(
-    const T* __restrict__ Z, const T* __restrict__ y_t, int k_stride,
-    const T* __restrict__ penalty, const int* __restrict__ idx,
-    const int* __restrict__ offsets, const int* __restrict__ tiles,
-    int n_categories, int tile_rows, RT* __restrict__ R,
-    T* __restrict__ partial, unsigned long long* __restrict__ counts,
-    long long* __restrict__ col_ws, T term, T sigma, T count_scale, int n_pcs,
-    int n_clusters) {
-    int tile = blockIdx.x, start, end;
-    if (tile >= tiles[n_categories]) return;
-    int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
-                                     tile_rows, start, end);
-    constexpr int S = FUSED_MAX_CLUSTER_SLOTS;
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int n_warps = blockDim.x >> 5;
-    int n_chunks =
-        (n_clusters + FUSED_CLUSTER_STRIDE - 1) / FUSED_CLUSTER_STRIDE;
-    long long* cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
-    for (int k = lane; k < n_clusters; k += 32) cols[k] = 0;
-    __syncwarp();  // other lanes accumulate these columns
-    const T* pen_row =
-        penalty ? penalty + (size_t)category * n_clusters : nullptr;
-
-    // Log weights of the rows' clusters in chunk c (lane owns 4 per chunk).
-    auto logits = [&](const int (&cell)[FUSED_ROWS], int c,
-                      T(&lw)[FUSED_ROWS][S], T(&om)[FUSED_ROWS][S]) {
-        int k0 = c * FUSED_CLUSTER_STRIDE + 4 * lane;
-        T dots[FUSED_ROWS][S] = {};
-        for (int d = 0; d < n_pcs; ++d) {
-            T y[4];
-            load4(y_t + (size_t)d * k_stride + k0, y);
-#pragma unroll
-            for (int r = 0; r < FUSED_ROWS; ++r) {
-                T z = cell[r] >= 0 ? Z[(size_t)cell[r] * n_pcs + d] : T(0);
-#pragma unroll
-                for (int q = 0; q < S; ++q) dots[r][q] += z * y[q];
-            }
-        }
-#pragma unroll
-        for (int q = 0; q < S; ++q) {
-            int k = k0 + q;
-            T lp = !pen_row || k >= n_clusters ? T(0) : pen_row[k];
-#pragma unroll
-            for (int r = 0; r < FUSED_ROWS; ++r) {
-                om[r][q] = T(1) - dots[r][q];
-                lw[r][q] = k < n_clusters ? term * om[r][q] + lp : -INFINITY;
-            }
-        }
-    };
-    for (int base = start + warp * FUSED_ROWS; base < end;
-         base += n_warps * FUSED_ROWS) {
-        int cell[FUSED_ROWS];
-#pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r)
-            cell[r] = base + r >= end ? -1 : idx ? idx[base + r] : base + r;
-        T lw[FUSED_ROWS][S], om[FUSED_ROWS][S];
-        T row_max[FUSED_ROWS], row_sum[FUSED_ROWS];
-#pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r)
-            row_max[r] = -INFINITY, row_sum[r] = T(0);
-        for (int c = 0; c < n_chunks; ++c) {  // online maximum and sum
-            logits(cell, c, lw, om);
-#pragma unroll
-            for (int r = 0; r < FUSED_ROWS; ++r) {
-                T m = row_max[r];
-#pragma unroll
-                for (int q = 0; q < S; ++q) m = max(m, lw[r][q]);
-                m = warp_max(m);
-                T s = T(0);
-#pragma unroll
-                for (int q = 0; q < S; ++q) s += exp(lw[r][q] - m);
-                row_sum[r] = row_sum[r] * exp(row_max[r] - m) + warp_sum(s);
-                row_max[r] = m;
-            }
-        }
-        T distance[FUSED_ROWS] = {}, entropy[FUSED_ROWS] = {};
-        for (int c = 0; c < n_chunks; ++c) {
-            if (n_chunks > 1)
-                logits(cell, c, lw, om);  // one chunk: still loaded
-            int k0 = c * FUSED_CLUSTER_STRIDE + 4 * lane;
-#pragma unroll
-            for (int r = 0; r < FUSED_ROWS; ++r) {
-                if (cell[r] < 0) continue;
-                T inv = T(1) / row_sum[r], log_sum = log(row_sum[r]);
-                RT* row = R + (size_t)cell[r] * n_clusters;
+                    stored[q] = to_storage<RT>(vals[q] * inv);
+                if constexpr (sizeof(RT) <= 4)
+                    if (vec_store && k0 < n_clusters) store4(row + k0, stored);
 #pragma unroll
                 for (int q = 0; q < S; ++q) {
                     int k = k0 + q;
-                    if (k >= n_clusters) continue;
-                    T value = exp(lw[r][q] - row_max[r]) * inv;
-                    RT stored = to_storage<RT>(value);
-                    row[k] = stored;
-                    value = from_storage<T>(stored);
-                    cols[k] += count_to_fixed(value, count_scale);
-                    distance[r] += value * T(2) * om[r][q];
-                    entropy[r] += value * (lw[r][q] - row_max[r] - log_sum);
+                    if (k < n_clusters) {
+                        if (!vec_store) row[k] = stored[q];
+                        // Count the stored (possibly bfloat16) value.
+                        T value = from_storage<T>(stored[q]);
+                        col[q] += count_to_fixed(value, count_scale);
+                        distance += value * T(2) * (T(1) - dots[r][q]);
+                        // log(value) = log of the unnormalized weight -
+                        // log(sum)
+                        entropy += value * (term * (T(1) - dots[r][q]) +
+                                            log_pen[q] - shift - log_sum);
+                    }
                 }
+                T total = warp_sum(distance + sigma * entropy);
+                if (lane == 0) partial[c] = total;
             }
         }
-#pragma unroll
-        for (int r = 0; r < FUSED_ROWS; ++r) {
-            T total = warp_sum(distance[r] + sigma * entropy[r]);
-            if (lane == 0 && cell[r] >= 0) partial[cell[r]] = total;
-        }
     }
-    __syncthreads();
+    __syncthreads();  // col_sums overlays the buffers
+    if constexpr (BLOCKS) {
+        col_sums = col_ws + (size_t)tile * n_warps * n_clusters;
+    } else {
+#pragma unroll
+        for (int q = 0; q < S; ++q)
+            if (k0 + q < n_clusters)
+                col_sums[warp * n_clusters + k0 + q] = col[q];
+        __syncthreads();
+    }
     for (int k = threadIdx.x; k < n_clusters; k += blockDim.x) {
         long long sum = 0;
-        for (int w = 0; w < n_warps; ++w)
-            sum += col_ws[((size_t)tile * n_warps + w) * n_clusters + k];
+        for (int w = 0; w < n_warps; ++w) sum += col_sums[w * n_clusters + k];
         atomicAdd(counts + (size_t)category * n_clusters + k,
                   (unsigned long long)sum);
     }
