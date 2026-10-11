@@ -294,7 +294,7 @@ def test_fused_initialize_matches_reference(
         block_cat_offsets=block_cat_offsets,
         block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
         seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
-        y_scale=cp.empty(1, cp.float64),
+        y_bound=cp.empty(n_pcs, cp.float64),
         y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
         y_t=cp.empty((-(-n_pcs // 4) * 4, stride), cp.float32),
         col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),

@@ -1,9 +1,7 @@
 #include <cuda_runtime.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/vector.h>
 #include <optional>
 #include <stdexcept>
-#include <vector>
 
 #include "../../nb_types.h"
 
@@ -17,32 +15,48 @@ using namespace nb::literals;
 constexpr int MAX_BLOCK_DIM = 256;
 constexpr int BLOCK_DIM_1D = 256;
 
+// out[g][d] = max |X_id| over the cells i of group g in the segments, as
+// bit patterns of |x| (exact and order-free; NaN above inf), so every split
+// of the cells gives the same maxima.
+template <typename T>
+__global__ void group_absmax_kernel(const T* X, int D, const int* seg_start,
+                                    const int* seg_group, T* out) {
+    using U = std::conditional_t<sizeof(T) == 4, unsigned, unsigned long long>;
+    U* o = reinterpret_cast<U*>(out) + (size_t)seg_group[blockIdx.x] * D;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        U m = 0;
+        for (int i = seg_start[blockIdx.x] + threadIdx.y;
+             i < seg_start[blockIdx.x + 1]; i += blockDim.y) {
+            U u;
+            memcpy(&u, X + (size_t)i * D + d, sizeof(T));
+            m = max(m, u & (~U(0) >> 1));
+        }
+        atomicMax(o + d, m);
+    }
+}
+
 // out[g * group_stride + k * ld_out + d] = sum over the cells of group g of
 // R_ik X_id (R row stride ldr), exact over the segments (segment_gemm.cuh) in
-// 1 (float32) or 2 limbs of 30 bits; bounds[g] >= n_g max|X|.
+// 1 (float32) or 2 limbs of 30 bits; bounds (n_groups x n_pcs) >= n_g
+// max|X_gd|.
 template <typename T, typename RT, typename OT>
 static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
                          int n_clusters, const int* seg_start,
-                         const int* seg_group, int n_seg,
-                         const std::vector<double>& bounds, double* scales,
-                         long long* acc, OT* out, long long group_stride,
-                         int ld_out, cudaStream_t stream) {
-    int limbs = sizeof(T) == 4 ? 1 : 2, n_groups = (int)bounds.size();
-    std::vector<double> h(n_groups);
-    for (int g = 0; g < n_groups; g++)
-        h[g] = harmony_segments::scale_for_bound(bounds[g], limbs);
-    cudaMemcpyAsync(scales, h.data(), n_groups * sizeof(double),
-                    cudaMemcpyHostToDevice, stream);
+                         const int* seg_group, int n_seg, int n_groups,
+                         const double* bounds, long long* acc, OT* out,
+                         long long group_stride, int ld_out,
+                         cudaStream_t stream) {
+    int limbs = sizeof(T) == 4 ? 1 : 2;
     cudaMemsetAsync(
         acc, 0,
         (size_t)n_groups * limbs * n_clusters * n_pcs * sizeof(long long),
         stream);
     cuda_check(harmony_segments::segment_rtz(X, R, n_pcs, n_clusters, ldr,
                                              seg_start, seg_group, n_seg,
-                                             scales, acc, limbs, stream),
+                                             bounds, acc, limbs, stream),
                "segment sums");
     cuda_check(harmony_segments::finalize_rtz(acc, n_groups, n_pcs, n_clusters,
-                                              limbs, scales, out, group_stride,
+                                              limbs, bounds, out, group_stride,
                                               ld_out, stream),
                "segment sums");
 }
@@ -57,9 +71,9 @@ static void prepare_multi_impl(
     const int* marginal_joint_offsets, const int* marginal_joint_indices,
     const T* lambda_kb, const uint8_t* active, int n_pcs, int n_clusters,
     int n_batches, int n_covariates, const int* seg_start, const int* seg_group,
-    int n_seg, const std::vector<double>& bounds, double* gram, double* rhs,
-    double* joint_rhs, double* scales, long long* acc, cudaStream_t stream) {
-    int nb1 = n_batches + 1, n_joint_categories = (int)bounds.size();
+    int n_seg, int n_joint_categories, const double* bounds, double* gram,
+    double* rhs, double* joint_rhs, long long* acc, cudaStream_t stream) {
+    int nb1 = n_batches + 1;
     cudaMemsetAsync(gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double),
                     stream);
     initialize_multi_gram_kernel<T><<<n_clusters, MAX_BLOCK_DIM, 0, stream>>>(
@@ -83,8 +97,8 @@ static void prepare_multi_impl(
     CUDA_CHECK_LAST_ERROR(add_joint_cross_kernel);
 
     segment_sums(X, R, ldr, n_pcs, n_clusters, seg_start, seg_group, n_seg,
-                 bounds, scales, acc, joint_rhs, (long long)n_clusters * n_pcs,
-                 n_pcs, stream);
+                 n_joint_categories, bounds, acc, joint_rhs,
+                 (long long)n_clusters * n_pcs, n_pcs, stream);
     marginal_from_joint_rhs_kernel<<<
         strided_grid((long long)n_clusters * nb1 * n_pcs, BLOCK_DIM_1D),
         BLOCK_DIM_1D, 0, stream>>>(joint_rhs, marginal_joint_offsets,
@@ -120,20 +134,21 @@ static void apply_multi_impl(const T* X, const T* R, int ldr, const T* W_all,
 
 // Batched correction of cells sorted by batch, all clusters at once. The
 // right-hand sides S_b = R_b^T X_b are exact sums over segments
-// (segment_gemm.cuh; `bounds[b]` >= n_b max|X|), the coefficients the closed
-// form of ridge_coefficients_kernel; Z = X - R_i W[batch] is applied row by
-// row and normalized on request (apply_rows.cuh), so results do not depend on
-// how the cells are split. S and W are (n_clusters, n_batches, n_pcs).
+// (segment_gemm.cuh; bounds[b][d] >= n_b max|X_bd|), the coefficients the
+// closed form of ridge_coefficients_kernel; Z = X - R_i W[batch] is applied row
+// by row and normalized on request (apply_rows.cuh), so results do not depend
+// on how the cells are split. S and W are (n_clusters, n_batches, n_pcs).
 template <typename T, typename RT>
-static void correction_batched_impl(
-    const T* X, const RT* R, const T* O, const T* lambda_kb, int n_pcs,
-    int n_clusters, const int* seg_start, const int* seg_group, int n_seg,
-    const std::vector<double>& bounds, T* Z, T* S, T* W, double* scales,
-    long long* rhs_acc, bool normalize, cudaStream_t stream) {
-    int n_batches = (int)bounds.size();
+static void correction_batched_impl(const T* X, const RT* R, const T* O,
+                                    const T* lambda_kb, int n_pcs,
+                                    int n_clusters, const int* seg_start,
+                                    const int* seg_group, int n_seg,
+                                    int n_batches, const double* bounds, T* Z,
+                                    T* S, T* W, long long* rhs_acc,
+                                    bool normalize, cudaStream_t stream) {
     long long s_cluster = (long long)n_batches * n_pcs;
     segment_sums(X, R, n_clusters, n_pcs, n_clusters, seg_start, seg_group,
-                 n_seg, bounds, scales, rhs_acc, S, n_pcs, (int)s_cluster,
+                 n_seg, n_batches, bounds, rhs_acc, S, n_pcs, (int)s_cluster,
                  stream);
     ridge_coefficients_kernel<T>
         <<<strided_grid((long long)n_clusters * n_pcs, BLOCK_DIM_1D),
@@ -148,26 +163,55 @@ static void correction_batched_impl(
 
 // ---- nanobind registration ----
 
+// The right-hand side bounds must be n_groups x n_pcs.
+template <typename Bounds>
+static int bound_groups(const Bounds& bounds, size_t n_pcs) {
+    if (bounds.ndim() != 2 || bounds.shape(1) != n_pcs)
+        throw std::invalid_argument("bounds must be groups x PCs");
+    return (int)bounds.shape(0);
+}
+
 template <typename T, typename Device>
 static void register_correction_batched(nb::module_& m) {
+    m.def(
+        "group_absmax",
+        [](gpu_array_c<const T, Device> X,
+           gpu_array_c<const int, Device> seg_start,
+           gpu_array_c<const int, Device> seg_group, gpu_array_c<T, Device> out,
+           std::uintptr_t stream) {
+            if (out.ndim() != 2 || out.shape(1) != X.shape(1) ||
+                seg_group.size() + 1 != seg_start.size())
+                throw std::invalid_argument("group_absmax: bad shapes");
+            auto s = (cudaStream_t)stream;
+            cudaMemsetAsync(out.data(), 0, out.size() * sizeof(T), s);
+            if (seg_group.size() == 0) return;
+            group_absmax_kernel<T>
+                <<<(unsigned)seg_group.size(), dim3(32, 8), 0, s>>>(
+                    X.data(), (int)X.shape(1), seg_start.data(),
+                    seg_group.data(), out.data());
+            CUDA_CHECK_LAST_ERROR(group_absmax_kernel);
+        },
+        "X"_a, nb::kw_only(), "seg_start"_a, "seg_group"_a, "out"_a,
+        "stream"_a = 0);
+
     m.def(
         "correction_batched",
         [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> R,
            gpu_array_c<const T, Device> O,
            gpu_array_c<const T, Device> lambda_kb,
            gpu_array_c<const int, Device> seg_start,
-           gpu_array_c<const int, Device> seg_group, std::vector<double> bounds,
+           gpu_array_c<const int, Device> seg_group,
+           gpu_array_c<const double, Device> bounds,
            // workspace
            gpu_array_c<T, Device> Z, gpu_array_c<T, Device> S,
-           gpu_array_c<T, Device> W, gpu_array_c<double, Device> scales,
-           gpu_array_c<long long, Device> rhs_acc, bool normalize,
-           std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
+           gpu_array_c<T, Device> W, gpu_array_c<long long, Device> rhs_acc,
+           bool normalize, std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
            std::uintptr_t stream) {
-            int n_pcs = (int)X.shape(1), n_clusters = (int)R.shape(1);
+            int n_pcs = (int)X.shape(1), n_clusters = (int)R.shape(1),
+                n_batches = bound_groups(bounds, n_pcs);
             size_t limbs = sizeof(T) == 4 ? 1 : 2,
-                   n_coef = bounds.size() * n_clusters * n_pcs;
-            if (scales.size() < bounds.size() ||
-                rhs_acc.size() < limbs * n_coef || S.size() < n_coef ||
+                   n_coef = (size_t)n_batches * n_clusters * n_pcs;
+            if (rhs_acc.size() < limbs * n_coef || S.size() < n_coef ||
                 W.size() < n_coef || seg_group.size() + 1 != seg_start.size())
                 throw std::invalid_argument(
                     "correction_batched workspace is too small");
@@ -175,7 +219,7 @@ static void register_correction_batched(nb::module_& m) {
                 correction_batched_impl<T>(
                     X.data(), r, O.data(), lambda_kb.data(), n_pcs, n_clusters,
                     seg_start.data(), seg_group.data(), (int)seg_group.size(),
-                    bounds, Z.data(), S.data(), W.data(), scales.data(),
+                    n_batches, bounds.data(), Z.data(), S.data(), W.data(),
                     rhs_acc.data(), normalize, (cudaStream_t)stream);
             };
             if (!R_bf16) return run(R.data());
@@ -185,7 +229,7 @@ static void register_correction_batched(nb::module_& m) {
             throw std::invalid_argument("bfloat16 assignments require float32");
         },
         "X"_a, nb::kw_only(), "R"_a, "O"_a, "lambda_kb"_a, "seg_start"_a,
-        "seg_group"_a, "bounds"_a, "Z"_a, "S"_a, "W"_a, "scales"_a, "rhs_acc"_a,
+        "seg_group"_a, "bounds"_a, "Z"_a, "S"_a, "W"_a, "rhs_acc"_a,
         "normalize"_a = false, "R_bf16"_a = nb::none(), "stream"_a = 0);
 
     m.def(
@@ -198,28 +242,28 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const T, Device> lambda_kb,
            gpu_array_c<const uint8_t, Device> active, int n_batches,
            gpu_array_c<const int, Device> seg_start,
-           gpu_array_c<const int, Device> seg_group, std::vector<double> bounds,
+           gpu_array_c<const int, Device> seg_group,
+           gpu_array_c<const double, Device> bounds,
            gpu_array_c<double, Device> gram, gpu_array_c<double, Device> rhs,
            gpu_array_c<double, Device> joint_rhs,
-           gpu_array_c<double, Device> scales,
            gpu_array_c<long long, Device> acc, std::uintptr_t stream) {
             if (R.ndim() != 2 || R.stride(1) != 1)
                 throw std::invalid_argument("R must have contiguous rows");
+            int n_joint_categories = bound_groups(bounds, X.shape(1));
             prepare_multi_impl<T>(
                 X.data(), R.data(), (int)R.stride(0), joint_O.data(),
                 joint_cats.data(), marginal_joint_offsets.data(),
                 marginal_joint_indices.data(), lambda_kb.data(), active.data(),
                 (int)X.shape(1), (int)R.shape(1), n_batches,
                 (int)joint_cats.shape(1), seg_start.data(), seg_group.data(),
-                (int)seg_group.size(), bounds, gram.data(), rhs.data(),
-                joint_rhs.data(), scales.data(), acc.data(),
+                (int)seg_group.size(), n_joint_categories, bounds.data(),
+                gram.data(), rhs.data(), joint_rhs.data(), acc.data(),
                 (cudaStream_t)stream);
         },
         "X"_a, nb::kw_only(), "R"_a, "joint_O"_a, "joint_cats"_a,
         "marginal_joint_offsets"_a, "marginal_joint_indices"_a, "lambda_kb"_a,
         "active_mask"_a, "n_batches"_a, "seg_start"_a, "seg_group"_a,
-        "bounds"_a, "gram"_a, "rhs"_a, "joint_rhs"_a, "scales"_a, "acc"_a,
-        "stream"_a = 0);
+        "bounds"_a, "gram"_a, "rhs"_a, "joint_rhs"_a, "acc"_a, "stream"_a = 0);
 
     m.def(
         "apply_multi",
