@@ -118,7 +118,7 @@ struct ClusteringArgs {
     long long* block_counts;
     const int* seg_start;  // centroid segments (see segment_gemm.cuh)
     int n_seg;
-    double* y_scale;           // centroid fixed-point scale (1)
+    double* y_bound;           // centroid sum bounds (n_pcs)
     long long* y_acc;          // centroid sums: limbs x K x D
     T* y_t;                    // centroids transposed (transpose_centroids)
     long long* col_workspace;  // cluster blocks: per-warp column sums
@@ -299,10 +299,9 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
     // Centroid sums: 2 (float32) or 3 limbs of 30 bits; |Z_norm|, R <= 1.
     int y_limbs = sizeof(T) == 4 ? 2 : 3;
     size_t kd = (size_t)a.n_clusters * a.n_pcs;
-    double y_scale =
-        harmony_segments::scale_for_bound((double)a.n_total, y_limbs);
-    cudaMemcpyAsync(a.y_scale, &y_scale, sizeof(double), cudaMemcpyHostToDevice,
-                    a.stream);
+    std::vector<double> y_bound(a.n_pcs, (double)a.n_total);
+    cudaMemcpyAsync(a.y_bound, y_bound.data(), a.n_pcs * sizeof(double),
+                    cudaMemcpyHostToDevice, a.stream);
     int ob_total = a.n_batches * a.n_clusters;
     int blocks_1d = (ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
     auto stored = [&](int blk) {
@@ -368,10 +367,10 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         cuda_check(
             harmony_segments::segment_rtz(
                 a.Z_norm, R, a.n_pcs, a.n_clusters, a.n_clusters, a.seg_start,
-                nullptr, a.n_seg, a.y_scale, a.y_acc, y_limbs, a.stream),
+                nullptr, a.n_seg, a.y_bound, a.y_acc, y_limbs, a.stream),
             "centroids");
         cuda_check(harmony_segments::finalize_rtz(
-                       a.y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_scale,
+                       a.y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_bound,
                        a.Y_norm, 0, a.n_pcs, a.stream),
                    "centroids");
         l2_row_normalize(a.Y_norm, a.Y_norm, a.n_clusters, a.n_pcs, a.stream);
@@ -435,7 +434,7 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<int, Device> block_cat_offsets,
            gpu_array_c<long long, Device> block_counts,
            gpu_array_c<const int, Device> seg_start,
-           gpu_array_c<double, Device> y_scale,
+           gpu_array_c<double, Device> y_bound,
            gpu_array_c<long long, Device> y_acc,
            std::optional<gpu_array_c<uint16_t, Device>> R_bf16, Ints joint_cats,
            Ints joints, gpu_array_c<T, Device> y_t,
@@ -467,6 +466,7 @@ static void register_clustering_loop(nb::module_& m) {
                 block_counts.size() < (n_blocks + 3) * kb ||
                 objective_partials.size() < cells + 8 ||
                 y_acc.size() < (size_t)3 * n_clusters * n_pcs ||
+                y_bound.size() < (size_t)n_pcs ||
                 y_t.size() < (size_t)fused_padded_pcs(n_pcs) * k_stride ||
                 reinterpret_cast<uintptr_t>(y_t.data()) % 16 ||
                 (col_workspace &&
@@ -493,7 +493,7 @@ static void register_clustering_loop(nb::module_& m) {
                                 block_counts.data(),
                                 seg_start.data(),
                                 (int)seg_start.size() - 1,
-                                y_scale.data(),
+                                y_bound.data(),
                                 y_acc.data(),
                                 y_t.data(),
                                 ptr(col_workspace),
@@ -520,7 +520,7 @@ static void register_clustering_loop(nb::module_& m) {
         },
         "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "theta"_a,
         "Y_norm"_a, "idx_list"_a, "penalty"_a, "objective_partials"_a,
-        "block_cat_offsets"_a, "block_counts"_a, "seg_start"_a, "y_scale"_a,
+        "block_cat_offsets"_a, "block_counts"_a, "seg_start"_a, "y_bound"_a,
         "y_acc"_a, "R_bf16"_a = nb::none(), "joint_cats"_a = nb::none(),
         "joints"_a = nb::none(), "y_t"_a, "col_workspace"_a = nb::none(),
         "dots_workspace"_a = nb::none(), "force_blocks"_a = false, "n_cells"_a,

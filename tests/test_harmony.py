@@ -16,6 +16,7 @@ from rapids_singlecell.preprocessing._harmony import (
     _compute_lambda_kb,
     _correction,
     _correction_multi,
+    _rhs_bounds,
     _segments,
     _solve_spd_batched,
 )
@@ -323,7 +324,6 @@ def test_harmony_correction_matches_dense_design(
     lambda_np[2] = np_dtype.type(_SUPPRESS_PENALTY)
     lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
     offsets = np.searchsorted(cats_np, np.arange(n_batches + 1)).astype(np.int32)
-    bounds = (np.diff(offsets) * np.abs(X_np).max()).tolist()
 
     result = _correction(
         cp.asarray(X_np),
@@ -336,7 +336,7 @@ def test_harmony_correction_matches_dense_design(
         cat_offsets=cp.asarray(offsets),
         cell_indices=cp.arange(n_cells, dtype=cp.int32),
         normalize=normalize,
-        segments=(*_segments(offsets), bounds),
+        segments=(*_segments(offsets), _rhs_bounds(cp.asarray(X_np), offsets)),
     )
 
     expected = _dense_design_correction(X_np, R_np, cats_np, lambda_np, n_batches)
@@ -344,6 +344,51 @@ def test_harmony_correction_matches_dense_design(
         expected /= np.linalg.norm(expected, axis=1, keepdims=True)
     atol = 2e-5 if dtype == cp.float32 else 1e-11
     cp.testing.assert_allclose(result, cp.asarray(expected), atol=atol, rtol=atol)
+
+
+@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+@pytest.mark.parametrize("method", ["batched", "fast"])
+def test_harmony_correction_keeps_a_large_single_batch_cluster(dtype, method):
+    # One batch, one cluster of 2**25 cells, ridge_lambda 1: the coefficients
+    # are zero and the embedding stays (an explicit inverse's pivot
+    # N - O^2 / (O + 1) cancels to 0 in float32).
+    n = 2**25
+    X = cp.tile(cp.asarray([3, 4], dtype=dtype), (n, 1))
+    offsets = np.array([0, n], dtype=np.int32)
+    result = _correction(
+        X,
+        R=cp.ones((n, 1), dtype=dtype),
+        O=cp.full((1, 1), n, dtype=dtype),
+        lambda_kb=cp.ones((1, 1), dtype=dtype),
+        correction_method=method,
+        cats=cp.zeros(n, dtype=cp.int32),
+        n_batches=1,
+        cat_offsets=cp.asarray(offsets),
+        cell_indices=cp.arange(n, dtype=cp.int32),
+        segments=(*_segments(offsets), _rhs_bounds(X, offsets)),
+    )
+    cp.testing.assert_allclose(result, X, rtol=1e-12 if dtype == cp.float64 else 0)
+
+
+@pytest.mark.parametrize("big", [1e19, 1e18])
+def test_harmony_extreme_batch_keeps_the_others(big):
+    # The exact right-hand sides are scaled per batch and PC, so a batch of
+    # 1e19 does not round away the sums of the others: batched = fast.
+    n = 300
+    X = np.repeat(np.array([[big, 0], [0, 1], [0, 3]], np.float32), n, axis=0)
+    obs = pd.DataFrame(
+        {"batch": pd.Categorical(np.repeat(["b0", "b1", "b2"], n))},
+        index=np.arange(3 * n).astype(str),
+    )
+
+    def run(method):
+        adata = ad.AnnData(obs=obs, obsm={"X_pca": X})
+        rsc.pp.harmony_integrate(
+            adata, "batch", n_clusters=2, sigma=0.01, correction_method=method, rng=0
+        )
+        return adata.obsm["X_pca_harmony"][n:]
+
+    np.testing.assert_allclose(run("batched"), run("fast"), rtol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
@@ -396,7 +441,7 @@ def test_harmony_multikey_correction_matches_dense_design(
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
             segments=(
                 *_segments(joint_offsets),
-                (np.diff(joint_offsets) * np.abs(X_np).max()).tolist(),
+                _rhs_bounds(cp.asarray(X_np), joint_offsets),
             ),
             marginal_joint_offsets=cp.asarray(marginal_offsets),
             marginal_joint_indices=cp.asarray(

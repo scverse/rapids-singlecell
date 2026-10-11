@@ -245,14 +245,6 @@ def harmonize(
     order = cp.argsort(groups.astype(cp.float64) + keys)
     del keys
     Z = _sorted_device_copy(Z, order)
-    # Exact right-hand side sums per group are bounded by n_g max|X|.
-    low, high = float(Z.min()), float(Z.max())
-    if not (math.isfinite(low) and math.isfinite(high)):
-        raise ValueError(
-            "Input data contains NaN or infinite values. Please handle these "
-            "before running harmony_integrate."
-        )
-    max_abs = max(high, -low)
     # Only one batch key reads the batch codes (as the block draw's groups).
     cats = cats[order] if n_covariates == 1 else None
     # Sorted groups: offsets from the group sizes, cells in order.
@@ -263,6 +255,7 @@ def harmonize(
         joint_codes = joint_codes[order]
     del batch_codes, groups
     host_offsets = cp.asnumpy(group_offsets)
+    rhs_bounds = _rhs_bounds(Z, host_offsets)
     Z_norm = _normalize_cp(Z)
 
     # Set up parameters
@@ -364,7 +357,7 @@ def harmonize(
     )
     chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
     seg_start, seg_group = _segments(host_offsets, unit)
-    segments = (seg_start, seg_group, (np.diff(host_offsets) * max_abs).tolist())
+    segments = (seg_start, seg_group, rhs_bounds)
     # Centroid sums need no group cuts.
     workspace["seg_start"] = (
         seg_start if n_covariates == 1 else _segments(host_offsets[[0, -1]], unit)[0]
@@ -574,6 +567,28 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
             drain(*pending)
 
 
+def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
+    """Bounds of the exact right-hand side sums (segment_gemm.cuh): n_g
+    max |X_gd| for each group g of the cells (sorted by group, ``offsets`` on
+    the host) and PC d, so no other group or PC coarsens a sum."""
+    seg_start, seg_group = _segments(offsets)  # any single-group segments
+    maxima = cp.empty((len(offsets) - 1, Z.shape[1]), dtype=Z.dtype)
+    _correction_batched_cuda.group_absmax(
+        Z,
+        seg_start=seg_start,
+        seg_group=seg_group,
+        out=maxima,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    bounds = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None] * maxima
+    if not bool(cp.isfinite(bounds).all()):
+        raise ValueError(
+            "Input data contains NaN or infinite values. Please handle these "
+            "before running harmony_integrate."
+        )
+    return bounds
+
+
 def _segments(
     offsets: np.ndarray, unit: int = _SEGMENT
 ) -> tuple[cp.ndarray, cp.ndarray]:
@@ -711,7 +726,7 @@ def _allocate_clustering_workspace(
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and their scale.
         "y_acc": cp.empty((3, n_clusters, n_pcs), dtype=cp.int64),
-        "y_scale": cp.empty(1, dtype=cp.float64),
+        "y_bound": cp.empty(n_pcs, dtype=cp.float64),
         "idx_list": cp.empty(n_cells, dtype=cp.int32),
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
         "objective_partials": cp.empty(n_cells + 8, dtype=dtype),
@@ -934,7 +949,6 @@ def _correction_multi(
             gram=gram,
             rhs=rhs,
             joint_rhs=joint_rhs,
-            scales=cp.empty(n_joint_categories, dtype=cp.float64),
             acc=acc,
             stream=stream,
         )
@@ -1131,7 +1145,6 @@ def _correction_batched(
         Z=Z,
         S=cp.empty((n_clusters, n_batches, n_pcs), dtype=dtype),
         W=cp.empty((n_clusters, n_batches, n_pcs), dtype=dtype),
-        scales=cp.empty(n_batches, dtype=cp.float64),
         rhs_acc=cp.empty(
             (n_batches, _limbs(dtype.itemsize), n_clusters, n_pcs), dtype=cp.int64
         ),
