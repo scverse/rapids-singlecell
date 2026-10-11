@@ -215,6 +215,26 @@ __global__ void update_counts_kernel(long long* total, long long* fold_stored,
     if (clear) clear[i] = 0;
 }
 
+// counts[seg_group[s] K + k] += the fixed-point counts of column k of R (row
+// stride ldr) over segment s: the clustering's exact counts, per segment
+// group, whatever the segments or GPUs.
+template <typename T>
+__global__ void segment_counts_kernel(const T* R, int ldr, int K,
+                                      const int* seg_start,
+                                      const int* seg_group, int n_seg, T scale,
+                                      unsigned long long* counts) {
+    for (long long p = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         p < (long long)n_seg * K; p += (long long)gridDim.x * blockDim.x) {
+        int s = (int)(p / K), k = (int)(p % K);
+        long long sum = 0;
+        for (int i = seg_start[s]; i < seg_start[s + 1]; ++i)
+            sum += count_to_fixed(R[(size_t)i * ldr + k], scale);
+        if (sum)
+            atomicAdd(counts + (size_t)seg_group[s] * K + k,
+                      (unsigned long long)sum);
+    }
+}
+
 // total = sum of the n_blocks block counts (n values each).
 __global__ void sum_blocks_kernel(const long long* __restrict__ blocks,
                                   int n_blocks, long long* __restrict__ total,
@@ -387,17 +407,25 @@ __device__ __forceinline__ void tile_products(
 // k_stride); then each row is normalized from them. Column sums go through
 // per-warp slices of `col_ws` (tiles x warps x K). One block gives the bits of
 // the single-block path.
-template <typename T, typename RT, int V, bool BLOCKS>
+// JOINT (several keys): tiles take any rows of the block, in joint category
+// order (`joints` per cell). A warp follows its rows' joint categories: a
+// run's log penalty sums its levels' (`joint_cats`, n_cov per category) in
+// key order, and its counts go to each of its levels.
+template <typename T, typename RT, int V, bool BLOCKS, bool JOINT>
 __global__ void __launch_bounds__(FUSED_THREADS,
                                   sizeof(T) == 4 ? FUSED_CTAS : 1)
-    fused_assign_kernel(
-        const T* __restrict__ Z, const T* __restrict__ y_t, int k_stride,
-        const T* __restrict__ penalty, const int* __restrict__ idx,
-        const int* __restrict__ offsets, const int* __restrict__ tiles,
-        int n_categories, int tile_rows, RT* __restrict__ R,
-        T* __restrict__ partial, unsigned long long* __restrict__ counts,
-        T* __restrict__ dots_ws, long long* __restrict__ col_ws, T term,
-        T sigma, T count_scale, int n_pcs, int n_clusters) {
+    fused_assign_kernel(const T* __restrict__ Z, const T* __restrict__ y_t,
+                        int k_stride, const T* __restrict__ penalty,
+                        const int* __restrict__ idx,
+                        const int* __restrict__ offsets,
+                        const int* __restrict__ tiles, int n_categories,
+                        int tile_rows, RT* __restrict__ R,
+                        T* __restrict__ partial,
+                        unsigned long long* __restrict__ counts,
+                        T* __restrict__ dots_ws, long long* __restrict__ col_ws,
+                        T term, T sigma, T count_scale, int n_pcs,
+                        int n_clusters, const int* __restrict__ joints,
+                        const int* __restrict__ joint_cats, int n_cov) {
     int tile = blockIdx.x, start, end;
     if (tile >= tiles[n_categories]) return;
     int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
@@ -415,23 +443,56 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     int k0 = 4 * lane;  // this lane's clusters k0 .. k0 + 3 of each block
     const T* pen_row =
         penalty ? penalty + (size_t)category * n_clusters : nullptr;
-    auto lp = [&](int k) { return pen_row ? pen_row[k] : T(0); };
+    const int* levels = joint_cats;  // JOINT: the warp's run's levels
+    int joint = -1;                  // JOINT: the warp's run (-1: none yet)
+    auto lp = [&](int k) {
+        if constexpr (JOINT) {
+            T sum = T(0);
+            for (int c = 0; penalty && c < n_cov; ++c)
+                sum += penalty[(size_t)levels[c] * n_clusters + k];
+            return sum;
+        }
+        return pen_row ? pen_row[k] : T(0);
+    };
     T log_pen[S], top = -INFINITY;
     long long col[S] = {};
     long long* cols = nullptr;  // BLOCKS: this warp's column sums
+    auto refresh = [&] {        // the log penalties and their top
+        top = -INFINITY;
+        if constexpr (BLOCKS) {
+            for (int k = lane; k < n_clusters; k += 32) top = max(top, lp(k));
+        } else {
+#pragma unroll
+            for (int q = 0; q < S; ++q) {
+                log_pen[q] = k0 + q < n_clusters ? lp(k0 + q) : T(0);
+                if (k0 + q < n_clusters) top = max(top, log_pen[q]);
+            }
+        }
+        top = warp_max(top);
+    };
+    // JOINT: the warp's counts of its run go to each of the run's levels.
+    auto flush = [&] {
+        if (joint < 0) return;
+        for (int k = k0; k < n_clusters; k += FUSED_CLUSTER_STRIDE)
+#pragma unroll
+            for (int q = 0; q < S; ++q) {
+                if (k + q >= n_clusters) break;
+                long long v;
+                if constexpr (BLOCKS)
+                    v = cols[k + q], cols[k + q] = 0;
+                else
+                    v = col[q], col[q] = 0;
+                for (int c = 0; v && c < n_cov; ++c)
+                    atomicAdd(counts + (size_t)levels[c] * n_clusters + k + q,
+                              (unsigned long long)v);
+            }
+    };
     if constexpr (BLOCKS) {
-        for (int k = lane; k < n_clusters; k += 32) top = max(top, lp(k));
         cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
         for (int k = lane; k < n_clusters; k += 32) cols[k] = 0;
         __syncwarp();  // other lanes accumulate these columns
-    } else {
-#pragma unroll
-        for (int q = 0; q < S; ++q) {
-            log_pen[q] = k0 + q < n_clusters ? lp(k0 + q) : T(0);
-            if (k0 + q < n_clusters) top = max(top, log_pen[q]);
-        }
     }
-    top = warp_max(top);
+    if constexpr (!JOINT) refresh();
     bool row_shift = term < T(-30);
     // Rows of four-aligned clusters: one store per lane and row (bfloat16
     // and float; for double the two stores cost more than they save).
@@ -533,6 +594,18 @@ __global__ void __launch_bounds__(FUSED_THREADS,
         int base = start + g * TM + warp * FUSED_ROWS;
         bool active = base < end;  // warp-uniform
         int lane_cell = lane < FUSED_ROWS ? cell(base + lane) : -1;
+        int lane_joint = JOINT && lane_cell >= 0 ? joints[lane_cell] : -1;
+        // JOINT: row r of a new run first flushes the warp's counts.
+        auto run = [&](int r) {
+            if constexpr (JOINT) {
+                int j = __shfl_sync(0xffffffff, lane_joint, r);
+                if (j != joint) {  // warp-uniform
+                    flush();
+                    joint = j, levels = joint_cats + (size_t)j * n_cov;
+                    refresh();
+                }
+            }
+        };
         for (int b = 0; b < n_blocks; ++b) {
 #pragma unroll
             for (int r = 0; r < FUSED_ROWS; ++r)
@@ -569,6 +642,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
             for (int r = 0; r < FUSED_ROWS; ++r) {
                 int c = __shfl_sync(0xffffffff, lane_cell, r);
                 if (c < 0) break;  // warp-uniform
+                run(r);
                 const T* drow =
                     dots_ws +
                     (size_t)(tile * TM + warp * FUSED_ROWS + r) * k_stride;
@@ -624,6 +698,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
             for (int r = 0; r < FUSED_ROWS; ++r) {
                 int c = __shfl_sync(0xffffffff, lane_cell, r);
                 if (c < 0) break;  // warp-uniform
+                run(r);
                 T vals[S];
                 T sum = T(0);
                 T shift = top;
@@ -674,6 +749,11 @@ __global__ void __launch_bounds__(FUSED_THREADS,
             }
         }
     }
+    if constexpr (JOINT) {  // what is left belongs to the tile's last run
+        int last = joints[cell(end - 1)];
+        if (joint != last) flush();
+        levels = joint_cats + (size_t)last * n_cov;
+    }
     __syncthreads();  // col_sums overlays the buffers
     if constexpr (BLOCKS) {
         col_sums = col_ws + (size_t)tile * n_warps * n_clusters;
@@ -687,8 +767,13 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     for (int k = threadIdx.x; k < n_clusters; k += blockDim.x) {
         long long sum = 0;
         for (int w = 0; w < n_warps; ++w) sum += col_sums[w * n_clusters + k];
-        atomicAdd(counts + (size_t)category * n_clusters + k,
-                  (unsigned long long)sum);
+        if constexpr (JOINT)
+            for (int c = 0; sum && c < n_cov; ++c)
+                atomicAdd(counts + (size_t)levels[c] * n_clusters + k,
+                          (unsigned long long)sum);
+        else
+            atomicAdd(counts + (size_t)category * n_clusters + k,
+                      (unsigned long long)sum);
     }
 }
 
@@ -700,25 +785,6 @@ __global__ void transpose_centroids_kernel(const T* Y_norm, T* y_t, int n_pcs,
     transpose_padded(Y_norm, y_t, n_clusters, n_pcs, pcs, k_stride,
                      blockIdx.x * blockDim.x + threadIdx.x,
                      blockDim.x * gridDim.x);
-}
-
-// Log penalty of every joint category: the sum of its levels' log penalties.
-template <typename T>
-__global__ void joint_log_penalty_kernel(const T* penalty,
-                                         const int* joint_cats,
-                                         int n_covariates, int n_joint,
-                                         int n_clusters, T* out) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < (long long)n_joint * n_clusters;
-         i += (long long)blockDim.x * gridDim.x) {
-        long long j = i / n_clusters, k = i % n_clusters;
-        T sum = T(0);
-        for (int c = 0; c < n_covariates; ++c)
-            sum +=
-                penalty[(size_t)joint_cats[j * n_covariates + c] * n_clusters +
-                        k];
-        out[i] = sum;
-    }
 }
 
 // Diversity term over O/E, added by the final objective reduction.

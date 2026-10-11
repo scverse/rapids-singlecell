@@ -6,27 +6,6 @@
 
 #include "../storage.cuh"
 
-// Marginal counts from the joint-category counts: each (category, cluster)
-// sums its joint categories (CSR `marginal_joint_*`) in a fixed order.
-template <typename T>
-__global__ void materialize_marginal_from_joint_kernel(
-    const T* __restrict__ joint_values,
-    const int* __restrict__ marginal_joint_offsets,
-    const int* __restrict__ marginal_joint_indices, T* __restrict__ marginal,
-    int n_batches, int n_clusters) {
-    size_t total = (size_t)n_batches * n_clusters;
-    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (size_t)blockDim.x * gridDim.x) {
-        int batch = (int)(i / n_clusters), cluster = (int)(i % n_clusters);
-        T sum = T(0);
-        for (int p = marginal_joint_offsets[batch];
-             p < marginal_joint_offsets[batch + 1]; ++p)
-            sum += joint_values[(size_t)marginal_joint_indices[p] * n_clusters +
-                                cluster];
-        marginal[i] = sum;
-    }
-}
-
 // a[cat + 1, pc0 .. pc0 + 1] = sum over the category's cells of v * bias; one
 // block per (category, pair of PCs).
 template <typename T>

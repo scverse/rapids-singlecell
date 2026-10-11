@@ -397,8 +397,6 @@ def test_harmony_multikey_correction_matches_dense_design(
     order = np.argsort(joint_codes_np, kind="stable")
     cats_np, X_np, R_np = cats_np[order], X_np[order], R_np[order]
     joint_codes_np = joint_codes_np[order]
-    joint_O_np = np.zeros((len(joint_cats_np), n_clusters), dtype=np_dtype)
-    np.add.at(joint_O_np, joint_codes_np, R_np)
     joint_offsets = np.searchsorted(
         joint_codes_np, np.arange(len(joint_cats_np) + 1)
     ).astype(np.int32)
@@ -414,7 +412,6 @@ def test_harmony_multikey_correction_matches_dense_design(
             cp.asarray(X_np),
             cp.asarray(R_np),
             lambda_kb=cp.asarray(lambda_np),
-            joint_O=cp.asarray(joint_O_np),
             n_batches=n_batches,
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
             segments=(
@@ -804,6 +801,7 @@ def _repeatability_adata(dtype, n_pcs=17):
                 "batch": ordinal % 5,
                 "second": (ordinal // 5) % 3,
                 "third": (ordinal // 15) % 2,
+                "fine": ordinal % 37,  # with batch: runs of ~2.6 cells
             },
             index=ordinal.astype(str),
         ),
@@ -983,6 +981,7 @@ def test_harmony_bfloat16_falls_back_to_float32():
         ("batch", 128, 100, {}),
         ("batch", 300, 100, {}),
         (["batch", "second"], 300, 7, {}),
+        (["batch", "fine"], 17, 7, {}),
         ("batch", 1023, 20, {}),
         ("batch", 50, 100, {"sigma": 0.02}),  # each row shifted by its maximum
         ("batch", 50, 64, {"dtype": np.float64}),
@@ -1011,23 +1010,30 @@ def test_harmony_cluster_blocks_match_fused(
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize("cells_per_sm", [160, 480])
 @pytest.mark.parametrize(
-    ("dtype", "n_pcs"),
+    ("dtype", "n_pcs", "key"),
     [
-        ("float32", 50),
-        ("float32", 100),
-        ("float64", 32),
-        ("float64", 50),
-        ("bfloat16", 50),
+        ("float32", 50, "batch"),
+        ("float32", 100, "batch"),
+        ("float64", 32, "batch"),
+        ("float64", 50, "batch"),
+        ("bfloat16", 50, "batch"),
+        ("float32", 50, ["batch", "fine"]),
     ],
 )
-def test_harmony_fused_tiles_of_several_groups(monkeypatch, cells_per_sm, dtype, n_pcs):
+def test_harmony_fused_tiles_of_several_groups(
+    monkeypatch, cells_per_sm, dtype, n_pcs, key
+):
     # One block of 160 cells per SM: tiles of two or three groups of 64 rows
     # with one or two CTAs per SM (T4, float64: one); 480 per SM: the tiles of
     # large blocks (three groups, or one with one CTA per SM). Centroids are
-    # resident up to 64 float32 (32 float64) PCs, streamed beyond.
+    # resident up to 64 float32 (32 float64) PCs, streamed beyond. Two keys:
+    # runs of 1-2 cells of a joint category.
     n_cells = cells_per_sm * cp.cuda.Device().attributes["MultiProcessorCount"]
     obs = pd.DataFrame(
-        {"batch": pd.Categorical(np.arange(n_cells) % 2)},
+        {
+            "batch": pd.Categorical(np.arange(n_cells) % 2),
+            "fine": pd.Categorical(np.arange(n_cells) % 997),
+        },
         index=np.arange(n_cells).astype(str),
     )
     X = np.random.default_rng(7).standard_normal((n_cells, n_pcs))
@@ -1036,7 +1042,7 @@ def test_harmony_fused_tiles_of_several_groups(monkeypatch, cells_per_sm, dtype,
         adata = ad.AnnData(obs=obs, obsm={"X_pca": X.astype(np.float32)})
         rsc.pp.harmony_integrate(
             adata,
-            "batch",
+            key,
             dtype=dtype,
             rng=734,
             block_proportion=1.0,
@@ -1048,6 +1054,29 @@ def test_harmony_fused_tiles_of_several_groups(monkeypatch, cells_per_sm, dtype,
     assert run().tobytes() == fused.tobytes()
     monkeypatch.setattr(harmony_module, "_FORCE_CLUSTER_BLOCKS", True)
     assert run().tobytes() == fused.tobytes()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_multikey_workspace_is_per_level(monkeypatch):
+    # Several keys keep counts per batch level, and tiles take any cells: no
+    # clustering buffer grows with the joint categories (here 185).
+    allocate, shapes = harmony_module._allocate_clustering_workspace, []
+
+    def record(*args, **kwargs):
+        workspace = allocate(*args, **kwargs)
+        shapes.append({k: v.shape for k, v in workspace.items() if hasattr(v, "shape")})
+        return workspace
+
+    monkeypatch.setattr(harmony_module, "_allocate_clustering_workspace", record)
+    adata = _repeatability_adata(np.float32)
+    rsc.pp.harmony_integrate(
+        adata, ["batch", "fine"], rng=734, n_clusters=300, max_iter_harmony=1
+    )
+    n_blocks, n_tiles = 20, 4 * cp.cuda.Device().attributes["MultiProcessorCount"] + 2
+    (shape,) = shapes
+    assert shape["block_counts"] == (n_blocks + 3, 5 + 37, 300)
+    assert shape["block_cat_offsets"] == (n_blocks + 3,)
+    assert shape["dots_workspace"] == (n_tiles * 64 * 384,)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
