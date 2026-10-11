@@ -158,10 +158,12 @@ def harmony_integrate(
         Only used with ``flavor="harmony2"``.
         Set to ``None`` to disable pruning.
     correction_method
-        Method for the correction step.
-        ``"fast"`` uses a precomputed factorization that avoids the full inversion,
-        which can be faster for datasets with many batches.
-        ``"batched"`` processes all clusters simultaneously (fastest but requires more memory).
+        Method for the correction step. Both solve the ridge regressions in
+        closed form. ``"batched"`` corrects all clusters at once from exact
+        right-hand sides and normalizes in the same pass; its workspace grows
+        with clusters x batches x components. ``"fast"`` corrects one cluster
+        at a time with the least workspace (float right-hand sides, a separate
+        normalization pass, one GPU with ``multi_gpu``).
         With one key, ``None`` automatically selects ``"batched"`` unless its
         workspace would exceed 1 GiB, in which case ``"fast"`` is used.
         Multiple keys always use the exact general-design solve because the
@@ -176,15 +178,16 @@ def harmony_integrate(
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
-        The blocks are drawn once per call, balanced across batches, and
-        visited in a rotating order (the reference implementations redraw
-        random blocks every iteration).
+        The blocks are drawn once per call and visited in a rotating order
+        (the reference implementations redraw random blocks every iteration).
     shuffle_chunk_size
         Cells move between the update blocks in runs of this many neighbouring
         cells of the same batch (joint category with several keys), in random
         order within the batch, so the GPU writes contiguous rows. Every block
-        takes an equal share of each stretch of the batch-sorted cells, so the
-        blocks are balanced across batches. ``1`` moves cells one at a time.
+        takes an equal share of each stretch of about ``n_cells / 384``
+        batch-sorted cells, so batches spanning several stretches are spread
+        evenly; smaller batches are dealt in runs and can be spread less evenly
+        than by independent random blocks (``1`` moves cells one at a time).
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.

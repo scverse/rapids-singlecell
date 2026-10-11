@@ -124,8 +124,8 @@ def harmonize(
     shuffle_chunk_size
         Cells per run of neighbouring cells of the same batch (joint category
         with several keys) that move between update blocks together. Every
-        block takes an equal share of each stretch of the batch-sorted cells.
-        ``1`` moves cells one at a time.
+        block takes an equal share of each stretch of about n_cells / 384
+        batch-sorted cells (see _block_layout). ``1`` moves cells one at a time.
 
     theta
         Weight of the diversity penalty term. A scalar is broadcast to every
@@ -136,8 +136,8 @@ def harmonize(
         Discounting factor on ``theta``. By default, there is no discounting.
 
     correction_method
-        Choose ``fast`` for bounded-memory correction or ``batched`` for
-        batched processing. With one key, ``None`` automatically selects ``batched``
+        ``batched`` corrects all clusters at once from exact right-hand sides,
+        ``fast`` one cluster at a time in bounded memory. With one key, ``None`` automatically selects ``batched``
         unless its workspace would exceed 1 GiB, in which case ``fast`` is
         used. Multiple keys use the exact general-design solve and process
         clusters in workspace-bounded chunks when needed. For multiple keys,
@@ -269,6 +269,14 @@ def harmonize(
     if n_clusters is None:
         n_clusters = int(min(100, n_cells / 30))
         n_clusters = max(n_clusters, 2)
+    if n_covariates > 1:  # fails before any GPU work if a system cannot fit
+        _multi_correction_cluster_chunk_size(
+            n_pcs=Z.shape[1],
+            n_clusters=n_clusters,
+            n_batches=n_batches,
+            n_joint_categories=n_joint_categories,
+            itemsize=Z.dtype.itemsize,
+        )
 
     theta_array = _get_theta_array(theta, n_levels, Z.dtype)
     if tau > 0:
@@ -971,23 +979,15 @@ def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
     gram_ptrs = gram_work.data.ptr + matrix_offsets * cp.uint64(matrix_size * matrix_size * gram.dtype.itemsize)
     rhs_ptrs = rhs_work.data.ptr + matrix_offsets * cp.uint64(matrix_size * n_rhs * rhs.dtype.itemsize)
 
-    if gram.dtype == cp.float32:
-        potrf_batched = cp.cuda.cusolver.spotrfBatched
-        trsm_batched = cp.cuda.cublas.strsmBatched
-        scalar_dtype = np.float32
-    elif gram.dtype == cp.float64:
-        potrf_batched = cp.cuda.cusolver.dpotrfBatched
-        trsm_batched = cp.cuda.cublas.dtrsmBatched
-        scalar_dtype = np.float64
-    else:
-        raise TypeError("Batched Harmony correction requires float32 or float64")
+    if gram.dtype != cp.float64 or rhs.dtype != cp.float64:
+        raise TypeError("The multi-key systems are solved in float64")
 
     stream = cp.cuda.get_current_stream()
     cusolver_handle = cp.cuda.device.get_cusolver_handle()
     cublas_handle = cp.cuda.device.get_cublas_handle()
     cp.cuda.cusolver.setStream(cusolver_handle, stream.ptr)
     cp.cuda.cublas.setStream(cublas_handle, stream.ptr)
-    potrf_batched(
+    cp.cuda.cusolver.dpotrfBatched(
         cusolver_handle,
         cp.cuda.cublas.CUBLAS_FILL_MODE_LOWER,
         matrix_size,
@@ -1000,12 +1000,12 @@ def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
     # A C-contiguous (n, d) RHS is a column-major (d, n) matrix. Two
     # right-side triangular solves therefore produce rhs.T @ inv(gram)
     # directly in the original C-contiguous layout, without transposes.
-    one = np.ones(1, dtype=scalar_dtype)
+    one = np.ones(1, dtype=np.float64)
     for operation in (
         cp.cuda.cublas.CUBLAS_OP_T,
         cp.cuda.cublas.CUBLAS_OP_N,
     ):
-        trsm_batched(
+        cp.cuda.cublas.dtrsmBatched(
             cublas_handle,
             cp.cuda.cublas.CUBLAS_SIDE_RIGHT,
             cp.cuda.cublas.CUBLAS_FILL_MODE_LOWER,
@@ -1036,11 +1036,11 @@ def _multi_correction_cluster_chunk_size(
 ) -> int:
     """Choose a cluster chunk that keeps multi-key scratch below 1 GiB."""
     nb1 = n_batches + 1
-    # Double Gram and RHS with the solver's copies and output, the coefficients,
-    # joint right-hand sides (double) and coefficients, exact joint sums, and
-    # sliced lambda, active mask and joint counts.
+    # Double Gram and RHS with the solver's copies, the coefficients, joint
+    # right-hand sides (double) and coefficients, exact joint sums, and sliced
+    # lambda, active mask and joint counts.
     per_cluster = (
-        8 * (3 * nb1 * nb1 + 3 * nb1 * n_pcs)
+        16 * (nb1 * nb1 + nb1 * n_pcs)
         + itemsize * nb1 * n_pcs
         + n_joint_categories * ((8 + itemsize) * n_pcs + itemsize)
         + 8 * _limbs(itemsize) * n_joint_categories * n_pcs

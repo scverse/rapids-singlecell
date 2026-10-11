@@ -37,7 +37,9 @@ __global__ void initialize_multi_gram_kernel(
          joint += blockDim.x)
         total += count(joint);
     total = block_sum(total);
-    if (threadIdx.x == 0) cluster_gram[0] = total;
+    // A cluster without cells has zero right-hand sides: a unit pivot keeps
+    // its system positive definite (W = 0).
+    if (threadIdx.x == 0) cluster_gram[0] = total > 0 ? total : 1;
 
     for (int batch = threadIdx.x; batch < n_batches; batch += blockDim.x) {
         int row = batch + 1;
@@ -105,12 +107,11 @@ __global__ void add_joint_cross_kernel(
 // Expand joint-category cross-products R_j^T X_j into the regression
 // right-hand sides: row 0 (intercept) sums every joint, row b + 1 the joints
 // containing active category b (in ascending CSR order, deterministic).
-template <typename T>
 __global__ void marginal_from_joint_rhs_kernel(
-    const T* __restrict__ joint_rhs,
+    const double* __restrict__ joint_rhs,
     const int* __restrict__ marginal_joint_offsets,
     const int* __restrict__ marginal_joint_indices,
-    const uint8_t* __restrict__ active, T* __restrict__ rhs, int n_pcs,
+    const uint8_t* __restrict__ active, double* __restrict__ rhs, int n_pcs,
     int n_clusters, int n_batches, int n_joint_categories) {
     int nb1 = n_batches + 1;
     size_t total = (size_t)n_clusters * nb1 * n_pcs;
@@ -123,7 +124,7 @@ __global__ void marginal_from_joint_rhs_kernel(
             return joint_rhs[((size_t)joint * n_clusters + cluster) * n_pcs +
                              pc];
         };
-        T value = T(0);
+        double value = 0;
         if (row == 0) {
             for (int joint = 0; joint < n_joint_categories; ++joint)
                 value += at(joint);

@@ -202,8 +202,8 @@ def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
     np.testing.assert_array_equal(joint_codes, np.array([0, 1, 0]))
 
 
-@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_harmony_multikey_singular_gram_uses_least_squares(dtype):
+def test_harmony_multikey_singular_gram_uses_least_squares():
+    dtype = cp.float64
     gram = cp.asarray(
         [
             [[4.0, 1.0], [1.0, 3.0]],
@@ -229,8 +229,7 @@ def test_harmony_multikey_singular_gram_uses_least_squares(dtype):
     )
 
     assert bool(cp.isfinite(result).all())
-    atol = 1e-5 if dtype == cp.float32 else 1e-12
-    cp.testing.assert_allclose(result, expected, atol=atol, rtol=atol)
+    cp.testing.assert_allclose(result, expected, atol=1e-12, rtol=1e-12)
 
 
 @pytest.mark.parametrize("ridge_lambda", [0.0, -0.1, float("inf"), float("nan")])
@@ -844,6 +843,7 @@ def test_harmony_bfloat16_assignments(n_clusters):
         ("harmony1", 50.0, 20, 0.1, {}),
         ("harmony1", 50.0, 20, 0.1, {"dtype": np.float64}),
         ("harmony1", 300.0, 20, 0.1, {"correction_method": "fast"}),
+        ("harmony1", 50.0, 20, 0.1, {"key": ["batch", "second"]}),
     ],
 )
 def test_harmony_large_theta_stays_finite(
@@ -852,7 +852,13 @@ def test_harmony_large_theta_stays_finite(
     # theta=200 takes float32 penalties of evenly mixed batches to about
     # 0.5**200, far below the smallest float: log-space penalties keep the
     # assignments and the objective finite (sigma=0.02: shifted per row).
-    # harmony1 empties clusters entirely; they get no correction.
+    # harmony1 empties clusters entirely; they get no correction (several
+    # keys: a unit pivot, no least-squares fallback).
+    kwargs = dict(kwargs)
+    key = kwargs.pop("key", "batch")
+    monkeypatch.setattr(
+        cp.linalg, "lstsq", lambda *a, **k: pytest.fail("singular cluster system")
+    )
     objectives = []
     convergent = harmony_module._is_convergent_harmony
     monkeypatch.setattr(
@@ -863,7 +869,7 @@ def test_harmony_large_theta_stays_finite(
     adata = _repeatability_adata(np.float32)
     rsc.pp.harmony_integrate(
         adata,
-        "batch",
+        key,
         flavor=flavor,
         theta=theta,
         sigma=sigma,
@@ -966,15 +972,25 @@ def test_harmony_general_assignment_matches_fused(
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("cells_per_sm", [160, 480])
 @pytest.mark.parametrize(
-    ("dtype", "n_pcs"),
-    [("float32", 50), ("float32", 100), ("float64", 50), ("bfloat16", 50)],
+    ("dtype", "n_pcs", "tolerance"),
+    [
+        ("float32", 50, 1e-6),
+        ("float32", 100, 1e-6),
+        ("float64", 32, 1e-12),
+        ("float64", 50, 1e-12),
+        ("bfloat16", 50, 1e-4),
+    ],
 )
-def test_harmony_fused_tiles_of_several_groups(monkeypatch, dtype, n_pcs):
-    # One block of 160 cells per SM: assignment tiles hold two or three groups
-    # of 64 rows with one or two CTAs per SM (T4, float64: one), so warps run
-    # several groups, with resident (50 PCs) and streamed (100) centroids.
-    n_cells = 160 * cp.cuda.Device().attributes["MultiProcessorCount"]
+def test_harmony_fused_tiles_of_several_groups(
+    monkeypatch, cells_per_sm, dtype, n_pcs, tolerance
+):
+    # One block of 160 cells per SM: tiles of two or three groups of 64 rows
+    # with one or two CTAs per SM (T4, float64: one); 480 per SM: the tiles of
+    # large blocks (three groups, or one with one CTA per SM). Centroids are
+    # resident up to 64 float32 (32 float64) PCs, streamed beyond.
+    n_cells = cells_per_sm * cp.cuda.Device().attributes["MultiProcessorCount"]
     obs = pd.DataFrame(
         {"batch": pd.Categorical(np.arange(n_cells) % 2)},
         index=np.arange(n_cells).astype(str),
@@ -996,7 +1012,7 @@ def test_harmony_fused_tiles_of_several_groups(monkeypatch, dtype, n_pcs):
     fused = run()
     assert run().tobytes() == fused.tobytes()
     monkeypatch.setattr(harmony_module, "_FORCE_GENERAL_ASSIGNMENT", True)
-    assert _get_measure(run(), fused, "L2") < 1e-4
+    assert _get_measure(run(), fused, "L2") < tolerance
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

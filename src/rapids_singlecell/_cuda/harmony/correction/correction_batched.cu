@@ -85,11 +85,11 @@ static void prepare_multi_impl(
     segment_sums(X, R, ldr, n_pcs, n_clusters, seg_start, seg_group, n_seg,
                  bounds, scales, acc, joint_rhs, (long long)n_clusters * n_pcs,
                  n_pcs, stream);
-    marginal_from_joint_rhs_kernel<double>
-        <<<strided_grid((long long)n_clusters * nb1 * n_pcs, BLOCK_DIM_1D),
-           BLOCK_DIM_1D, 0, stream>>>(
-            joint_rhs, marginal_joint_offsets, marginal_joint_indices, active,
-            rhs, n_pcs, n_clusters, n_batches, n_joint_categories);
+    marginal_from_joint_rhs_kernel<<<
+        strided_grid((long long)n_clusters * nb1 * n_pcs, BLOCK_DIM_1D),
+        BLOCK_DIM_1D, 0, stream>>>(joint_rhs, marginal_joint_offsets,
+                                   marginal_joint_indices, active, rhs, n_pcs,
+                                   n_clusters, n_batches, n_joint_categories);
     CUDA_CHECK_LAST_ERROR(marginal_from_joint_rhs_kernel);
 }
 
