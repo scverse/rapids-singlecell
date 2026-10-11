@@ -975,51 +975,52 @@ def test_harmony_bfloat16_falls_back_to_float32():
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize(
-    ("key", "n_pcs", "n_clusters"),
+    ("key", "n_pcs", "n_clusters", "kwargs"),
     [
-        ("batch", 17, 7),
-        (["batch", "second"], 17, 7),
-        ("batch", 3, 128),
-        ("batch", 128, 100),
-        ("batch", 300, 100),
-        (["batch", "second"], 300, 7),
-        ("batch", 1023, 20),
+        ("batch", 17, 7, {}),
+        (["batch", "second"], 17, 7, {}),
+        ("batch", 3, 128, {}),
+        ("batch", 128, 100, {}),
+        ("batch", 300, 100, {}),
+        (["batch", "second"], 300, 7, {}),
+        ("batch", 1023, 20, {}),
+        ("batch", 50, 100, {"sigma": 0.02}),  # each row shifted by its maximum
+        ("batch", 50, 64, {"dtype": np.float64}),
     ],
 )
-def test_harmony_general_assignment_matches_fused(
-    monkeypatch, *, key, n_pcs, n_clusters
+def test_harmony_cluster_blocks_match_fused(
+    monkeypatch, *, key, n_pcs, n_clusters, kwargs
 ):
+    # The cluster-block path (more than 128 clusters) gives the bits of the
+    # single-block one.
     X = np.random.default_rng(3).standard_normal((480, n_pcs)).astype(np.float32)
 
     def run():
         adata = _repeatability_adata(np.float32)
         adata.obsm["X_pca"] = X
         rsc.pp.harmony_integrate(
-            adata, key, rng=734, n_clusters=n_clusters, max_iter_harmony=2
+            adata, key, rng=734, n_clusters=n_clusters, max_iter_harmony=2, **kwargs
         )
         return adata.obsm["X_pca_harmony"]
 
     fused = run()
-    monkeypatch.setattr(harmony_module, "_FORCE_GENERAL_ASSIGNMENT", True)
-    general = run()
-    assert _get_measure(general, fused, "L2") < 1e-4
+    monkeypatch.setattr(harmony_module, "_FORCE_CLUSTER_BLOCKS", True)
+    assert run().tobytes() == fused.tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize("cells_per_sm", [160, 480])
 @pytest.mark.parametrize(
-    ("dtype", "n_pcs", "tolerance"),
+    ("dtype", "n_pcs"),
     [
-        ("float32", 50, 1e-6),
-        ("float32", 100, 1e-6),
-        ("float64", 32, 1e-12),
-        ("float64", 50, 1e-12),
-        ("bfloat16", 50, 1e-4),
+        ("float32", 50),
+        ("float32", 100),
+        ("float64", 32),
+        ("float64", 50),
+        ("bfloat16", 50),
     ],
 )
-def test_harmony_fused_tiles_of_several_groups(
-    monkeypatch, cells_per_sm, dtype, n_pcs, tolerance
-):
+def test_harmony_fused_tiles_of_several_groups(monkeypatch, cells_per_sm, dtype, n_pcs):
     # One block of 160 cells per SM: tiles of two or three groups of 64 rows
     # with one or two CTAs per SM (T4, float64: one); 480 per SM: the tiles of
     # large blocks (three groups, or one with one CTA per SM). Centroids are
@@ -1045,8 +1046,8 @@ def test_harmony_fused_tiles_of_several_groups(
 
     fused = run()
     assert run().tobytes() == fused.tobytes()
-    monkeypatch.setattr(harmony_module, "_FORCE_GENERAL_ASSIGNMENT", True)
-    assert _get_measure(run(), fused, "L2") < tolerance
+    monkeypatch.setattr(harmony_module, "_FORCE_CLUSTER_BLOCKS", True)
+    assert run().tobytes() == fused.tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -1055,7 +1056,7 @@ def test_harmony_fused_tiles_of_several_groups(
     [("batch", "float32"), ("batch", "bfloat16"), (["batch", "second"], "float32")],
 )
 def test_harmony_many_clusters(key, dtype):
-    # More than 128 clusters take the general kernel in two sweeps.
+    # More than 128 clusters go in cluster blocks.
     outputs = []
     for _ in range(2):
         adata = _repeatability_adata(np.float32)
