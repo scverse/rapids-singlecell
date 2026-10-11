@@ -269,14 +269,6 @@ def harmonize(
     if n_clusters is None:
         n_clusters = int(min(100, n_cells / 30))
         n_clusters = max(n_clusters, 2)
-    if n_covariates > 1:  # fails before any GPU work if a system cannot fit
-        _multi_correction_cluster_chunk_size(
-            n_pcs=Z.shape[1],
-            n_clusters=n_clusters,
-            n_batches=n_batches,
-            n_joint_categories=n_joint_categories,
-            itemsize=Z.dtype.itemsize,
-        )
 
     theta_array = _get_theta_array(theta, n_levels, Z.dtype)
     if tau > 0:
@@ -357,40 +349,40 @@ def harmonize(
             stacklevel=4,
         )
         bfloat16 = False
-    # Buffers for all Harmony iterations.
+    # Buffers for all Harmony iterations. With several keys the assignment
+    # tiles take any cells (in joint category order, see the JOINT kernel).
+    tile_groups = n_batches if n_covariates == 1 else 1
     workspace = _allocate_clustering_workspace(
         n_cells,
         n_pcs=Z.shape[1],
         n_clusters=n_clusters,
         n_batches=n_batches,
-        n_groups=n_groups,
-        n_covariates=n_covariates,
+        n_groups=tile_groups,
         n_blocks=n_blocks,
         dtype=Z_norm.dtype,
         bfloat16=bfloat16,
     )
-    if n_covariates > 1:
-        workspace.update(
-            joint_cats=joint_cats,
-            marginal_joint_offsets=marginal_joint_offsets,
-            marginal_joint_indices=marginal_joint_indices,
-            n_first=int(n_levels[0]),
-        )
     chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
     seg_start, seg_group = _segments(host_offsets, unit)
-    workspace["seg_start"] = seg_start
     segments = (seg_start, seg_group, (np.diff(host_offsets) * max_abs).tolist())
+    # Centroid sums need no group cuts.
+    workspace["seg_start"] = (
+        seg_start if n_covariates == 1 else _segments(host_offsets[[0, -1]], unit)[0]
+    )
+    if n_covariates > 1:
+        workspace.update(
+            joint_cats=joint_cats, joints=joint_codes, n_first=int(n_levels[0])
+        )
     # The update blocks are drawn once, before the large arrays exist.
     _draw_blocks(
-        joint_codes if n_covariates > 1 else cats,
-        n_groups=n_groups,
+        cats if n_covariates == 1 else cp.zeros(n_cells, dtype=cp.int32),
+        n_groups=tile_groups,
         n_blocks=n_blocks,
         seed=kernel_seed,
         chunk=chunk,
         unit=unit,
         workspace=workspace,
     )
-    joint_codes = None  # only the block draw reads them
     loop_args = {
         "Pr_b": Pr_b,
         "theta": theta_array,
@@ -451,7 +443,6 @@ def harmonize(
                 Z,
                 R,
                 lambda_kb=lambda_kb,
-                joint_O=workspace["O_joint"],
                 n_batches=n_batches,
                 joint_cats=joint_cats,
                 marginal_joint_offsets=marginal_joint_offsets,
@@ -698,18 +689,17 @@ def _allocate_clustering_workspace(
     n_clusters: int,
     n_batches: int,
     n_groups: int,
-    n_covariates: int,
     n_blocks: int,
     dtype: cp.dtype,
     bfloat16: bool = False,
 ) -> dict:
-    """Buffers of the clustering loop. Groups are batches, or joint categories
-    (with counts in ``O_joint``) for several keys."""
-    counts_bytes = n_blocks * n_groups * n_clusters * 8
+    """Buffers of the clustering loop. The tiles' groups are the batches, or
+    one group for several keys; counts are kept per batch level."""
+    counts_bytes = n_blocks * n_batches * n_clusters * 8
     if counts_bytes > 1 << 30:
         warnings.warn(
             f"Harmony keeps {counts_bytes / 2**30:.1f} GiB of cluster counts for "
-            f"{n_blocks} update blocks x {n_groups} batch groups; a larger "
+            f"{n_blocks} update blocks x {n_batches} batch levels; a larger "
             "block_proportion needs less.",
             UserWarning,
             stacklevel=5,
@@ -731,11 +721,8 @@ def _allocate_clustering_workspace(
         ),
         # Fixed-point counts of each block (the blocks are fixed per harmonize
         # call), of O, and two slots of new block counts.
-        "block_counts": cp.empty((n_blocks + 3, n_groups, n_clusters), dtype=cp.int64),
+        "block_counts": cp.empty((n_blocks + 3, n_batches, n_clusters), dtype=cp.int64),
     }
-    if n_covariates > 1:
-        workspace["O_joint"] = cp.zeros((n_groups, n_clusters), dtype=dtype)
-        workspace["group_penalty"] = cp.empty((n_groups, n_clusters), dtype=dtype)
     # Centroids transposed: padded PCs x 128-cluster blocks.
     stride = -(-n_clusters // _FUSED_MAX_CLUSTERS) * _FUSED_MAX_CLUSTERS
     workspace["y_t"] = cp.empty((-(-n_pcs // 4) * 4, stride), dtype=dtype)
@@ -880,7 +867,6 @@ def _correction_multi(
     R: cp.ndarray,
     *,
     lambda_kb: cp.ndarray,
-    joint_O: cp.ndarray,
     n_batches: int,
     joint_cats: cp.ndarray,
     marginal_joint_offsets: cp.ndarray,
@@ -891,9 +877,9 @@ def _correction_multi(
 ) -> cp.ndarray:
     """Apply the exact general-design correction in bounded cluster chunks.
 
-    Cells are sorted by joint category, ``segments`` are their segments (see
-    _segments, plus the right-hand side bounds) and ``joint_O`` holds the
-    per-joint cluster counts.
+    Cells are sorted by joint category and ``segments`` are their segments
+    (see _segments, plus the right-hand side bounds). The joint counts are the
+    clustering's, recomputed from R per chunk.
     """
     seg_start, seg_group, bounds = segments
     n_pcs, n_clusters = X.shape[1], R.shape[1]
@@ -920,10 +906,22 @@ def _correction_multi(
         joint_rhs = cp.empty((n_joint_categories, k, n_pcs), dtype=cp.float64)
         gram = cp.empty((k, nb1, nb1), dtype=cp.float64)
         rhs = cp.empty((k, nb1, n_pcs), dtype=cp.float64)
+        acc = cp.empty(
+            (n_joint_categories, _limbs(X.dtype.itemsize), k, n_pcs), dtype=cp.int64
+        )
+        joint_O = cp.empty((n_joint_categories, k), dtype=X.dtype)
+        _clustering_cuda.joint_counts(
+            R_chunk,
+            seg_start=seg_start,
+            seg_group=seg_group,
+            out=joint_O,
+            acc=acc,
+            stream=stream,
+        )
         _correction_batched_cuda.prepare_multi(
             X,
             R=R_chunk,
-            joint_O=cp.ascontiguousarray(joint_O[:, chunk]),
+            joint_O=joint_O,
             joint_cats=joint_cats,
             marginal_joint_offsets=marginal_joint_offsets,
             marginal_joint_indices=marginal_joint_indices,
@@ -937,13 +935,11 @@ def _correction_multi(
             rhs=rhs,
             joint_rhs=joint_rhs,
             scales=cp.empty(n_joint_categories, dtype=cp.float64),
-            acc=cp.empty(
-                (n_joint_categories, _limbs(X.dtype.itemsize), k, n_pcs), dtype=cp.int64
-            ),
+            acc=acc,
             stream=stream,
         )
         W_all = _solve_spd_batched(gram, rhs).astype(X.dtype)
-        del gram, rhs, joint_rhs
+        del gram, rhs, joint_rhs, acc, joint_O
         last = i == len(starts) - 1
         _correction_batched_cuda.apply_multi(
             X,
@@ -1035,7 +1031,8 @@ def _multi_correction_cluster_chunk_size(
     n_joint_categories: int,
     itemsize: int,
 ) -> int:
-    """Choose a cluster chunk that keeps multi-key scratch below 1 GiB."""
+    """Choose a cluster chunk that keeps multi-key scratch below 1 GiB (one
+    cluster at a time above that)."""
     nb1 = n_batches + 1
     # Double Gram and RHS with the solver's copies, the coefficients, joint
     # right-hand sides (double) and coefficients, exact joint sums, and sliced
@@ -1047,13 +1044,6 @@ def _multi_correction_cluster_chunk_size(
         + 8 * _limbs(itemsize) * n_joint_categories * n_pcs
         + (itemsize + 1) * n_batches
     )
-    if per_cluster > _CORRECTION_WORKSPACE_LIMIT_BYTES:
-        gib = per_cluster / _CORRECTION_WORKSPACE_LIMIT_BYTES
-        raise MemoryError(
-            "A single multi-key Harmony correction cluster requires "
-            f"approximately {gib:.2f} GiB of scratch space; reduce the "
-            "number of batch levels or embedding dimensions."
-        )
     return max(1, min(n_clusters, _CORRECTION_WORKSPACE_LIMIT_BYTES // per_cluster))
 
 

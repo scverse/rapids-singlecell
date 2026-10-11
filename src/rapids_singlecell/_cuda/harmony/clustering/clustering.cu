@@ -11,7 +11,6 @@
 
 #include "../../nb_types.h"
 
-#include "../scatter/kernels_scatter.cuh"
 #include "../scatter/kernels_scatter_reduce.cuh"
 #include "../segment_gemm.cuh"
 #include "kernels_clustering.cuh"
@@ -104,17 +103,17 @@ struct ClusteringArgs {
     T *E, *O;
     const T *Pr_b, *theta;
     const int* joint_cats;  // several keys: J x n_covariates levels
-    const int *marginal_joint_offsets, *marginal_joint_indices;
-    T* O_joint;        // several keys: counts per joint category
-    T* group_penalty;  // several keys: J x K log penalties
+    const int* joints;      // several keys: each cell's joint category
 
     // Workspace
     T* Y_norm;  // centroids, normalized in place
     int* idx_list;
-    T* penalty;              // batches x K log penalties
-    T* objective_partials;   // n_cells, then objective scratch
-    int* block_cat_offsets;  // n_blocks x groups + 1, then one block's tiles
-    // (n_blocks + 3) x groups x K fixed-point counts: each block's, O's, and
+    T* penalty;             // batches x K log penalties
+    T* objective_partials;  // n_cells, then objective scratch
+    // n_blocks x groups + 1, then one block's tiles; groups are batches, one
+    // with several keys.
+    int* block_cat_offsets;
+    // (n_blocks + 3) x batches x K fixed-point counts: each block's, O's, and
     // two slots of new block counts.
     long long* block_counts;
     const int* seg_start;  // centroid segments (see segment_gemm.cuh)
@@ -197,10 +196,16 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
     // Z pieces: the widest of 16, 8 and 4 bytes dividing a row and Z.
     size_t bits = reinterpret_cast<size_t>(a.Z_norm) | 16 | n_pcs * sizeof(T);
     size_t v = bits & (~bits + 1);
-    auto kernel = blocks    ? fused_assign_kernel<T, RT, sizeof(T), true>
-                  : v == 16 ? fused_assign_kernel<T, RT, 16, false>
-                  : v == 8  ? fused_assign_kernel<T, RT, 8, false>
-                            : fused_assign_kernel<T, RT, sizeof(T), false>;
+    auto pick = [&](auto joint) {
+        constexpr bool J = decltype(joint)::value;
+        return blocks    ? fused_assign_kernel<T, RT, sizeof(T), true, J>
+               : v == 16 ? fused_assign_kernel<T, RT, 16, false, J>
+               : v == 8  ? fused_assign_kernel<T, RT, 8, false, J>
+                         : fused_assign_kernel<T, RT, sizeof(T), false, J>;
+    };
+    auto kernel = pick(std::false_type{});
+    if constexpr (std::is_same_v<RT, T>)  // bfloat16 R needs one key
+        if (a.n_covariates > 1) kernel = pick(std::true_type{});
     long long capacity = (long long)ASSIGN_TILES_PER_SM * n_sm;
     long long granule = FUSED_GROUP;
     int per_sm = 1;
@@ -233,7 +238,7 @@ static void fused_assign_pass(const ClusteringArgs<T>& a, RT* R,
         a.Z_norm, a.y_t, k_stride, penalty, a.idx_list, offsets, tiles,
         n_groups, (int)tile_rows, R, a.objective_partials, ucounts,
         a.dots_workspace, a.col_workspace, term, a.sigma, count_scale, n_pcs,
-        n_clusters);
+        n_clusters, a.joints, a.joint_cats, a.n_covariates);
     CUDA_CHECK_LAST_ERROR(fused_assign_kernel);
 }
 
@@ -272,16 +277,16 @@ static double fused_objective(const ClusteringArgs<T>& a,
 template <typename T, typename RT>
 static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
     int n_sm = device_attribute(cudaDevAttrMultiProcessorCount);
-    // Cells are grouped by batch (one key) or joint category (several keys).
-    // Several keys keep counts per joint category and rebuild the marginal O.
+    // Tiles hold one batch (one key) or any cells of a block, in joint
+    // category order (several keys; see fused_assign_kernel's JOINT). Counts
+    // are per batch level either way.
     bool multi = a.n_covariates > 1;
-    if (multi && (!a.joint_cats || !a.O_joint || !a.marginal_joint_offsets ||
-                  !a.marginal_joint_indices || !a.group_penalty))
+    if (multi && (!a.joint_cats || !a.joints))
         throw std::invalid_argument(
             "fused clustering with several keys needs the joint arrays");
-    int n_groups = multi ? a.n_joint_categories : a.n_batches;
-    T* O_group = multi ? a.O_joint : a.O;
-    const T* group_penalty = multi ? a.group_penalty : a.penalty;
+    if (multi && !std::is_same_v<RT, T>)
+        throw std::invalid_argument("bfloat16 assignments need one batch key");
+    int n_groups = multi ? 1 : a.n_batches;
     int n_blocks = a.n_blocks;
     // Assignment tiles are sized to the block so small blocks still fill the
     // GPU; their tile offsets follow the block's category offsets.
@@ -298,7 +303,7 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         harmony_segments::scale_for_bound((double)a.n_total, y_limbs);
     cudaMemcpyAsync(a.y_scale, &y_scale, sizeof(double), cudaMemcpyHostToDevice,
                     a.stream);
-    int ob_total = n_groups * a.n_clusters;
+    int ob_total = a.n_batches * a.n_clusters;
     int blocks_1d = (ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
     auto stored = [&](int blk) {
         return a.block_counts + (size_t)blk * ob_total;
@@ -311,17 +316,9 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                              long long* clear) {
         update_counts_kernel<T><<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
             total, fresh ? stored(fold) : nullptr, fresh,
-            hold < 0 ? nullptr : stored(hold), clear, scales.count_inv, O_group,
+            hold < 0 ? nullptr : stored(hold), clear, scales.count_inv, a.O,
             ob_total);
         CUDA_CHECK_LAST_ERROR(update_counts_kernel);
-        if (!multi) return;
-        materialize_marginal_from_joint_kernel<T>
-            <<<strided_grid((long long)a.n_batches * a.n_clusters,
-                            BLOCK_DIM_1D),
-               BLOCK_DIM_1D, 0, a.stream>>>(a.O_joint, a.marginal_joint_offsets,
-                                            a.marginal_joint_indices, a.O,
-                                            a.n_batches, a.n_clusters);
-        CUDA_CHECK_LAST_ERROR(materialize_marginal_from_joint_kernel);
     };
     // E (and the penalty unless null) from the full O.
     auto penalty_from_counts = [&](T* penalty) {
@@ -392,14 +389,7 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                           fold < 0 ? nullptr : slot(fold), block(step),
                           slot(step));
             penalty_from_counts(a.penalty);
-            if (multi) {
-                joint_log_penalty_kernel<T>
-                    <<<strided_grid(ob_total, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
-                       a.stream>>>(a.penalty, a.joint_cats, a.n_covariates,
-                                   n_groups, a.n_clusters, a.group_penalty);
-                CUDA_CHECK_LAST_ERROR(joint_log_penalty_kernel);
-            }
-            assign(block(step), group_penalty, slot(step));
+            assign(block(step), a.penalty, slot(step));
         }
         for (int fold = std::max(0, n_blocks - 2); fold < n_blocks; ++fold)
             update_counts(block(fold), slot(fold), -1, nullptr);
@@ -448,21 +438,20 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<double, Device> y_scale,
            gpu_array_c<long long, Device> y_acc,
            std::optional<gpu_array_c<uint16_t, Device>> R_bf16, Ints joint_cats,
-           Ints marginal_joint_offsets, Ints marginal_joint_indices,
-           Opt O_joint, Opt group_penalty, gpu_array_c<T, Device> y_t,
+           Ints joints, gpu_array_c<T, Device> y_t,
            std::optional<gpu_array_c<long long, Device>> col_workspace,
            Opt dots_workspace, bool force_blocks, int n_cells,
            long long n_total, int n_pcs, int n_clusters, int n_batches,
            int n_covariates, int n_joint_categories, int n_first, int n_blocks,
            double sigma, double tol, int max_iter, unsigned int seed,
            bool stabilized, std::uintptr_t stream, bool initialize) {
-            int n_groups = n_covariates > 1 ? n_joint_categories : n_batches;
+            bool multi = n_covariates > 1;
+            int n_groups = multi ? 1 : n_batches;
             size_t max_tiles =
                 (size_t)ASSIGN_TILES_PER_SM *
                     device_attribute(cudaDevAttrMultiProcessorCount) +
                 n_groups + 1;
-            size_t cells = n_cells, kb = (size_t)n_batches * n_clusters,
-                   kg = (size_t)n_groups * n_clusters;
+            size_t cells = n_cells, kb = (size_t)n_batches * n_clusters;
             size_t k_stride = (n_clusters + FUSED_CLUSTER_STRIDE - 1) /
                               FUSED_CLUSTER_STRIDE * FUSED_CLUSTER_STRIDE;
             if (Z_norm.size() < cells * n_pcs ||
@@ -470,11 +459,12 @@ static void register_clustering_loop(nb::module_& m) {
                 idx_list.size() < cells || E.size() < kb || O.size() < kb ||
                 penalty.size() < kb ||
                 Y_norm.size() < (size_t)n_clusters * n_pcs ||
-                (O_joint && O_joint->size() < kg) ||
-                (group_penalty && group_penalty->size() < kg) ||
+                (multi && (!joints || joints->size() < cells || !joint_cats ||
+                           joint_cats->size() <
+                               (size_t)n_joint_categories * n_covariates)) ||
                 block_cat_offsets.size() <
                     (size_t)n_blocks * n_groups + n_groups + 2 ||
-                block_counts.size() < (n_blocks + 3) * kg ||
+                block_counts.size() < (n_blocks + 3) * kb ||
                 objective_partials.size() < cells + 8 ||
                 y_acc.size() < (size_t)3 * n_clusters * n_pcs ||
                 y_t.size() < (size_t)fused_padded_pcs(n_pcs) * k_stride ||
@@ -494,10 +484,7 @@ static void register_clustering_loop(nb::module_& m) {
                                 Pr_b.data(),
                                 theta.data(),
                                 ptr(joint_cats),
-                                ptr(marginal_joint_offsets),
-                                ptr(marginal_joint_indices),
-                                ptr(O_joint),
-                                ptr(group_penalty),
+                                ptr(joints),
                                 Y_norm.data(),
                                 idx_list.data(),
                                 penalty.data(),
@@ -535,14 +522,51 @@ static void register_clustering_loop(nb::module_& m) {
         "Y_norm"_a, "idx_list"_a, "penalty"_a, "objective_partials"_a,
         "block_cat_offsets"_a, "block_counts"_a, "seg_start"_a, "y_scale"_a,
         "y_acc"_a, "R_bf16"_a = nb::none(), "joint_cats"_a = nb::none(),
-        "marginal_joint_offsets"_a = nb::none(),
-        "marginal_joint_indices"_a = nb::none(), "O_joint"_a = nb::none(),
-        "group_penalty"_a = nb::none(), "y_t"_a, "col_workspace"_a = nb::none(),
+        "joints"_a = nb::none(), "y_t"_a, "col_workspace"_a = nb::none(),
         "dots_workspace"_a = nb::none(), "force_blocks"_a = false, "n_cells"_a,
         "n_total"_a = 0, "n_pcs"_a, "n_clusters"_a, "n_batches"_a,
         "n_covariates"_a = 1, "n_joint_categories"_a = 0, "n_first"_a = 0,
         "n_blocks"_a, "sigma"_a, "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0,
         "stabilized"_a, "stream"_a = 0, "initialize"_a = false);
+}
+
+// out (groups x K) = the clustering's counts of R's columns per segment
+// group (see segment_counts_kernel); acc: groups x K scratch.
+template <typename T, typename Device>
+static void register_joint_counts(nb::module_& m) {
+    m.def(
+        "joint_counts",
+        [](gpu_array<const T, Device> R,
+           gpu_array_c<const int, Device> seg_start,
+           gpu_array_c<const int, Device> seg_group, gpu_array_c<T, Device> out,
+           gpu_array_c<long long, Device> acc, long long n_total,
+           std::uintptr_t stream) {
+            int K = (int)R.shape(1), n_seg = (int)seg_group.size();
+            size_t n = out.size();
+            if (R.ndim() != 2 || R.stride(1) != 1 || out.ndim() != 2 ||
+                (int)out.shape(1) != K || acc.size() < n ||
+                seg_start.size() != (size_t)n_seg + 1)
+                throw std::invalid_argument("joint_counts: bad shapes");
+            FixedScales<T> scales(n_total > 0 ? n_total : (long long)R.shape(0),
+                                  0, K);
+            auto s = (cudaStream_t)stream;
+            cudaMemsetAsync(acc.data(), 0, n * sizeof(long long), s);
+            segment_counts_kernel<T>
+                <<<strided_grid((long long)n_seg * K, BLOCK_DIM_1D),
+                   BLOCK_DIM_1D, 0, s>>>(
+                    R.data(), (int)R.stride(0), K, seg_start.data(),
+                    seg_group.data(), n_seg, scales.count,
+                    reinterpret_cast<unsigned long long*>(acc.data()));
+            CUDA_CHECK_LAST_ERROR(segment_counts_kernel);
+            update_counts_kernel<T>
+                <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D,
+                   0, s>>>(acc.data(), nullptr, nullptr, nullptr, nullptr,
+                           scales.count_inv, out.data(), (int)n);
+            CUDA_CHECK_LAST_ERROR(update_counts_kernel);
+        },
+        nb::call_guard<nb::gil_scoped_release>(), "R"_a, nb::kw_only(),
+        "seg_start"_a, "seg_group"_a, "out"_a, "acc"_a, "n_total"_a = 0,
+        "stream"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -684,6 +708,8 @@ void register_bindings(nb::module_& m) {
         "itemsize"_a = 4);
     register_clustering_loop<float, Device>(m);
     register_clustering_loop<double, Device>(m);
+    register_joint_counts<float, Device>(m);
+    register_joint_counts<double, Device>(m);
     register_kmeans<float, Device>(m);
     register_kmeans<double, Device>(m);
 }

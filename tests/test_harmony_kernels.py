@@ -218,37 +218,60 @@ def test_draw_blocks_split_invariant():
     [(7, False, False), (7, True, False), (300, True, False), (300, True, True)],
 )
 @pytest.mark.parametrize("n_pcs", [50, 1023])
-def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_pcs):
+@pytest.mark.parametrize("n_keys", [1, 2])
+def test_fused_initialize_matches_reference(
+    n_clusters, force_blocks, large, n_pcs, n_keys
+):
     # One unpenalized assignment pass over the update blocks: R is the
-    # softmax of -2/sigma (1 - z.y), O its per-batch column sums,
+    # softmax of -2/sigma (1 - z.y), O its column sums per batch level,
     # E = Pr_b x column sums, plus the objective. Large: one block of 384
     # cells per tile slot, so tiles of six row groups, three cluster blocks.
+    # Two keys: 3 x 400 levels, so runs of one joint category are about 2.5
+    # (small) or 240 cells (large).
     if large and n_pcs > 50:
         pytest.skip("the float64 reference is slow")
     rng = cp.random.default_rng(7)
     n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
-    n_batches, sigma = 3, 0.1
+    levels, sigma = [3, 400][:n_keys], 0.1
+    n_batches = sum(levels)
     n_cells, block_size = (384 * 4 * n_sm,) * 2 if large else (3000, 700)
     Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
     Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
     Y = Z[:n_clusters] + 0.1
     Y = (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).astype(cp.float32)
-    cats = cp.sort(rng.integers(0, n_batches, n_cells)).astype(cp.int32)
-    Pr_b = (cp.bincount(cats, minlength=n_batches) / n_cells).astype(cp.float32)
+    # Marginal batch levels per key, cells sorted by joint category.
+    codes = cp.sort(rng.integers(0, 3 * 400, n_cells))
+    joint_ids, joints = cp.unique(codes, return_inverse=True)
+    joints = joints.astype(cp.int32)
+    joint_cats = cp.stack([joint_ids // 400, 3 + joint_ids % 400], axis=1)
+    codes = cp.stack([codes // 400, 3 + codes % 400], axis=1)[:, :n_keys]
+    Pr_b = (cp.bincount(codes.ravel(), minlength=n_batches) / n_cells).astype(
+        cp.float32
+    )
     theta = cp.full(n_batches, 2.0, dtype=cp.float32)
     n_blocks = -(-n_cells // block_size)
-    n_tiles = 4 * n_sm + n_batches + 1
+    n_groups = n_batches if n_keys == 1 else 1  # the tiles' groups
+    n_tiles = 4 * n_sm + n_groups + 1
     idx_list = cp.empty(n_cells, cp.int32)
-    block_cat_offsets = cp.empty(n_blocks * n_batches + n_batches + 2, cp.int32)
+    block_cat_offsets = cp.empty(n_blocks * n_groups + n_groups + 2, cp.int32)
+    joint_args = {}
+    if n_keys > 1:
+        joint_args = {
+            "joint_cats": joint_cats.astype(cp.int32),
+            "joints": joints,
+            "n_covariates": n_keys,
+            "n_joint_categories": len(joint_cats),
+            "n_first": levels[0],
+        }
     _cl.draw_blocks(
-        cats,
+        codes[:, 0] if n_keys == 1 else cp.zeros(n_cells, cp.int32),
         idx_list=idx_list,
         block_cat_offsets=block_cat_offsets,
         idx_list_alt=cp.empty(n_cells, cp.int32),
         sort_keys=cp.empty(n_cells, cp.uint32),
         sort_keys_alt=cp.empty(n_cells, cp.uint32),
         cub_temp=cp.empty(_cl.get_cub_sort_temp_bytes(n_cells=n_cells), cp.uint8),
-        n_groups=n_batches,
+        n_groups=n_groups,
         n_blocks=n_blocks,
         unit=n_cells,
         seed=3,
@@ -286,13 +309,14 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
         max_iter=0,
         stabilized=True,
         initialize=True,
+        **joint_args,
     )
     sim = Z.astype(cp.float64) @ Y.T.astype(cp.float64)
     w = cp.exp(-2 / sigma * (1 - sim))
     R_ref = w / w.sum(1, keepdims=True)
     cp.testing.assert_allclose(R, R_ref, rtol=1e-4, atol=1e-6)
-    O_ref = cp.stack([R_ref[cats == b].sum(0) for b in range(n_batches)])
-    cp.testing.assert_allclose(O, O_ref, rtol=1e-4)
+    O_ref = cp.stack([R_ref[(codes == b).any(1)].sum(0) for b in range(n_batches)])
+    cp.testing.assert_allclose(O, O_ref, rtol=1e-4, atol=1e-6)
     E_ref = Pr_b[:, None].astype(cp.float64) * R_ref.sum(0)[None, :]
     cp.testing.assert_allclose(E, E_ref, rtol=1e-4)
     distance = (R_ref * 2 * (1 - sim)).sum()
