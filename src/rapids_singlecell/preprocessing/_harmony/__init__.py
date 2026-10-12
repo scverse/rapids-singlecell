@@ -674,17 +674,23 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
 def _upload_sorted(
     Z, order: cp.ndarray, bounds: list[int], devices: list[int], *, peer: bool
 ) -> list[cp.ndarray]:
-    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input
-    shards are gathered on the current GPU. Host input chunks holding a GPU's
-    rows are staged in pinned memory by several host threads while the
-    previous chunk is copied, then placed on the GPU (all GPUs at once), so no
-    unsorted device copy is kept."""
+    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input is
+    gathered on its own GPU, the other GPUs' shards first, so only a shard's
+    rows move and that GPU holds one extra shard at a time. Host input chunks
+    holding a GPU's rows are staged in pinned memory by several host threads
+    while the previous chunk is copied, then placed on the GPU (all GPUs at
+    once), so no unsorted device copy is kept."""
     shards = list(itertools.pairwise(bounds))
     if isinstance(Z, cp.ndarray):
-        Z = _copy(Z, order.device.id, peer=peer)
-        return [
-            _copy(Z[order[lo:hi]], d, peer=peer) for d, (lo, hi) in zip(devices, shards)
-        ]
+        source, parts = Z.device.id, [None] * len(devices)
+        with cp.cuda.Device(source):
+            for r in sorted(range(len(devices)), key=lambda r: devices[r] == source):
+                lo, hi = shards[r]  # the temporaries die with the statement
+                parts[r] = _copy(
+                    Z[_copy(order[lo:hi], source, peer=peer)], devices[r], peer=peer
+                )
+            cp.cuda.get_current_stream().synchronize()  # read on other streams
+        return parts
     n, d = Z.shape
     rows = _staging_rows(n, d * Z.itemsize)
     n_chunks = -(-n // rows)
