@@ -1178,10 +1178,11 @@ def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs):
     )
     X = rng.standard_normal((n_cells, n_pcs)) + obs["batch"].to_numpy()[:, None]
 
-    def run(device_input=False, **kwargs):
+    def run(device_input=None, **kwargs):
         adata = ad.AnnData(obs=obs.astype("category"), obsm={"X_pca": X.copy()})
-        if device_input:
-            adata.obsm["X_pca"] = cp.asarray(X)
+        if device_input is not None:  # on that GPU
+            with cp.cuda.Device(device_input):
+                adata.obsm["X_pca"] = cp.asarray(X)
         rsc.pp.harmony_integrate(
             adata,
             key,
@@ -1197,10 +1198,43 @@ def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs):
     one = run()
     assert run(multi_gpu=[0, 1]).tobytes() == one.tobytes()
     assert ranks == [[0, 1]]  # two GPUs really ran
-    assert run(multi_gpu=[0, 1], device_input=True).tobytes() == one.tobytes()
+    for device in (0, 1):
+        assert run(multi_gpu=[0, 1], device_input=device).tobytes() == one.tobytes()
     # Without validated peer copies everything moves through the host.
     monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)
     assert run(multi_gpu=[0, 1]).tobytes() == one.tobytes()
+    assert run(multi_gpu=[0, 1], device_input=1).tobytes() == one.tobytes()
+
+
+@pytest.mark.parametrize("peer", [False, True])
+@pytest.mark.parametrize("source", [0, 1])
+def test_harmony_device_input_is_gathered_on_its_gpu(source, peer):
+    # Device input is gathered on its GPU and only shards move: with pools
+    # limited to one 4 MiB shard (and its index) per GPU, 8 MiB of input on
+    # either GPU reaches GPUs 0 and 1.
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires two GPUs")
+    if peer and not harmony_module._peer_copies_work([0, 1]):
+        pytest.skip("no validated peer copies")
+    with cp.cuda.Device(source):
+        X = cp.random.default_rng(0).standard_normal((4096, 512), dtype=cp.float32)
+    order = cp.asarray(np.random.default_rng(1).permutation(4096))
+    allocator, pool = cp.cuda.get_allocator(), cp.cuda.MemoryPool()
+    cp.cuda.set_allocator(pool.malloc)
+    try:
+        for device in (0, 1):
+            with cp.cuda.Device(device):
+                pool.set_limit(size=X.nbytes * 9 // 16)
+        parts = harmony_module._upload_sorted(
+            X, order, [0, 2048, 4096], [0, 1], peer=peer
+        )
+        assert [part.device.id for part in parts] == [0, 1]
+        expected = cp.asnumpy(X)[cp.asnumpy(order)]
+        np.testing.assert_array_equal(
+            np.concatenate(list(map(cp.asnumpy, parts))), expected
+        )
+    finally:
+        cp.cuda.set_allocator(allocator)
 
 
 def _record_ranks(monkeypatch) -> list:
