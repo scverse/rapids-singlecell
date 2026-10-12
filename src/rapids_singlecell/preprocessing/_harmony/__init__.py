@@ -676,10 +676,11 @@ def _upload_sorted(
 ) -> list[cp.ndarray]:
     """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input is
     gathered on its own GPU, the other GPUs' shards first, so only a shard's
-    rows move and that GPU holds one extra shard at a time. Host input chunks
-    holding a GPU's rows are staged in pinned memory by several host threads
-    while the previous chunk is copied, then placed on the GPU (all GPUs at
-    once), so no unsorted device copy is kept."""
+    rows move and that GPU holds one extra shard at a time. Host input is
+    staged in pinned chunks by several host threads while the previous chunk
+    is copied, then placed on the GPU (all GPUs at once), so no unsorted device
+    copy is kept: one GPU reads the input in order, several GPUs each only
+    their own rows (gathered in input order, from C-ordered input)."""
     shards = list(itertools.pairwise(bounds))
     if isinstance(Z, cp.ndarray):
         source, parts = Z.device.id, [None] * len(devices)
@@ -693,44 +694,44 @@ def _upload_sorted(
         return parts
     n, d = Z.shape
     rows = _staging_rows(n, d * Z.itemsize)
-    n_chunks = -(-n // rows)
     position = cp.empty(n, dtype=cp.int32)
     position[order] = cp.arange(n, dtype=cp.int32)
-    # Sorted positions spanned by each input chunk.
-    chunks = cp.full(n_chunks * rows, position[-1], dtype=cp.int32)
-    chunks[:n] = position
-    chunks = chunks.reshape(n_chunks, rows)
-    first, last = cp.asnumpy(chunks.min(1)), cp.asnumpy(chunks.max(1))
-    del chunks
-    # Destination row per input row; other GPUs' rows go to a spare row.
-    targets = [
-        cp.where((position >= lo) & (position < hi), position - lo, hi - lo)
-        for lo, hi in shards
-    ]
+    # Each GPU's input rows (all of them for one GPU) and their shard rows.
+    sources, targets = [None], [position]
+    if len(shards) > 1:
+        Z = np.ascontiguousarray(Z)  # np.take copies other layouts whole
+        sources, targets = [], []
+        for lo, hi in shards:
+            mine = cp.flatnonzero((position >= lo) & (position < hi))
+            targets.append(position[mine] - lo)
+            sources.append(cp.asnumpy(mine.astype(cp.int32)))
     # The upload threads read them on their own streams.
     cp.cuda.get_current_stream().synchronize()
 
     def upload(rank, fill):
-        lo, hi = shards[rank]
+        (lo, hi), source = shards[rank], sources[rank]
         with cp.cuda.Device(devices[rank]):
             target = _copy(targets[rank], devices[rank], peer=peer)
             stream = cp.cuda.get_current_stream()
-            X = cp.empty((hi - lo + 1, d), dtype=Z.dtype)
+            X = cp.empty((hi - lo, d), dtype=Z.dtype)
             slots = [
                 [_pinned(rows, d, Z.dtype), cp.empty((rows, d), dtype=Z.dtype), None]
                 for _ in range(2)
             ]
-            for i, k in enumerate(np.flatnonzero((last >= lo) & (first < hi))):
+            for i, a in enumerate(range(0, hi - lo, rows)):
                 host, staged, done = slots[i % 2]
                 if done is not None:
                     done.synchronize()  # the slot's previous chunk is placed
-                a, b = k * rows, min(n, (k + 1) * rows)
-                _parallel_copy(fill, host[: b - a], Z[a:b])
+                b = min(hi - lo, a + rows)
+                if source is None:
+                    _parallel_copy(fill, host[: b - a], Z[a:b])
+                else:
+                    _parallel_copy(fill, host[: b - a], Z, source[a:b])
                 staged[: b - a].set(host[: b - a], stream=stream)
                 X[target[a:b]] = staged[: b - a]
                 slots[i % 2][2] = stream.record()
             stream.synchronize()  # the caller reads it on its own stream
-            return X[: hi - lo]
+            return X
 
     with (
         ThreadPoolExecutor(_UPLOAD_THREADS) as fill,
@@ -800,10 +801,25 @@ def _pinned(rows: int, d: int, dtype) -> np.ndarray:
     return np.frombuffer(memory, dtype, rows * d).reshape(rows, d)
 
 
-def _parallel_copy(pool: ThreadPoolExecutor, dst: np.ndarray, src: np.ndarray) -> None:
-    """``dst[...] = src`` by several threads (host memory bound)."""
-    cuts = np.linspace(0, len(src), _UPLOAD_THREADS + 1, dtype=np.int64)
-    list(pool.map(lambda a, b: np.copyto(dst[a:b], src[a:b]), cuts[:-1], cuts[1:]))
+def _parallel_copy(
+    pool: ThreadPoolExecutor,
+    dst: np.ndarray,
+    src: np.ndarray,
+    index: np.ndarray | None = None,
+) -> None:
+    """``dst[...] = src``, or ``src[index]`` for increasing ``index`` into a
+    C-ordered ``src``, by several threads (host memory bound)."""
+    cuts = np.linspace(0, len(dst), _UPLOAD_THREADS + 1, dtype=np.int64)
+
+    def copy(a, b):
+        if index is None:
+            np.copyto(dst[a:b], src[a:b])
+        elif b > a and index[b - 1] - index[a] == b - a - 1:  # consecutive rows
+            np.copyto(dst[a:b], src[index[a] : index[a] + b - a])
+        elif b > a:  # mode="raise" would buffer the output
+            np.take(src, index[a:b], axis=0, out=dst[a:b], mode="clip")
+
+    list(pool.map(copy, cuts[:-1], cuts[1:]))
 
 
 def _download(src: cp.ndarray, out: np.ndarray) -> None:
