@@ -12,8 +12,12 @@ from rapids_singlecell._cuda import (
     _harmony_clustering_cuda as _cl,
 )
 from rapids_singlecell._cuda import (
+    _harmony_correction_batched_cuda as _cbat,
+)
+from rapids_singlecell._cuda import (
     _harmony_correction_cuda as _corr,
 )
+from rapids_singlecell.preprocessing._harmony import _segments
 from rapids_singlecell.preprocessing._harmony._kmeans import _fused_distances
 
 pytestmark = pytest.mark.skipif(
@@ -210,6 +214,38 @@ def test_draw_blocks_split_invariant():
     assert (per_unit == unit // n_blocks).all()
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_group_absmax_is_exact_and_split_invariant(dtype):
+    # Per-group maxima of |X| (bit patterns of the right-hand side bounds):
+    # exact, an empty group stays 0, a stale output is cleared, and the
+    # shards' maxima give the whole's.
+    rng = np.random.default_rng(0)
+    offsets = np.array([0, 3000, 3000, 5000, 9000], dtype=np.int32)
+    X = rng.standard_normal((9000, 7)).astype(dtype)
+    X[4000, 3] = np.finfo(dtype).min
+    X[5000:, 5] = -0.0
+
+    def absmax(lo, hi):
+        out = cp.full((4, 7), 9, dtype=dtype)
+        seg_start, seg_group = _segments(np.clip(offsets, lo, hi) - lo)
+        _cbat.group_absmax(
+            cp.asarray(X[lo:hi]), seg_start=seg_start, seg_group=seg_group, out=out
+        )
+        return cp.asnumpy(out)
+
+    expected = np.stack(
+        [
+            np.abs(X[a:b]).max(0) if b > a else np.zeros(7, dtype)
+            for a, b in zip(offsets[:-1], offsets[1:])
+        ]
+    )
+    whole = absmax(0, 9000)
+    np.testing.assert_array_equal(whole, expected)
+    np.testing.assert_array_equal(
+        np.maximum(absmax(0, 4096), absmax(4096, 9000)), whole
+    )
+
+
 # ---------- fused initialization (assignment kernels) ----------
 
 
@@ -294,7 +330,7 @@ def test_fused_initialize_matches_reference(
         block_cat_offsets=block_cat_offsets,
         block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
         seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
-        y_bound=cp.empty(n_pcs, cp.float64),
+        y_bound=cp.empty(n_pcs, cp.int16),
         y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
         y_t=cp.empty((-(-n_pcs // 4) * 4, stride), cp.float32),
         col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),

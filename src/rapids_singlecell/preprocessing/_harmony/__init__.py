@@ -576,9 +576,10 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
 
 
 def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
-    """Bounds of the exact right-hand side sums (segment_gemm.cuh): n_g
-    max |X_gd| for each group g of the cells (sorted by group, ``offsets`` on
-    the host) and PC d, so no other group or PC coarsens a sum."""
+    """Bounds of the exact right-hand side sums (segment_gemm.cuh): the
+    exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells
+    (sorted by group, ``offsets`` on the host) and PC d, so no other group or
+    PC coarsens a sum."""
     seg_start, seg_group = _segments(offsets)  # any single-group segments
     maxima = cp.empty((len(offsets) - 1, Z.shape[1]), dtype=Z.dtype)
     _correction_batched_cuda.group_absmax(
@@ -594,7 +595,7 @@ def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
             "Input data contains NaN or infinite values. Please handle these "
             "before running harmony_integrate."
         )
-    return bounds
+    return cp.frexp(cp.where(bounds > 0, bounds, 1.0))[1].astype(cp.int16)
 
 
 def _segments(
@@ -734,7 +735,7 @@ def _allocate_clustering_workspace(
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and their scale.
         "y_acc": cp.empty((3, n_clusters, n_pcs), dtype=cp.int64),
-        "y_bound": cp.empty(n_pcs, dtype=cp.float64),
+        "y_bound": cp.empty(n_pcs, dtype=cp.int16),
         "idx_list": cp.empty(n_cells, dtype=cp.int32),
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
         "objective_partials": cp.empty(n_cells + 8, dtype=dtype),

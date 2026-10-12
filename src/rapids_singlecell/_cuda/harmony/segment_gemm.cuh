@@ -25,17 +25,20 @@ namespace harmony_segments {
 
 constexpr int kThreads = 256, kSmemBudget = 48 * 1024, kLimbBits = 30;
 
-// Output (g, k, d) is summed in units of 2^-scale_exp(bound[g D + d]): the
-// bound (finite, the same on every shard) is at least the sum over group g
-// of |A_id| R_ik for every k, and below 2^e. N_total for the centroids
-// (|Z| <= 1, R in [0, 1]); n_g max |X_gd| over the cells of group g for the
-// right-hand sides, so no other group or PC coarsens them. The top limb stays
-// below 2^62; one unit of the last limb is 2^-61, 2^-91, 2^-121 of 2^e for
-// 1, 2, 3 limbs.
-__host__ __device__ inline int scale_exp(double bound, int limbs) {
+// Output (g, k, d) is summed in units of 2^-scale_exp(bound_exp[g D + d]):
+// bound_exp (the same on every shard) is the exponent e of a bound below 2^e
+// on the sum over group g of |A_id| R_ik for every k (bound_exponent): N_total
+// for the centroids (|Z| <= 1, R in [0, 1]); n_g max |X_gd| over the cells of
+// group g for the right-hand sides, so no other group or PC coarsens them. The
+// top limb stays below 2^62; one unit of the last limb is 2^-61, 2^-91,
+// 2^-121 of 2^e for 1, 2, 3 limbs.
+inline int bound_exponent(double bound) {
     int e;
-    frexp(bound > 0 ? bound : 1.0, &e);
-    return 61 - e + kLimbBits * (limbs - 1);
+    std::frexp(bound > 0 ? bound : 1.0, &e);
+    return e;
+}
+__host__ __device__ inline int scale_exp(int bound_exp, int limbs) {
+    return 61 - bound_exp + kLimbBits * (limbs - 1);
 }
 
 struct Plan {
@@ -168,7 +171,7 @@ __global__ void __launch_bounds__(kThreads, 2)
     segment_kernel(const T* __restrict__ A, const RT* __restrict__ R, int D,
                    int K, int ldr, const int* __restrict__ seg_start,
                    const int* __restrict__ seg_group, int n_seg,
-                   const double* __restrict__ bound,
+                   const short* __restrict__ bound_exp,
                    unsigned long long* __restrict__ acc, int limbs, Plan p) {
     extern __shared__ __align__(16) char smem[];
     const int d0 = blockIdx.y / p.n_ky * p.dgt * TD;
@@ -240,7 +243,7 @@ __global__ void __launch_bounds__(kThreads, 2)
     __syncthreads();
 
     const int g = seg_group ? seg_group[blockIdx.x] : 0;
-    const double* bg = bound + (size_t)g * D + d0;  // this tile's columns
+    const short* bg = bound_exp + (size_t)g * D + d0;  // this tile's columns
     const size_t ls = (size_t)K * D;
     unsigned long long* out = acc + g * limbs * ls + (size_t)k0 * D + d0;
     auto put = [&](T v, int d, int k) {
@@ -273,7 +276,7 @@ __global__ void __launch_bounds__(kThreads, 2)
 template <typename T>
 __global__ void finalize_kernel(const long long* __restrict__ acc, int n_groups,
                                 int D, int K, int limbs,
-                                const double* __restrict__ bound,
+                                const short* __restrict__ bound_exp,
                                 T* __restrict__ out, long long out_group_stride,
                                 int ld_out) {
     const long long kd = (long long)K * D;
@@ -285,7 +288,7 @@ __global__ void finalize_kernel(const long long* __restrict__ acc, int n_groups,
         for (int l = 0; l < limbs; ++l)
             v = ldexp(v, kLimbBits) + (double)acc[(g * limbs + l) * kd + e];
         out[g * out_group_stride + e / D * ld_out + e % D] =
-            T(ldexp(v, -scale_exp(bound[g * D + e % D], limbs)));
+            T(ldexp(v, -scale_exp(bound_exp[(size_t)g * D + e % D], limbs)));
     }
 }
 
@@ -294,15 +297,15 @@ __global__ void finalize_kernel(const long long* __restrict__ acc, int n_groups,
 // acc += fixed point of sum_{i in group g} A_i^T R_i; acc: n_groups x limbs x
 // K x D int64 ([g][l][k][d]), zeroed by the caller, summed as int64 across
 // shards; value = sum_l acc[g][l][k][d] 2^(30 (limbs - 1 - l)) /
-// 2^scale_exp(bound[g][d]). A, R: rows seg_start[0] .. seg_start[n_seg] of
+// 2^scale_exp(bound_exp[g][d]). A, R: rows seg_start[0] .. seg_start[n_seg] of
 // this shard; R(i, k) = R[i ldr + k] (ldr >= K, the bytes between rows
 // readable). seg_start (n_seg + 1, local rows), seg_group (n_seg; null: group
-// 0), bound (n_groups x D): device pointers. Sums in T (R converted to T),
+// 0), bound_exp (n_groups x D): device pointers. Sums in T (R converted to T),
 // finite inputs, limbs in [1, 3]. Stream-ordered, no allocation, no sync.
 template <typename T, typename RT>
 cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
                         const int* seg_start, const int* seg_group, int n_seg,
-                        const double* bound, long long* acc, int limbs,
+                        const short* bound_exp, long long* acc, int limbs,
                         cudaStream_t s) {
     if (D < 1 || K < 1 || ldr < K || limbs < 1 || limbs > 3)
         return cudaErrorInvalidValue;
@@ -325,7 +328,7 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
             cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, p.smem);
         kernel<<<dim3(n_seg, p.n_dy * p.n_ky), kThreads, p.smem, s>>>(
-            A, R, D, K, ldr, seg_start, seg_group, n_seg, bound,
+            A, R, D, K, ldr, seg_start, seg_group, n_seg, bound_exp,
             reinterpret_cast<unsigned long long*>(acc), limbs, p);
         return cudaGetLastError();
     };
@@ -346,14 +349,14 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
 // out_group_stride = D, ld_out = n_batches D.
 template <typename T>
 cudaError_t finalize_rtz(const long long* acc, int n_groups, int D, int K,
-                         int limbs, const double* bound, T* out,
+                         int limbs, const short* bound_exp, T* out,
                          long long out_group_stride, int ld_out,
                          cudaStream_t s) {
     const long long total = (long long)n_groups * K * D;
     if (total <= 0) return cudaSuccess;
     const int blocks = (int)std::min<long long>((total + 255) / 256, 4096);
     detail::finalize_kernel<T><<<blocks, 256, 0, s>>>(
-        acc, n_groups, D, K, limbs, bound, out, out_group_stride, ld_out);
+        acc, n_groups, D, K, limbs, bound_exp, out, out_group_stride, ld_out);
     return cudaGetLastError();
 }
 
