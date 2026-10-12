@@ -1498,12 +1498,13 @@ def test_harmony_two_ranks_on_one_gpu(monkeypatch, key, n_pcs, dtype, n_clusters
             harmony_module, "_multi_correction_cluster_chunk_size", lambda **_: 2
         )
         assert run([0, 0]).tobytes() == run([0]).tobytes()
-    # Without peer copies (pinned host send slots), from input sorted by batch
-    # in several upload chunks, so that each shard skips the other's chunks.
+    # Without peer copies (pinned host send slots), in several upload chunks
+    # per shard: scattered rows, and runs of rows from input sorted by batch.
     monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)
     monkeypatch.setattr(
         harmony_module, "_UPLOAD_BYTES", 40 * adata.obsm["X_pca"][0].nbytes
     )
+    assert run([0, 0]).tobytes() == run([0]).tobytes()
     by_batch = adata[np.argsort(adata.obs["batch"].to_numpy(), kind="stable")].copy()
     assert run([0, 0], by_batch).tobytes() == run([0], by_batch).tobytes()
     # The last batch sorts into the last shard.
@@ -1511,6 +1512,30 @@ def test_harmony_two_ranks_on_one_gpu(monkeypatch, key, n_pcs, dtype, n_clusters
     X[adata.obs["batch"].to_numpy() == 4, 0] = np.nan
     with pytest.raises(ValueError, match="NaN or infinite"):
         run([0, 0])
+
+
+@pytest.mark.parametrize("layout", ["C", "F"])
+def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout):
+    # Several GPUs stage only their own input rows (runs and scattered rows),
+    # so every row crosses the host once.
+    X = np.random.default_rng(0).standard_normal((1000, 8)).astype(np.float32)
+    order = np.concatenate(
+        [np.arange(500, 1000), np.random.default_rng(1).permutation(500)]
+    )
+    staged, copy = [], harmony_module._parallel_copy
+    monkeypatch.setattr(
+        harmony_module,
+        "_parallel_copy",
+        lambda pool, dst, *a: staged.append(len(dst)) or copy(pool, dst, *a),
+    )
+    monkeypatch.setattr(harmony_module, "_UPLOAD_BYTES", 40 * X[0].nbytes)
+    bounds = [0, 300, 650, 1000]
+    parts = harmony_module._upload_sorted(
+        np.asarray(X, order=layout), cp.asarray(order), bounds, [0, 0, 0], peer=False
+    )
+    assert sum(staged) == len(X)
+    for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
+        np.testing.assert_array_equal(cp.asnumpy(part), X[order[lo:hi]])
 
 
 def test_harmonize_failure_joins_the_output_prefault(monkeypatch):
@@ -1597,7 +1622,7 @@ def test_harmony_device_input_shards_hold_only_their_rows():
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 def test_harmony_threads_wait_for_the_callers_stream(monkeypatch):
     # The caller works on a non-blocking stream that a sleeping host callback
-    # holds up before the upload targets and the centroids are written: the
+    # holds up before the cell order and the centroids are written: the
     # upload and GPU threads, on their own streams, must still read them. A
     # memory pool keeps cudaFree from synchronizing the device, which would
     # hide a missing wait.
@@ -1632,10 +1657,15 @@ def test_harmony_threads_wait_for_the_callers_stream(monkeypatch):
     cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
     try:
         run(rng.standard_normal(X.shape).astype(np.float32))  # pools hold other rows
-        where, centroids = cp.where, harmony_module._kmeans_centroids
+        upload, centroids = (
+            harmony_module._upload_sorted,
+            harmony_module._kmeans_centroids,
+        )
         with monkeypatch.context() as m:
             m.setattr(
-                cp, "where", lambda *a: late(where(*a)) if len(a) == 3 else where(*a)
+                harmony_module,
+                "_upload_sorted",
+                lambda Z, order, *a, **k: upload(Z, late(order), *a, **k),
             )
             m.setattr(
                 harmony_module,
