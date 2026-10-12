@@ -44,7 +44,7 @@ _KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
 _FORCE_CLUSTER_BLOCKS = False
 _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
 _UPLOAD_THREADS = 8
-_COMM_VALUES = 1 << 22  # int64 values per exchange slot; larger sums go in pieces
+_COMM_VALUES = 1 << 22  # int64 values per exchange; larger sums take several
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
 _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
 
