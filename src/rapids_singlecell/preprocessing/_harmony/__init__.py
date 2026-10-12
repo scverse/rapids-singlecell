@@ -350,7 +350,7 @@ def harmonize(
             "correction_method='original' is deprecated and will be removed in "
             f"a future release. {replacement_message}",
             FutureWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
         correction_method = replacement
     if n_covariates > 1:
@@ -359,7 +359,7 @@ def harmonize(
                 f"correction_method={correction_method!r} is ignored when multiple "
                 "batch keys are provided; using the exact general-design correction.",
                 UserWarning,
-                stacklevel=4,
+                stacklevel=5,
             )
         correction_method = "batched"  # several keys: the multi-key solve
 
@@ -387,7 +387,7 @@ def harmonize(
             "dtype='bfloat16' needs one batch key and the batched correction; "
             "using float32 assignments instead (twice the assignment memory).",
             UserWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
         bfloat16 = False
     counts_bytes = n_blocks * n_batches * n_clusters * 8  # every GPU keeps them
@@ -397,7 +397,7 @@ def harmonize(
             f"{n_blocks} update blocks x {n_batches} batch levels; a larger "
             "block_proportion needs less.",
             UserWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
     devices = devices or [cp.cuda.Device().id]
     if len(devices) > 1 and correction_method != "batched":
@@ -405,7 +405,7 @@ def harmonize(
             "The fast correction runs on one GPU (it is also chosen when the "
             "batched correction's workspace would exceed 1 GiB).",
             UserWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
         devices = devices[:1]
     # Shards: contiguous runs of the sorted cells, one per GPU, cut at
@@ -430,6 +430,10 @@ def harmonize(
         rng=rng,
         peer=peer,
     )
+    # Each GPU's sorted groups: one key drops them after its block draw,
+    # several keys keep them as their cells' joint categories.
+    shard_groups = [groups[lo:hi] for lo, hi in itertools.pairwise(bounds)]
+    del groups
     if correction_method != "fast":  # the only later reader
         cats = cell_indices = None
     comm = None
@@ -463,6 +467,7 @@ def harmonize(
             codes = {key: local(value) for key, value in codes.items()}
 
         X = parts[rank]
+        mine, shard_groups[rank] = local(shard_groups[rank]), None
         Z_norm = _normalize_cp(X)
         seg_start, seg_group = _segments(host_offsets, unit, lo, hi)
         segments = (seg_start, seg_group, cp.asarray(rhs_bounds))
@@ -491,15 +496,14 @@ def harmonize(
             }
             workspace.update(
                 joint_cats=joint["joint_cats"],
-                joints=local(groups[lo:hi]),
+                # a view would keep every cell's groups on this GPU
+                joints=mine if mine.base is None else mine.copy(),
                 n_first=int(n_levels[0]),
             )
         workspace["Y_norm"][...] = local(Y_norm)
         # The update blocks are drawn once, before the large arrays exist.
         _draw_blocks(
-            local(groups[lo:hi])
-            if n_covariates == 1
-            else cp.zeros(hi - lo, dtype=cp.int32),
+            mine if n_covariates == 1 else cp.zeros(hi - lo, dtype=cp.int32),
             n_groups=tile_groups,
             n_blocks=n_blocks,
             seed=kernel_seed,
@@ -508,6 +512,7 @@ def harmonize(
             first=lo,
             workspace=workspace,
         )
+        del mine
         sums = {"comm": comm.handle if comm else 0, "rank": rank}
         loop_args = {
             "Pr_b": local(Pr_b),
