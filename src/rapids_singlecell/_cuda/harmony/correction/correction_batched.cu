@@ -37,13 +37,13 @@ __global__ void group_absmax_kernel(const T* X, int D, const int* seg_start,
 
 // out[g * group_stride + k * ld_out + d] = sum over the cells of group g of
 // R_ik X_id (R row stride ldr), exact over the segments (segment_gemm.cuh) in
-// 1 (float32) or 2 limbs of 30 bits; bounds (n_groups x n_pcs) >= n_g
-// max|X_gd|.
+// 1 (float32) or 2 limbs of 30 bits; bounds (n_groups x n_pcs): exponents of
+// n_g max|X_gd| (segment_gemm.cuh).
 template <typename T, typename RT, typename OT>
 static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
                          int n_clusters, const int* seg_start,
                          const int* seg_group, int n_seg, int n_groups,
-                         const double* bounds, long long* acc, OT* out,
+                         const short* bounds, long long* acc, OT* out,
                          long long group_stride, int ld_out,
                          cudaStream_t stream) {
     int limbs = sizeof(T) == 4 ? 1 : 2;
@@ -71,7 +71,7 @@ static void prepare_multi_impl(
     const int* marginal_joint_offsets, const int* marginal_joint_indices,
     const T* lambda_kb, const uint8_t* active, int n_pcs, int n_clusters,
     int n_batches, int n_covariates, const int* seg_start, const int* seg_group,
-    int n_seg, int n_joint_categories, const double* bounds, double* gram,
+    int n_seg, int n_joint_categories, const short* bounds, double* gram,
     double* rhs, double* joint_rhs, long long* acc, cudaStream_t stream) {
     int nb1 = n_batches + 1;
     cudaMemsetAsync(gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double),
@@ -134,16 +134,17 @@ static void apply_multi_impl(const T* X, const T* R, int ldr, const T* W_all,
 
 // Batched correction of cells sorted by batch, all clusters at once. The
 // right-hand sides S_b = R_b^T X_b are exact sums over segments
-// (segment_gemm.cuh; bounds[b][d] >= n_b max|X_bd|), the coefficients the
-// closed form of ridge_coefficients_kernel; Z = X - R_i W[batch] is applied row
-// by row and normalized on request (apply_rows.cuh), so results do not depend
-// on how the cells are split. S and W are (n_clusters, n_batches, n_pcs).
+// (segment_gemm.cuh; bounds[b][d]: exponent of n_b max|X_bd|), the coefficients
+// the closed form of ridge_coefficients_kernel; Z = X - R_i W[batch] is applied
+// row by row and normalized on request (apply_rows.cuh), so results do not
+// depend on how the cells are split. S and W are (n_clusters, n_batches,
+// n_pcs).
 template <typename T, typename RT>
 static void correction_batched_impl(const T* X, const RT* R, const T* O,
                                     const T* lambda_kb, int n_pcs,
                                     int n_clusters, const int* seg_start,
                                     const int* seg_group, int n_seg,
-                                    int n_batches, const double* bounds, T* Z,
+                                    int n_batches, const short* bounds, T* Z,
                                     T* S, T* W, long long* rhs_acc,
                                     bool normalize, cudaStream_t stream) {
     long long s_cluster = (long long)n_batches * n_pcs;
@@ -201,7 +202,7 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const T, Device> lambda_kb,
            gpu_array_c<const int, Device> seg_start,
            gpu_array_c<const int, Device> seg_group,
-           gpu_array_c<const double, Device> bounds,
+           gpu_array_c<const short, Device> bounds,
            // workspace
            gpu_array_c<T, Device> Z, gpu_array_c<T, Device> S,
            gpu_array_c<T, Device> W, gpu_array_c<long long, Device> rhs_acc,
@@ -243,7 +244,7 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const uint8_t, Device> active, int n_batches,
            gpu_array_c<const int, Device> seg_start,
            gpu_array_c<const int, Device> seg_group,
-           gpu_array_c<const double, Device> bounds,
+           gpu_array_c<const short, Device> bounds,
            gpu_array_c<double, Device> gram, gpu_array_c<double, Device> rhs,
            gpu_array_c<double, Device> joint_rhs,
            gpu_array_c<long long, Device> acc, std::uintptr_t stream) {

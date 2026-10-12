@@ -118,7 +118,7 @@ struct ClusteringArgs {
     long long* block_counts;
     const int* seg_start;  // centroid segments (see segment_gemm.cuh)
     int n_seg;
-    double* y_bound;           // centroid sum bounds (n_pcs)
+    short* y_bound;            // centroid sum bound exponents (n_pcs)
     long long* y_acc;          // centroid sums: limbs x K x D
     T* y_t;                    // centroids transposed (transpose_centroids)
     long long* col_workspace;  // cluster blocks: per-warp column sums
@@ -299,8 +299,9 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
     // Centroid sums: 2 (float32) or 3 limbs of 30 bits; |Z_norm|, R <= 1.
     int y_limbs = sizeof(T) == 4 ? 2 : 3;
     size_t kd = (size_t)a.n_clusters * a.n_pcs;
-    std::vector<double> y_bound(a.n_pcs, (double)a.n_total);
-    cudaMemcpyAsync(a.y_bound, y_bound.data(), a.n_pcs * sizeof(double),
+    std::vector<short> y_bound(
+        a.n_pcs, (short)harmony_segments::bound_exponent((double)a.n_total));
+    cudaMemcpyAsync(a.y_bound, y_bound.data(), a.n_pcs * sizeof(short),
                     cudaMemcpyHostToDevice, a.stream);
     int ob_total = a.n_batches * a.n_clusters;
     int blocks_1d = (ob_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
@@ -434,7 +435,7 @@ static void register_clustering_loop(nb::module_& m) {
            gpu_array_c<int, Device> block_cat_offsets,
            gpu_array_c<long long, Device> block_counts,
            gpu_array_c<const int, Device> seg_start,
-           gpu_array_c<double, Device> y_bound,
+           gpu_array_c<short, Device> y_bound,
            gpu_array_c<long long, Device> y_acc,
            std::optional<gpu_array_c<uint16_t, Device>> R_bf16, Ints joint_cats,
            Ints joints, gpu_array_c<T, Device> y_t,

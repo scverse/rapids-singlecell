@@ -276,12 +276,14 @@ __global__ void penalty_from_counts_kernel(const T* O, const T* Pr_b,
     }
 }
 
-// One CTA per assignment tile (cells of one category within the block). Each
-// warp holds FUSED_ROWS cells of a group and each lane four consecutive
-// clusters: similarities to the normalized centroids, penalized soft
-// assignment written to R in place, and the cell's distance + entropy
-// objective term. The tile's new column sums (fixed point) are added to its
-// group's `counts`; integer atomics are exact, so the order does not matter.
+// One CTA per assignment tile (cells of one batch within the block; several
+// keys: any cells of the block, see JOINT below). Each warp holds FUSED_ROWS
+// cells of a group and each lane four consecutive clusters: similarities to
+// the normalized centroids, penalized soft assignment written to R in place,
+// and the cell's distance + entropy objective term. The new column sums
+// (fixed point) are added to the counts of the batch (several keys: of each
+// level of a joint run); integer atomics are exact, so the order does not
+// matter.
 constexpr int FUSED_ROWS = 8;
 constexpr int FUSED_CLUSTER_STRIDE = 32 * FUSED_MAX_CLUSTER_SLOTS;
 constexpr int FUSED_GROUP = FUSED_THREADS / 32 * FUSED_ROWS;

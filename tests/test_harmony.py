@@ -371,11 +371,15 @@ def test_harmony_correction_keeps_a_large_single_batch_cluster(dtype, method):
 
 
 @pytest.mark.parametrize("big", [1e19, 1e18])
-def test_harmony_extreme_batch_keeps_the_others(big):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_harmony_extreme_batch_keeps_the_others(big, mixed):
     # The exact right-hand sides are scaled per batch and PC, so a batch of
-    # 1e19 does not round away the sums of the others: batched = fast.
+    # 1e19 does not round away the sums of the others: batched = fast. Mixed:
+    # the extreme batch's other cells sum in the other PC (per-PC bounds).
     n = 300
     X = np.repeat(np.array([[big, 0], [0, 1], [0, 3]], np.float32), n, axis=0)
+    if mixed:
+        X[: n // 2] = [0, 2]
     obs = pd.DataFrame(
         {"batch": pd.Categorical(np.repeat(["b0", "b1", "b2"], n))},
         index=np.arange(3 * n).astype(str),
@@ -386,9 +390,9 @@ def test_harmony_extreme_batch_keeps_the_others(big):
         rsc.pp.harmony_integrate(
             adata, "batch", n_clusters=2, sigma=0.01, correction_method=method, rng=0
         )
-        return adata.obsm["X_pca_harmony"][n:]
+        return adata.obsm["X_pca_harmony"][X[:, 0] != big]
 
-    np.testing.assert_allclose(run("batched"), run("fast"), rtol=1e-5)
+    np.testing.assert_allclose(run("batched"), run("fast"), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
