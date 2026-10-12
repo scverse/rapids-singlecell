@@ -1281,6 +1281,26 @@ def test_harmony_two_ranks_on_one_gpu(monkeypatch, key, n_pcs, dtype, n_clusters
         run([0, 0])
 
 
+def test_harmonize_failure_joins_the_output_prefault(monkeypatch):
+    # The thread zeroing `out` is joined when harmonize raises too, so it
+    # never writes the caller's array afterwards.
+    class Late(np.ndarray):
+        def fill(self, value):
+            time.sleep(0.2)
+            super().fill(value)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("upload")
+
+    adata = _repeatability_adata(np.float32)
+    X = adata.obsm["X_pca"]
+    out = np.ones_like(X).view(Late)
+    monkeypatch.setattr(harmony_module, "_upload_sorted", fail)
+    with pytest.raises(RuntimeError, match="upload"):
+        harmony_module.harmonize(X, adata.obs, "batch", out=out)
+    assert not out.any()
+
+
 def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch):
     # An error on the second GPU reaches the caller, not the first GPU's
     # 'another GPU failed'.

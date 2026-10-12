@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import itertools
 import math
 import threading
@@ -54,6 +55,31 @@ _STOPPING_HARMONY2 = (4, 1e-3, 1e-2)
 _STOPPING_HARMONY1 = (200, 1e-5, 1e-4)
 
 
+def _prefaulted(func):
+    """Zero the host output ``out`` in a thread while ``func`` runs (copying
+    into touched pages is about twice as fast as into a fresh allocation) and
+    join it before the call returns or raises, so it never writes ``out``
+    afterwards. An output sharing memory with the host input is left alone:
+    the input is read later."""
+
+    @functools.wraps(func)
+    def wrapper(Z, *args, out=None, **kwargs):
+        prefault = None
+        if out is not None and not (
+            isinstance(Z, np.ndarray) and np.may_share_memory(out, Z)
+        ):
+            prefault = threading.Thread(target=out.fill, args=(0,), daemon=True)
+            prefault.start()
+        try:
+            return func(Z, *args, out=out, _prefault=prefault, **kwargs)
+        finally:
+            if prefault is not None:
+                prefault.join()
+
+    return wrapper
+
+
+@_prefaulted
 def harmonize(
     Z: cp.array,
     batch_mat: pd.DataFrame,
@@ -81,6 +107,7 @@ def harmonize(
     bfloat16: bool = False,
     devices: list[int] | None = None,
     out: np.ndarray | None = None,
+    _prefault: threading.Thread | None = None,
 ) -> cp.ndarray | np.ndarray:
     """
     Integrate data using Harmony algorithm.
@@ -191,7 +218,8 @@ def harmonize(
         correction and the host output ``out``.
 
     out
-        Host array receiving the corrected embedding (then returned).
+        Host array receiving the corrected embedding (then returned). It is
+        zeroed in a thread while the GPUs work, also when the call fails.
 
     Returns
     -------
@@ -222,15 +250,6 @@ def harmonize(
     n_cells = Z.shape[0]
 
     rng = np.random.default_rng(rng)
-    # Fault in the host output while the GPUs work; copying into touched pages
-    # is about twice as fast as into a fresh allocation. An output sharing
-    # memory with the host input is left alone: the input is read later.
-    prefault = None
-    if out is not None and not (
-        isinstance(Z, np.ndarray) and np.may_share_memory(out, Z)
-    ):
-        prefault = threading.Thread(target=out.fill, args=(0,), daemon=True)
-        prefault.start()
     # Process batch information
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates = int(n_levels.size)
@@ -626,8 +645,8 @@ def harmonize(
             "Harmony did not converge. Consider increasing the number of iterations"
         )
     parts.clear()  # free the input before the output
-    if prefault is not None:
-        prefault.join()
+    if _prefault is not None:  # see _prefaulted
+        _prefault.join()
     if n_ranks > 1:
         shards = [r[0] for r in results]
         del results  # _write_shards releases the shards as it goes
