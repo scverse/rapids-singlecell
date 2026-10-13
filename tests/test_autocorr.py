@@ -4,8 +4,10 @@ from pathlib import Path
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import pytest
-from anndata import read_h5ad
+from anndata import AnnData, read_h5ad
+from cupyx.scipy import sparse as sparse_gpu
 from scipy import sparse, stats
 
 from rapids_singlecell.gr import spatial_autocorr
@@ -244,37 +246,92 @@ def test_autocorr_multi_gpu_odd_perms(mode, n_perms):
     assert "pval_sim" in df.columns
 
 
-@pytest.mark.parametrize("mode", ["moran", "geary"])
-@pytest.mark.parametrize("n_perms", [49, 50, 51, 99, 100, 101])
-@pytest.mark.parametrize("use_sparse", [True, False])
-def test_autocorr_permutation_shape(mode, n_perms, use_sparse):
-    """Test that permutation arrays have exact correct shape for any n_perms."""
-    from cupyx.scipy import sparse as gpu_sparse
-
-    from rapids_singlecell.squidpy_gpu._gearysc import _gearys_C_cupy
-    from rapids_singlecell.squidpy_gpu._moransi import _morans_I_cupy
-
-    # Create small test data
-    np.random.seed(42)
-    n_cells, n_genes = 50, 10
-    X = np.random.rand(n_cells, n_genes).astype(np.float64)
-
-    if use_sparse:
-        data = gpu_sparse.csr_matrix(cp.array(X))
-    else:
-        data = cp.array(X)
-
-    # Create simple adjacency matrix
-    adj = gpu_sparse.random(n_cells, n_cells, density=0.1, format="csr", dtype=np.float64)
-    adj = adj + adj.T  # Make symmetric
-
+def _reference(x, w, mode):
+    """Moran's I / Geary's C of every column of x under weights w (NumPy, float64)."""
+    n = x.shape[0]
     if mode == "moran":
-        _, perms = _morans_I_cupy(data, adj, n_permutations=n_perms)
-    else:
-        _, perms = _gearys_C_cupy(data, adj, n_permutations=n_perms)
+        xc = x - x.mean(axis=0)
+        return (xc * (w @ xc)).sum(axis=0) / (xc * xc).sum(axis=0)
+    rows, cols = w.nonzero()
+    diff = x[rows] - x[cols]
+    num = (np.asarray(w[rows, cols]).ravel()[:, None] * diff * diff).sum(axis=0)
+    ss = ((x - x.mean(axis=0)) ** 2).sum(axis=0)
+    return (n - 1) * num / (2 * w.sum() * ss)
 
-    # Verify exact shape
-    assert perms.shape == (n_perms, n_genes), f"Expected ({n_perms}, {n_genes}), got {perms.shape}"
+
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+@pytest.mark.parametrize("n_perms", [None, 1, 16, 37])
+@pytest.mark.parametrize("density", [0.3, 1.0])
+def test_block_scores_match_reference(mode, n_perms, density):
+    """Observed and permuted scores match NumPy with the kernel's permutations."""
+    from rapids_singlecell._cuda import _autocorr_cuda as _ac
+    from rapids_singlecell.squidpy_gpu._autocorr import _block_scores
+
+    rng = np.random.default_rng(0)
+    n, n_genes = 400, 21
+    x = rng.random((n, n_genes)) * (rng.random((n, n_genes)) < density)
+    x[:5] = 0  # rows without expression are skipped
+    w = sparse.random(n, n, density=0.02, format="csr", random_state=1)
+    w.setdiag(0)
+    w.eliminate_zeros()
+    keys = None
+    if n_perms:
+        keys = rng.integers(0, 2**32, (n_perms, _ac.ROUNDS), dtype=np.uint32)
+    adj = sparse_gpu.csr_matrix(w)
+    observed, perms = _block_scores(
+        cp.asarray(x),
+        adj,
+        cp.asarray(np.asarray(w.sum(1)).ravel()),
+        cp.asarray(np.asarray(w.sum(0)).ravel()),
+        None if keys is None else cp.asarray(keys),
+        geary=mode == "geary",
+    )
+    np.testing.assert_allclose(observed.get(), _reference(x, w, mode), rtol=1e-10)
+    if n_perms is None:
+        assert perms is None
+        return
+    assert perms.shape == (n_perms, n_genes)
+    for p in range(n_perms):
+        pi = cp.empty(n, dtype=cp.int32)
+        _ac.permutation(cp.asarray(keys[p]), out=pi)
+        pi = pi.get()
+        assert np.array_equal(np.sort(pi), np.arange(n))
+        np.testing.assert_allclose(
+            perms[p].get(), _reference(x, w[pi], mode), rtol=1e-10, atol=1e-12
+        )
+
+
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+def test_autocorr_seed_blocks_and_dask(mode):
+    """Seeded permutations are reproducible, over gene blocks and from Dask."""
+    import dask.array as da
+
+    rng = np.random.default_rng(3)
+    n, n_genes = 600, 70  # three blocks of up to 32 genes
+    x = sparse.random(n, n_genes, density=0.2, format="csr", random_state=4)
+    pos = rng.random((n, 2))
+    from sklearn.neighbors import kneighbors_graph
+
+    adata = AnnData(x.astype(np.float32))
+    adata.obsp["spatial_connectivities"] = kneighbors_graph(pos, 6)
+    kw = {"mode": mode, "copy": True, "n_perms": 40, "seed": 0, "corr_method": None}
+    df1 = spatial_autocorr(adata, **kw)
+    df2 = spatial_autocorr(adata, **kw)
+    pd.testing.assert_frame_equal(df1, df2)
+    stat = "I" if mode == "moran" else "C"
+    expected = _reference(
+        x.toarray().astype(np.float64),
+        adata.obsp["spatial_connectivities"].multiply(1 / 6).tocsr(),
+        mode,
+    )
+    np.testing.assert_allclose(
+        df1[stat].sort_index(),
+        pd.Series(expected, index=adata.var_names).sort_index(),
+        rtol=1e-5,
+    )
+    lazy = AnnData(da.from_array(x.astype(np.float32), chunks=(128, -1)))
+    lazy.obsp["spatial_connectivities"] = adata.obsp["spatial_connectivities"]
+    pd.testing.assert_frame_equal(df1, spatial_autocorr(lazy, **kw))
 
 
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])

@@ -8,6 +8,7 @@ from typing import (
 import cupy as cp
 import numpy as np
 import pandas as pd
+from cupyx.scipy import sparse as cpx_sparse
 from pandas.api.types import infer_dtype
 from scipy import stats
 from scipy.sparse import issparse, spmatrix
@@ -140,17 +141,32 @@ def _g_moments(w: spmatrix | np.ndarray):
 
     See `pysal <https://pysal.org/libpysal/_modules/libpysal/weights/weights.html#W>`_ implementation.
     """
-    # s0
-    s0 = w.sum()
+    if not cpx_sparse.isspmatrix(w):
+        w = cpx_sparse.csr_matrix(w)
+    w = w.tocsr()
+    rows = cp.searchsorted(w.indptr[1:], cp.arange(w.nnz), side="right")
+    # canonical (sorted, unique columns per row) unless a row's columns do not increase
+    if bool(((w.indices[1:] <= w.indices[:-1]) & (rows[1:] == rows[:-1])).any()):
+        w.sum_duplicates()
+        rows = cp.searchsorted(w.indptr[1:], cp.arange(w.nnz), side="right")
+    from rapids_singlecell._cuda import _autocorr_cuda as _ac
 
-    # s1
-    t = w.transpose() + w
-    t2 = t.multiply(t)
-    s1 = t2.sum() / 2.0
+    sums = cp.zeros(3)
+    indices = w.indices.astype(cp.int32, copy=False)
+    _ac.moments(
+        w.indptr, indices, w.data, out=sums, stream=cp.cuda.get_current_stream().ptr
+    )
+    s0, sum_w2, mirror = (float(v) for v in sums.get())
+    # s1 = sum((w + w^T)^2) / 2 = sum(w^2) + sum_ij w_ij w_ji
+    s1 = sum_w2 + mirror
 
     # s2
-    s2array: np.ndarray = np.array(w.sum(1) + w.sum(0).transpose()) ** 2
-    s2 = s2array.sum()
+    data = w.data.astype(cp.float64)
+    n = w.shape[0]
+    degree = cp.bincount(rows, data, minlength=n) + cp.bincount(
+        indices, data, minlength=n
+    )
+    s2 = float((degree * degree).sum())
 
     return s0, s1, s2
 

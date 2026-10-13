@@ -1,214 +1,179 @@
 #include <cuda_runtime.h>
 #include "../nb_types.h"
 
+#include <nanobind/stl/optional.h>
+#include <optional>
+
 #include "kernels_autocorr.cuh"
 
 using namespace nb::literals;
 
-constexpr int DENSE_BLOCK_DIM = 8;
-constexpr int SPARSE_BLOCK_SIZE = 1024;
-constexpr int ELEMENTWISE_BLOCK_SIZE = 32;
+constexpr int AUTOCORR_BLOCK = 256;
 
-template <typename T>
-static inline void launch_morans_dense(const T* data_centered,
-                                       const int* adj_row_ptr,
-                                       const int* adj_col_ind,
-                                       const T* adj_data, T* num,
-                                       size_t n_samples, size_t n_features,
-                                       cudaStream_t stream) {
-    dim3 block(DENSE_BLOCK_DIM, DENSE_BLOCK_DIM);
-    dim3 grid(
-        strided_grid(static_cast<long long>(n_features), DENSE_BLOCK_DIM),
-        strided_grid_y(static_cast<long long>(n_samples), DENSE_BLOCK_DIM));
-    morans_I_num_dense_kernel<<<grid, block, 0, stream>>>(
-        data_centered, adj_row_ptr, adj_col_ind, adj_data, num, n_samples,
-        n_features);
-    CUDA_CHECK_LAST_ERROR(morans_I_num_dense_kernel);
-}
-
-template <typename T, typename AdjIdxT, typename DataIdxT>
-static inline void launch_morans_sparse(
-    const AdjIdxT* adj_row_ptr, const AdjIdxT* adj_col_ind, const T* adj_data,
-    const DataIdxT* data_row_ptr, const DataIdxT* data_col_ind,
-    const T* data_values, int n_samples, int n_features, const T* mean_array,
-    T* num, cudaStream_t stream) {
-    dim3 block(SPARSE_BLOCK_SIZE);
-    dim3 grid(n_samples);
-    morans_I_num_sparse_kernel<T, AdjIdxT, DataIdxT>
-        <<<grid, block, 0, stream>>>(adj_row_ptr, adj_col_ind, adj_data,
-                                     data_row_ptr, data_col_ind, data_values,
-                                     n_samples, n_features, mean_array, num);
-    CUDA_CHECK_LAST_ERROR(morans_I_num_sparse_kernel);
-}
-
-template <typename T>
-static inline void launch_gearys_dense(const T* data, const int* adj_row_ptr,
-                                       const int* adj_col_ind,
-                                       const T* adj_data, T* num,
-                                       size_t n_samples, size_t n_features,
-                                       cudaStream_t stream) {
-    dim3 block(DENSE_BLOCK_DIM, DENSE_BLOCK_DIM);
-    dim3 grid(
-        strided_grid(static_cast<long long>(n_features), DENSE_BLOCK_DIM),
-        strided_grid_y(static_cast<long long>(n_samples), DENSE_BLOCK_DIM));
-    gearys_C_num_dense_kernel<<<grid, block, 0, stream>>>(
-        data, adj_row_ptr, adj_col_ind, adj_data, num, n_samples, n_features);
-    CUDA_CHECK_LAST_ERROR(gearys_C_num_dense_kernel);
-}
-
-template <typename T, typename AdjIdxT, typename DataIdxT>
-static inline void launch_gearys_sparse(
-    const AdjIdxT* adj_row_ptr, const AdjIdxT* adj_col_ind, const T* adj_data,
-    const DataIdxT* data_row_ptr, const DataIdxT* data_col_ind,
-    const T* data_values, int n_samples, int n_features, T* num,
-    cudaStream_t stream) {
-    dim3 block(SPARSE_BLOCK_SIZE);
-    dim3 grid(n_samples);
-    gearys_C_num_sparse_kernel<T, AdjIdxT, DataIdxT>
-        <<<grid, block, 0, stream>>>(adj_row_ptr, adj_col_ind, adj_data,
-                                     data_row_ptr, data_col_ind, data_values,
-                                     n_samples, n_features, num);
-    CUDA_CHECK_LAST_ERROR(gearys_C_num_sparse_kernel);
-}
-
-template <typename T, typename IdxT>
-static inline void launch_pre_den_sparse(const IdxT* data_col_ind,
-                                         const T* data_values, long long nnz,
-                                         const T* mean_array, T* den,
-                                         int* counter, cudaStream_t stream) {
-    dim3 block(ELEMENTWISE_BLOCK_SIZE);
-    dim3 grid(strided_grid(nnz, ELEMENTWISE_BLOCK_SIZE));
-    pre_den_sparse_kernel<T, IdxT><<<grid, block, 0, stream>>>(
-        data_col_ind, data_values, nnz, mean_array, den, counter);
-    CUDA_CHECK_LAST_ERROR(pre_den_sparse_kernel);
+template <typename T, typename P>
+static void moments_launch(const P* indptr, const int* indices, const T* data,
+                           int n, double* out, cudaStream_t stream) {
+    int device = 0, n_sm = 0;
+    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    cuda_check(
+        cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device),
+        "cudaDeviceGetAttribute(MultiProcessorCount)");
+    const int grid =
+        std::min<long long>(strided_grid(n, AUTOCORR_BLOCK), 8LL * n_sm);
+    autocorr_moments_kernel<<<grid, AUTOCORR_BLOCK, 0, stream>>>(
+        indptr, indices, data, n, out);
+    CUDA_CHECK_LAST_ERROR(autocorr_moments_kernel);
 }
 
 template <typename T, typename Device>
-void def_morans_dense(nb::module_& m) {
+void def_sums(nb::module_& m) {
     m.def(
-        "morans_dense",
-        [](gpu_array_c<const T, Device> data_centered,
-           gpu_array_c<const int, Device> adj_row_ptr,
-           gpu_array_c<const int, Device> adj_col_ind,
-           gpu_array_c<const T, Device> adj_data, gpu_array_c<T, Device> num,
-           size_t n_samples, size_t n_features, std::uintptr_t stream) {
-            launch_morans_dense(data_centered.data(), adj_row_ptr.data(),
-                                adj_col_ind.data(), adj_data.data(), num.data(),
-                                n_samples, n_features, (cudaStream_t)stream);
+        "sums",
+        [](gpu_array_c<const T, Device> x, gpu_array_c<const T, Device> z,
+           gpu_array_c<const T, Device> r,
+           std::optional<gpu_array_c<const unsigned int, Device>> keys,
+           gpu_array_c<double, Device> out, bool geary, bool uniform,
+           std::uintptr_t stream) {
+            const int n = x.shape(0), n_genes = x.shape(1);
+            const int n_perms = keys ? (int)keys->shape(0) : 0;
+            nb_require(n_genes <= 32 && z.shape(0) == (size_t)n &&
+                           z.shape(1) == (size_t)n_genes &&
+                           r.shape(0) == (size_t)n,
+                       "sums: x, z (n, <= 32 genes) and r (n) must match");
+            nb_require(n_perms <= AUTOCORR_BATCH &&
+                           (!keys || keys->shape(1) == AUTOCORR_ROUNDS),
+                       "sums: keys must be (<= 16, 6)");
+            nb_require(out.shape(0) == (size_t)(n_perms ? n_perms : 1) &&
+                           out.shape(1) == 2 && out.shape(2) == (size_t)n_genes,
+                       "sums: out must be (n_perms or 1, 2, n_genes)");
+            int device = 0, n_sm = 0;
+            cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+            cuda_check(cudaDeviceGetAttribute(
+                           &n_sm, cudaDevAttrMultiProcessorCount, device),
+                       "cudaDeviceGetAttribute(MultiProcessorCount)");
+            const int grid = std::min<long long>(
+                strided_grid((long long)n * 32, AUTOCORR_BLOCK), 8LL * n_sm);
+            const unsigned int* k = keys ? keys->data() : nullptr;
+            const auto kernel =
+                geary ? (uniform ? autocorr_sums_kernel<T, true, true>
+                                 : autocorr_sums_kernel<T, true, false>)
+                      : (uniform ? autocorr_sums_kernel<T, false, true>
+                                 : autocorr_sums_kernel<T, false, false>);
+            kernel<<<grid, AUTOCORR_BLOCK, 0, (cudaStream_t)stream>>>(
+                x.data(), z.data(), r.data(), n, n_genes, k, n_perms,
+                out.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_sums_kernel);
         },
-        "data_centered"_a, nb::kw_only(), "adj_row_ptr"_a, "adj_col_ind"_a,
-        "adj_data"_a, "num"_a, "n_samples"_a, "n_features"_a, "stream"_a = 0);
+        "x"_a.noconvert(), "z"_a.noconvert(), "r"_a.noconvert(),
+        "keys"_a.noconvert().none(), nb::kw_only(), "out"_a.noconvert(),
+        "geary"_a, "uniform"_a = false, "stream"_a = 0);
 }
 
-template <typename T, typename AdjIdxT, typename DataIdxT, typename Device>
-void def_morans_sparse(nb::module_& m) {
+template <typename T, typename P, typename Device>
+void def_lag(nb::module_& m) {
     m.def(
-        "morans_sparse",
-        [](gpu_array_c<const AdjIdxT, Device> adj_row_ptr,
-           gpu_array_c<const AdjIdxT, Device> adj_col_ind,
-           gpu_array_c<const T, Device> adj_data,
-           gpu_array_c<const DataIdxT, Device> data_row_ptr,
-           gpu_array_c<const DataIdxT, Device> data_col_ind,
-           gpu_array_c<const T, Device> data_values, int n_samples,
-           int n_features, gpu_array_c<const T, Device> mean_array,
-           gpu_array_c<T, Device> num, std::uintptr_t stream) {
-            launch_morans_sparse<T, AdjIdxT, DataIdxT>(
-                adj_row_ptr.data(), adj_col_ind.data(), adj_data.data(),
-                data_row_ptr.data(), data_col_ind.data(), data_values.data(),
-                n_samples, n_features, mean_array.data(), num.data(),
-                (cudaStream_t)stream);
+        "lag",
+        [](gpu_array_c<const P, Device> indptr,
+           gpu_array_c<const int, Device> indices,
+           gpu_array_c<const T, Device> weights, gpu_array_c<const T, Device> x,
+           gpu_array_c<T, Device> z, std::uintptr_t stream) {
+            const int n = x.shape(0), n_genes = x.shape(1);
+            nb_require(n_genes <= 32 && indptr.shape(0) == (size_t)n + 1 &&
+                           z.shape(0) == (size_t)n &&
+                           z.shape(1) == (size_t)n_genes,
+                       "lag: W (n, n) CSR, x and z (n, <= 32)");
+            int device = 0, n_sm = 0;
+            cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+            cuda_check(cudaDeviceGetAttribute(
+                           &n_sm, cudaDevAttrMultiProcessorCount, device),
+                       "cudaDeviceGetAttribute(MultiProcessorCount)");
+            const int grid = std::min<long long>(
+                strided_grid((long long)n * 32, AUTOCORR_BLOCK), 16LL * n_sm);
+            autocorr_lag_kernel<<<grid, AUTOCORR_BLOCK, 0,
+                                  (cudaStream_t)stream>>>(
+                indptr.data(), indices.data(), weights.data(), x.data(), n,
+                n_genes, z.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_lag_kernel);
         },
-        "adj_row_ptr"_a, "adj_col_ind"_a, "adj_data"_a, nb::kw_only(),
-        "data_row_ptr"_a, "data_col_ind"_a, "data_values"_a, "n_samples"_a,
-        "n_features"_a, "mean_array"_a, "num"_a, "stream"_a = 0);
+        "indptr"_a.noconvert(), "indices"_a.noconvert(),
+        "weights"_a.noconvert(), "x"_a.noconvert(), nb::kw_only(),
+        "z"_a.noconvert(), "stream"_a = 0);
 }
 
 template <typename T, typename Device>
-void def_gearys_dense(nb::module_& m) {
+void def_colstats(nb::module_& m) {
     m.def(
-        "gearys_dense",
-        [](gpu_array_c<const T, Device> data,
-           gpu_array_c<const int, Device> adj_row_ptr,
-           gpu_array_c<const int, Device> adj_col_ind,
-           gpu_array_c<const T, Device> adj_data, gpu_array_c<T, Device> num,
-           size_t n_samples, size_t n_features, std::uintptr_t stream) {
-            launch_gearys_dense(data.data(), adj_row_ptr.data(),
-                                adj_col_ind.data(), adj_data.data(), num.data(),
-                                n_samples, n_features, (cudaStream_t)stream);
+        "colstats",
+        [](gpu_array_c<const T, Device> x, gpu_array_c<const double, Device> c,
+           gpu_array_c<double, Device> out, std::uintptr_t stream) {
+            const int n = x.shape(0), n_genes = x.shape(1);
+            nb_require(n_genes <= 32 && c.shape(0) == (size_t)n &&
+                           out.shape(0) == 4 && out.shape(1) == (size_t)n_genes,
+                       "colstats: x (n, <= 32), c (n), out (4, n_genes)");
+            int device = 0, n_sm = 0;
+            cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+            cuda_check(cudaDeviceGetAttribute(
+                           &n_sm, cudaDevAttrMultiProcessorCount, device),
+                       "cudaDeviceGetAttribute(MultiProcessorCount)");
+            const int grid = std::min<long long>(
+                strided_grid((long long)n * 32, AUTOCORR_BLOCK), 8LL * n_sm);
+            autocorr_colstats_kernel<<<grid, AUTOCORR_BLOCK, 0,
+                                       (cudaStream_t)stream>>>(
+                x.data(), c.data(), n, n_genes, out.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_colstats_kernel);
         },
-        "data"_a, nb::kw_only(), "adj_row_ptr"_a, "adj_col_ind"_a, "adj_data"_a,
-        "num"_a, "n_samples"_a, "n_features"_a, "stream"_a = 0);
+        "x"_a.noconvert(), "c"_a.noconvert(), nb::kw_only(),
+        "out"_a.noconvert(), "stream"_a = 0);
 }
 
-template <typename T, typename AdjIdxT, typename DataIdxT, typename Device>
-void def_gearys_sparse(nb::module_& m) {
+template <typename T, typename P, typename Device>
+void def_moments(nb::module_& m) {
     m.def(
-        "gearys_sparse",
-        [](gpu_array_c<const AdjIdxT, Device> adj_row_ptr,
-           gpu_array_c<const AdjIdxT, Device> adj_col_ind,
-           gpu_array_c<const T, Device> adj_data,
-           gpu_array_c<const DataIdxT, Device> data_row_ptr,
-           gpu_array_c<const DataIdxT, Device> data_col_ind,
-           gpu_array_c<const T, Device> data_values, int n_samples,
-           int n_features, gpu_array_c<T, Device> num, std::uintptr_t stream) {
-            launch_gearys_sparse<T, AdjIdxT, DataIdxT>(
-                adj_row_ptr.data(), adj_col_ind.data(), adj_data.data(),
-                data_row_ptr.data(), data_col_ind.data(), data_values.data(),
-                n_samples, n_features, num.data(), (cudaStream_t)stream);
+        "moments",
+        [](gpu_array_c<const P, Device> indptr,
+           gpu_array_c<const int, Device> indices,
+           gpu_array_c<const T, Device> data, gpu_array_c<double, Device> out,
+           std::uintptr_t stream) {
+            const int n = indptr.shape(0) - 1;
+            nb_require(out.shape(0) == 3, "moments: out must have 3 entries");
+            moments_launch(indptr.data(), indices.data(), data.data(), n,
+                           out.data(), (cudaStream_t)stream);
         },
-        "adj_row_ptr"_a, "adj_col_ind"_a, "adj_data"_a, nb::kw_only(),
-        "data_row_ptr"_a, "data_col_ind"_a, "data_values"_a, "n_samples"_a,
-        "n_features"_a, "num"_a, "stream"_a = 0);
-}
-
-template <typename T, typename IdxT, typename Device>
-void def_pre_den_sparse(nb::module_& m) {
-    m.def(
-        "pre_den_sparse",
-        [](gpu_array_c<const IdxT, Device> data_col_ind,
-           gpu_array_c<const T, Device> data_values, long long nnz,
-           gpu_array_c<const T, Device> mean_array, gpu_array_c<T, Device> den,
-           gpu_array_c<int, Device> counter, std::uintptr_t stream) {
-            launch_pre_den_sparse<T, IdxT>(
-                data_col_ind.data(), data_values.data(), nnz, mean_array.data(),
-                den.data(), counter.data(), (cudaStream_t)stream);
-        },
-        "data_col_ind"_a, "data_values"_a, nb::kw_only(), "nnz"_a,
-        "mean_array"_a, "den"_a, "counter"_a, "stream"_a = 0);
+        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
+        nb::kw_only(), "out"_a.noconvert(), "stream"_a = 0);
 }
 
 template <typename Device>
 void register_bindings(nb::module_& m) {
-    def_morans_dense<float, Device>(m);
-    def_morans_dense<double, Device>(m);
-
-    def_morans_sparse<float, int, int, Device>(m);
-    def_morans_sparse<float, int, long long, Device>(m);
-    def_morans_sparse<float, long long, int, Device>(m);
-    def_morans_sparse<float, long long, long long, Device>(m);
-    def_morans_sparse<double, int, int, Device>(m);
-    def_morans_sparse<double, int, long long, Device>(m);
-    def_morans_sparse<double, long long, int, Device>(m);
-    def_morans_sparse<double, long long, long long, Device>(m);
-
-    def_gearys_dense<float, Device>(m);
-    def_gearys_dense<double, Device>(m);
-
-    def_gearys_sparse<float, int, int, Device>(m);
-    def_gearys_sparse<float, int, long long, Device>(m);
-    def_gearys_sparse<float, long long, int, Device>(m);
-    def_gearys_sparse<float, long long, long long, Device>(m);
-    def_gearys_sparse<double, int, int, Device>(m);
-    def_gearys_sparse<double, int, long long, Device>(m);
-    def_gearys_sparse<double, long long, int, Device>(m);
-    def_gearys_sparse<double, long long, long long, Device>(m);
-
-    def_pre_den_sparse<float, int, Device>(m);
-    def_pre_den_sparse<float, long long, Device>(m);
-    def_pre_den_sparse<double, int, Device>(m);
-    def_pre_den_sparse<double, long long, Device>(m);
+    def_moments<float, int, Device>(m);
+    def_moments<double, int, Device>(m);
+    def_moments<float, long long, Device>(m);
+    def_moments<double, long long, Device>(m);
+    def_colstats<float, Device>(m);
+    def_colstats<double, Device>(m);
+    def_sums<float, Device>(m);
+    def_sums<double, Device>(m);
+    def_lag<float, int, Device>(m);
+    def_lag<double, int, Device>(m);
+    def_lag<float, long long, Device>(m);
+    def_lag<double, long long, Device>(m);
+    m.def(
+        "permutation",
+        [](gpu_array_c<const unsigned int, Device> keys,
+           gpu_array_c<int, Device> out, std::uintptr_t stream) {
+            const int n = out.shape(0);
+            nb_require(n >= 2 && keys.shape(0) == AUTOCORR_ROUNDS,
+                       "permutation: n >= 2 and 6 keys");
+            autocorr_permutation_kernel<<<(n + 255) / 256, 256, 0,
+                                          (cudaStream_t)stream>>>(
+                keys.data(), n, out.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_permutation_kernel);
+        },
+        "keys"_a, nb::kw_only(), "out"_a, "stream"_a = 0);
 }
 
 NB_MODULE(_autocorr_cuda, m) {
+    m.attr("BATCH") = AUTOCORR_BATCH;
+    m.attr("ROUNDS") = AUTOCORR_ROUNDS;
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }
