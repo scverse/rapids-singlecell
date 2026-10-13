@@ -1552,6 +1552,20 @@ def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout):
         np.testing.assert_array_equal(cp.asnumpy(part), X[order[lo:hi]])
 
 
+def test_harmonize_checks_out_first():
+    # A wrong output, or none with several GPUs, fails before any GPU work.
+    adata = _repeatability_adata(np.float32)
+    X = adata.obsm["X_pca"]
+    for out in (
+        np.empty((len(X) - 1, X.shape[1]), X.dtype),
+        np.empty_like(X, np.float64),
+    ):
+        with pytest.raises(ValueError, match="out must be"):
+            harmony_module.harmonize(X, adata.obs, "batch", out=out)
+    with pytest.raises(ValueError, match="host array"):
+        harmony_module.harmonize(X, adata.obs, "batch", devices=[0, 0])
+
+
 def test_harmonize_failure_joins_the_output_prefault(monkeypatch):
     # The thread zeroing `out` is joined when harmonize raises too, so it
     # never writes the caller's array afterwards.

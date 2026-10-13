@@ -243,6 +243,14 @@ def harmonize(
     max_iter_clustering = operator.index(max_iter_clustering)
     if max_iter_harmony < 1:
         raise ValueError("max_iter_harmony must be >= 1")
+    if out is not None and (
+        not isinstance(out, np.ndarray) or out.shape != Z.shape or out.dtype != Z.dtype
+    ):
+        raise ValueError(
+            f"out must be a NumPy array of shape {Z.shape} and dtype {Z.dtype}."
+        )
+    if devices is not None and len(devices) > 1 and out is None:
+        raise ValueError("Several GPUs write the result into a host array `out`.")
     try:
         valid = int(shuffle_chunk_size) == shuffle_chunk_size >= 1
     except (TypeError, ValueError, OverflowError):
@@ -684,7 +692,7 @@ def harmonize(
     if not is_converged:
         warnings.warn(
             "Harmony did not converge. Consider increasing the number of iterations",
-            stacklevel=4,
+            stacklevel=5,
         )
     parts.clear()  # free the input before the output
     if _prefault is not None:  # see _prefaulted

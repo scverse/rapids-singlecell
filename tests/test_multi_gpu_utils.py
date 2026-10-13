@@ -263,6 +263,11 @@ class TestParseDeviceIds:
             assert parse_device_ids(multi_gpu=True) == [0]
             assert parse_device_ids(multi_gpu=False) == [0]
 
+    @pytest.mark.parametrize("ids", [[0.0], [True], ["0"]])
+    def test_non_integer_ids_are_rejected(self, ids):
+        with pytest.raises(ValueError, match="must be integers"):
+            parse_device_ids(multi_gpu=ids)
+
 
 class TestDeviceCopy:
     @pytest.fixture(autouse=True)

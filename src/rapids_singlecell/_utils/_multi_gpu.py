@@ -13,6 +13,7 @@ distances and Harmony.
 
 from __future__ import annotations
 
+import numbers
 from contextlib import contextmanager
 from functools import cache
 from typing import TYPE_CHECKING
@@ -218,6 +219,10 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
         raise ValueError(f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}")
 
     # Validate device IDs
+    if not all(
+        isinstance(d, numbers.Integral) and not isinstance(d, bool) for d in device_ids
+    ):
+        raise ValueError(f"multi_gpu device ids must be integers, got {device_ids}.")
     invalid_ids = [d for d in device_ids if d < 0 or d >= n_available]
     if invalid_ids:
         raise ValueError(f"Invalid GPU device ID(s): {invalid_ids}. Available devices: {list(range(n_available))}")
