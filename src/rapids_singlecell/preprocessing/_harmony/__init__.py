@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import operator
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal
@@ -193,13 +194,22 @@ def harmonize(
     if tol_harmony is None:
         tol_harmony = stopping[2]
 
+    max_iter_harmony = operator.index(max_iter_harmony)  # NumPy integers too
     if max_iter_harmony < 1:
         raise ValueError("max_iter_harmony must be >= 1")
-    if int(shuffle_chunk_size) != shuffle_chunk_size or shuffle_chunk_size < 1:
+    try:
+        valid = int(shuffle_chunk_size) == shuffle_chunk_size >= 1
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
         raise ValueError(
-            f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size}."
+            f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size!r}."
         )
     shuffle_chunk_size = int(shuffle_chunk_size)
+    if not np.isfinite(sigma) or sigma <= 0:
+        raise ValueError(f"sigma must be a finite positive number, got {sigma}.")
+    if not 0 < block_proportion <= 1:
+        raise ValueError(f"block_proportion must be in (0, 1], got {block_proportion}.")
     if colsum_algo not in (None, "columns", "atomics", "gemm", "benchmark"):
         raise ValueError(f"Unknown colsum_algo {colsum_algo!r}.")
     n_cells = Z.shape[0]
@@ -262,14 +272,25 @@ def harmonize(
     if n_clusters is None:
         n_clusters = int(min(100, n_cells / 30))
         n_clusters = max(n_clusters, 2)
+    # Several keys solve a dense float64 system over all their levels per
+    # cluster (and factor a copy); fail before any GPU work if it cannot fit.
+    system_bytes = 16 * (n_batches + 1) ** 2
+    if n_covariates > 1 and system_bytes > _CORRECTION_WORKSPACE_LIMIT_BYTES:
+        raise MemoryError(
+            f"Harmony with several batch keys solves a dense system over their "
+            f"{n_batches} levels per cluster ({system_bytes / 2**30:.1f} GiB); "
+            "reduce the number of levels (a key with about one level per cell "
+            "is not a batch variable)."
+        )
 
     theta_array = _get_theta_array(theta, n_levels, Z.dtype)
     if tau > 0:
         theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
     theta_array = cp.ascontiguousarray(theta_array.ravel())
+    if not bool(cp.isfinite(theta_array).all()):
+        raise ValueError(f"theta must be finite, got {theta}.")
 
     # Validate parameters
-    assert block_proportion > 0 and block_proportion <= 1
     if dynamic_lambda:
         if not np.isfinite(alpha) or alpha <= 0:
             raise ValueError(f"alpha must be a finite positive number when dynamic_lambda=True, got {alpha}.")
@@ -353,7 +374,6 @@ def harmonize(
         n_groups=tile_groups,
         n_blocks=n_blocks,
         dtype=Z_norm.dtype,
-        bfloat16=bfloat16,
     )
     chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
     seg_start, seg_group = _segments(host_offsets, unit)
@@ -429,7 +449,7 @@ def harmonize(
         # before the correction; unless this is the last round, the
         # correction writes the normalized embedding for the next clustering.
         is_converged = _is_convergent_harmony(objectives_harmony, tol=tol_harmony)
-        normalize = not is_converged and i + 1 < max_iter_harmony
+        normalize = bool(not is_converged and i + 1 < max_iter_harmony)
         # Correction step
         if n_covariates > 1:
             Z_hat = _correction_multi(
@@ -437,6 +457,7 @@ def harmonize(
                 R,
                 lambda_kb=lambda_kb,
                 n_batches=n_batches,
+                n_first=int(n_levels[0]),
                 joint_cats=joint_cats,
                 marginal_joint_offsets=marginal_joint_offsets,
                 marginal_joint_indices=marginal_joint_indices,
@@ -472,7 +493,8 @@ def harmonize(
 
     if not is_converged:
         warnings.warn(
-            "Harmony did not converge. Consider increasing the number of iterations"
+            "Harmony did not converge. Consider increasing the number of iterations",
+            stacklevel=4,
         )
     if order is not None:
         # Free the working set before allocating the output.
@@ -581,13 +603,16 @@ def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
         out=maxima,
         stream=cp.cuda.get_current_stream().ptr,
     )
-    bounds = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None] * maxima
-    if not bool(cp.isfinite(bounds).all()):
+    if not bool(cp.isfinite(maxima).all()):
         raise ValueError(
             "Input data contains NaN or infinite values. Please handle these "
             "before running harmony_integrate."
         )
-    return cp.frexp(cp.where(bounds > 0, bounds, 1.0))[1].astype(cp.int16)
+    n = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None]
+    bounds = n * maxima  # beyond float64 near 1e308: n < 2^a, max < 2^b
+    exp = cp.frexp(cp.where(bounds > 0, bounds, 1.0))[1]
+    exp = cp.where(cp.isinf(bounds), cp.frexp(n)[1] + cp.frexp(maxima)[1], exp)
+    return exp.astype(cp.int16)
 
 
 def _segments(
@@ -707,7 +732,6 @@ def _allocate_clustering_workspace(
     n_groups: int,
     n_blocks: int,
     dtype: cp.dtype,
-    bfloat16: bool = False,
 ) -> dict:
     """Buffers of the clustering loop. The tiles' groups are the batches, or
     one group for several keys; counts are kept per batch level."""
@@ -884,6 +908,7 @@ def _correction_multi(
     *,
     lambda_kb: cp.ndarray,
     n_batches: int,
+    n_first: int,
     joint_cats: cp.ndarray,
     marginal_joint_offsets: cp.ndarray,
     marginal_joint_indices: cp.ndarray,
@@ -944,6 +969,7 @@ def _correction_multi(
             lambda_kb=lambda_chunk,
             active_mask=(lambda_chunk < X.dtype.type(_SUPPRESS_PENALTY)).view(cp.uint8),
             n_batches=n_batches,
+            n_first=n_first,
             seg_start=seg_start,
             seg_group=seg_group,
             bounds=bounds,
@@ -999,6 +1025,35 @@ def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
     cublas_handle = cp.cuda.device.get_cublas_handle()
     cp.cuda.cusolver.setStream(cusolver_handle, stream.ptr)
     cp.cuda.cublas.setStream(cublas_handle, stream.ptr)
+    lower = cp.cuda.cublas.CUBLAS_FILL_MODE_LOWER
+    if matrix_size >= 256:
+        # Large systems (many batch levels): the blocked factorization of one
+        # matrix at a time is much faster than the batched one. A symmetric
+        # C-ordered matrix is its own column-major form.
+        dpotrf, dpotrs = cp.cuda.cusolver.dpotrf, cp.cuda.cusolver.dpotrs
+        n = matrix_size
+        size = cp.cuda.cusolver.dpotrf_bufferSize(
+            cusolver_handle, lower, n, gram_work.data.ptr, n
+        )
+        work = cp.empty(max(size, 1), dtype=cp.float64)
+        solve_info = cp.empty(1, dtype=cp.int32)  # keeps the factor's info
+        for i in range(n_matrices):
+            factor, solution = gram_work[i], cp.asfortranarray(rhs[i])
+            dpotrf(
+                cusolver_handle, lower, n, factor.data.ptr, n, work.data.ptr,
+                size, info[i:].data.ptr,
+            )  # fmt: skip
+            dpotrs(
+                cusolver_handle, lower, n, n_rhs, factor.data.ptr, n,
+                solution.data.ptr, n, solve_info.data.ptr,
+            )  # fmt: skip
+            rhs_work[i] = solution
+        failed = np.flatnonzero(cp.asnumpy(info))
+        for matrix_index in failed:
+            rhs_work[matrix_index] = cp.linalg.lstsq(
+                gram[matrix_index], rhs[matrix_index], rcond=None
+            )[0]
+        return rhs_work
     cp.cuda.cusolver.dpotrfBatched(
         cusolver_handle,
         cp.cuda.cublas.CUBLAS_FILL_MODE_LOWER,

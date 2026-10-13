@@ -105,35 +105,50 @@ __global__ void add_joint_cross_kernel(
 }
 
 // Expand joint-category cross-products R_j^T X_j into the regression
-// right-hand sides: row 0 (intercept) sums every joint, row b + 1 the joints
-// containing active category b (in ascending CSR order, deterministic).
+// right-hand sides: row b + 1 sums the joints containing category b (in
+// ascending CSR order, deterministic). Row 0 and the inactive categories:
+// intercept_and_mask_kernel.
 __global__ void marginal_from_joint_rhs_kernel(
     const double* __restrict__ joint_rhs,
     const int* __restrict__ marginal_joint_offsets,
-    const int* __restrict__ marginal_joint_indices,
-    const uint8_t* __restrict__ active, double* __restrict__ rhs, int n_pcs,
-    int n_clusters, int n_batches, int n_joint_categories) {
-    int nb1 = n_batches + 1;
-    size_t total = (size_t)n_clusters * nb1 * n_pcs;
+    const int* __restrict__ marginal_joint_indices, double* __restrict__ rhs,
+    int n_pcs, int n_clusters, int n_batches) {
+    size_t total = (size_t)n_clusters * n_batches * n_pcs;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += (size_t)blockDim.x * gridDim.x) {
         int pc = (int)(idx % n_pcs);
-        int row = (int)(idx / n_pcs % nb1);
-        int cluster = (int)(idx / ((size_t)n_pcs * nb1));
-        auto at = [&](int joint) {
-            return joint_rhs[((size_t)joint * n_clusters + cluster) * n_pcs +
-                             pc];
-        };
+        int b = (int)(idx / n_pcs % n_batches);
+        int cluster = (int)(idx / ((size_t)n_pcs * n_batches));
         double value = 0;
-        if (row == 0) {
-            for (int joint = 0; joint < n_joint_categories; ++joint)
-                value += at(joint);
-        } else if (active[(size_t)(row - 1) * n_clusters + cluster] != 0) {
-            for (int position = marginal_joint_offsets[row - 1];
-                 position < marginal_joint_offsets[row]; ++position)
-                value += at(marginal_joint_indices[position]);
-        }
-        rhs[idx] = value;
+        for (int position = marginal_joint_offsets[b];
+             position < marginal_joint_offsets[b + 1]; ++position)
+            value += joint_rhs[((size_t)marginal_joint_indices[position] *
+                                    n_clusters +
+                                cluster) *
+                                   n_pcs +
+                               pc];
+        rhs[((size_t)cluster * (n_batches + 1) + b + 1) * n_pcs + pc] = value;
+    }
+}
+
+// Row 0 (intercept) sums every joint: the rows of the first key's n_first
+// categories, which hold every joint once. Then the rows of inactive
+// categories are zeroed.
+__global__ void intercept_and_mask_kernel(const uint8_t* __restrict__ active,
+                                          double* __restrict__ rhs, int n_pcs,
+                                          int n_clusters, int n_batches,
+                                          int n_first) {
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < (size_t)n_clusters * n_pcs;
+         idx += (size_t)blockDim.x * gridDim.x) {
+        int pc = (int)(idx % n_pcs), cluster = (int)(idx / n_pcs);
+        double* row = rhs + (size_t)cluster * (n_batches + 1) * n_pcs + pc;
+        double value = 0;
+        for (int b = 0; b < n_first; ++b) value += row[(size_t)(b + 1) * n_pcs];
+        row[0] = value;
+        for (int b = 0; b < n_batches; ++b)
+            if (!active[(size_t)b * n_clusters + cluster])
+                row[(size_t)(b + 1) * n_pcs] = 0;
     }
 }
 

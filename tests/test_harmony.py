@@ -203,6 +203,24 @@ def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
     np.testing.assert_array_equal(joint_codes, np.array([0, 1, 0]))
 
 
+def test_harmony_large_multikey_systems_solve_one_at_a_time():
+    # 256+ levels take the blocked per-matrix factorization; a singular system
+    # still falls back to least squares.
+    rng = np.random.default_rng(0)
+    n, d = 300, 7
+    M = rng.standard_normal((2, n, n))
+    B = rng.standard_normal((n, 50))
+    gram = np.stack(
+        [M[0] @ M[0].T + n * np.eye(n), M[1] @ M[1].T + n * np.eye(n), B @ B.T]
+    )
+    rhs = gram @ rng.standard_normal((3, n, d))
+    result = cp.asnumpy(_solve_spd_batched(cp.asarray(gram), cp.asarray(rhs)))
+    np.testing.assert_allclose(
+        result[:2], np.linalg.solve(gram[:2], rhs[:2]), rtol=1e-9
+    )
+    np.testing.assert_allclose(gram[2] @ result[2], rhs[2], rtol=1e-7, atol=1e-7)
+
+
 def test_harmony_multikey_singular_gram_uses_least_squares():
     dtype = cp.float64
     gram = cp.asarray(
@@ -261,6 +279,69 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
             random_state=734,
             dtype=cp.float32,
         )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"sigma": 0}, "sigma"),
+        ({"sigma": -0.0}, "sigma"),
+        ({"sigma": float("nan")}, "sigma"),
+        ({"theta": float("nan")}, "theta"),
+        ({"theta": float("inf")}, "theta"),
+        ({"block_proportion": 0}, "block_proportion"),
+        ({"block_proportion": 1.5}, "block_proportion"),
+        ({"block_proportion": float("nan")}, "block_proportion"),
+    ],
+)
+def test_harmony_rejects_invalid_parameters(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _integrate(**kwargs)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("key", ["batch", ["batch", "second"]])
+def test_harmony_accepts_numpy_integers(key):
+    # NumPy integers reach the CUDA bindings only through Python types.
+    expected = _integrate(key=key, max_iter_harmony=2)
+    for value in (np.int64(2), np.uint8(2)):
+        assert (
+            _integrate(key=key, max_iter_harmony=value).tobytes() == expected.tobytes()
+        )
+
+
+def test_harmony_dtype_none_keeps_the_input_dtype():
+    expected = _integrate(np.float32, max_iter_harmony=2)
+    assert _integrate(None, max_iter_harmony=2).tobytes() == expected.tobytes()
+    assert _integrate(">f4", max_iter_harmony=2).tobytes() == expected.tobytes()
+
+
+def test_harmony_accepts_huge_finite_values():
+    # A bound beyond float64 (n_b max|X| > 1.8e308) is still finite input.
+    X = _repeatability_adata(np.float64).obsm["X_pca"]
+    X[0, 0] = 1e307
+    assert np.isfinite(_integrate(np.float64, X_pca=X, max_iter_harmony=2)).all()
+
+
+def test_harmony_multikey_rejects_huge_designs_early():
+    # Several keys solve a dense system over all their levels; about one level
+    # per cell cannot fit and fails before any GPU work.
+    n = 9000
+    adata = ad.AnnData(
+        obs=pd.DataFrame(
+            {"batch": np.arange(n) % 5, "cell": np.arange(n)},
+            index=np.arange(n).astype(str),
+        ).astype("category"),
+        obsm={"X_pca": np.random.default_rng(0).standard_normal((n, 5), np.float32)},
+    )
+    with pytest.raises(MemoryError, match="levels"):
+        rsc.pp.harmony_integrate(adata, ["batch", "cell"])
+
+
+def test_harmony_did_not_converge_points_at_the_caller():
+    with pytest.warns(UserWarning, match="did not converge") as record:
+        _integrate(max_iter_harmony=1, tol_harmony=-np.inf)
+    assert record[0].filename == __file__
 
 
 @pytest.mark.parametrize("dtype", [np.float16, np.int32])
@@ -442,6 +523,7 @@ def test_harmony_multikey_correction_matches_dense_design(
             cp.asarray(R_np),
             lambda_kb=cp.asarray(lambda_np),
             n_batches=n_batches,
+            n_first=int(levels[0]),
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
             segments=(
                 *_segments(joint_offsets),
@@ -854,7 +936,15 @@ def test_harmony_integrate_repeats_bitwise(
     assert outputs[0].tobytes() == outputs[1].tobytes()
 
 
-def _integrate(dtype=np.float32, *, X_pca=None, key="batch", n_clusters=7, **kwargs):
+def _integrate(
+    dtype=np.float32,
+    *,
+    X_pca=None,
+    key="batch",
+    n_clusters=7,
+    max_iter_harmony=2,
+    **kwargs,
+):
     adata = _repeatability_adata(np.float32)
     if X_pca is not None:
         adata.obsm["X_pca"] = X_pca
@@ -864,7 +954,7 @@ def _integrate(dtype=np.float32, *, X_pca=None, key="batch", n_clusters=7, **kwa
         dtype=dtype,
         rng=734,
         n_clusters=n_clusters,
-        max_iter_harmony=2,
+        max_iter_harmony=max_iter_harmony,
         **kwargs,
     )
     return adata.obsm["X_pca_harmony"]
@@ -929,7 +1019,7 @@ def test_harmony_large_theta_stays_finite(
     assert all(0 < o < 1e6 for o in objectives[-1])
 
 
-@pytest.mark.parametrize("chunk", [0, -2, 1.5])
+@pytest.mark.parametrize("chunk", [0, -2, 1.5, "8", float("inf"), float("nan")])
 def test_harmony_shuffle_chunk_size_rejects_invalid(chunk):
     with pytest.raises(ValueError, match="shuffle_chunk_size"):
         _integrate(shuffle_chunk_size=chunk)

@@ -93,6 +93,7 @@ def harmony_integrate(
         halves their memory (about a quarter less GPU memory with 50
         components). It needs one batch key and the batched
         correction and falls back to float32 with a warning otherwise.
+        ``None`` keeps the input's float32 or float64.
     flavor
         Which version of the Harmony algorithm to use.
         ``"harmony2"`` (default) enables the stabilized diversity penalty,
@@ -209,9 +210,12 @@ def harmony_integrate(
     bfloat16 = str(dtype) == "bfloat16" or getattr(dtype, "__name__", "") == "bfloat16"
     if bfloat16:
         dtype = np.float32
-    dtype = np.dtype(dtype)
-    if dtype not in (np.float32, np.float64):
-        raise ValueError(f"dtype must be float32, float64 or 'bfloat16', got {dtype}.")
+    if dtype is not None:
+        dtype = np.dtype(dtype).newbyteorder("=")
+        if dtype not in (np.float32, np.float64):
+            raise ValueError(
+                f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}."
+            )
 
     from ._harmony import _download, harmonize
 
@@ -254,6 +258,10 @@ def harmony_integrate(
 
     # Get the input data
     input_data = adata.obsm[basis]
+    if dtype is None:  # the input's float type, as in earlier releases
+        dtype = np.dtype(getattr(input_data, "dtype", np.float32))
+        if dtype not in (np.float32, np.float64):
+            dtype = np.dtype(np.float32)
 
     try:
         # Handle different array types

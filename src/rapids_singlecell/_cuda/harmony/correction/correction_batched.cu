@@ -70,9 +70,10 @@ static void prepare_multi_impl(
     const T* X, const T* R, int ldr, const T* joint_O, const int* joint_cats,
     const int* marginal_joint_offsets, const int* marginal_joint_indices,
     const T* lambda_kb, const uint8_t* active, int n_pcs, int n_clusters,
-    int n_batches, int n_covariates, const int* seg_start, const int* seg_group,
-    int n_seg, int n_joint_categories, const short* bounds, double* gram,
-    double* rhs, double* joint_rhs, long long* acc, cudaStream_t stream) {
+    int n_batches, int n_first, int n_covariates, const int* seg_start,
+    const int* seg_group, int n_seg, int n_joint_categories,
+    const short* bounds, double* gram, double* rhs, double* joint_rhs,
+    long long* acc, cudaStream_t stream) {
     int nb1 = n_batches + 1;
     cudaMemsetAsync(gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double),
                     stream);
@@ -100,11 +101,16 @@ static void prepare_multi_impl(
                  n_joint_categories, bounds, acc, joint_rhs,
                  (long long)n_clusters * n_pcs, n_pcs, stream);
     marginal_from_joint_rhs_kernel<<<
-        strided_grid((long long)n_clusters * nb1 * n_pcs, BLOCK_DIM_1D),
+        strided_grid((long long)n_clusters * n_batches * n_pcs, BLOCK_DIM_1D),
         BLOCK_DIM_1D, 0, stream>>>(joint_rhs, marginal_joint_offsets,
-                                   marginal_joint_indices, active, rhs, n_pcs,
-                                   n_clusters, n_batches, n_joint_categories);
+                                   marginal_joint_indices, rhs, n_pcs,
+                                   n_clusters, n_batches);
     CUDA_CHECK_LAST_ERROR(marginal_from_joint_rhs_kernel);
+    intercept_and_mask_kernel<<<strided_grid((long long)n_clusters * n_pcs,
+                                             BLOCK_DIM_1D),
+                                BLOCK_DIM_1D, 0, stream>>>(
+        active, rhs, n_pcs, n_clusters, n_batches, n_first);
+    CUDA_CHECK_LAST_ERROR(intercept_and_mask_kernel);
 }
 
 // Z = X - R_i W_joint[joint of i] (normalized on request) for the clusters of
@@ -242,7 +248,7 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const int, Device> marginal_joint_indices,
            gpu_array_c<const T, Device> lambda_kb,
            gpu_array_c<const uint8_t, Device> active, int n_batches,
-           gpu_array_c<const int, Device> seg_start,
+           int n_first, gpu_array_c<const int, Device> seg_start,
            gpu_array_c<const int, Device> seg_group,
            gpu_array_c<const short, Device> bounds,
            gpu_array_c<double, Device> gram, gpu_array_c<double, Device> rhs,
@@ -250,12 +256,15 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<long long, Device> acc, std::uintptr_t stream) {
             if (R.ndim() != 2 || R.stride(1) != 1)
                 throw std::invalid_argument("R must have contiguous rows");
+            if (n_first < 1 || n_first > n_batches)
+                throw std::invalid_argument(
+                    "n_first must be in [1, n_batches]");
             int n_joint_categories = bound_groups(bounds, X.shape(1));
             prepare_multi_impl<T>(
                 X.data(), R.data(), (int)R.stride(0), joint_O.data(),
                 joint_cats.data(), marginal_joint_offsets.data(),
                 marginal_joint_indices.data(), lambda_kb.data(), active.data(),
-                (int)X.shape(1), (int)R.shape(1), n_batches,
+                (int)X.shape(1), (int)R.shape(1), n_batches, n_first,
                 (int)joint_cats.shape(1), seg_start.data(), seg_group.data(),
                 (int)seg_group.size(), n_joint_categories, bounds.data(),
                 gram.data(), rhs.data(), joint_rhs.data(), acc.data(),
@@ -263,8 +272,9 @@ static void register_correction_batched(nb::module_& m) {
         },
         "X"_a, nb::kw_only(), "R"_a, "joint_O"_a, "joint_cats"_a,
         "marginal_joint_offsets"_a, "marginal_joint_indices"_a, "lambda_kb"_a,
-        "active_mask"_a, "n_batches"_a, "seg_start"_a, "seg_group"_a,
-        "bounds"_a, "gram"_a, "rhs"_a, "joint_rhs"_a, "acc"_a, "stream"_a = 0);
+        "active_mask"_a, "n_batches"_a, "n_first"_a, "seg_start"_a,
+        "seg_group"_a, "bounds"_a, "gram"_a, "rhs"_a, "joint_rhs"_a, "acc"_a,
+        "stream"_a = 0);
 
     m.def(
         "apply_multi",

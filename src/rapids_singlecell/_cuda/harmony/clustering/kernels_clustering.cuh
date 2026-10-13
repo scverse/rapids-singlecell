@@ -628,7 +628,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
                                   [](T acc, T z, T y) { return acc + z * y; });
                 if (!async) load(false);
             }
-            if constexpr (BLOCKS)
+            if constexpr (BLOCKS) {  // braced: nvcc 12.2 rejects a bare for
                 for (int r = 0; r < FUSED_ROWS && active; ++r) {
                     if (base + r >= end) break;  // warp-uniform
                     T* row =
@@ -638,6 +638,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
 #pragma unroll
                     for (int q = 0; q < S; ++q) row[q] = dots[r][q];
                 }
+            }
         }
         if (!active) continue;
         if constexpr (BLOCKS) {
@@ -769,13 +770,14 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     for (int k = threadIdx.x; k < n_clusters; k += blockDim.x) {
         long long sum = 0;
         for (int w = 0; w < n_warps; ++w) sum += col_sums[w * n_clusters + k];
-        if constexpr (JOINT)
+        if constexpr (JOINT) {
             for (int c = 0; sum && c < n_cov; ++c)
                 atomicAdd(counts + (size_t)levels[c] * n_clusters + k,
                           (unsigned long long)sum);
-        else
+        } else {
             atomicAdd(counts + (size_t)category * n_clusters + k,
                       (unsigned long long)sum);
+        }
     }
 }
 
