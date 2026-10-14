@@ -130,6 +130,8 @@ intersphinx_mapping = {
     "statsmodels": ("https://www.statsmodels.org/stable/", None),
     "omnipath": ("https://omnipath.readthedocs.io/en/latest/", None),
     "dask": ("https://docs.dask.org/en/stable/", None),
+    "dask_cuda": ("https://docs.rapids.ai/api/dask-cuda/stable/", None),
+    "zarr": ("https://zarr.readthedocs.io/en/stable/", None),
 }
 
 # List of patterns, relative to source directory, that match files and
@@ -202,6 +204,8 @@ nitpick_ignore = [
     ],
     ("py:data", "typing.Union"),
     ("py:class", "cuml.linear_model.LogisticRegression"),
+    # zarr documents it as `zarr.storage.StoreLike`, a type alias intersphinx cannot resolve
+    ("py:obj", "zarr.core.group.StoreLike"),
     *[
         ("py:class", f"anndata._core.aligned_mapping.{cls}{kind}")
         for cls in "Layers AxisArrays PairwiseArrays".split()
