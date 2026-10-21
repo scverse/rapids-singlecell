@@ -255,16 +255,17 @@ def test_group_absmax_is_exact_and_split_invariant(dtype):
 )
 @pytest.mark.parametrize("n_pcs", [50, 1023])
 @pytest.mark.parametrize("n_keys", [1, 2])
+@pytest.mark.parametrize("stabilized", [True, False])
 def test_fused_initialize_matches_reference(
-    n_clusters, force_blocks, large, n_pcs, n_keys
+    n_clusters, force_blocks, large, n_pcs, n_keys, *, stabilized
 ):
     # One unpenalized assignment pass over the update blocks: R is the
     # softmax of -2/sigma (1 - z.y), O its column sums per batch level,
     # E = Pr_b x column sums, plus the objective. Large: one block of 384
     # cells per tile slot, so tiles of six row groups, three cluster blocks.
     # Two keys: 3 x 400 levels, so runs of one joint category are about 2.5
-    # (small) or 240 cells (large).
-    if large and n_pcs > 50:
+    # (small) or 240 cells (large). Then one penalized pass (below).
+    if large and (n_pcs > 50 or not stabilized):
         pytest.skip("the float64 reference is slow")
     rng = cp.random.default_rng(7)
     n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
@@ -284,7 +285,7 @@ def test_fused_initialize_matches_reference(
     Pr_b = (cp.bincount(codes.ravel(), minlength=n_batches) / n_cells).astype(
         cp.float32
     )
-    theta = cp.full(n_batches, 2.0, dtype=cp.float32)
+    theta = 0.5 + 2 * rng.random(n_batches, dtype=cp.float32)  # per level
     n_blocks = -(-n_cells // block_size)
     n_groups = n_batches if n_keys == 1 else 1  # the tiles' groups
     n_tiles = 4 * n_sm + n_groups + 1
@@ -316,7 +317,8 @@ def test_fused_initialize_matches_reference(
     O = cp.empty((n_batches, n_clusters), cp.float32)
     E = cp.empty_like(O)
     stride = -(-n_clusters // 128) * 128
-    objective = _cl.clustering_loop(
+    loop = partial(
+        _cl.clustering_loop,
         Z,
         R=R,
         E=E,
@@ -342,21 +344,55 @@ def test_fused_initialize_matches_reference(
         n_batches=n_batches,
         n_blocks=n_blocks,
         sigma=sigma,
-        max_iter=0,
-        stabilized=True,
-        initialize=True,
+        stabilized=stabilized,
         **joint_args,
     )
-    sim = Z.astype(cp.float64) @ Y.T.astype(cp.float64)
+
+    def counts(R, codes):  # column sums of R per batch level
+        O = cp.zeros((n_batches, n_clusters))
+        cp.add.at(O, codes, R[:, None])
+        return O
+
+    def penalty(O):  # E, theta log((E + 1) / (O + E + 1)); plain: O + 1
+        E = Pr_b[:, None] * O[: levels[0]].sum(0)
+        return E, theta[:, None] * cp.log((E + 1) / (O + stabilized * E + 1))
+
+    def check(objective, R_ref, sim):
+        cp.testing.assert_allclose(R, R_ref, rtol=1e-4, atol=1e-6)
+        O_ref = counts(R_ref, codes)
+        cp.testing.assert_allclose(O, O_ref, rtol=1e-4, atol=1e-6)
+        E_ref, log_pen = penalty(O_ref)
+        cp.testing.assert_allclose(E, E_ref, rtol=1e-4)
+        # Distance + sigma entropy; the diversity is -sigma O log penalty. The
+        # objective is an exact sum, rounded to float32 once.
+        terms = R_ref * (2 * (1 - sim) + sigma * cp.log(R_ref))
+        expected = float(terms.sum() - sigma * (O_ref * log_pen).sum())
+        assert objective == pytest.approx(expected, rel=1e-6)
+
+    objective = loop(max_iter=0, initialize=True)
+    Z64 = Z.astype(cp.float64)
+    sim = Z64 @ Y.T.astype(cp.float64)
     w = cp.exp(-2 / sigma * (1 - sim))
-    R_ref = w / w.sum(1, keepdims=True)
-    cp.testing.assert_allclose(R, R_ref, rtol=1e-4, atol=1e-6)
-    O_ref = cp.stack([R_ref[(codes == b).any(1)].sum(0) for b in range(n_batches)])
-    cp.testing.assert_allclose(O, O_ref, rtol=1e-4, atol=1e-6)
-    E_ref = Pr_b[:, None].astype(cp.float64) * R_ref.sum(0)[None, :]
-    cp.testing.assert_allclose(E, E_ref, rtol=1e-4)
-    distance = (R_ref * 2 * (1 - sim)).sum()
-    entropy = (R_ref * cp.log(R_ref)).sum()
-    diversity = sigma * 2.0 * (O_ref * cp.log((O_ref + E_ref + 1) / (E_ref + 1))).sum()
-    expected = float(distance + sigma * entropy + diversity)
-    assert objective == pytest.approx(expected, rel=1e-4)
+    check(objective, w / w.sum(1, keepdims=True), sim)
+    if n_blocks == 1:
+        return  # no other block's counts, so no penalty
+    # One penalized pass from the centroids of R (seed 0: blocks in order):
+    # each block against the counts without its own, a block's new counts
+    # entering them before the block after next. A cell's log penalty sums
+    # its levels' (two keys: its joint category's).
+    R0 = R.astype(cp.float64)
+    objective = loop(max_iter=1)
+    Y = R0.T @ Z64
+    sim = Z64 @ (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).T
+    starts = block_cat_offsets[: n_blocks * n_groups + 1 : n_groups].tolist()
+    blocks = [idx_list[a:b] for a, b in zip(starts, starts[1:])]
+    old = [counts(R0[c], codes[c]) for c in blocks]
+    total, new, R_ref = sum(old), [], cp.empty_like(R0)
+    for b, c in enumerate(blocks):
+        if b >= 2:
+            total += new[b - 2] - old[b - 2]
+        log_pen = penalty(total - old[b])[1][codes[c]].sum(1)
+        w = cp.exp(-2 / sigma * (1 - sim[c]) + log_pen)
+        R_ref[c] = w / w.sum(1, keepdims=True)
+        new.append(counts(R_ref[c], codes[c]))
+    check(objective, R_ref, sim)
