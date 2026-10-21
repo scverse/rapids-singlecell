@@ -446,8 +446,8 @@ def harmonize(
     devices = devices or [cp.cuda.Device().id]
     if len(devices) > 1 and correction_method != "batched":
         warnings.warn(
-            "The fast correction runs on one GPU (it is also chosen when the "
-            "batched correction's workspace would exceed 1 GiB).",
+            "The fast correction runs on one GPU (it is also chosen when one "
+            "cluster's batched correction workspace would exceed 1 GiB).",
             UserWarning,
             stacklevel=5,
         )

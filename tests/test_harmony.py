@@ -1356,19 +1356,22 @@ def test_harmony_many_clusters(key, dtype):
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize(
-    ("key", "dtype", "n_pcs"),
+    ("key", "dtype", "n_pcs", "chunk"),
     [
-        ("batch", "float32", 17),
-        ("batch", "bfloat16", 17),
-        (["batch", "second"], "float64", 17),
-        ("batch", "float32", 300),
+        ("batch", "float32", 17, None),
+        ("batch", "bfloat16", 17, None),
+        (["batch", "second"], "float64", 17, None),
+        ("batch", "float32", 300, None),
+        ("batch", "bfloat16", 17, 7),  # batched correction, 7 clusters per pass
     ],
 )
-def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs):
+def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs, chunk):
     # Every sum is exact and the blocks and segments follow the global cell
     # order, so two GPUs give the bits of one.
     if cp.cuda.runtime.getDeviceCount() < 2:
         pytest.skip("requires two GPUs")
+    if chunk:
+        monkeypatch.setattr(harmony_module, "_batched_cluster_chunk", lambda *_: chunk)
     import rapids_singlecell._utils._multi_gpu as utils_multi_gpu
     import rapids_singlecell.preprocessing._harmony._multi_gpu as multi_gpu_module
 

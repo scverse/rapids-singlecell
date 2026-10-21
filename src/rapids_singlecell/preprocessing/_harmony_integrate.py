@@ -203,8 +203,8 @@ def harmony_integrate(
         or comma-separated string of device ids, or ``False``/``None`` for the
         current GPU. The result is bitwise identical to a run on one GPU of the
         same model. The fast correction runs on one GPU; it is also chosen
-        for ``correction_method=None`` when the batched correction would need
-        more than 1 GiB of workspace.
+        for ``correction_method=None`` when one cluster's batched correction
+        would need more than 1 GiB of workspace.
     verbose
         Whether to print the number of iterations until convergence.
 
