@@ -220,6 +220,16 @@ def harmonize(
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates = int(n_levels.size)
     n_batches = int(n_levels.sum())
+    # Several keys solve a dense float64 system over all their levels per
+    # cluster (and factor a copy); fail before the GPU work if it cannot fit.
+    system_bytes = 16 * (n_batches + 1) ** 2
+    if n_covariates > 1 and system_bytes > _CORRECTION_WORKSPACE_LIMIT_BYTES:
+        raise MemoryError(
+            f"Harmony with several batch keys solves a dense system over their "
+            f"{n_batches} levels per cluster ({system_bytes / 2**30:.1f} GiB); "
+            "reduce the number of levels (a key with about one level per cell "
+            "is not a batch variable)."
+        )
     N_b = cp.bincount(batch_codes.ravel(), minlength=n_batches).astype(Z.dtype)
     Pr_b = (N_b.reshape(-1, 1) / n_cells).astype(Z.dtype)
 
@@ -256,14 +266,16 @@ def harmonize(
     order = cp.argsort(groups.astype(cp.float64) + keys)
     del keys
     Z = _sorted_device_copy(Z, order)
+    groups = groups[order]
     # Only one batch key reads the batch codes (as the block draw's groups).
-    cats = cats[order] if n_covariates == 1 else None
-    # Sorted groups: offsets from the group sizes, cells in order.
-    group_offsets = cp.zeros(n_groups + 1, dtype=cp.int32)
-    group_offsets[1:] = cp.cumsum(cp.bincount(groups, minlength=n_groups))
+    cats = groups if n_covariates == 1 else None
+    joint_codes = groups if n_covariates > 1 else None
+    # Sorted groups: offsets by binary search (a histogram's scratch grows
+    # with the number of groups), cells in order.
+    group_offsets = cp.searchsorted(
+        groups, cp.arange(n_groups + 1, dtype=groups.dtype)
+    ).astype(cp.int32)
     cell_indices = cp.arange(n_cells, dtype=cp.int32)
-    if n_covariates > 1:
-        joint_codes = joint_codes[order]
     del batch_codes, groups
     host_offsets = cp.asnumpy(group_offsets)
     rhs_bounds = _rhs_bounds(Z, host_offsets)
@@ -274,16 +286,6 @@ def harmonize(
         n_clusters = int(min(100, n_cells / 30))
         n_clusters = max(n_clusters, 2)
     n_clusters = operator.index(n_clusters)
-    # Several keys solve a dense float64 system over all their levels per
-    # cluster (and factor a copy); fail before any GPU work if it cannot fit.
-    system_bytes = 16 * (n_batches + 1) ** 2
-    if n_covariates > 1 and system_bytes > _CORRECTION_WORKSPACE_LIMIT_BYTES:
-        raise MemoryError(
-            f"Harmony with several batch keys solves a dense system over their "
-            f"{n_batches} levels per cluster ({system_bytes / 2**30:.1f} GiB); "
-            "reduce the number of levels (a key with about one level per cell "
-            "is not a batch variable)."
-        )
 
     theta_array = _get_theta_array(theta, n_levels, Z.dtype)
     if tau > 0:
