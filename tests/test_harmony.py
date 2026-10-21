@@ -314,6 +314,10 @@ def test_harmony_dtype_none_keeps_the_input_dtype():
     expected = _integrate(np.float32, max_iter_harmony=2)
     assert _integrate(None, max_iter_harmony=2).tobytes() == expected.tobytes()
     assert _integrate(">f4", max_iter_harmony=2).tobytes() == expected.tobytes()
+    X = _repeatability_adata(np.float64).obsm["X_pca"]
+    expected = _integrate(np.float64, X_pca=X)
+    for data in (pd.DataFrame(X, index=np.arange(len(X)).astype(str)), X.astype(">f8")):
+        assert _integrate(None, X_pca=data).tobytes() == expected.tobytes()
 
 
 def test_harmony_accepts_huge_finite_values():

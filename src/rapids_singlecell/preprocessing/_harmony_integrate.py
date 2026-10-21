@@ -259,7 +259,9 @@ def harmony_integrate(
     # Get the input data
     input_data = adata.obsm[basis]
     if dtype is None:  # the input's float type, as in earlier releases
-        dtype = np.dtype(getattr(input_data, "dtype", np.float32))
+        if not hasattr(input_data, "dtype"):  # e.g. a pandas DataFrame
+            input_data = np.asarray(input_data)
+        dtype = np.dtype(input_data.dtype).newbyteorder("=")
         if dtype not in (np.float32, np.float64):
             dtype = np.dtype(np.float32)
 
