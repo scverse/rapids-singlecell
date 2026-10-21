@@ -6,6 +6,8 @@
 // others' values fit the receive slot, every GPU copies and adds them; larger
 // sums go in P pieces: GPU r adds piece r of every GPU's values, then copies
 // the others' summed pieces (2 (P-1)/P instead of P-1 times the values).
+// Sums over cells sorted by group move only each GPU's groups, and values
+// split between the GPUs only each GPU's part (allgather).
 // Integer sums are exact in any order, so all GPUs hold the bits of a
 // single-GPU run. The caller allocates all buffers.
 
@@ -17,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace harmony_comm {
@@ -32,6 +35,7 @@ struct Comm {
     std::vector<Rank> ranks;
     size_t capacity;  // values per exchange (send slot)
     bool peer;
+    std::vector<size_t> groups;  // per GPU: first and end group of its cells
     std::atomic<int> arrived{0};
     std::atomic<unsigned> generation{0};
     std::atomic<bool> aborted{false};  // a rank failed: release the others
@@ -39,10 +43,15 @@ struct Comm {
     // buffers: per rank send[0], send[1] (device, or pinned host without
     // peer copies), recv[0], recv[1] (device).
     Comm(const std::vector<int>& devices, const std::vector<uintptr_t>& buffers,
-         size_t capacity, bool peer)
-        : ranks(devices.size()), capacity(capacity), peer(peer) {
-        if (buffers.size() != 4 * devices.size())
-            throw std::invalid_argument("harmony comm: 4 buffers per GPU");
+         size_t capacity, bool peer, const std::vector<size_t>& groups)
+        : ranks(devices.size()),
+          capacity(capacity),
+          peer(peer),
+          groups(groups) {
+        if (buffers.size() != 4 * devices.size() ||
+            groups.size() != 2 * devices.size())
+            throw std::invalid_argument(
+                "harmony comm: 4 buffers and 2 group bounds per GPU");
         int previous;
         cudaGetDevice(&previous);
         for (size_t r = 0; r < devices.size(); ++r) {
@@ -179,6 +188,71 @@ inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
     if (!comm || comm->ranks.size() < 2) return;
     for (size_t i = 0; i < n; i += comm->capacity)
         exchange(comm, rank, data + i, std::min(comm->capacity, n - i), stream);
+}
+
+// Every GPU's data (stream-ordered) gets values range(r) = {lo, hi} of GPU r
+// (disjoint ranges): per exchange every GPU stages the next `capacity` values
+// of its range and copies the others' through its receive slot. Read data
+// with a kernel, or synchronize before freeing it.
+template <typename Range>
+inline void allgather(Comm* comm, int rank, long long* data, Range range,
+                      cudaStream_t stream) {
+    if (!comm || comm->ranks.size() < 2) return;
+    auto& me = comm->ranks[rank];
+    size_t c = comm->capacity, n_rounds = 0;
+    for (int r = 0; r < (int)comm->ranks.size(); ++r)
+        n_rounds =
+            std::max(n_rounds, (range(r).second - range(r).first + c - 1) / c);
+    for (size_t w = 0; w < n_rounds; ++w) {
+        auto piece = [&](int r) {
+            auto [lo, hi] = range(r);
+            lo = std::min(hi, lo + w * c);
+            return std::pair{lo, std::min(hi, lo + c)};
+        };
+        int slot = me.count++ & 1;  // see exchange
+        for (auto& peer : comm->ranks)
+            cudaStreamWaitEvent(stream, peer.read[slot]);
+        auto [lo, hi] = piece(rank);
+        Comm::check(cudaMemcpyAsync(me.send[slot], data + lo,
+                                    (hi - lo) * sizeof(long long),
+                                    cudaMemcpyDefault, stream));
+        Comm::check(cudaEventRecord(me.sent[slot], stream));
+        comm->barrier();
+        for (int r = 0; r < (int)comm->ranks.size(); ++r) {
+            if (r == rank) continue;
+            auto [a, b] = piece(r);
+            cudaStreamWaitEvent(stream, comm->ranks[r].sent[slot]);
+            comm->pull(rank, r, me.recv[slot], comm->ranks[r].send[slot], b - a,
+                       stream);
+            Comm::check(cudaMemcpyAsync(data + a, me.recv[slot],
+                                        (b - a) * sizeof(long long),
+                                        cudaMemcpyDeviceToDevice, stream));
+        }
+        Comm::check(cudaEventRecord(me.read[slot], stream));
+    }
+}
+
+// Sums of group-major rows of n values over cells sorted by group, zero
+// outside each GPU's groups (Comm::groups): the groups straddling GPUs are
+// summed (allreduce), then every GPU copies the rows from each GPU's first
+// group to the next one's (about (P-1)/P of the rows instead of P-1 times).
+inline void allgather_groups(Comm* comm, int rank, long long* data, size_t n,
+                             cudaStream_t stream) {
+    if (!comm || comm->ranks.size() < 2) return;
+    const auto& g = comm->groups;
+    size_t n_ranks = comm->ranks.size(), summed = SIZE_MAX;
+    for (size_t r = 1; r < n_ranks; ++r)
+        if (g[2 * r] < g[2 * r - 1] && g[2 * r] != summed) {
+            summed = g[2 * r];
+            allreduce(comm, rank, data + summed * n, n, stream);
+        }
+    allgather(
+        comm, rank, data,
+        [&](size_t r) {
+            size_t end = r + 1 < n_ranks ? g[2 * r + 2] : g[2 * r + 1];
+            return std::pair{g[2 * r] * n, end * n};
+        },
+        stream);
 }
 
 }  // namespace harmony_comm

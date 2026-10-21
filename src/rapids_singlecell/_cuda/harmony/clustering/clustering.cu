@@ -690,8 +690,8 @@ static void register_joint_counts(nb::module_& m) {
                     seg_group.data(), n_seg, scales.count,
                     reinterpret_cast<unsigned long long*>(acc.data()));
             CUDA_CHECK_LAST_ERROR(segment_counts_kernel);
-            harmony_comm::allreduce((harmony_comm::Comm*)comm, rank, acc.data(),
-                                    n, s);
+            harmony_comm::allgather_groups((harmony_comm::Comm*)comm, rank,
+                                           acc.data(), K, s);
             update_counts_kernel<T>
                 <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D,
                    0, s>>>(acc.data(), nullptr, nullptr, nullptr, nullptr,
@@ -702,6 +702,31 @@ static void register_joint_counts(nb::module_& m) {
         nb::kw_only(), "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
         "out"_a.noconvert(), "acc"_a.noconvert(), "n_total"_a = 0,
         "stream"_a = 0, "comm"_a = 0, "rank"_a = 0);
+}
+
+// data (rows x n int64) on every GPU of comm: GPU r's rows starts[r] ..
+// starts[r + 1] are copied to the others.
+template <typename Device>
+static void register_allgather_rows(nb::module_& m) {
+    m.def(
+        "allgather_rows",
+        [](gpu_array_c<long long, Device> data,
+           const std::vector<size_t>& starts, std::uintptr_t stream,
+           std::uintptr_t comm, int rank) {
+            auto* c = (harmony_comm::Comm*)comm;
+            size_t n = data.ndim() == 2 ? data.shape(1) : 1;
+            if (c && (starts.size() != c->ranks.size() + 1 ||
+                      starts.back() > data.shape(0)))
+                throw std::invalid_argument("allgather_rows: bad starts");
+            harmony_comm::allgather(
+                c, rank, data.data(),
+                [&](int r) {
+                    return std::pair{starts[r] * n, starts[r + 1] * n};
+                },
+                (cudaStream_t)stream);
+        },
+        nb::call_guard<nb::gil_scoped_release>(), "data"_a.noconvert(),
+        nb::kw_only(), "starts"_a, "stream"_a = 0, "comm"_a = 0, "rank"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -856,6 +881,9 @@ void register_bindings(nb::module_& m) {
         "itemsize"_a = 4);
     register_clustering_loop<float, Device>(m);
     register_clustering_loop<double, Device>(m);
+    register_joint_counts<float, Device>(m);
+    register_joint_counts<double, Device>(m);
+    register_allgather_rows<Device>(m);
     register_kmeans<float, Device>(m);
     register_kmeans<double, Device>(m);
 }
@@ -865,8 +893,8 @@ NB_MODULE(_harmony_clustering_cuda, m) {
     using harmony_comm::Comm;
     nb::class_<Comm>(m, "Comm")
         .def(nb::init<const std::vector<int>&, const std::vector<uintptr_t>&,
-                      size_t, bool>(),
-             "devices"_a, "buffers"_a, "capacity"_a, "peer"_a)
+                      size_t, bool, const std::vector<size_t>&>(),
+             "devices"_a, "buffers"_a, "capacity"_a, "peer"_a, "groups"_a)
         .def_prop_ro("handle", [](Comm& c) { return (uintptr_t)&c; })
         .def("abort", [](Comm& c) { c.aborted = true; })
         .def("synchronize", &Comm::synchronize,

@@ -956,6 +956,11 @@ def _repeatability_adata(dtype, n_pcs=17):
                 "second": (ordinal // 5) % 3,
                 "third": (ordinal // 15) % 2,
                 "fine": ordinal % 37,  # with batch: runs of ~2.6 cells
+                "many": ordinal % 300,  # with batch: 306 levels
+                # One level on every shard of multi_gpu, and an empty one.
+                "skewed": pd.Categorical(
+                    np.where(ordinal % 10, "a", "c"), categories=["a", "b", "c"]
+                ),
             },
             index=ordinal.astype(str),
         ),
@@ -1364,6 +1369,7 @@ def test_harmony_many_clusters(key, dtype):
         (["batch", "second"], "float64", 17, None),
         ("batch", "float32", 300, None),
         ("batch", "bfloat16", 17, 7),  # batched correction, 7 clusters per pass
+        (["batch", "many"], "float32", 17, None),  # systems split between the GPUs
     ],
 )
 def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs, chunk):
@@ -1383,6 +1389,7 @@ def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs, chunk
         index=np.arange(n_cells).astype(str),
     )
     X = rng.standard_normal((n_cells, n_pcs)) + obs["batch"].to_numpy()[:, None]
+    obs["many"] = rng.integers(0, 300, n_cells)
 
     def run(device_input=None, **kwargs):
         adata = ad.AnnData(obs=obs.astype("category"), obsm={"X_pca": X.copy()})
@@ -1473,6 +1480,8 @@ def _record_ranks(monkeypatch) -> list:
         ("batch", 300, np.float32, 7),
         (["batch", "second"], 17, np.float32, 300),  # cluster blocks
         (["batch", "fine"], 17, np.float32, 7),  # joint runs of ~2.6 cells
+        (["batch", "many"], 17, np.float32, 7),  # systems split between GPUs
+        ("skewed", 17, np.float32, 7),  # a batch on every shard, an empty one
     ],
 )
 @pytest.mark.parametrize("n_ranks", [2, 3])
@@ -1508,7 +1517,7 @@ def test_harmony_two_ranks_on_one_gpu(
     # Exchanges larger than a slot go in pieces.
     monkeypatch.setattr(harmony_module, "_COMM_VALUES", 100)
     assert run(several).tobytes() == one.tobytes()
-    if key == "batch":
+    if isinstance(key, str):
         with pytest.warns(UserWarning, match="fast correction runs on one GPU"):
             run(several, correction_method="fast")
         assert len(ranks) == 2  # no third exchange
@@ -1519,7 +1528,17 @@ def test_harmony_two_ranks_on_one_gpu(
         monkeypatch.setattr(
             harmony_module, "_multi_correction_cluster_chunk_size", lambda **_: 2
         )
-        assert run(several).tobytes() == run([0]).tobytes()
+        solved, solve = [], harmony_module._solve_spd_batched
+        monkeypatch.setattr(
+            harmony_module,
+            "_solve_spd_batched",
+            lambda gram, rhs: solved.append(len(gram)) or solve(gram, rhs),
+        )
+        one = run([0])
+        on_one, solved[:] = sum(solved), []
+        assert run(several).tobytes() == one.tobytes()
+        if key[1] == "many":  # each GPU solves its share of the systems
+            assert sum(solved) == on_one
     # Without peer copies (pinned host send slots), in several upload chunks
     # per shard: scattered rows, and runs of rows from input sorted by batch.
     monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)

@@ -65,8 +65,8 @@ static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
                                              seg_start, seg_group, n_seg,
                                              bounds, acc, limbs, stream),
                "segment sums");
-    harmony_comm::allreduce(
-        comm, rank, acc, (size_t)n_groups * limbs * n_clusters * n_pcs, stream);
+    harmony_comm::allgather_groups(comm, rank, acc,
+                                   (size_t)limbs * n_clusters * n_pcs, stream);
     cuda_check(harmony_segments::finalize_rtz(acc, n_groups, n_pcs, n_clusters,
                                               limbs, bounds, out, group_stride,
                                               ld_out, stream),

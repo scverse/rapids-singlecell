@@ -77,11 +77,12 @@ def _gather_rows(
     return rows[0] if len(rows) == 1 else cp.concatenate(rows)
 
 
-def _comm(devices: list[int], capacity: int, *, peer: bool):
+def _comm(devices: list[int], capacity: int, *, peer: bool, groups: list[int]):
     """The exchange of int64 sums across ``devices`` and its buffers, which
     must outlive it: per GPU two send slots (device memory, or pinned host
     memory without peer copies) and two receive slots of capacity + one value
-    per GPU (comm.cuh sums what would not fit in pieces)."""
+    per GPU (comm.cuh sums what would not fit in pieces). ``groups``: first
+    and end group of each GPU's cells (sorted by group)."""
     buffers = []
     for device in devices:
         with cp.cuda.Device(device):
@@ -94,4 +95,4 @@ def _comm(devices: list[int], capacity: int, *, peer: bool):
             for _ in range(2):
                 buffers.append(cp.empty(capacity + len(devices), dtype=cp.int64))
     pointers = [b.data.ptr if isinstance(b, cp.ndarray) else b.ptr for b in buffers]
-    return _clustering_cuda.Comm(devices, pointers, capacity, peer), buffers
+    return _clustering_cuda.Comm(devices, pointers, capacity, peer, groups), buffers
