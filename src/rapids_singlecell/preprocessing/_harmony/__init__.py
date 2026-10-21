@@ -137,13 +137,14 @@ def harmonize(
         Discounting factor on ``theta``. By default, there is no discounting.
 
     correction_method
-        ``batched`` corrects all clusters at once from exact right-hand sides,
-        ``fast`` one cluster at a time in bounded memory. With one key, ``None`` automatically selects ``batched``
-        unless its workspace would exceed 1 GiB, in which case ``fast`` is
-        used. Multiple keys use the exact general-design solve and process
-        clusters in workspace-bounded chunks when needed. For multiple keys,
-        ``None`` and ``batched`` select this solve; ``fast`` is ignored with a
-        warning.
+        ``batched`` corrects from exact right-hand sides, as many clusters per
+        pass as fit in 1 GiB of workspace, ``fast`` one cluster at a time in
+        bounded memory. With one key, ``None`` automatically selects
+        ``batched`` unless one cluster's workspace would exceed 1 GiB, in
+        which case ``fast`` is used. Multiple keys use the exact
+        general-design solve and process clusters in workspace-bounded chunks
+        when needed. For multiple keys, ``None`` and ``batched`` select this
+        solve; ``fast`` is ignored with a warning.
 
     colsum_algo
         No effect: column sums come from the fused clustering kernels. Kept
@@ -340,16 +341,10 @@ def harmonize(
             )
         correction_method = "batched"  # several keys: the multi-key solve
 
-    # One key: the batched correction unless its workspace is too large.
+    # One key: the batched correction unless one cluster's workspace is too large.
     if correction_method is None:
-        # Right-hand sides, coefficients and their exact sums (_correction_batched).
-        itemsize = Z.dtype.itemsize
-        batched_bytes = (
-            n_clusters * n_batches * Z.shape[1] * (2 * itemsize + 8 * _limbs(itemsize))
-        )
-        correction_method = (
-            "batched" if batched_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
-        )
+        fit = _batched_cluster_chunk(Z.shape[1], n_batches, Z.dtype.itemsize)
+        correction_method = "batched" if fit else "fast"
 
     # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
     # generator collapses into an integer here; the per-iteration offset keeps
@@ -1170,6 +1165,7 @@ def _correction_fast(
         R_col=cp.empty(n_cells, dtype=dtype),
         S=cp.empty((nb1, n_pcs), dtype=dtype),
         W=cp.empty((nb1, n_pcs), dtype=dtype),
+        beta=cp.empty(n_pcs, dtype=cp.float64),
         stream=cp.cuda.get_current_stream().ptr,
     )
     return Z
@@ -1186,32 +1182,50 @@ def _correction_batched(
     normalize: bool = False,
 ) -> cp.ndarray:
     """
-    Batched correction of cells sorted by batch, all clusters at once:
-    right-hand sides and the correction over ``segments`` (see _segments,
-    plus the right-hand side bounds).
+    Batched correction of cells sorted by batch, as many clusters per pass as
+    fit in 1 GiB of workspace: right-hand sides and the correction over
+    ``segments`` (see _segments, plus the right-hand side bounds).
     """
     seg_start, seg_group, bounds = segments
     n_pcs, n_clusters, n_batches = X.shape[1], R.shape[1], len(bounds)
     dtype = X.dtype
+    chunk = _batched_cluster_chunk(n_pcs, n_batches, dtype.itemsize)
+    chunk = -(-n_clusters // -(-n_clusters // max(1, chunk)))  # balanced
     Z = _correction_output(X, output)
-    _correction_batched_cuda.correction_batched(
-        X,
-        **_assignment_args(R, X.dtype),
-        O=O,
-        lambda_kb=lambda_kb,
-        seg_start=seg_start,
-        seg_group=seg_group,
-        bounds=bounds,
-        Z=Z,
-        S=cp.empty((n_clusters, n_batches, n_pcs), dtype=dtype),
-        W=cp.empty((n_clusters, n_batches, n_pcs), dtype=dtype),
-        rhs_acc=cp.empty(
-            (n_batches, _limbs(dtype.itemsize), n_clusters, n_pcs), dtype=cp.int64
-        ),
-        normalize=normalize,
-        stream=cp.cuda.get_current_stream().ptr,
+    S = cp.empty((chunk, n_batches, n_pcs), dtype=dtype)
+    W = cp.empty_like(S)
+    rhs_acc = cp.empty(
+        (n_batches, _limbs(dtype.itemsize), chunk, n_pcs), dtype=cp.int64
     )
+    # Each chunk continues the sums of the earlier clusters in Z.
+    for start in range(0, n_clusters, chunk):
+        n = min(chunk, n_clusters - start)
+        _correction_batched_cuda.correction_batched(
+            X,
+            **_assignment_args(R, X.dtype),
+            O=O,
+            lambda_kb=lambda_kb,
+            seg_start=seg_start,
+            seg_group=seg_group,
+            bounds=bounds,
+            Z=Z,
+            S=S[:n],
+            W=W[:n],
+            rhs_acc=rhs_acc,
+            normalize=normalize,
+            cluster_start=start,
+            resume=start > 0,
+            finish=start + n == n_clusters,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
     return Z
+
+
+def _batched_cluster_chunk(n_pcs: int, n_batches: int, itemsize: int) -> int:
+    """Clusters per pass of the batched correction whose right-hand sides,
+    coefficients and exact sums fit in 1 GiB (0: not even one)."""
+    per_cluster = n_batches * n_pcs * (2 * itemsize + 8 * _limbs(itemsize))
+    return _CORRECTION_WORKSPACE_LIMIT_BYTES // per_cluster
 
 
 def _is_convergent_harmony(objectives_harmony: list, tol: float) -> bool:

@@ -387,22 +387,32 @@ def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize(
     ("method", "normalize"),
-    [("batched", False), ("batched", True), ("fast", False)],
+    [("batched", False), ("batched", True), ("fast", False), ("chunks", True)],
 )
 @pytest.mark.parametrize(
-    ("n_cells", "n_pcs", "n_clusters"),
+    ("n_cells", "n_pcs", "n_clusters", "n_batches"),
     # The large case has counts ~2e5 against lambda < 1 (harmony1-like): an
-    # explicit inverse loses the solution to cancellation there.
-    [(40, 5, 3), (3000, 50, 100), (3000, 300, 300), (1_500_000, 8, 2)],
+    # explicit inverse loses the solution to cancellation there. 300 batches:
+    # the intercept sums run over several tiles of batches.
+    [
+        (40, 5, 3, 4),
+        (3000, 50, 100, 4),
+        (3000, 300, 300, 4),
+        (1_500_000, 8, 2, 4),
+        (1500, 300, 3, 300),
+    ],
 )
 def test_harmony_correction_matches_dense_design(
-    dtype, *, method, normalize, n_cells, n_pcs, n_clusters
+    dtype, *, method, normalize, n_cells, n_pcs, n_clusters, n_batches, monkeypatch
 ):
+    if method == "chunks":  # batched, one cluster per pass (odd offsets too)
+        monkeypatch.setattr(harmony_module, "_batched_cluster_chunk", lambda *_: 1)
+        method = "batched"
     rng = np.random.default_rng(734)
-    n_batches = 4
     np_dtype = np.dtype(dtype)
     # Cells sorted by batch; batch 2 is empty.
-    cats_np = np.sort(rng.choice([0, 1, 3], size=n_cells)).astype(np.int32)
+    levels = np.delete(np.arange(n_batches), 2)
+    cats_np = np.sort(rng.choice(levels, size=n_cells)).astype(np.int32)
     X_np = rng.normal(size=(n_cells, n_pcs)).astype(np_dtype)
     R_np = rng.random(size=(n_cells, n_clusters)).astype(np_dtype)
     R_np /= R_np.sum(axis=1, keepdims=True)
@@ -1073,6 +1083,28 @@ def test_harmony_small_host_input_stages_its_rows(monkeypatch):
     )
     _integrate(X_pca=_repeatability_adata(np.float32).obsm["X_pca"])
     assert rows and max(rows) <= 480
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
+def test_harmony_auto_batched_in_cluster_chunks(monkeypatch, dtype):
+    # The batched workspace of 3 of the 7 clusters (37 batches x 17 PCs x 16
+    # bytes each) fits the limit: no fast correction, chunks of 3 clusters.
+    monkeypatch.setattr(
+        harmony_module, "_CORRECTION_WORKSPACE_LIMIT_BYTES", 3 * 37 * 17 * 16
+    )
+    monkeypatch.setattr(harmony_module, "_correction_fast", None)
+    starts = []
+    batched = harmony_module._correction_batched_cuda.correction_batched
+    monkeypatch.setattr(
+        harmony_module._correction_batched_cuda,
+        "correction_batched",
+        lambda *a, **k: starts.append(k["cluster_start"]) or batched(*a, **k),
+    )
+    auto = _integrate(dtype, key="fine")
+    assert starts[:3] == [0, 3, 6]
+    forced = _integrate(dtype, key="fine", correction_method="batched")
+    assert auto.tobytes() == forced.tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

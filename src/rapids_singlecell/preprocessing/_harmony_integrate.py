@@ -160,13 +160,15 @@ def harmony_integrate(
         Set to ``None`` to disable pruning.
     correction_method
         Method for the correction step. Both solve the ridge regressions in
-        closed form. ``"batched"`` corrects all clusters at once from exact
-        right-hand sides and normalizes in the same pass; its workspace grows
-        with clusters x batches x components. ``"fast"`` corrects one cluster
-        at a time with the least workspace (float right-hand sides, a separate
-        normalization pass, one GPU with ``multi_gpu``).
-        With one key, ``None`` automatically selects ``"batched"`` unless its
-        workspace would exceed 1 GiB, in which case ``"fast"`` is used.
+        closed form. ``"batched"`` corrects from exact right-hand sides, as
+        many clusters per pass as fit in 1 GiB of workspace (clusters x
+        batches x components), and normalizes in the same pass. ``"fast"``
+        corrects one cluster at a time with the least workspace (float
+        right-hand sides, a separate normalization pass, one GPU with
+        ``multi_gpu``).
+        With one key, ``None`` automatically selects ``"batched"`` unless one
+        cluster's workspace would exceed 1 GiB, in which case ``"fast"`` is
+        used.
         Multiple keys always use the exact general-design solve because the
         arrowhead optimization applies only to one batch variable; clusters are
         processed in workspace-bounded chunks when needed. For multiple keys,

@@ -138,34 +138,32 @@ static void apply_multi_impl(const T* X, const T* R, int ldr, const T* W_all,
         "multi-key apply");
 }
 
-// Batched correction of cells sorted by batch, all clusters at once. The
+// Batched correction of cells sorted by batch, clusters k0 .. k0 + n_k - 1
+// (all at once, or in chunks: resume / finish as in apply_rows). The
 // right-hand sides S_b = R_b^T X_b are exact sums over segments
-// (segment_gemm.cuh; bounds[b][d]: exponent of n_b max|X_bd|), the coefficients
-// the closed form of ridge_coefficients_kernel; Z = X - R_i W[batch] is applied
-// row by row and normalized on request (apply_rows.cuh), so results do not
-// depend on how the cells are split. S and W are (n_clusters, n_batches,
-// n_pcs).
+// (segment_gemm.cuh; bounds[b][d]: exponent of n_b max|X_bd|), the
+// coefficients the closed form of ridge_coefficients; Z = X - R_i W[batch] is
+// applied row by row and normalized on request (apply_rows.cuh), so results do
+// not depend on how the cells are split. S and W are (n_k, n_batches, n_pcs).
 template <typename T, typename RT>
-static void correction_batched_impl(const T* X, const RT* R, const T* O,
-                                    const T* lambda_kb, int n_pcs,
-                                    int n_clusters, const int* seg_start,
-                                    const int* seg_group, int n_seg,
-                                    int n_batches, const short* bounds, T* Z,
-                                    T* S, T* W, long long* rhs_acc,
-                                    bool normalize, cudaStream_t stream) {
+static void correction_batched_impl(
+    const T* X, const RT* R, const T* O, const T* lambda_kb, int n_pcs,
+    int n_clusters, int k0, int n_k, const int* seg_start, const int* seg_group,
+    int n_seg, int n_batches, const short* bounds, T* Z, T* S, T* W,
+    long long* rhs_acc, bool normalize, bool resume, bool finish,
+    cudaStream_t stream) {
     long long s_cluster = (long long)n_batches * n_pcs;
-    segment_sums(X, R, n_clusters, n_pcs, n_clusters, seg_start, seg_group,
-                 n_seg, n_batches, bounds, rhs_acc, S, n_pcs, (int)s_cluster,
-                 stream);
-    ridge_coefficients_kernel<T>
-        <<<strided_grid((long long)n_clusters * n_pcs, BLOCK_DIM_1D),
-           BLOCK_DIM_1D, 0, stream>>>(O, lambda_kb, S, W, s_cluster, n_batches,
-                                      n_clusters, n_pcs, 0, n_clusters);
-    CUDA_CHECK_LAST_ERROR(ridge_coefficients_kernel);
-    cuda_check(harmony_apply::apply_rows(
-                   X, R, n_clusters, W, s_cluster, n_pcs, n_pcs, n_clusters,
-                   seg_start, seg_group, n_seg, normalize, Z, stream),
-               "correction apply");
+    segment_sums(X, R + k0, n_clusters, n_pcs, n_k, seg_start, seg_group, n_seg,
+                 n_batches, bounds, rhs_acc, S, n_pcs, (int)s_cluster, stream);
+    // rhs_acc (summed into S) holds the intercepts
+    ridge_coefficients(O, lambda_kb, S, W, reinterpret_cast<double*>(rhs_acc),
+                       s_cluster, n_batches, n_clusters, n_pcs, k0, n_k,
+                       stream);
+    cuda_check(
+        harmony_apply::apply_rows(X, R + k0, n_clusters, W, s_cluster, n_pcs,
+                                  n_pcs, n_k, seg_start, seg_group, n_seg,
+                                  normalize, Z, stream, resume, finish),
+        "correction apply");
 }
 
 // ---- nanobind registration ----
@@ -213,11 +211,15 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<T, Device> Z, gpu_array_c<T, Device> S,
            gpu_array_c<T, Device> W, gpu_array_c<long long, Device> rhs_acc,
            bool normalize, std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
-           std::uintptr_t stream) {
+           int cluster_start, bool resume, bool finish, std::uintptr_t stream) {
+            // S: the clusters of this call, from cluster_start
             int n_pcs = (int)X.shape(1), n_clusters = (int)R.shape(1),
-                n_batches = bound_groups(bounds, n_pcs);
+                n_k = (int)S.shape(0), n_batches = bound_groups(bounds, n_pcs);
             size_t limbs = sizeof(T) == 4 ? 1 : 2,
-                   n_coef = (size_t)n_batches * n_clusters * n_pcs;
+                   n_coef = (size_t)n_batches * n_k * n_pcs;
+            if (S.ndim() != 3 || cluster_start < 0 ||
+                cluster_start + n_k > n_clusters)
+                throw std::invalid_argument("correction_batched: bad clusters");
             if (rhs_acc.size() < limbs * n_coef || S.size() < n_coef ||
                 W.size() < n_coef || seg_group.size() + 1 != seg_start.size())
                 throw std::invalid_argument(
@@ -225,9 +227,10 @@ static void register_correction_batched(nb::module_& m) {
             auto run = [&](auto* r) {
                 correction_batched_impl<T>(
                     X.data(), r, O.data(), lambda_kb.data(), n_pcs, n_clusters,
-                    seg_start.data(), seg_group.data(), (int)seg_group.size(),
-                    n_batches, bounds.data(), Z.data(), S.data(), W.data(),
-                    rhs_acc.data(), normalize, (cudaStream_t)stream);
+                    cluster_start, n_k, seg_start.data(), seg_group.data(),
+                    (int)seg_group.size(), n_batches, bounds.data(), Z.data(),
+                    S.data(), W.data(), rhs_acc.data(), normalize, resume,
+                    finish, (cudaStream_t)stream);
             };
             if (!R_bf16) return run(R.data());
             if constexpr (std::is_same_v<T, float>)
@@ -240,6 +243,7 @@ static void register_correction_batched(nb::module_& m) {
         "seg_group"_a.noconvert(), "bounds"_a.noconvert(), "Z"_a.noconvert(),
         "S"_a.noconvert(), "W"_a.noconvert(), "rhs_acc"_a.noconvert(),
         "normalize"_a = false, "R_bf16"_a.noconvert() = nb::none(),
+        "cluster_start"_a = 0, "resume"_a = false, "finish"_a = true,
         "stream"_a = 0);
 
     m.def(
