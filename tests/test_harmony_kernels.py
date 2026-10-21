@@ -300,7 +300,7 @@ def test_fused_initialize_matches_reference(
             "n_first": levels[0],
         }
     _cl.draw_blocks(
-        codes[:, 0] if n_keys == 1 else cp.zeros(n_cells, cp.int32),
+        codes[:, 0].astype(cp.int32) if n_keys == 1 else cp.zeros(n_cells, cp.int32),
         idx_list=idx_list,
         block_cat_offsets=block_cat_offsets,
         idx_list_alt=cp.empty(n_cells, cp.int32),

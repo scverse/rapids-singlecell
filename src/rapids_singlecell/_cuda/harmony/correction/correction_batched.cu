@@ -198,8 +198,8 @@ static void register_correction_batched(nb::module_& m) {
                     seg_group.data(), out.data());
             CUDA_CHECK_LAST_ERROR(group_absmax_kernel);
         },
-        "X"_a, nb::kw_only(), "seg_start"_a, "seg_group"_a, "out"_a,
-        "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "seg_start"_a.noconvert(),
+        "seg_group"_a.noconvert(), "out"_a.noconvert(), "stream"_a = 0);
 
     m.def(
         "correction_batched",
@@ -235,9 +235,12 @@ static void register_correction_batched(nb::module_& m) {
                     reinterpret_cast<const __nv_bfloat16*>(R_bf16->data()));
             throw std::invalid_argument("bfloat16 assignments require float32");
         },
-        "X"_a, nb::kw_only(), "R"_a, "O"_a, "lambda_kb"_a, "seg_start"_a,
-        "seg_group"_a, "bounds"_a, "Z"_a, "S"_a, "W"_a, "rhs_acc"_a,
-        "normalize"_a = false, "R_bf16"_a = nb::none(), "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(), "O"_a.noconvert(),
+        "lambda_kb"_a.noconvert(), "seg_start"_a.noconvert(),
+        "seg_group"_a.noconvert(), "bounds"_a.noconvert(), "Z"_a.noconvert(),
+        "S"_a.noconvert(), "W"_a.noconvert(), "rhs_acc"_a.noconvert(),
+        "normalize"_a = false, "R_bf16"_a.noconvert() = nb::none(),
+        "stream"_a = 0);
 
     m.def(
         "prepare_multi",
@@ -270,11 +273,14 @@ static void register_correction_batched(nb::module_& m) {
                 gram.data(), rhs.data(), joint_rhs.data(), acc.data(),
                 (cudaStream_t)stream);
         },
-        "X"_a, nb::kw_only(), "R"_a, "joint_O"_a, "joint_cats"_a,
-        "marginal_joint_offsets"_a, "marginal_joint_indices"_a, "lambda_kb"_a,
-        "active_mask"_a, "n_batches"_a, "n_first"_a, "seg_start"_a,
-        "seg_group"_a, "bounds"_a, "gram"_a, "rhs"_a, "joint_rhs"_a, "acc"_a,
-        "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(),
+        "joint_O"_a.noconvert(), "joint_cats"_a.noconvert(),
+        "marginal_joint_offsets"_a.noconvert(),
+        "marginal_joint_indices"_a.noconvert(), "lambda_kb"_a.noconvert(),
+        "active_mask"_a.noconvert(), "n_batches"_a, "n_first"_a,
+        "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
+        "bounds"_a.noconvert(), "gram"_a.noconvert(), "rhs"_a.noconvert(),
+        "joint_rhs"_a.noconvert(), "acc"_a.noconvert(), "stream"_a = 0);
 
     m.def(
         "apply_multi",
@@ -295,9 +301,11 @@ static void register_correction_batched(nb::module_& m) {
                 normalize, resume, finish, W_joint.data(), Z.data(),
                 (cudaStream_t)stream);
         },
-        "X"_a, nb::kw_only(), "R"_a, "W_all"_a, "joint_cats"_a, "n_batches"_a,
-        "seg_start"_a, "seg_group"_a, "normalize"_a, "W_joint"_a, "Z"_a,
-        "resume"_a = false, "finish"_a = true, "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(),
+        "W_all"_a.noconvert(), "joint_cats"_a.noconvert(), "n_batches"_a,
+        "seg_start"_a.noconvert(), "seg_group"_a.noconvert(), "normalize"_a,
+        "W_joint"_a.noconvert(), "Z"_a.noconvert(), "resume"_a = false,
+        "finish"_a = true, "stream"_a = 0);
 }
 
 template <typename Device>

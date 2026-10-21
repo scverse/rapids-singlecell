@@ -195,6 +195,7 @@ def harmonize(
         tol_harmony = stopping[2]
 
     max_iter_harmony = operator.index(max_iter_harmony)  # NumPy integers too
+    max_iter_clustering = operator.index(max_iter_clustering)
     if max_iter_harmony < 1:
         raise ValueError("max_iter_harmony must be >= 1")
     try:
@@ -272,6 +273,7 @@ def harmonize(
     if n_clusters is None:
         n_clusters = int(min(100, n_cells / 30))
         n_clusters = max(n_clusters, 2)
+    n_clusters = operator.index(n_clusters)
     # Several keys solve a dense float64 system over all their levels per
     # cluster (and factor a copy); fail before any GPU work if it cannot fit.
     system_bytes = 16 * (n_batches + 1) ** 2

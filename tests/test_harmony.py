@@ -300,14 +300,17 @@ def test_harmony_rejects_invalid_parameters(kwargs, match):
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("key", ["batch", ["batch", "second"]])
-def test_harmony_accepts_numpy_integers(key):
-    # NumPy integers reach the CUDA bindings only through Python types.
-    expected = _integrate(key=key, max_iter_harmony=2)
-    for value in (np.int64(2), np.uint8(2)):
-        assert (
-            _integrate(key=key, max_iter_harmony=value).tobytes() == expected.tobytes()
-        )
+def test_harmony_accepts_numpy_integers(key, dtype):
+    # NumPy integers act as Python integers; in float64 they once made the
+    # bindings run their float32 overload on converted copies.
+    kwargs = {"max_iter_harmony": 2, "max_iter_clustering": 3, "n_clusters": 7}
+    expected = _integrate(dtype, key=key, **kwargs)
+    for name, value in kwargs.items():
+        for kind in (np.int64, np.uint8):
+            result = _integrate(dtype, key=key, **{**kwargs, name: kind(value)})
+            assert result.tobytes() == expected.tobytes()
 
 
 def test_harmony_dtype_none_keeps_the_input_dtype():

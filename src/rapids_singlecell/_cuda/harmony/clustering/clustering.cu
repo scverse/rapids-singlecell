@@ -519,13 +519,18 @@ static void register_clustering_loop(nb::module_& m) {
                                 initialize};
             return fused_clustering_loop_impl(a);
         },
-        "Z_norm"_a, nb::kw_only(), "R"_a, "E"_a, "O"_a, "Pr_b"_a, "theta"_a,
-        "Y_norm"_a, "idx_list"_a, "penalty"_a, "objective_partials"_a,
-        "block_cat_offsets"_a, "block_counts"_a, "seg_start"_a, "y_bound"_a,
-        "y_acc"_a, "R_bf16"_a = nb::none(), "joint_cats"_a = nb::none(),
-        "joints"_a = nb::none(), "y_t"_a, "col_workspace"_a = nb::none(),
-        "dots_workspace"_a = nb::none(), "force_blocks"_a = false, "n_cells"_a,
-        "n_total"_a = 0, "n_pcs"_a, "n_clusters"_a, "n_batches"_a,
+        "Z_norm"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(),
+        "E"_a.noconvert(), "O"_a.noconvert(), "Pr_b"_a.noconvert(),
+        "theta"_a.noconvert(), "Y_norm"_a.noconvert(), "idx_list"_a.noconvert(),
+        "penalty"_a.noconvert(), "objective_partials"_a.noconvert(),
+        "block_cat_offsets"_a.noconvert(), "block_counts"_a.noconvert(),
+        "seg_start"_a.noconvert(), "y_bound"_a.noconvert(),
+        "y_acc"_a.noconvert(), "R_bf16"_a.noconvert() = nb::none(),
+        "joint_cats"_a.noconvert() = nb::none(),
+        "joints"_a.noconvert() = nb::none(), "y_t"_a.noconvert(),
+        "col_workspace"_a.noconvert() = nb::none(),
+        "dots_workspace"_a.noconvert() = nb::none(), "force_blocks"_a = false,
+        "n_cells"_a, "n_total"_a = 0, "n_pcs"_a, "n_clusters"_a, "n_batches"_a,
         "n_covariates"_a = 1, "n_joint_categories"_a = 0, "n_first"_a = 0,
         "n_blocks"_a, "sigma"_a, "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0,
         "stabilized"_a, "stream"_a = 0, "initialize"_a = false);
@@ -565,8 +570,9 @@ static void register_joint_counts(nb::module_& m) {
                            scales.count_inv, out.data(), (int)n);
             CUDA_CHECK_LAST_ERROR(update_counts_kernel);
         },
-        nb::call_guard<nb::gil_scoped_release>(), "R"_a, nb::kw_only(),
-        "seg_start"_a, "seg_group"_a, "out"_a, "acc"_a, "n_total"_a = 0,
+        nb::call_guard<nb::gil_scoped_release>(), "R"_a.noconvert(),
+        nb::kw_only(), "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
+        "out"_a.noconvert(), "acc"_a.noconvert(), "n_total"_a = 0,
         "stream"_a = 0);
 }
 
@@ -597,8 +603,10 @@ static void register_kmeans(nb::module_& m) {
                     cluster);
             CUDA_CHECK_LAST_ERROR(kmeans_select_center_kernel);
         },
-        "X"_a, nb::kw_only(), "weights"_a, "uniforms"_a, "centers"_a,
-        "totals"_a, "n_draws"_a, "cluster"_a, "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "weights"_a.noconvert(),
+        "uniforms"_a.noconvert(), "centers"_a.noconvert(),
+        "totals"_a.noconvert(), "n_draws"_a.noconvert(), "cluster"_a,
+        "stream"_a = 0);
     m.def(
         "scatter_add",
         [](gpu_array_c<const T, Device> values,
@@ -614,8 +622,8 @@ static void register_kmeans(nb::module_& m) {
                            n_categories, out.data(), workspace.data(),
                            (cudaStream_t)stream);
         },
-        "values"_a, nb::kw_only(), "categories"_a, "out"_a, "workspace"_a,
-        "stream"_a = 0);
+        "values"_a.noconvert(), nb::kw_only(), "categories"_a.noconvert(),
+        "out"_a.noconvert(), "workspace"_a.noconvert(), "stream"_a = 0);
     m.def(
         "kmeans_assign",
         [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> centers,
@@ -648,8 +656,8 @@ static void register_kmeans(nb::module_& m) {
                     n_rows, n_cols, n_clusters);
             CUDA_CHECK_LAST_ERROR(kmeans_assign_kernel);
         },
-        "X"_a, nb::kw_only(), "centers"_a, "labels"_a, "minimum"_a,
-        "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "centers"_a.noconvert(),
+        "labels"_a.noconvert(), "minimum"_a.noconvert(), "stream"_a = 0);
     m.def(
         "kmeans_closest",
         [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> center,
@@ -661,7 +669,8 @@ static void register_kmeans(nb::module_& m) {
                                            closest.data(), n_rows, n_cols);
             CUDA_CHECK_LAST_ERROR(kmeans_closest_kernel);
         },
-        "X"_a, nb::kw_only(), "center"_a, "closest"_a, "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "center"_a.noconvert(),
+        "closest"_a.noconvert(), "stream"_a = 0);
     m.def(
         "l2_row_normalize",
         [](gpu_array_c<const T, Device> src, gpu_array_c<T, Device> dst,
@@ -669,7 +678,8 @@ static void register_kmeans(nb::module_& m) {
             l2_row_normalize(src.data(), dst.data(), (int)src.shape(0),
                              (int)src.shape(1), (cudaStream_t)stream);
         },
-        "src"_a, nb::kw_only(), "dst"_a, "stream"_a = 0);
+        "src"_a.noconvert(), nb::kw_only(), "dst"_a.noconvert(),
+        "stream"_a = 0);
 }
 
 template <typename Device>
@@ -692,10 +702,11 @@ void register_bindings(nb::module_& m) {
                         sort_keys_alt.data(), cub_temp.data(), cub_temp.size(),
                         (cudaStream_t)stream);
         },
-        "group_codes"_a, nb::kw_only(), "idx_list"_a, "block_cat_offsets"_a,
-        "idx_list_alt"_a, "sort_keys"_a, "sort_keys_alt"_a, "cub_temp"_a,
-        "n_groups"_a, "n_blocks"_a, "unit"_a, "seed"_a, "shuffle_chunk"_a = 1,
-        "first"_a = 0, "stream"_a = 0);
+        "group_codes"_a.noconvert(), nb::kw_only(), "idx_list"_a.noconvert(),
+        "block_cat_offsets"_a.noconvert(), "idx_list_alt"_a.noconvert(),
+        "sort_keys"_a.noconvert(), "sort_keys_alt"_a.noconvert(),
+        "cub_temp"_a.noconvert(), "n_groups"_a, "n_blocks"_a, "unit"_a,
+        "seed"_a, "shuffle_chunk"_a = 1, "first"_a = 0, "stream"_a = 0);
     m.def(
         "get_cub_sort_temp_bytes",
         [](int n_cells) { return sort_temp_bytes(n_cells, 32); }, nb::kw_only(),

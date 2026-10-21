@@ -62,9 +62,12 @@ static void register_correction_fast(nb::module_& m) {
                 n_clusters, n_batches, Z.data(), R_col.data(), S.data(),
                 W.data(), (cudaStream_t)stream);
         },
-        "X"_a, nb::kw_only(), "R"_a, "O"_a, "cats"_a, "cat_offsets"_a,
-        "cell_indices"_a, "lambda_kb"_a, "n_cells"_a, "n_pcs"_a, "n_clusters"_a,
-        "n_batches"_a, "Z"_a, "R_col"_a, "S"_a, "W"_a, "stream"_a = 0);
+        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(), "O"_a.noconvert(),
+        "cats"_a.noconvert(), "cat_offsets"_a.noconvert(),
+        "cell_indices"_a.noconvert(), "lambda_kb"_a.noconvert(), "n_cells"_a,
+        "n_pcs"_a, "n_clusters"_a, "n_batches"_a, "Z"_a.noconvert(),
+        "R_col"_a.noconvert(), "S"_a.noconvert(), "W"_a.noconvert(),
+        "stream"_a = 0);
 }
 
 template <typename Device>
