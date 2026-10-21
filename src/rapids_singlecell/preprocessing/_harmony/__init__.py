@@ -329,7 +329,6 @@ def harmonize(
     del batch_codes
     if n_covariates > 1:
         del joint_codes  # unsorted
-    host_offsets = cp.asnumpy(group_offsets)
 
     # Set up parameters
     if n_clusters is None:
@@ -355,8 +354,6 @@ def harmonize(
     if tau > 0:
         theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
     theta_array = cp.ascontiguousarray(theta_array.ravel())
-    if not bool(cp.isfinite(theta_array).all()):
-        raise ValueError(f"theta must be finite, got {theta}.")
 
     # Validate parameters
     if dynamic_lambda:
@@ -462,17 +459,43 @@ def harmonize(
         min(n_cells, round(n_cells * r / n_ranks / unit) * unit) for r in range(n_ranks)
     ] + [n_cells]
     peer = n_ranks > 1 and _peer_copies_work(devices)
-    parts = _upload_sorted(Z, order, bounds, devices, peer=peer)
-    del Z
+    # Every GPU writes its rows of the output (see _write_shards).
+    shard_rows = _shard_rows(order, bounds, devices)
+    parts = _upload_sorted(Z, order, bounds, devices, shard_rows)
+    del Z, order
+    # Read after the upload, whose host staging overlaps the sort.
+    if not bool(cp.isfinite(theta_array).all()):
+        raise ValueError(f"theta must be finite, got {theta}.")
+    host_offsets = cp.asnumpy(group_offsets)
     rhs_bounds = _rhs_bounds(parts, host_offsets, bounds)
+    # With several keys the assignment tiles take any cells (in joint
+    # category order, see the JOINT kernel).
+    tile_groups = n_batches if n_covariates == 1 else 1
+    # The normalized cells and the clustering buffers exist before the
+    # k-means: its many small temporaries allocate faster (by cudaMalloc)
+    # while other small buffers are held.
+    normalized, workspaces = [], []
+    for rank, (lo, hi) in enumerate(itertools.pairwise(bounds)):
+        with cp.cuda.Device(devices[rank]):  # a loop name would hold a shard
+            normalized.append(_normalize_cp(parts[rank]))
+            workspaces.append(
+                _allocate_clustering_workspace(
+                    hi - lo,
+                    n_pcs=n_pcs,
+                    n_clusters=n_clusters,
+                    n_batches=n_batches,
+                    n_groups=tile_groups,
+                    n_blocks=n_blocks,
+                    dtype=dtype,
+                )
+            )
     Y_norm = _kmeans_centroids(
-        parts,
+        normalized,
         bounds=bounds,
         cat_offsets=group_offsets,
         cell_indices=cell_indices,
         n_clusters=n_clusters,
         rng=rng,
-        peer=peer,
     )
     # Each GPU's sorted groups: one key drops them after its block draw,
     # several keys keep them as their cells' joint categories.
@@ -489,16 +512,12 @@ def harmonize(
             devices, min(capacity * n_clusters, _COMM_VALUES), peer=peer
         )
 
-    # With several keys the assignment tiles take any cells (in joint
-    # category order, see the JOINT kernel).
-    tile_groups = n_batches if n_covariates == 1 else 1
-
     def run(rank: int):
         # One GPU's shard; several GPUs run it in parallel threads.
         lo, hi = bounds[rank], bounds[rank + 1]
 
         def local(a):
-            return _copy(a, devices[rank], peer=peer)
+            return _copy(a, devices[rank])
 
         # The fast correction (one GPU, maybe not the current one) reads the
         # batch codes and offsets.
@@ -512,18 +531,10 @@ def harmonize(
 
         X = parts[rank]
         mine, shard_groups[rank] = local(shard_groups[rank]), None
-        Z_norm = _normalize_cp(X)
+        Z_norm, normalized[rank] = normalized[rank], None
+        workspace, workspaces[rank] = workspaces[rank], None
         seg_start, seg_group = _segments(host_offsets, unit, lo, hi)
         segments = (seg_start, seg_group, cp.asarray(rhs_bounds))
-        workspace = _allocate_clustering_workspace(
-            hi - lo,
-            n_pcs=n_pcs,
-            n_clusters=n_clusters,
-            n_batches=n_batches,
-            n_groups=tile_groups,
-            n_blocks=n_blocks,
-            dtype=dtype,
-        )
         # Centroid sums need no group cuts.
         workspace["seg_start"] = (
             seg_start
@@ -661,16 +672,18 @@ def harmonize(
                 cp.cuda.get_current_stream().synchronize()  # read by other threads
                 return result
             except BaseException as error:
-                if comm is not None:
-                    errors.append(error)
-                    comm.abort()  # release the other GPUs' threads
+                errors.append(error)
+                comm.abort()  # release the other GPUs' threads
                 raise
 
-    if n_ranks == 1:
-        results = [guarded(0)]
+    if n_ranks == 1:  # in this thread, on its stream
+        with cp.cuda.Device(devices[0]):
+            results = [run(0)]
     else:
         # The GPUs' threads read this thread's arrays on their own streams.
-        cp.cuda.get_current_stream().synchronize()
+        for device in {cp.cuda.Device().id, *devices}:
+            with cp.cuda.Device(device):
+                cp.cuda.get_current_stream().synchronize()
         pool = ThreadPoolExecutor(n_ranks)
         futures, done = [], False
         try:
@@ -691,7 +704,7 @@ def harmonize(
             raise errors[0]
         results = [future.result() for future in futures]
         del futures
-    _, is_converged, i = results[0]
+    is_converged, i = results[0][1:]  # the shards are released as written
     if is_converged and verbose:
         print(f"Harmony converged in {i + 1} iterations")
     if not is_converged:
@@ -700,21 +713,12 @@ def harmonize(
             stacklevel=5,
         )
     parts.clear()  # free the input before the output
-    if _prefault is not None:  # see _prefaulted
-        _prefault.join()
-    if n_ranks > 1:
-        shards = [r[0] for r in results]
-        del results  # _write_shards releases the shards as it goes
-        _write_shards(shards, order, bounds, devices, out, peer=peer)
-        return out
-    Z_hat = results[0][0]
-    # Put the result back in input order, on its GPU.
-    with cp.cuda.Device(Z_hat.device.id):
-        result = cp.empty_like(Z_hat)
-        result[_copy(order, Z_hat.device.id, peer=peer)] = Z_hat
-        if out is None:
-            return result
-        _download(result, out)
+    shards = [r[0] for r in results]
+    del results  # _write_shards releases the shards as it goes
+    if out is None:  # one GPU: the result in input order, on its GPU
+        with cp.cuda.Device(devices[0]):
+            return shards[0][shard_rows[1][0]]
+    _write_shards(shards, shard_rows, devices, out, _prefault)
     return out
 
 
@@ -729,46 +733,51 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
 
 
 def _upload_sorted(
-    Z, order: cp.ndarray, bounds: list[int], devices: list[int], *, peer: bool
+    Z,
+    order: cp.ndarray,
+    bounds: list[int],
+    devices: list[int],
+    shard_rows: tuple[list, list] | None = None,
 ) -> list[cp.ndarray]:
     """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input is
-    gathered on its own GPU, the other GPUs' shards first, so only a shard's
-    rows move and that GPU holds one extra shard at a time. Host input is
-    staged in pinned chunks by several host threads while the previous chunk
-    is copied, then placed on the GPU (all GPUs at once), so no unsorted device
-    copy is kept: one GPU reads the input in order, several GPUs each only
-    their own rows (gathered in input order, from C-ordered input)."""
+    gathered on its own GPU, the other GPUs' shards first and in chunks of
+    _UPLOAD_BYTES, so only a shard's rows move and that GPU holds one extra
+    chunk at a time. Host input is staged in pinned chunks by several host
+    threads while the previous chunk is copied, then placed on the GPU (all
+    GPUs at once), so no unsorted device copy is kept: one GPU reads the input
+    in order, several GPUs each only their own rows (``shard_rows``, see
+    _shard_rows; gathered in input order, from C-ordered input)."""
     shards = list(itertools.pairwise(bounds))
+    n, d = Z.shape
     if isinstance(Z, cp.ndarray):
         source, parts = Z.device.id, [None] * len(devices)
+        step = max(1, _UPLOAD_BYTES // (d * Z.itemsize))
         with cp.cuda.Device(source):
             for r in sorted(range(len(devices)), key=lambda r: devices[r] == source):
                 lo, hi = shards[r]  # the temporaries die with the statement
-                parts[r] = _copy(
-                    Z[_copy(order[lo:hi], source, peer=peer)], devices[r], peer=peer
-                )
+                if devices[r] == source:
+                    parts[r] = Z[_copy(order[lo:hi], source)]
+                    continue
+                with cp.cuda.Device(devices[r]):
+                    parts[r] = cp.empty((hi - lo, d), dtype=Z.dtype)
+                for a in range(lo, hi, step):
+                    b = min(hi, a + step)
+                    chunk = Z[_copy(order[a:b], source)]
+                    _copy(chunk, devices[r], out=parts[r][a - lo : b - lo])
+                    del chunk  # before the next one
             cp.cuda.get_current_stream().synchronize()  # read on other streams
         return parts
-    n, d = Z.shape
     rows = _staging_rows(n, d * Z.itemsize)
-    position = cp.empty(n, dtype=cp.int32)
-    position[order] = cp.arange(n, dtype=cp.int32)
-    # Each GPU's input rows (all of them for one GPU) and their shard rows.
-    sources, targets = [None], [position]
+    sources, targets = shard_rows or _shard_rows(order, bounds, devices)
     if len(shards) > 1:
         Z = np.ascontiguousarray(Z)  # np.take copies other layouts whole
-        sources, targets = [], []
-        for lo, hi in shards:
-            mine = cp.flatnonzero((position >= lo) & (position < hi))
-            targets.append(position[mine] - lo)
-            sources.append(cp.asnumpy(mine.astype(cp.int32)))
-    # The upload threads read them on their own streams.
-    cp.cuda.get_current_stream().synchronize()
+        # The upload threads read them on their own streams.
+        cp.cuda.get_current_stream().synchronize()
 
     def upload(rank, fill):
         (lo, hi), source = shards[rank], sources[rank]
         with cp.cuda.Device(devices[rank]):
-            target = _copy(targets[rank], devices[rank], peer=peer)
+            target = targets[rank]
             stream = cp.cuda.get_current_stream()
             X = cp.empty((hi - lo, d), dtype=Z.dtype)
             slots = [
@@ -790,57 +799,56 @@ def _upload_sorted(
             stream.synchronize()  # the caller reads it on its own stream
             return X
 
-    with (
-        ThreadPoolExecutor(_UPLOAD_THREADS) as fill,
-        ThreadPoolExecutor(len(devices)) as pool,
-    ):
-        return list(pool.map(lambda rank: upload(rank, fill), range(len(devices))))
+    with ThreadPoolExecutor(_UPLOAD_THREADS) as fill:
+        if len(devices) == 1:
+            return [upload(0, fill)]
+        with ThreadPoolExecutor(len(devices)) as pool:
+            return list(pool.map(lambda rank: upload(rank, fill), range(len(devices))))
+
+
+def _shard_rows(
+    order: cp.ndarray, bounds: list[int], devices: list[int]
+) -> tuple[list, list]:
+    """Each shard's cells in input order: their input rows (increasing, on the
+    host; ``None`` for a single shard, which has them all) and their rows in
+    the shard (on its GPU)."""
+    n = order.size
+    position = cp.empty(n, dtype=cp.int32)
+    position[order] = cp.arange(n, dtype=cp.int32)
+    if len(bounds) == 2:
+        return [None], [_copy(position, devices[0])]
+    sources, targets = [], []
+    for (lo, hi), device in zip(itertools.pairwise(bounds), devices, strict=True):
+        mine = cp.flatnonzero((position >= lo) & (position < hi))
+        targets.append(_copy(position[mine] - lo, device))
+        sources.append(cp.asnumpy(mine.astype(cp.int32)))
+    return sources, targets
 
 
 def _write_shards(
     results: list[cp.ndarray],
-    order: cp.ndarray,
-    bounds: list[int],
+    shard_rows: tuple[list, list],
     devices: list[int],
     out: np.ndarray,
-    *,
-    peer: bool,
+    prefault: threading.Thread | None,
 ) -> None:
     """``out[order] = concatenated results`` (the shards' rows in sorted
-    order): each GPU's rows are split by the output range (in input order) they
-    land in, moved to that range's GPU and placed there; every GPU then copies
-    its range to the host."""
-    shards = list(itertools.pairwise(bounds))
-
-    def split(rank):
-        lo, hi = shards[rank]
-        with cp.cuda.Device(devices[rank]):
-            rows = _copy(order[lo:hi], devices[rank], peer=peer)
-            values, results[rank] = results[rank], None
-            parts = []
-            for a, b in shards:
-                mine = cp.flatnonzero((rows >= a) & (rows < b))
-                parts.append((values[mine], rows[mine] - a))
-            cp.cuda.get_current_stream().synchronize()
-            return parts
+    order): every GPU puts its rows in input order and copies them into
+    theirs of ``out`` (see _shard_rows), so no row moves between the GPUs.
+    ``out`` is written once ``prefault`` (see _prefaulted) has finished."""
+    sources, targets = shard_rows
 
     def write(rank):
-        # This GPU's output rows, gathering every GPU's part (each released
-        # once placed), then one host copy.
-        a, b = shards[rank]
         with cp.cuda.Device(devices[rank]):
-            rows = cp.empty((b - a, out.shape[1]), dtype=out.dtype)
-            for parts in split_parts:
-                values, positions = (
-                    _copy(x, devices[rank], peer=peer) for x in parts[rank]
-                )
-                parts[rank] = None
-                rows[positions] = values
-                del values, positions
-            _download(rows, out[a:b])
+            values = results[rank][targets[rank]]
+            results[rank] = None
+            if prefault is not None:
+                prefault.join()
+            _download(values, out, sources[rank])
 
+    if len(devices) == 1:
+        return write(0)
     with ThreadPoolExecutor(len(devices)) as pool:
-        split_parts = list(pool.map(split, range(len(devices))))
         list(pool.map(write, range(len(devices))))
 
 
@@ -863,25 +871,35 @@ def _parallel_copy(
     dst: np.ndarray,
     src: np.ndarray,
     index: np.ndarray | None = None,
+    *,
+    scatter: bool = False,
 ) -> None:
-    """``dst[...] = src``, or ``src[index]`` for increasing ``index`` into a
-    C-ordered ``src``, by several threads (host memory bound)."""
-    cuts = np.linspace(0, len(dst), _UPLOAD_THREADS + 1, dtype=np.int64)
+    """``dst[...] = src``, ``src[index]`` or (``scatter``) ``dst[index] = src``
+    for increasing ``index`` into C-ordered arrays, by several threads (host
+    memory bound)."""
+    n = len(src if scatter else dst)
+    cuts = np.linspace(0, n, _UPLOAD_THREADS + 1, dtype=np.int64)
 
     def copy(a, b):
         if index is None:
             np.copyto(dst[a:b], src[a:b])
         elif b > a and index[b - 1] - index[a] == b - a - 1:  # consecutive rows
-            np.copyto(dst[a:b], src[index[a] : index[a] + b - a])
+            run = slice(index[a], index[a] + b - a)
+            np.copyto(*((dst[run], src[a:b]) if scatter else (dst[a:b], src[run])))
+        elif scatter:
+            dst[index[a:b]] = src[a:b]
         elif b > a:  # mode="raise" would buffer the output
             np.take(src, index[a:b], axis=0, out=dst[a:b], mode="clip")
 
     list(pool.map(copy, cuts[:-1], cuts[1:]))
 
 
-def _download(src: cp.ndarray, out: np.ndarray) -> None:
-    """``out[...] = src`` through pinned chunks: the next chunk is copied from
-    the GPU while host threads move the previous one into ``out``."""
+def _download(
+    src: cp.ndarray, out: np.ndarray, index: np.ndarray | None = None
+) -> None:
+    """``out[...] = src``, or ``out[index] = src`` for increasing ``index``,
+    through pinned chunks: the next chunk is copied from the GPU while host
+    threads move the previous one into ``out``."""
     n, d = src.shape
     rows = _staging_rows(n, d * src.itemsize)
     stream = cp.cuda.get_current_stream()
@@ -890,7 +908,10 @@ def _download(src: cp.ndarray, out: np.ndarray) -> None:
 
         def drain(chunk, a, b, done):
             done.synchronize()
-            _parallel_copy(pool, out[a:b], chunk)
+            if index is None:
+                _parallel_copy(pool, out[a:b], chunk)
+            else:
+                _parallel_copy(pool, out, chunk, index[a:b], scatter=True)
 
         pending = None
         for j, a in enumerate(range(0, n, rows)):
@@ -1022,10 +1043,9 @@ def _kmeans_centroids(
     cell_indices: cp.ndarray,
     n_clusters: int,
     rng: np.random.Generator,
-    peer: bool,
 ) -> cp.ndarray:
-    """Normalized k-means centroids of a stratified sample of the sorted cells
-    (shards ``parts``), on the current GPU."""
+    """Normalized k-means centroids of a stratified sample of the normalized
+    sorted cells (shards ``parts``), on the current GPU."""
     # Fit only the initialization sample, retaining every observed stratum.
     n_cells = bounds[-1]
     n_init_cells = min(n_cells, _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
@@ -1037,7 +1057,7 @@ def _kmeans_centroids(
         sample = _stratified_sample_indices(
             cat_offsets, cell_indices, n_init_cells, rng
         )
-    rows = _normalize_cp(_gather_rows(parts, bounds, sample, peer=peer))
+    rows = _gather_rows(parts, bounds, sample)
     Y = _kmeans(rows, n_clusters, max_iter=_KMEANS_MAX_ITER, rng=_seed_from_rng(rng))
     return _normalize_cp(Y)
 
