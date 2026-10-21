@@ -868,6 +868,8 @@ NB_MODULE(_harmony_clustering_cuda, m) {
                       size_t, bool>(),
              "devices"_a, "buffers"_a, "capacity"_a, "peer"_a)
         .def_prop_ro("handle", [](Comm& c) { return (uintptr_t)&c; })
-        .def("abort", [](Comm& c) { c.aborted = true; });
+        .def("abort", [](Comm& c) { c.aborted = true; })
+        .def("synchronize", &Comm::synchronize,
+             nb::call_guard<nb::gil_scoped_release>());
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

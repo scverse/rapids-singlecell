@@ -65,14 +65,19 @@ struct Comm {
         cudaSetDevice(previous);
     }
     ~Comm() {
+        for (Rank& me : ranks)
+            for (int s = 0; s < 2; ++s)
+                for (cudaEvent_t e : {me.sent[s], me.reduced[s], me.read[s]})
+                    cudaEventDestroy(e);
+    }
+    // After a failure, other ranks may still have exchanges in flight on the
+    // buffers: wait for their GPUs before the buffers are released.
+    void synchronize() {
         int previous;
         cudaGetDevice(&previous);
         for (Rank& me : ranks) {
             cudaSetDevice(me.device);
             cudaDeviceSynchronize();
-            for (int s = 0; s < 2; ++s)
-                for (cudaEvent_t e : {me.sent[s], me.reduced[s], me.read[s]})
-                    cudaEventDestroy(e);
         }
         cudaSetDevice(previous);
     }

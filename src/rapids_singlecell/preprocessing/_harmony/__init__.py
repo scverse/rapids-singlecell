@@ -672,16 +672,21 @@ def harmonize(
         # The GPUs' threads read this thread's arrays on their own streams.
         cp.cuda.get_current_stream().synchronize()
         pool = ThreadPoolExecutor(n_ranks)
-        futures = [pool.submit(guarded, rank) for rank in range(n_ranks)]
+        futures, done = [], False
         try:
+            for rank in range(n_ranks):
+                futures.append(pool.submit(guarded, rank))
             wait(futures)
+            done = not errors
         except BaseException:  # e.g. Ctrl-C: stop the GPU threads first
             comm.abort()
             wait(futures)
             raise
         finally:
             pool.shutdown()
-            del comm, comm_buffers  # ~Comm synchronizes the GPUs first
+            if not done:  # without holding the GIL
+                comm.synchronize()
+            del comm, comm_buffers
         if errors:
             raise errors[0]
         results = [future.result() for future in futures]

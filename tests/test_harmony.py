@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import anndata as ad
 import cupy as cp
@@ -1591,9 +1592,10 @@ def test_harmonize_failure_joins_the_output_prefault(monkeypatch):
 
 
 @pytest.mark.parametrize("devices", [[0, 0], [0, 0, 0]])
-def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch, devices):
+@pytest.mark.parametrize("where", ["draw", "thread"])
+def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch, devices, where):
     # An error on the other GPUs reaches the caller, not the first GPU's
-    # 'another GPU failed'.
+    # 'another GPU failed'. A GPU thread that cannot start stops the others.
     class Failure(Exception):
         pass
 
@@ -1604,7 +1606,17 @@ def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch, devices):
             raise Failure
         return draw(*args, first=first, **kwargs)
 
-    monkeypatch.setattr(harmony_module, "_draw_blocks", draw_or_fail)
+    class Pool(ThreadPoolExecutor):
+        def submit(self, fn, *args):
+            if fn.__name__ == "guarded" and args[0] == len(devices) - 1:
+                raise Failure
+            return super().submit(fn, *args)
+
+    if where == "draw":
+        monkeypatch.setattr(harmony_module, "_draw_blocks", draw_or_fail)
+    else:
+        monkeypatch.setattr(harmony_module, "ThreadPoolExecutor", Pool)
+    threads = threading.active_count()
     X = _repeatability_adata(np.float32).obsm["X_pca"]
     with pytest.raises(Failure):
         harmony_module.harmonize(
@@ -1616,6 +1628,7 @@ def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch, devices):
             devices=devices,
             out=np.empty_like(X),
         )
+    assert threading.active_count() == threads
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
