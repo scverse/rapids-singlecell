@@ -1362,23 +1362,30 @@ def test_harmony_many_clusters(key, dtype):
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 @pytest.mark.parametrize(
-    ("key", "dtype", "n_pcs", "chunk"),
+    ("key", "dtype", "n_pcs", "chunk", "recount"),
     [
-        ("batch", "float32", 17, None),
-        ("batch", "bfloat16", 17, None),
-        (["batch", "second"], "float64", 17, None),
-        ("batch", "float32", 300, None),
-        ("batch", "bfloat16", 17, 7),  # batched correction, 7 clusters per pass
-        (["batch", "many"], "float32", 17, None),  # systems split between the GPUs
+        ("batch", "float32", 17, None, False),
+        ("batch", "bfloat16", 17, None, False),
+        (["batch", "second"], "float64", 17, None, False),
+        ("batch", "float32", 300, None, False),
+        ("batch", "bfloat16", 17, 7, False),  # batched correction, 7 clusters per pass
+        (["batch", "many"], "float32", 17, None, False),  # systems split between GPUs
+        ("batch", "bfloat16", 17, None, True),  # recounted block counts
+        (["batch", "second"], "float32", 17, None, True),
     ],
 )
-def test_harmony_multi_gpu_matches_one_gpu(monkeypatch, key, dtype, n_pcs, chunk):
+def test_harmony_multi_gpu_matches_one_gpu(
+    monkeypatch, key, dtype, n_pcs, *, chunk, recount
+):
     # Every sum is exact and the blocks and segments follow the global cell
-    # order, so two GPUs give the bits of one.
+    # order, so two GPUs give the bits of one (recount: block counts are
+    # recounted from R on each GPU).
     if cp.cuda.runtime.getDeviceCount() < 2:
         pytest.skip("requires two GPUs")
     if chunk:
         monkeypatch.setattr(harmony_module, "_batched_cluster_chunk", lambda *_: chunk)
+    if recount:
+        monkeypatch.setattr(harmony_module, "_KEEP_BLOCK_COUNTS", False)
     import rapids_singlecell._utils._multi_gpu as utils_multi_gpu
     import rapids_singlecell.preprocessing._harmony._multi_gpu as multi_gpu_module
 

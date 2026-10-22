@@ -432,15 +432,11 @@ def harmonize(
             stacklevel=5,
         )
         bfloat16 = False
-    counts_bytes = n_blocks * n_batches * n_clusters * 8  # every GPU keeps them
-    if counts_bytes > 1 << 30:
-        warnings.warn(
-            f"Harmony keeps {counts_bytes / 2**30:.1f} GiB of cluster counts for "
-            f"{n_blocks} update blocks x {n_batches} batch levels; a larger "
-            "block_proportion needs less.",
-            UserWarning,
-            stacklevel=5,
-        )
+    # Each block's counts are kept (on every GPU) unless they would outgrow
+    # R; then three blocks' are recounted from R at a time (see clustering.cu).
+    keep = _KEEP_BLOCK_COUNTS
+    if keep is None:
+        keep = (n_blocks + 3) * n_batches * 8 <= n_cells * dtype.itemsize
     devices = devices or [cp.cuda.Device().id]
     if len(devices) > 1 and correction_method != "batched":
         warnings.warn(
@@ -487,6 +483,7 @@ def harmonize(
                     n_batches=n_batches,
                     n_groups=tile_groups,
                     n_blocks=n_blocks,
+                    n_stored=n_blocks if keep else min(n_blocks, 3),
                     dtype=dtype,
                 )
             )
@@ -498,8 +495,9 @@ def harmonize(
         n_clusters=n_clusters,
         rng=rng,
     )
-    # Each GPU's sorted groups: one key drops them after its block draw,
-    # several keys keep them as their cells' joint categories.
+    # Each GPU's sorted groups: one key drops them after its block draw
+    # unless it recounts block counts, several keys keep them as their cells'
+    # joint categories.
     shard_groups = [groups[lo:hi] for lo, hi in itertools.pairwise(bounds)]
     del groups
     if correction_method != "fast":  # the only later reader
@@ -509,7 +507,9 @@ def harmonize(
         # Exact int64 sums of block counts, centroids and right-hand sides;
         # per-group sums move only each GPU's groups.
         limbs = _limbs(dtype.itemsize)
-        capacity = max(n_blocks * n_batches, limbs * n_groups * n_pcs, 3 * n_pcs)
+        capacity = max(
+            (n_blocks if keep else 1) * n_batches, limbs * n_groups * n_pcs, 3 * n_pcs
+        )
         first = np.searchsorted(host_offsets, bounds[:-1], side="right") - 1
         end = np.searchsorted(host_offsets, np.subtract(bounds[1:], 1), side="right")
         comm, comm_buffers = _comm(
@@ -555,12 +555,10 @@ def harmonize(
                 "marginal_joint_offsets": local(marginal_joint_offsets),
                 "marginal_joint_indices": local(marginal_joint_indices),
             }
-            workspace.update(
-                joint_cats=joint["joint_cats"],
-                # a view would keep every cell's groups on this GPU
-                joints=mine if mine.base is None else mine.copy(),
-                n_first=int(n_levels[0]),
-            )
+            workspace.update(joint_cats=joint["joint_cats"], n_first=int(n_levels[0]))
+        if n_covariates > 1 or not keep:  # joint runs; recounted by batch
+            # a view would keep every cell's groups on this GPU
+            workspace["joints"] = mine if mine.base is None else mine.copy()
         workspace["Y_norm"][...] = local(Y_norm)
         # The update blocks are drawn once, before the large arrays exist.
         _draw_blocks(
@@ -1083,9 +1081,6 @@ def _allocate_clustering_workspace(
 ) -> dict:
     """Buffers of the clustering loop. The tiles' groups are the batches, or
     one group for several keys; counts are kept per batch level."""
-    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
-    # Assignment tiles: four per SM, plus one partial tile per group.
-    n_tiles = 4 * n_sm + n_groups + 1
     workspace = {
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and the exponents of their

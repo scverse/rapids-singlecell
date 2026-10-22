@@ -404,13 +404,16 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                        a.stream),
                    "block counts memset");
         for (int blk = 0; blk < n_blocks; ++blk)
-            assign(blk, nullptr, stored(blk));
-        harmony_comm::allreduce(a.comm, a.rank, a.block_counts,
-                                (size_t)n_blocks * ob_total, a.stream);
-        sum_blocks_kernel<<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
-            a.block_counts, n_blocks, total, ob_total);
-        CUDA_CHECK_LAST_ERROR(sum_blocks_kernel);
-        update_counts(-1, nullptr, -1, nullptr);
+            assign(blk, nullptr, keep ? stored(blk) : total);
+        harmony_comm::allreduce(a.comm, a.rank, keep ? a.block_counts : total,
+                                (size_t)(keep ? n_blocks : 1) * ob_total,
+                                a.stream);
+        if (keep) {
+            sum_blocks_kernel<<<blocks_1d, BLOCK_DIM_1D, 0, a.stream>>>(
+                a.block_counts, n_blocks, total, ob_total);
+            CUDA_CHECK_LAST_ERROR(sum_blocks_kernel);
+        }
+        update_counts(nullptr, nullptr, nullptr, nullptr);
         objective(true);
     }
     constexpr int WINDOW_SIZE = 3;
@@ -444,12 +447,13 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         auto kept = [&](int step) {  // block(step)'s kept counts, if kept
             return keep && step >= 0 ? stored(block(step)) : nullptr;
         };
-        // Recounting: block(j)'s old counts (a ring of three) are counted from
-        // R at step j - 2 and zeroed when read at step j. slot(step) starts
-        // from old(step + 1) - old(step) - old(step + 2): folded in two steps
-        // later, with block(step)'s new counts, it turns O without
-        // block(step + 1) into O without block(step + 2), and after the last
-        // step total into all counts. Steps -2 and -1 start the first two.
+        // Recounting: block(j)'s old counts (a ring of three, this GPU's) are
+        // counted from R at step j - 2 and zeroed when read at step j.
+        // slot(step) starts from old(step + 1) - old(step) - old(step + 2):
+        // folded in two steps later, with block(step)'s new counts, it turns O
+        // without block(step + 1) into O without block(step + 2), and after
+        // the last step total into all counts. Steps -2 and -1 start the
+        // first two; each step sums one slot over the GPUs, as when kept.
         auto old = [&](int j) {
             return !keep && j >= 0 && j < n_blocks ? stored(j % 3) : nullptr;
         };
@@ -469,17 +473,20 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         int first = keep ? 0 : -2;
         for (int step = first; step < n_blocks; ++step) {
             int fold = step - 2;
-            if (fold >= 0) summed(fold);
-            update_counts(fold < 0 ? -1 : block(fold),
-                          fold < 0 ? nullptr : slot(fold), block(step),
-                          slot(step));
-            penalty_from_counts(a.penalty);
-            assign(block(step), a.penalty, slot(step));
+            if (!keep && step + 2 < n_blocks) recount(step + 2);
+            if (fold >= first) summed(fold);
+            update_counts(kept(fold), fold >= first ? slot(fold) : nullptr,
+                          kept(step), slot(step), old(step), old(step + 1),
+                          old(step + 2));
+            if (step >= 0) {
+                penalty_from_counts(a.penalty);
+                assign(block(step), a.penalty, slot(step));
+            }
             exchange(step);
         }
         for (int fold = std::max(0, n_blocks - 2); fold < n_blocks; ++fold) {
             summed(fold);
-            update_counts(block(fold), slot(fold), -1, nullptr);
+            update_counts(kept(fold), slot(fold), nullptr, nullptr);
         }
 
         // Objective: per-cell terms from the assignment pass plus diversity.
