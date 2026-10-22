@@ -29,9 +29,11 @@ __global__ void scatter_category_offsets_kernel(const int* sorted_categories,
     if (category == 0) offsets[n_categories] = n_rows;
 }
 
+// Also zeroes `next_tile` (unless null; see fused_assign_kernel).
 __global__ void scatter_tile_offsets_kernel(const int* offsets,
                                             int n_categories, int* tiles,
-                                            int tile_rows = SCATTER_TILE_ROWS) {
+                                            int tile_rows = SCATTER_TILE_ROWS,
+                                            int* next_tile = nullptr) {
     using Scan = cub::BlockScan<int, SCATTER_SCAN_THREADS>;
     __shared__ typename Scan::TempStorage scratch;
     int total = 0;
@@ -49,6 +51,7 @@ __global__ void scatter_tile_offsets_kernel(const int* offsets,
         __syncthreads();
     }
     if (threadIdx.x == 0) tiles[n_categories] = total;
+    if (threadIdx.x == 0 && next_tile) *next_tile = 0;
 }
 
 // Category of `tile` and its rows [start, end) (tiles of `tile_rows` rows cut

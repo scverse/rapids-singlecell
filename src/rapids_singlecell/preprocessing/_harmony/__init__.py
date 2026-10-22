@@ -41,6 +41,8 @@ _KMEANS_MAX_ITER = 25
 _KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
 # Tests: assign every shape in cluster blocks (as for more than 128 clusters).
 _FORCE_CLUSTER_BLOCKS = False
+# Tests: whether every block's counts are kept (None: unless they outgrow R).
+_KEEP_BLOCK_COUNTS = None
 _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
 _UPLOAD_THREADS = 8
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
@@ -364,7 +366,12 @@ def harmonize(
         bfloat16 = False
     # Buffers for all Harmony iterations. With several keys the assignment
     # tiles take any cells (in joint category order, see the JOINT kernel).
+    # Each block's counts are kept unless they would outgrow R; then three
+    # blocks' are recounted from R at a time (see clustering.cu).
     tile_groups = n_batches if n_covariates == 1 else 1
+    keep = _KEEP_BLOCK_COUNTS
+    if keep is None:
+        keep = (n_blocks + 3) * n_batches * 8 <= n_cells * Z.dtype.itemsize
     workspace = _allocate_clustering_workspace(
         n_cells,
         n_pcs=Z.shape[1],
@@ -372,6 +379,7 @@ def harmonize(
         n_batches=n_batches,
         n_groups=tile_groups,
         n_blocks=n_blocks,
+        n_stored=n_blocks if keep else min(n_blocks, 3),
         dtype=Z_norm.dtype,
     )
     chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
@@ -385,6 +393,8 @@ def harmonize(
         workspace.update(
             joint_cats=joint_cats, joints=joint_codes, n_first=int(n_levels[0])
         )
+    elif not keep:  # recounted by batch
+        workspace["joints"] = cats
     # The update blocks are drawn once, before the large arrays exist.
     _draw_blocks(
         cats if n_covariates == 1 else cp.zeros(n_cells, dtype=cp.int32),
@@ -730,22 +740,11 @@ def _allocate_clustering_workspace(
     n_batches: int,
     n_groups: int,
     n_blocks: int,
+    n_stored: int,
     dtype: cp.dtype,
 ) -> dict:
     """Buffers of the clustering loop. The tiles' groups are the batches, or
     one group for several keys; counts are kept per batch level."""
-    counts_bytes = n_blocks * n_batches * n_clusters * 8
-    if counts_bytes > 1 << 30:
-        warnings.warn(
-            f"Harmony keeps {counts_bytes / 2**30:.1f} GiB of cluster counts for "
-            f"{n_blocks} update blocks x {n_batches} batch levels; a larger "
-            "block_proportion needs less.",
-            UserWarning,
-            stacklevel=5,
-        )
-    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
-    # Assignment tiles: four per SM, plus one partial tile per group.
-    n_tiles = 4 * n_sm + n_groups + 1
     workspace = {
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and their scale.
@@ -759,16 +758,18 @@ def _allocate_clustering_workspace(
             n_blocks * n_groups + 1 + n_groups + 1, dtype=cp.int32
         ),
         # Fixed-point counts of each block (the blocks are fixed per harmonize
-        # call), of O, and two slots of new block counts.
-        "block_counts": cp.empty((n_blocks + 3, n_batches, n_clusters), dtype=cp.int64),
+        # call) or three recounted ones, of O, and two slots of new counts.
+        "block_counts": cp.empty((n_stored + 3, n_batches, n_clusters), dtype=cp.int64),
     }
     # Centroids transposed: padded PCs x 128-cluster blocks.
     stride = -(-n_clusters // _FUSED_MAX_CLUSTERS) * _FUSED_MAX_CLUSTERS
     workspace["y_t"] = cp.empty((-(-n_pcs // 4) * 4, stride), dtype=dtype)
     if _FORCE_CLUSTER_BLOCKS or n_clusters > _FUSED_MAX_CLUSTERS:
-        # Cluster blocks: per-warp column sums, a group's dot products per tile.
-        workspace["col_workspace"] = cp.empty(n_tiles * 8 * n_clusters, dtype=cp.int64)
-        workspace["dots_workspace"] = cp.empty(n_tiles * 64 * stride, dtype=dtype)
+        # Cluster blocks: per-warp column sums and a group's dot products for
+        # each resident CTA, and the CTAs' tile counter.
+        n_slots = _clustering_cuda.assign_slots(itemsize=dtype.itemsize)
+        workspace["col_workspace"] = cp.empty(n_slots * 8 * n_clusters + 1, cp.int64)
+        workspace["dots_workspace"] = cp.empty(n_slots * 64 * stride, dtype=dtype)
         workspace["force_blocks"] = _FORCE_CLUSTER_BLOCKS
     return workspace
 

@@ -1200,10 +1200,8 @@ def test_harmony_fused_tiles_of_several_groups(
     assert run().tobytes() == fused.tobytes()
 
 
-@pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_multikey_workspace_is_per_level(monkeypatch):
-    # Several keys keep counts per batch level, and tiles take any cells: no
-    # clustering buffer grows with the joint categories (here 185).
+def _workspace_shapes(monkeypatch) -> list:
+    """The shapes of each clustering workspace allocated from now on."""
     allocate, shapes = harmony_module._allocate_clustering_workspace, []
 
     def record(*args, **kwargs):
@@ -1212,15 +1210,78 @@ def test_harmony_multikey_workspace_is_per_level(monkeypatch):
         return workspace
 
     monkeypatch.setattr(harmony_module, "_allocate_clustering_workspace", record)
+    return shapes
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_multikey_workspace_is_per_level(monkeypatch):
+    # Several keys keep counts per batch level, and tiles take any cells: no
+    # clustering buffer grows with the joint categories (here 185).
+    shapes = _workspace_shapes(monkeypatch)
+    monkeypatch.setattr(harmony_module, "_KEEP_BLOCK_COUNTS", True)
     adata = _repeatability_adata(np.float32)
     rsc.pp.harmony_integrate(
         adata, ["batch", "fine"], rng=734, n_clusters=300, max_iter_harmony=1
     )
-    n_blocks, n_tiles = 20, 4 * cp.cuda.Device().attributes["MultiProcessorCount"] + 2
+    n_blocks, n_slots = 20, harmony_module._clustering_cuda.assign_slots(itemsize=4)
     (shape,) = shapes
     assert shape["block_counts"] == (n_blocks + 3, 5 + 37, 300)
     assert shape["block_cat_offsets"] == (n_blocks + 3,)
-    assert shape["dots_workspace"] == (n_tiles * 64 * 384,)
+    assert shape["dots_workspace"] == (n_slots * 64 * 384,)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_clustering_workspace_is_bounded(monkeypatch):
+    # One-cell blocks (480): block counts are recounted from R rather than
+    # each block's kept, and the cluster-block scratch holds the resident
+    # CTAs, however many batch levels (5 or 37).
+    shapes = _workspace_shapes(monkeypatch)
+    for key in ("batch", "fine"):
+        _integrate(key=key, n_clusters=300, max_iter_harmony=1, block_proportion=0.002)
+    few, many = shapes
+    assert (few["block_counts"], many["block_counts"]) == ((6, 5, 300), (6, 37, 300))
+    assert few["col_workspace"] == many["col_workspace"]
+    assert few["dots_workspace"] == many["dots_workspace"]
+    n_slots = harmony_module._clustering_cuda.assign_slots(itemsize=4)
+    assert few["dots_workspace"] == (n_slots * 64 * 384,)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize(
+    ("key", "dtype", "n_clusters", "block_proportion"),
+    [
+        ("batch", np.float32, 7, 0.05),
+        ("batch", "bfloat16", 300, 0.05),
+        ("batch", np.float64, 7, 0.002),  # one-cell blocks
+        (["batch", "second"], np.float32, 7, 0.05),
+        (["batch", "fine"], np.float32, 300, 0.01),
+    ],
+)
+def test_harmony_recounted_block_counts_are_exact(
+    monkeypatch, key, dtype, n_clusters, block_proportion
+):
+    # Block counts recounted from R give the bits of the kept ones.
+    outputs = []
+    for keep in (True, False):
+        monkeypatch.setattr(harmony_module, "_KEEP_BLOCK_COUNTS", keep)
+        outputs.append(
+            _integrate(
+                dtype, key=key, n_clusters=n_clusters, block_proportion=block_proportion
+            )
+        )
+    assert outputs[0].tobytes() == outputs[1].tobytes()
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+@pytest.mark.parametrize("n_slots", [1, 3])
+@pytest.mark.parametrize("key", ["batch", ["batch", "fine"]])
+def test_harmony_cluster_blocks_on_few_slots(monkeypatch, key, n_slots):
+    # A scratch of one or three CTAs: they claim every tile, with the same bits.
+    expected = _integrate(key=key, n_clusters=300)
+    monkeypatch.setattr(
+        harmony_module._clustering_cuda, "assign_slots", lambda itemsize: n_slots
+    )
+    assert _integrate(key=key, n_clusters=300).tobytes() == expected.tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

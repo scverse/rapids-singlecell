@@ -193,26 +193,34 @@ __global__ void objective_fixed_kernel(const T* __restrict__ partial,
 
 // Cluster counts per group, kept exactly: `total` (fixed point) is O over all
 // cells. Optionally folds a block's new counts in (total += new - stored,
-// stored = new), then writes total minus the held-out block's counts `hold`
-// to `out` in T and zeroes `clear` (the next assignment's counts).
+// stored = new; without stored total += new), then writes total minus the
+// held-out block's counts `hold` to `out` in T and starts `clear`, the next
+// assignment's counts, from next - cur - after (recounted counts, see
+// fused_clustering_loop_body; null: zero), zeroing cur.
 template <typename T>
 __global__ void update_counts_kernel(long long* total, long long* fold_stored,
                                      const long long* fold_new,
                                      const long long* hold, long long* clear,
                                      double inv_scale, T* __restrict__ out,
-                                     int n) {
+                                     int n, long long* cur = nullptr,
+                                     const long long* next = nullptr,
+                                     const long long* after = nullptr) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     long long t = total[i];
     if (fold_new) {
         long long v = fold_new[i];
-        t += v - fold_stored[i];
-        fold_stored[i] = v;
+        t += fold_stored ? v - fold_stored[i] : v;
+        if (fold_stored) fold_stored[i] = v;
         total[i] = t;
     }
     if (hold) t -= hold[i];
     out[i] = (T)((double)t * inv_scale);
-    if (clear) clear[i] = 0;
+    if (clear) {
+        long long c = (next ? next[i] : 0) - (after ? after[i] : 0);
+        if (cur) c -= cur[i], cur[i] = 0;
+        clear[i] = c;
+    }
 }
 
 // counts[seg_group[s] K + k] += the fixed-point counts of column k of R (row
@@ -244,6 +252,52 @@ __global__ void sum_blocks_kernel(const long long* __restrict__ blocks,
     long long t = 0;
     for (int b = 0; b < n_blocks; ++b) t += blocks[(size_t)b * n + i];
     total[i] = t;
+}
+
+// counts[level K + k] += the fixed-point counts of column k of R, as the
+// assignment counts them, over the cells idx[begin .. end): to the level of
+// each cell's group (`groups`), or with several keys to each level of its
+// joint category (`joint_cats`). A thread sums one column over
+// RECOUNT_CELLS positions, loaded before they are summed.
+constexpr int RECOUNT_CELLS = 8;
+template <typename T, typename RT>
+__global__ void recount_kernel(const RT* __restrict__ R, int K,
+                               const int* __restrict__ idx, int begin, int end,
+                               const int* __restrict__ groups,
+                               const int* __restrict__ joint_cats, int n_cov,
+                               T scale, unsigned long long* counts) {
+    long long n =
+        (long long)(end - begin + RECOUNT_CELLS - 1) / RECOUNT_CELLS * K;
+    for (long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x; t < n;
+         t += (long long)gridDim.x * blockDim.x) {
+        int k = (int)(t % K), p = begin + (int)(t / K) * RECOUNT_CELLS;
+        int group[RECOUNT_CELLS];
+        long long value[RECOUNT_CELLS];
+#pragma unroll
+        for (int j = 0; j < RECOUNT_CELLS; ++j) {
+            int cell = p + j < end ? idx[p + j] : -1;
+            group[j] = cell < 0 ? -1 : groups[cell];
+            value[j] =
+                cell < 0 ? 0
+                         : count_to_fixed(
+                               from_storage<T>(R[(size_t)cell * K + k]), scale);
+        }
+        long long sum = 0;
+        auto flush = [&](int g) {
+            for (int c = 0; sum && c < (joint_cats ? n_cov : 1); ++c) {
+                int level = joint_cats ? joint_cats[(size_t)g * n_cov + c] : g;
+                atomicAdd(counts + (size_t)level * K + k,
+                          (unsigned long long)sum);
+            }
+            sum = 0;
+        };
+#pragma unroll
+        for (int j = 0; j < RECOUNT_CELLS; ++j) {
+            if (j && group[j] != group[j - 1]) flush(group[j - 1]);
+            sum += value[j];
+        }
+        flush(group[RECOUNT_CELLS - 1]);
+    }
 }
 
 // ---- Assignment (no similarity matrix) ----
@@ -405,31 +459,25 @@ __device__ __forceinline__ void tile_products(
 // by its own maximum instead.
 // BLOCKS (more than 128 clusters): each group takes the clusters in blocks of
 // FUSED_CLUSTER_STRIDE, its rows and the block's centroids streamed as above,
-// and stores the dot products in `dots_ws` (tiles x FUSED_GROUP rows x
+// and stores the dot products in `dots_ws` (CTAs x FUSED_GROUP rows x
 // k_stride); then each row is normalized from them. Column sums go through
-// per-warp slices of `col_ws` (tiles x warps x K). One block gives the bits of
+// per-warp slices of `col_ws` (CTAs x warps x K). One block gives the bits of
 // the single-block path.
 // JOINT (several keys): tiles take any rows of the block, in joint category
 // order (`joints` per cell). A warp follows its rows' joint categories: a
 // run's log penalty sums its levels' (`joint_cats`, n_cov per category) in
 // key order, and its counts go to each of its levels.
 template <typename T, typename RT, int V, bool BLOCKS, bool JOINT>
-__global__ void __launch_bounds__(FUSED_THREADS,
-                                  sizeof(T) == 4 ? FUSED_CTAS : 1)
-    fused_assign_kernel(const T* __restrict__ Z, const T* __restrict__ y_t,
-                        int k_stride, const T* __restrict__ penalty,
-                        const int* __restrict__ idx,
-                        const int* __restrict__ offsets,
-                        const int* __restrict__ tiles, int n_categories,
-                        int tile_rows, RT* __restrict__ R,
-                        T* __restrict__ partial,
-                        unsigned long long* __restrict__ counts,
-                        T* __restrict__ dots_ws, long long* __restrict__ col_ws,
-                        T term, T sigma, T count_scale, int n_pcs,
-                        int n_clusters, const int* __restrict__ joints,
-                        const int* __restrict__ joint_cats, int n_cov) {
-    int tile = blockIdx.x, start, end;
-    if (tile >= tiles[n_categories]) return;
+__device__ __forceinline__ void fused_assign_tile(
+    int tile, const T* __restrict__ Z, const T* __restrict__ y_t, int k_stride,
+    const T* __restrict__ penalty, const int* __restrict__ idx,
+    const int* __restrict__ offsets, const int* __restrict__ tiles,
+    int n_categories, int tile_rows, RT* __restrict__ R,
+    T* __restrict__ partial, unsigned long long* __restrict__ counts,
+    T* __restrict__ dots_ws, long long* __restrict__ col_ws, T term, T sigma,
+    T count_scale, int n_pcs, int n_clusters, const int* __restrict__ joints,
+    const int* __restrict__ joint_cats, int n_cov) {
+    int start, end;
     int category = scatter_tile_rows(tile, n_categories, offsets, tiles,
                                      tile_rows, start, end);
 
@@ -489,8 +537,10 @@ __global__ void __launch_bounds__(FUSED_THREADS,
                               (unsigned long long)v);
             }
     };
-    if constexpr (BLOCKS) {
-        cols = col_ws + ((size_t)tile * n_warps + warp) * n_clusters;
+    if constexpr (BLOCKS) {  // this CTA's slot of the scratch
+        col_ws += (size_t)blockIdx.x * n_warps * n_clusters;
+        dots_ws += (size_t)blockIdx.x * TM * k_stride;
+        cols = col_ws + (size_t)warp * n_clusters;
         for (int k = lane; k < n_clusters; k += 32) cols[k] = 0;
         __syncwarp();  // other lanes accumulate these columns
     }
@@ -631,10 +681,9 @@ __global__ void __launch_bounds__(FUSED_THREADS,
             if constexpr (BLOCKS) {  // braced: nvcc 12.2 rejects a bare for
                 for (int r = 0; r < FUSED_ROWS && active; ++r) {
                     if (base + r >= end) break;  // warp-uniform
-                    T* row =
-                        dots_ws +
-                        (size_t)(tile * TM + warp * FUSED_ROWS + r) * k_stride +
-                        b * FUSED_CLUSTER_STRIDE + k0;
+                    T* row = dots_ws +
+                             (size_t)(warp * FUSED_ROWS + r) * k_stride +
+                             b * FUSED_CLUSTER_STRIDE + k0;
 #pragma unroll
                     for (int q = 0; q < S; ++q) row[q] = dots[r][q];
                 }
@@ -647,8 +696,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
                 if (c < 0) break;  // warp-uniform
                 run(r);
                 const T* drow =
-                    dots_ws +
-                    (size_t)(tile * TM + warp * FUSED_ROWS + r) * k_stride;
+                    dots_ws + (size_t)(warp * FUSED_ROWS + r) * k_stride;
                 auto logit = [&](int k) {
                     return term * (T(1) - drow[k]) + lp(k);
                 };
@@ -759,7 +807,7 @@ __global__ void __launch_bounds__(FUSED_THREADS,
     }
     __syncthreads();  // col_sums overlays the buffers
     if constexpr (BLOCKS) {
-        col_sums = col_ws + (size_t)tile * n_warps * n_clusters;
+        col_sums = col_ws;
     } else {
 #pragma unroll
         for (int q = 0; q < S; ++q)
@@ -777,6 +825,44 @@ __global__ void __launch_bounds__(FUSED_THREADS,
         } else {
             atomicAdd(counts + (size_t)category * n_clusters + k,
                       (unsigned long long)sum);
+        }
+    }
+}
+
+// One CTA per tile; with cluster blocks one per slot of the scratch (the
+// resident CTAs). Each takes tile blockIdx.x, then blockIdx.x + gridDim.x (in
+// launch order: one more per SM before any SM takes two), then claims tiles
+// from `next_tile` (zeroed with the tile offsets) as it finishes one, which
+// evens out uneven tiles.
+template <typename T, typename RT, int V, bool BLOCKS, bool JOINT>
+__global__ void __launch_bounds__(FUSED_THREADS,
+                                  sizeof(T) == 4 ? FUSED_CTAS : 1)
+    fused_assign_kernel(
+        const T* __restrict__ Z, const T* __restrict__ y_t, int k_stride,
+        const T* __restrict__ penalty, const int* __restrict__ idx,
+        const int* __restrict__ offsets, const int* __restrict__ tiles,
+        int n_categories, int tile_rows, RT* __restrict__ R,
+        T* __restrict__ partial, unsigned long long* __restrict__ counts,
+        T* __restrict__ dots_ws, long long* __restrict__ col_ws, T term,
+        T sigma, T count_scale, int n_pcs, int n_clusters,
+        const int* __restrict__ joints, const int* __restrict__ joint_cats,
+        int n_cov, int* __restrict__ next_tile) {
+    // The claim waits in the last word of the second row stage: free after a
+    // tile's last barrier, and filled again only after the next tile's first.
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    int* claimed = reinterpret_cast<int*>(smem_raw + STREAM_SMEM) - 1;
+    for (int tile = blockIdx.x, n = 0; tile < tiles[n_categories]; ++n) {
+        fused_assign_tile<T, RT, V, BLOCKS, JOINT>(
+            tile, Z, y_t, k_stride, penalty, idx, offsets, tiles, n_categories,
+            tile_rows, R, partial, counts, dots_ws, col_ws, term, sigma,
+            count_scale, n_pcs, n_clusters, joints, joint_cats, n_cov);
+        if constexpr (!BLOCKS) {
+            break;
+        } else {
+            if (threadIdx.x == 0 && n > 0)
+                *claimed = 2 * gridDim.x + atomicAdd(next_tile, 1);
+            __syncthreads();  // the next tile reuses the scratch
+            tile = n == 0 ? tile + gridDim.x : *claimed;
         }
     }
 }
