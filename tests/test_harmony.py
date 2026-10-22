@@ -556,7 +556,8 @@ def test_harmony_multikey_correction_matches_dense_design(
     result = correct()
 
     expected = _dense_design_correction(X_np, R_np, cats_np, lambda_np, n_batches)
-    atol = 2e-5 if dtype == cp.float32 else 1e-11
+    # float64: the NumPy reference rounds differently per CPU (up to 2.4e-11)
+    atol = 2e-5 if dtype == cp.float32 else 1e-10
     cp.testing.assert_allclose(result, cp.asarray(expected), atol=atol, rtol=atol)
 
     monkeypatch.setattr(
