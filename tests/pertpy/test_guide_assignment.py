@@ -10,238 +10,185 @@ from cupyx.scipy.sparse import csr_matrix as gpu_csr
 
 import rapids_singlecell as rsc
 from rapids_singlecell.get import X_to_CPU
-from rapids_singlecell.pertpy_gpu._guide_assignment import _fit_assign_cuda
 
 
-@pytest.fixture
-def guide_adata() -> AnnData:
-    """Synthetic guide RNA dataset with clear bimodal signal.
-
-    200 cells, 8 guides.  For each guide, ~30 % of cells have high counts
-    (signal, drawn from Poisson(lambda=50)) and the rest have low counts
-    (background, drawn from Poisson(lambda=2)).
-    """
-    rng = np.random.default_rng(42)
-    n_cells = 200
-    n_guides = 8
-    n_signal = 60  # 30% signal
-
+def _synthetic_counts(
+    rng: np.random.Generator,
+    n_cells: int,
+    n_guides: int,
+    *,
+    frac_pos: float,
+    log2_mean: float,
+    background: float,
+) -> tuple[np.ndarray, np.ndarray]:
     X = np.zeros((n_cells, n_guides), dtype=np.float32)
+    truth = np.zeros((n_cells, n_guides), dtype=bool)
     for g in range(n_guides):
-        bg = rng.poisson(lam=2, size=n_cells - n_signal).astype(np.float32)
-        sig = rng.poisson(lam=50, size=n_signal).astype(np.float32)
-        X[:, g] = np.concatenate([bg, sig])
-        rng.shuffle(X[:, g])
+        is_pos = rng.random(n_cells) < frac_pos
+        X[is_pos, g] = np.clip(
+            np.round(2 ** rng.normal(log2_mean, 0.6, is_pos.sum())), 1, None
+        )
+        X[~is_pos, g] = rng.poisson(background, (~is_pos).sum())
+        truth[is_pos, g] = True
+    return X, truth
 
-    var = pd.DataFrame(index=[f"guide_{i}" for i in range(n_guides)])
-    obs = pd.DataFrame(index=[f"cell_{i}" for i in range(n_cells)])
-    return AnnData(X=cp.array(X), obs=obs, var=var)
+
+def _adata(X: np.ndarray) -> AnnData:
+    return AnnData(
+        X=cp.asarray(X),
+        obs=pd.DataFrame(index=[f"cell_{i}" for i in range(X.shape[0])]),
+        var=pd.DataFrame(index=[f"guide_{i}" for i in range(X.shape[1])]),
+    )
 
 
 @pytest.fixture
-def guide_adata_sparse(guide_adata: AnnData) -> AnnData:
-    """Same data as guide_adata but stored as CuPy CSR sparse."""
-    adata = guide_adata.copy()
-    adata.X = gpu_csr(adata.X)
-    return adata
-
-
-# ------------------------------------------------------------------ #
-#  assign_by_threshold
-# ------------------------------------------------------------------ #
-
-
-def test_assign_by_threshold(guide_adata: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_by_threshold(guide_adata, assignment_threshold=5)
-
-    result = X_to_CPU(guide_adata.layers["assigned_guides"])
-    X = X_to_CPU(guide_adata.X)
-
-    expected = (X >= 5).astype(np.int8)
-    np.testing.assert_array_equal(result, expected)
-
-
-def test_assign_by_threshold_sparse(guide_adata_sparse: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_by_threshold(guide_adata_sparse, assignment_threshold=5)
-
-    result = X_to_CPU(guide_adata_sparse.layers["assigned_guides"]).toarray()
-    X = X_to_CPU(guide_adata_sparse.X).toarray()
-
-    expected = (X >= 5).astype(np.int8)
-    np.testing.assert_array_equal(result, expected)
-
-
-def test_assign_by_threshold_sparse_csc(guide_adata: AnnData) -> None:
-    adata = guide_adata.copy()
-    adata.X = gpu_csc(adata.X)
-
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_by_threshold(adata, assignment_threshold=5)
-
-    result = adata.layers["assigned_guides"]
-    assert isinstance(result, gpu_csc)
-
-    result = X_to_CPU(result).toarray()
-    expected = (X_to_CPU(adata.X).toarray() >= 5).astype(np.int8)
-    np.testing.assert_array_equal(result, expected)
-
-
-# ------------------------------------------------------------------ #
-#  assign_to_max_guide
-# ------------------------------------------------------------------ #
-
-
-def test_assign_to_max_guide(guide_adata: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_to_max_guide(guide_adata, assignment_threshold=5)
-
-    assigned = guide_adata.obs["assigned_guide"]
-    X = X_to_CPU(guide_adata.X)
-
-    for i in range(guide_adata.n_obs):
-        row = X[i]
-        max_val = row.max()
-        if max_val >= 5:
-            expected_guide = guide_adata.var_names[int(row.argmax())]
-            assert assigned.iloc[i] == expected_guide, (
-                f"Cell {i}: expected {expected_guide}, got {assigned.iloc[i]}"
-            )
-        else:
-            assert assigned.iloc[i] == "Negative", (
-                f"Cell {i}: expected Negative, got {assigned.iloc[i]}"
-            )
-
-
-def test_assign_to_max_guide_sparse(guide_adata_sparse: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_to_max_guide(guide_adata_sparse, assignment_threshold=5)
-
-    assigned = guide_adata_sparse.obs["assigned_guide"]
-    X = X_to_CPU(guide_adata_sparse.X).toarray()
-
-    for i in range(guide_adata_sparse.n_obs):
-        row = X[i]
-        max_val = row.max()
-        if max_val >= 5:
-            expected_guide = guide_adata_sparse.var_names[int(row.argmax())]
-            assert assigned.iloc[i] == expected_guide
-        else:
-            assert assigned.iloc[i] == "Negative"
-
-
-def test_assign_to_max_guide_below_threshold() -> None:
-    """All counts below threshold → all Negative."""
-    rng = np.random.default_rng(0)
-    X = rng.poisson(lam=1, size=(50, 4)).astype(np.float32)
-    adata = AnnData(
-        X=cp.array(X),
-        var=pd.DataFrame(index=[f"g{i}" for i in range(4)]),
-        obs=pd.DataFrame(index=[f"c{i}" for i in range(50)]),
+def guide_adata() -> tuple[AnnData, np.ndarray]:
+    """800 cells by 12 guides with 12 % positive cells per guide."""
+    X, truth = _synthetic_counts(
+        np.random.default_rng(0), 800, 12, frac_pos=0.12, log2_mean=5.0, background=0.8
     )
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_to_max_guide(adata, assignment_threshold=100)
-    assert (adata.obs["assigned_guide"] == "Negative").all()
+    return _adata(X), truth
 
 
-# ------------------------------------------------------------------ #
-#  assign_mixture_model
-# ------------------------------------------------------------------ #
+@pytest.fixture
+def guide_adata_sparse(
+    guide_adata: tuple[AnnData, np.ndarray],
+) -> tuple[AnnData, np.ndarray]:
+    adata, truth = guide_adata
+    adata = adata.copy()
+    adata.X = gpu_csr(adata.X)
+    return adata, truth
 
 
-def test_mixture_model_separation(guide_adata: AnnData) -> None:
-    """EM should separate the clearly bimodal signal."""
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_mixture_model(guide_adata, max_iter=100)
-
-    # Check that at least some cells are assigned (not all negative)
-    assigned = guide_adata.obs["assigned_guide"]
-    n_assigned = (assigned != "negative").sum()
-    assert n_assigned > 0, "No cells were assigned to any guide"
-
-    # With such clear separation (Poisson(2) vs Poisson(50)),
-    # most high-count cells should be positive
-    X = X_to_CPU(guide_adata.X)
-
-    # For each guide, cells with count >= 20 should mostly be assigned
-    for g in range(X.shape[1]):
-        high_count_cells = X[:, g] >= 20
-        if high_count_cells.sum() == 0:
-            continue
-        # At least 80% of high-count cells should have this guide in assignment
-        guide_name = guide_adata.var_names[g]
-        has_guide = assigned.str.contains(guide_name, na=False)
-        overlap = (high_count_cells & has_guide.values).sum()
-        assert overlap / high_count_cells.sum() >= 0.8, (
-            f"Guide {guide_name}: only {overlap}/{high_count_cells.sum()} "
-            "high-count cells assigned"
-        )
+@pytest.fixture
+def tiny_adata() -> AnnData:
+    return _adata(np.array([[6, 0, 2], [1, 5, 0], [0, 1, 7]], dtype=np.float32))
 
 
-def test_mixture_model_stores_params(guide_adata: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_mixture_model(guide_adata)
+def _dense(X) -> np.ndarray:
+    X = X_to_CPU(X)
+    return X.toarray() if hasattr(X, "toarray") else np.asarray(X)
 
-    for col in [
+
+@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
+def test_assign_by_threshold(tiny_adata: AnnData, storage: str) -> None:
+    if storage != "dense":
+        tiny_adata.X = (gpu_csr if storage == "csr" else gpu_csc)(tiny_adata.X)
+    rsc.ptg.GuideAssignment().assign_by_threshold(tiny_adata, assignment_threshold=5)
+
+    result = tiny_adata.layers["assigned_guides"]
+    assert type(result) is type(tiny_adata.X)
+    if storage == "dense":
+        assert result.dtype == cp.int8
+    else:
+        assert result.nnz == 3
+    np.testing.assert_array_equal(
+        _dense(result), (_dense(tiny_adata.X) >= 5).astype(np.int8)
+    )
+
+
+@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
+def test_assign_to_max_guide(tiny_adata: AnnData, storage: str) -> None:
+    if storage != "dense":
+        tiny_adata.X = (gpu_csr if storage == "csr" else gpu_csc)(tiny_adata.X)
+    rsc.ptg.GuideAssignment().assign_to_max_guide(tiny_adata, assignment_threshold=6)
+    assert tuple(tiny_adata.obs["assigned_guide"]) == ("guide_0", "Negative", "guide_2")
+
+
+@pytest.mark.parametrize("fixture", ["guide_adata", "guide_adata_sparse"])
+def test_mixture_model_recovers_known_positives(request, fixture: str) -> None:
+    adata, truth = request.getfixturevalue(fixture)
+    rsc.ptg.GuideAssignment().assign_mixture_model(adata)
+
+    thresholds = np.nan_to_num(adata.var["threshold"].to_numpy(), nan=np.inf)
+    pred = _dense(adata.X) >= thresholds[None, :]
+    assert (pred == truth).mean() > 0.98
+    assert (pred & truth).sum() / truth.sum() > 0.9
+    assert (pred & ~truth).sum() <= 0.005 * truth.size
+
+    layer = adata.layers["assigned_guides"]
+    assert type(layer) is type(adata.X)
+    np.testing.assert_array_equal(_dense(layer), pred.astype(np.int8))
+    for col in (
         "poisson_rate",
         "gaussian_mean",
         "gaussian_std",
         "mix_probs_0",
         "mix_probs_1",
         "threshold",
-    ]:
-        assert col in guide_adata.var.columns, f"Missing column: {col}"
-
-    # Parameters should be finite for all guides
-    for col in ["poisson_rate", "gaussian_mean", "gaussian_std"]:
-        vals = guide_adata.var[col].dropna()
-        assert len(vals) > 0, f"No values for {col}"
-        assert np.all(np.isfinite(vals)), f"Non-finite values in {col}"
-
-    # Poisson rate should be < Gaussian mean (anti-flip)
-    rates = guide_adata.var["poisson_rate"].dropna()
-    means = guide_adata.var["gaussian_mean"].dropna()
-    assert (rates < means).all(), "Poisson rate should be < Gaussian mean"
-
-    assert guide_adata.var["threshold"].dropna().ge(1).all()
+        "final_loss",
+    ):
+        assert np.isfinite(adata.var[col]).all()
+    assert (adata.var["gaussian_mean"] > adata.var["poisson_rate"]).all()
 
 
-def test_mixture_model_overwrites_existing_var_columns(guide_adata: AnnData) -> None:
-    guide_adata.var["threshold"] = pd.Categorical(["old"] * guide_adata.n_vars)
-    guide_adata.var["poisson_rate"] = "old"
+def test_mixture_model_dense_matches_sparse(
+    guide_adata: tuple[AnnData, np.ndarray],
+    guide_adata_sparse: tuple[AnnData, np.ndarray],
+) -> None:
+    dense, _ = guide_adata
+    sparse, _ = guide_adata_sparse
+    rsc.ptg.GuideAssignment().assign_mixture_model(dense)
+    rsc.ptg.GuideAssignment().assign_mixture_model(sparse)
+
+    assert list(dense.obs["assigned_guide"]) == list(sparse.obs["assigned_guide"])
+    np.testing.assert_array_equal(dense.var["threshold"], sparse.var["threshold"])
+
+
+def test_mixture_model_high_moi_keeps_component_order() -> None:
+    """With half of the cells positive, the Gaussian must stay the on-target component."""
+    X, truth = _synthetic_counts(
+        np.random.default_rng(0), 2000, 3, frac_pos=0.5, log2_mean=6.0, background=1.0
+    )
+    adata = _adata(X)
+    rsc.ptg.GuideAssignment().assign_mixture_model(adata)
+
+    thresholds = adata.var["threshold"].to_numpy()
+    assert np.all(thresholds > 1)
+    assert (adata.var["gaussian_mean"] > adata.var["poisson_rate"]).all()
+    assert ((X >= thresholds[None, :]) == truth).mean() > 0.99
+
+
+def test_mixture_model_multiple_guides(guide_adata: tuple[AnnData, np.ndarray]) -> None:
+    adata, _ = guide_adata
+    rsc.ptg.GuideAssignment().assign_mixture_model(
+        adata, max_assignments_per_cell=1, multiple_grna_assigned_key="too_many"
+    )
+    n_assigned = _dense(adata.layers["assigned_guides"]).sum(axis=1)
+    assigned = adata.obs["assigned_guide"].astype(str).to_numpy()
+    assert (n_assigned > 1).any()
+    assert (assigned[n_assigned == 0] == "negative").all()
+    assert (assigned[n_assigned > 1] == "too_many").all()
+
+    rsc.ptg.GuideAssignment().assign_mixture_model(adata, output_layer=None)
+    joined = adata.obs["assigned_guide"].astype(str).to_numpy()[n_assigned == 2]
+    assert all(len(label.split("+")) == 2 for label in joined)
+
+
+def test_mixture_model_only_return_results(
+    guide_adata: tuple[AnnData, np.ndarray],
+) -> None:
+    adata, _ = guide_adata
+    result = rsc.ptg.GuideAssignment().assign_mixture_model(
+        adata, only_return_results=True
+    )
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (adata.n_obs,)
+    assert "assigned_guide" not in adata.obs
+    assert "threshold" not in adata.var
+    assert "assigned_guides" not in adata.layers
+
+
+def test_mixture_model_layer_is_honored(
+    guide_adata: tuple[AnnData, np.ndarray],
+) -> None:
+    adata, _ = guide_adata
+    adata.layers["raw_guides"] = gpu_csc(adata.X)
+    adata.X = cp.zeros_like(adata.X)
 
     ga = rsc.ptg.GuideAssignment()
-    ga.assign_mixture_model(guide_adata)
-
-    assert pd.api.types.is_float_dtype(guide_adata.var["threshold"])
-    assert pd.api.types.is_float_dtype(guide_adata.var["poisson_rate"])
-    assert guide_adata.var["threshold"].dropna().ge(1).all()
-    assert np.isfinite(guide_adata.var["poisson_rate"].dropna()).all()
-
-
-def test_mixture_model_sparse_input(guide_adata_sparse: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_mixture_model(guide_adata_sparse)
-
-    assigned = guide_adata_sparse.obs["assigned_guide"]
-    n_assigned = (assigned != "negative").sum()
-    assert n_assigned > 0
-
-
-@pytest.mark.parametrize("layer_kind", ["dense", "csr", "csc"])
-def test_mixture_model_layer_is_honored(guide_adata: AnnData, layer_kind: str) -> None:
-    adata = guide_adata.copy()
-    layer_counts = guide_adata.X.copy()
-    if layer_kind == "csr":
-        layer_counts = gpu_csr(layer_counts)
-    elif layer_kind == "csc":
-        layer_counts = gpu_csc(layer_counts)
-    adata.layers["raw_guides"] = layer_counts
-    adata.X = cp.zeros_like(guide_adata.X)
-
-    ga = rsc.ptg.GuideAssignment()
-    with pytest.warns(UserWarning, match="No guides"):
+    with pytest.warns(UserWarning, match="Skipping 12 guides"):
         x_result = ga.assign_mixture_model(adata, only_return_results=True)
     layer_result = ga.assign_mixture_model(
         adata, layer="raw_guides", only_return_results=True
@@ -251,181 +198,178 @@ def test_mixture_model_layer_is_honored(guide_adata: AnnData, layer_kind: str) -
     assert np.count_nonzero(layer_result != "negative") > 0
 
 
-def test_mixture_model_only_return_results(guide_adata: AnnData) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    obs_columns = guide_adata.obs.columns.copy()
-    var_columns = guide_adata.var.columns.copy()
-    result = ga.assign_mixture_model(guide_adata, only_return_results=True)
+def test_mixture_model_skips_low_count_guides() -> None:
+    X = np.zeros((200, 4), dtype=np.float32)
+    X[0, 1] = 1
+    X[:50, 2] = 1
+    rng = np.random.default_rng(0)
+    is_pos = rng.random(200) < 0.15
+    X[is_pos, 3] = np.round(2 ** rng.normal(5.0, 0.6, is_pos.sum()))
+    X[~is_pos, 3] = rng.poisson(0.8, (~is_pos).sum())
+    adata = _adata(X)
 
-    assert result is not None
-    assert len(result) == guide_adata.n_obs
-    assert isinstance(result, np.ndarray)
-    assert guide_adata.obs.columns.equals(obs_columns)
-    assert guide_adata.var.columns.equals(var_columns)
+    with pytest.warns(
+        UserWarning, match="Skipping 3 guides .*: guide_0, guide_1, guide_2"
+    ):
+        rsc.ptg.GuideAssignment().assign_mixture_model(adata)
+    assert adata.var["threshold"].isna().tolist() == [True, True, True, False]
+
+
+def test_mixture_model_rejects_negative_values_and_unknown_model(
+    tiny_adata: AnnData,
+) -> None:
+    with pytest.raises(ValueError, match="Model not implemented"):
+        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata, model="not_a_model")
+    tiny_adata.X[0, 0] = -1
+    with pytest.raises(ValueError, match="negative values"):
+        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata)
+
+
+@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
+def test_mixture_model_rejects_negative_values_next_to_nan(
+    tiny_adata: AnnData, storage: str
+) -> None:
+    tiny_adata.X[0, 0] = -1
+    tiny_adata.X[1, 1] = cp.nan
+    if storage != "dense":
+        tiny_adata.X = (gpu_csr if storage == "csr" else gpu_csc)(tiny_adata.X)
+    with pytest.raises(ValueError, match="negative values"):
+        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata)
+
+
+def _layouts(X: np.ndarray) -> dict:
+    """The same counts as dense C/F, CSR, CSC, COO, int64-indexed, float64 and unsorted CSR."""
+    csr = gpu_csr(cp.asarray(X))
+    wide = csr.copy()
+    wide.indptr, wide.indices = (
+        wide.indptr.astype(cp.int64),
+        wide.indices.astype(cp.int64),
+    )
+    indptr = cp.asnumpy(csr.indptr)
+    reverse = np.concatenate(
+        [np.arange(start, end)[::-1] for start, end in zip(indptr[:-1], indptr[1:])]
+    )
+    unsorted = gpu_csr(
+        (csr.data[reverse], csr.indices[reverse], csr.indptr), shape=csr.shape
+    )
+    return {
+        "dense C": cp.asarray(X),
+        "dense F": cp.asfortranarray(cp.asarray(X)),
+        "csr": csr,
+        "csc": gpu_csc(cp.asarray(X)),
+        "coo": csr.tocoo(),
+        "int64 indices": wide,
+        "float64": csr.astype(cp.float64),
+        "unsorted csr": unsorted,
+    }
+
+
+def test_layouts_match(
+    guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rapids_singlecell.pertpy_gpu import _guide_assignment
+
+    adata, _ = guide_adata
+    X = cp.asnumpy(adata.X)
+    ga = rsc.ptg.GuideAssignment()
+    reference = adata.copy()
+    ga.assign_mixture_model(reference)
+    # Tiny histograms and column chunks run the histogram tail, its retry and
+    # many chunks per column on this small data.
+    monkeypatch.setattr(_guide_assignment, "_HISTOGRAM_CAP", 8)
+    monkeypatch.setattr(_guide_assignment, "_COLUMN_CHUNK", 7)
+    for name, layout in _layouts(X).items():
+        a = AnnData(X=layout, obs=adata.obs.copy(), var=adata.var.copy())
+        ga.assign_mixture_model(a)
+        ga.assign_to_max_guide(a, assignment_threshold=3, obs_key="max_guide")
+        ga.assign_by_threshold(a, assignment_threshold=3, output_layer="threshold")
+        np.testing.assert_array_equal(
+            a.var["threshold"], reference.var["threshold"], err_msg=name
+        )
+        np.testing.assert_array_equal(
+            a.obs["assigned_guide"], reference.obs["assigned_guide"], err_msg=name
+        )
+        np.testing.assert_array_equal(
+            _dense(a.layers["assigned_guides"]),
+            _dense(reference.layers["assigned_guides"]),
+            err_msg=name,
+        )
+        np.testing.assert_array_equal(
+            _dense(a.layers["threshold"]), X >= 3, err_msg=name
+        )
+        best = np.where(X.max(axis=1) >= 3, X.argmax(axis=1), -1)
+        expected = np.append(adata.var_names, "Negative")[best]
+        np.testing.assert_array_equal(a.obs["max_guide"], expected, err_msg=name)
+
+
+@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
+def test_assign_to_max_guide_nan_ties_and_empty_cells(storage: str) -> None:
+    # A NaN is the largest count but fails the threshold, ties go to the first
+    # guide and cells without counts stay unassigned, as in pertpy.
+    X = np.array([[np.nan, 5, 0], [2, 2, 0], [0, 0, 0], [-0.0, 0, 0]], np.float32)
+    adata = _adata(X)
+    if storage != "dense":
+        adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
+    rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=1)
+    assert list(adata.obs["assigned_guide"]) == [
+        "Negative",
+        "guide_0",
+        "Negative",
+        "Negative",
+    ]
+
+
+@pytest.mark.parametrize("storage", ["csr", "csc"])
+def test_assign_to_max_guide_without_guides(storage: str) -> None:
+    adata = _adata(np.zeros((3, 0), np.float32))
+    adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
+    rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=1)
+    assert list(adata.obs["assigned_guide"]) == ["Negative"] * 3
+
+
+@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
+def test_assign_by_threshold_compares_in_data_precision(storage: str) -> None:
+    adata = _adata(np.array([[0.7, 0.2]], np.float32))
+    if storage != "dense":
+        adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
+    rsc.ptg.GuideAssignment().assign_by_threshold(adata, assignment_threshold=0.7)
+    np.testing.assert_array_equal(_dense(adata.layers["assigned_guides"]), [[1, 0]])
+
+
+def _pertpy_labels(binary: np.ndarray, names: np.ndarray, **kwargs) -> pd.Categorical:
+    """pertpy's per-cell labels of a dense binary assignment."""
+    cap = kwargs.get("max_assignments_per_cell", 5)
+    out = np.full(len(binary), kwargs.get("no_grna_assigned_key", "negative"), object)
+    for i, row in enumerate(binary):
+        guides = names[np.flatnonzero(row)]
+        if 1 <= guides.size <= cap:
+            out[i] = "+".join(guides)
+    out[binary.sum(axis=1) > cap] = kwargs.get("multiple_grna_assigned_key", "multiple")
+    return pd.Categorical(out)
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "match"),
+    ("names", "kwargs"),
     [
-        ({"posterior_threshold": 1.0}, "posterior_threshold"),
-        ({"max_iter": 0}, "max_iter"),
-        ({"tol": 0.0}, "tol"),
-        ({"max_assignments_per_cell": 0}, "max_assignments_per_cell"),
+        (None, {"no_grna_assigned_key": "none", "multiple_grna_assigned_key": "none"}),
+        (None, {"multiple_grna_assigned_key": "guide_0+guide_1"}),
+        (None, {"max_assignments_per_cell": 0}),
+        (None, {"max_assignments_per_cell": 1}),
+        (["a", "a", "b", "b", "c", "c", "d", "d", "e", "e", "f", "f"], {}),
     ],
 )
-def test_mixture_model_invalid_args_before_data_access(
-    guide_adata: AnnData, kwargs: dict[str, float | int], match: str
+def test_mixture_model_labels_match_pertpy(
+    guide_adata: tuple[AnnData, np.ndarray], names: list | None, kwargs: dict
 ) -> None:
-    ga = rsc.ptg.GuideAssignment()
-    with pytest.raises(ValueError, match=match):
-        ga.assign_mixture_model(guide_adata, layer="missing_layer", **kwargs)
-
-
-def test_mixture_model_cuda_assignments_are_bool(guide_adata: AnnData) -> None:
-    from rapids_singlecell._cuda import _guide_assignment_cuda
-
-    if _guide_assignment_cuda is None:
-        pytest.skip("_guide_assignment_cuda extension is not available")
-
-    assignments, *_ = _fit_assign_cuda(
-        cp.ascontiguousarray(guide_adata.X.astype(cp.float32, copy=False)),
-        max_iter=90,
-        tol=1e-4,
-        posterior_threshold=0.645,
+    adata, _ = guide_adata
+    if names is not None:
+        adata.var_names = names
+    rsc.ptg.GuideAssignment().assign_mixture_model(adata, **kwargs)
+    expected = _pertpy_labels(
+        _dense(adata.layers["assigned_guides"]) > 0,
+        np.asarray(adata.var_names, dtype=object),
+        **kwargs,
     )
-
-    assert assignments.dtype == cp.bool_
-
-
-def test_mixture_model_cuda_c_and_f_layouts_match(guide_adata: AnnData) -> None:
-    from rapids_singlecell._cuda import _guide_assignment_cuda
-
-    if _guide_assignment_cuda is None:
-        pytest.skip("_guide_assignment_cuda extension is not available")
-
-    X_c = cp.ascontiguousarray(guide_adata.X.astype(cp.float32, copy=False))
-    X_f = cp.asfortranarray(guide_adata.X.astype(cp.float32, copy=False))
-
-    c_result = _fit_assign_cuda(
-        X_c,
-        max_iter=90,
-        tol=1e-4,
-        posterior_threshold=0.645,
-    )
-    f_result = _fit_assign_cuda(
-        X_f,
-        max_iter=90,
-        tol=1e-4,
-        posterior_threshold=0.645,
-    )
-
-    for c_value, f_value in zip(c_result[:-1], f_result[:-1], strict=True):
-        cp.testing.assert_array_equal(c_value, f_value)
-    assert c_result[-1] == f_result[-1]
-
-
-def test_mixture_model_skip_low_count() -> None:
-    """Guides with < 2 expressing cells should be skipped with a warning."""
-    X = np.zeros((50, 3), dtype=np.float32)
-    # guide 0: only 1 cell expressing
-    X[0, 0] = 10.0
-    # guide 1: no cells expressing
-    # guide 2: good signal
-    X[:20, 2] = np.random.default_rng(0).poisson(lam=50, size=20).astype(np.float32)
-
-    adata = AnnData(
-        X=cp.array(X),
-        var=pd.DataFrame(index=["low", "empty", "good"]),
-        obs=pd.DataFrame(index=[f"c{i}" for i in range(50)]),
-    )
-
-    ga = rsc.ptg.GuideAssignment()
-    with pytest.warns(UserWarning, match="less than 2 cells"):
-        ga.assign_mixture_model(adata)
-
-    # "good" guide should have some assignments
-    assigned = adata.obs["assigned_guide"]
-    assert assigned.str.contains("good", na=False).any()
-
-
-def test_mixture_model_skip_max_count_below_two() -> None:
-    """Guides whose non-zero counts never reach 2 UMIs are skipped."""
-    X = np.zeros((50, 2), dtype=np.float32)
-    X[:25, :] = 1.0
-
-    adata = AnnData(
-        X=cp.array(X),
-        var=pd.DataFrame(index=["one_a", "one_b"]),
-        obs=pd.DataFrame(index=[f"c{i}" for i in range(50)]),
-    )
-
-    ga = rsc.ptg.GuideAssignment()
-    with pytest.warns(UserWarning, match="maximum UMI count is less than 2"):
-        ga.assign_mixture_model(adata)
-
-    assert (adata.obs["assigned_guide"] == "negative").all()
-
-
-def test_multiple_guide_assignment() -> None:
-    """Cells assigned to multiple guides get joined names."""
-    rng = np.random.default_rng(99)
-    n_cells = 100
-    n_guides = 3
-
-    # All cells get high counts for guide 0 and 1, low for guide 2
-    X = np.zeros((n_cells, n_guides), dtype=np.float32)
-    X[:, 0] = rng.poisson(lam=50, size=n_cells).astype(np.float32)
-    X[:, 1] = rng.poisson(lam=50, size=n_cells).astype(np.float32)
-    # guide 2: mix of low and high
-    X[:30, 2] = rng.poisson(lam=50, size=30).astype(np.float32)
-    X[30:, 2] = rng.poisson(lam=2, size=70).astype(np.float32)
-
-    # Add some background cells
-    bg_cells = rng.choice(n_cells, size=20, replace=False)
-    X[bg_cells, 0] = rng.poisson(lam=2, size=20).astype(np.float32)
-    X[bg_cells, 1] = rng.poisson(lam=2, size=20).astype(np.float32)
-
-    adata = AnnData(
-        X=cp.array(X),
-        var=pd.DataFrame(index=["gA", "gB", "gC"]),
-        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_cells)]),
-    )
-
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_mixture_model(adata)
-
-    assigned = adata.obs["assigned_guide"]
-    # Some cells should have multi-guide assignments (containing "+")
-    has_multi = assigned.str.contains("+", na=False, regex=False)
-    assert has_multi.any(), "Expected some cells with multiple guide assignments"
-
-
-def test_multiple_guide_max_cap() -> None:
-    """Cells exceeding max_assignments_per_cell get the multiple key."""
-    rng = np.random.default_rng(7)
-    n_cells = 50
-    n_guides = 6
-
-    # All cells get very high counts for all guides
-    X = rng.poisson(lam=100, size=(n_cells, n_guides)).astype(np.float32)
-    # Add some background cells for EM to separate
-    X[:10, :] = rng.poisson(lam=2, size=(10, n_guides)).astype(np.float32)
-
-    adata = AnnData(
-        X=cp.array(X),
-        var=pd.DataFrame(index=[f"g{i}" for i in range(n_guides)]),
-        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_cells)]),
-    )
-
-    ga = rsc.ptg.GuideAssignment()
-    ga.assign_mixture_model(
-        adata,
-        max_assignments_per_cell=2,
-        multiple_grna_assigned_key="too_many",
-    )
-
-    assigned = adata.obs["assigned_guide"]
-    # Some cells should be capped
-    assert (assigned == "too_many").any(), (
-        "Expected some cells capped at max assignments"
-    )
+    labels = adata.obs["assigned_guide"]
+    assert list(labels.cat.categories) == list(expected.categories)
+    np.testing.assert_array_equal(labels.astype(str), np.asarray(expected, dtype=str))
