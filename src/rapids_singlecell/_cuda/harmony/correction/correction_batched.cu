@@ -5,6 +5,7 @@
 
 #include "../../nb_types.h"
 
+#include "../comm.cuh"
 #include "../segment_gemm.cuh"
 #include "apply_rows.cuh"
 #include "kernels_correction_fast.cuh"
@@ -35,16 +36,17 @@ __global__ void group_absmax_kernel(const T* X, int D, const int* seg_start,
     }
 }
 
-// out[g * group_stride + k * ld_out + d] = sum over the cells of group g of
-// R_ik X_id (R row stride ldr), exact over the segments (segment_gemm.cuh) in
-// 1 (float32) or 2 limbs of 30 bits; bounds (n_groups x n_pcs): exponents of
-// n_g max|X_gd| (segment_gemm.cuh).
+// out[g * group_stride + k * ld_out + d] = sum over the cells of group g (on
+// all GPUs of comm) of R_ik X_id (R row stride ldr), exact over the segments
+// (segment_gemm.cuh) in 1 (float32) or 2 limbs of 30 bits; bounds (n_groups x
+// n_pcs): exponents of n_g max|X_gd| (segment_gemm.cuh).
 template <typename T, typename RT, typename OT>
 static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
                          int n_clusters, const int* seg_start,
                          const int* seg_group, int n_seg, int n_groups,
                          const short* bounds, long long* acc, OT* out,
                          long long group_stride, int ld_out,
+                         harmony_comm::Comm* comm, int rank,
                          cudaStream_t stream) {
     int limbs = sizeof(T) == 4 ? 1 : 2;
     cudaMemsetAsync(
@@ -55,6 +57,8 @@ static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
                                              seg_start, seg_group, n_seg,
                                              bounds, acc, limbs, stream),
                "segment sums");
+    harmony_comm::allgather_groups(comm, rank, acc,
+                                   (size_t)limbs * n_clusters * n_pcs, stream);
     cuda_check(harmony_segments::finalize_rtz(acc, n_groups, n_pcs, n_clusters,
                                               limbs, bounds, out, group_stride,
                                               ld_out, stream),
@@ -73,7 +77,7 @@ static void prepare_multi_impl(
     int n_batches, int n_first, int n_covariates, const int* seg_start,
     const int* seg_group, int n_seg, int n_joint_categories,
     const short* bounds, double* gram, double* rhs, double* joint_rhs,
-    long long* acc, cudaStream_t stream) {
+    long long* acc, harmony_comm::Comm* comm, int rank, cudaStream_t stream) {
     int nb1 = n_batches + 1;
     cudaMemsetAsync(gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double),
                     stream);
@@ -99,7 +103,7 @@ static void prepare_multi_impl(
 
     segment_sums(X, R, ldr, n_pcs, n_clusters, seg_start, seg_group, n_seg,
                  n_joint_categories, bounds, acc, joint_rhs,
-                 (long long)n_clusters * n_pcs, n_pcs, stream);
+                 (long long)n_clusters * n_pcs, n_pcs, comm, rank, stream);
     marginal_from_joint_rhs_kernel<<<
         strided_grid((long long)n_clusters * n_batches * n_pcs, BLOCK_DIM_1D),
         BLOCK_DIM_1D, 0, stream>>>(joint_rhs, marginal_joint_offsets,
@@ -151,10 +155,11 @@ static void correction_batched_impl(
     int n_clusters, int k0, int n_k, const int* seg_start, const int* seg_group,
     int n_seg, int n_batches, const short* bounds, T* Z, T* S, T* W,
     long long* rhs_acc, bool normalize, bool resume, bool finish,
-    cudaStream_t stream) {
+    harmony_comm::Comm* comm, int rank, cudaStream_t stream) {
     long long s_cluster = (long long)n_batches * n_pcs;
     segment_sums(X, R + k0, n_clusters, n_pcs, n_k, seg_start, seg_group, n_seg,
-                 n_batches, bounds, rhs_acc, S, n_pcs, (int)s_cluster, stream);
+                 n_batches, bounds, rhs_acc, S, n_pcs, (int)s_cluster, comm,
+                 rank, stream);
     // rhs_acc (summed into S) holds the intercepts
     ridge_coefficients(O, lambda_kb, S, W, reinterpret_cast<double*>(rhs_acc),
                        s_cluster, n_batches, n_clusters, n_pcs, k0, n_k,
@@ -211,7 +216,8 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<T, Device> Z, gpu_array_c<T, Device> S,
            gpu_array_c<T, Device> W, gpu_array_c<long long, Device> rhs_acc,
            bool normalize, std::optional<gpu_array_c<uint16_t, Device>> R_bf16,
-           int cluster_start, bool resume, bool finish, std::uintptr_t stream) {
+           int cluster_start, bool resume, bool finish, std::uintptr_t stream,
+           std::uintptr_t comm, int rank) {
             // S: the clusters of this call, from cluster_start
             int n_pcs = (int)X.shape(1), n_clusters = (int)R.shape(1),
                 n_k = (int)S.shape(0), n_batches = bound_groups(bounds, n_pcs);
@@ -230,7 +236,8 @@ static void register_correction_batched(nb::module_& m) {
                     cluster_start, n_k, seg_start.data(), seg_group.data(),
                     (int)seg_group.size(), n_batches, bounds.data(), Z.data(),
                     S.data(), W.data(), rhs_acc.data(), normalize, resume,
-                    finish, (cudaStream_t)stream);
+                    finish, (harmony_comm::Comm*)comm, rank,
+                    (cudaStream_t)stream);
             };
             if (!R_bf16) return run(R.data());
             if constexpr (std::is_same_v<T, float>)
@@ -238,13 +245,14 @@ static void register_correction_batched(nb::module_& m) {
                     reinterpret_cast<const __nv_bfloat16*>(R_bf16->data()));
             throw std::invalid_argument("bfloat16 assignments require float32");
         },
-        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(), "O"_a.noconvert(),
+        nb::call_guard<nb::gil_scoped_release>(), "X"_a.noconvert(),
+        nb::kw_only(), "R"_a.noconvert(), "O"_a.noconvert(),
         "lambda_kb"_a.noconvert(), "seg_start"_a.noconvert(),
         "seg_group"_a.noconvert(), "bounds"_a.noconvert(), "Z"_a.noconvert(),
         "S"_a.noconvert(), "W"_a.noconvert(), "rhs_acc"_a.noconvert(),
         "normalize"_a = false, "R_bf16"_a.noconvert() = nb::none(),
         "cluster_start"_a = 0, "resume"_a = false, "finish"_a = true,
-        "stream"_a = 0);
+        "stream"_a = 0, "comm"_a = 0, "rank"_a = 0);
 
     m.def(
         "prepare_multi",
@@ -260,7 +268,8 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const short, Device> bounds,
            gpu_array_c<double, Device> gram, gpu_array_c<double, Device> rhs,
            gpu_array_c<double, Device> joint_rhs,
-           gpu_array_c<long long, Device> acc, std::uintptr_t stream) {
+           gpu_array_c<long long, Device> acc, std::uintptr_t stream,
+           std::uintptr_t comm, int rank) {
             if (R.ndim() != 2 || R.stride(1) != 1)
                 throw std::invalid_argument("R must have contiguous rows");
             if (n_first < 1 || n_first > n_batches)
@@ -275,16 +284,17 @@ static void register_correction_batched(nb::module_& m) {
                 (int)joint_cats.shape(1), seg_start.data(), seg_group.data(),
                 (int)seg_group.size(), n_joint_categories, bounds.data(),
                 gram.data(), rhs.data(), joint_rhs.data(), acc.data(),
-                (cudaStream_t)stream);
+                (harmony_comm::Comm*)comm, rank, (cudaStream_t)stream);
         },
-        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(),
-        "joint_O"_a.noconvert(), "joint_cats"_a.noconvert(),
-        "marginal_joint_offsets"_a.noconvert(),
+        nb::call_guard<nb::gil_scoped_release>(), "X"_a.noconvert(),
+        nb::kw_only(), "R"_a.noconvert(), "joint_O"_a.noconvert(),
+        "joint_cats"_a.noconvert(), "marginal_joint_offsets"_a.noconvert(),
         "marginal_joint_indices"_a.noconvert(), "lambda_kb"_a.noconvert(),
         "active_mask"_a.noconvert(), "n_batches"_a, "n_first"_a,
         "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
         "bounds"_a.noconvert(), "gram"_a.noconvert(), "rhs"_a.noconvert(),
-        "joint_rhs"_a.noconvert(), "acc"_a.noconvert(), "stream"_a = 0);
+        "joint_rhs"_a.noconvert(), "acc"_a.noconvert(), "stream"_a = 0,
+        "comm"_a = 0, "rank"_a = 0);
 
     m.def(
         "apply_multi",
