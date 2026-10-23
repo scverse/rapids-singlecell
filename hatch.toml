@@ -10,6 +10,8 @@ dependency-groups = [ "test" ]
 overrides.matrix.cuda.features = [
     { if = [ "12" ], value = "rapids-cu12" },
     { if = [ "13" ], value = "rapids-cu13" },
+    { if = [ "12" ], value = "io-cu12" },
+    { if = [ "13" ], value = "io-cu13" },
 ]
 
 # Python per deps
