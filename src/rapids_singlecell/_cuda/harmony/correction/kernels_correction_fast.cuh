@@ -1,132 +1,107 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <type_traits>
 
-// ---- Compute inverse matrix for one or all clusters (algebraic fast-inverse)
-// ---- Uses the algebraic simplification to avoid explicit matrix inversion:
-//   factor[b] = 1 / (O_k[b] + lambda_kb[b,k])
-//   P_row0[b] = -factor[b] * O_k[b]
-//   c = N_k - sum(factor[b] * O_k[b]^2)
-//   c_inv = 1 / c
-//   inv[0,0] = c_inv
-//   inv[0,j] = c_inv * P_row0[j-1]        (j > 0)
-//   inv[i,0] = P_row0[i-1] * c_inv        (i > 0)
-//   inv[i,j] = P_row0[i-1]*c_inv*P_row0[j-1] + factor[i-1]*delta(i,j)  (i,j >
-//   0)
-//
-// lambda_kb is (n_batches, n_clusters) row-major, same layout as O.
-//
-// When cluster_k >= 0, computes only that cluster (launch with 1 block).
-//   g_factor/g_P_row0 are flat (n_batches,) workspace.
-// When cluster_k < 0, computes all clusters (launch with n_clusters blocks).
-//   g_factor/g_P_row0 are (n_clusters, n_batches) workspace.
+#include <algorithm>
+
+#include "../../nb_types.h"
+#include "../storage.cuh"
+
+// ---- Ridge coefficients of one batch key ----
+// The design [intercept, batch indicators] with ridge lambda_kb on the batch
+// terms has the arrowhead Gram [[N_k, O_k^T], [O_k, diag(O_k + lambda_k)]].
+// Eliminating the batch terms, with S_b = R_b^T X_b and
+// f_b = 1 / (O_kb + lambda_kb):
+//   beta0 = sum_b f_b lambda_kb S_b / sum_b f_b lambda_kb O_kb  (0 if empty)
+//   W_b   = f_b (S_b - O_kb beta0)
+// Unlike N_k - sum_b f_b O_kb^2 (the inverse's pivot), no term cancels at
+// large counts, so a fixed lambda stays accurate in float32. Clusters k0 ..
+// k0 + n_k - 1; S and W hold rows b of cluster k at (k - k0) * cluster_stride
+// + b * n_pcs. A cluster without cells (all O_kb = 0) gets no correction.
+
+// beta[(k - k0) * n_pcs + d] of cluster k0 + blockIdx.x: both sums run over
+// b in order (fma chains in double), the denominator in warp 0, the numerators
+// of 32 PCs in each other warp; f_b lambda_kb once per tile of b.
 template <typename T>
-__global__ void compute_inv_mats_kernel(const T* __restrict__ O,
-                                        const T* __restrict__ lambda_kb,
-                                        T* __restrict__ inv_mats,
-                                        T* __restrict__ g_factor,
-                                        T* __restrict__ g_P_row0, int n_batches,
-                                        int n_clusters, int cluster_k = -1) {
-    int k = (cluster_k >= 0) ? cluster_k : blockIdx.x;
-    if (k >= n_clusters) return;
-
-    int nb1 = n_batches + 1;
-    T* inv = (cluster_k >= 0) ? inv_mats : inv_mats + (size_t)k * nb1 * nb1;
-
-    // Choose workspace: single-cluster or batched global memory
-    T* my_factor;
-    T* my_P_row0;
-    if (cluster_k >= 0) {
-        my_factor = g_factor;
-        my_P_row0 = g_P_row0;
-    } else {
-        my_factor = g_factor + (size_t)k * n_batches;
-        my_P_row0 = g_P_row0 + (size_t)k * n_batches;
-    }
-
-    // Phase 1: compute factor, P_row0, and reduce for N_k and c
-    T local_Nk = T(0);
-    T local_c_neg = T(0);
-
-    for (int b = threadIdx.x; b < n_batches; b += blockDim.x) {
-        T o_val =
-            O[b * n_clusters + k];  // O is (n_batches, n_clusters) row-major
-        T lam = lambda_kb[b * n_clusters + k];  // same layout as O
-        T f = T(1) / (o_val + lam);
-        T p = -f * o_val;
-        my_factor[b] = f;
-        my_P_row0[b] = p;
-        local_Nk += o_val;
-        local_c_neg += f * o_val * o_val;
-    }
-
-    // Warp-level reduction
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        local_Nk += __shfl_down_sync(0xffffffff, local_Nk, offset);
-        local_c_neg += __shfl_down_sync(0xffffffff, local_c_neg, offset);
-    }
-
-    // Block-level reduction
-    __shared__ T s_Nk[32];
-    __shared__ T s_c_neg[32];
-    int warp_id = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-
-    if (lane == 0) {
-        s_Nk[warp_id] = local_Nk;
-        s_c_neg[warp_id] = local_c_neg;
-    }
-    __syncthreads();
-
-    __shared__ T s_c_inv;
-    if (threadIdx.x < 32) {
-        int nwarps = (blockDim.x + 31) >> 5;
-        T Nk =
-            (static_cast<int>(threadIdx.x) < nwarps) ? s_Nk[threadIdx.x] : T(0);
-        T c_neg = (static_cast<int>(threadIdx.x) < nwarps)
-                      ? s_c_neg[threadIdx.x]
-                      : T(0);
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            Nk += __shfl_down_sync(0xffffffff, Nk, offset);
-            c_neg += __shfl_down_sync(0xffffffff, c_neg, offset);
+__global__ void __launch_bounds__(288)
+    ridge_intercept_kernel(const T* __restrict__ O,
+                           const T* __restrict__ lambda_kb,
+                           const T* __restrict__ S, double* __restrict__ beta,
+                           long long cluster_stride, int n_batches,
+                           int n_clusters, int n_pcs, int k0) {
+    constexpr int TB = 256;
+    __shared__ double ws[TB], os[TB], denominator;
+    const int k = k0 + blockIdx.x, warp = threadIdx.x / 32;
+    const int d =
+        (blockIdx.y * (blockDim.x / 32 - 1) + warp - 1) * 32 + threadIdx.x % 32;
+    const bool pc = warp > 0 && d < n_pcs;
+    const T* s = S + blockIdx.x * cluster_stride + d;
+    double c = 0, num = 0;
+    for (int b0 = 0; b0 < n_batches; b0 += TB) {
+        const int n = min(TB, n_batches - b0);
+        __syncthreads();
+        for (int t = threadIdx.x; t < n; t += blockDim.x) {
+            double o = O[(size_t)(b0 + t) * n_clusters + k];
+            double lam = lambda_kb[(size_t)(b0 + t) * n_clusters + k];
+            ws[t] = lam / (o + lam);  // f_b lambda_kb
+            os[t] = o;
         }
-        if (threadIdx.x == 0) {
-            s_c_inv = T(1) / (Nk - c_neg);
+        __syncthreads();
+        if (warp == 0) {
+#pragma unroll 16
+            for (int t = 0; t < n; ++t) c += ws[t] * os[t];
+        } else if (pc) {
+#pragma unroll 16
+            for (int t = 0; t < n; ++t)
+                num += ws[t] * s[(size_t)(b0 + t) * n_pcs];
         }
     }
+    if (threadIdx.x == 0) denominator = c;
     __syncthreads();
+    if (pc)
+        beta[(size_t)blockIdx.x * n_pcs + d] =
+            denominator > 0 ? num / denominator : 0;
+}
 
-    T c_inv = s_c_inv;
-    for (int b = threadIdx.x; b < n_batches; b += blockDim.x)
-        inv[(size_t)(b + 1) * nb1] = my_P_row0[b] * c_inv;
-    __syncthreads();
-
-    // Phase 2: fill inv_mat entries (read factor/P_row0 from global memory)
-    int total = nb1 * nb1;
-    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
-        int i = idx / nb1;
-        int j = idx % nb1;
-
-        T val;
-        if (i == 0 && j == 0) {
-            val = c_inv;
-        } else if (i == 0) {
-            val = c_inv * my_P_row0[j - 1];
-        } else if (j == 0) {
-            continue;
-        } else {
-            val = inv[(size_t)i * nb1] * my_P_row0[j - 1];
-            if (i == j) val += my_factor[i - 1];
-        }
-        inv[idx] = val;
+// W from beta, one element per thread.
+template <typename T>
+__global__ void ridge_coefficients_kernel(
+    const T* __restrict__ O, const T* __restrict__ lambda_kb,
+    const T* __restrict__ S, const double* __restrict__ beta, T* __restrict__ W,
+    long long cluster_stride, int n_batches, int n_clusters, int n_pcs, int k0,
+    int n_k) {
+    const long long n = (long long)n_k * n_batches * n_pcs;
+    for (long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x; t < n;
+         t += (long long)blockDim.x * gridDim.x) {
+        const int d = int(t % n_pcs), b = int(t / n_pcs % n_batches),
+                  kk = int(t / n_pcs / n_batches);
+        double o = O[(size_t)b * n_clusters + k0 + kk];
+        double lam = lambda_kb[(size_t)b * n_clusters + k0 + kk];
+        size_t i = kk * cluster_stride + (size_t)b * n_pcs + d;
+        W[i] = T((S[i] - o * beta[(size_t)kk * n_pcs + d]) / (o + lam));
     }
 }
 
+// W of clusters k0 .. k0 + n_k - 1; beta: n_k x n_pcs doubles of scratch.
+template <typename T>
+static void ridge_coefficients(const T* O, const T* lambda_kb, const T* S, T* W,
+                               double* beta, long long cluster_stride,
+                               int n_batches, int n_clusters, int n_pcs, int k0,
+                               int n_k, cudaStream_t stream) {
+    const int warps = std::min(8, (n_pcs + 31) / 32);  // + warp 0
+    ridge_intercept_kernel<T>
+        <<<dim3(n_k, (n_pcs + 32 * warps - 1) / (32 * warps)), 32 * (warps + 1),
+           0, stream>>>(O, lambda_kb, S, beta, cluster_stride, n_batches,
+                        n_clusters, n_pcs, k0);
+    CUDA_CHECK_LAST_ERROR(ridge_intercept_kernel);
+    ridge_coefficients_kernel<T>
+        <<<strided_grid((long long)n_k * n_batches * n_pcs, 256), 256, 0,
+           stream>>>(O, lambda_kb, S, beta, W, cluster_stride, n_batches,
+                     n_clusters, n_pcs, k0, n_k);
+    CUDA_CHECK_LAST_ERROR(ridge_coefficients_kernel);
+}
+
 // ---- Gather column: dst[i] = src[i * n_cols + col] ----
-// Extracts a single column from a row-major matrix.
 template <typename T>
 __global__ void gather_column_kernel(const T* __restrict__ src,
                                      T* __restrict__ dst, int col, int n_rows,

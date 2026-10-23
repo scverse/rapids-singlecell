@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import warnings
 from typing import TYPE_CHECKING, Literal
 
@@ -26,7 +27,7 @@ def harmony_integrate(
     *,
     basis: str = "X_pca",
     adjusted_basis: str | None = None,
-    dtype: type = np.float32,
+    dtype: type | str = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
     max_iter_harmony: int = 10,
@@ -42,6 +43,7 @@ def harmony_integrate(
     correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     block_proportion: float = 0.05,
+    shuffle_chunk_size: int = 8,
     rng: SeedLike | RNGLike | None = None,
     verbose: bool = False,
 ) -> None:
@@ -86,7 +88,12 @@ def harmony_integrate(
         The data type used for initialization and Harmony computation.
         Defaults to ``numpy.float32``. Use ``numpy.float64`` when additional
         precision is needed; it can be slower on GPUs with reduced
-        double-precision throughput.
+        double-precision throughput. ``"bfloat16"`` computes in float32 but
+        stores the soft cluster assignments in bfloat16, which is faster and
+        halves their memory (about a quarter less GPU memory with 50
+        components). It needs one batch key and the batched
+        correction and falls back to float32 with a warning otherwise.
+        ``None`` keeps the input's float32 or float64.
     flavor
         Which version of the Harmony algorithm to use.
         ``"harmony2"`` (default) enables the stabilized diversity penalty,
@@ -152,26 +159,38 @@ def harmony_integrate(
         Only used with ``flavor="harmony2"``.
         Set to ``None`` to disable pruning.
     correction_method
-        Method for the correction step.
-        ``"fast"`` uses a precomputed factorization that avoids the full inversion,
-        which can be faster for datasets with many batches.
-        ``"batched"`` processes all clusters simultaneously (fastest but requires more memory).
-        With one key, ``None`` automatically selects ``"batched"`` unless its
-        workspace would exceed 1 GiB, in which case ``"fast"`` is used.
+        Method for the correction step. Both solve the ridge regressions in
+        closed form. ``"batched"`` corrects from exact right-hand sides, as
+        many clusters per pass as fit in 1 GiB of workspace (clusters x
+        batches x components), and normalizes in the same pass. ``"fast"``
+        corrects one cluster at a time with the least workspace (float
+        right-hand sides, a separate normalization pass, one GPU with
+        ``multi_gpu``).
+        With one key, ``None`` automatically selects ``"batched"`` unless one
+        cluster's workspace would exceed 1 GiB, in which case ``"fast"`` is
+        used.
         Multiple keys always use the exact general-design solve because the
         arrowhead optimization applies only to one batch variable; clusters are
         processed in workspace-bounded chunks when needed. For multiple keys,
         use ``None`` or ``"batched"``; passing ``"fast"`` emits a warning and
         uses the exact solve.
     colsum_algo
-        Algorithm for column sums.
-        If ``None``, chosen automatically.
-        The legacy ``"atomics"`` and ``"benchmark"`` values use automatic
-        deterministic selection.
+        No effect: column sums come from the fused clustering kernels. Kept
+        for compatibility.
     block_proportion
         Proportion of cells updated per clustering sub-iteration.
         Smaller values produce more stochastic updates.
         Larger values are faster but may converge to different solutions.
+        The blocks are drawn once per call and visited in a rotating order
+        (the reference implementations redraw random blocks every iteration).
+    shuffle_chunk_size
+        Cells move between the update blocks in runs of this many neighbouring
+        cells of the same batch (joint category with several keys), in random
+        order within the batch, so the GPU writes contiguous rows. Every block
+        takes an equal share of each stretch of about ``n_cells / 384``
+        batch-sorted cells, so batches spanning several stretches are spread
+        evenly; smaller batches are dealt in runs and can be spread less evenly
+        than by independent random blocks (``1`` moves cells one at a time).
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -181,7 +200,7 @@ def harmony_integrate(
         Lloyd reductions. Results may differ across GPU architectures or
         CUDA versions; concurrent CUDA streams are outside this guarantee.
     verbose
-        Whether to print benchmarking and convergence information.
+        Whether to print the number of iterations until convergence.
 
     Returns
     -------
@@ -190,8 +209,17 @@ def harmony_integrate(
     such that different experiments are integrated.
     """
     rng = np.random.default_rng(rng)
+    bfloat16 = str(dtype) == "bfloat16" or getattr(dtype, "__name__", "") == "bfloat16"
+    if bfloat16:
+        dtype = np.float32
+    if dtype is not None:
+        dtype = np.dtype(dtype).newbyteorder("=")
+        if dtype not in (np.float32, np.float64):
+            raise ValueError(
+                f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}."
+            )
 
-    from ._harmony import harmonize
+    from ._harmony import _download, harmonize
 
     # Resolve flavor into internal flags
     if flavor not in {"harmony1", "harmony2"}:
@@ -205,20 +233,20 @@ def harmony_integrate(
             "ridge_lambda is ignored when flavor='harmony2'; "
             "use alpha to control regularization strength.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
     if flavor == "harmony1":
         if alpha != 0.2:
             warnings.warn(
                 "alpha is ignored when flavor='harmony1'; use ridge_lambda instead.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         if batch_prune_threshold != 1e-5:
             warnings.warn(
                 "batch_prune_threshold is ignored when flavor='harmony1'.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
 
     basis = _resolve_obsm_key(adata, basis)
@@ -234,18 +262,19 @@ def harmony_integrate(
 
     # Get the input data
     input_data = adata.obsm[basis]
+    if dtype is None:  # the input's float type, as in earlier releases
+        if not hasattr(input_data, "dtype"):  # e.g. a pandas DataFrame
+            input_data = np.asarray(input_data)
+        dtype = np.dtype(input_data.dtype).newbyteorder("=")
+        if dtype not in (np.float32, np.float64):
+            dtype = np.dtype(np.float32)
 
     try:
         # Handle different array types
         if isinstance(input_data, np.ndarray):
-            # NumPy array: convert directly to CuPy
-            try:
-                X = cp.array(input_data, dtype=dtype, order="C")
-            except (cp.cuda.memory.OutOfMemoryError, MemoryError) as e:
-                raise MemoryError(
-                    "Not enough GPU memory to allocate array. "
-                    "Try reducing the dataset size or using a GPU with more memory."
-                ) from e
+            # NumPy array: Harmony uploads it in chunks, so no unsorted device
+            # copy is kept. Harmony rejects NaN and infinite values.
+            X = np.ascontiguousarray(input_data, dtype=dtype)
         elif isinstance(input_data, cp.ndarray):
             # CuPy array: ensure correct dtype and layout with a copy
             X = input_data.astype(dtype, order="C", copy=False)
@@ -260,15 +289,14 @@ def harmony_integrate(
                     f"Could not convert input of type {type(input_data).__name__} to CuPy array: {str(e)}"
                 ) from e
 
-        # Verify array is valid
-        if cp.isnan(X).any():
-            raise ValueError(
-                "Input data contains NaN values. Please handle these before running harmony_integrate."
-            )
-
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
 
+    # Fault in the host output while the GPU works; copying into touched pages
+    # is about twice as fast as into a fresh allocation.
+    host_out = np.empty(X.shape, dtype=X.dtype)
+    prefault = threading.Thread(target=host_out.fill, args=(0,), daemon=True)
+    prefault.start()
     harmony_out = harmonize(
         X,
         adata.obs,
@@ -281,6 +309,7 @@ def harmony_integrate(
         ridge_lambda=ridge_lambda,
         sigma=sigma,
         block_proportion=block_proportion,
+        shuffle_chunk_size=shuffle_chunk_size,
         theta=theta,
         tau=tau,
         correction_method=correction_method,
@@ -291,6 +320,9 @@ def harmony_integrate(
         alpha=alpha,
         batch_prune_threshold=batch_prune_threshold,
         verbose=verbose,
+        bfloat16=bfloat16,
     )
 
-    adata.obsm[adjusted_basis] = harmony_out.get()
+    prefault.join()
+    _download(harmony_out, host_out)
+    adata.obsm[adjusted_basis] = host_out
