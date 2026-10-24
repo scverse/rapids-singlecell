@@ -138,7 +138,7 @@ def _perm(
         # Update running statistics
         sum_null += perm_result
         sum_null_sq += perm_result**2
-        extreme_count += cp.abs(perm_result) > es_abs
+        extreme_count += cp.abs(perm_result) >= es_abs
 
     # Compute final statistics
     null_mean = sum_null / times
@@ -153,13 +153,8 @@ def _perm(
         cp.where(cp.abs(es) > 1e-10, cp.sign(es) * 1e6, 0.0),
     )
 
-    # Compute empirical p-value
-    pvals = extreme_count.astype(cp.float32)
-    pvals = cp.where(pvals == 0.0, 1.0, pvals)
-    pvals = cp.where(pvals == times, times - 1, pvals)
-    pvals = pvals / times
-    pvals = cp.where(pvals >= 0.5, 1 - pvals, pvals)
-    pvals = pvals * 2  # Two-tailed test
+    # Two-sided empirical p-value, counting the observed score as one of the permutations
+    pvals = (extreme_count.astype(cp.float32) + 1.0) / (times + 1.0)
 
     return nes.astype(cp.float32), pvals
 
@@ -205,12 +200,14 @@ def _func_waggr(
 
     .. math::
 
-        p_{value}=\frac{ES_{rand} \geq ES}{P}
+        p_{value}=\frac{1 + \#\{|ES_{rand}| \geq |ES|\}}{1 + P}
 
     Where:
 
     - :math:`ES_{rand}` are the enrichment scores of the random permutations
     - :math:`P` is the total number of permutations
+
+    The observed score is counted as one of the permutations, so that :math:`p_{value}` is never 0 :cite:`phipson2010`.
 
     Additionally, :math:`ES` is updated to a normalized enrichment score :math:`NES`.
 
