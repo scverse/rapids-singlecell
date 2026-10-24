@@ -786,15 +786,16 @@ def _upload_sorted(
             target = targets[rank]
             stream = cp.cuda.get_current_stream()
             X = cp.empty((hi - lo, d), dtype=Z.dtype)
+            step = max(1, min(rows, hi - lo))  # no larger than the shard
             slots = [
-                [_pinned(rows, d, Z.dtype), cp.empty((rows, d), dtype=Z.dtype), None]
+                [_pinned(step, d, Z.dtype), cp.empty((step, d), dtype=Z.dtype), None]
                 for _ in range(2)
             ]
-            for i, a in enumerate(range(0, hi - lo, rows)):
+            for i, a in enumerate(range(0, hi - lo, step)):
                 host, staged, done = slots[i % 2]
                 if done is not None:
                     done.synchronize()  # the slot's previous chunk is placed
-                b = min(hi - lo, a + rows)
+                b = min(hi - lo, a + step)
                 if source is None:
                     _parallel_copy(fill, host[: b - a], Z[a:b])
                 else:
