@@ -940,12 +940,18 @@ def _rhs_bounds(
     exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells
     (sorted by group, ``offsets`` on the host) and PC d, so no other group or
     PC coarsens a sum. ``parts`` hold the cells ``bounds[r] .. bounds[r + 1]``;
-    maxima are exact, so every split gives the same bounds."""
-    maxima = []
+    each GPU takes the maxima of its own groups (a group spanning GPUs from
+    each), which are exact, so every split gives the same bounds."""
+    maxima = np.zeros((len(offsets) - 1, parts[0].shape[1]), dtype=parts[0].dtype)
     for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
+        if hi == lo:
+            continue
+        # the groups of the cells lo .. hi - 1
+        first, end = np.searchsorted(offsets, [lo, hi - 1], side="right") - [1, 0]
         with cp.cuda.Device(part.device.id):
             seg_start, seg_group = _segments(offsets, _SEGMENT, lo, hi)
-            m = cp.empty((len(offsets) - 1, part.shape[1]), dtype=part.dtype)
+            seg_group -= int(first)  # rows of m
+            m = cp.empty((end - first, part.shape[1]), dtype=part.dtype)
             _correction_batched_cuda.group_absmax(
                 part,
                 seg_start=seg_start,
@@ -953,8 +959,8 @@ def _rhs_bounds(
                 out=m,
                 stream=cp.cuda.get_current_stream().ptr,
             )
-            maxima.append(m.get())
-    maxima = np.maximum.reduce(maxima).astype(np.float64)
+            np.maximum(maxima[first:end], m.get(), out=maxima[first:end])
+    maxima = maxima.astype(np.float64)
     if not np.isfinite(maxima).all():
         raise ValueError(
             "Input data contains NaN or infinite values. Please handle these before running harmony_integrate."
