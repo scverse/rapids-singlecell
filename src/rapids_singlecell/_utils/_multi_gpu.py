@@ -82,16 +82,17 @@ def _copy_to_device_p2p(
     ``out`` if given, of the same layout).
 
     The copy runs on the destination's current stream after the work on the
-    source's current stream, which then waits for the copy: ``array`` may be
-    released right away. cudaMemcpyPeerAsync also works for stream-ordered
-    pool memory, which CuPy's generic cross-device copies reject.
+    source's current stream and has landed on return, so ``array`` may be
+    released right away: CuPy's pool reuses a freed block on the stream it was
+    allocated on, which nothing orders after the copy. cudaMemcpyPeerAsync also
+    works for stream-ordered pool memory, which CuPy's generic cross-device
+    copies reject.
     """
     with cp.cuda.Device(array.device.id):
         contiguous = array.flags.c_contiguous or array.flags.f_contiguous
         source = array if contiguous else cp.ascontiguousarray(array)
-        source_stream = cp.cuda.get_current_stream()
         ready = cp.cuda.Event(block=False, disable_timing=True)
-        ready.record(source_stream)
+        ready.record(cp.cuda.get_current_stream())
     with cp.cuda.Device(destination):
         stream = cp.cuda.get_current_stream()
         stream.wait_event(ready)
@@ -107,12 +108,7 @@ def _copy_to_device_p2p(
             source.nbytes,
             stream.ptr,
         )
-        done = cp.cuda.Event(block=False, disable_timing=True)
-        done.record(stream)
-        if source is not array:
-            stream.synchronize()  # the contiguous temporary must outlive it
-    with cp.cuda.Device(array.device.id):  # default stream handles are per device
-        source_stream.wait_event(done)
+        stream.synchronize()
     return out
 
 

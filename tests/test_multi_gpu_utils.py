@@ -387,9 +387,11 @@ class TestDeviceCopy:
             pytest.skip("no working peer copies on this system")
         assert enabled == [(1, 0), (0, 1)]
 
-    def test_peer_copy_orders_the_source_after_it(self):
+    @pytest.mark.parametrize("other_stream", [False, True])
+    def test_peer_copy_orders_the_source_after_it(self, other_stream):
         # The source may be released right away: with the destination's stream
-        # held up, the source GPU reuses its pool block only after the copy.
+        # held up, the source GPU reuses its pool block only after the copy,
+        # also when the block belongs to a stream other than the current one.
         if cp.cuda.runtime.getDeviceCount() < 2:
             pytest.skip("requires two GPUs")
         if not _multi_gpu._peer_copy_works(1, 0):
@@ -403,13 +405,15 @@ class TestDeviceCopy:
                     cp.full(n, -1, dtype=cp.float32)
                     cp.cuda.Device().synchronize()
             with cp.cuda.Device(0):
-                source = cp.arange(n, dtype=cp.float32)
+                allocating = cp.cuda.Stream(non_blocking=True) if other_stream else None
+                with allocating or cp.cuda.get_current_stream():
+                    source = cp.arange(n, dtype=cp.float32)
                 cp.cuda.Device().synchronize()
             with cp.cuda.Device(1), cp.cuda.Stream(non_blocking=True) as stream:
                 stream.launch_host_func(lambda _: time.sleep(0.2), None)
                 copied = _multi_gpu._copy_to_device(source, 1)
             del source
-            with cp.cuda.Device(0):
+            with cp.cuda.Device(0), allocating or cp.cuda.get_current_stream():
                 cp.full(n, -1, dtype=cp.float32)  # takes the source's block
             with cp.cuda.Device(1):
                 cp.cuda.Device().synchronize()
