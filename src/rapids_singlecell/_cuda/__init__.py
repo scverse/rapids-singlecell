@@ -37,6 +37,7 @@ __all__ = [
     "_hvg_cuda",
     "_jaccard_cuda",
     "_kde_cuda",
+    "_leiden_cuda",
     "_ligrec_cuda",
     "_mean_var_cuda",
     "_mixscale_cuda",
