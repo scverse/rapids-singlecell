@@ -100,6 +100,7 @@ def co_occurrence(
         return out, interval
 
     adata.uns[f"{cluster_key}_co_occurrence"] = {"occ": out, "interval": interval}
+    return None
 
 
 def _find_min_max(spatial: cp.ndarray) -> tuple[float, float]:

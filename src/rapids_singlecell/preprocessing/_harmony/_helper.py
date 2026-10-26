@@ -10,6 +10,8 @@ from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
 from rapids_singlecell._cuda import _harmony_outer_cuda as _outer_cuda
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pandas as pd
 
 # Column-sum heuristic thresholds (rows x cols regions)
@@ -271,7 +273,9 @@ def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
     return X.T @ cp.ones(X.shape[0], dtype=X.dtype)
 
 
-def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> callable:
+def _choose_colsum_algo_heuristic(
+    rows: int, cols: int, algo: str | None
+) -> Callable[..., cp.ndarray]:
     """Choose a deterministic column reduction from the shape and device."""
     if algo in {"atomics", "benchmark"}:
         algo = None

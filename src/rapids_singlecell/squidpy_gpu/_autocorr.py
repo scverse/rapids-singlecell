@@ -212,3 +212,4 @@ def spatial_autocorr(
     if copy:
         return df
     adata.uns[params["mode"]] = df
+    return None

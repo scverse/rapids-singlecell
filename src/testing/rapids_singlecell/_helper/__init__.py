@@ -161,7 +161,7 @@ def as_cupy(a: NDArray | CSArray | CSMatrix) -> CupyCSRMatrix | cp.ndarray:
         return cp.asarray(a)
     if isinstance(a, CSMatrix):
         return cusparse.csr_matrix(a)
-    if isinstance(a, CSArray):  # type: ignore[arg-type]
+    if isinstance(a, CSArray):
         # Convert via SciPy csr_matrix then to Cupy
-        return cusparse.csr_matrix(sparse.csr_matrix(a))  # type: ignore[arg-type]
+        return cusparse.csr_matrix(sparse.csr_matrix(a))
     return a

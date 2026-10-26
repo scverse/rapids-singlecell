@@ -174,6 +174,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
         time=start,
         deep=f"Adding `adata.uns[{key_added!r}]`",
     )
+    return None
 
 
 def _assert_non_empty_sequence(seq, *, name: str) -> list:

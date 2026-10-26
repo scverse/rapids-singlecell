@@ -159,6 +159,7 @@ def filter_genes(
         data._inplace_subset_var(gene_subset.get())
     else:
         return gene_subset.get(), number_per_gene.get()
+    return None
 
 
 def filter_cells(
@@ -299,6 +300,7 @@ def filter_cells(
         data._inplace_subset_obs(cell_subset.get())
     else:
         return cell_subset.get(), number_per_cell.get()
+    return None
 
 
 def filter_highly_variable(adata: AnnData) -> None:

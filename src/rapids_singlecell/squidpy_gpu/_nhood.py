@@ -140,6 +140,7 @@ def interaction_matrix(
     if copy:
         return out
     adata.uns[f"{cluster_key}_interactions"] = out
+    return None
 
 
 def nhood_enrichment(
@@ -237,3 +238,4 @@ def nhood_enrichment(
     if copy:
         return NhoodEnrichmentResult(zscore=zscore, counts=count)
     adata.uns[f"{cluster_key}_nhood_enrichment"] = {"zscore": zscore, "count": count}
+    return None

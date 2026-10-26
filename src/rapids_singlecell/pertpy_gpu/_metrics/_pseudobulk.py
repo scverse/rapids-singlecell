@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from scipy.sparse import csc_matrix as csc_matrix_cpu
     from scipy.sparse import csr_matrix as csr_matrix_cpu
 
-    _MatrixLike = (
+    type _MatrixLike = (
         np.ndarray
         | cp.ndarray
         | csr_matrix_cpu
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
         | cp_sparse.csr_matrix
         | cp_sparse.csc_matrix
     )
-    _GPUMatrixLike = cp.ndarray | cp_sparse.csr_matrix | cp_sparse.csc_matrix
+    type _GPUMatrixLike = cp.ndarray | cp_sparse.csr_matrix | cp_sparse.csc_matrix
 
 
 def _as_gpu_data(data: pd.DataFrame | _MatrixLike) -> _GPUMatrixLike:

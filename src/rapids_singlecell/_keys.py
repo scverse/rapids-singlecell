@@ -102,7 +102,7 @@ def _draw_graph_keys(key_added: str | None, *, layout: str) -> _EmbeddingKeys:
 
 def _preset_keys(embedding: _Embedding, *, layout: str = "") -> list[_EmbeddingKeys]:
     """The keys `embedding` uses under each preset, oldest preset first."""
-    return [_embedding_keys(embedding, p, layout=layout) for p in Preset]  # type: ignore[call-overload]
+    return [_embedding_keys(embedding, p, layout=layout) for p in Preset]
 
 
 def _preset_obsm_names(embedding: _Embedding, *, layout: str = "") -> set[str]:

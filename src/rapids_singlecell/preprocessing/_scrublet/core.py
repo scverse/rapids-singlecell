@@ -232,8 +232,8 @@ class Scrublet:
 
         pair_ix = _sample_comb((n_obs, n_obs), n_sim, rng=self._rng)
 
-        E1 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 0], :])
-        E2 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 1], :])
+        E1 = self._counts_obs[pair_ix[:, 0], :]
+        E2 = self._counts_obs[pair_ix[:, 1], :]
         tots1 = self._total_counts_obs[pair_ix[:, 0]]
         tots2 = self._total_counts_obs[pair_ix[:, 1]]
         if synthetic_doublet_umi_subsampling < 1:

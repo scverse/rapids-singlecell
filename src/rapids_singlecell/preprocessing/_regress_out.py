@@ -101,6 +101,7 @@ def regress_out(
         _set_obs_rep(adata, X, layer=layer)
     else:
         return X
+    return None
 
 
 def _regress_out_categorical(X, categorical_series):

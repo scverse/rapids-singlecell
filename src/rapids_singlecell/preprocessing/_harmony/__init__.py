@@ -29,6 +29,8 @@ from ._helper import (
 from ._kmeans import _kmeans
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pandas as pd
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -47,7 +49,7 @@ _STOPPING_HARMONY1 = (200, 1e-5, 1e-4)
 
 
 def harmonize(
-    Z: cp.array,
+    Z: cp.ndarray,
     batch_mat: pd.DataFrame,
     batch_key: str | list[str],
     *,
@@ -69,7 +71,7 @@ def harmonize(
     alpha: float = 0.2,
     batch_prune_threshold: float | None = 1e-5,
     verbose: bool = False,
-) -> cp.array:
+) -> cp.ndarray:
     """
     Integrate data using Harmony algorithm.
 
@@ -506,7 +508,7 @@ def _initialize_clusters(
     rng: np.random.Generator,
     cats: cp.ndarray,
     n_batches: int,
-    colsum_func: callable = None,
+    colsum_func: Callable[..., cp.ndarray] | None = None,
     stabilized_penalty: bool = True,
     cat_offsets: cp.ndarray,
     cell_indices: cp.ndarray,
@@ -651,7 +653,7 @@ def _clustering(
     max_iter: int,
     sigma: float,
     block_proportion: float,
-    colsum_func: callable = None,
+    colsum_func: Callable[..., cp.ndarray] | None = None,
     n_batches: int = 0,
     n_covariates: int = 1,
     joint_codes: cp.ndarray | None,

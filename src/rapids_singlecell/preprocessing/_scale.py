@@ -139,6 +139,7 @@ def scale(
         return adata
     elif not inplace:
         return X
+    return None
 
 
 def _scale_dispatch(X, *, mask_obs, zero_center, inplace, max_value):

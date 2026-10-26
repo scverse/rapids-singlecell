@@ -267,6 +267,7 @@ def pca(
 
     if copy:
         return adata
+    return None
 
 
 def _pca_compute(

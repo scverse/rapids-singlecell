@@ -448,3 +448,4 @@ def spatial_neighbors_from_builder(
     adata.obsp[conns_key], adata.obsp[dists_key] = result
     keys = {"connectivities_key": conns_key, "distances_key": dists_key}
     adata.uns[f"{key_added}_neighbors"] = {**keys, "params": builder.uns_params()}
+    return None

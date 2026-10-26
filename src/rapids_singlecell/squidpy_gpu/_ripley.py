@@ -220,6 +220,7 @@ def ripley(
     if copy:
         return res
     adata.uns[f"{cluster_key}_ripley_{mode}"] = res
+    return None
 
 
 def _ppp(hull: ConvexHull, n: int, generator: cp.random.Generator) -> cp.ndarray:

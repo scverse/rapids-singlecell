@@ -128,6 +128,7 @@ def normalize_total(
         return adata
     elif not inplace:
         return X
+    return None
 
 
 def _counts_to_scales(
@@ -434,6 +435,7 @@ def log1p(
         return adata
     elif not inplace:
         return X
+    return None
 
 
 def _calc_sqrt(X: ArrayTypesDask) -> ArrayTypesDask:
@@ -516,6 +518,7 @@ def sqrt(
         return adata
     elif not inplace:
         return X
+    return None
 
 
 def normalize_pearson_residuals(
@@ -656,3 +659,4 @@ def normalize_pearson_residuals(
         _set_obs_rep(adata, residuals, layer=layer)
     else:
         return residuals
+    return None

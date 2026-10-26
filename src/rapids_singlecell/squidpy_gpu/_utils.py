@@ -147,7 +147,7 @@ def _g_moments(w: spmatrix | np.ndarray):
 
     # s1
     t = w.transpose() + w
-    t2 = t.multiply(t)  # type: ignore[union-attr]
+    t2 = t.multiply(t)
     s1 = t2.sum() / 2.0
 
     # s2

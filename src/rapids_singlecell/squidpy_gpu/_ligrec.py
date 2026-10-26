@@ -630,3 +630,4 @@ def ligrec(
     if key_added is None:
         key_added = f"{cluster_key}_ligrec"
     adata.uns[key_added] = res
+    return None

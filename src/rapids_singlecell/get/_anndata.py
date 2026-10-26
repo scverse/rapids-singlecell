@@ -75,6 +75,7 @@ def anndata_to_GPU(
 
     if copy:
         return adata
+    return None
 
 
 def X_to_GPU(
@@ -161,6 +162,7 @@ def anndata_to_CPU(
 
     if copy:
         return adata
+    return None
 
 
 def X_to_CPU(X: GPU_ARRAY_TYPE | DaskArray) -> CPU_ARRAY_TYPE | DaskArray:
