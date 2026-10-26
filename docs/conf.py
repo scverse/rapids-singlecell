@@ -111,7 +111,9 @@ linkcheck_ignore = [
 # -- Options for HTML output -------------------------------------------------
 
 html_theme_options = {
-    "secondary_accent": True,  # second brand colour from the scverse website
+    # TODO: drop once scverse-doc is released with the website accents (scverse/scverse-doc#78)
+    "accent": "#8E93F0",  # violet
+    "secondary_accent": "#F59A3A",  # orange
     "navigation_with_keys": False,
     "show_toc_level": 2,
 }
