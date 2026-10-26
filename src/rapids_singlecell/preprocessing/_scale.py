@@ -87,9 +87,7 @@ def scale(
 
     if not isinstance(data, AnnData):
         if layer is not None or obsm is not None:
-            raise ValueError(
-                "`layer` and `obsm` can only be used with an AnnData object."
-            )
+            raise ValueError("`layer` and `obsm` can only be used with an AnnData object.")
         X = data
         _check_gpu_X(X, allow_dask=True)
         mask_obs = _check_mask(X, mask_obs, "obs")
@@ -227,9 +225,7 @@ def _scale_array(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=
     return X, mean, std
 
 
-def _scale_sparse_csc(
-    X, *, mask_obs=None, zero_center=True, inplace=True, max_value=None
-):
+def _scale_sparse_csc(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=None):
     if zero_center:
         X = _sparse_to_dense(X, order="C")
         # inplace is True because we copied with `toarray`
@@ -272,9 +268,7 @@ def _scale_sparse_csc(
         return X, mean, std
 
 
-def _scale_sparse_csr(
-    X, *, mask_obs=None, zero_center=True, inplace=True, max_value=None
-):
+def _scale_sparse_csr(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=None):
     if zero_center:
         X = _sparse_to_dense(X, order="C")
         # inplace is True because we copied with `toarray`
@@ -319,9 +313,7 @@ def _scale_sparse_csr(
 def _scale_dask(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=None):
     if not inplace:
         X = X.copy()
-    mean, var = dask.compute(
-        *_get_mean_var(X[mask_obs if mask_obs is not None else slice(None), :])
-    )
+    mean, var = dask.compute(*_get_mean_var(X[mask_obs if mask_obs is not None else slice(None), :]))
     if mask_obs is None:
         mask_array = cp.ones(X.shape[0], dtype=cp.int32)
     else:
@@ -330,9 +322,7 @@ def _scale_dask(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=N
     std[std == 0] = 1
     max_value = _get_max_value(max_value, X.dtype)
 
-    mask_array = da.from_array(
-        mask_array, chunks=(X.chunks[0],), meta=_meta_dense(mask_array.dtype)
-    )
+    mask_array = da.from_array(mask_array, chunks=(X.chunks[0],), meta=_meta_dense(mask_array.dtype))
 
     if isinstance(X._meta, sparse.csr_matrix) and zero_center:
 
@@ -353,9 +343,7 @@ def _scale_dask(X, *, mask_obs=None, zero_center=True, inplace=True, max_value=N
     elif isinstance(X._meta, cp.ndarray) and not zero_center:
         scale = _scale_dask_array_nzc
     else:
-        raise ValueError(
-            "Invalid `._meta` type only supports `cupyx.scipy.sparse.csr_matrix` and `cp.ndarray`"
-        )
+        raise ValueError("Invalid `._meta` type only supports `cupyx.scipy.sparse.csr_matrix` and `cp.ndarray`")
     return scale(X, mask_array=mask_array, mean=mean, std=std, max_value=max_value)
 
 

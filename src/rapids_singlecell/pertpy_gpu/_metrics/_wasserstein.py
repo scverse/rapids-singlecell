@@ -87,12 +87,8 @@ def _build_ragged_layout(
     g_off = cp.asarray(g_off_h)
 
     # Flat row/column -> pair via searchsorted on the internal start offsets.
-    row2pair = cp.searchsorted(
-        f_off[1:], cp.arange(total_rows, dtype=cp.int64), side="right"
-    ).astype(cp.int32)
-    col2pair = cp.searchsorted(
-        g_off[1:], cp.arange(total_cols, dtype=cp.int64), side="right"
-    ).astype(cp.int32)
+    row2pair = cp.searchsorted(f_off[1:], cp.arange(total_rows, dtype=cp.int64), side="right").astype(cp.int32)
+    col2pair = cp.searchsorted(g_off[1:], cp.arange(total_cols, dtype=cp.int64), side="right").astype(cp.int32)
 
     # Flat tile schedule (one TILE x TILE tile per block in build_cost).
     ntn_h = (n_h.astype(np.int64) + COST_TILE - 1) // COST_TILE
@@ -101,9 +97,7 @@ def _build_ragged_layout(
     tile_off_h, total_tiles = _excl_cumsum(tpp_h)
     tile_off = cp.asarray(tile_off_h)
     ntm = cp.asarray(ntm_h)
-    tile_pair = cp.searchsorted(
-        tile_off[1:], cp.arange(total_tiles, dtype=cp.int64), side="right"
-    ).astype(cp.int32)
+    tile_pair = cp.searchsorted(tile_off[1:], cp.arange(total_tiles, dtype=cp.int64), side="right").astype(cp.int32)
     t_local = cp.arange(total_tiles, dtype=cp.int64) - tile_off[tile_pair]
     ntm_p = ntm[tile_pair]
     tile_i0 = ((t_local // ntm_p) * COST_TILE).astype(cp.int32)
@@ -148,9 +142,7 @@ def _build_ragged_layout(
     }
 
 
-def _launch_build_cost(
-    emb: cp.ndarray, layout: dict, cost: cp.ndarray, stream_ptr: int
-) -> None:
+def _launch_build_cost(emb: cp.ndarray, layout: dict, cost: cp.ndarray, stream_ptr: int) -> None:
     """Fill the flat ``cost`` array for a ragged ``layout`` (one kernel launch)."""
     _sk.build_cost(
         emb,
@@ -247,10 +239,7 @@ def _plan_device_batches(
         return round_robin
 
     bounds = _split_positions_by_work(n_row_host, n_col_host, n_devices)
-    return [
-        _plan_batches(bounds[i], bounds[i + 1], n_row_host, n_col_host, itemsize)
-        for i in range(n_devices)
-    ]
+    return [_plan_batches(bounds[i], bounds[i + 1], n_row_host, n_col_host, itemsize) for i in range(n_devices)]
 
 
 class WassersteinMetric(BaseMetric):
@@ -295,10 +284,7 @@ class WassersteinMetric(BaseMetric):
     ):
         super().__init__(layer_key=layer_key, obsm_key=obsm_key)
         if not MIN_RELAXATION <= relaxation < MAX_RELAXATION:
-            raise ValueError(
-                f"relaxation must be in [{MIN_RELAXATION}, {MAX_RELAXATION}); "
-                f"got {relaxation}."
-            )
+            raise ValueError(f"relaxation must be in [{MIN_RELAXATION}, {MAX_RELAXATION}); got {relaxation}.")
         # Fixed to OTT-JAX / pertpy defaults (not user-tunable); eps is auto.
         self.epsilon_scale = DEFAULT_EPSILON_SCALE
         self.max_iter = DEFAULT_MAX_ITER
@@ -370,11 +356,7 @@ class WassersteinMetric(BaseMetric):
         cost_bufs: dict[int, cp.ndarray] = {}
         converged = True
         for r in range(max((len(p) for p in plans), default=0)):
-            batch = [
-                (dev, *plans[di][r])
-                for di, dev in enumerate(device_ids)
-                if r < len(plans[di])
-            ]
+            batch = [(dev, *plans[di][r]) for di, dev in enumerate(device_ids) if r < len(plans[di])]
 
             # Phases are kept separate (layout/alloc, then cost kernels, then
             # solve) so the per-device kernels launch back-to-back and overlap.
@@ -593,8 +575,7 @@ class WassersteinMetric(BaseMetric):
 
     def _warn_not_converged(self) -> None:
         warnings.warn(
-            f"Sinkhorn did not converge in {self.max_iter} iterations "
-            f"(tol={self.tol}).",
+            f"Sinkhorn did not converge in {self.max_iter} iterations (tol={self.tol}).",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -620,9 +601,7 @@ class WassersteinMetric(BaseMetric):
         device_ids = parse_device_ids(multi_gpu=multi_gpu)
 
         _assert_categorical_obs(adata, key=groupby)
-        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
-            adata, groupby, groups
-        )
+        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(adata, groupby, groups)
         k = len(groups_list)
 
         # Upper-triangle pairs (i < j); diagonal is 0
@@ -686,20 +665,11 @@ class WassersteinMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> (
-        pd.Series
-        | pd.DataFrame
-        | tuple[pd.Series, pd.Series]
-        | tuple[pd.DataFrame, pd.DataFrame]
-    ):
+    ) -> pd.Series | pd.DataFrame | tuple[pd.Series, pd.Series] | tuple[pd.DataFrame, pd.DataFrame]:
         device_ids = parse_device_ids(multi_gpu=multi_gpu)
 
-        selected_groups, single_control, needed = self._resolve_onesided_inputs(
-            adata, groupby, selected_group, groups
-        )
-        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
-            adata, groupby, needed
-        )
+        selected_groups, single_control, needed = self._resolve_onesided_inputs(adata, groupby, selected_group, groups)
+        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(adata, groupby, needed)
         k = len(groups_list)
         group_map = {v: i for i, v in enumerate(groups_list)}
         selected_indices = [group_map[sg] for sg in selected_groups]
@@ -807,9 +777,7 @@ class WassersteinMetric(BaseMetric):
             all_cells.append(np.asarray(cell_idx, dtype=np.int64))
             offsets_host.append(offsets_host[-1] + len(cell_idx))
 
-        flat_cell_idx = (
-            np.concatenate(all_cells) if all_cells else np.array([], dtype=np.int64)
-        )
+        flat_cell_idx = np.concatenate(all_cells) if all_cells else np.array([], dtype=np.int64)
         cat_offsets = cp.asarray(offsets_host, dtype=cp.int32)
         cell_indices = cp.asarray(flat_cell_idx, dtype=cp.int32)
         embedding = cp.asarray(embedding_raw)

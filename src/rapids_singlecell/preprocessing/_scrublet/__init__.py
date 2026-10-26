@@ -240,9 +240,7 @@ def scrublet(
 
     if batch_key is not None:
         if batch_key not in adata.obs.keys():
-            raise ValueError(
-                "`batch_key` must be a column of .obs in the input annData object."
-            )
+            raise ValueError("`batch_key` must be a column of .obs in the input annData object.")
 
         # Run Scrublet independently on batches and return just the
         # scrublet-relevant parts of the objects to add to the input object
@@ -268,9 +266,7 @@ def scrublet(
         # Save the .uns from each batch separately
 
         adata.uns["scrublet"] = {}
-        adata.uns["scrublet"]["batches"] = dict(
-            zip(batches, [scrub["uns"] for scrub in scrubbed])
-        )
+        adata.uns["scrublet"]["batches"] = dict(zip(batches, [scrub["uns"] for scrub in scrubbed]))
 
         # Record that we've done batched analysis, so e.g. the plotting
         # function knows what to do.
@@ -457,9 +453,7 @@ def _scrublet_call_doublets(
         "parameters": {
             "expected_doublet_rate": expected_doublet_rate,
             "sim_doublet_ratio": (
-                adata_sim.uns.get("scrublet", {})
-                .get("parameters", {})
-                .get("sim_doublet_ratio", None)
+                adata_sim.uns.get("scrublet", {}).get("parameters", {}).get("sim_doublet_ratio", None)
             ),
             "n_neighbors": n_neighbors,
             **meta_random_state,
@@ -480,9 +474,7 @@ def _scrublet_call_doublets(
         adata_obs.obs["predicted_doublet"] = False
 
     if get_doublet_neighbor_parents:
-        adata_obs.uns["scrublet"]["doublet_neighbor_parents"] = (
-            scrub.doublet_neighbor_parents_
-        )
+        adata_obs.uns["scrublet"]["doublet_neighbor_parents"] = scrub.doublet_neighbor_parents_
 
     return adata_obs
 

@@ -154,10 +154,7 @@ class PCA_sparse_svd:
                 rng=self.rng,
             )
         else:
-            raise ValueError(
-                f"Unknown svd_solver '{self.svd_solver}'. "
-                "Must be one of: 'lanczos', 'randomized'"
-            )
+            raise ValueError(f"Unknown svd_solver '{self.svd_solver}'. Must be one of: 'lanczos', 'randomized'")
 
     def transform(self, X: spmatrix) -> cp.ndarray:
         """

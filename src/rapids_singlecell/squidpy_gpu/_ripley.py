@@ -121,14 +121,9 @@ def ripley(
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
     if mode not in ("F", "G", "L"):
-        raise ValueError(
-            f"Expected `mode` to be one of 'F', 'G' or 'L', found {mode!r}."
-        )
+        raise ValueError(f"Expected `mode` to be one of 'F', 'G' or 'L', found {mode!r}.")
     if metric != "euclidean":
-        raise ValueError(
-            f"Unsupported metric {metric!r}. Ripley's statistics on the GPU "
-            "support only 'euclidean'."
-        )
+        raise ValueError(f"Unsupported metric {metric!r}. Ripley's statistics on the GPU support only 'euclidean'.")
 
     spatial = adata.obsm[spatial_key]
     coordinates = np.ascontiguousarray(
@@ -136,9 +131,7 @@ def ripley(
         dtype=np.float64,
     )
     if coordinates.ndim != 2 or coordinates.shape[1] != 2:
-        raise ValueError(
-            f"Expected 2D spatial coordinates, found shape {coordinates.shape}."
-        )
+        raise ValueError(f"Expected 2D spatial coordinates, found shape {coordinates.shape}.")
     clusters = adata.obs[cluster_key]
     if clusters.isna().any():
         raise ValueError(
@@ -151,10 +144,7 @@ def ripley(
         sizes = np.bincount(cluster_idx, minlength=n_clusters)
         if sizes.min() < n_neigh:
             small = classes[sizes.argmin()]
-            raise ValueError(
-                f"Cluster {small!r} has `{sizes.min()}` observations, fewer than "
-                f"`n_neigh={n_neigh}`."
-            )
+            raise ValueError(f"Cluster {small!r} has `{sizes.min()}` observations, fewer than `n_neigh={n_neigh}`.")
 
     N = coordinates.shape[0]
     hull = ConvexHull(coordinates)
@@ -165,9 +155,7 @@ def ripley(
 
     # Every random draw, F's per-cluster points first, comes from one stream.
     n_patterns = n_simulations + (n_clusters if mode == "F" else 0)
-    generator = cp.random.default_rng(
-        np.random.default_rng(rng).integers(np.iinfo(np.int64).max)
-    )
+    generator = cp.random.default_rng(np.random.default_rng(rng).integers(np.iinfo(np.int64).max))
     random = _ppp(hull, n_patterns * n_observations, generator)
     random = random.reshape(n_patterns, n_observations, 2)
     sims_random = random[n_patterns - n_simulations :]
@@ -202,9 +190,7 @@ def ripley(
     pvalues = pvalues / (n_simulations + 1)
     pvalues = np.minimum(pvalues, 1 - pvalues)
 
-    obs_df = _reshape_res(
-        obs_arr.T, columns=classes, index=support, var_name=cluster_key
-    )
+    obs_df = _reshape_res(obs_arr.T, columns=classes, index=support, var_name=cluster_key)
     sims_df = _reshape_res(
         sims.T,
         columns=np.arange(n_simulations),
@@ -276,9 +262,7 @@ def _f_g_function(hist: np.ndarray) -> np.ndarray:
     return np.pad(fracs, ((0, 0), (1, 0)))
 
 
-def _pair_counts(
-    points: cp.ndarray, codes: cp.ndarray, n_libraries: int, support: np.ndarray
-) -> np.ndarray:
+def _pair_counts(points: cp.ndarray, codes: cp.ndarray, n_libraries: int, support: np.ndarray) -> np.ndarray:
     """Unordered pairs of each library within each support distance."""
     # Centering keeps more float32 bits; distances do not change.
     points = (points - points.mean(axis=0)).astype(cp.float32)
@@ -289,9 +273,7 @@ def _pair_counts(
         stop = min(start + _PAIR_CHUNK, n_libraries)
         in_chunk = (codes >= start) & (codes < stop)
         chunk_points = cp.ascontiguousarray(points[in_chunk])
-        cat_offsets, cell_indices = _create_category_index_mapping(
-            codes[in_chunk] - start, stop - start
-        )
+        cat_offsets, cell_indices = _create_category_index_mapping(codes[in_chunk] - start, stop - start)
         diagonal = cp.arange(stop - start, dtype=cp.int32)
         chunk, ok = _co_occurrence_gpu(
             spatial=chunk_points,
@@ -306,17 +288,12 @@ def _pair_counts(
             device_ids=[device],
         )
         if not ok:
-            raise ValueError(
-                f"`n_steps={len(support)}` needs more shared memory than the "
-                "GPU provides for Ripley's L."
-            )
+            raise ValueError(f"`n_steps={len(support)}` needs more shared memory than the GPU provides for Ripley's L.")
         counts[start:stop] = chunk[diagonal, diagonal].get()
     return counts
 
 
-def _reshape_res(
-    results: np.ndarray, columns: np.ndarray, index: np.ndarray, var_name: str
-) -> pd.DataFrame:
+def _reshape_res(results: np.ndarray, columns: np.ndarray, index: np.ndarray, var_name: str) -> pd.DataFrame:
     df = pd.DataFrame(results, columns=columns, index=index)
     df.index.set_names(["bins"], inplace=True)
     df = df.melt(var_name=var_name, value_name="stats", ignore_index=False)

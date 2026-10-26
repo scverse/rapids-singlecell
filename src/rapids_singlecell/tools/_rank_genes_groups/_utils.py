@@ -100,9 +100,7 @@ def _select_groups(
     # re-sort to category order, so the output column order echoes `groups=`.
 
     if skip_empty_groups:
-        counts = {
-            str(name): int(count) for name, count in labels.value_counts().items()
-        }
+        counts = {str(name): int(count) for name, count in labels.value_counts().items()}
         valid_selected = [group for group in selected if counts.get(str(group), 0) >= 2]
         if reference != "rest":
             ref_matches = [group for group in selected if str(group) == str(reference)]
@@ -116,10 +114,7 @@ def _select_groups(
                     raise ValueError(msg)
         selected = valid_selected
         if len(selected) == 0:
-            msg = (
-                "No groups with at least two samples remain after applying "
-                "skip_empty_groups=True."
-            )
+            msg = "No groups with at least two samples remain after applying skip_empty_groups=True."
             raise ValueError(msg)
 
     n_groups = len(selected)
@@ -134,9 +129,7 @@ def _select_groups(
         code_lookup[category_index] = str_to_sel.get(str(category), n_groups)
     group_codes = code_lookup[orig_codes]
 
-    group_sizes = np.bincount(group_codes, minlength=n_groups + 1)[:n_groups].astype(
-        np.int64
-    )
+    group_sizes = np.bincount(group_codes, minlength=n_groups + 1)[:n_groups].astype(np.int64)
 
     invalid_groups = {str(selected[i]) for i in range(n_groups) if group_sizes[i] < 2}
     if invalid_groups:

@@ -87,9 +87,7 @@ def _fdr_correct(
     elif corr_axis == "interactions":
         pvals = pvals.T.apply(fdr).T
     else:
-        raise NotImplementedError(
-            f"FDR correction for `{corr_axis}` is not implemented."
-        )
+        raise NotImplementedError(f"FDR correction for `{corr_axis}` is not implemented.")
 
     return pvals
 
@@ -101,9 +99,7 @@ def _check_tuple_needles(needles, haystack, *, msg: str, reraise: bool = True):
         if not isinstance(needle, Sequence):
             raise TypeError(f"Expected a `Sequence`, found `{type(needle).__name__}`.")
         if len(needle) != 2:
-            raise ValueError(
-                f"Expected a `tuple` of length `2`, found `{len(needle)}`."
-            )
+            raise ValueError(f"Expected a `tuple` of length `2`, found `{len(needle)}`.")
         a, b = needle
 
         if a not in haystack:
@@ -245,9 +241,7 @@ def ligrec(
     adata = _extract_adata(adata, table_key=table_key)
     # Get and Check interactions
     if interactions is None:
-        interactions = _get_interactions(
-            interactions_params, transmitter_params, receiver_params
-        )
+        interactions = _get_interactions(interactions_params, transmitter_params, receiver_params)
 
     if isinstance(interactions, Mapping):
         interactions = pd.DataFrame(interactions)
@@ -289,9 +283,7 @@ def ligrec(
         raise ValueError("The interactions are empty")
     # Prepare adata
     if not isinstance(adata, AnnData):
-        raise TypeError(
-            f"Expected `adata` to be of type `anndata.AnnData`, found `{type(adata).__name__}`."
-        )
+        raise TypeError(f"Expected `adata` to be of type `anndata.AnnData`, found `{type(adata).__name__}`.")
     if not adata.n_obs:
         raise ValueError("No cells are in `adata.obs_names`.")
     if not adata.n_vars:
@@ -299,18 +291,14 @@ def ligrec(
 
     if use_raw:
         if adata.raw is None:
-            raise AttributeError(
-                "No `.raw` attribute found. Try specifying `use_raw=False`."
-            )
+            raise AttributeError("No `.raw` attribute found. Try specifying `use_raw=False`.")
         var_names = adata.raw.var_names
         X = adata.raw.X
     else:
         var_names = adata.var_names
         X = adata.X
 
-    data = pd.DataFrame.sparse.from_spmatrix(
-        csc_matrix(X), index=adata.obs_names, columns=var_names
-    )
+    data = pd.DataFrame.sparse.from_spmatrix(csc_matrix(X), index=adata.obs_names, columns=var_names)
 
     if gene_symbols:
         if use_raw:
@@ -358,33 +346,20 @@ def ligrec(
         tgt = interactions.pop(TARGET).apply(lambda s: str(s).split("_")).explode()
         tgt.name = TARGET
 
-        interactions = pd.merge(
-            interactions, src, how="left", left_index=True, right_index=True
-        )
-        interactions = pd.merge(
-            interactions, tgt, how="left", left_index=True, right_index=True
-        )
+        interactions = pd.merge(interactions, src, how="left", left_index=True, right_index=True)
+        interactions = pd.merge(interactions, tgt, how="left", left_index=True, right_index=True)
     else:
         raise ValueError(f"Invalid option `{complex_policy!r}` for `ComplexPolicy`.")
 
-    interactions = interactions[
-        interactions[SOURCE].isin(data.columns)
-        & interactions[TARGET].isin(data.columns)
-    ]
+    interactions = interactions[interactions[SOURCE].isin(data.columns) & interactions[TARGET].isin(data.columns)]
 
     _assert_categorical_obs(adata, key=cluster_key)
     if interactions.empty:
         raise ValueError("After filtering by genes, no interactions remain.")
-    filtered_data = data.loc[
-        :, list(set(interactions[SOURCE]) | set(interactions[TARGET]))
-    ]
+    filtered_data = data.loc[:, list(set(interactions[SOURCE]) | set(interactions[TARGET]))]
     if len(adata.obs[cluster_key].cat.categories) <= 1:
-        raise ValueError(
-            f"Expected at least `2` clusters, found `{len(adata.obs[cluster_key].cat.categories)}`."
-        )
-    filtered_data["clusters"] = (
-        adata.obs.copy()[cluster_key].astype("string").astype("category").values
-    )
+        raise ValueError(f"Expected at least `2` clusters, found `{len(adata.obs[cluster_key].cat.categories)}`.")
+    filtered_data["clusters"] = adata.obs.copy()[cluster_key].astype("string").astype("category").values
     interactions.drop_duplicates(subset=(SOURCE, TARGET), inplace=True, keep="first")
     if clusters is None:
         clusters = list(map(str, adata.obs[cluster_key].cat.categories))
@@ -405,14 +380,10 @@ def ligrec(
 
     if gene_symbols:
         if use_raw:
-            filter_var = np.isin(
-                adata.raw.var[gene_symbols].str.upper(), filtered_data.columns
-            )
+            filter_var = np.isin(adata.raw.var[gene_symbols].str.upper(), filtered_data.columns)
             genes = adata.raw.var[gene_symbols][filter_var].str.upper()
         else:
-            filter_var = np.isin(
-                adata.var[gene_symbols].str.upper(), filtered_data.columns
-            )
+            filter_var = np.isin(adata.var[gene_symbols].str.upper(), filtered_data.columns)
             genes = adata.var[gene_symbols][filter_var].str.upper()
     else:
         if use_raw:
@@ -508,9 +479,7 @@ def ligrec(
     mean_cp = mean_cp.astype(cp.float32, order="C")
     mask_cp = mask_cp.astype(cp.bool_, order="C")
     total_counts = total_counts.astype(cp.float32)
-    res = cp.zeros(
-        (len(interactions_), len(interaction_clusters)), dtype=np.float32, order="C"
-    )
+    res = cp.zeros((len(interactions_), len(interaction_clusters)), dtype=np.float32, order="C")
     if cpissparse(data_cp):
         for _i in range(n_perms):
             cp.random.shuffle(clustering_use)
@@ -578,9 +547,7 @@ def ligrec(
                 stream=cp.cuda.get_current_stream().ptr,
             )
 
-    res_mean = cp.zeros(
-        (len(interactions_), len(interaction_clusters)), dtype=np.float32, order="C"
-    )
+    res_mean = cp.zeros((len(interactions_), len(interaction_clusters)), dtype=np.float32, order="C")
 
     _lc.res_mean(
         interactions_,
@@ -600,29 +567,21 @@ def ligrec(
         "means": _create_sparse_df(
             res_mean,
             index=pd.MultiIndex.from_frame(interactions, names=[SOURCE, TARGET]),
-            columns=pd.MultiIndex.from_tuples(
-                clusters_named, names=["cluster_1", "cluster_2"]
-            ),
+            columns=pd.MultiIndex.from_tuples(clusters_named, names=["cluster_1", "cluster_2"]),
             fill_value=0,
         ),
         "pvalues": _create_sparse_df(
             pvalues,
             index=pd.MultiIndex.from_frame(interactions, names=[SOURCE, TARGET]),
-            columns=pd.MultiIndex.from_tuples(
-                clusters_named, names=["cluster_1", "cluster_2"]
-            ),
+            columns=pd.MultiIndex.from_tuples(clusters_named, names=["cluster_1", "cluster_2"]),
             fill_value=np.nan,
         ),
-        "metadata": interactions_all[
-            interactions_all.columns.difference([SOURCE, TARGET])
-        ],
+        "metadata": interactions_all[interactions_all.columns.difference([SOURCE, TARGET])],
     }
     res["metadata"].index = res["means"].index.copy()
 
     if corr_method is not None:
-        res["pvalues"] = _fdr_correct(
-            res["pvalues"], corr_method, corr_axis, alpha=alpha
-        )
+        res["pvalues"] = _fdr_correct(res["pvalues"], corr_method, corr_axis, alpha=alpha)
 
     if copy:
         return res

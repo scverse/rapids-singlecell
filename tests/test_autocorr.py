@@ -39,9 +39,7 @@ def test_autocorr_consistency(mode):
     assert dummy_adata.uns[UNS_KEY].columns.shape == (4,)
     assert df1.columns.shape == (9,)
     # test pval_norm same
-    np.testing.assert_allclose(
-        df1["pval_norm"].values, df2["pval_norm"].values, atol=1e-5, rtol=1e-5
-    )
+    np.testing.assert_allclose(df1["pval_norm"].values, df2["pval_norm"].values, atol=1e-5, rtol=1e-5)
     # test highly variable
     assert dummy_adata.uns[UNS_KEY].shape != df1.shape
     # assert idx are sorted and contain same elements
@@ -125,12 +123,8 @@ def test_autocorr_dtype_parameter():
     # Input is float64, but force float32 computation
     adata.X = adata.X.astype(np.float64)
 
-    df_f32 = spatial_autocorr(
-        adata, mode="moran", copy=True, n_perms=None, dtype=np.float32
-    )
-    df_f64 = spatial_autocorr(
-        adata, mode="moran", copy=True, n_perms=None, dtype=np.float64
-    )
+    df_f32 = spatial_autocorr(adata, mode="moran", copy=True, n_perms=None, dtype=np.float32)
+    df_f64 = spatial_autocorr(adata, mode="moran", copy=True, n_perms=None, dtype=np.float64)
 
     # Both should produce valid results
     assert not np.any(np.isinf(df_f32["I"].values))
@@ -190,13 +184,9 @@ def test_autocorr_multi_gpu_sparse(mode):
     adata_multi.X = sparse.csr_matrix(adata_multi.X, dtype=np.float64)
 
     # Single GPU
-    df_single = spatial_autocorr(
-        adata_single, mode=mode, copy=True, n_perms=50, multi_gpu=False
-    )
+    df_single = spatial_autocorr(adata_single, mode=mode, copy=True, n_perms=50, multi_gpu=False)
     # Multi GPU
-    df_multi = spatial_autocorr(
-        adata_multi, mode=mode, copy=True, n_perms=50, multi_gpu=True
-    )
+    df_multi = spatial_autocorr(adata_multi, mode=mode, copy=True, n_perms=50, multi_gpu=True)
 
     stat_col = "I" if mode == "moran" else "C"
 
@@ -222,13 +212,9 @@ def test_autocorr_multi_gpu_dense(mode):
     adata_multi.X = adata_multi.X.astype(np.float64)
 
     # Single GPU
-    df_single = spatial_autocorr(
-        adata_single, mode=mode, copy=True, n_perms=50, multi_gpu=False
-    )
+    df_single = spatial_autocorr(adata_single, mode=mode, copy=True, n_perms=50, multi_gpu=False)
     # Multi GPU
-    df_multi = spatial_autocorr(
-        adata_multi, mode=mode, copy=True, n_perms=50, multi_gpu=True
-    )
+    df_multi = spatial_autocorr(adata_multi, mode=mode, copy=True, n_perms=50, multi_gpu=True)
 
     stat_col = "I" if mode == "moran" else "C"
 
@@ -279,9 +265,7 @@ def test_autocorr_permutation_shape(mode, n_perms, use_sparse):
         data = cp.array(X)
 
     # Create simple adjacency matrix
-    adj = gpu_sparse.random(
-        n_cells, n_cells, density=0.1, format="csr", dtype=np.float64
-    )
+    adj = gpu_sparse.random(n_cells, n_cells, density=0.1, format="csr", dtype=np.float64)
     adj = adj + adj.T  # Make symmetric
 
     if mode == "moran":
@@ -290,9 +274,7 @@ def test_autocorr_permutation_shape(mode, n_perms, use_sparse):
         _, perms = _gearys_C_cupy(data, adj, n_permutations=n_perms)
 
     # Verify exact shape
-    assert perms.shape == (n_perms, n_genes), (
-        f"Expected ({n_perms}, {n_genes}), got {perms.shape}"
-    )
+    assert perms.shape == (n_perms, n_genes), f"Expected ({n_perms}, {n_genes}), got {perms.shape}"
 
 
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
@@ -309,9 +291,7 @@ def test_autocorr_analytic_variance(mode, stat):
         var -= 1 / (n - 1) ** 2
     else:
         var = ((2 * s1 + s2) * (n - 1) - 4 * s0**2) / (2 * (n + 1) * s0**2)
-    df = spatial_autocorr(
-        adata, mode=mode, transformation=False, copy=True, corr_method=None
-    )
+    df = spatial_autocorr(adata, mode=mode, transformation=False, copy=True, corr_method=None)
     np.testing.assert_allclose(df["var_norm"], var, rtol=1e-10)
     expected = -1 / (n - 1) if mode == "moran" else 1.0
     z = (df[stat] - expected) / np.sqrt(var)

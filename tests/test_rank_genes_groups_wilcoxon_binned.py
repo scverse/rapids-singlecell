@@ -22,9 +22,7 @@ def adata_blobs():
     return adata
 
 
-def _compare_gene_rankings(
-    binned_result, exact_result, *, n_top: int = 5, field: str = "names"
-):
+def _compare_gene_rankings(binned_result, exact_result, *, n_top: int = 5, field: str = "names"):
     """Check that binned and exact results share most top genes."""
     for group in binned_result[field].dtype.names:
         binned_genes = set(binned_result[field][group][:n_top])
@@ -32,8 +30,7 @@ def _compare_gene_rankings(
         overlap = len(binned_genes & exact_genes)
         # Allow some disagreement due to approximation, but expect good overlap
         assert overlap >= n_top - 2, (
-            f"Group {group}: only {overlap}/{n_top} top genes overlap. "
-            f"Binned: {binned_genes}, Exact: {exact_genes}"
+            f"Group {group}: only {overlap}/{n_top} top genes overlap. Binned: {binned_genes}, Exact: {exact_genes}"
         )
 
 
@@ -46,9 +43,7 @@ class TestWilcoxonBinned:
         adata = adata_blobs.copy()
         adata.X = array_type(adata.X)
 
-        rsc.tl.rank_genes_groups(
-            adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
         result = adata.uns["rank_genes_groups"]
         assert "names" in result
@@ -63,9 +58,7 @@ class TestWilcoxonBinned:
         adata = adata_blobs.copy()
         adata.X = array_type(adata.X)
 
-        rsc.tl.rank_genes_groups(
-            adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
         result = adata.uns["rank_genes_groups"]
         expected_groups = ("0", "1", "2")
@@ -77,9 +70,7 @@ class TestWilcoxonBinned:
         adata = adata_blobs.copy()
         adata.X = array_type(adata.X)
 
-        rsc.tl.rank_genes_groups(
-            adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
         result = adata.uns["rank_genes_groups"]
         for group in result["pvals"].dtype.names:
@@ -99,9 +90,7 @@ class TestWilcoxonBinnedMatchesExact:
 
         adata_binned.X = array_type(adata_binned.X)
 
-        rsc.tl.rank_genes_groups(
-            adata_binned, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata_binned, "blobs", method="wilcoxon_binned", use_raw=False)
         rsc.tl.rank_genes_groups(adata_exact, "blobs", method="wilcoxon", use_raw=False)
 
         _compare_gene_rankings(
@@ -117,22 +106,14 @@ class TestWilcoxonBinnedMatchesExact:
 
         adata_binned.X = array_type(adata_binned.X)
 
-        rsc.tl.rank_genes_groups(
-            adata_binned, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata_binned, "blobs", method="wilcoxon_binned", use_raw=False)
         rsc.tl.rank_genes_groups(adata_exact, "blobs", method="wilcoxon", use_raw=False)
 
         for group in adata_binned.uns["rank_genes_groups"]["scores"].dtype.names:
-            binned_scores = np.asarray(
-                adata_binned.uns["rank_genes_groups"]["scores"][group], dtype=float
-            )
-            exact_scores = np.asarray(
-                adata_exact.uns["rank_genes_groups"]["scores"][group], dtype=float
-            )
+            binned_scores = np.asarray(adata_binned.uns["rank_genes_groups"]["scores"][group], dtype=float)
+            exact_scores = np.asarray(adata_exact.uns["rank_genes_groups"]["scores"][group], dtype=float)
             corr = np.corrcoef(binned_scores, exact_scores)[0, 1]
-            assert corr > 0.95, (
-                f"Group {group}: correlation {corr:.4f} between binned and exact scores"
-            )
+            assert corr > 0.95, f"Group {group}: correlation {corr:.4f} between binned and exact scores"
 
 
 class TestWilcoxonBinnedParameters:
@@ -142,9 +123,7 @@ class TestWilcoxonBinnedParameters:
         adata = adata_blobs.copy()
         rsc.get.anndata_to_GPU(adata)
 
-        rsc.tl.rank_genes_groups(
-            adata, "blobs", method="wilcoxon_binned", use_raw=False, n_genes=3
-        )
+        rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False, n_genes=3)
 
         result = adata.uns["rank_genes_groups"]
         for group in result["names"].dtype.names:
@@ -173,12 +152,8 @@ class TestWilcoxonBinnedParameters:
         rsc.get.anndata_to_GPU(adata_low)
         rsc.get.anndata_to_GPU(adata_high)
 
-        rsc.tl.rank_genes_groups(
-            adata_low, "blobs", method="wilcoxon_binned", use_raw=False, n_bins=100
-        )
-        rsc.tl.rank_genes_groups(
-            adata_high, "blobs", method="wilcoxon_binned", use_raw=False, n_bins=5000
-        )
+        rsc.tl.rank_genes_groups(adata_low, "blobs", method="wilcoxon_binned", use_raw=False, n_bins=100)
+        rsc.tl.rank_genes_groups(adata_high, "blobs", method="wilcoxon_binned", use_raw=False, n_bins=5000)
 
         for adata in [adata_low, adata_high]:
             result = adata.uns["rank_genes_groups"]
@@ -211,12 +186,8 @@ class TestWilcoxonBinnedParameters:
         )
 
         for group in adata_small.uns["rank_genes_groups"]["scores"].dtype.names:
-            scores_small = np.asarray(
-                adata_small.uns["rank_genes_groups"]["scores"][group], dtype=float
-            )
-            scores_large = np.asarray(
-                adata_large.uns["rank_genes_groups"]["scores"][group], dtype=float
-            )
+            scores_small = np.asarray(adata_small.uns["rank_genes_groups"]["scores"][group], dtype=float)
+            scores_large = np.asarray(adata_large.uns["rank_genes_groups"]["scores"][group], dtype=float)
             np.testing.assert_allclose(scores_small, scores_large, rtol=1e-10)
 
 
@@ -300,14 +271,12 @@ class TestWilcoxonBinnedEdgeCases:
         result_sub = adata_sub.uns["rank_genes_groups"]
 
         # Subset groups should be a subset of all-groups result
-        assert set(result_sub["names"].dtype.names) <= set(
-            result_all["names"].dtype.names
-        )
+        assert set(result_sub["names"].dtype.names) <= set(result_all["names"].dtype.names)
 
         for group in result_sub["names"].dtype.names:
-            assert tuple(result_all["names"][group]) == tuple(
-                result_sub["names"][group]
-            ), f"names mismatch for group {group}"
+            assert tuple(result_all["names"][group]) == tuple(result_sub["names"][group]), (
+                f"names mismatch for group {group}"
+            )
             for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
                 np.testing.assert_allclose(
                     np.asarray(result_all[field][group], dtype=float),
@@ -346,22 +315,14 @@ class TestWilcoxonBinnedEdgeCases:
         )
 
         expected_groups = {g for g in groups if g != reference}
-        assert (
-            set(adata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
-        )
-        assert (
-            set(bdata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
-        )
+        assert set(adata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
+        assert set(bdata.uns["rank_genes_groups"]["names"].dtype.names) == expected_groups
 
         test_group = next(iter(expected_groups))
         for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
             np.testing.assert_allclose(
-                np.asarray(
-                    adata.uns["rank_genes_groups"][field][test_group], dtype=float
-                ),
-                np.asarray(
-                    bdata.uns["rank_genes_groups"][field][test_group], dtype=float
-                ),
+                np.asarray(adata.uns["rank_genes_groups"][field][test_group], dtype=float),
+                np.asarray(bdata.uns["rank_genes_groups"][field][test_group], dtype=float),
                 rtol=1e-5,
                 atol=1e-6,
                 equal_nan=True,
@@ -421,9 +382,7 @@ class TestWilcoxonBinnedEdgeCases:
         adata.X[mask] = 0.0
         adata.X = csr_matrix(adata.X)
 
-        rsc.tl.rank_genes_groups(
-            adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
         result = adata.uns["rank_genes_groups"]
         for group in result["pvals"].dtype.names:
@@ -453,12 +412,8 @@ class TestWilcoxonBinnedEdgeCases:
         dense_adata = adata_blobs.copy()
         dense_adata.X = dense
 
-        rsc.tl.rank_genes_groups(
-            sparse_adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
-        rsc.tl.rank_genes_groups(
-            dense_adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(sparse_adata, "blobs", method="wilcoxon_binned", use_raw=False)
+        rsc.tl.rank_genes_groups(dense_adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
         sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
         dn_scores = dense_adata.uns["rank_genes_groups"]["scores"]
@@ -478,9 +433,7 @@ class TestWilcoxonBinnedEdgeCases:
         adata.uns.pop("log1p", None)
 
         with pytest.warns(UserWarning, match="log1p"):
-            rsc.tl.rank_genes_groups(
-                adata, "blobs", method="wilcoxon_binned", use_raw=False
-            )
+            rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
     def test_constant_data(self, adata_blobs):
         """All-constant data (bin_width <= 0) should not crash."""
@@ -488,9 +441,7 @@ class TestWilcoxonBinnedEdgeCases:
         adata.X = np.ones_like(adata.X)
         rsc.get.anndata_to_GPU(adata)
 
-        rsc.tl.rank_genes_groups(
-            adata, "blobs", method="wilcoxon_binned", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
 
         result = adata.uns["rank_genes_groups"]
         for group in result["pvals"].dtype.names:
@@ -520,12 +471,8 @@ class TestWilcoxonBinnedEdgeCases:
         )
 
         for group in adata_auto.uns["rank_genes_groups"]["scores"].dtype.names:
-            scores_auto = np.asarray(
-                adata_auto.uns["rank_genes_groups"]["scores"][group], dtype=float
-            )
-            scores_log1p = np.asarray(
-                adata_log1p.uns["rank_genes_groups"]["scores"][group], dtype=float
-            )
+            scores_auto = np.asarray(adata_auto.uns["rank_genes_groups"]["scores"][group], dtype=float)
+            scores_log1p = np.asarray(adata_log1p.uns["rank_genes_groups"]["scores"][group], dtype=float)
             corr = np.corrcoef(scores_auto, scores_log1p)[0, 1]
             assert corr > 0.99, f"Group {group}: auto vs log1p correlation {corr:.4f}"
 
@@ -536,9 +483,7 @@ def test_top_genes_match_scipy(adata_blobs):
 
     adata = adata_blobs.copy()
     rsc.get.anndata_to_GPU(adata)
-    rsc.tl.rank_genes_groups(
-        adata, "blobs", method="wilcoxon_binned", use_raw=False, tie_correct=True
-    )
+    rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False, tie_correct=True)
 
     X = adata_blobs.X.astype(np.float64)
     groups = adata_blobs.obs["blobs"]
@@ -547,15 +492,10 @@ def test_top_genes_match_scipy(adata_blobs):
         # Sort binned results by p-value (direction-agnostic)
         pvals_binned = adata.uns["rank_genes_groups"]["pvals"][group]
         binned_order = np.argsort(pvals_binned)
-        binned_top = set(
-            adata.uns["rank_genes_groups"]["names"][group][binned_order[:n_top]]
-        )
+        binned_top = set(adata.uns["rank_genes_groups"]["names"][group][binned_order[:n_top]])
 
         mask_g = (groups == group).values
-        pvals = [
-            mannwhitneyu(X[mask_g, i], X[~mask_g, i], alternative="two-sided").pvalue
-            for i in range(X.shape[1])
-        ]
+        pvals = [mannwhitneyu(X[mask_g, i], X[~mask_g, i], alternative="two-sided").pvalue for i in range(X.shape[1])]
         scipy_top = set(adata_blobs.var_names[np.argsort(pvals)[:n_top]])
         overlap = len(binned_top & scipy_top)
         assert overlap >= n_top - 1, f"Group {group}: {overlap}/{n_top} overlap"
@@ -594,10 +534,7 @@ def test_binned_bin_exact_matches_scipy(reference):
             n_genes=n_genes,
         )
         r = a.uns["rank_genes_groups"]
-        return {
-            grp: dict(zip(r["names"][grp], np.asarray(r["pvals"][grp], float)))
-            for grp in r["names"].dtype.names
-        }
+        return {grp: dict(zip(r["names"][grp], np.asarray(r["pvals"][grp], float))) for grp in r["names"].dtype.names}
 
     # correctness vs scipy (tie_correct=True; both continuity settings)
     for use_continuity in (False, True):
@@ -613,17 +550,11 @@ def test_binned_bin_exact_matches_scipy(reference):
                     alternative="two-sided",
                     method="asymptotic",
                 )
-                np.testing.assert_allclose(
-                    gm[v], p, rtol=1e-6, atol=1e-6, equal_nan=True
-                )
+                np.testing.assert_allclose(gm[v], p, rtol=1e-6, atol=1e-6, equal_nan=True)
 
     # non-vacuity self-guards: each flag must materially change the result
     def differs(a, b):
-        return any(
-            not np.isclose(a[g][v], b[g][v], rtol=1e-9, atol=1e-12)
-            for g in a
-            for v in a[g]
-        )
+        return any(not np.isclose(a[g][v], b[g][v], rtol=1e-9, atol=1e-12) for g in a for v in a[g])
 
     assert differs(run(True, True), run(True, False)), "use_continuity inert (vacuous)"
     assert differs(run(True, False), run(False, False)), "tie_correct inert (vacuous)"
@@ -663,12 +594,8 @@ def test_binned_log1p_invalid_for_negative_sparse_coerces_to_auto(adata_blobs):
     auto_ad = adata_blobs.copy()
     auto_ad.X = cpsp.csr_matrix(dense)
     with pytest.warns(RuntimeWarning, match="bin_range='log1p' is invalid"):
-        rsc.tl.rank_genes_groups(
-            sp_ad, "blobs", method="wilcoxon_binned", use_raw=False, bin_range="log1p"
-        )
-    rsc.tl.rank_genes_groups(
-        auto_ad, "blobs", method="wilcoxon_binned", use_raw=False, bin_range="auto"
-    )
+        rsc.tl.rank_genes_groups(sp_ad, "blobs", method="wilcoxon_binned", use_raw=False, bin_range="log1p")
+    rsc.tl.rank_genes_groups(auto_ad, "blobs", method="wilcoxon_binned", use_raw=False, bin_range="auto")
     sp_s = sp_ad.uns["rank_genes_groups"]["scores"]
     au_s = auto_ad.uns["rank_genes_groups"]["scores"]
     for grp in sp_s.dtype.names:

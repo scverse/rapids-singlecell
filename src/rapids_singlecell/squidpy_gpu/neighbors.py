@@ -441,9 +441,7 @@ class PercentilePostprocessor:
             index = self.percentile / 100 * (sizes - 1.0)
             threshold = cp.empty(len(sizes), dtype=values.dtype)
             stream = cp.cuda.get_current_stream().ptr
-            _spatial_cuda.library_percentile(
-                index, values, starts, sizes, threshold, stream
-            )
+            _spatial_cuda.library_percentile(index, values, starts, sizes, threshold, stream)
             threshold = threshold[library]
         return _prune(adj, dst, dst.data > threshold)
 
@@ -498,9 +496,7 @@ def _block_diag(mats: Sequence[CSR]) -> CSR:
             cp.asarray(offsets[-1:], dtype=cp.int32),
         ]
     )
-    return cp_sparse.csr_matrix(
-        (data, indices, indptr), shape=(int(sizes[-1]), int(sizes[-1]))
-    )
+    return cp_sparse.csr_matrix((data, indices, indptr), shape=(int(sizes[-1]), int(sizes[-1])))
 
 
 def _prune(adj: CSR, dst: CSR, outside: cp.ndarray, *, keep_diagonal=False) -> CSRPair:
@@ -553,9 +549,7 @@ def _spgemm(left: CSR, right: CSR) -> CSR:
             m.indices, m.indptr = m.indices.astype(cp.int64), m.indptr.astype(cp.int64)
         product = left @ right
         # The constructor restores int32 indices when they fit.
-        return cp_sparse.csr_matrix(
-            (product.data, product.indices, product.indptr), shape=product.shape
-        )
+        return cp_sparse.csr_matrix((product.data, product.indices, product.indptr), shape=product.shape)
 
 
 def _library_sort(values: cp.ndarray, library: cp.ndarray) -> tuple[cp.ndarray, ...]:
@@ -584,10 +578,7 @@ def _knn(coords: cp.ndarray, n_neighs: int, codes: cp.ndarray | None):
 
 def _validate_coordinates(coords: Any) -> cp.ndarray:
     coords = coords.to_numpy() if hasattr(coords, "to_numpy") else coords
-    if (
-        not isinstance(coords, (np.ndarray, cp.ndarray))
-        or coords.dtype.kind not in "iuf"
-    ):
+    if not isinstance(coords, (np.ndarray, cp.ndarray)) or coords.dtype.kind not in "iuf":
         raise TypeError("Spatial coordinates must be a dense array of real numbers.")
     coords = cp.asarray(coords, dtype=cp.float32, order="C")
     if coords.ndim != 2 or 0 in coords.shape:

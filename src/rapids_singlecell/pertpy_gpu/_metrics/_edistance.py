@@ -162,9 +162,7 @@ class EDistanceMetric(BaseMetric):
         downstream means/bootstrap/contrast math is layout-agnostic.
         """
         embedding_raw = self._get_embedding(adata)
-        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(
-            adata, groupby, needed_groups
-        )
+        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(adata, groupby, needed_groups)
         source = _materialize_source(embedding_raw, mask)
         return source, cat_offsets, cell_indices, groups_list
 
@@ -221,9 +219,7 @@ class EDistanceMetric(BaseMetric):
         """
         _assert_categorical_obs(adata, key=groupby)
 
-        embedding, cat_offsets, cell_indices, groups_list = self._load_source(
-            adata, groupby, groups
-        )
+        embedding, cat_offsets, cell_indices, groups_list = self._load_source(adata, groupby, groups)
         k = len(groups_list)
 
         if not bootstrap:
@@ -260,12 +256,7 @@ class EDistanceMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> (
-        pd.Series
-        | pd.DataFrame
-        | tuple[pd.Series, pd.Series]
-        | tuple[pd.DataFrame, pd.DataFrame]
-    ):
+    ) -> pd.Series | pd.DataFrame | tuple[pd.Series, pd.Series] | tuple[pd.DataFrame, pd.DataFrame]:
         """
         Compute energy distances from selected reference group(s) to all other groups.
 
@@ -302,13 +293,9 @@ class EDistanceMetric(BaseMetric):
             Series (single control) or DataFrame (multiple controls).
             If bootstrap=True, returns tuple of (distances, distances_var).
         """
-        selected_groups, single_control, needed = self._resolve_onesided_inputs(
-            adata, groupby, selected_group, groups
-        )
+        selected_groups, single_control, needed = self._resolve_onesided_inputs(adata, groupby, selected_group, groups)
 
-        embedding, cat_offsets, cell_indices, groups_list = self._load_source(
-            adata, groupby, needed
-        )
+        embedding, cat_offsets, cell_indices, groups_list = self._load_source(adata, groupby, needed)
         k = len(groups_list)
         group_map = {v: i for i, v in enumerate(groups_list)}
         selected_indices = [group_map[sg] for sg in selected_groups]
@@ -512,9 +499,7 @@ class EDistanceMetric(BaseMetric):
             cell_idx = group_indices.get(lookup_key)
             if cell_idx is None:
                 missing.append(key)
-            group_cells[idx] = (
-                cell_idx if cell_idx is not None else np.array([], dtype=np.intp)
-            )
+            group_cells[idx] = cell_idx if cell_idx is not None else np.array([], dtype=np.intp)
         if missing:
             warnings.warn(
                 f"No cells found for {missing}; their contrasts are NaN.",
@@ -833,9 +818,7 @@ class EDistanceMetric(BaseMetric):
                 is_double = embedding.dtype == np.float64
                 config = _ed.get_kernel_config(n_features, is_double)
                 if config is None:
-                    raise RuntimeError(
-                        "Insufficient shared memory for edistance kernel"
-                    )
+                    raise RuntimeError("Insufficient shared memory for edistance kernel")
                 cell_tile, feat_tile, block_size, shared_mem = config
                 blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
 
@@ -1262,9 +1245,7 @@ class EDistanceMetric(BaseMetric):
             return cat_offsets, cell_indices
 
         # Generate random integers for all cells at once
-        random_ints = rng.integers(
-            0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64
-        )
+        random_ints = rng.integers(0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64)
 
         # cp.repeat requires list for repeats - small transfer (k integers)
         group_sizes_list = group_sizes_gpu.get().tolist()
@@ -1311,29 +1292,21 @@ class EDistanceMetric(BaseMetric):
 
         # Vectorized edistance: e[a,b] = 2*d[a,b] - d[a,a] - d[b,b]
         diag_means = cp.diag(pairwise_means_boot)
-        edistance_means = (
-            2 * pairwise_means_boot - diag_means[:, None] - diag_means[None, :]
-        )
+        edistance_means = 2 * pairwise_means_boot - diag_means[:, None] - diag_means[None, :]
         cp.fill_diagonal(edistance_means, 0)
 
         # Vectorized variance computation (delta method approximation):
         # var[a, b] = 4 * var[a, b] + var[a, a] + var[b, b]
         diag_vars = cp.diag(pairwise_vars_boot)
-        edistance_vars = (
-            4 * pairwise_vars_boot + diag_vars[:, None] + diag_vars[None, :]
-        )
+        edistance_vars = 4 * pairwise_vars_boot + diag_vars[:, None] + diag_vars[None, :]
         cp.fill_diagonal(edistance_vars, 0)
 
-        df_mean = pd.DataFrame(
-            edistance_means.get(), index=groups_list, columns=groups_list
-        )
+        df_mean = pd.DataFrame(edistance_means.get(), index=groups_list, columns=groups_list)
         df_mean.index.name = groupby
         df_mean.columns.name = groupby
         df_mean.name = "pairwise edistance"
 
-        df_var = pd.DataFrame(
-            edistance_vars.get(), index=groups_list, columns=groups_list
-        )
+        df_var = pd.DataFrame(edistance_vars.get(), index=groups_list, columns=groups_list)
         df_var.index.name = groupby
         df_var.columns.name = groupby
         df_var.name = "pairwise edistance variance"
@@ -1353,18 +1326,14 @@ class EDistanceMetric(BaseMetric):
     ) -> pd.DataFrame:
         """Prepare edistance DataFrame."""
         device_ids = parse_device_ids(multi_gpu=multi_gpu)
-        pairwise_means = self._pairwise_means(
-            embedding, cat_offsets, cell_indices, k, device_ids
-        )
+        pairwise_means = self._pairwise_means(embedding, cat_offsets, cell_indices, k, device_ids)
 
         # Vectorized edistance: e[a,b] = 2*d[a,b] - d[a,a] - d[b,b]
         diag = cp.diag(pairwise_means)
         edistance_matrix = 2 * pairwise_means - diag[:, None] - diag[None, :]
         cp.fill_diagonal(edistance_matrix, 0)  # Self-distance is 0
 
-        df = pd.DataFrame(
-            edistance_matrix.get(), index=groups_list, columns=groups_list
-        )
+        df = pd.DataFrame(edistance_matrix.get(), index=groups_list, columns=groups_list)
         df.index.name = groupby
         df.columns.name = groupby
         df.name = "pairwise edistance"

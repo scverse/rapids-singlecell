@@ -22,21 +22,12 @@ REFERENCES = ("conditions.md", "dask.md", "perturbation.md", "setup.md", "spatia
 
 
 def _skill_texts() -> dict[str, str]:
-    return {
-        path.relative_to(SKILL).as_posix(): path.read_text(encoding="utf-8")
-        for path in SKILL.rglob("*.md")
-    }
+    return {path.relative_to(SKILL).as_posix(): path.read_text(encoding="utf-8") for path in SKILL.rglob("*.md")}
 
 
 def test_skill_bundle_is_minimal() -> None:
-    assert SKILL == (
-        Path(install.__file__).resolve().parent / "data" / "rapids-singlecell"
-    )
-    files = {
-        path.relative_to(SKILL).as_posix()
-        for path in SKILL.rglob("*")
-        if path.is_file()
-    }
+    assert SKILL == (Path(install.__file__).resolve().parent / "data" / "rapids-singlecell")
+    files = {path.relative_to(SKILL).as_posix() for path in SKILL.rglob("*") if path.is_file()}
     assert files == {
         "SKILL.md",
         "agents/openai.yaml",
@@ -96,9 +87,7 @@ def test_facades_export_every_public_callable(facade: str, package: str) -> None
     public = {
         name
         for name, value in vars(source).items()
-        if not name.startswith("_")
-        and callable(value)
-        and not isinstance(value, ModuleType)
+        if not name.startswith("_") and callable(value) and not isinstance(value, ModuleType)
     }
     exported = set(module.__all__) | set(getattr(module, "__deprecated_exports__", {}))
     assert public <= exported
@@ -180,14 +169,10 @@ def test_default_agent_destinations(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    assert install._target(agent, None) == (
-        tmp_path / directory / "skills" / "rapids-singlecell"
-    )
+    assert install._target(agent, None) == (tmp_path / directory / "skills" / "rapids-singlecell")
 
 
-def test_default_claude_science_destination(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_default_claude_science_destination(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     root = tmp_path / ".claude-science"
     root.mkdir()
@@ -196,14 +181,10 @@ def test_default_claude_science_destination(
         encoding="utf-8",
     )
 
-    assert install._target("claude-science", None) == (
-        root / "orgs" / "test-org" / "skills" / "rapids-singlecell"
-    )
+    assert install._target("claude-science", None) == (root / "orgs" / "test-org" / "skills" / "rapids-singlecell")
 
 
-def test_claude_science_requires_safe_active_org(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_claude_science_requires_safe_active_org(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     root = tmp_path / ".claude-science"
     root.mkdir()
@@ -242,9 +223,7 @@ def test_managed_memory_toggle() -> None:
 
 
 def test_managed_pool_route_is_checkable() -> None:
-    assert kernel._rmm_options(
-        "managed-pool", 0, initial_pool_size="1GiB", maximum_pool_size="8GiB"
-    ) == {
+    assert kernel._rmm_options("managed-pool", 0, initial_pool_size="1GiB", maximum_pool_size="8GiB") == {
         "pool_allocator": True,
         "managed_memory": True,
         "devices": 0,
@@ -279,9 +258,7 @@ def test_extension_discovery(tmp_path: Path) -> None:
     assert kernel._extension_names(tmp_path) == ["_norm_cuda"]
 
 
-def test_kernel_json_cli(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_kernel_json_cli(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     report = {"ready": True, "checks": {}}
     monkeypatch.setattr(kernel, "_preflight", lambda *args, **kwargs: report)
     assert kernel.main(["--json"]) == 0
@@ -295,7 +272,4 @@ def test_console_scripts_are_packaged() -> None:
         "rapids-singlecell-install-skills": "rapids_singlecell_skills.install:main",
         "rapids-singlecell-check-kernel": "rapids_singlecell_skills.kernel:main",
     }
-    assert (
-        "src/rapids_singlecell_skills"
-        in project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
-    )
+    assert "src/rapids_singlecell_skills" in project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]

@@ -87,9 +87,7 @@ def test_inner_product_unnormalized_connectivities(method, sparse):
         neighbors(adata, n_neighbors=k, metric="inner_product", method=method)
         distances = adata.obsp["distances"]
         indices = distances.indices.reshape(len(X), k)
-        np.testing.assert_array_equal(
-            np.sort(indices, axis=1), np.sort(expected_indices, axis=1)
-        )
+        np.testing.assert_array_equal(np.sort(indices, axis=1), np.sort(expected_indices, axis=1))
         np.testing.assert_allclose(
             distances.data.reshape(len(X), k),
             products[np.arange(len(X))[:, None], indices] * scale**2,
@@ -204,12 +202,8 @@ def test_neighbors_key_added():
     dists_key = adata.uns[KEY]["distances_key"]
 
     assert adata.uns["neighbors"]["params"] == adata.uns[KEY]["params"]
-    assert np.allclose(
-        adata.obsp["connectivities"].toarray(), adata.obsp[conns_key].toarray()
-    )
-    assert np.allclose(
-        adata.obsp["distances"].toarray(), adata.obsp[dists_key].toarray()
-    )
+    assert np.allclose(adata.obsp["connectivities"].toarray(), adata.obsp[conns_key].toarray())
+    assert np.allclose(adata.obsp["distances"].toarray(), adata.obsp[dists_key].toarray())
 
 
 def test_bbknn():
@@ -279,10 +273,7 @@ def test_bbknn_trim_default_matches_upstream():
         algorithm="brute",
         neighbors_within_batch=neighbors_within_batch,
     )
-    assert (
-        adata.uns["neighbors"]["params"]["trim"]
-        == 10 * neighbors_within_batch * n_batches
-    )
+    assert adata.uns["neighbors"]["params"]["trim"] == 10 * neighbors_within_batch * n_batches
 
 
 @pytest.mark.parametrize("trim", [5, 240])

@@ -287,8 +287,7 @@ def _check_gpu_X(X, *, require_cf=False, allow_dask=False, allow_csc=True):
         if allow_dask:
             if X.numblocks[1] != 1:
                 raise ValueError(
-                    "Dask arrays must be chunked only along observations. "
-                    "Rechunk with `X.rechunk({1: -1})`."
+                    "Dask arrays must be chunked only along observations. Rechunk with `X.rechunk({1: -1})`."
                 )
             return _check_gpu_X(X._meta, allow_csc=False)
         else:

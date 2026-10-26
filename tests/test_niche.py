@@ -197,11 +197,7 @@ def test_neighborhood_profile_counts_unique_neighbors(weighted, on_gpu, abs_nhoo
             {GROUPS: pd.Categorical(["A", "A", "B", "A", "B", None])},
             index=[str(i) for i in range(6)],
         ),
-        obsp={
-            SPATIAL_CONNECTIVITIES_KEY: sparse_gpu.csr_matrix(graph)
-            if on_gpu
-            else graph
-        },
+        obsp={SPATIAL_CONNECTIVITIES_KEY: sparse_gpu.csr_matrix(graph) if on_gpu else graph},
     )
     before = graph.copy()
 
@@ -286,9 +282,7 @@ def test_utag_unexpressed_gene(adata, to_sparse):
     a1.X = X[:, 1:]
     a2.X = sparse.csr_matrix(X) if to_sparse else X
     for a in (a1, a2):
-        calculate_niche(
-            a, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7
-        )
+        calculate_niche(a, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7)
     np.testing.assert_array_equal(
         a1.obs["utag_niche_res=0.5"].astype(str).values,
         a2.obs["utag_niche_res=0.5"].astype(str).values,
@@ -319,9 +313,7 @@ def test_groups_not_in_obs_raises(adata):
 def test_missing_connectivities_raises(adata):
     del adata.obsp["spatial_connectivities"]
     with pytest.raises(KeyError, match="spatial_connectivities"):
-        calculate_niche(
-            adata, flavor="neighborhood", groups=GROUPS, n_neighbors=10, resolutions=0.5
-        )
+        calculate_niche(adata, flavor="neighborhood", groups=GROUPS, n_neighbors=10, resolutions=0.5)
 
 
 def test_invalid_distance_raises(adata):
@@ -410,9 +402,7 @@ def test_cellcharter_variance(adata):
 
 def test_cellcharter_invalid_aggregation(adata):
     with pytest.raises(ValueError, match="aggregation"):
-        calculate_niche(
-            adata, flavor="cellcharter", n_components=4, aggregation="bogus"
-        )
+        calculate_niche(adata, flavor="cellcharter", n_components=4, aggregation="bogus")
 
 
 def test_cellcharter_bad_n_components(adata):
@@ -422,9 +412,7 @@ def test_cellcharter_bad_n_components(adata):
 
 def test_cellcharter_missing_use_rep(adata):
     with pytest.raises(KeyError):
-        calculate_niche(
-            adata, flavor="cellcharter", n_components=4, use_rep="not_there"
-        )
+        calculate_niche(adata, flavor="cellcharter", n_components=4, use_rep="not_there")
 
 
 def test_cellcharter_use_rep_too_few_dims(adata):
@@ -487,9 +475,7 @@ def test_flavor_function_matches_dispatcher(adata, flavor, func, kwargs, cols):
     func(a1, **kwargs)
     calculate_niche(a2, flavor=flavor, **kwargs)
     for col in cols:
-        np.testing.assert_array_equal(
-            a1.obs[col].astype(str).values, a2.obs[col].astype(str).values
-        )
+        np.testing.assert_array_equal(a1.obs[col].astype(str).values, a2.obs[col].astype(str).values)
 
 
 def test_calculate_niche_is_deprecated(adata):
@@ -499,9 +485,7 @@ def test_calculate_niche_is_deprecated(adata):
 
 def test_mask_excludes_cells(adata):
     mask = pd.Series(np.arange(adata.n_obs) % 3 != 0, index=adata.obs_names)
-    calculate_niche_neighborhood(
-        adata, groups=GROUPS, n_neighbors=10, resolutions=0.5, mask=mask
-    )
+    calculate_niche_neighborhood(adata, groups=GROUPS, n_neighbors=10, resolutions=0.5, mask=mask)
     labels = adata.obs["nhood_niche_res=0.5"].astype(str)
     assert (labels[~mask.values] == "not_a_niche").all()
     assert (labels[mask.values] != "not_a_niche").any()
@@ -531,23 +515,15 @@ def test_min_niche_size_applies_to_all_flavors(adata, func, kwargs, col):
 
 
 def test_library_key_stratifies(adata):
-    adata.obs["sample"] = pd.Categorical(
-        np.where(np.arange(adata.n_obs) < adata.n_obs // 2, "s1", "s2")
-    )
-    calculate_niche_neighborhood(
-        adata, groups=GROUPS, n_neighbors=10, resolutions=0.5, library_key="sample"
-    )
+    adata.obs["sample"] = pd.Categorical(np.where(np.arange(adata.n_obs) < adata.n_obs // 2, "s1", "s2"))
+    calculate_niche_neighborhood(adata, groups=GROUPS, n_neighbors=10, resolutions=0.5, library_key="sample")
     labels = adata.obs["nhood_niche_res=0.5"].astype(str)
     assert isinstance(adata.obs["nhood_niche_res=0.5"].dtype, pd.CategoricalDtype)
     assert labels.str.startswith(("lib=s1_", "lib=s2_")).all()
     # each library gets its own label space
-    assert not set(labels[adata.obs["sample"] == "s1"]) & set(
-        labels[adata.obs["sample"] == "s2"]
-    )
+    assert not set(labels[adata.obs["sample"] == "s1"]) & set(labels[adata.obs["sample"] == "s2"])
 
 
 def test_library_key_not_in_obs_raises(adata):
     with pytest.raises(KeyError, match="missing_lib"):
-        calculate_niche_utag(
-            adata, n_neighbors=10, resolutions=0.5, library_key="missing_lib"
-        )
+        calculate_niche_utag(adata, n_neighbors=10, resolutions=0.5, library_key="missing_lib")

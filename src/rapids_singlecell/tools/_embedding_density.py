@@ -19,9 +19,7 @@ def _basis_obsm_key(adata: AnnData, basis: str) -> str | None:
     if basis in adata.obsm:
         return basis
     embedding, layout = (
-        ("draw_graph", basis.removeprefix("draw_graph_"))
-        if basis.startswith("draw_graph_")
-        else (basis, "")
+        ("draw_graph", basis.removeprefix("draw_graph_")) if basis.startswith("draw_graph_") else (basis, "")
     )
     if embedding in _EMBEDDINGS:
         keys = _existing_preset_keys(adata, embedding, layout=layout)

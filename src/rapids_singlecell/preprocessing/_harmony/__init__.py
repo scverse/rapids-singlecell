@@ -169,11 +169,7 @@ def harmonize(
     The integrated embedding by Harmony, of the same shape as the input embedding.
     """
 
-    stopping = (
-        _STOPPING_HARMONY2
-        if stabilized_penalty and dynamic_lambda
-        else _STOPPING_HARMONY1
-    )
+    stopping = _STOPPING_HARMONY2 if stabilized_penalty and dynamic_lambda else _STOPPING_HARMONY1
     if max_iter_clustering is None:
         max_iter_clustering = stopping[0]
     if tol_clustering is None:
@@ -194,9 +190,7 @@ def harmonize(
 
     # Keep the established one-dimensional layout for one covariate. Multiple
     # covariates use a cell-major matrix of disjoint marginal category codes.
-    cats = cp.asarray(
-        batch_codes[:, 0] if n_covariates == 1 else batch_codes, dtype=cp.int32
-    )
+    cats = cp.asarray(batch_codes[:, 0] if n_covariates == 1 else batch_codes, dtype=cp.int32)
     joint_cats = None
     joint_codes = None
     joint_offsets = None
@@ -204,21 +198,13 @@ def harmonize(
     marginal_joint_offsets = None
     marginal_joint_indices = None
     if n_covariates > 1:
-        joint_cats_host, joint_codes_host = _factorize_joint_codes(
-            batch_codes, n_levels
-        )
+        joint_cats_host, joint_codes_host = _factorize_joint_codes(batch_codes, n_levels)
         joint_cats = cp.asarray(joint_cats_host, dtype=cp.int32)
         joint_codes = cp.asarray(joint_codes_host, dtype=cp.int32)
         n_joint_categories = joint_cats.shape[0]
-        joint_offsets, joint_cell_indices = _create_category_index_mapping(
-            joint_codes, n_joint_categories
-        )
-        marginal_joint_offsets, flat_joint_indices = _create_category_index_mapping(
-            joint_cats.ravel(), n_batches
-        )
-        marginal_joint_indices = (flat_joint_indices // n_covariates).astype(
-            cp.int32, copy=False
-        )
+        joint_offsets, joint_cell_indices = _create_category_index_mapping(joint_codes, n_joint_categories)
+        marginal_joint_offsets, flat_joint_indices = _create_category_index_mapping(joint_cats.ravel(), n_batches)
+        marginal_joint_indices = (flat_joint_indices // n_covariates).astype(cp.int32, copy=False)
         init_offsets, init_indices = joint_offsets, joint_cell_indices
     else:
         n_joint_categories = 0
@@ -236,9 +222,7 @@ def harmonize(
     # TODO: Allow for multiple colsum algorithms in a list
     assert colsum_algo in ["columns", "atomics", "gemm", "benchmark", None]
     colsum_func_big = _choose_colsum_algo_heuristic(n_cells, n_clusters, None)
-    colsum_func_small = _choose_colsum_algo_heuristic(
-        int(n_cells * block_proportion), n_clusters, colsum_algo
-    )
+    colsum_func_small = _choose_colsum_algo_heuristic(int(n_cells * block_proportion), n_clusters, colsum_algo)
     theta_array = _get_theta_array(theta, n_levels, Z.dtype)
     if tau > 0:
         theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
@@ -248,17 +232,12 @@ def harmonize(
     assert block_proportion > 0 and block_proportion <= 1
     if dynamic_lambda:
         if not np.isfinite(alpha) or alpha <= 0:
-            raise ValueError(
-                f"alpha must be a finite positive number when dynamic_lambda=True, got {alpha}."
-            )
+            raise ValueError(f"alpha must be a finite positive number when dynamic_lambda=True, got {alpha}.")
         if batch_prune_threshold is not None and not (0 <= batch_prune_threshold <= 1):
-            raise ValueError(
-                f"batch_prune_threshold must be in [0, 1] or None, got {batch_prune_threshold}."
-            )
+            raise ValueError(f"batch_prune_threshold must be in [0, 1] or None, got {batch_prune_threshold}.")
     elif not np.isfinite(ridge_lambda) or ridge_lambda <= 0:
         raise ValueError(
-            "ridge_lambda must be a finite positive number when "
-            f"dynamic_lambda=False, got {ridge_lambda}."
+            f"ridge_lambda must be a finite positive number when dynamic_lambda=False, got {ridge_lambda}."
         )
     if correction_method is not None and correction_method not in {
         "fast",
@@ -299,9 +278,7 @@ def harmonize(
     if correction_method is None and n_covariates == 1:
         nb1 = n_batches + 1
         inv_mats_bytes = n_clusters * nb1 * nb1 * Z.dtype.itemsize
-        correction_method = (
-            "batched" if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
-        )
+        correction_method = "batched" if inv_mats_bytes <= _CORRECTION_WORKSPACE_LIMIT_BYTES else "fast"
 
     rng = np.random.default_rng(rng)
     # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
@@ -486,9 +463,7 @@ def harmonize(
             Z_norm = _normalize_cp(Z_hat, p=2, out=Z_hat)
 
     if not is_converged:
-        warnings.warn(
-            "Harmony did not converge. Consider increasing the number of iterations"
-        )
+        warnings.warn("Harmony did not converge. Consider increasing the number of iterations")
 
     return Z_hat
 
@@ -680,11 +655,7 @@ def _clustering(
 
     joint_args = {}
     if use_joint_scatter:
-        if (
-            joint_codes is None
-            or marginal_joint_offsets is None
-            or marginal_joint_indices is None
-        ):
+        if joint_codes is None or marginal_joint_offsets is None or marginal_joint_indices is None:
             raise ValueError("Joint scatter requires all joint category arrays.")
         joint_args = {
             "joint_codes": joint_codes,
@@ -819,16 +790,10 @@ def _correction_multi(
     n_joint_categories = joint_cats.shape[0]
     nb1 = n_batches + 1
     if joint_offsets is None or joint_cell_indices is None:
-        joint_offsets, joint_cell_indices = _create_category_index_mapping(
-            joint_codes, n_joint_categories
-        )
+        joint_offsets, joint_cell_indices = _create_category_index_mapping(joint_codes, n_joint_categories)
     if marginal_joint_offsets is None or marginal_joint_indices is None:
-        marginal_joint_offsets, flat_joint_indices = _create_category_index_mapping(
-            joint_cats.ravel(), n_batches
-        )
-        marginal_joint_indices = (flat_joint_indices // n_covariates).astype(
-            cp.int32, copy=False
-        )
+        marginal_joint_offsets, flat_joint_indices = _create_category_index_mapping(joint_cats.ravel(), n_batches)
+        marginal_joint_indices = (flat_joint_indices // n_covariates).astype(cp.int32, copy=False)
     rhs_tile_rows = _correction_batched_cuda.JOINT_RHS_TILE_ROWS
     n_rhs_tiles = (n_cells + rhs_tile_rows - 1) // rhs_tile_rows + n_joint_categories
     for rhs_tiles in (n_rhs_tiles, 0):
@@ -872,24 +837,14 @@ def _correction_multi(
         else:
             R_chunk = cp.ascontiguousarray(R[:, cluster_start:cluster_stop])
             O_chunk = cp.ascontiguousarray(O[:, cluster_start:cluster_stop])
-            lambda_kb_chunk = cp.ascontiguousarray(
-                lambda_kb[:, cluster_start:cluster_stop]
-            )
+            lambda_kb_chunk = cp.ascontiguousarray(lambda_kb[:, cluster_start:cluster_stop])
 
         gram = cp.empty((chunk_n_clusters, nb1, nb1), dtype=X.dtype)
         rhs = cp.empty((chunk_n_clusters, nb1, n_pcs), dtype=X.dtype)
         joint_O = cp.empty((n_joint_categories, chunk_n_clusters), dtype=X.dtype)
-        joint_rhs = cp.empty(
-            (n_joint_categories, chunk_n_clusters, n_pcs), dtype=X.dtype
-        )
-        joint_rhs_partials = (
-            cp.empty((n_rhs_tiles, chunk_n_clusters, n_pcs), dtype=X.dtype)
-            if n_rhs_tiles
-            else None
-        )
-        active_mask = cp.ascontiguousarray(
-            (lambda_kb_chunk < X.dtype.type(_SUPPRESS_PENALTY)).astype(cp.uint8)
-        )
+        joint_rhs = cp.empty((n_joint_categories, chunk_n_clusters, n_pcs), dtype=X.dtype)
+        joint_rhs_partials = cp.empty((n_rhs_tiles, chunk_n_clusters, n_pcs), dtype=X.dtype) if n_rhs_tiles else None
+        active_mask = cp.ascontiguousarray((lambda_kb_chunk < X.dtype.type(_SUPPRESS_PENALTY)).astype(cp.uint8))
 
         _correction_batched_cuda.prepare_multi(
             X,
@@ -964,12 +919,8 @@ def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
     info = cp.empty(n_matrices, dtype=cp.int32)
 
     matrix_offsets = cp.arange(n_matrices, dtype=cp.uint64)
-    gram_ptrs = gram_work.data.ptr + matrix_offsets * cp.uint64(
-        matrix_size * matrix_size * gram.dtype.itemsize
-    )
-    rhs_ptrs = rhs_work.data.ptr + matrix_offsets * cp.uint64(
-        matrix_size * n_rhs * rhs.dtype.itemsize
-    )
+    gram_ptrs = gram_work.data.ptr + matrix_offsets * cp.uint64(matrix_size * matrix_size * gram.dtype.itemsize)
+    rhs_ptrs = rhs_work.data.ptr + matrix_offsets * cp.uint64(matrix_size * n_rhs * rhs.dtype.itemsize)
 
     if gram.dtype == cp.float32:
         potrf_batched = cp.cuda.cusolver.spotrfBatched
@@ -1022,9 +973,7 @@ def _solve_spd_batched(gram: cp.ndarray, rhs: cp.ndarray) -> cp.ndarray:
         )
     failed = np.flatnonzero(cp.asnumpy(info))
     for matrix_index in failed:
-        rhs_work[matrix_index] = cp.linalg.lstsq(
-            gram[matrix_index], rhs[matrix_index], rcond=None
-        )[0]
+        rhs_work[matrix_index] = cp.linalg.lstsq(gram[matrix_index], rhs[matrix_index], rcond=None)[0]
     return rhs_work
 
 
@@ -1043,18 +992,13 @@ def _multi_correction_cluster_chunk_size(
         return 0
 
     nb1 = n_batches + 1
-    fixed_bytes = (
-        (n_joint_categories + 1) * np.dtype(np.int32).itemsize if n_rhs_tiles else 0
-    )
+    fixed_bytes = (n_joint_categories + 1) * np.dtype(np.int32).itemsize if n_rhs_tiles else 0
 
     def _workspace_bytes(chunk_n_clusters: int, *, copy_cluster_slices: bool) -> int:
         # CuPy's solve preserves its inputs. Account conservatively for the
         # Gram/RHS copies, solve output, and a possible contiguous output copy.
         float_elements_per_cluster = (
-            3 * nb1 * nb1
-            + 3 * nb1 * n_pcs
-            + n_joint_categories * (n_pcs + 1)
-            + n_rhs_tiles * n_pcs
+            3 * nb1 * nb1 + 3 * nb1 * n_pcs + n_joint_categories * (n_pcs + 1) + n_rhs_tiles * n_pcs
         )
         if copy_cluster_slices:
             float_elements_per_cluster += n_cells + 2 * n_batches
@@ -1062,9 +1006,7 @@ def _multi_correction_cluster_chunk_size(
         # Active-mask construction can temporarily hold bool and uint8 arrays;
         # LU also needs pivots and device pointer arrays per cluster.
         auxiliary_bytes_per_cluster = 2 * n_batches + 4 * nb1 + 16
-        return fixed_bytes + chunk_n_clusters * (
-            float_elements_per_cluster * itemsize + auxiliary_bytes_per_cluster
-        )
+        return fixed_bytes + chunk_n_clusters * (float_elements_per_cluster * itemsize + auxiliary_bytes_per_cluster)
 
     full_workspace = _workspace_bytes(n_clusters, copy_cluster_slices=False)
     if full_workspace <= _CORRECTION_WORKSPACE_LIMIT_BYTES:
@@ -1081,8 +1023,7 @@ def _multi_correction_cluster_chunk_size(
 
     return min(
         n_clusters,
-        (_CORRECTION_WORKSPACE_LIMIT_BYTES - fixed_bytes)
-        // (single_cluster_workspace - fixed_bytes),
+        (_CORRECTION_WORKSPACE_LIMIT_BYTES - fixed_bytes) // (single_cluster_workspace - fixed_bytes),
     )
 
 

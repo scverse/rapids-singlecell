@@ -145,9 +145,7 @@ def _highly_variable_pearson_residuals(
     ranks_residual_var = cp.argsort(cp.argsort(-residual_gene_vars, axis=1), axis=1)
     ranks_residual_var = ranks_residual_var.astype(X.dtype)
     # count in how many batches a genes was among the n_top_genes
-    highly_variable_nbatches = cp.sum(
-        (ranks_residual_var < n_top_genes).astype(int), axis=0
-    ).get()
+    highly_variable_nbatches = cp.sum((ranks_residual_var < n_top_genes).astype(int), axis=0).get()
     ranks_residual_var[ranks_residual_var >= n_top_genes] = np.nan
     ranks_residual_var = ranks_residual_var.get()
     ranks_masked_array = np.ma.masked_invalid(ranks_residual_var)
@@ -185,7 +183,5 @@ def _highly_variable_pearson_residuals(
     adata.var["highly_variable_rank"] = df["highly_variable_rank"].values
     if batch_key is not None:
         adata.var["highly_variable_nbatches"] = df["highly_variable_nbatches"].values
-        adata.var["highly_variable_intersection"] = df[
-            "highly_variable_intersection"
-        ].values
+        adata.var["highly_variable_intersection"] = df["highly_variable_intersection"].values
     adata.var["highly_variable"] = df["highly_variable"].values

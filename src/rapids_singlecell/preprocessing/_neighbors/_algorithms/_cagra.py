@@ -49,9 +49,7 @@ def _cagra_knn(
         metric_to_use = "sqeuclidean"
     else:
         metric_to_use = metric
-    build_params = cagra.IndexParams(
-        metric=metric_to_use, graph_degree=k, build_algo="nn_descent"
-    )
+    build_params = cagra.IndexParams(metric=metric_to_use, graph_degree=k, build_algo="nn_descent")
     index = cagra.build(build_params, X, **build_kwargs)
 
     search_params = cagra.SearchParams()

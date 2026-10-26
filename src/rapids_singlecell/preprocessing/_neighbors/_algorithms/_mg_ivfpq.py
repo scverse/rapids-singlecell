@@ -27,8 +27,7 @@ def _mg_ivf_pq_knn(
         from cuvs.neighbors.mg import ivf_pq as mg_ivf_pq
     except ImportError:
         raise ImportError(
-            "The 'mg_ivf_pq' algorithm is only available in cuvs >= 25.10. "
-            "Please update your cuvs installation."
+            "The 'mg_ivf_pq' algorithm is only available in cuvs >= 25.10. Please update your cuvs installation."
         )
     distribution_mode = algorithm_kwds.get("distribution_mode", "replicated")
     n_lists = algorithm_kwds.get("n_lists", _compute_nlist(X.shape[0]))

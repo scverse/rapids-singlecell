@@ -52,9 +52,7 @@ class TestSplitPairs:
         pair_right = cp.array([0, 1, 1, 2, 2], dtype=cp.int32)
         group_sizes = cp.array([100, 200, 300], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=3, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=3, group_sizes=group_sizes)
 
         # Concatenate all splits and verify they match original
         all_left = cp.concatenate([r[0] for r in result])
@@ -74,9 +72,7 @@ class TestSplitPairs:
         pair_right = cp.array([1, 2, 2, 2], dtype=cp.int32)
         group_sizes = cp.array([10, 10, 1000], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=2, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=2, group_sizes=group_sizes)
 
         # The diagonal pair (2,2) has most work, should likely be alone or with few others
         # First device should get the smaller pairs, second should get the large diagonal
@@ -95,9 +91,7 @@ class TestSplitPairs:
         # Group 1: 10 cells -> 10*9/2 = 45 work
         group_sizes = cp.array([100, 10], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=2, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=2, group_sizes=group_sizes)
 
         # Each device should get one pair since there are 2 pairs and 2 devices
         # The work is very unbalanced (4950 vs 45), but we only have 2 pairs
@@ -131,9 +125,7 @@ class TestSplitPairs:
         # Exponentially increasing group sizes to create unbalanced work
         group_sizes = cp.array([10, 20, 40, 80, 160], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=3, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=3, group_sizes=group_sizes)
 
         # Calculate actual work per device
         def calc_work(left, right, sizes):
@@ -167,9 +159,7 @@ class TestSplitPairs:
         if len(result[0][0]) > 0:
             first_left = result[0][0].get()
             # Should be monotonically increasing (or equal for diagonal)
-            assert all(
-                first_left[i] <= first_left[i + 1] for i in range(len(first_left) - 1)
-            )
+            assert all(first_left[i] <= first_left[i + 1] for i in range(len(first_left) - 1))
 
     def test_single_pair(self):
         """Single pair is assigned to exactly one device."""
@@ -177,9 +167,7 @@ class TestSplitPairs:
         pair_right = cp.array([1], dtype=cp.int32)
         group_sizes = cp.array([100, 100], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=4, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=4, group_sizes=group_sizes)
 
         assert len(result) == 4
         # Exactly one device should have the pair
@@ -205,9 +193,7 @@ class TestSplitPairs:
         n_pairs = len(pair_left)
         assert n_pairs == n_groups * (n_groups + 1) // 2  # 5050 pairs
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=8, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=8, group_sizes=group_sizes)
 
         assert len(result) == 8
         total = sum(len(r[0]) for r in result)
@@ -219,9 +205,7 @@ class TestSplitPairs:
         pair_right = cp.array([1, 2, 2], dtype=cp.int32)
         group_sizes = cp.array([10, 20, 30], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=2, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=2, group_sizes=group_sizes)
 
         for left, right in result:
             assert isinstance(left, cp.ndarray)
@@ -324,9 +308,7 @@ class TestDeviceCopy:
         destination = source.device.id + 1
         monkeypatch.setattr(_multi_gpu, "_peer_copy_works", lambda *_: works)
         monkeypatch.setattr(_multi_gpu, selected, lambda *_: copied)
-        monkeypatch.setattr(
-            _multi_gpu, unused, lambda *_: pytest.fail("wrong copy route")
-        )
+        monkeypatch.setattr(_multi_gpu, unused, lambda *_: pytest.fail("wrong copy route"))
 
         assert _multi_gpu._copy_to_device(source, destination) is copied
 

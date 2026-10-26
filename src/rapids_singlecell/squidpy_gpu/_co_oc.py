@@ -87,14 +87,10 @@ def co_occurrence(
     else:
         interval = cp.array(sorted(interval), dtype=np.float32, copy=True)
     if len(interval) <= 1:
-        raise ValueError(
-            f"Expected interval to be of length `>= 2`, found `{len(interval)}`."
-        )
+        raise ValueError(f"Expected interval to be of length `>= 2`, found `{len(interval)}`.")
 
     device_ids = parse_device_ids(multi_gpu=multi_gpu)
-    out = _co_occurrence_helper(
-        spatial, interval, labs, fast=True, device_ids=device_ids
-    )
+    out = _co_occurrence_helper(spatial, interval, labs, fast=True, device_ids=device_ids)
     out, interval = out.get(), interval.get()
     if copy:
         return out, interval
@@ -107,15 +103,8 @@ def _find_min_max(spatial: cp.ndarray) -> tuple[float, float]:
     coord_sum = cp.sum(spatial, axis=1)
     min_idx, min_idx2 = cp.argpartition(coord_sum, 2)[:2]
     max_idx = cp.argmax(coord_sum)
-    thres_max = (
-        pairwise_distances(
-            spatial[min_idx, :].reshape(1, -1), spatial[max_idx, :].reshape(1, -1)
-        )[0, 0]
-        / 2.0
-    )
-    thres_min = pairwise_distances(
-        spatial[min_idx, :].reshape(1, -1), spatial[min_idx2, :].reshape(1, -1)
-    )[0, 0]
+    thres_max = pairwise_distances(spatial[min_idx, :].reshape(1, -1), spatial[max_idx, :].reshape(1, -1))[0, 0] / 2.0
+    thres_min = pairwise_distances(spatial[min_idx, :].reshape(1, -1), spatial[min_idx2, :].reshape(1, -1))[0, 0]
     return thres_min.astype(np.float32), thres_max.astype(np.float32)
 
 

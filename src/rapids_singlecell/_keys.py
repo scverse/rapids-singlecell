@@ -43,9 +43,7 @@ class _PcaKeys(_EmbeddingKeys):
 
 
 @overload
-def _embedding_keys(
-    embedding: Literal["pca"], key_added: str | Default | Preset | None = ...
-) -> _PcaKeys: ...
+def _embedding_keys(embedding: Literal["pca"], key_added: str | Default | Preset | None = ...) -> _PcaKeys: ...
 @overload
 def _embedding_keys(
     embedding: Literal["tsne", "umap", "diffmap"],
@@ -73,9 +71,7 @@ def _embedding_keys(
     if isinstance(key_added, Default):
         key_added = settings.preset
     if isinstance(key_added, Preset):
-        key_added = cast(
-            "BasicEmbeddingPreset", getattr(key_added, embedding)
-        ).key_added
+        key_added = cast("BasicEmbeddingPreset", getattr(key_added, embedding)).key_added
     match embedding, key_added:
         case "draw_graph", k:
             return _draw_graph_keys(k, layout=layout)
@@ -110,9 +106,7 @@ def _preset_obsm_names(embedding: _Embedding, *, layout: str = "") -> set[str]:
     return {keys.obsm for keys in _preset_keys(embedding, layout=layout)}
 
 
-def _keys_for_obsm(
-    embedding: _Embedding, obsm: str, *, layout: str = ""
-) -> _EmbeddingKeys | None:
+def _keys_for_obsm(embedding: _Embedding, obsm: str, *, layout: str = "") -> _EmbeddingKeys | None:
     """Reverse `_embedding_keys`: the keys whose `.obsm` name is `obsm`.
 
     `obsm` is a stored key name, not a `key_added` — `'X_pca'` maps back to the
@@ -139,9 +133,7 @@ def _preset_harmony_names() -> set[str]:
     return {_harmony_obsm_key(name) for name in _preset_obsm_names("pca")}
 
 
-def _existing_preset_keys(
-    adata: AnnData, embedding: _Embedding, *, layout: str = ""
-) -> _EmbeddingKeys | None:
+def _existing_preset_keys(adata: AnnData, embedding: _Embedding, *, layout: str = "") -> _EmbeddingKeys | None:
     """Return the keys `embedding` is actually stored under, or `None` if absent."""
     for keys in _preset_keys(embedding, layout=layout):
         if keys.obsm in adata.obsm:
@@ -162,9 +154,7 @@ def _resolve_obsm_key(
     explicit keys such as `'X_scVI'` always win. A preset name that is absent falls
     back to the other preset's spelling, and `key=None` auto-detects.
     """
-    if key is not None and (
-        key in adata.obsm or key not in _preset_obsm_names(embedding, layout=layout)
-    ):
+    if key is not None and (key in adata.obsm or key not in _preset_obsm_names(embedding, layout=layout)):
         return key
     existing = _existing_preset_keys(adata, embedding, layout=layout)
     return key if existing is None else existing.obsm

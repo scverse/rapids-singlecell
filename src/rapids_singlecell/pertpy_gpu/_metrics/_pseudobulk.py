@@ -28,12 +28,7 @@ if TYPE_CHECKING:
     from scipy.sparse import csr_matrix as csr_matrix_cpu
 
     type _MatrixLike = (
-        np.ndarray
-        | cp.ndarray
-        | csr_matrix_cpu
-        | csc_matrix_cpu
-        | cp_sparse.csr_matrix
-        | cp_sparse.csc_matrix
+        np.ndarray | cp.ndarray | csr_matrix_cpu | csc_matrix_cpu | cp_sparse.csr_matrix | cp_sparse.csc_matrix
     )
     type _GPUMatrixLike = cp.ndarray | cp_sparse.csr_matrix | cp_sparse.csc_matrix
 
@@ -197,9 +192,7 @@ class PseudobulkMetric(BaseMetric):
 
         groups_list = list(obs_col.cat.categories)
         group_labels = cp.asarray(obs_col.cat.codes.to_numpy(), dtype=cp.int32)
-        cat_offsets, cell_indices = _create_category_index_mapping(
-            group_labels, len(groups_list)
-        )
+        cat_offsets, cell_indices = _create_category_index_mapping(group_labels, len(groups_list))
         return _as_gpu_data(data), cat_offsets, cell_indices, groups_list
 
     def _bootstrap_sample_cells(
@@ -217,9 +210,7 @@ class PseudobulkMetric(BaseMetric):
         if total_cells == 0:
             return cell_indices
 
-        random_ints = rng.integers(
-            0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64
-        )
+        random_ints = rng.integers(0, cp.iinfo(cp.int64).max, size=total_cells, dtype=cp.int64)
         group_sizes_list = group_sizes_gpu.get().tolist()
         cell_group_sizes = cp.repeat(group_sizes_gpu, group_sizes_list)
         bootstrap_local_idx = random_ints % cell_group_sizes
@@ -237,9 +228,7 @@ class PseudobulkMetric(BaseMetric):
         random_state: int,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         _check_n_bootstrap(n_bootstrap)
-        embedding, cat_offsets, cell_indices, group_names = self._subset_to_groups(
-            adata, groupby, groups
-        )
+        embedding, cat_offsets, cell_indices, group_names = self._subset_to_groups(adata, groupby, groups)
         group_sizes = cp.diff(cat_offsets)
         group_sizes_cpu = group_sizes.get().astype(np.intp, copy=False)
         boot_obs = pd.DataFrame(
@@ -303,9 +292,7 @@ class PseudobulkMetric(BaseMetric):
         random_state: int,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         _check_n_bootstrap(n_bootstrap)
-        embedding, cat_offsets, cell_indices, group_names = self._subset_to_groups(
-            adata, groupby, needed_groups
-        )
+        embedding, cat_offsets, cell_indices, group_names = self._subset_to_groups(adata, groupby, needed_groups)
         group_map = {name: idx for idx, name in enumerate(group_names)}
         selected_indices = [group_map[group] for group in selected_groups]
         selected = cp.asarray(selected_indices, dtype=cp.intp)
@@ -356,9 +343,7 @@ class PseudobulkMetric(BaseMetric):
         distances.index.name = groupby
         distances.columns.name = "selected_group"
 
-        variances = pd.DataFrame(
-            variance.get(), index=group_names, columns=selected_groups
-        )
+        variances = pd.DataFrame(variance.get(), index=group_names, columns=selected_groups)
         variances.index.name = groupby
         variances.columns.name = "selected_group"
         return distances, variances
@@ -431,12 +416,7 @@ class PseudobulkMetric(BaseMetric):
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> (
-        pd.Series
-        | pd.DataFrame
-        | tuple[pd.Series, pd.Series]
-        | tuple[pd.DataFrame, pd.DataFrame]
-    ):
+    ) -> pd.Series | pd.DataFrame | tuple[pd.Series, pd.Series] | tuple[pd.DataFrame, pd.DataFrame]:
         selected_groups, single_control, needed_groups = self._resolve_onesided_inputs(
             adata, groupby, selected_group, groups
         )
@@ -486,9 +466,7 @@ class PseudobulkMetric(BaseMetric):
         means, obs = self._aggregate_means(adata, by)
 
         obs_by_arrays = [obs[col].to_numpy() for col in by]
-        condition_to_idx: dict[tuple, int] = {
-            key: idx for idx, key in enumerate(zip(*obs_by_arrays))
-        }
+        condition_to_idx: dict[tuple, int] = {key: idx for idx, key in enumerate(zip(*obs_by_arrays))}
 
         target_vals = contrasts[groupby].to_numpy()
         ref_vals = contrasts["reference"].to_numpy()
@@ -504,9 +482,7 @@ class PseudobulkMetric(BaseMetric):
                 left_idx.append(condition_to_idx[target_key])
                 right_idx.append(condition_to_idx[reference_key])
             except KeyError as err:
-                raise ValueError(
-                    f"No cells found for contrast condition {err.args[0]}"
-                ) from None
+                raise ValueError(f"No cells found for contrast condition {err.args[0]}") from None
 
         left = cp.asarray(left_idx, dtype=cp.intp)
         right = cp.asarray(right_idx, dtype=cp.intp)
@@ -587,10 +563,7 @@ class PearsonDistance(PseudobulkMetric):
         X_centered = X_mean - cp.mean(X_mean, axis=1, keepdims=True)
         Y_centered = Y_mean - cp.mean(Y_mean, axis=1, keepdims=True)
         numerator = X_centered @ Y_centered.T
-        denominator = (
-            cp.linalg.norm(X_centered, axis=1)[:, None]
-            * cp.linalg.norm(Y_centered, axis=1)[None, :]
-        )
+        denominator = cp.linalg.norm(X_centered, axis=1)[:, None] * cp.linalg.norm(Y_centered, axis=1)[None, :]
         return 1 - numerator / denominator
 
     def _distance_between_pairs(
@@ -601,9 +574,7 @@ class PearsonDistance(PseudobulkMetric):
         X_centered = X_mean - cp.mean(X_mean, axis=1, keepdims=True)
         Y_centered = Y_mean - cp.mean(Y_mean, axis=1, keepdims=True)
         numerator = cp.sum(X_centered * Y_centered, axis=1)
-        denominator = cp.linalg.norm(X_centered, axis=1) * cp.linalg.norm(
-            Y_centered, axis=1
-        )
+        denominator = cp.linalg.norm(X_centered, axis=1) * cp.linalg.norm(Y_centered, axis=1)
         return 1 - numerator / denominator
 
 
@@ -620,10 +591,7 @@ class CosineDistance(PseudobulkMetric):
         Y_mean: cp.ndarray,
     ) -> cp.ndarray:
         numerator = X_mean @ Y_mean.T
-        denominator = (
-            cp.linalg.norm(X_mean, axis=1)[:, None]
-            * cp.linalg.norm(Y_mean, axis=1)[None, :]
-        )
+        denominator = cp.linalg.norm(X_mean, axis=1)[:, None] * cp.linalg.norm(Y_mean, axis=1)[None, :]
         return cp.clip(1 - numerator / denominator, 0, 2)
 
     def _distance_between_pairs(

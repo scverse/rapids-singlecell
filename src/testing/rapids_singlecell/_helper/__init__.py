@@ -47,9 +47,7 @@ MAP_ARRAY_TYPES: dict[
     ),
 }
 
-ARRAY_TYPES_MEM = tuple(
-    at for (strg, _), ats in MAP_ARRAY_TYPES.items() if strg == "mem" for at in ats
-)
+ARRAY_TYPES_MEM = tuple(at for (strg, _), ats in MAP_ARRAY_TYPES.items() if strg == "mem" for at in ats)
 
 
 def _half_chunk_size(a: tuple[int, ...]) -> tuple[int, ...]:
@@ -76,9 +74,7 @@ def _(a):
 @as_dense_dask_array.register(DaskArray)
 def _(a):
     # Map to numpy arrays blockwise, preserving dtype; meta informs dask about target array type
-    return a.map_blocks(
-        asarray, dtype=a.dtype, meta=np.empty((0,) * a.ndim, dtype=a.dtype)
-    )
+    return a.map_blocks(asarray, dtype=a.dtype, meta=np.empty((0,) * a.ndim, dtype=a.dtype))
 
 
 @singledispatch

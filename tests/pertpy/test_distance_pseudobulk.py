@@ -59,14 +59,9 @@ def _group_means(X: np.ndarray, groups: np.ndarray) -> tuple[np.ndarray, list[st
 def pseudobulk_adata() -> tuple[AnnData, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(13)
     n_groups, cells_per_group, n_features = 4, 6, 7
-    blocks = [
-        rng.normal(loc=i * 0.5, size=(cells_per_group, n_features))
-        for i in range(n_groups)
-    ]
+    blocks = [rng.normal(loc=i * 0.5, size=(cells_per_group, n_features)) for i in range(n_groups)]
     X = np.vstack(blocks).astype(np.float32)
-    groups = np.array(
-        [f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)]
-    )
+    groups = np.array([f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)])
     obs = pd.DataFrame({"group": pd.Categorical(groups)})
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
@@ -133,9 +128,7 @@ def test_pseudobulk_onesided_matches_reference(
     means, names = _group_means(X, groups)
     ref_idx = names.index("g0")
 
-    result = Distance(metric=metric).onesided_distances(
-        adata, groupby="group", selected_group="g0"
-    )
+    result = Distance(metric=metric).onesided_distances(adata, groupby="group", selected_group="g0")
 
     assert isinstance(result, pd.Series)
     assert result.loc["g0"] == pytest.approx(0.0, abs=1e-7)
@@ -152,9 +145,7 @@ def test_pseudobulk_groups_parameter_filters(
     pseudobulk_adata: tuple[AnnData, np.ndarray, np.ndarray],
 ) -> None:
     adata, _, _ = pseudobulk_adata
-    result = Distance(metric=metric).pairwise(
-        adata, groupby="group", groups=["g0", "g2"]
-    )
+    result = Distance(metric=metric).pairwise(adata, groupby="group", groups=["g0", "g2"])
     assert list(result.index) == ["g0", "g2"]
     assert list(result.columns) == ["g0", "g2"]
 
@@ -199,9 +190,7 @@ def test_pseudobulk_input_variants(input_kind: str) -> None:
         adata.obsm["X_pca"] = X.copy()
         obsm_key = "X_pca"
     elif input_kind == "obsm_dataframe":
-        adata.obsm["X_pca"] = pd.DataFrame(
-            X, index=adata.obs_names, columns=[f"PC{i}" for i in range(n_features)]
-        )
+        adata.obsm["X_pca"] = pd.DataFrame(X, index=adata.obs_names, columns=[f"PC{i}" for i in range(n_features)])
         obsm_key = "X_pca"
     elif input_kind == "layer_dense":
         adata.layers["counts"] = cp.asarray(X)
@@ -211,9 +200,7 @@ def test_pseudobulk_input_variants(input_kind: str) -> None:
         layer_key = "counts"
 
     result = (
-        Distance(metric="euclidean", layer_key=layer_key, obsm_key=obsm_key)
-        .pairwise(adata, groupby="group")
-        .values
+        Distance(metric="euclidean", layer_key=layer_key, obsm_key=obsm_key).pairwise(adata, groupby="group").values
     )
 
     means, _ = _group_means(X, groups)
@@ -236,20 +223,14 @@ def test_pseudobulk_contrast_distances_matches_reference(metric: str) -> None:
     blocks, obs_rows = [], []
     for ti, t in enumerate(treatments):
         for ci, c in enumerate(celltypes):
-            blocks.append(
-                rng.normal(loc=ti * 0.7 + ci * 0.2, size=(per_cond, n_features))
-            )
+            blocks.append(rng.normal(loc=ti * 0.7 + ci * 0.2, size=(per_cond, n_features)))
             obs_rows.extend({"treatment": t, "celltype": c} for _ in range(per_cond))
     X = np.vstack(blocks).astype(np.float32)
-    obs = pd.DataFrame(obs_rows).astype(
-        {"treatment": "category", "celltype": "category"}
-    )
+    obs = pd.DataFrame(obs_rows).astype({"treatment": "category", "celltype": "category"})
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
 
-    contrasts = Distance.create_contrasts(
-        adata, groupby="treatment", selected_group="ctrl", split_by="celltype"
-    )
+    contrasts = Distance.create_contrasts(adata, groupby="treatment", selected_group="ctrl", split_by="celltype")
     result = Distance(metric=metric).contrast_distances(adata, contrasts=contrasts)
 
     assert metric in result.columns
@@ -343,9 +324,7 @@ def test_pseudobulk_pairwise_cross_check_pertpy(
     cpu_adata = AnnData(X.copy(), obs=adata.obs.copy())
     cpu_adata.obsm["X_pca"] = X.copy()
 
-    expected = pt.tl.Distance(metric, obsm_key="X_pca").pairwise(
-        cpu_adata, groupby="group", show_progressbar=False
-    )
+    expected = pt.tl.Distance(metric, obsm_key="X_pca").pairwise(cpu_adata, groupby="group", show_progressbar=False)
     actual = Distance(metric=metric).pairwise(adata, groupby="group")
     expected = expected.loc[actual.index, actual.columns]
     np.testing.assert_allclose(actual.values, expected.values, rtol=1e-5, atol=1e-5)
@@ -416,9 +395,7 @@ def test_pseudobulk_single_group(metric: str) -> None:
     assert pw.shape == (1, 1)
     assert pw[0, 0] == pytest.approx(0.0, abs=1e-7)
 
-    os = Distance(metric=metric).onesided_distances(
-        adata, groupby="group", selected_group="g0"
-    )
+    os = Distance(metric=metric).onesided_distances(adata, groupby="group", selected_group="g0")
     assert os.loc["g0"] == pytest.approx(0.0, abs=1e-7)
 
 
@@ -428,9 +405,7 @@ def test_pseudobulk_single_group(metric: str) -> None:
 
 # r2_distance is asymmetric in onesided (ss_tot keyed off the row group), so
 # its onesided bootstrap is not the symmetrized pairwise row.
-SYMMETRIC_PSEUDOBULK_METRICS = tuple(
-    m for m in PSEUDOBULK_METRICS if m != "r2_distance"
-)
+SYMMETRIC_PSEUDOBULK_METRICS = tuple(m for m in PSEUDOBULK_METRICS if m != "r2_distance")
 
 
 @pytest.fixture
@@ -438,14 +413,9 @@ def bootstrap_adata() -> tuple[AnnData, np.ndarray, np.ndarray]:
     """Larger, well-separated dataset for stable bootstrap statistics."""
     rng = np.random.default_rng(11)
     n_groups, cells_per_group, n_features = 3, 60, 6
-    blocks = [
-        rng.normal(loc=i * 0.8, size=(cells_per_group, n_features))
-        for i in range(n_groups)
-    ]
+    blocks = [rng.normal(loc=i * 0.8, size=(cells_per_group, n_features)) for i in range(n_groups)]
     X = np.vstack(blocks).astype(np.float32)
-    groups = np.array(
-        [f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)]
-    )
+    groups = np.array([f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)])
     obs = pd.DataFrame({"group": pd.Categorical(groups)})
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
@@ -458,9 +428,7 @@ def test_pseudobulk_pairwise_bootstrap_structure(
     bootstrap_adata: tuple[AnnData, np.ndarray, np.ndarray],
 ) -> None:
     adata, _, _ = bootstrap_adata
-    result = Distance(metric=metric).pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=20, random_state=42
-    )
+    result = Distance(metric=metric).pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=20, random_state=42)
 
     assert isinstance(result, tuple)
     distances, variances = result
@@ -485,20 +453,14 @@ def test_pseudobulk_bootstrap_reproducible(
 ) -> None:
     adata, _, _ = bootstrap_adata
     dist = Distance(metric=metric)
-    m1, v1 = dist.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=7
-    )
-    m2, v2 = dist.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=7
-    )
+    m1, v1 = dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=7)
+    m2, v2 = dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=7)
     # Same seed reproduces results up to GPU float-accumulation noise.
     np.testing.assert_allclose(m1.values, m2.values, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(v1.values, v2.values, rtol=1e-5, atol=1e-6)
 
     # A different seed gives a genuinely different resample.
-    m3, _ = dist.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=8
-    )
+    m3, _ = dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=15, random_state=8)
     assert not np.allclose(m1.values, m3.values)
 
 
@@ -555,9 +517,7 @@ def test_pseudobulk_onesided_bootstrap_matches_pairwise(
     (symmetric metrics): both resample identical group means."""
     adata, _, _ = bootstrap_adata
     dist = Distance(metric=metric)
-    pw_mean, pw_var = dist.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=20, random_state=42
-    )
+    pw_mean, pw_var = dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=20, random_state=42)
     os_mean, os_var = dist.onesided_distances(
         adata,
         groupby="group",
@@ -566,12 +526,8 @@ def test_pseudobulk_onesided_bootstrap_matches_pairwise(
         n_bootstrap=20,
         random_state=42,
     )
-    np.testing.assert_allclose(
-        os_mean.values, pw_mean.loc[:, "g0"].values, rtol=1e-5, atol=1e-6
-    )
-    np.testing.assert_allclose(
-        os_var.values, pw_var.loc[:, "g0"].values, rtol=1e-5, atol=1e-6
-    )
+    np.testing.assert_allclose(os_mean.values, pw_mean.loc[:, "g0"].values, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(os_var.values, pw_var.loc[:, "g0"].values, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("metric", TRUE_PSEUDOBULK_METRICS)
@@ -583,13 +539,9 @@ def test_pseudobulk_bootstrap_mean_close_to_point_estimate(
     adata, _, _ = bootstrap_adata
     dist = Distance(metric=metric)
     point = dist.pairwise(adata, groupby="group")
-    boot_mean, _ = dist.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=100, random_state=0
-    )
+    boot_mean, _ = dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=100, random_state=0)
     off_diag = ~np.eye(3, dtype=bool)
-    np.testing.assert_allclose(
-        boot_mean.values[off_diag], point.values[off_diag], rtol=0.3
-    )
+    np.testing.assert_allclose(boot_mean.values[off_diag], point.values[off_diag], rtol=0.3)
 
 
 @pytest.mark.parametrize("metric", PSEUDOBULK_METRICS)
@@ -619,8 +571,6 @@ def test_pseudobulk_bootstrap_rejects_nonpositive_n_bootstrap(
     with pytest.raises(ValueError, match="n_bootstrap"):
         dist.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=0)
     with pytest.raises(ValueError, match="n_bootstrap"):
-        dist.onesided_distances(
-            adata, groupby="group", selected_group="g0", bootstrap=True, n_bootstrap=0
-        )
+        dist.onesided_distances(adata, groupby="group", selected_group="g0", bootstrap=True, n_bootstrap=0)
     with pytest.raises(ValueError, match="n_bootstrap"):
         dist.bootstrap(X[groups == "g0"], X[groups == "g1"], n_bootstrap=0)

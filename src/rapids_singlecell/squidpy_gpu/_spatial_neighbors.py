@@ -437,9 +437,7 @@ def spatial_neighbors_from_builder(
         groups = np.split(order, np.flatnonzero(np.diff(codes[order])) + 1)
         graphs = [builder.build(coords[cp.asarray(group)]) for group in groups]
         result = builder.combine(graphs, order)
-    result = SpatialNeighborsResult(
-        *(scipy.sparse.csr_matrix(g.get() if hasattr(g, "get") else g) for g in result)
-    )
+    result = SpatialNeighborsResult(*(scipy.sparse.csr_matrix(g.get() if hasattr(g, "get") else g) for g in result))
     if copy:
         return result
     if adata.is_view:

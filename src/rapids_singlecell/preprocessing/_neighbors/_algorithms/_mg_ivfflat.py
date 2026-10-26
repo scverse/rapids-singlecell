@@ -27,8 +27,7 @@ def _mg_ivf_flat_knn(
         from cuvs.neighbors.mg import ivf_flat as mg_ivf_flat
     except ImportError:
         raise ImportError(
-            "The 'mg_ivf_flat' algorithm is only available in cuvs >= 25.10. "
-            "Please update your cuvs installation."
+            "The 'mg_ivf_flat' algorithm is only available in cuvs >= 25.10. Please update your cuvs installation."
         )
     distribution_mode = algorithm_kwds.get("distribution_mode", "replicated")
     assert distribution_mode in ["replicated", "shared"], "Invalid distribution mode"

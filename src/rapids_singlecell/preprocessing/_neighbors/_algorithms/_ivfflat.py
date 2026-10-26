@@ -51,9 +51,7 @@ def _ivf_flat_knn(
 
     # Create SearchParams with nprobes if provided
     search_params = ivf_flat.SearchParams(n_probes=n_probes)
-    distances, neighbors = _batched_search(
-        lambda q: ivf_flat.search(search_params, index, q, k, **search_kwargs), Y
-    )
+    distances, neighbors = _batched_search(lambda q: ivf_flat.search(search_params, index, q, k, **search_kwargs), Y)
 
     if resources is not None:
         resources.sync()

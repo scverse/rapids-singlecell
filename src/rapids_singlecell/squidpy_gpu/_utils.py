@@ -83,9 +83,7 @@ def _p_value_calc(
     n_perms = sims.shape[0]
     large_perm = (sims >= score).sum(axis=0)
     # subtract total perm for negative values
-    large_perm[(n_perms - large_perm) < large_perm] = (
-        n_perms - large_perm[(n_perms - large_perm) < large_perm]
-    )
+    large_perm[(n_perms - large_perm) < large_perm] = n_perms - large_perm[(n_perms - large_perm) < large_perm]
     # get p-value based on permutation
     p_sim: np.ndarray = (large_perm + 1) / (n_perms + 1)
 
@@ -192,11 +190,7 @@ def _create_sparse_df(
     )
 
     if not issparse(data):
-        pred = (
-            (lambda col: ~np.isnan(col))
-            if fill_value is np.nan
-            else (lambda col: ~np.isclose(col, fill_value))
-        )
+        pred = (lambda col: ~np.isnan(col)) if fill_value is np.nan else (lambda col: ~np.isclose(col, fill_value))
         dtype = SparseDtype(data.dtype, fill_value=fill_value)
         n_rows, n_cols = data.shape
         arrays = []
@@ -207,9 +201,7 @@ def _create_sparse_df(
             arr = SparseArray._simple_new(data[mask, i], idx, dtype)
             arrays.append(arr)
 
-        return pd.DataFrame._from_arrays(
-            arrays, columns=columns, index=index, verify_integrity=False
-        )
+        return pd.DataFrame._from_arrays(arrays, columns=columns, index=index, verify_integrity=False)
 
     if TYPE_CHECKING:
         assert isinstance(data, spmatrix)
@@ -238,9 +230,7 @@ def _create_sparse_df(
         arr = SparseArray._simple_new(array_data[sl], idx, dtype)
         arrays.append(arr)
 
-    return pd.DataFrame._from_arrays(
-        arrays, columns=columns, index=index, verify_integrity=False
-    )
+    return pd.DataFrame._from_arrays(arrays, columns=columns, index=index, verify_integrity=False)
 
 
 def _assert_categorical_obs(adata, key):
@@ -248,9 +238,7 @@ def _assert_categorical_obs(adata, key):
         raise KeyError(f"Cluster key `{key}` not found in `adata.obs`.")
 
     if not isinstance(adata.obs[key].dtype, pd.CategoricalDtype):
-        raise TypeError(
-            f"Expected `adata.obs[{key!r}]` to be `categorical`, found `{infer_dtype(adata.obs[key])}`."
-        )
+        raise TypeError(f"Expected `adata.obs[{key!r}]` to be `categorical`, found `{infer_dtype(adata.obs[key])}`.")
 
 
 def _assert_spatial_basis(adata, key: str) -> None:

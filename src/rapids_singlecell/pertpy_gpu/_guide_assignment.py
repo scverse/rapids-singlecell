@@ -271,9 +271,7 @@ def _assignments_to_labels(
 
     if isinstance(assignments, cp.ndarray) and n_guides > _GROUPED_READOUT_MAX_GUIDES:
         num_guides_assigned_gpu = assignments.sum(axis=0)
-        assignable_gpu = (num_guides_assigned_gpu > 0) & (
-            num_guides_assigned_gpu <= max_assignments_per_cell
-        )
+        assignable_gpu = (num_guides_assigned_gpu > 0) & (num_guides_assigned_gpu <= max_assignments_per_cell)
         assignable_count_gpu = cp.count_nonzero(assignable_gpu)
         assignable_count = int(assignable_count_gpu.item())
 
@@ -287,9 +285,7 @@ def _assignments_to_labels(
             num_guides_assigned = cp.asnumpy(num_guides_assigned_gpu)
             labels = np.empty(n_cells, dtype=object)
             labels[num_guides_assigned == 0] = no_grna_assigned_key
-            labels[num_guides_assigned > max_assignments_per_cell] = (
-                multiple_grna_assigned_key
-            )
+            labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
             return labels
 
         assignable_fraction = assignable_count / n_cells
@@ -301,9 +297,7 @@ def _assignments_to_labels(
             num_guides_assigned = cp.asnumpy(num_guides_assigned_gpu)
             labels = np.empty(n_cells, dtype=object)
             labels[num_guides_assigned == 0] = no_grna_assigned_key
-            labels[num_guides_assigned > max_assignments_per_cell] = (
-                multiple_grna_assigned_key
-            )
+            labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
             labels[assignable_idx] = _assignments_to_labels(
                 subset_assignments,
                 guide_names,
@@ -319,22 +313,15 @@ def _assignments_to_labels(
 
     num_guides_assigned = assignments.sum(axis=0)
 
-    assignable = (num_guides_assigned > 0) & (
-        num_guides_assigned <= max_assignments_per_cell
-    )
+    assignable = (num_guides_assigned > 0) & (num_guides_assigned <= max_assignments_per_cell)
     assignable_count = int(assignable.sum())
-    if (
-        guide_names.size <= _PACKED_READOUT_MAX_GUIDES
-        and assignable_count >= _PACKED_READOUT_MIN_ASSIGNABLE_CELLS
-    ):
+    if guide_names.size <= _PACKED_READOUT_MAX_GUIDES and assignable_count >= _PACKED_READOUT_MIN_ASSIGNABLE_CELLS:
         labels = np.empty(n_cells, dtype=object)
         labels[num_guides_assigned == 0] = no_grna_assigned_key
         labels[(num_guides_assigned > 0) & ~assignable] = multiple_grna_assigned_key
 
         packed = np.packbits(assignments[:, assignable].T, axis=1, bitorder="little")
-        padded = np.zeros(
-            (packed.shape[0], np.dtype(np.uint64).itemsize), dtype=np.uint8
-        )
+        padded = np.zeros((packed.shape[0], np.dtype(np.uint64).itemsize), dtype=np.uint8)
         padded[:, : packed.shape[1]] = packed
         codes = padded.view(np.uint64).ravel()
 
@@ -344,9 +331,7 @@ def _assignments_to_labels(
         one = np.uint64(1)
         for i, code in enumerate(unique_codes):
             selected = ((code >> guide_bits) & one).astype(bool)
-            unique_labels[i] = multiple_grna_assignment_string.join(
-                guide_names[selected].tolist()
-            )
+            unique_labels[i] = multiple_grna_assignment_string.join(guide_names[selected].tolist())
 
         labels[assignable] = unique_labels[inverse]
         return labels
@@ -356,9 +341,7 @@ def _assignments_to_labels(
 
     single_assignment = num_guides_assigned == 1
     if single_assignment.any():
-        labels[single_assignment] = guide_names[
-            np.argmax(assignments[:, single_assignment], axis=0)
-        ]
+        labels[single_assignment] = guide_names[np.argmax(assignments[:, single_assignment], axis=0)]
 
     multi_assignment = assignable & (num_guides_assigned > 1)
     if guide_names.size <= _GROUPED_READOUT_MAX_GUIDES:
@@ -370,26 +353,19 @@ def _assignments_to_labels(
             _rows, guide_indices = np.nonzero(assignments[:, cell_indices].T)
             guide_indices = guide_indices.reshape(cell_indices.size, n_assigned)
             labels[cell_indices] = [
-                multiple_grna_assignment_string.join(guide_names[row].tolist())
-                for row in guide_indices
+                multiple_grna_assignment_string.join(guide_names[row].tolist()) for row in guide_indices
             ]
-        labels[num_guides_assigned > max_assignments_per_cell] = (
-            multiple_grna_assigned_key
-        )
+        labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
         return labels
 
     for cell_idx in np.flatnonzero(multi_assignment):
-        labels[cell_idx] = multiple_grna_assignment_string.join(
-            guide_names[assignments[:, cell_idx]].tolist()
-        )
+        labels[cell_idx] = multiple_grna_assignment_string.join(guide_names[assignments[:, cell_idx]].tolist())
 
     labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
     return labels
 
 
-def _validate_fit_args(
-    *, max_iter: int, tol: float, posterior_threshold: float
-) -> None:
+def _validate_fit_args(*, max_iter: int, tol: float, posterior_threshold: float) -> None:
     if max_iter < 1:
         raise ValueError("max_iter must be at least 1.")
     if tol <= 0:
@@ -440,8 +416,7 @@ def _fit_assign_cuda(
 
     if _guide_assignment_cuda is None:
         raise ImportError(
-            "The _guide_assignment_cuda extension is not available. "
-            "Build rapids-singlecell with CUDA extensions."
+            "The _guide_assignment_cuda extension is not available. Build rapids-singlecell with CUDA extensions."
         )
 
     if not (X.flags.c_contiguous or X.flags.f_contiguous):
@@ -481,20 +456,16 @@ def _fit_assign_cuda(
     nonzero_counts_cpu = cp.asnumpy(nonzero_counts)
     max_counts_cpu = cp.asnumpy(max_counts)
 
-    for guide, (nz_count, max_count) in enumerate(
-        zip(nonzero_counts_cpu, max_counts_cpu, strict=True)
-    ):
+    for guide, (nz_count, max_count) in enumerate(zip(nonzero_counts_cpu, max_counts_cpu, strict=True)):
         if 0 < nz_count < 2:
             warnings.warn(
-                f"Skipping guide index {guide} as there are less than 2 cells "
-                "expressing the guide.",
+                f"Skipping guide index {guide} as there are less than 2 cells expressing the guide.",
                 UserWarning,
                 stacklevel=4,
             )
         elif nz_count >= 2 and max_count < 2:
             warnings.warn(
-                f"Skipping guide index {guide} as the maximum UMI count is less "
-                "than 2.",
+                f"Skipping guide index {guide} as the maximum UMI count is less than 2.",
                 UserWarning,
                 stacklevel=4,
             )

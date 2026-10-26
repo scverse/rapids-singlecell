@@ -146,8 +146,12 @@ windows.repair-wheel-command = [
 ]
 
 [tool.ruff]
-line-length = 88
+line-length = 120
 src = [ "src" ]
+extend-include = [ "*.ipynb" ]
+# tutorials live in the rapids-singlecell-tutorials submodule (docs/notebooks are symlinks)
+extend-exclude = [ "docs/notebooks", "notebooks" ]
+format.docstring-code-format = true
 lint.select = [
   "BLE",     # flake8-blind-except
   "C4",      # flake8-comprehensions
@@ -166,24 +170,27 @@ lint.select = [
   "W",       # Warning detected by Pycodestyle
 ]
 lint.ignore = [
-  # line too long -> we accept long comment lines; formatting gets rid of long code lines
-  "E501",
-  # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
-  "E731",
-  # allow I, O, l as variable names -> I is the identity matrix
-  "E741",
-  # Missing docstring in public package
-  "F403",
+  "B008", # Errors from function calls in argument defaults. These are fine when the result is immutable.
+  "D100", # Missing docstring in public module
+  "D104", # Missing docstring in public package
+  "D105", # __magic__ methods are often self-explanatory, allow missing docstrings
+  "D107", # Missing docstring in __init__
+  # Disable one in each pair of mutually incompatible rules
+  "D203", # We don’t want a blank line before a class docstring
+  "D213", # <> We want docstrings to start immediately after the opening triple quote
+  "D400", # first line should end with a period [Bug: doesn’t work with single-line docstrings]
+  "D401", # First line should be in imperative mood; try rephrasing
+  "E501", # line too long -> we accept long comment lines; formatter gets rid of long code lines
+  "E731", # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
+  "E741", # allow I, O, l as variable names -> I is the identity matrix
+  "F403", # allow star imports
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"docs/*" = [ "I" ]
-"tests/*" = [ "D", "FBT" ]
-"*/__init__.py" = [ "F401" ]
-
-[tool.ruff.lint.isort]
-known-first-party = [ "rapids_singlecell" ]
-required-imports = [ "from __future__ import annotations" ]
+lint.per-file-ignores."*/__init__.py" = [ "F401" ]
+lint.per-file-ignores."docs/*" = [ "I" ]
+lint.per-file-ignores."tests/*" = [ "D", "FBT" ]
+lint.isort.known-first-party = [ "rapids_singlecell" ]
+lint.isort.required-imports = [ "from __future__ import annotations" ]
+lint.pydocstyle.convention = "numpy"
 
 [tool.codespell]
 ignore-words-list = "nd,indext,coo,alo,clen,fo,ot,numer"

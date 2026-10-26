@@ -34,9 +34,7 @@ class _Cutoffs:
 
         cutoffs = {"min_disp", "max_disp", "min_mean", "max_mean"}
         defaults = {
-            p.name: p.default
-            for p in signature(highly_variable_genes).parameters.values()
-            if p.name in cutoffs
+            p.name: p.default for p in signature(highly_variable_genes).parameters.values() if p.name in cutoffs
         }
         if {k: v for k, v in locals().items() if k in cutoffs} != defaults:
             msg = "If you pass `n_top_genes`, all cutoffs are ignored."

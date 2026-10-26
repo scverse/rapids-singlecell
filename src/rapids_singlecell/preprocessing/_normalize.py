@@ -94,13 +94,9 @@ def normalize_total(
 
     if exclude_highly_expressed:
         if isinstance(X, DaskArray):
-            raise NotImplementedError(
-                "`exclude_highly_expressed` is not supported for Dask arrays."
-            )
+            raise NotImplementedError("`exclude_highly_expressed` is not supported for Dask arrays.")
         if not 0 < max_fraction < 1:
-            raise ValueError(
-                f"`max_fraction` must be between 0 and 1, got {max_fraction}."
-            )
+            raise ValueError(f"`max_fraction` must be between 0 and 1, got {max_fraction}.")
 
     if isinstance(X, DaskArray):
         X = _normalize_total_dask(X, target_sum)
@@ -131,17 +127,13 @@ def normalize_total(
     return None
 
 
-def _counts_to_scales(
-    counts_per_cell: cp.ndarray, target_sum: float | None = None
-) -> cp.ndarray:
+def _counts_to_scales(counts_per_cell: cp.ndarray, target_sum: float | None = None) -> cp.ndarray:
     """Compute per-cell scale factors. Uses median of nonzero counts if target_sum is None."""
     nonzero = counts_per_cell > 0
     if target_sum is None:
         target_sum = cp.median(counts_per_cell[nonzero])
     scales = cp.zeros_like(counts_per_cell)
-    scales[nonzero] = (
-        cp.array(target_sum, dtype=counts_per_cell.dtype) / counts_per_cell[nonzero]
-    )
+    scales[nonzero] = cp.array(target_sum, dtype=counts_per_cell.dtype) / counts_per_cell[nonzero]
     return scales
 
 
@@ -407,9 +399,7 @@ def log1p(
     """
     if not isinstance(data, AnnData):
         if layer is not None or obsm is not None:
-            raise ValueError(
-                "`layer` and `obsm` can only be used with an AnnData object."
-            )
+            raise ValueError("`layer` and `obsm` can only be used with an AnnData object.")
         X = data
         _check_gpu_X(X, allow_dask=True)
         return _calc_log1p(X, base=base)
@@ -491,9 +481,7 @@ def sqrt(
     """
     if not isinstance(data, AnnData):
         if layer is not None or obsm is not None:
-            raise ValueError(
-                "`layer` and `obsm` can only be used with an AnnData object."
-            )
+            raise ValueError("`layer` and `obsm` can only be used with an AnnData object.")
         X = data
         _check_gpu_X(X, allow_dask=True)
         return _calc_sqrt(X)
@@ -633,9 +621,7 @@ def normalize_pearson_residuals(
                 stream=stream,
             )
         else:
-            raise ValueError(
-                "Please transform you sparse matrix into CSR or CSC format."
-            )
+            raise ValueError("Please transform you sparse matrix into CSR or CSC format.")
     else:
         residuals = cp.zeros(X.shape, dtype=X.dtype)
         sums_cells = X.sum(axis=1).astype(X.dtype)

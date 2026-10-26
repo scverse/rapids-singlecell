@@ -10,9 +10,7 @@ from rapids_singlecell._cuda import _pv_cuda as _pv
 def _rev_cummin64(x, n_rows, m):
     y = cp.empty_like(x)
 
-    _pv.rev_cummin64(
-        x, out=y, n_rows=n_rows, m=m, stream=cp.cuda.get_current_stream().ptr
-    )
+    _pv.rev_cummin64(x, out=y, n_rows=n_rows, m=m, stream=cp.cuda.get_current_stream().ptr)
     return y
 
 

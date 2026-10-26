@@ -38,9 +38,7 @@ def _reference_zscore(adata, key, n_perms, seed):
     k = len(adata.obs[key].cat.categories)
 
     def count(labels):
-        return np.bincount(labels[g.row] * k + labels[g.col], minlength=k * k).reshape(
-            k, k
-        )
+        return np.bincount(labels[g.row] * k + labels[g.col], minlength=k * k).reshape(k, k)
 
     rng = np.random.default_rng(seed)
     perms = np.stack([count(rng.permutation(codes)) for _ in range(n_perms)])
@@ -54,29 +52,20 @@ def test_interaction_matrix(adata, weights, normalized):
     g.data = np.random.default_rng(0).random(g.nnz)
     adata.obsp["spatial_connectivities"] = g
 
-    out = rsc.gr.interaction_matrix(
-        adata, "leiden", weights=weights, normalized=normalized, copy=True
-    )
+    out = rsc.gr.interaction_matrix(adata, "leiden", weights=weights, normalized=normalized, copy=True)
     expected = _reference_counts(adata, "leiden", weights=weights)
     if normalized:
         expected = expected / expected.sum(axis=1, keepdims=True)
     assert out.dtype == np.float64
     np.testing.assert_allclose(out, expected)
 
-    assert (
-        rsc.gr.interaction_matrix(
-            adata, "leiden", weights=weights, normalized=normalized
-        )
-        is None
-    )
+    assert rsc.gr.interaction_matrix(adata, "leiden", weights=weights, normalized=normalized) is None
     np.testing.assert_allclose(adata.uns["leiden_interactions"], out)
 
 
 @pytest.mark.parametrize("dtype", [bool, np.int32])
 def test_interaction_matrix_integer_graph(adata, dtype):
-    adata.obsp["spatial_connectivities"] = adata.obsp["spatial_connectivities"].astype(
-        dtype
-    )
+    adata.obsp["spatial_connectivities"] = adata.obsp["spatial_connectivities"].astype(dtype)
     out = rsc.gr.interaction_matrix(adata, "leiden", copy=True)
     assert np.issubdtype(out.dtype, np.integer)
     np.testing.assert_array_equal(out, _reference_counts(adata, "leiden"))
@@ -89,9 +78,7 @@ def test_missing_labels_are_dropped(adata):
     adata.obs["leiden"] = pd.Categorical(labels)
     expected = _reference_counts(adata, "leiden")
 
-    np.testing.assert_array_equal(
-        rsc.gr.interaction_matrix(adata, "leiden", copy=True), expected
-    )
+    np.testing.assert_array_equal(rsc.gr.interaction_matrix(adata, "leiden", copy=True), expected)
     res = rsc.gr.nhood_enrichment(adata, "leiden", n_perms=50, seed=0, copy=True)
     np.testing.assert_array_equal(res.counts, expected)
 
@@ -109,9 +96,7 @@ def test_nhood_enrichment(adata):
     finite = np.isfinite(expected)
     assert np.isfinite(res["zscore"][finite]).all()
     # Independent permutations: only Monte Carlo error separates the two.
-    np.testing.assert_allclose(
-        res["zscore"][finite], expected[finite], rtol=0.1, atol=0.25
-    )
+    np.testing.assert_allclose(res["zscore"][finite], expected[finite], rtol=0.1, atol=0.25)
 
 
 def test_nhood_enrichment_seed(adata):
@@ -127,16 +112,12 @@ def test_nhood_enrichment_seed(adata):
 def test_nhood_enrichment_library_key(adata):
     """Labels only move within a library: one cluster per library never changes."""
     adata.obs["lib"] = adata.obs["leiden"].copy()
-    res = rsc.gr.nhood_enrichment(
-        adata, "leiden", library_key="lib", n_perms=20, seed=0, copy=True
-    )
+    res = rsc.gr.nhood_enrichment(adata, "leiden", library_key="lib", n_perms=20, seed=0, copy=True)
     # Every permutation reproduces the observed counts, so the std is zero.
     assert np.isnan(res.zscore).all()
 
     adata.obs["lib"] = pd.Categorical(np.arange(adata.n_obs) % 3)
-    res = rsc.gr.nhood_enrichment(
-        adata, "leiden", library_key="lib", n_perms=100, seed=0, copy=True
-    )
+    res = rsc.gr.nhood_enrichment(adata, "leiden", library_key="lib", n_perms=100, seed=0, copy=True)
     assert np.isfinite(res.zscore).any()
 
 
@@ -181,12 +162,8 @@ def test_permuted_counts_kernel(k):
     )
     for b in range(batch):
         for g in range(3):
-            cp.testing.assert_array_equal(
-                cp.sort(buf[b][lib == g]), cp.sort(labels[lib == g])
-            )
-        expected = cp.bincount(
-            buf[b, rows] * k + buf[b, cols], minlength=k * k
-        ).reshape(k, k)
+            cp.testing.assert_array_equal(cp.sort(buf[b][lib == g]), cp.sort(labels[lib == g]))
+        expected = cp.bincount(buf[b, rows] * k + buf[b, cols], minlength=k * k).reshape(k, k)
         cp.testing.assert_array_equal(out[b], expected)
     assert not (buf[0] == buf[1]).all()
 
@@ -198,9 +175,7 @@ def test_small_groups_are_shuffled_uniformly(m):
 
     n_perms = 60_000
     labels = cp.arange(m, dtype=cp.int32)
-    seeds = cp.asarray(
-        np.random.default_rng(m).integers(0, 2**64, n_perms, dtype=np.uint64)
-    )
+    seeds = cp.asarray(np.random.default_rng(m).integers(0, 2**64, n_perms, dtype=np.uint64))
     buf = cp.empty((n_perms, m), dtype=cp.int32)
     out = cp.zeros((n_perms, m, m), dtype=cp.uint64)
     edge = cp.zeros(1, dtype=cp.int32)
@@ -216,8 +191,6 @@ def test_small_groups_are_shuffled_uniformly(m):
         batch=4096,
         labels_out=buf,
     )
-    _, counts = np.unique(
-        (buf * m ** cp.arange(m)).sum(axis=1).get(), return_counts=True
-    )
+    _, counts = np.unique((buf * m ** cp.arange(m)).sum(axis=1).get(), return_counts=True)
     assert counts.size == np.prod(np.arange(1, m + 1))
     assert chisquare(counts).pvalue > 1e-4

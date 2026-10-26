@@ -55,9 +55,7 @@ def _squared_distances(X, centers, *, squared_norms):
 def _assign_labels(X, centers, *, squared_norms, labels, minimum):
     for begin in range(0, X.shape[0], _ASSIGNMENT_BATCH_ROWS):
         end = min(begin + _ASSIGNMENT_BATCH_ROWS, X.shape[0])
-        distances = _squared_distances(
-            X[begin:end], centers, squared_norms=squared_norms[begin:end]
-        )
+        distances = _squared_distances(X[begin:end], centers, squared_norms=squared_norms[begin:end])
         batch_labels = cp.argmin(distances, axis=1).astype(cp.int32)
         labels[begin:end] = batch_labels
         minimum[begin:end] = distances[cp.arange(end - begin), batch_labels]
@@ -77,13 +75,9 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
     uniforms = cp.asarray(deepcopy(rng).random(n_clusters - 1))
     n_draws = cp.zeros(1, dtype=cp.int32)
     weight_tile_rows = _clustering_cuda.KMEANS_WEIGHT_TILE_ROWS
-    totals = cp.empty(
-        (n_rows + weight_tile_rows - 1) // weight_tile_rows, dtype=cp.float64
-    )
+    totals = cp.empty((n_rows + weight_tile_rows - 1) // weight_tile_rows, dtype=cp.float64)
     for cluster in range(n_clusters):
-        candidate = _squared_distances(
-            X, centers[cluster : cluster + 1], squared_norms=squared_norms
-        ).ravel()
+        candidate = _squared_distances(X, centers[cluster : cluster + 1], squared_norms=squared_norms).ravel()
         cp.minimum(closest, candidate, out=closest)
         if cluster + 1 < n_clusters:
             _clustering_cuda.select_kmeans_center(
@@ -114,9 +108,7 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
     )
     has_empty = True
     for _ in range(max_iter):
-        _assign_labels(
-            X, centers, squared_norms=squared_norms, labels=labels, minimum=minimum
-        )
+        _assign_labels(X, centers, squared_norms=squared_norms, labels=labels, minimum=minimum)
         if not has_empty and bool(cp.array_equal(labels, previous)):
             break
         previous[:] = labels

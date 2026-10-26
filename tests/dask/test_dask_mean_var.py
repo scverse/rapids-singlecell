@@ -58,9 +58,5 @@ def test_sparse_nanmean(client, array_type, percent_nan):
     else:
         S = as_sparse_cupy_dask_array(S).persist()
 
-    cp.testing.assert_allclose(
-        _nan_mean(A, 1).ravel(), (_nan_mean(S, 1)).ravel().compute()
-    )
-    cp.testing.assert_allclose(
-        _nan_mean(A, 0).ravel(), (_nan_mean(S, 0)).ravel().compute()
-    )
+    cp.testing.assert_allclose(_nan_mean(A, 1).ravel(), (_nan_mean(S, 1)).ravel().compute())
+    cp.testing.assert_allclose(_nan_mean(A, 0).ravel(), (_nan_mean(S, 0)).ravel().compute())

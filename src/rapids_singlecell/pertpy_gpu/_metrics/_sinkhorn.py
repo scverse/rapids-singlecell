@@ -92,9 +92,7 @@ def _step(st, *, will_check, tol, omega=DEFAULT_RELAXATION):
     _sk.update_g(cost, co, n, m, f, fo, g, go, c2p, eps, st["log_b"], conv, omega, sp)
     _sk.update_f(cost, co, m, g, go, f, fo, r2p, eps, st["log_a"], conv, omega, sp)
     if will_check:
-        _sk.check_convergence(
-            f, st["f_prev"], fo, n, g, st["g_prev"], go, m, float(tol), conv, sp
-        )
+        _sk.check_convergence(f, st["f_prev"], fo, n, g, st["g_prev"], go, m, float(tol), conv, sp)
 
 
 def _segment_sum(values: cp.ndarray, starts: cp.ndarray, total: int) -> cp.ndarray:
@@ -103,9 +101,7 @@ def _segment_sum(values: cp.ndarray, starts: cp.ndarray, total: int) -> cp.ndarr
     Deterministic (unlike atomic scatter-add, which would make the bootstrap
     variance vary run to run) and float64-accumulated for float32 potentials.
     """
-    pref = cp.concatenate(
-        [cp.zeros(1, dtype=cp.float64), cp.cumsum(values.astype(cp.float64))]
-    )
+    pref = cp.concatenate([cp.zeros(1, dtype=cp.float64), cp.cumsum(values.astype(cp.float64))])
     ends = cp.concatenate([starts[1:], cp.asarray([total], dtype=starts.dtype)])
     return pref[ends] - pref[starts]
 

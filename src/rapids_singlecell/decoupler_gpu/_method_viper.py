@@ -24,9 +24,7 @@ def _buffer(cache, name, shape, dtype=cp.float64):
 
 def _unsigned_quantiles(quantiles):
     magnitude = cp.empty_like(quantiles)
-    _vp.unsigned_quantiles(
-        quantiles, magnitude, stream=cp.cuda.get_current_stream().ptr
-    )
+    _vp.unsigned_quantiles(quantiles, magnitude, stream=cp.cuda.get_current_stream().ptr)
     return magnitude
 
 
@@ -157,9 +155,9 @@ def _pleiotropy(
     keep = ~cp.isnan(reverse)
     difference = cp.log10(reverse[keep]) - cp.log10(pvals[task[keep], right[keep]])
     rows, left, right = rows[keep], left[keep], right[keep]
-    counts = cp.bincount(
-        cp.concatenate((rows * nsrc + left, rows * nsrc + right)), minlength=nes.size
-    ).reshape(nes.shape)
+    counts = cp.bincount(cp.concatenate((rows * nsrc + left, rows * nsrc + right)), minlength=nes.size).reshape(
+        nes.shape
+    )
     first = difference > 0
     losers = cp.where(first, left, right)
     winners = cp.where(first, right, left)
@@ -197,9 +195,7 @@ def _correct(
     nobs, nvar = signed.shape
     cache = {} if cache is None else cache
     nsrc = adj.shape[1]
-    sources, targets, starts, weights = (
-        _sparse_network(adj) if sparse_net is None else sparse_net
-    )
+    sources, targets, starts, weights = _sparse_network(adj) if sparse_net is None else sparse_net
     nedge = sources.size
     if "penalty" not in cache:
         index = cp.full((nsrc, nvar), -1, dtype=cp.int32)
@@ -302,15 +298,11 @@ def _func_viper(
         rsc.dcg.viper(adata, net, tmin=3)
     """
     assert isinstance(pleiotropy, bool), "pleiotropy must be bool"
-    assert (
-        isinstance(reg_sign, int | float) and np.isfinite(reg_sign) and 0 < reg_sign < 1
-    ), "reg_sign must be numeric and between 0 and 1"
-    assert isinstance(n_targets, int) and n_targets >= 0, (
-        "n_targets must be an integer and >= 0"
+    assert isinstance(reg_sign, int | float) and np.isfinite(reg_sign) and 0 < reg_sign < 1, (
+        "reg_sign must be numeric and between 0 and 1"
     )
-    assert isinstance(penalty, int | float) and np.isfinite(penalty) and penalty > 0, (
-        "penalty must be numeric and > 0"
-    )
+    assert isinstance(n_targets, int) and n_targets >= 0, "n_targets must be an integer and >= 0"
+    assert isinstance(penalty, int | float) and np.isfinite(penalty) and penalty > 0, "penalty must be numeric and > 0"
     mat, adj = cp.ascontiguousarray(mat), cp.ascontiguousarray(adj)
     if bool(cp.any(~cp.isfinite(adj))) or bool(cp.any(cp.all(adj == 0, axis=0))):
         raise ValueError("Each source must have finite weights and a nonzero target")
@@ -340,9 +332,7 @@ def _func_viper(
     )
     nes = (cp.abs(sum1) + cp.maximum(sum2, 0)) * cp.sign(sum1) * cp.sqrt(counts)
     if pleiotropy:
-        _log(
-            "viper - refining scores based on pleiotropy", level="info", verbose=verbose
-        )
+        _log("viper - refining scores based on pleiotropy", level="info", verbose=verbose)
         threshold = float(ndtri(cp.asarray(1 - reg_sign / 2)))
         active = int(cp.max(cp.count_nonzero(cp.abs(nes) > threshold, axis=1)))
         # Bound overlap and likelihood scratch without changing the initial

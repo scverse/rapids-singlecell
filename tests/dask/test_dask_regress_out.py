@@ -19,9 +19,7 @@ def _make_adata(n_obs=1000, n_genes=100, density=0.6, dtype="float32"):
     from anndata import AnnData
 
     rng = np.random.default_rng(42)
-    X = sp_random(
-        n_obs, n_genes, density=density, format="csr", random_state=rng
-    ).astype(dtype)
+    X = sp_random(n_obs, n_genes, density=density, format="csr", random_state=rng).astype(dtype)
     adata = AnnData(X)
     adata.obs["percent_mito"] = rng.random(n_obs).astype(dtype)
     adata.obs["n_counts"] = np.array(X.sum(axis=1)).ravel()
@@ -126,9 +124,7 @@ def test_regress_out_inplace_false_dask(client, data_kind):
     else:
         dask_data.X = as_dense_cupy_dask_array(dask_data.X)
 
-    result = rsc.pp.regress_out(
-        dask_data, keys=["n_counts", "percent_mito"], inplace=False
-    )
+    result = rsc.pp.regress_out(dask_data, keys=["n_counts", "percent_mito"], inplace=False)
     assert result is not None
     # Result should be a DaskArray
     from dask.array import Array as DaskArray

@@ -36,11 +36,7 @@ _H2D_CHUNK = 1 << 28  # indices per host-to-device copy
 
 def _device_coo(graph) -> sparse.coo_matrix:
     """Canonical device COO, expanded on the GPU for a host CSR."""
-    if not (
-        sc_sparse.issparse(graph)
-        and graph.format == "csr"
-        and graph.has_canonical_format
-    ):
+    if not (sc_sparse.issparse(graph) and graph.format == "csr" and graph.has_canonical_format):
         return sparse.coo_matrix(graph)
     row = cp.zeros(graph.nnz, dtype=cp.int32)
     starts = cp.asarray(graph.indptr[1:-1])
@@ -48,9 +44,7 @@ def _device_coo(graph) -> sparse.coo_matrix:
     cp.cumsum(row, out=row)
     col = cp.empty(graph.nnz, dtype=cp.int32)
     for start in range(0, graph.nnz, _H2D_CHUNK):
-        col[start : start + _H2D_CHUNK] = cp.asarray(
-            graph.indices[start : start + _H2D_CHUNK]
-        )
+        col[start : start + _H2D_CHUNK] = cp.asarray(graph.indices[start : start + _H2D_CHUNK])
     data = cp.asarray(graph.data, dtype=cp.float32)
     coo = sparse.coo_matrix((data, (row, col)), shape=graph.shape)
     coo.has_canonical_format = True
@@ -174,9 +168,7 @@ def umap(
         neighbors_key = "neighbors"
 
     if neighbors_key not in adata.uns:
-        raise ValueError(
-            f'Did not find .uns["{neighbors_key}"]. Run `sc.pp.neighbors` first.'
-        )
+        raise ValueError(f'Did not find .uns["{neighbors_key}"]. Run `sc.pp.neighbors` first.')
 
     neighbors = NeighborsView(adata, neighbors_key)
     if a is None or b is None:
@@ -207,10 +199,7 @@ def umap(
     if hasattr(init_coords, "dtype"):
         init_coords = _validate_init_pos(init_coords)
         if init_coords.shape[1] != n_components:
-            raise ValueError(
-                f"Expected {n_components} columns but got "
-                f"{init_coords.shape[1]} columns."
-            )
+            raise ValueError(f"Expected {n_components} columns but got {init_coords.shape[1]} columns.")
 
     logger_level = _get_logger_level(logger)
     X_umap = simplicial_set_embedding(

@@ -97,9 +97,7 @@ def test_pleiotropy_without_significant_pairs(pleiotropy_data):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_pleiotropy_chunks_and_call_state_are_independent(
-    pleiotropy_data, monkeypatch, dtype
-):
+def test_pleiotropy_chunks_and_call_state_are_independent(pleiotropy_data, monkeypatch, dtype):
     mat, adj = (array.astype(dtype) for array in pleiotropy_data)
     mat = np.vstack([mat, mat[::-1], mat[:1]])
     changed = adj.copy()
@@ -110,10 +108,7 @@ def test_pleiotropy_chunks_and_call_state_are_independent(
     # Keep the CPU parity fixture away from an exactly cancelling overlap.
     changed[8, 0] *= 1.001
     cases = [(adj, 10), (changed, 10), (changed, 16), (adj, 10)]
-    reference = [
-        dc_cpu.mt._viper._func_viper(mat, network, n_targets=n_targets)
-        for network, n_targets in cases
-    ]
+    reference = [dc_cpu.mt._viper._func_viper(mat, network, n_targets=n_targets) for network, n_targets in cases]
     assert np.max(np.abs(reference[0][0] - reference[1][0])) > 0.1
     assert np.max(np.abs(reference[1][0] - reference[2][0])) > 0.1
     gpu_mat, gpu_adj = cp.asarray(mat), cp.asarray(adj)
@@ -198,9 +193,7 @@ def test_symmetric_overlap_uses_zero_signed_contribution():
         sparse_net=dc._method_viper._sparse_network(gpu_adj),
         cache={},
     )
-    np.testing.assert_allclose(
-        overlap_p.get(), [[np.nan, p_left], [p_right, np.nan]], rtol=1e-12
-    )
+    np.testing.assert_allclose(overlap_p.get(), [[np.nan, p_left], [p_right, np.nan]], rtol=1e-12)
     # Source 0 loses the overlap; the remaining signed rescore is unambiguous.
     assert p_left < p_right
     likelihood = (adj != 0).astype(float)
@@ -393,9 +386,7 @@ def test_viper_uses_current_nonblocking_stream(pleiotropy_data, dtype):
     np.testing.assert_allclose(pval, expected_p, rtol=2e-6, atol=2e-7)
 
 
-@pytest.mark.parametrize(
-    "kind", ["dataframe", "sparse", "cupy_sparse", "backed", "dask"]
-)
+@pytest.mark.parametrize("kind", ["dataframe", "sparse", "cupy_sparse", "backed", "dask"])
 def test_public_routing_batching_and_adjustment(pleiotropy_data, kind, tmp_path):
     mat, adj = pleiotropy_data
     frame, net = _frame_and_net(mat, adj)
@@ -452,9 +443,7 @@ def test_tied_extrema_match_upstream_with_same_sparse_batches(bsize):
     dc_cpu.mt.viper(cpu, net, tmin=0, empty=False, bsize=bsize, pleiotropy=False)
     dc.viper(gpu, net, tmin=0, empty=False, bsize=bsize, pleiotropy=False)
     for key in ["score_viper", "padj_viper"]:
-        pd.testing.assert_frame_equal(
-            gpu.obsm[key], cpu.obsm[key], check_dtype=False, rtol=2e-6, atol=2e-7
-        )
+        pd.testing.assert_frame_equal(gpu.obsm[key], cpu.obsm[key], check_dtype=False, rtol=2e-6, atol=2e-7)
 
 
 def test_metadata():

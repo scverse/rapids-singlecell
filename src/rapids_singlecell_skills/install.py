@@ -23,32 +23,18 @@ def _claude_science_parent() -> Path:
         active_org = json.loads(active_org_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(
-            "cannot resolve the Claude Science active organization from "
-            f"{active_org_path}; provide --dest"
+            f"cannot resolve the Claude Science active organization from {active_org_path}; provide --dest"
         ) from error
 
     org_uuid = active_org.get("org_uuid") if isinstance(active_org, dict) else None
-    if (
-        not isinstance(org_uuid, str)
-        or not org_uuid
-        or Path(org_uuid).name != org_uuid
-        or org_uuid in {".", ".."}
-    ):
-        raise ValueError(
-            f"invalid Claude Science org_uuid in {active_org_path}; provide --dest"
-        )
+    if not isinstance(org_uuid, str) or not org_uuid or Path(org_uuid).name != org_uuid or org_uuid in {".", ".."}:
+        raise ValueError(f"invalid Claude Science org_uuid in {active_org_path}; provide --dest")
     return root / "orgs" / org_uuid / "skills"
 
 
 def skill_source() -> Path:
     """Return the package-owned skill directory."""
-    source = Path(
-        str(
-            resources.files("rapids_singlecell_skills")
-            .joinpath("data")
-            .joinpath(SKILL_NAME)
-        )
-    )
+    source = Path(str(resources.files("rapids_singlecell_skills").joinpath("data").joinpath(SKILL_NAME)))
     if not (source / "SKILL.md").is_file():
         raise RuntimeError(f"packaged skill is missing: {source}")
     return source
@@ -60,9 +46,7 @@ def _default_parent(agent: str) -> Path:
     try:
         variable, fallback = _DEFAULT_ROOTS[agent]
     except KeyError as error:
-        raise ValueError(
-            f"agent {agent!r} has no default skill directory; provide --dest"
-        ) from error
+        raise ValueError(f"agent {agent!r} has no default skill directory; provide --dest") from error
     root = os.environ.get(variable, fallback) if variable is not None else fallback
     return Path(root).expanduser() / "skills"
 
@@ -113,9 +97,7 @@ def _looks_like_existing_skill(target: Path) -> bool:
     return skill_file.is_file() and all(path.is_file() for path in anchors)
 
 
-def check_skill(
-    agent: str = "codex", *, destination: Path | None = None
-) -> tuple[bool, str]:
+def check_skill(agent: str = "codex", *, destination: Path | None = None) -> tuple[bool, str]:
     """Check whether an agent copy exactly matches the package-owned skill."""
     source = skill_source()
     target = _target(agent, destination)
@@ -154,8 +136,7 @@ def install_skill(
                 shutil.rmtree(target)
             else:
                 raise RuntimeError(
-                    "refusing --force for a directory that is not recognizably "
-                    f"the {SKILL_NAME} skill: {target}"
+                    f"refusing --force for a directory that is not recognizably the {SKILL_NAME} skill: {target}"
                 )
         else:
             raise RuntimeError(f"refusing --force for non-directory target: {target}")

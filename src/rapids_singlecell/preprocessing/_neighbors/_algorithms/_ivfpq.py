@@ -51,9 +51,7 @@ def _ivf_pq_knn(
     index = ivf_pq.build(index_params, X, **build_kwargs)
     # Create SearchParams with nprobes if provided
     search_params = ivf_pq.SearchParams(n_probes=n_probes)
-    distances, neighbors = _batched_search(
-        lambda q: ivf_pq.search(search_params, index, q, k, **search_kwargs), Y
-    )
+    distances, neighbors = _batched_search(lambda q: ivf_pq.search(search_params, index, q, k, **search_kwargs), Y)
     if resources is not None:
         resources.sync()
 
