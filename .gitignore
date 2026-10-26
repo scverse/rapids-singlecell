@@ -56,3 +56,13 @@ AGENTS.md
 # tmp_scripts
 tmp_scripts/
 /benchmarks/
+
+# From the scverse cookiecutter template
+*~
+buck-out/
+/.idea/
+.venv/
+uv.lock
+.*cache/
+/node_modules/
+/.coverage*
