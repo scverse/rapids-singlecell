@@ -111,8 +111,7 @@ linkcheck_ignore = [
 # -- Options for HTML output -------------------------------------------------
 
 html_theme_options = {
-    "accent": "#8E93F0",  # violet
-    "secondary_accent": "#F59A3A",  # orange
+    "secondary_accent": True,  # second brand colour from the scverse website
     "navigation_with_keys": False,
     "show_toc_level": 2,
 }
