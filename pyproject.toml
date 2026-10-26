@@ -54,7 +54,6 @@ rapids-cu12 = [
 docs = [
     "sphinx>=8.1",
     "nbsphinx>=0.8.12",
-    "sphinx-tabs",
     "sphinxcontrib.bibtex",
     "scverse-doc[full]>=0.3",
     "sphinx-autodoc-typehints",

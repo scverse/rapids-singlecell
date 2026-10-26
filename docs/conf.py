@@ -36,7 +36,6 @@ release = info["Version"]
 
 templates_path = ["_templates"]
 bibtex_bibfiles = ["references.bib"]
-needs_sphinx = "8.1"
 suppress_warnings = [
     "ref.citation",
     "myst.header",  # https://github.com/executablebooks/MyST-Parser/issues/262
@@ -56,7 +55,6 @@ extensions = [
     "nbsphinx",
     "scverse_misc.sphinx_ext",
     "sphinx.ext.linkcode",
-    "sphinx_tabs.tabs",
     "sphinxcontrib.bibtex",
 ]
 
@@ -113,8 +111,8 @@ linkcheck_ignore = [
 # -- Options for HTML output -------------------------------------------------
 
 html_theme_options = {
-    "accent": "#007c91",  # teal blue
-    "secondary_accent": "#76b900",  # NVIDIA green
+    "accent": "#8E93F0",  # violet
+    "secondary_accent": "#F59A3A",  # orange
     "navigation_with_keys": False,
     "show_toc_level": 2,
 }
