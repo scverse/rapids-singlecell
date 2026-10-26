@@ -113,7 +113,8 @@ linkcheck_ignore = [
 # -- Options for HTML output -------------------------------------------------
 
 html_theme_options = {
-    "accent": "#7400ff",
+    "accent": "#007c91",  # teal blue
+    "secondary_accent": "#76b900",  # NVIDIA green
     "navigation_with_keys": False,
     "show_toc_level": 2,
 }
