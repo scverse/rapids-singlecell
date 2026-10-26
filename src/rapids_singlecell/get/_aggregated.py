@@ -58,8 +58,7 @@ def _planes_for_funcs(funcs):
 
 
 class Aggregate:
-    """\
-    Functionality for generic grouping and aggregating.
+    """Functionality for generic grouping and aggregating.
 
     There is currently support for count_nonzero, sum, mean, and variance.
 
@@ -148,8 +147,10 @@ class Aggregate:
             return self.count_mean_var_dense(funcs, dof=dof)
 
     def count_mean_var_host(self, funcs=None, *, dof: int = 1):
-        """Aggregate in-memory host input (numpy / scipy sparse) by streaming
-        row/column blocks to the GPU without materializing the full matrix."""
+        """Aggregate in-memory host input (numpy / scipy sparse) on the GPU.
+
+        Streams row/column blocks to the GPU without materializing the full matrix.
+        """
         from rapids_singlecell._cuda import _rank_stream_cuda as _rss
 
         assert dof >= 0
@@ -196,8 +197,8 @@ class Aggregate:
         return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
     def count_mean_var_dask(self, funcs=None, *, dof: int = 1, split_every: int = 2):
-        """
-        This function is used to calculate the sum, mean, and variance of the data matrix.
+        """Calculate the sum, mean, and variance of the data matrix.
+
         It automatically detects sparse vs dense matrices and uses the appropriate
         CUDA kernel for aggregation. Only the accumulator planes the requested
         ``funcs`` need are allocated and reduced across blocks.
@@ -296,12 +297,11 @@ class Aggregate:
         return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
     def count_mean_var_sparse(self, funcs=None, *, dof: int = 1):
-        """
-        This function is used to calculate the sum, mean, and variance of the sparse data matrix.
+        """Calculate the sum, mean, and variance of the sparse data matrix.
+
         It uses a custom cuda-kernel to perform the aggregation. Only the
         accumulator planes the requested ``funcs`` need are allocated.
         """
-
         assert dof >= 0
         funcs = _ALL_FUNCS if funcs is None else set(funcs)
         need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
@@ -329,11 +329,10 @@ class Aggregate:
         return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
     def count_mean_var_sparse_sparse(self, funcs, dof: int = 1):
-        """
-        This function is used to calculate the sum, mean, and variance of the sparse data matrix.
+        """Calculate the sum, mean, and variance of the sparse data matrix.
+
         It uses a custom cuda-kernel to perform the aggregation.
         """
-
         assert dof >= 0
         undefined_mean = "mean" in funcs and bool(cp.any(self.n_cells == 0))
         undefined_var = "var" in funcs and bool(cp.any(self.n_cells <= dof))
@@ -457,12 +456,11 @@ class Aggregate:
         return results
 
     def count_mean_var_dense(self, funcs=None, *, dof: int = 1):
-        """
-        This function is used to calculate the sum, mean, and variance of the dense data matrix.
+        """Calculate the sum, mean, and variance of the dense data matrix.
+
         It uses a custom cuda-kernel to perform the aggregation. Only the
         accumulator planes the requested ``funcs`` need are allocated.
         """
-
         assert dof >= 0
         funcs = _ALL_FUNCS if funcs is None else set(funcs)
         need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
@@ -539,8 +537,7 @@ def aggregate(
     return_sparse: bool = False,
     **kwargs,
 ) -> AnnData:
-    """\
-    Aggregate data matrix based on some categorical grouping.
+    """Aggregate data matrix based on some categorical grouping.
 
     This function is useful for pseudobulking as well as plotting.
 
@@ -590,7 +587,6 @@ def aggregate(
 
     Examples
     --------
-
     Calculating mean expression and number of nonzero entries per cluster:
 
     >>> import scanpy as sc, pandas as pd

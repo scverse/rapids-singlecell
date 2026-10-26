@@ -534,7 +534,10 @@ def test_binned_bin_exact_matches_scipy(reference):
             n_genes=n_genes,
         )
         r = a.uns["rank_genes_groups"]
-        return {grp: dict(zip(r["names"][grp], np.asarray(r["pvals"][grp], float))) for grp in r["names"].dtype.names}
+        return {
+            grp: dict(zip(r["names"][grp], np.asarray(r["pvals"][grp], float), strict=False))
+            for grp in r["names"].dtype.names
+        }
 
     # correctness vs scipy (tie_correct=True; both continuity settings)
     for use_continuity in (False, True):

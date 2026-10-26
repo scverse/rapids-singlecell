@@ -194,7 +194,6 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
     c : ndarray
         Array of feature names.
     """
-
     if isinstance(data, list):
         m, r, c = data
         m = np.array(m, dtype=float)

@@ -103,8 +103,7 @@ def _build_csr_source(embedding_raw, selector) -> _CSRData:
 
 
 def _materialize_source(embedding_raw, selector):
-    """Materialize the subset as a C-contiguous CuPy array (dense input) or a
-    :class:`_CSRData` bundle (sparse input).
+    """Materialize the subset as a C-contiguous CuPy array (dense input) or a :class:`_CSRData` bundle (sparse input).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``.
     """
@@ -318,7 +317,7 @@ class EDistanceMetric(BaseMetric):
             # e[s,b] = 2*d[s,b] - d[s,s] - d[b,b]
             ed_cols = {}
             var_cols = {}
-            for i, (sg, si) in enumerate(zip(selected_groups, selected_indices)):
+            for i, (sg, si) in enumerate(zip(selected_groups, selected_indices, strict=False)):
                 ed_row = 2 * cross_mean[i, :] - diag_mean[si] - diag_mean
                 ed_row[si] = 0.0
                 ed_cols[sg] = ed_row.get()
@@ -355,7 +354,7 @@ class EDistanceMetric(BaseMetric):
         # cross_means[i, j] = mean dist from selected[i] to group j
         # diag_means[j] = mean within-group dist for group j
         ed_cols = {}
-        for i, (sg, si) in enumerate(zip(selected_groups, selected_indices)):
+        for i, (sg, si) in enumerate(zip(selected_groups, selected_indices, strict=False)):
             ed_row = 2 * cross_means[i, :] - diag_means[si] - diag_means
             ed_row[si] = 0.0
             ed_cols[sg] = ed_row.get()

@@ -17,6 +17,7 @@ def _calc_recall(distances, reference_distances, tolerance=0.9):
     for (p_start, p_stop), (g_start, g_stop) in zip(
         itertools.pairwise(distances.indptr),
         itertools.pairwise(reference_distances.indptr),
+        strict=False,
     ):
         inter = np.intersect1d(
             distances.indices[p_start:p_stop],

@@ -49,8 +49,7 @@ def pca(
     copy: bool = False,
     **kwargs,
 ) -> None | AnnData | ArrayTypesDask:
-    """\
-    Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
+    r"""Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
 
     Uses the following implementations based on data type (defaults for `svd_solver` in parentheses):
 
@@ -138,13 +137,13 @@ def pca(
 
     key_added
         If not specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\\ `['X_pca']`, the loadings as
-        :attr:`~anndata.AnnData.varm`\\ `['PCs']`, and the parameters in
-        :attr:`~anndata.AnnData.uns`\\ `['pca']`.
+        :attr:`~anndata.AnnData.obsm`\ `['X_pca']`, the loadings as
+        :attr:`~anndata.AnnData.varm`\ `['PCs']`, and the parameters in
+        :attr:`~anndata.AnnData.uns`\ `['pca']`.
         If specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\\ `[key_added]`, the loadings as
-        :attr:`~anndata.AnnData.varm`\\ `[key_added]`, and the parameters in
-        :attr:`~anndata.AnnData.uns`\\ `[key_added]`.
+        :attr:`~anndata.AnnData.obsm`\ `[key_added]`, the loadings as
+        :attr:`~anndata.AnnData.varm`\ `[key_added]`, and the parameters in
+        :attr:`~anndata.AnnData.uns`\ `[key_added]`.
 
     return_info
         Only relevant when passing a matrix instead of an
@@ -165,9 +164,7 @@ def pca(
 
     Returns
     -------
-        If a matrix is passed and `return_info=False`, the PCA representation is \
-        returned. If a matrix is passed and `return_info=True`, a tuple of \
-        ``(X_pca, components, variance_ratio, variance)`` is returned.
+        If a matrix is passed and `return_info=False`, the PCA representation is returned. If a matrix is passed and `return_info=True`, a tuple of ``(X_pca, components, variance_ratio, variance)`` is returned.
 
         If an AnnData object is passed, adds fields to `adata`:
 
@@ -178,8 +175,7 @@ def pca(
             `.uns['pca' | key_added]['variance_ratio']`
                 Ratio of explained variance.
             `.uns['pca' | key_added]['variance']`
-                Explained variance, equivalent to the eigenvalues of the \
-                covariance matrix.
+                Explained variance, equivalent to the eigenvalues of the covariance matrix.
     """
     if "use_highly_variable" in kwargs:
         raise TypeError("pca() got an unexpected keyword argument 'use_highly_variable'")

@@ -991,8 +991,8 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
         gpu_names = list(gpu_result["names"][group])
         cpu_names = list(cpu_result["names"][group])
         for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
-            gpu_map = dict(zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float)))
-            cpu_map = dict(zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float)))
+            gpu_map = dict(zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float), strict=False))
+            cpu_map = dict(zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float), strict=False))
             for gene, gpu_val in gpu_map.items():
                 np.testing.assert_allclose(
                     gpu_val,
@@ -1451,8 +1451,8 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
     c = cpu.uns["rank_genes_groups"]
     for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
         for group in g["names"].dtype.names:
-            actual = dict(zip(g["names"][group], np.asarray(g[field][group], dtype=float)))
-            expected = dict(zip(c["names"][group], np.asarray(c[field][group], dtype=float)))
+            actual = dict(zip(g["names"][group], np.asarray(g[field][group], dtype=float), strict=False))
+            expected = dict(zip(c["names"][group], np.asarray(c[field][group], dtype=float), strict=False))
             for gene, value in actual.items():
                 np.testing.assert_allclose(
                     value,
@@ -1489,8 +1489,8 @@ def test_wilcoxon_fdr_ties_nan_match_scanpy():
     g = gpu.uns["rank_genes_groups"]
     c = cpu.uns["rank_genes_groups"]
     for group in g["names"].dtype.names:
-        g_adj = dict(zip(g["names"][group], np.asarray(g["pvals_adj"][group], float)))
-        c_adj = dict(zip(c["names"][group], np.asarray(c["pvals_adj"][group], float)))
+        g_adj = dict(zip(g["names"][group], np.asarray(g["pvals_adj"][group], float), strict=False))
+        c_adj = dict(zip(c["names"][group], np.asarray(c["pvals_adj"][group], float), strict=False))
         for gene, val in g_adj.items():
             np.testing.assert_allclose(val, c_adj[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
@@ -1571,8 +1571,8 @@ def _assert_ovo_matches_scanpy(adata, reference):
     g, c = adata.uns["rank_genes_groups"], bdata.uns["rank_genes_groups"]
     for fld in ("scores", "pvals", "pvals_adj"):
         for grp in g[fld].dtype.names:
-            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
-            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float), strict=False))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float), strict=False))
             for gene, val in gm.items():
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
@@ -1606,7 +1606,7 @@ def test_ovr_dense_gmem_branch_matches_scipy():
     rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, tie_correct=True)
     res = adata.uns["rank_genes_groups"]
     for grp in ("0", "1", "250", "1000", "3057", "6112", "6199"):
-        gp = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float)))
+        gp = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float), strict=False))
         mask = labels == int(grp)
         for gi, gene in enumerate(var.index):
             _, p = mannwhitneyu(
@@ -1678,8 +1678,8 @@ def test_ovr_tie_correct_false_tie_heavy_matches_scanpy(fmt):
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
-            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
-            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float), strict=False))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float), strict=False))
             for gene, val in gm.items():
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
@@ -1712,7 +1712,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
     )
     res = gpu.uns["rank_genes_groups"]
     for grp in res["names"].dtype.names:
-        gm = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float)))
+        gm = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float), strict=False))
         mask_g = labels == grp
         mask_r = (labels != grp) if reference == "rest" else (labels == reference)
         for gi, gene in enumerate(var.index):
@@ -1813,8 +1813,8 @@ def test_rank_genes_groups_reads_raw_matches_scanpy(use_raw):
     sc.tl.rank_genes_groups(bdata, "group", **kw)
     g, c = adata.uns["rank_genes_groups"], bdata.uns["rank_genes_groups"]
     for grp in g["scores"].dtype.names:
-        gm = dict(zip(g["names"][grp], np.asarray(g["scores"][grp], float)))
-        cm = dict(zip(c["names"][grp], np.asarray(c["scores"][grp], float)))
+        gm = dict(zip(g["names"][grp], np.asarray(g["scores"][grp], float), strict=False))
+        cm = dict(zip(c["names"][grp], np.asarray(c["scores"][grp], float), strict=False))
         for gene, val in gm.items():
             np.testing.assert_allclose(val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
@@ -1842,8 +1842,8 @@ def test_log1p_base_logfoldchanges_match_scanpy(reference, fmt):
     sc.tl.rank_genes_groups(cpu, "group", **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for grp in g["logfoldchanges"].dtype.names:
-        gm = dict(zip(g["names"][grp], np.asarray(g["logfoldchanges"][grp], float)))
-        cm = dict(zip(c["names"][grp], np.asarray(c["logfoldchanges"][grp], float)))
+        gm = dict(zip(g["names"][grp], np.asarray(g["logfoldchanges"][grp], float), strict=False))
+        cm = dict(zip(c["names"][grp], np.asarray(c["logfoldchanges"][grp], float), strict=False))
         for gene, val in gm.items():
             np.testing.assert_allclose(val, cm[gene], rtol=1e-6, atol=1e-6, equal_nan=True)
 
@@ -1903,8 +1903,8 @@ def test_bonferroni_matches_scanpy(fmt):
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals", "pvals_adj"):
         for grp in g[fld].dtype.names:
-            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
-            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float), strict=False))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float), strict=False))
             for gene, val in gm.items():
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
@@ -1954,8 +1954,8 @@ def test_ovr_fully_dense_column_match_scanpy(fmt):
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
-            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
-            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float), strict=False))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float), strict=False))
             for gene, val in gm.items():
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-13, atol=1e-15, equal_nan=True)
 
@@ -1983,8 +1983,8 @@ def test_ovr_device_sparse_subset_match_scanpy(fmt):
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
-            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float)))
-            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float)))
+            gm = dict(zip(g["names"][grp], np.asarray(g[fld][grp], float), strict=False))
+            cm = dict(zip(c["names"][grp], np.asarray(c[fld][grp], float), strict=False))
             for gene, val in gm.items():
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-13, atol=1e-15, equal_nan=True)
 
@@ -2294,12 +2294,14 @@ def test_wilcoxon_ovo_exact_tier_boundaries_match_scanpy(boundary):
                 zip(
                     actual_result["names"][group],
                     np.asarray(actual_result[field][group], dtype=float),
+                    strict=False,
                 )
             )
             expected_by_gene = dict(
                 zip(
                     expected_result["names"][group],
                     np.asarray(expected_result[field][group], dtype=float),
+                    strict=False,
                 )
             )
             for gene, expected_value in expected_by_gene.items():

@@ -43,8 +43,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
     table_key: str | None = None,
     dtype: np.dtype | type = np.float32,
 ) -> pd.DataFrame | None:
-    """\
-    Identify spatially variable genes with *Sepal*.
+    """Identify spatially variable genes with *Sepal*.
 
     *Sepal* simulates a diffusion process to quantify spatial structure in
     tissue :cite:`andersson2021`. This is a GPU port of :func:`squidpy.gr.sepal`

@@ -44,8 +44,10 @@ def _assert_group_results_match(actual, expected, group):
     assert set(actual_names) == set(expected_names)
 
     for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
-        actual_by_gene = dict(zip(actual_names, np.asarray(actual_result[field][group], dtype=float)))
-        expected_by_gene = dict(zip(expected_names, np.asarray(expected_result[field][group], dtype=float)))
+        actual_by_gene = dict(zip(actual_names, np.asarray(actual_result[field][group], dtype=float), strict=False))
+        expected_by_gene = dict(
+            zip(expected_names, np.asarray(expected_result[field][group], dtype=float), strict=False)
+        )
         for gene, value in actual_by_gene.items():
             np.testing.assert_allclose(
                 value,

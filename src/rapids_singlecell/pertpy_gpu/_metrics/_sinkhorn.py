@@ -117,6 +117,7 @@ def finalize(st) -> cp.ndarray:
 
 def run_async(units, *, max_iter, tol, check_every, omega=DEFAULT_RELAXATION):
     """Run the Sinkhorn loop across ``units`` (one per device) as a multi-stream
+
     queue: dispatch ``check_every`` iters to each stream, sync, read per-pair
     convergence, and stop once every pair on every unit has converged.
     """

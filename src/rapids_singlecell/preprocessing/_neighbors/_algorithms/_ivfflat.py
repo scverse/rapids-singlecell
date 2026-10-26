@@ -34,7 +34,8 @@ def _ivf_flat_knn(
         build_kwargs = {"handle": resources}
         search_kwargs = {"handle": resources}
         warnings.warn(
-            "Using `pylibraft` for ANN was removed in RAFT 24.12 and is deprecated in rapids-singlecell. Please update RAPIDS to use `cuvs` for ANN."
+            "Using `pylibraft` for ANN was removed in RAFT 24.12 and is deprecated in rapids-singlecell. Please update RAPIDS to use `cuvs` for ANN.",
+            stacklevel=2,
         )
     else:
         from cuvs.neighbors import ivf_flat

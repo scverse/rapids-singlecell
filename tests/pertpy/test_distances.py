@@ -246,7 +246,7 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
             distance.contrast_distances(small_adata, contrasts)["edistance"].to_numpy(),
         )
 
-    for actual, expected in zip(compute("F"), compute("C")):
+    for actual, expected in zip(compute("F"), compute("C"), strict=False):
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 

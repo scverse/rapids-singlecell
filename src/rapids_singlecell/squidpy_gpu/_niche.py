@@ -67,8 +67,7 @@ def calculate_niche_neighborhood(
     library_key: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches from cell-type neighborhood profiles on the GPU.
+    """Compute spatial niches from cell-type neighborhood profiles on the GPU.
 
     Each cell is described by the frequency of ``groups`` labels among its spatial
     neighbors; the profiles are then clustered with leiden. Mirrors
@@ -159,8 +158,7 @@ def calculate_niche_utag(
     library_key: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches from UTAG-smoothed expression on the GPU.
+    """Compute spatial niches from UTAG-smoothed expression on the GPU.
 
     Expression is propagated over the L1-normalized spatial graph, PCA-reduced and
     clustered with leiden. Mirrors ``squidpy.gr.calculate_niche_utag``
@@ -230,8 +228,7 @@ def calculate_niche_cellcharter(
     library_key: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches with the CellCharter approach on the GPU.
+    """Compute spatial niches with the CellCharter approach on the GPU.
 
     Expression is shell-aggregated over n-hop neighborhoods, PCA-reduced and clustered
     with a Gaussian mixture. Mirrors ``squidpy.gr.calculate_niche_cellcharter``
@@ -344,8 +341,7 @@ def calculate_niche(
     copy: bool | None = None,
     **kwargs,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches on the GPU.
+    """Compute spatial niches on the GPU.
 
     .. deprecated:: 0.17.0
         ``calculate_niche`` is deprecated and will be removed in a future release,
@@ -638,7 +634,7 @@ def _leiden_cluster(
     base_colname: str,
     library_id: object | None,
 ) -> list[str]:
-    """kNN graph + leiden over the embedding; one ``<base_colname>_res=<res>`` per resolution."""
+    """KNN graph + leiden over the embedding; one ``<base_colname>_res=<res>`` per resolution."""
     res_list = list(resolutions)
     result_columns = [f"{base_colname}_res={res}" for res in res_list]
     if adata.n_obs == 1:

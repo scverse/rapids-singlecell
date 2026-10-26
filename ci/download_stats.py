@@ -72,6 +72,7 @@ def query(sql: str, *, attempts: int = MAX_ATTEMPTS, timeout: int = 60) -> list[
 
 
 def fetch_totals(projects: str) -> dict[str, int]:
+    """All-time downloads per project."""
     rows = query(
         f"SELECT project, sum(count) AS total FROM pypi.pypi_downloads WHERE project IN ({projects}) GROUP BY project"
     )
@@ -79,6 +80,7 @@ def fetch_totals(projects: str) -> dict[str, int]:
 
 
 def fetch_recent(projects: str) -> tuple[dict[str, int], str]:
+    """Downloads per project over the last `RECENT_DAYS` days, and the latest date covered."""
     rows = query(
         f"SELECT project, sum(count) AS recent, max(date) AS latest "
         f"FROM pypi.pypi_downloads_per_day "
@@ -91,6 +93,7 @@ def fetch_recent(projects: str) -> tuple[dict[str, int], str]:
 
 
 def previous_value(previous: dict | None, package: str, key: str) -> int:
+    """Return the last published figure `key` for `package`, or 0 if there is none."""
     if previous is None:
         return 0
     return int(previous.get("packages", {}).get(package, {}).get(key, 0))
@@ -166,6 +169,7 @@ def humanize(count: int) -> str:
 
 
 def write_badge(path: Path, label: str, count: int) -> None:
+    """Write a shields.io endpoint badge showing `count`."""
     path.write_text(
         json.dumps(
             {
@@ -217,6 +221,7 @@ def append_history(path: Path, report: dict) -> None:
 
 
 def main() -> None:
+    """Collect the download numbers and write the report, badges and history."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output-dir",

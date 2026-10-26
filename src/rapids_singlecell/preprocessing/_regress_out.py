@@ -27,9 +27,7 @@ def regress_out(
     batchsize: int | Literal["all"] | None = None,
     verbose: bool = False,
 ) -> Union[cp.ndarray, None]:  # noqa: UP007
-    """
-    Use linear regression to adjust for the effects of unwanted noise
-    and variation.
+    """Use linear regression to adjust for the effects of unwanted noise and variation.
 
     Parameters
     ----------

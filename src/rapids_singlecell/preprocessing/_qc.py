@@ -25,8 +25,7 @@ def calculate_qc_metrics(
     log1p: bool = True,
     layer: str = None,
 ) -> None:
-    """\
-    Calculate basic quality-control metrics :cite:p:`McCarthy2017`.
+    """Calculate basic quality-control metrics :cite:p:`McCarthy2017`.
 
     Calculates number of genes per cell (n_genes) and number of counts per cell (n_counts).
     Loosely based on calculate_qc_metrics from scanpy :cite:p:`Wolf2018`. Updates :attr:`~anndata.AnnData.obs` and :attr:`~anndata.AnnData.var`  with columns with qc data.
@@ -71,7 +70,6 @@ def calculate_qc_metrics(
                 E.g. 'pct_dropout_by_counts'. Percentage of cells this feature does not appear in.
 
     """
-
     X = _get_obs_rep(adata, layer=layer)
 
     _check_gpu_X(X, allow_dask=True)

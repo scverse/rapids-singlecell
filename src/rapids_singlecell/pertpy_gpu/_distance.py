@@ -425,9 +425,7 @@ class Distance:
         groups: Sequence[str] | None = None,
         split_by: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """
-        Build a contrasts DataFrame for use with
-        :meth:`~Distance.contrast_distances`.
+        """Build a contrasts DataFrame for use with :meth:`~Distance.contrast_distances`.
 
         Each row represents one contrast: comparing a group against the
         reference, optionally within each level of ``split_by`` columns.

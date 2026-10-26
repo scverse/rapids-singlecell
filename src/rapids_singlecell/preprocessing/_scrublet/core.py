@@ -34,8 +34,7 @@ def _sample_comb(dims: tuple[int, ...], nsamp: int, *, rng: np.random.Generator)
 
 @dataclass(kw_only=True)
 class Scrublet:
-    """\
-    Initialize Scrublet object with counts matrix and doublet prediction parameters
+    """Initialize Scrublet object with counts matrix and doublet prediction parameters
 
     Parameters
     ----------
@@ -205,7 +204,6 @@ class Scrublet:
         ----
         doublet_parents_
         """
-
         if sim_doublet_ratio is None:
             sim_doublet_ratio = self.sim_doublet_ratio
         else:
@@ -233,8 +231,7 @@ class Scrublet:
         self.doublet_parents_ = pair_ix
 
     def set_manifold(self, manifold_obs: NDArray[np.float64], manifold_sim: NDArray[np.float64]) -> None:
-        """\
-        Set the manifold coordinates used in k-nearest-neighbor graph construction
+        """Set the manifold coordinates used in k-nearest-neighbor graph construction
 
         Arguments
         ---------
@@ -254,7 +251,6 @@ class Scrublet:
         ----
         manifold_obs_, manifold_sim_,
         """
-
         self.manifold_obs_ = manifold_obs
         self.manifold_sim_ = manifold_sim
 
@@ -265,8 +261,7 @@ class Scrublet:
         distance_metric="euclidean",
         get_doublet_neighbor_parents: bool = False,
     ) -> NDArray[np.float64]:
-        """\
-        Calculate doublet scores for observed transcriptomes and simulated doublets
+        """Calculate doublet scores for observed transcriptomes and simulated doublets
 
         Requires that manifold_obs_ and manifold_sim_ have already been set.
 
@@ -294,7 +289,6 @@ class Scrublet:
         doublet_errors_obs_, doublet_errors_sim_,
         doublet_neighbor_parents_
         """
-
         self._nearest_neighbor_classifier(
             k=self._n_neighbors,
             exp_doub_rate=self.expected_doublet_rate,
@@ -388,8 +382,7 @@ class Scrublet:
             self.doublet_neighbor_parents_ = neighbor_parents
 
     def call_doublets(self, *, threshold: float | None = None, verbose: bool = True) -> NDArray[np.bool_] | None:
-        """\
-        Call trancriptomes as doublets or singlets
+        """Call trancriptomes as doublets or singlets
 
         Arguments
         ---------
@@ -410,7 +403,6 @@ class Scrublet:
         detected_doublet_rate_, detectable_doublet_fraction,
         overall_doublet_rate_
         """
-
         if threshold is None:
             # automatic threshold detection
             # http://scikit-image.org/docs/dev/api/skimage.filters.html

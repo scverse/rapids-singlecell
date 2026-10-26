@@ -100,8 +100,8 @@ def test_rank_genes_groups_ttest_dask(client, data_kind, dtype, method, mean_in_
         dask_scores = np.asarray(dask_data.uns["rank_genes_groups"]["scores"][group], dtype=float)
 
         # Create gene->score mappings
-        gpu_score_map = dict(zip(gpu_names, gpu_scores))
-        dask_score_map = dict(zip(dask_names, dask_scores))
+        gpu_score_map = dict(zip(gpu_names, gpu_scores, strict=False))
+        dask_score_map = dict(zip(dask_names, dask_scores, strict=False))
 
         # All genes should have identical scores
         for gene in gpu_score_map:
@@ -194,8 +194,8 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         dask_scores = np.asarray(cpu_dask.uns["rank_genes_groups"]["scores"][group], dtype=float)
 
         # Create gene->score mappings
-        gpu_score_map = dict(zip(gpu_names, gpu_scores))
-        dask_score_map = dict(zip(dask_names, dask_scores))
+        gpu_score_map = dict(zip(gpu_names, gpu_scores, strict=False))
+        dask_score_map = dict(zip(dask_names, dask_scores, strict=False))
 
         # All genes should have matching scores
         for gene in gpu_score_map:

@@ -15,8 +15,8 @@ def _rev_cummin64(x, n_rows, m):
 
 
 def fdr_bh_axis1_cupy_optimized(ps, *, mem_gb: float = 4.0) -> cp.ndarray:
-    """
-    Benjamini–Hochberg adjusted p-values along axis=1 (rows), GPU-optimized.
+    """Benjamini–Hochberg adjusted p-values along axis=1 (rows), GPU-optimized.
+
     - Keeps values in float64 for CPU-equivalence.
     - Uses int32 index buffers where safe.
     - Processes rows in chunks to cap peak memory.
@@ -93,9 +93,7 @@ def fdr_bh_axis1_cupy_optimized(ps, *, mem_gb: float = 4.0) -> cp.ndarray:
 
 @nb.jit(nopython=True, cache=True)
 def _fdr_bh_single_row(ps_row, m):
-    """
-    Apply Benjamini-Hochberg correction to a single row.
-    """
+    """Apply Benjamini-Hochberg correction to a single row."""
     # Sort the row and get indices
     order = np.argsort(ps_row)
     ps_sorted = ps_row[order]
@@ -132,9 +130,7 @@ def _fdr_bh_single_row(ps_row, m):
 
 @nb.jit(nopython=True, parallel=True, cache=True)
 def _fdr_bh_parallel(ps, m):
-    """
-    Apply Benjamini-Hochberg correction to all rows in parallel.
-    """
+    """Apply Benjamini-Hochberg correction to all rows in parallel."""
     n_rows = ps.shape[0]
     result = np.empty_like(ps, dtype=np.float64)
 
@@ -145,8 +141,8 @@ def _fdr_bh_parallel(ps, m):
 
 
 def fdr_bh_axis1_numba(ps):
-    """
-    Benjamini–Hochberg adjusted p-values along axis=1 (rows).
+    """Benjamini–Hochberg adjusted p-values along axis=1 (rows).
+
     ps: numpy.ndarray (n_rows, n_tests), values in [0, 1].
     Returns: numpy.ndarray of same shape.
     """
@@ -171,14 +167,13 @@ def fdr_bh_axis1(ps: np.ndarray, *, if_gpu: bool = False) -> np.ndarray:
     """
     Main function with CPU/GPU selection and optimization options.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     ps : array-like
         Input p-values array
     if_gpu : bool, default=False
         Whether to use GPU (CuPy) or CPU (Numba)
     """
-
     if if_gpu:
         out = fdr_bh_axis1_cupy_optimized(ps)
     else:

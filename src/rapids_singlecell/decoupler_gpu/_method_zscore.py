@@ -70,7 +70,6 @@ def _func_zscore(
         adata, net = dc.ds.toy()
         rsc.dcg.zscore(adata, net, tmin=3)
     """
-
     assert isinstance(flavor, str) and flavor in ["KSEA", "RoKAI"], "flavor must be str and KSEA or RoKAI"
     nobs, nvar = mat.shape
     nvar, nsrc = adj.shape

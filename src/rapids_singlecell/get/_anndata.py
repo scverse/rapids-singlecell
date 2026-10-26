@@ -58,7 +58,6 @@ def anndata_to_GPU(
     -------
     Updates `adata` inplace or returns an updated copy
     """
-
     if copy:
         adata = adata.copy()
 
@@ -102,7 +101,7 @@ def X_to_GPU(X: CPU_ARRAY_TYPE | DaskArray, warning: str = "X") -> GPU_ARRAY_TYP
     elif isinstance(X, np.ndarray):
         X = cp.array(X)
     else:
-        warnings.warn(f"{warning} not supported for GPU conversion returning {warning}", Warning)
+        warnings.warn(f"{warning} not supported for GPU conversion returning {warning}", Warning, stacklevel=2)
     return X
 
 
@@ -134,7 +133,6 @@ def anndata_to_CPU(
     -------
     Updates `adata` inplace or returns an updated copy
     """
-
     if copy:
         adata = adata.copy()
 

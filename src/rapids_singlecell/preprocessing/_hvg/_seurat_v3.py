@@ -101,8 +101,8 @@ def _highly_variable_genes_seurat_v3(
     check_values=True,
     flavor: str = "seurat_v3",
 ):
-    """\
-    See `highly_variable_genes`.
+    """See `highly_variable_genes`.
+
     For further implementation details see https://www.overleaf.com/read/ckptrbgzzzpg
 
     Returns
@@ -126,11 +126,12 @@ def _highly_variable_genes_seurat_v3(
         warnings.warn(
             "`flavor='seurat_v3'` expects `n_top_genes`  to be defined, defaulting to 2000 HVGs",
             UserWarning,
+            stacklevel=2,
         )
     try:
         from skmisc.loess import loess
-    except ImportError:
-        raise ImportError("Please install skmisc package via `pip install --user scikit-misc")
+    except ImportError as e:
+        raise ImportError("Please install skmisc package via `pip install --user scikit-misc") from e
 
     df = pd.DataFrame(index=adata.var.index)
     X = _get_obs_rep(adata, layer=layer)
@@ -142,6 +143,7 @@ def _highly_variable_genes_seurat_v3(
         warnings.warn(
             "`flavor='seurat_v3'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
 
     mean, var = _get_mean_var(X, axis=0)

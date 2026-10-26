@@ -74,9 +74,7 @@ def _validate_output_buffer(
 
 
 def _normalize_cp(X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None) -> cp.ndarray:
-    """
-    Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`.
-    """
+    """Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`."""
     if p == 2:
         X = cp.ascontiguousarray(X)
         if out is None:
@@ -203,9 +201,7 @@ def _get_theta_array(
     n_levels: int | np.ndarray,
     dtype: cp.dtype,
 ) -> cp.ndarray:
-    """
-    Normalize scalar, per-variable, or per-category theta values.
-    """
+    """Normalize scalar, per-variable, or per-category theta values."""
     levels = np.atleast_1d(n_levels).astype(np.int64, copy=False)
     n_covariates = levels.size
     n_categories = int(levels.sum())
@@ -232,8 +228,8 @@ def _get_theta_array(
 
 
 def _column_sum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column of the 2D, C-contiguous float32 array A.
+    """Sum each column of the 2D, C-contiguous float32 array A.
+
     Returns a 1D float32 cupy array of length A.shape[1].
     """
     rows, cols = X.shape
@@ -254,9 +250,7 @@ def _column_sum(X: cp.ndarray) -> cp.ndarray:
 
 
 def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column with cuBLAS GEMM
-    """
+    """Sum each column with cuBLAS GEMM"""
     return X.T @ cp.ones(X.shape[0], dtype=X.dtype)
 
 

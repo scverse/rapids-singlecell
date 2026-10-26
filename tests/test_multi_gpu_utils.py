@@ -130,7 +130,7 @@ class TestSplitPairs:
         # Calculate actual work per device
         def calc_work(left, right, sizes):
             work = 0
-            for l, r in zip(left.get(), right.get()):
+            for l, r in zip(left.get(), right.get(), strict=False):
                 if l == r:
                     work += sizes[l] * (sizes[l] - 1) // 2
                 else:

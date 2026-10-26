@@ -153,8 +153,10 @@ extend-include = [ "*.ipynb" ]
 extend-exclude = [ "docs/notebooks", "notebooks" ]
 format.docstring-code-format = true
 lint.select = [
+  "B",       # flake8-bugbear
   "BLE",     # flake8-blind-except
   "C4",      # flake8-comprehensions
+  "D",       # pydocstyle
   "E",       # Error detected by Pycodestyle
   "F",       # Errors detected by Pyflakes
   "FBT",     # No boolean positional parameters

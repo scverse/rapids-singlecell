@@ -466,7 +466,7 @@ class PseudobulkMetric(BaseMetric):
         means, obs = self._aggregate_means(adata, by)
 
         obs_by_arrays = [obs[col].to_numpy() for col in by]
-        condition_to_idx: dict[tuple, int] = {key: idx for idx, key in enumerate(zip(*obs_by_arrays))}
+        condition_to_idx: dict[tuple, int] = {key: idx for idx, key in enumerate(zip(*obs_by_arrays, strict=False))}
 
         target_vals = contrasts[groupby].to_numpy()
         ref_vals = contrasts["reference"].to_numpy()

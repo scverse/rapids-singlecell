@@ -45,8 +45,7 @@ def _highly_variable_genes_single_batch(
     n_bins: int = 20,
     flavor: Literal["seurat", "cell_ranger"] = "seurat",
 ) -> pd.DataFrame:
-    """\
-    See `highly_variable_genes`.
+    """See `highly_variable_genes`.
 
     Returns
     -------
@@ -163,7 +162,7 @@ def _nth_highest(x: NDArray[np.float64], n: int) -> float:
     x = x[~np.isnan(x)]
     if n > x.size:
         msg = "`n_top_genes` > number of normalized dispersions, returning all genes with normalized dispersions."
-        warnings.warn(msg, UserWarning)
+        warnings.warn(msg, UserWarning, stacklevel=2)
         n = x.size
     # interestingly, np.argpartition is slightly slower
     x[::-1].sort()

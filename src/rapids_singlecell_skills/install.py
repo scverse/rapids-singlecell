@@ -147,6 +147,7 @@ def install_skill(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point of `rapids-singlecell-install-skills`."""
     parser = argparse.ArgumentParser(
         prog="rapids-singlecell-install-skills",
         description="Install the RAPIDS-singlecell skill bundled with this package.",

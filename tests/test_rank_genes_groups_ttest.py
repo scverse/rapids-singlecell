@@ -201,8 +201,8 @@ def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference
         gpu_names = list(gpu_result["names"][group])
         cpu_names = list(cpu_result["names"][group])
         for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
-            gpu_map = dict(zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float)))
-            cpu_map = dict(zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float)))
+            gpu_map = dict(zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float), strict=False))
+            cpu_map = dict(zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float), strict=False))
             for gene, gpu_val in gpu_map.items():
                 np.testing.assert_allclose(
                     gpu_val,
@@ -369,7 +369,7 @@ def test_rank_genes_groups_ttest_direct_scipy():
     # Get rsc scores for group A
     rsc_names = list(adata.uns["rank_genes_groups"]["names"]["A"])
     rsc_scores = np.asarray(adata.uns["rank_genes_groups"]["scores"]["A"], dtype=np.float64)
-    rsc_score_map = dict(zip(rsc_names, rsc_scores))
+    rsc_score_map = dict(zip(rsc_names, rsc_scores, strict=False))
 
     # Compute scipy t-test directly on the two matrices
     scipy_scores, _ = stats.ttest_ind(X_group1, X_group2, equal_var=False)
@@ -433,7 +433,7 @@ def test_rank_genes_groups_ttest_matches_scipy():
         # Get rapids_singlecell scores (need to map by gene name since order differs)
         rsc_names = list(adata.uns["rank_genes_groups"]["names"][group])
         rsc_scores = np.asarray(adata.uns["rank_genes_groups"]["scores"][group], dtype=np.float64)
-        rsc_score_map = dict(zip(rsc_names, rsc_scores))
+        rsc_score_map = dict(zip(rsc_names, rsc_scores, strict=False))
 
         # Compare scores for each gene
         # Gap is from GPU vs CPU mean/var computation (~float32 intermediates)

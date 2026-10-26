@@ -168,7 +168,6 @@ def harmonize(
     -------
     The integrated embedding by Harmony, of the same shape as the input embedding.
     """
-
     stopping = _STOPPING_HARMONY2 if stabilized_penalty and dynamic_lambda else _STOPPING_HARMONY1
     if max_iter_clustering is None:
         max_iter_clustering = stopping[0]
@@ -463,7 +462,7 @@ def harmonize(
             Z_norm = _normalize_cp(Z_hat, p=2, out=Z_hat)
 
     if not is_converged:
-        warnings.warn("Harmony did not converge. Consider increasing the number of iterations")
+        warnings.warn("Harmony did not converge. Consider increasing the number of iterations", stacklevel=2)
 
     return Z_hat
 
@@ -492,7 +491,8 @@ def _initialize_clusters(
     """
     Initialize cluster centroids and related matrices for Harmony algorithm.
 
-    Returns:
+    Returns
+    -------
         R: Cluster assignment matrix
         E: Expected cluster assignment by batch
         O: Observed cluster assignment by batch
@@ -640,10 +640,10 @@ def _clustering(
     stabilized_penalty: bool = True,
     clustering_workspace: dict = None,
 ) -> None:
-    """
-    Perform iterative clustering updates on normalized input data, adjusting
-    cluster assignments and associated penalty terms until convergence or
-    maximum iterations are reached.
+    """Perform iterative clustering updates on normalized input data.
+
+    Adjusts cluster assignments and associated penalty terms until convergence
+    or the maximum number of iterations is reached.
 
     This function operates in-place to update the cluster assignment matrix (R)
     and penalty-related matrices (O and E).
@@ -736,9 +736,7 @@ def _correction(
     max_batch_cells: int,
     output: cp.ndarray | None = None,
 ) -> cp.ndarray:
-    """
-    Apply correction to the embedding based on the specified method.
-    """
+    """Apply correction to the embedding based on the specified method."""
     if correction_method == "batched":
         return _correction_batched(
             X,

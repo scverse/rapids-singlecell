@@ -16,8 +16,7 @@ def sparse_multiply(
     E: sparse.csr_matrix | sparse.csc_matrix | NDArray[np.float64],
     a: float | int | NDArray[np.float64],
 ) -> sparse.csr_matrix | sparse.csc_matrix:
-    """multiply each row of E by a scalar"""
-
+    """Multiply each row of E by a scalar"""
     nrow = E.shape[0]
     w = sparse.dia_matrix((a, 0), shape=(nrow, nrow), dtype=a.dtype)
     # w.setdiag(a)

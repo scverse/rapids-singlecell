@@ -55,8 +55,7 @@ def neighbors(
     key_added: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
-    """\
-    Compute a neighborhood graph of observations :cite:p:`Ootomo2024`.
+    """Compute a neighborhood graph of observations :cite:p:`Ootomo2024`.
 
     The neighbor search efficiency of this heavily relies on cuVS,
     which also provides a method for estimating connectivities of data points -
@@ -196,6 +195,7 @@ def neighbors(
         warn(
             f"Parameter `rng`/`random_state` ignored if `method={method!r}`.",
             UserWarning,
+            stacklevel=2,
         )
         meta_random_state.pop("random_state", None)
 
@@ -291,9 +291,11 @@ def bbknn(
     key_added: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
-    """\
-    Batch balanced KNN :cite:p:`Polanski2019`, altering the KNN procedure to identify each cell's top neighbours in
+    """Batch balanced KNN :cite:p:`Polanski2019`.
+
+    Batch balanced KNN alters the KNN procedure to identify each cell's top neighbours in
     each batch separately instead of the entire cell pool with no accounting for batch.
+
     The nearest neighbours for each batch are then merged to create a final list of
     neighbours for the cell.
 
@@ -392,7 +394,6 @@ def bbknn(
     See `key_added` parameter description for the storage path of
     connectivities and distances.
     """
-
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 

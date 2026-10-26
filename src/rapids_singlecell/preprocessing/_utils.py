@@ -105,10 +105,7 @@ def _mean_var_minor(X, major, minor):
 
 
 def _mean_var_minor_dask(X, major, minor):
-    """
-    Implements sum operation for dask array when the backend is cupy sparse csr matrix
-    """
-
+    """Implements sum operation for dask array when the backend is cupy sparse csr matrix"""
     from rapids_singlecell._cuda import _mean_var_cuda as _mv
 
     def __mean_var(X_part):
@@ -140,10 +137,7 @@ def _mean_var_minor_dask(X, major, minor):
 
 # todo: Implement this dynamically for csc matrix as well
 def _mean_var_major_dask(X, major, minor):
-    """
-    Implements sum operation for dask array when the backend is cupy sparse csr matrix
-    """
-
+    """Implements sum operation for dask array when the backend is cupy sparse csr matrix"""
     from rapids_singlecell._cuda import _mean_var_cuda as _mv
 
     def __mean_var(X_part):
@@ -177,9 +171,7 @@ def _mean_var_major_dask(X, major, minor):
 
 
 def _mean_var_dense_dask(X, axis):
-    """
-    Implements sum operation for dask array when the backend is cupy dense matrix
-    """
+    """Implements sum operation for dask array when the backend is cupy dense matrix"""
     from ._kernels._mean_var_kernel import mean_sum, sq_sum
 
     def __mean_var(X_part):

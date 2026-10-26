@@ -172,6 +172,7 @@ class GuideAssignment:
         posterior_threshold
             Minimum posterior probability of the Gaussian component required
             for a raw UMI count to define the assignment threshold.
+
         Returns
         -------
         If ``only_return_results`` is ``True``, returns an array of

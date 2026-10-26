@@ -106,8 +106,8 @@ def _p_value_calc(
 
 
 def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str, Any]):
-    """
-    Analytic p-value computation.
+    """Analytic p-value computation.
+
     See `Moran's I <https://pysal.org/esda/_modules/esda/moran.html#Moran>`_ and
     `Geary's C <https://pysal.org/esda/_modules/esda/geary.html#Geary>`_ implementation.
     """
@@ -136,8 +136,8 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
 
 
 def _g_moments(w: spmatrix | np.ndarray):
-    """
-    Compute moments of adjacency matrix for analytic p-value calculation.
+    """Compute moments of adjacency matrix for analytic p-value calculation.
+
     See `pysal <https://pysal.org/libpysal/_modules/libpysal/weights/weights.html#W>`_ implementation.
     """
     # s0

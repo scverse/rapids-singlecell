@@ -58,6 +58,7 @@ def _poisson_gene_selection(
         warnings.warn(
             "`flavor='poisson_gene_selection'` expects `n_top_genes` to be defined, defaulting to 2000 HVGs",
             UserWarning,
+            stacklevel=2,
         )
 
     X = _get_obs_rep(adata, layer=layer)
@@ -67,6 +68,7 @@ def _poisson_gene_selection(
         warnings.warn(
             "`flavor='poisson_gene_selection'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
 
     # Handle batches

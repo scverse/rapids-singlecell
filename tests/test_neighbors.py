@@ -179,6 +179,7 @@ def test_indices_approx_nn(algo):
     for (rsc_start, rsc_stop), (b_start, b_stop) in zip(
         itertools.pairwise(adata.obsp["distances"].indptr),
         itertools.pairwise(brute_data.obsp["distances"].indptr),
+        strict=False,
     ):
         counter += len(
             np.intersect1d(
@@ -225,6 +226,7 @@ def test_bbknn():
     for (rsc_start, rsc_stop), (b_start, b_stop) in zip(
         itertools.pairwise(adata.obsp["rapids_distances"].indptr),
         itertools.pairwise(adata.obsp["distances"].indptr),
+        strict=False,
     ):
         counter += len(
             np.intersect1d(

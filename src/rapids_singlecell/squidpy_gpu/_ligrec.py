@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import product
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
+    Any,
     Literal,
 )
 
@@ -26,14 +28,14 @@ TARGET = "target"
 
 
 def _get_interactions(
-    interactions_params={},
-    transmitter_params={"categories": "ligand"},
-    receiver_params={"categories": "receptor"},
+    interactions_params: Mapping[str, Any] = MappingProxyType({}),
+    transmitter_params: Mapping[str, Any] = MappingProxyType({"categories": "ligand"}),
+    receiver_params: Mapping[str, Any] = MappingProxyType({"categories": "receptor"}),
 ):
     try:
         from omnipath.interactions import import_intercell_network
-    except ImportError:
-        raise ImportError("Please install omnipath package via `pip install omnipath")
+    except ImportError as e:
+        raise ImportError("Please install omnipath package via `pip install omnipath") from e
 
     interactions = import_intercell_network(
         interactions_params=interactions_params,
@@ -135,12 +137,11 @@ def ligrec(
     key_added: str | None = None,
     gene_symbols: str | None = None,
     n_perms: int = 1000,
-    interactions_params: dict = {},
-    transmitter_params: dict = {"categories": "ligand"},
-    receiver_params: dict = {"categories": "receptor"},
+    interactions_params: Mapping[str, Any] = MappingProxyType({}),
+    transmitter_params: Mapping[str, Any] = MappingProxyType({"categories": "ligand"}),
+    receiver_params: Mapping[str, Any] = MappingProxyType({"categories": "receptor"}),
 ) -> pd.DataFrame | None:
-    """\
-    Perform the permutation test as described in [Efremova et al., 2020].
+    """Perform the permutation test as described in [Efremova et al., 2020].
 
     Parameters
     ----------
@@ -259,7 +260,7 @@ def ligrec(
         if isinstance(interactions[0], str):
             interactions = list(product(interactions, repeat=2))
         elif len(interactions) == 2:
-            interactions = tuple(zip(*interactions))
+            interactions = tuple(zip(*interactions, strict=False))
 
         if not all(len(i) == 2 for i in interactions):
             raise ValueError("Not all interactions are of length `2`.")
@@ -335,7 +336,7 @@ def ligrec(
             if "attempt to get argmin of an empty sequence" in str(e):
                 return str(df.index[0])
             else:
-                raise ValueError(e)
+                raise ValueError(e) from e
 
     if complex_policy == "min":
         interactions[SOURCE] = interactions[SOURCE].apply(find_min_gene_in_complex)
@@ -405,8 +406,8 @@ def ligrec(
     interactions_all = interactions.copy()
     interactions = pd.DataFrame(interactions, columns=[SOURCE, TARGET])
 
-    cluster_mapper = dict(zip(cat.categories, range(len(cat.categories))))
-    gene_mapper = dict(zip(genes, range(len(genes))))  # -1 for 'clusters'
+    cluster_mapper = dict(zip(cat.categories, range(len(cat.categories)), strict=False))
+    gene_mapper = dict(zip(genes, range(len(genes)), strict=False))  # -1 for 'clusters'
 
     genes = [gene_mapper[c] if c != "clusters" else c for c in genes]
     clusters_ = np.array(

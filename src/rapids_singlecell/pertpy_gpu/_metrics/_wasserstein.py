@@ -166,8 +166,9 @@ def _split_positions_by_work(
     n_right_host: np.ndarray,
     n_devices: int,
 ) -> list[int]:
-    """Partition pair positions into ``n_devices`` contiguous segments of equal
-    cumulative work (``n_left * n_right``); returns ``n_devices + 1`` boundaries.
+    """Partition pair positions into ``n_devices`` contiguous segments of equal cumulative work.
+
+    Work is ``n_left * n_right``. Returns ``n_devices + 1`` boundaries.
     """
     n = len(n_left_host)
     if n_devices <= 1 or n == 0:
@@ -191,9 +192,12 @@ def _plan_batches(
     n_col_host: np.ndarray,
     itemsize: int,
 ) -> list[tuple[int, int]]:
-    """Greedily pack ``[start, stop)`` into ``(batch_start, batch_stop)`` batches,
-    each capped by ``COST_BUDGET_BYTES`` of true cost cells (no padding) and
-    ``MAX_BATCH`` pairs. A single oversized pair gets its own batch.
+    """Greedily pack ``[start, stop)`` into ``(batch_start, batch_stop)`` batches.
+
+    Each batch is capped by ``COST_BUDGET_BYTES`` of true cost cells (no padding)
+    and ``MAX_BATCH`` pairs.
+
+    A single oversized pair gets its own batch.
     """
     budget_cells = max(COST_BUDGET_BYTES // itemsize, 1)
     plans = []

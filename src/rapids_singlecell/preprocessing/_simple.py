@@ -21,8 +21,8 @@ def flag_gene_family(
     gene_family_prefix: str = None,
     gene_list: list = None,
 ) -> None:
-    """
-    Flags a gene or gene_family in .var with boolean. (e.g all mitochondrial genes).
+    """Flags a gene or gene_family in .var with boolean. (e.g all mitochondrial genes).
+
     Please only choose gene_family prefix or gene_list
 
     Parameters
@@ -60,8 +60,7 @@ def filter_genes(
     inplace: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """\
-    Filter genes based on number of cells or counts.
+    """Filter genes based on number of cells or counts.
 
     Keep genes that have at least `min_counts` counts or are expressed in at
     least `min_cells` cells or have at most `max_counts` counts or are expressed
@@ -153,8 +152,7 @@ def filter_cells(
     inplace: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """\
-    Filter cell outliers based on counts and numbers of genes expressed.
+    """Filter cell outliers based on counts and numbers of genes expressed.
 
     For instance, only keep cells with at least `min_counts` counts or
     `min_genes` genes expressed. This is to filter measurement outliers,
@@ -211,19 +209,19 @@ def filter_cells(
     >>> sc.pp.filter_cells(adata, min_genes=0)
     >>> adata.n_obs
     640
-    >>> int(adata.obs['n_genes'].min())
+    >>> int(adata.obs["n_genes"].min())
     1
     >>> # filter manually
-    >>> adata_copy = adata[adata.obs['n_genes'] >= 3]
+    >>> adata_copy = adata[adata.obs["n_genes"] >= 3]
     >>> adata_copy.n_obs
     554
-    >>> int(adata_copy.obs['n_genes'].min())
+    >>> int(adata_copy.obs["n_genes"].min())
     3
     >>> # actually do some filtering
     >>> sc.pp.filter_cells(adata, min_genes=3)
     >>> adata.n_obs
     554
-    >>> int(adata.obs['n_genes'].min())
+    >>> int(adata.obs["n_genes"].min())
     3
     """
     n_given_options = sum(option is not None for option in [min_genes, min_counts, max_genes, max_counts])

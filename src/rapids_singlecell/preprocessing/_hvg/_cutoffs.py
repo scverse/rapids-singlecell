@@ -38,7 +38,7 @@ class _Cutoffs:
         }
         if {k: v for k, v in locals().items() if k in cutoffs} != defaults:
             msg = "If you pass `n_top_genes`, all cutoffs are ignored."
-            warnings.warn(msg, UserWarning)
+            warnings.warn(msg, UserWarning, stacklevel=2)
         return n_top_genes
 
     def in_bounds(

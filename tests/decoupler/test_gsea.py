@@ -151,7 +151,7 @@ def test_public_outputs_and_batching_match_decoupler(kind, tmp_path):
         times=times,
         seed=42,
     )
-    aligned = [cnct[start : start + length] for start, length in zip(starts, offsets)]
+    aligned = [cnct[start : start + length] for start, length in zip(starts, offsets, strict=False)]
     actual, pval = _run(matrix, aligned, times=times, seed=42)
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
     np.testing.assert_array_equal(pval, raw_p)

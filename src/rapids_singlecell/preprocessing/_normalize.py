@@ -36,8 +36,7 @@ def normalize_total(
     inplace: bool = True,
     copy: bool = False,
 ) -> Union[AnnData, csr_matrix, cp.ndarray, None]:  # noqa: UP007
-    """\
-    Normalizes rows in matrix so they sum to `target_sum`.
+    """Normalizes rows in matrix so they sum to `target_sum`.
 
     Parameters
     ----------
@@ -68,6 +67,7 @@ def normalize_total(
 
         copy
             Whether to return a copy or update `adata`. Not compatible with inplace=False.
+
     Returns
     -------
         Returns a normalized copy or  updates `adata` with a normalized version of
@@ -364,10 +364,9 @@ def log1p(
     inplace: bool = True,
     copy: bool = False,
 ) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
-    """\
-    Logarithmize the data matrix.
+    r"""Logarithmize the data matrix.
 
-    Computes :math:`X = \\log(X + 1)`, where :math:`log` denotes the natural logarithm
+    Computes :math:`X = \log(X + 1)`, where :math:`log` denotes the natural logarithm
     unless a different `base` is given.
 
     Parameters
@@ -391,10 +390,7 @@ def log1p(
 
     Returns
     -------
-    The resulting matrix after applying the logarithm of one plus the input matrix. \
-    If a matrix is passed, the transformed matrix is returned. If an AnnData object is \
-    passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the \
-    `data` object in-place and returns None.
+    The resulting matrix after applying the logarithm of one plus the input matrix. If a matrix is passed, the transformed matrix is returned. If an AnnData object is passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the `data` object in-place and returns None.
 
     """
     if not isinstance(data, AnnData):
@@ -449,10 +445,9 @@ def sqrt(
     inplace: bool = True,
     copy: bool = False,
 ) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
-    """\
-    Take the square root of the data matrix.
+    r"""Take the square root of the data matrix.
 
-    Computes :math:`X = \\sqrt{X}`.
+    Computes :math:`X = \sqrt{X}`.
 
     Parameters
     ----------
@@ -473,10 +468,7 @@ def sqrt(
 
     Returns
     -------
-    The resulting matrix after applying the square root to the input matrix. \
-    If a matrix is passed, the transformed matrix is returned. If an AnnData object is \
-    passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the \
-    `data` object in-place and returns None.
+    The resulting matrix after applying the square root to the input matrix. If a matrix is passed, the transformed matrix is returned. If an AnnData object is passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the `data` object in-place and returns None.
 
     """
     if not isinstance(data, AnnData):
@@ -518,8 +510,8 @@ def normalize_pearson_residuals(
     layer: str | None = None,
     inplace: bool = True,
 ) -> Union[cp.ndarray, None]:  # noqa: UP007
-    """\
-    Applies analytic Pearson residual normalization :cite:p:`Lause2021`.
+    """Applies analytic Pearson residual normalization :cite:p:`Lause2021`.
+
     The residuals are based on a negative binomial offset model with overdispersion
     `theta` shared across genes. By default, residuals are clipped to `sqrt(n_obs)`
     and overdispersion `theta=100` is used.
@@ -557,6 +549,7 @@ def normalize_pearson_residuals(
         warnings.warn(
             "`flavor='pearson_residuals'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
     computed_on = layer if layer else "adata.X"
     settings_dict = {"theta": theta, "clip": clip, "computed_on": computed_on}

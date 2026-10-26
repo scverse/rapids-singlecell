@@ -125,9 +125,7 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: Literal[True]) -> cp.nd
 
 
 def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.ndarray | tuple[cp.ndarray, cp.ndarray]:
-    """
-    Computes the mean and the covariance of matrix X of
-    the form Cov(X, X) = E(XX) - E(X)E(X)
+    """Computes the mean and the covariance of matrix X of the form Cov(X, X) = E(XX) - E(X)E(X)
 
     This is a temporary fix for
     cuml issue #5475 and cupy issue #7699,
@@ -136,7 +134,6 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.nda
 
     Parameters
     ----------
-
     x : cupyx.scipy.sparse of size (m, n)
     return_gram : boolean (default = False)
         If True, gram matrix of the form (1 / n) * X.T.dot(X)
@@ -152,7 +149,6 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.nda
 
     Returns
     -------
-
     result : cov(X, X) when return_gram and return_mean are False
             cov(X, X), gram(X, X) when return_gram is True,
             return_mean is False
@@ -161,7 +157,6 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.nda
             cov(X, X), gram(X, X), mean(X), mean(X)
             when return_gram is True and return_mean is True
     """
-
     gram_matrix = _create_gram_matrix(x)
 
     if return_gram:

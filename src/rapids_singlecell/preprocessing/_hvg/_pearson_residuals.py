@@ -30,8 +30,8 @@ def _highly_variable_pearson_residuals(
     check_values: bool = True,
     layer: str | None = None,
 ):
-    """
-    Select highly variable genes using analytic Pearson residuals.
+    """Select highly variable genes using analytic Pearson residuals.
+
     Pearson residuals of a negative binomial offset model are computed
     (with overdispersion `theta` shared across genes). By default, overdispersion
     `theta=100` is used and residuals are clipped to `sqrt(n_obs)`. Finally, genes
@@ -44,12 +44,14 @@ def _highly_variable_pearson_residuals(
         warnings.warn(
             "`flavor='pearson_residuals'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
     if n_top_genes is None:
         n_top_genes = 2000
         warnings.warn(
             "`flavor='pearson_residuals'` expects `n_top_genes`  to be defined, defaulting to 2000 HVGs",
             UserWarning,
+            stacklevel=2,
         )
     if theta <= 0:
         raise ValueError("Pearson residuals require theta > 0")

@@ -69,8 +69,7 @@ def umap(
     neighbors_key: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
-    """\
-    Embed the neighborhood graph using UMAP :cite:p:`McInnes2018` :cite:p:`Nolet2021`.
+    r"""Embed the neighborhood graph using UMAP :cite:p:`McInnes2018` :cite:p:`Nolet2021`.
 
     UMAP (Uniform Manifold Approximation and Projection) is a manifold learning
     technique suitable for visualizing high-dimensional data. Besides tending to
@@ -133,11 +132,11 @@ def umap(
         `spread`.
     key_added
         If not specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\\ `['X_umap']` and the the parameters in
-        :attr:`~anndata.AnnData.uns`\\ `['umap']`.
+        :attr:`~anndata.AnnData.obsm`\ `['X_umap']` and the the parameters in
+        :attr:`~anndata.AnnData.uns`\ `['umap']`.
         If specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\\ ``[key_added]`` and the the parameters in
-        :attr:`~anndata.AnnData.uns`\\ ``[key_added]``.
+        :attr:`~anndata.AnnData.obsm`\ ``[key_added]`` and the the parameters in
+        :attr:`~anndata.AnnData.uns`\ ``[key_added]``.
     neighbors_key
         If not specified, umap looks .uns['neighbors'] for neighbors settings
         and .obsp['connectivities'] for connectivities
@@ -156,7 +155,6 @@ def umap(
         `adata.uns['umap' | key_added]['params']` : :class:`dict`
             UMAP parameters `a`, `b`, and `random_state` (if specified).
     """
-
     # a seed forces cuML's slower deterministic optimizer
     unseeded = rng is None or (isinstance(rng, _LegacyRng) and rng.arg is None)
     rng = np.random.default_rng(rng)
