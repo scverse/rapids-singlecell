@@ -5,9 +5,6 @@ default_stages:
   - pre-commit
   - pre-push
 minimum_pre_commit_version: 2.16.0
-ci:
-  # pre-commit.ci has no hatch; mypy runs in the autofix.ci workflow instead
-  skip: [mypy]
 repos:
   - repo: https://github.com/biomejs/pre-commit
     rev: v2.6.2
@@ -25,7 +22,7 @@ repos:
     rev: v1.9.6
     hooks:
       - id: tombi-format
-        # pre-commit.ci has no network; our files don't need SchemaStore schemas
+        # our files don't need SchemaStore schemas, so skip fetching them
         args: [--offline]
         exclude: ^pyproject\.toml$
         groups: [format]
