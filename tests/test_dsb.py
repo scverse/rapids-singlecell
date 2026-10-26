@@ -53,11 +53,13 @@ CONFIGS = {
             "isotype_controls": ISOTYPES,
             "pseudocount": 5,
             "scale_factor": "mean_subtract",
-            "quantile_clipping": True,
+            "quantile_clip": (0.001, 0.9995),
         },
         True,
     ),
     "negative": ({"isotype_controls": ISOTYPES}, False),
+    "no_isotypes": ({"use_isotype_controls": False}, True),
+    "negative_no_isotypes": ({"use_isotype_controls": False}, False),
 }
 
 
@@ -152,7 +154,7 @@ def test_layer_and_key_added(counts):
 def test_copy_leaves_input(counts):
     cells, empty = counts
     before = cells.X.copy()
-    res = rsc.pp.dsb(cells, empty, copy=True)
+    res = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, copy=True)
     assert res is not cells
     np.testing.assert_array_equal(cells.X, before)
     assert "dsb_ambient_mean" not in cells.var
@@ -166,7 +168,7 @@ def test_empty_protein_order(counts):
         res = rsc.pp.dsb(cells, shuffled, isotype_controls=ISOTYPES, copy=True)
     np.testing.assert_allclose(res.X, expected, rtol=0, atol=1e-12)
     with pytest.raises(ValueError, match="different proteins"):
-        rsc.pp.dsb(cells, empty[:, 1:].copy(), copy=True)
+        rsc.pp.dsb(cells, empty[:, 1:].copy(), isotype_controls=ISOTYPES, copy=True)
 
 
 def test_invalid_arguments(counts):
@@ -175,8 +177,65 @@ def test_invalid_arguments(counts):
         rsc.pp.dsb(cells, empty, isotype_controls=["nope"], copy=True)
     with pytest.raises(ValueError, match="scale_factor"):
         rsc.pp.dsb(cells, empty, scale_factor="scale", copy=True)
-    with pytest.warns(UserWarning, match="isotype controls"):
+    with pytest.raises(ValueError, match="Set `isotype_controls`"):
         rsc.pp.dsb(cells, empty, copy=True)
+    with pytest.raises(ValueError, match="not both"):
+        rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, use_isotype_controls=False)
+    with pytest.raises(ValueError, match="only applies with `adata_empty`"):
+        rsc.pp.dsb(cells, scale_factor="mean_subtract", isotype_controls=ISOTYPES)
+    with pytest.raises(ValueError, match="fast_km"):
+        rsc.pp.dsb(cells, empty, fast_km=True, denoise_counts=False)
+    with pytest.raises(ValueError, match="pseudocount"):
+        rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, pseudocount=0)
+    with pytest.raises(ValueError, match="quantile_clip"):
+        rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, quantile_clip=(0.5, 0.1))
+    with pytest.raises(ValueError, match="at least 2 cells"):
+        rsc.pp.dsb(cells[:1].copy(), empty, isotype_controls=ISOTYPES)
+    with pytest.raises(ValueError, match="at least 2 empty"):
+        rsc.pp.dsb(cells, empty[:1].copy(), isotype_controls=ISOTYPES)
+    with pytest.raises(ValueError, match="no layer"):
+        rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, layer="raw")
+
+
+def test_isotype_inputs(counts):
+    cells, empty = counts
+    expected = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES[:1], copy=True).X
+    res = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES[0], copy=True)
+    np.testing.assert_array_equal(res.X, expected)
+
+
+@pytest.mark.parametrize("case", ["negative", "nan", "duplicates"])
+def test_invalid_counts(counts, case):
+    cells, empty = counts
+    a = cells.copy()
+    if case == "duplicates":
+        a.var_names = [a.var_names[0]] * a.n_vars
+        match = "not unique"
+    else:
+        a.X[0, 0] = -1 if case == "negative" else np.nan
+        match = "raw counts"
+    with pytest.raises(ValueError, match=match):
+        rsc.pp.dsb(a, empty, isotype_controls=ISOTYPES)
+
+
+def test_constant_inputs(counts):
+    cells, empty = counts
+    e = empty.copy()
+    e.X[:, 0] = 3
+    with pytest.raises(ValueError, match="same count in every empty"):
+        rsc.pp.dsb(cells, e, isotype_controls=ISOTYPES)
+    c = cells.copy()
+    c.X[:] = c.X[0]
+    with pytest.raises(ValueError, match="technical component, constant"):
+        rsc.pp.dsb(c, empty, isotype_controls=ISOTYPES)
+
+
+def test_stats_are_reset(counts):
+    cells, empty = counts
+    a = cells.copy()
+    rsc.pp.dsb(a, empty, isotype_controls=ISOTYPES, key_added="x")
+    rsc.pp.dsb(a, None, isotype_controls=ISOTYPES, key_added="x")
+    assert "dsb_ambient_sd" not in a.var
 
 
 def test_fast_km_is_optimal_two_means(counts):
@@ -337,7 +396,7 @@ def test_constant_technical_component(counts):
     same = AnnData(np.repeat(cells.X[:1], 20, axis=0), var=cells.var)
     expected = rsc.pp.dsb(same, empty, denoise_counts=False, copy=True).X
     with pytest.warns(UserWarning, match="technical component is constant"):
-        res = rsc.pp.dsb(same, empty, isotype_controls=None, copy=True)
+        res = rsc.pp.dsb(same, empty, use_isotype_controls=False, copy=True)
     np.testing.assert_array_equal(res.X, expected)
 
 

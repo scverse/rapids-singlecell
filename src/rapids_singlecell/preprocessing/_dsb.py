@@ -9,7 +9,7 @@ or R stats source was consulted):
   Scrucca et al. 2016).
 * ``limma::removeBatchEffect(x, covariates = v)`` (Ritchie et al. 2015):
   per-protein least squares on ``[1, v]``, subtracting slope times the
-  *uncentered* ``v``.
+  *centered* ``v`` (limma >= 3.66).
 * ``prcomp(scale. = TRUE)`` and ``quantile`` (type 7): standard definitions.
 """
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 import cupy as cp
 import numpy as np
@@ -28,7 +28,7 @@ from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable
 
     from anndata import AnnData
 
@@ -38,19 +38,22 @@ _SUBSET = 2000  # Mclust starts longer vectors from a random subset this size
 # EM iteration cap (R has none); only a guard against fits that never converge
 _MAX_ITER = {np.dtype(np.float64): 100_000, np.dtype(np.float32): 10_000}
 _ISOTYPE_PATTERN = re.compile(r"sotype|Iso|iso|control|CTRL|ctrl|Ctrl|ontrol")
+_ScaleFactor = Literal["standardize", "mean_subtract"]
+_VAR_KEYS = ("dsb_ambient_mean", "dsb_ambient_sd")
+_OBS_KEYS = ("dsb_cell_background_mean", "dsb_technical_component")
 
 
 def dsb(
     adata: AnnData,
     adata_empty: AnnData | None = None,
     *,
-    isotype_controls: Sequence[str] | None = None,
+    isotype_controls: str | Iterable[str] | None = None,
+    use_isotype_controls: bool = True,
     denoise_counts: bool = True,
     pseudocount: float | None = None,
-    scale_factor: Literal["standardize", "mean_subtract"] = "standardize",
+    scale_factor: _ScaleFactor = "standardize",
     fast_km: bool = False,
-    quantile_clipping: bool = False,
-    quantile_clip: tuple[float, float] = (0.001, 0.9995),
+    quantile_clip: tuple[float, float] | None = None,
     layer: str | None = None,
     key_added: str | None = None,
     dtype: type = np.float64,
@@ -88,10 +91,12 @@ def dsb(
         Raw ADT counts of empty droplets with the same proteins. If `None`,
         the background is estimated from the cells.
     isotype_controls
-        Names of isotype control proteins in `adata.var_names` for step 2. If
-        `None`, only the per-cell background mean is regressed out.
+        Name(s) of isotype control proteins in `adata.var_names` for step 2.
+    use_isotype_controls
+        Use `isotype_controls` in step 2, as recommended by dsb. If `False`, only
+        the per-cell background mean is regressed out.
     denoise_counts
-        Run step 2. If `False`, `isotype_controls` is ignored.
+        Run step 2.
     pseudocount
         Added before log transformation. Defaults to 10 with `adata_empty` and
         1 without, as in dsb.
@@ -101,10 +106,9 @@ def dsb(
         Use the lower center of a two-cluster k-means as per-cell background.
         R's ``kmeans(nstart = 5)`` depends on random starts; here the exact
         optimum of the one-dimensional problem is computed.
-    quantile_clipping
-        Clip every protein to its `quantile_clip` quantiles (type 7).
     quantile_clip
-        Lower and upper quantiles for `quantile_clipping`.
+        Clip every protein to these lower and upper quantiles (type 7) of its
+        normalized values; dsb's `quantile.clipping` uses `(0.001, 0.9995)`.
     layer
         Layer with the counts in `adata` and `adata_empty`; `.X` if `None`.
     key_added
@@ -118,8 +122,8 @@ def dsb(
         cell's background estimate.
 
         Where R would fail, rsc warns and continues: a cell whose mixture fit
-        is singular in both models (R errors) gets the mean of its values
-        below the start split as background, and EM stops after 100,000
+        is singular in both models (R errors) gets the lower center of a
+        two-cluster k-means as background, and EM stops after 100,000
         (float64) or 10,000 (float32) iterations (R has no limit).
     rng
         Random number generator for the subsampled fits of long vectors.
@@ -128,13 +132,15 @@ def dsb(
 
     Returns
     -------
-    Returns `adata` if `copy=True`, else updates it and sets:
+    Returns `adata` if `copy=True`, else updates it and sets the following.
+    Statistics of earlier calls are removed.
 
     `.X` or `.layers[layer | key_added]`
         dsb normalized values (dense, `dtype`, on the device of the input).
     `.var['dsb_ambient_mean']`
         Per-protein background mean of ``log(counts + pseudocount)``: empty
-        droplet mean, or first mixture component without `adata_empty`.
+        droplet mean, or first mixture component without `adata_empty` (0 for
+        proteins whose fit failed).
     `.var['dsb_ambient_sd']`
         Empty droplet standard deviation (only with `adata_empty`).
     `.obs['dsb_cell_background_mean']`
@@ -143,43 +149,68 @@ def dsb(
         Covariate regressed out in step 2 (only with `denoise_counts`). Its sign
         is arbitrary in R; here it increases with the background mean.
     """
-    if scale_factor not in ("standardize", "mean_subtract"):
-        raise ValueError("`scale_factor` must be 'standardize' or 'mean_subtract'.")
+    if scale_factor not in (vals := get_args(_ScaleFactor)):
+        raise ValueError(
+            f"`scale_factor` must be one of {list(vals)}, got {scale_factor!r}."
+        )
+    if adata_empty is None and scale_factor != "standardize":
+        raise ValueError("`scale_factor` only applies with `adata_empty`.")
+    if fast_km and not denoise_counts:
+        raise ValueError("`fast_km` only applies with `denoise_counts=True`.")
     dtype = np.dtype(dtype)
     if dtype not in (np.float32, np.float64):
         raise ValueError("`dtype` must be float32 or float64.")
-    rng = np.random.default_rng(rng)
-    proteins = adata.var_names
-    X_in = _get_obs_rep(adata, layer=layer)
-    on_gpu = isinstance(X_in, cp.ndarray) or cpsparse.issparse(X_in)
     if pseudocount is None:
         pseudocount = 1 if adata_empty is None else 10
-    adt_log = cp.log(_dense_gpu(X_in, dtype) + dtype.type(pseudocount))
-
-    iso_idx = None
-    if denoise_counts and isotype_controls is not None:
-        missing = [p for p in isotype_controls if p not in proteins]
-        if missing:
-            raise ValueError(
-                f"isotype controls not found in `adata.var_names`: {missing}"
-            )
-        iso_idx = proteins.get_indexer(list(isotype_controls))
-    elif denoise_counts:
-        detected = [p for p in proteins if _ISOTYPE_PATTERN.search(p)]
-        warnings.warn(
-            "Denoising without `isotype_controls` is not recommended when "
-            f"isotype controls are available. Potential isotype controls: {detected}",
-            UserWarning,
-            stacklevel=2,
+    if not pseudocount > 0:
+        raise ValueError(f"`pseudocount` must be positive, got {pseudocount}.")
+    if quantile_clip is not None and not 0 <= quantile_clip[0] < quantile_clip[1] <= 1:
+        raise ValueError(
+            f"`quantile_clip` must be increasing quantiles in [0, 1], got {quantile_clip}."
         )
+    proteins = adata.var_names
+    if not proteins.is_unique:
+        raise ValueError(
+            f"`adata.var_names` are not unique: {list(proteins[proteins.duplicated()])}"
+        )
+    iso_idx = _isotype_indices(
+        proteins,
+        isotype_controls,
+        use_isotype_controls=use_isotype_controls,
+        required=denoise_counts,
+    )
+    if adata.n_obs < 2 or (denoise_counts and adata.n_vars < 2):
+        raise ValueError(
+            "dsb needs at least 2 cells, and 2 proteins with `denoise_counts`."
+        )
+    if adata_empty is not None:
+        adata_empty = _match_proteins(adata_empty, proteins)
+        if adata_empty.n_obs < 2:
+            raise ValueError("`adata_empty` needs at least 2 empty droplets.")
+        if layer is not None and layer not in adata_empty.layers:
+            raise ValueError(f"`adata_empty` has no layer {layer!r}.")
+    rng = np.random.default_rng(rng)
+    X_in = _get_obs_rep(adata, layer=layer)
+    on_gpu = isinstance(X_in, cp.ndarray) or cpsparse.issparse(X_in)
+    counts = _dense_gpu(X_in, dtype)
+    _check_counts(counts, "adata")
+    adt_log = cp.log(counts + dtype.type(pseudocount))
+    del counts
 
     var_stats = {}
     if adata_empty is not None:
-        empty = _get_obs_rep(_match_proteins(adata_empty, proteins), layer=layer)
-        empty_log = cp.log(_dense_gpu(empty, dtype) + dtype.type(pseudocount))
+        empty = _dense_gpu(_get_obs_rep(adata_empty, layer=layer), dtype)
+        _check_counts(empty, "adata_empty")
+        empty_log = cp.log(empty + dtype.type(pseudocount))
         mean, sd = empty_log.mean(axis=0), empty_log.std(axis=0, ddof=1)
         var_stats = {"dsb_ambient_mean": mean, "dsb_ambient_sd": sd}
         if scale_factor == "standardize":
+            constant = cp.asnumpy(empty.min(axis=0) == empty.max(axis=0))
+            if constant.any():
+                raise ValueError(
+                    "Proteins with the same count in every empty droplet cannot be "
+                    f"standardized; remove them from both objects: {list(proteins[constant])}"
+                )
             low = cp.asnumpy(sd < 0.05)
             if low.any():
                 warnings.warn(
@@ -218,21 +249,29 @@ def dsb(
             if bool(failed.any()):
                 warnings.warn(
                     f"The mixture model could not be fit for {int(failed.sum())} "
-                    "cells; using the mean of their lower values instead.",
+                    "cells; using the lower k-means center of their values instead.",
                     UserWarning,
                     stacklevel=2,
                 )
-            background = cp.where(failed, _lower_mean(norm, fit.q), fit.params[:, 0])
+            background = fit.params[:, 0].copy()
+            if bool(failed.any()):
+                background[failed] = _kmeans_low_centers(norm[failed])
         technical = background
         if iso_idx is not None:
-            technical = _first_pc_scores(
-                cp.concatenate([norm[:, iso_idx], background[:, None]], axis=1)
-            )
-        # limma::removeBatchEffect: subtract the slope times the uncentered v;
-        # a constant covariate leaves the data unchanged
+            noise = cp.concatenate([norm[:, iso_idx], background[:, None]], axis=1)
+            constant = cp.asnumpy(noise.min(axis=0) == noise.max(axis=0))
+            if constant.any():
+                names = [*proteins[iso_idx], "cell background mean"]
+                raise ValueError(
+                    "Cannot standardize the technical component, constant across "
+                    f"cells: {[n for n, c in zip(names, constant, strict=True) if c]}"
+                )
+            technical = _first_pc_scores(noise)
+        # limma::removeBatchEffect (>= 3.66) centers the covariate: subtract the
+        # slope times the centered v; a constant covariate leaves the data unchanged
         vc = technical - technical.mean()
         if float(vc @ vc) > 0:
-            norm -= technical[:, None] * ((vc @ norm) / (vc @ vc))
+            norm -= vc[:, None] * ((vc @ norm) / (vc @ vc))
         else:
             warnings.warn(
                 "The technical component is constant; step 2 leaves the data "
@@ -245,12 +284,16 @@ def dsb(
             "dsb_technical_component": technical,
         }
 
-    if quantile_clipping:
+    if quantile_clip is not None:
         q = cp.quantile(norm, cp.asarray(quantile_clip, dtype=dtype), axis=0)
         norm = cp.clip(norm, q[0], q[1])
 
     if copy:
         adata = adata.copy()
+    elif adata.is_view:
+        adata._init_as_actual(adata.copy())
+    adata.var.drop(columns=[k for k in _VAR_KEYS if k in adata.var], inplace=True)
+    adata.obs.drop(columns=[k for k in _OBS_KEYS if k in adata.obs], inplace=True)
     out = norm if on_gpu else cp.asnumpy(norm)
     if key_added is None:
         _set_obs_rep(adata, out, layer=layer)
@@ -261,6 +304,40 @@ def dsb(
     for key, val in obs_stats.items():
         adata.obs[key] = cp.asnumpy(val)
     return adata if copy else None
+
+
+def _isotype_indices(
+    proteins, isotype_controls, *, use_isotype_controls: bool, required: bool
+):
+    if isinstance(isotype_controls, str):
+        isotype_controls = [isotype_controls]
+    elif isotype_controls is not None:
+        isotype_controls = list(isotype_controls)
+    if isotype_controls:
+        if not use_isotype_controls:
+            raise ValueError(
+                "Pass `isotype_controls` or `use_isotype_controls=False`, not both."
+            )
+        if missing := [p for p in isotype_controls if p not in proteins]:
+            raise ValueError(
+                f"isotype controls not found in `adata.var_names`: {missing}"
+            )
+        return proteins.get_indexer(isotype_controls)
+    if required and use_isotype_controls:
+        detected = [p for p in proteins if _ISOTYPE_PATTERN.search(p)]
+        raise ValueError(
+            "Set `isotype_controls` to the names of the isotype controls, or "
+            "`use_isotype_controls=False` to regress out only the per-cell "
+            f"background (not recommended). Potential isotype controls: {detected}"
+        )
+    return None
+
+
+def _check_counts(x: cp.ndarray, name: str) -> None:
+    if not bool(cp.isfinite(x).all() and (x >= 0).all()):
+        raise ValueError(
+            f"`{name}` must contain raw counts: finite and non-negative values."
+        )
 
 
 def _dense_gpu(X, dtype: np.dtype) -> cp.ndarray:
@@ -282,10 +359,16 @@ def _match_proteins(adata_empty: AnnData, proteins) -> AnnData:
     names = adata_empty.var_names
     if names.equals(proteins):
         return adata_empty
-    if len(names) != len(proteins) or set(names) != set(proteins):
+    if (
+        not names.is_unique
+        or len(names) != len(proteins)
+        or set(names) != set(proteins)
+    ):
         diff = sorted(set(names).symmetric_difference(proteins))
+        dup = list(names[names.duplicated()])
         raise ValueError(
-            f"`adata` and `adata_empty` have different proteins: {diff[:20]}"
+            "`adata` and `adata_empty` have different proteins: "
+            f"{diff[:20]}{f', duplicated: {dup[:20]}' if dup else ''}"
         )
     warnings.warn(
         "Reordered the proteins of `adata_empty` to match `adata`.",
@@ -342,13 +425,6 @@ def _mixture_fits(M: cp.ndarray, rng: np.random.Generator) -> _MixtureFit:
             stacklevel=3,
         )
     return _MixtureFit(params, status, q)
-
-
-def _lower_mean(M: cp.ndarray, q: cp.ndarray) -> cp.ndarray:
-    """Mean of the values below the start split (fallback background)."""
-    below = M < q[:, None]
-    mean = cp.where(below, M, 0).sum(axis=1) / cp.maximum(below.sum(axis=1), 1)
-    return cp.where(below.any(axis=1), mean, M.mean(axis=1)).astype(M.dtype)
 
 
 def _kmeans_low_centers(M: cp.ndarray) -> cp.ndarray:

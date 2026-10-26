@@ -1,8 +1,10 @@
 # Reference values for tests/test_dsb.py from the dsb R package (2.0.1,
-# mclust 6.1.3, limma 3.62). Uses a subset of the example data shipped with
-# dsb (CC0 / public domain).
+# mclust 6.1.3, limma >= 3.66, which centers the covariates of
+# removeBatchEffect). Uses a subset of the example data shipped with dsb
+# (CC0 / public domain).
 #   Rscript tests/_scripts/dsb_reference.R tests/_data/dsb
 suppressPackageStartupMessages(library(dsb))
+stopifnot(packageVersion("limma") >= "3.66.0")
 out <- commandArgs(trailingOnly = TRUE)[1]
 dir.create(out, recursive = TRUE, showWarnings = FALSE)
 cells <- dsb::cells_citeseq_mtx[, 1:100]
@@ -26,3 +28,8 @@ r <- quiet(DSBNormalizeProtein(cells, empty, isotype.control.name.vec = iso,
 w(t(r), "meansub_clip")
 r <- quiet(ModelNegativeADTnorm(cells, isotype.control.name.vec = iso))
 w(t(r), "negative")
+# without isotype controls, step 2 depends on the covariate centering
+r <- quiet(DSBNormalizeProtein(cells, empty, use.isotype.control = FALSE))
+w(t(r), "no_isotypes")
+r <- quiet(ModelNegativeADTnorm(cells, use.isotype.control = FALSE))
+w(t(r), "negative_no_isotypes")
