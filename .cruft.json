@@ -13,7 +13,7 @@
       "github_repo": "rapids-singlecell",
       "license": "MIT License",
       "ide_integration": false,
-      "issue_categorization": "labels",
+      "issue_categorization": "issue types",
       "_copy_without_render": [
         ".github/workflows/build.yaml",
         ".github/workflows/test.yaml",
