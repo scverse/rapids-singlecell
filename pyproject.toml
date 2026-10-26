@@ -73,18 +73,14 @@ test = [
 ]
 docs = [
   "dask",
-  "myst-nb",
   "nbsphinx>=0.8.12",
   "pytest",
-  "scanpydoc[theme,typehints]>=0.9.4",
+  "scverse-doc[full]>=0.3",
   "scverse-misc[sphinx]>=0.1.3",
   "spatialdata>=0.7.2",
-  "sphinx>=4.5",
-  "sphinx-copybutton",
-  "sphinx-design",
-  "sphinx-tabs",
+  "sphinx>=8.1",
+  "sphinx-autodoc-typehints",
   "sphinxcontrib-bibtex",
-  "sphinxext-opengraph",
 ]
 test-minimal = [
   "anyio",
