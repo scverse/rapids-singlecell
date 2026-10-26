@@ -25,6 +25,8 @@ repos:
     rev: v1.9.6
     hooks:
       - id: tombi-format
+        # pre-commit.ci has no network; our files don't need SchemaStore schemas
+        args: [--offline]
         exclude: ^pyproject\.toml$
         groups: [format]
   - repo: https://github.com/astral-sh/ruff-pre-commit
