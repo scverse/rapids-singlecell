@@ -52,15 +52,11 @@ rapids-cu12 = [
 
 [dependency-groups]
 docs = [
-    "sphinx>=4.5.0",
-    "sphinx-copybutton",
+    "sphinx>=8.1",
     "nbsphinx>=0.8.12",
-    "myst-nb",
-    "sphinx-design",
-    "sphinx-tabs",
-    "sphinxext-opengraph",
     "sphinxcontrib.bibtex",
-    "scanpydoc[typehints,theme]>=0.9.4",
+    "scverse-doc[full]>=0.3",
+    "sphinx-autodoc-typehints",
     "scverse-misc[sphinx]>=0.1.3",
     "dask",
     "pytest",

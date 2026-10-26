@@ -19,14 +19,8 @@ dl.citation > dt {
 	font-size: 70% !important;
 }
 
-/* RSC colors are
-#7400ff - violet
-#76b900 - green
-#4169e1 - blue
-*/
-
-p.caption .caption-text {
-    color: #7400ff;
-    font-weight: 600;
-    text-transform: uppercase;
+/* scverse-doc mixes the link hover colour towards the (near-white) text colour,
+   which greys out the accent in dark mode. Brighten it instead, keeping chroma and hue. */
+html[data-theme="dark"] {
+	--pst-color-primary-highlight: oklch(from var(--scverse-color-accent-text) calc(l + 0.08) c h);
 }
