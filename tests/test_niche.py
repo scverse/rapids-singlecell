@@ -277,6 +277,24 @@ def test_determinism_utag_same_seed(adata):
     )
 
 
+@pytest.mark.parametrize("to_sparse", [False, True])
+def test_utag_unexpressed_gene(adata, to_sparse):
+    """An all-zero gene (common in large panels) carries no variance and must not break PCA."""
+    a1, a2 = adata[:, 1:].copy(), adata.copy()
+    X = np.asarray(a2.X.todense() if sparse.issparse(a2.X) else a2.X, dtype=np.float32)
+    X[:, 0] = 0
+    a1.X = X[:, 1:]
+    a2.X = sparse.csr_matrix(X) if to_sparse else X
+    for a in (a1, a2):
+        calculate_niche(
+            a, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7
+        )
+    np.testing.assert_array_equal(
+        a1.obs["utag_niche_res=0.5"].astype(str).values,
+        a2.obs["utag_niche_res=0.5"].astype(str).values,
+    )
+
+
 def test_unknown_flavor_raises(adata):
     with pytest.raises(ValueError, match="Unknown flavor"):
         calculate_niche(adata, flavor="bogus", n_neighbors=10, resolutions=0.5)

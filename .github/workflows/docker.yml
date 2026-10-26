@@ -46,7 +46,7 @@ jobs:
     strategy:
       matrix:
         RAPIDS_VER:
-          - "26.08"
+          - "26.10"
         CUDA_SUFFIX:
           - { ver: "12.9.1", label: "cuda12", pkg: "cu12" }
           - { ver: "13.3.0", label: "cuda13", pkg: "cu13" }

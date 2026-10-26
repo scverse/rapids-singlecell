@@ -80,7 +80,6 @@ autodoc_mock_imports = [
     "cupy",
     "cupyx",
     "pylibraft",
-    "dask",
     "cuvs",
 ]
 default_role = "literal"
@@ -185,6 +184,7 @@ qualname_overrides = {
     # builds the target as <annotation module>.<type qualname> -- a name numpy does not
     # document. Same treatment as anndata gives the pre-2.5 spelling of this alias.
     "numpy._typing._array_like.GenericAlias": ("py:data", "numpy.typing.NDArray"),
+    "spatialdata._core.spatialdata.SpatialData": "spatialdata.SpatialData",
 }
 
 nitpick_ignore = [
@@ -196,6 +196,7 @@ nitpick_ignore = [
     ("py:class", "anndata._core.raw.Raw"),
     ("py:class", "scanpy._utils.Empty"),
     ("py:class", "rapids_singlecell._settings.Default"),
+    ("py:class", "rapids_singlecell.pertpy_gpu._distance.MeanVar"),
     *[
         ("py:class", f"rapids_singlecell._settings.{cls}Preset")
         for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes"]

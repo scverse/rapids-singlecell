@@ -66,11 +66,11 @@ The preflight is disposable, so configure RMM again at the start of the notebook
 ````{tip}
 If the agent only has the skill but RSC is not installed yet, create a fresh environment
 from the matching definition on `main`
-([CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda13.yml),
-[CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda12.yml)):
+([CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.10_cuda13.yml),
+[CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.10_cuda12.yml)):
 
 ```bash
 CONDA_CHANNEL_PRIORITY=flexible mamba env create --name rsc \
-  --file /path/to/rsc_rapids_26.08_cuda13.yml
+  --file /path/to/rsc_rapids_26.10_cuda13.yml
 ```
 ````

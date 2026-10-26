@@ -167,3 +167,35 @@ def test_perm_function(mat, adjmat):
     )
     assert np.isfinite(nes.get()).all()
     assert ((0 <= pv.get()) & (pv.get() <= 1)).all()
+
+
+def test_waggr_pvalues():
+    """P-values grow as |ES| shrinks relative to the permuted scores (#854)."""
+    rng = np.random.default_rng(0)
+    nvar, times = 200, 1000
+    mat = rng.normal(size=(1, nvar))
+    adj = np.zeros((nvar, 2))
+    # Score of exactly 0: no evidence of enrichment
+    mat[0, :2] = 5.0
+    adj[:2, 0] = [1.0, -1.0]
+    # Strongly enriched set
+    mat[0, 50:70] += 3.0
+    adj[50:70, 1] = 1.0
+    es, pv = dc._method_waggr._func_waggr(
+        mat=cp.array(mat), adj=cp.array(adj), fun="wmean", times=times, seed=42
+    )
+    assert pv[0, 0] > 0.5
+    assert pv[0, 1] == pytest.approx(1 / (times + 1))
+
+    # A constant score is never more extreme than its permutations
+    def waggr_const_zero(x, w):
+        return cp.zeros((x.shape[0], w.shape[1]), dtype=x.dtype)
+
+    es, pv = dc._method_waggr._func_waggr(
+        mat=cp.array(mat),
+        adj=cp.array(adj),
+        fun=waggr_const_zero,
+        times=times,
+        seed=42,
+    )
+    assert (pv == 1).all()

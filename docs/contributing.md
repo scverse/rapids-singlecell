@@ -6,7 +6,7 @@
 
 - NVIDIA GPU with CUDA support
 - [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
-- A CUDA-X Data Science environment (e.g., conda `rapids-26.08` or pip-installed CUDA-X Data Science)
+- A CUDA-X Data Science environment (e.g., conda `rapids-26.10` or pip-installed CUDA-X Data Science)
 - CUDA toolkit for building from source
 
 ```{note}

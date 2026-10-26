@@ -18,6 +18,7 @@ notebooks/04_squidpy
 notebooks/05_pertpy
 notebooks/06_out-of-core
 notebooks/07_multi_gpu
+notebooks/08_atera_demo
 notebooks/brain_1M
 notebooks/ligrec_benchmark
 ```

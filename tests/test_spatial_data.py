@@ -167,6 +167,9 @@ _DOWNSTREAM = [
             "multi_gpu": False,
         },
     ),
+    ("ripley", {"cluster_key": "cluster", "mode": "G", "n_neigh": 1, "rng": 0}),
+    ("interaction_matrix", {"cluster_key": "cluster", "weights": True}),
+    ("nhood_enrichment", {"cluster_key": "cluster", "n_perms": 20, "seed": 0}),
     (
         "ligrec",
         {
@@ -220,11 +223,25 @@ def test_downstream_spatialdata(sdata, name, kwargs, copy):
             actual if copy else table.uns["moranI"],
             expected if copy else reference.uns["moranI"],
         )
+    elif name == "ripley":
+        a = actual if copy else table.uns["cluster_ripley_G"]
+        b = expected if copy else reference.uns["cluster_ripley_G"]
+        pd.testing.assert_frame_equal(a["G_stat"], b["G_stat"])
+        pd.testing.assert_frame_equal(a["sims_stat"], b["sims_stat"])
     elif name == "co_occurrence":
         a = actual if copy else table.uns["cluster_co_occurrence"].values()
         b = expected if copy else reference.uns["cluster_co_occurrence"].values()
         for x, y in zip(a, b, strict=True):
             np.testing.assert_allclose(x, y)
+    elif name == "interaction_matrix":
+        a = actual if copy else table.uns["cluster_interactions"]
+        b = expected if copy else reference.uns["cluster_interactions"]
+        np.testing.assert_array_equal(a, b)
+    elif name == "nhood_enrichment":
+        a = actual if copy else table.uns["cluster_nhood_enrichment"].values()
+        b = expected if copy else reference.uns["cluster_nhood_enrichment"].values()
+        for x, y in zip(a, b, strict=True):
+            np.testing.assert_array_equal(x, y)
     else:
         a = actual if copy else table.uns["cluster_ligrec"]
         b = expected if copy else reference.uns["cluster_ligrec"]

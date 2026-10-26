@@ -6,7 +6,7 @@ import cupy as cp
 import numpy as np
 import pytest
 from anndata import read_h5ad
-from scipy import sparse
+from scipy import sparse, stats
 
 from rapids_singlecell.gr import spatial_autocorr
 
@@ -293,3 +293,26 @@ def test_autocorr_permutation_shape(mode, n_perms, use_sparse):
     assert perms.shape == (n_perms, n_genes), (
         f"Expected ({n_perms}, {n_genes}), got {perms.shape}"
     )
+
+
+@pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
+def test_autocorr_analytic_variance(mode, stat):
+    """Analytic variance follows Cliff & Ord 1981 for each statistic (esda Moran/Geary)."""
+    adata = read_h5ad(Path(__file__).parent / Path("_data/dummy.h5ad"))
+    w = sparse.csr_matrix(adata.obsp["spatial_connectivities"], dtype=np.float64)
+    n, s0 = w.shape[0], w.sum()
+    s1 = (w + w.T).multiply(w + w.T).sum() / 2
+    deg = np.asarray(w.sum(0)).ravel() + np.asarray(w.sum(1)).ravel()
+    s2 = deg @ deg
+    if mode == "moran":
+        var = (n * n * s1 - n * s2 + 3 * s0**2) / ((n * n - 1) * s0**2)
+        var -= 1 / (n - 1) ** 2
+    else:
+        var = ((2 * s1 + s2) * (n - 1) - 4 * s0**2) / (2 * (n + 1) * s0**2)
+    df = spatial_autocorr(
+        adata, mode=mode, transformation=False, copy=True, corr_method=None
+    )
+    np.testing.assert_allclose(df["var_norm"], var, rtol=1e-10)
+    expected = -1 / (n - 1) if mode == "moran" else 1.0
+    z = (df[stat] - expected) / np.sqrt(var)
+    np.testing.assert_allclose(df["pval_norm"], stats.norm.sf(np.abs(z)), rtol=1e-6)
