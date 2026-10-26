@@ -310,7 +310,6 @@ module = [
   "rapids_singlecell.tools._draw_graph",
   "rapids_singlecell.tools._embedding_density",
   "rapids_singlecell.tools._ingest",
-  "rapids_singlecell.tools._leiden",
   "rapids_singlecell.tools._rank_genes_groups",
   "rapids_singlecell.tools._rank_genes_groups._core",
   "rapids_singlecell.tools._rank_genes_groups._logreg",
