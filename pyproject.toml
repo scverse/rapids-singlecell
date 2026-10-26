@@ -186,7 +186,7 @@ known-first-party = [ "rapids_singlecell" ]
 required-imports = [ "from __future__ import annotations" ]
 
 [tool.codespell]
-ignore-words-list = "nd"
+ignore-words-list = "nd,indext,coo,alo,clen,fo,ot,numer"
 skip = "*.ipynb,*.csv"
 
 [tool.mypy]
@@ -203,6 +203,11 @@ warn_unused_configs = true
 [[tool.mypy.overrides]]
 module = [ "cudf.*", "cuml.*", "cuvs.*", "numba.*", "pylibraft.*" ]
 ignore_missing_imports = true
+
+# scanpy has inline annotations but no py.typed marker
+[[tool.mypy.overrides]]
+module = [ "scanpy", "scanpy.*" ]
+follow_untyped_imports = true
 
 # nanobind stubs are generated at build time and absent with RSC_BUILD_EXTENSIONS=OFF
 # (when present, their overloads trip `overload-cannot-match`: not ours to fix)
@@ -305,6 +310,7 @@ module = [
   "rapids_singlecell.tools._draw_graph",
   "rapids_singlecell.tools._embedding_density",
   "rapids_singlecell.tools._ingest",
+  "rapids_singlecell.tools._leiden",
   "rapids_singlecell.tools._rank_genes_groups",
   "rapids_singlecell.tools._rank_genes_groups._core",
   "rapids_singlecell.tools._rank_genes_groups._logreg",

@@ -5,6 +5,9 @@ default_stages:
   - pre-commit
   - pre-push
 minimum_pre_commit_version: 2.16.0
+ci:
+  # pre-commit.ci has no hatch; mypy runs in the autofix.ci workflow instead
+  skip: [mypy]
 repos:
   - repo: https://github.com/biomejs/pre-commit
     rev: v2.6.2
@@ -17,11 +20,11 @@ repos:
     hooks:
       - id: pyproject-fmt
         groups: [format]
-  # pyproject.toml is formatted by pyproject-fmt, the remaining TOML files by taplo
-  - repo: https://github.com/ComPWA/taplo-pre-commit
-    rev: v0.9.3
+  # pyproject.toml is formatted by pyproject-fmt, the remaining TOML files by tombi
+  - repo: https://github.com/tombi-toml/tombi-pre-commit
+    rev: v1.9.6
     hooks:
-      - id: taplo-format
+      - id: tombi-format
         exclude: ^pyproject\.toml$
         groups: [format]
   - repo: https://github.com/astral-sh/ruff-pre-commit
