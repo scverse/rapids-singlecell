@@ -7,7 +7,8 @@
 // sums go in P pieces: GPU r adds piece r of every GPU's values, then copies
 // the others' summed pieces (2 (P-1)/P instead of P-1 times the values).
 // Sums over cells sorted by group move only each GPU's groups, and values
-// split between the GPUs only each GPU's part (allgather).
+// split between the GPUs only each GPU's part (allgather), to every GPU or
+// to one of them.
 // Integer sums are exact in any order, so all GPUs hold the bits of a
 // single-GPU run. The caller allocates all buffers.
 
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <thread>
@@ -33,6 +35,11 @@ struct Comm {
         cudaEvent_t sent[2]{}, reduced[2]{}, read[2]{};
         cudaStream_t copies{};  // see pull
         cudaEvent_t queued{}, copied{};
+        // The clustering sums a block's counts on `side` while the next block
+        // is assigned: ready once the counts are in their slot, summed once
+        // their sum is.
+        cudaStream_t side{};
+        cudaEvent_t ready[2]{}, summed[2]{};
         unsigned count = 0;
     };
     std::vector<Rank> ranks;
@@ -44,7 +51,8 @@ struct Comm {
     std::atomic<bool> aborted{false};  // a rank failed: release the others
 
     // buffers: per rank send[0], send[1] (device, or pinned host without
-    // peer copies), recv[0], recv[1] (device).
+    // peer copies), recv[0], recv[1] (device). peer: the caller validated
+    // peer copies between every two devices, which enabled peer access.
     Comm(const std::vector<int>& devices, const std::vector<uintptr_t>& buffers,
          size_t capacity, bool peer, const std::vector<size_t>& groups)
         : ranks(devices.size()),
@@ -68,18 +76,15 @@ struct Comm {
                     me.recv[s] =
                         reinterpret_cast<long long*>(buffers[4 * r + 2 + s]);
                     for (cudaEvent_t* e :
-                         {&me.sent[s], &me.reduced[s], &me.read[s]})
+                         {&me.sent[s], &me.reduced[s], &me.read[s],
+                          &me.ready[s], &me.summed[s]})
                         create(e, cudaEventCreateWithFlags,
                                cudaEventDisableTiming);
                 }
-                create(&me.copies, cudaStreamCreateWithFlags,
-                       cudaStreamNonBlocking);
+                for (cudaStream_t* s : {&me.copies, &me.side})
+                    create(s, cudaStreamCreateWithFlags, cudaStreamNonBlocking);
                 for (cudaEvent_t* e : {&me.queued, &me.copied})
                     create(e, cudaEventCreateWithFlags, cudaEventDisableTiming);
-                for (int other : devices)
-                    if (peer && other != me.device &&
-                        cudaDeviceEnablePeerAccess(other, 0) != cudaSuccess)
-                        cudaGetLastError();  // already enabled
             }
         } catch (...) {  // no destructor runs on a half-built object
             release(previous);
@@ -107,24 +112,31 @@ struct Comm {
         for (Rank& me : ranks) {
             if (!me.sent[0]) continue;  // none created on this GPU
             cudaSetDevice(me.device);
-            if (me.copies) cudaStreamDestroy(me.copies);
+            for (cudaStream_t s : {me.copies, me.side})
+                if (s) cudaStreamDestroy(s);
             for (cudaEvent_t e :
-                 {me.sent[0], me.reduced[0], me.read[0], me.sent[1],
-                  me.reduced[1], me.read[1], me.queued, me.copied})
+                 {me.sent[0], me.reduced[0], me.read[0], me.ready[0],
+                  me.summed[0], me.sent[1], me.reduced[1], me.read[1],
+                  me.ready[1], me.summed[1], me.queued, me.copied})
                 if (e) cudaEventDestroy(e);
         }
         cudaSetDevice(device);
     }
     // After a failure, other ranks may still have exchanges in flight on the
-    // buffers: wait for their GPUs before the buffers are released.
-    void synchronize() {
-        int previous;
-        cudaGetDevice(&previous);
-        for (Rank& me : ranks) {
-            cudaSetDevice(me.device);
-            cudaDeviceSynchronize();
-        }
-        cudaSetDevice(previous);
+    // buffers: wait for them before the buffers are released. All work of an
+    // exchange precedes its rank's sent, reduced or read event, and a slot's
+    // reuse waits for its previous use, so the latest of those events cover
+    // every exchange. A failed GPU may never complete them (nor the streams
+    // waiting on them): give up after `timeout` seconds.
+    void synchronize(double timeout) {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::duration<double>(timeout);
+        for (Rank& me : ranks)
+            for (cudaEvent_t e : {me.sent[0], me.reduced[0], me.read[0],
+                                  me.sent[1], me.reduced[1], me.read[1]})
+                while (e && cudaEventQuery(e) == cudaErrorNotReady &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     static void check(cudaError_t status) {
         cuda_check(status, "harmony comm");
@@ -142,6 +154,21 @@ struct Comm {
                 throw std::runtime_error("harmony comm: another GPU failed");
             std::this_thread::yield();
         }
+    }
+    // Stages n values at data in the next send slot of `rank`, once every
+    // rank (this one too, possibly on another stream) is done with that
+    // slot's previous exchange, and waits for the other ranks to have staged
+    // theirs. Returns the slot.
+    int stage(int rank, const long long* data, size_t n, cudaStream_t stream) {
+        Rank& me = ranks[rank];
+        int slot = me.count++ & 1;
+        for (Rank& peer : ranks)
+            check(cudaStreamWaitEvent(stream, peer.read[slot]));
+        check(cudaMemcpyAsync(me.send[slot], data, n * sizeof(long long),
+                              cudaMemcpyDefault, stream));
+        check(cudaEventRecord(me.sent[slot], stream));
+        barrier();
+        return slot;
     }
     // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU,
     // in order on `stream` but copied on the rank's own stream: on a legacy
@@ -162,6 +189,19 @@ struct Comm {
     }
 };
 
+// cudaStreamSynchronize(stream) on a rank of comm (none: plain). A failed GPU
+// may never complete the events the stream waits on, so this polls and gives
+// up once a rank aborted, leaving the stream's work behind.
+inline void synchronize(Comm* comm, cudaStream_t stream, const char* what) {
+    if (comm)
+        while (cudaStreamQuery(stream) == cudaErrorNotReady) {
+            if (comm->aborted.load())
+                throw std::runtime_error("harmony comm: another GPU failed");
+            std::this_thread::yield();
+        }
+    cuda_check(cudaStreamSynchronize(stream), what);
+}
+
 // data[i] += value i of each of `pieces` received pieces of n values.
 __global__ void sum_pieces_kernel(const long long* __restrict__ recv,
                                   long long* data, size_t n, int pieces) {
@@ -177,14 +217,8 @@ __global__ void sum_pieces_kernel(const long long* __restrict__ recv,
 inline void exchange(Comm* comm, int rank, long long* data, size_t n,
                      cudaStream_t stream) {
     auto& me = comm->ranks[rank];
-    int slot = me.count++ & 1, n_ranks = (int)comm->ranks.size();
-    // Every rank (this one too, possibly on another stream) must be done
-    // with this slot's previous exchange before it is reused.
-    for (auto& peer : comm->ranks) cudaStreamWaitEvent(stream, peer.read[slot]);
-    Comm::check(cudaMemcpyAsync(me.send[slot], data, n * sizeof(long long),
-                                cudaMemcpyDefault, stream));
-    Comm::check(cudaEventRecord(me.sent[slot], stream));
-    comm->barrier();
+    int n_ranks = (int)comm->ranks.size();
+    int slot = comm->stage(rank, data, n, stream);
     // The same on every rank: n is a global size.
     bool pieces = (size_t)(n_ranks - 1) * n > comm->capacity;
     auto lo = [&](int r) { return pieces ? n * r / n_ranks : 0; };
@@ -192,7 +226,7 @@ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
     size_t first = lo(rank), m = hi(rank) - first;
     for (int r = 0, p = 0; r < n_ranks; ++r) {
         if (r == rank) continue;
-        cudaStreamWaitEvent(stream, comm->ranks[r].sent[slot]);
+        Comm::check(cudaStreamWaitEvent(stream, comm->ranks[r].sent[slot]));
         comm->pull(rank, r, me.recv[slot] + p++ * m,
                    comm->ranks[r].send[slot] + first, m, stream);
     }
@@ -212,7 +246,8 @@ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
         comm->barrier();
         for (int r = 0; r < n_ranks; ++r) {
             if (r == rank) continue;
-            cudaStreamWaitEvent(stream, comm->ranks[r].reduced[slot]);
+            Comm::check(
+                cudaStreamWaitEvent(stream, comm->ranks[r].reduced[slot]));
             comm->pull(rank, r, data + lo(r), comm->ranks[r].send[slot] + lo(r),
                        hi(r) - lo(r), stream);
         }
@@ -231,13 +266,16 @@ inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
         exchange(comm, rank, data + i, std::min(comm->capacity, n - i), stream);
 }
 
-// Every GPU's data (stream-ordered) gets values range(r) = {lo, hi} of GPU r
-// (disjoint ranges): per exchange every GPU stages the next `capacity` values
-// of its range and copies the others' through its receive slot. Read data
-// with a kernel, or synchronize before freeing it.
+// Every GPU's data (stream-ordered), or only GPU `to`'s (-1: every one's),
+// gets values range(r) = {lo, hi} of GPU r (disjoint ranges): per exchange
+// the other GPUs stage the next `capacity` values of their range and the
+// receiving ones copy them through their receive slot. The peer copy lands
+// in the slot, not in data: the caller may free data (scratch) before the
+// stream drains, and cudaFree with a peer copy pending into the buffer
+// faults both GPUs.
 template <typename Range>
 inline void allgather(Comm* comm, int rank, long long* data, Range range,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, int to = -1) {
     if (!comm || comm->ranks.size() < 2) return;
     auto& me = comm->ranks[rank];
     size_t c = comm->capacity, n_rounds = 0;
@@ -250,35 +288,32 @@ inline void allgather(Comm* comm, int rank, long long* data, Range range,
             lo = std::min(hi, lo + w * c);
             return std::pair{lo, std::min(hi, lo + c)};
         };
-        int slot = me.count++ & 1;  // see exchange
-        for (auto& peer : comm->ranks)
-            cudaStreamWaitEvent(stream, peer.read[slot]);
         auto [lo, hi] = piece(rank);
-        Comm::check(cudaMemcpyAsync(me.send[slot], data + lo,
-                                    (hi - lo) * sizeof(long long),
-                                    cudaMemcpyDefault, stream));
-        Comm::check(cudaEventRecord(me.sent[slot], stream));
-        comm->barrier();
-        for (int r = 0; r < (int)comm->ranks.size(); ++r) {
-            if (r == rank) continue;
-            auto [a, b] = piece(r);
-            cudaStreamWaitEvent(stream, comm->ranks[r].sent[slot]);
-            comm->pull(rank, r, me.recv[slot], comm->ranks[r].send[slot], b - a,
-                       stream);
-            Comm::check(cudaMemcpyAsync(data + a, me.recv[slot],
-                                        (b - a) * sizeof(long long),
-                                        cudaMemcpyDeviceToDevice, stream));
-        }
+        int slot =
+            comm->stage(rank, data + lo, rank == to ? 0 : hi - lo, stream);
+        if (to < 0 || to == rank)
+            for (int r = 0; r < (int)comm->ranks.size(); ++r) {
+                if (r == rank) continue;
+                auto [a, b] = piece(r);
+                Comm::check(
+                    cudaStreamWaitEvent(stream, comm->ranks[r].sent[slot]));
+                comm->pull(rank, r, me.recv[slot], comm->ranks[r].send[slot],
+                           b - a, stream);
+                Comm::check(cudaMemcpyAsync(data + a, me.recv[slot],
+                                            (b - a) * sizeof(long long),
+                                            cudaMemcpyDeviceToDevice, stream));
+            }
         Comm::check(cudaEventRecord(me.read[slot], stream));
     }
 }
 
 // Sums of group-major rows of n values over cells sorted by group, zero
-// outside each GPU's groups (Comm::groups): the groups straddling GPUs are
-// summed (allreduce), then every GPU copies the rows from each GPU's first
-// group to the next one's (about (P-1)/P of the rows instead of P-1 times).
+// outside each GPU's groups (Comm::groups), on every GPU or only on GPU `to`:
+// the groups straddling GPUs are summed (allreduce), then the rows from each
+// GPU's first group to the next one's are gathered (about (P-1)/P of the
+// rows instead of P-1 times).
 inline void allgather_groups(Comm* comm, int rank, long long* data, size_t n,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, int to = -1) {
     if (!comm || comm->ranks.size() < 2) return;
     const auto& g = comm->groups;
     size_t n_ranks = comm->ranks.size(), summed = SIZE_MAX;
@@ -293,7 +328,7 @@ inline void allgather_groups(Comm* comm, int rank, long long* data, size_t n,
             size_t end = r + 1 < n_ranks ? g[2 * r + 2] : g[2 * r + 1];
             return std::pair{g[2 * r] * n, end * n};
         },
-        stream);
+        stream, to);
 }
 
 }  // namespace harmony_comm

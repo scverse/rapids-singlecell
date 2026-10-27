@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -212,36 +213,39 @@ static int assign_tile_rows(const ClusteringArgs<T>& a, int n_rows,
 
 // Objective: exact fixed-point sum of the per-cell terms of the last pass,
 // plus the diversity term. Scratch: the 8 values after the per-cell terms.
+// Every GPU gets the same value (the loop below breaks on it, and the ranks
+// must make the same exchanges): the sum over all GPUs, and rank 0's
+// diversity, whose bits travel in the same exchange.
 template <typename T>
 static double fused_objective(const ClusteringArgs<T>& a,
                               const FixedScales<T>& scales) {
     cudaStream_t stream = a.stream;
-    auto* acc = reinterpret_cast<unsigned long long*>(
+    auto* acc = reinterpret_cast<long long*>(
         (reinterpret_cast<uintptr_t>(a.objective_partials + a.n_cells) + 15) &
         ~uintptr_t(15));
-    T* diversity = reinterpret_cast<T*>(acc + 1);
-    cuda_check(cudaMemsetAsync(acc, 0, sizeof(*acc), stream),
+    cuda_check(cudaMemsetAsync(acc, 0, 2 * sizeof(*acc), stream),
                "objective memset");
     if (a.n_cells > 0)
         objective_fixed_kernel<T>
             <<<std::min((a.n_cells + 255) / 256, 4096), 256, 0, stream>>>(
-                a.objective_partials, a.n_cells, scales.objective, acc);
+                a.objective_partials, a.n_cells, scales.objective,
+                reinterpret_cast<unsigned long long*>(acc));
     CUDA_CHECK_LAST_ERROR(objective_fixed_kernel);
-    objective_diversity_kernel<T>
-        <<<1, 256, 0, stream>>>(a.O, a.E, a.theta, a.sigma, a.n_batches,
-                                a.n_clusters, a.stabilized, diversity);
+    if (a.rank == 0)
+        objective_diversity_kernel<T>
+            <<<1, 256, 0, stream>>>(a.O, a.E, a.theta, a.sigma, a.n_batches,
+                                    a.n_clusters, a.stabilized, acc + 1);
     CUDA_CHECK_LAST_ERROR(objective_diversity_kernel);
-    struct {
-        long long acc;
-        T diversity;
-    } host;
-    harmony_comm::allreduce(a.comm, a.rank, reinterpret_cast<long long*>(acc),
-                            1, stream);
-    cuda_check(cudaMemcpyAsync(&host, acc, sizeof(host), cudaMemcpyDeviceToHost,
+    long long host[2];
+    harmony_comm::allreduce(a.comm, a.rank, acc, 2, stream);
+    harmony_comm::synchronize(a.comm, stream, "objective synchronization");
+    cuda_check(cudaMemcpyAsync(host, acc, sizeof(host), cudaMemcpyDeviceToHost,
                                stream),
                "objective copy");
     cuda_check(cudaStreamSynchronize(stream), "objective synchronization");
-    return (double)host.acc * scales.objective_inv + (double)host.diversity;
+    T diversity;
+    memcpy(&diversity, host + 1, sizeof(T));
+    return (double)host[0] * scales.objective_inv + (double)diversity;
 }
 
 // Returns the last objective (0 without one).
@@ -357,38 +361,21 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
             a.n_covariates, next_tile);
         CUDA_CHECK_LAST_ERROR(fused_assign_kernel);
     };
-    // Several GPUs: a block's new counts are summed on a side stream while
-    // the next block is assigned, and folded in once summed.
-    struct Side {
-        cudaStream_t stream = nullptr;
-        cudaEvent_t ready[2], summed[2];
-        ~Side() {
-            if (!stream) return;
-            cudaStreamSynchronize(stream);
-            cudaStreamDestroy(stream);
-            for (int s = 0; s < 2; ++s)
-                cudaEventDestroy(ready[s]), cudaEventDestroy(summed[s]);
-        }
-    } side;
-    if (a.comm) {
-        cuda_check(
-            cudaStreamCreateWithFlags(&side.stream, cudaStreamNonBlocking),
-            "exchange stream");
-        for (int s = 0; s < 2; ++s) {
-            cudaEventCreateWithFlags(&side.ready[s], cudaEventDisableTiming);
-            cudaEventCreateWithFlags(&side.summed[s], cudaEventDisableTiming);
-        }
-    }
+    // Several GPUs: a block's new counts are summed on the rank's side
+    // stream while the next block is assigned, and folded in once summed.
+    using harmony_comm::Comm;
     auto exchange = [&](int step) {
         if (!a.comm) return;
-        cudaEventRecord(side.ready[step & 1], a.stream);
-        cudaStreamWaitEvent(side.stream, side.ready[step & 1]);
-        harmony_comm::allreduce(a.comm, a.rank, slot(step), ob_total,
-                                side.stream);
-        cudaEventRecord(side.summed[step & 1], side.stream);
+        Comm::Rank& me = a.comm->ranks[a.rank];
+        Comm::check(cudaEventRecord(me.ready[step & 1], a.stream));
+        Comm::check(cudaStreamWaitEvent(me.side, me.ready[step & 1]));
+        harmony_comm::allreduce(a.comm, a.rank, slot(step), ob_total, me.side);
+        Comm::check(cudaEventRecord(me.summed[step & 1], me.side));
     };
     auto summed = [&](int step) {
-        if (a.comm) cudaStreamWaitEvent(a.stream, side.summed[step & 1]);
+        if (a.comm)
+            Comm::check(cudaStreamWaitEvent(
+                a.stream, a.comm->ranks[a.rank].summed[step & 1]));
     };
     // E from the full O, then the objective.
     auto objective = [&](bool evaluate) {
@@ -837,6 +824,22 @@ NB_MODULE(_harmony_clustering_cuda, m) {
         .def_prop_ro("handle", [](Comm& c) { return (uintptr_t)&c; })
         .def("abort", [](Comm& c) { c.aborted = true; })
         .def("synchronize", &Comm::synchronize,
-             nb::call_guard<nb::gil_scoped_release>());
+             nb::call_guard<nb::gil_scoped_release>(), "timeout"_a = 10.0)
+        // Tests: one sum, and a stream synchronization that gives up.
+        .def(
+            "allreduce",
+            [](Comm& c, int rank, uintptr_t data, size_t n, uintptr_t stream) {
+                harmony_comm::allreduce(&c, rank, (long long*)data, n,
+                                        (cudaStream_t)stream);
+            },
+            nb::call_guard<nb::gil_scoped_release>(), "rank"_a, "data"_a, "n"_a,
+            "stream"_a = 0)
+        .def(
+            "wait",
+            [](Comm& c, uintptr_t stream) {
+                harmony_comm::synchronize(&c, (cudaStream_t)stream,
+                                          "harmony comm wait");
+            },
+            nb::call_guard<nb::gil_scoped_release>(), "stream"_a = 0);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

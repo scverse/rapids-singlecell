@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import cupy as cp
@@ -19,6 +22,7 @@ from rapids_singlecell._cuda import (
 )
 from rapids_singlecell.preprocessing._harmony import _segments
 from rapids_singlecell.preprocessing._harmony._kmeans import _fused_distances
+from rapids_singlecell.preprocessing._harmony._multi_gpu import _comm
 
 pytestmark = pytest.mark.skipif(
     _cl is None or _corr is None,
@@ -384,3 +388,118 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
         R_ref[c] = w / w.sum(1, keepdims=True)
         new.append(counts(R_ref[c], codes[c]))
     check(objective, R_ref, sim)
+
+
+# ---------- several GPUs (ranks on one GPU) ----------
+
+
+def test_clustering_objective_is_rank_uniform():
+    # Every rank returns the objective of rank 0 (the exact sum over all
+    # cells, plus rank 0's diversity, whose bits travel in the exchange), so
+    # GPUs whose arithmetic differs still take the same trip count. Here
+    # rank 1's theta, which only the diversity reads in the unpenalized pass,
+    # is scaled, and a one-rank run with that theta shows the scale matters.
+    n_cells, unit, n_pcs, n_clusters, n_batches = 4000, 2000, 8, 7, 3
+    rng = cp.random.default_rng(5)
+    Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
+    Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
+    Y = Z[:n_clusters] + 0.1
+    Y /= cp.linalg.norm(Y, axis=1, keepdims=True)
+    codes = cp.sort(rng.integers(0, n_batches, n_cells)).astype(cp.int32)
+    Pr_b = (cp.bincount(codes, minlength=n_batches) / n_cells).astype(cp.float32)
+    theta = 0.5 + 2 * rng.random(n_batches, dtype=cp.float32)
+
+    def objective(lo, hi, theta, comm=0, rank=0):
+        m, n_blocks = hi - lo, 2
+        idx_list = cp.empty(m, cp.int32)
+        offsets = cp.empty(n_blocks * (2 * n_batches + 1) + 1, cp.int32)
+        _cl.draw_blocks(
+            codes[lo:hi],
+            idx_list=idx_list,
+            block_cat_offsets=offsets,
+            idx_list_alt=cp.empty(m, cp.int32),
+            sort_keys=cp.empty(m, cp.uint32),
+            sort_keys_alt=cp.empty(m, cp.uint32),
+            cub_temp=cp.empty(_cl.get_cub_sort_temp_bytes(n_cells=m), cp.uint8),
+            n_groups=n_batches,
+            n_blocks=n_blocks,
+            unit=unit,
+            seed=3,
+            first=lo,
+        )
+        O = cp.empty((n_batches, n_clusters), cp.float32)
+        return _cl.clustering_loop(
+            Z[lo:hi],
+            R=cp.empty((m, n_clusters), cp.float32),
+            E=cp.empty_like(O),
+            O=O,
+            Pr_b=Pr_b,
+            theta=theta,
+            Y_norm=Y.copy(),
+            idx_list=idx_list,
+            penalty=cp.empty_like(O),
+            objective_partials=cp.empty(m + 8, cp.float32),
+            block_cat_offsets=offsets,
+            block_starts=offsets[: n_blocks * n_batches + 1 : n_batches].get(),
+            block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
+            seg_start=cp.asarray([0, m], dtype=cp.int32),
+            y_bound=cp.full(n_pcs, np.frexp(n_cells)[1], cp.int16),
+            y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
+            y_t=cp.empty((n_pcs, 128), cp.float32),
+            n_cells=m,
+            n_total=n_cells,
+            n_pcs=n_pcs,
+            n_clusters=n_clusters,
+            n_batches=n_batches,
+            n_blocks=n_blocks,
+            sigma=0.1,
+            stabilized=True,
+            max_iter=0,
+            initialize=True,
+            comm=comm,
+            rank=rank,
+        )
+
+    one = objective(0, n_cells, theta)
+    assert objective(0, n_cells, 3 * theta) != one
+    comm, buffers = _comm([0, 0], 2 * n_batches * n_clusters, groups=[0, n_batches, 0, n_batches])
+    cuts, thetas = [0, unit, n_cells], [theta, 3 * theta]
+    with ThreadPoolExecutor(2) as pool:
+        ranks = [pool.submit(objective, cuts[r], cuts[r + 1], thetas[r], comm.handle, r) for r in range(2)]
+        assert [rank.result() for rank in ranks] == [one, one]
+
+
+def test_comm_gives_up_on_a_stuck_gpu():
+    # A GPU whose stream never completes (here: blocked by a host function)
+    # holds the other ranks' streams through the events they wait on. Once a
+    # rank aborts, their host synchronizations raise instead of waiting
+    # forever, and the comm's final wait for in-flight exchanges is bounded.
+    comm, buffers = _comm([0, 0], 16, groups=[0, 1, 0, 1])
+    gate, n = threading.Event(), 8
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(2)]
+    data = [cp.arange(n, dtype=cp.int64) for _ in range(2)]
+    cp.cuda.Device().synchronize()
+    streams[1].launch_host_func(lambda _: gate.wait(), None)
+
+    def rank(r):
+        comm.allreduce(r, data[r].data.ptr, n, streams[r].ptr)
+        comm.wait(streams[r].ptr)
+
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            ranks = [pool.submit(rank, r) for r in range(2)]
+            time.sleep(0.2)
+            assert not any(rank.done() for rank in ranks)
+            comm.abort()
+            for rank in ranks:
+                with pytest.raises(RuntimeError, match="another GPU failed"):
+                    rank.result(timeout=10)
+        start = time.monotonic()
+        comm.synchronize(0.3)  # rank 1's staging is still behind the gate
+        assert 0.25 < time.monotonic() - start < 3
+    finally:
+        gate.set()
+        for stream in streams:
+            stream.synchronize()
+    for d in data:  # the exchange completes once released
+        cp.testing.assert_array_equal(d, 2 * cp.arange(n))
