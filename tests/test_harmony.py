@@ -518,7 +518,6 @@ def test_harmony_correction_keeps_a_large_single_batch_cluster(dtype, method):
         cats=cp.zeros(n, dtype=cp.int32),
         n_batches=1,
         cat_offsets=cp.asarray(offsets),
-        cell_indices=cp.arange(n, dtype=cp.int32),
         segments=(*_segments(offsets), cp.asarray(_rhs_bounds([X], offsets, [0, n]))),
     )
     cp.testing.assert_allclose(result, X, rtol=1e-12 if dtype == cp.float64 else 0)
@@ -1130,8 +1129,8 @@ def test_harmony_host_input_is_converted_in_the_staging(monkeypatch):
     X64 = np.random.default_rng(1).standard_normal((480, 17))
     expected = _integrate(X_pca=X64.astype(np.float32))
     uploaded = []
-    sorted_copy = harmony_module._sorted_device_copy
-    monkeypatch.setattr(harmony_module, "_sorted_device_copy", lambda Z, *a: uploaded.append(Z) or sorted_copy(Z, *a))
+    upload = harmony_module._upload_sorted
+    monkeypatch.setattr(harmony_module, "_upload_sorted", lambda Z, *a, **k: uploaded.append(Z) or upload(Z, *a, **k))
     for X in (X64, np.asfortranarray(X64), X64.astype(">f8")):
         assert _integrate(X_pca=X).tobytes() == expected.tobytes()
         assert uploaded[-1] is X
@@ -1144,7 +1143,7 @@ def test_harmony_chunked_transfers(monkeypatch, n):
     monkeypatch.setattr(chunks_module, "_UPLOAD_BYTES", 40 * Z[0].nbytes)
     assert chunks_module._staging_rows(n, Z[0].nbytes) == 15
     order = rng.permutation(n)
-    sorted_copy = chunks_module._sorted_device_copy(Z, cp.asarray(order))
+    (sorted_copy,) = chunks_module._upload_sorted(Z, cp.asarray(order), [0, n], [0])
     np.testing.assert_array_equal(cp.asnumpy(sorted_copy), Z[order])
     out = np.empty_like(Z)
     chunks_module._download(sorted_copy, out)
@@ -1188,7 +1187,7 @@ def test_harmony_auto_batched_in_cluster_chunks(monkeypatch, dtype):
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 def test_harmony_bfloat16_falls_back_to_float32():
     key = ["batch", "second"]  # bfloat16 assignments need one batch key
-    with pytest.warns(UserWarning, match="dtype='bfloat16'") as record:
+    with pytest.warns(UserWarning, match="dtype='bfloat16'.*using float32 assignments") as record:
         fallback = _integrate("bfloat16", key=key)
     assert record[0].filename == __file__  # the warning points at the caller
     assert fallback.tobytes() == _integrate(key=key).tobytes()

@@ -292,7 +292,8 @@ static void joint_counts(const T* R, int ldr, int k, const int* seg_start,
                          cudaStream_t stream) {
     FixedScales<T> scales(n_total, 0, k);
     size_t n = (size_t)J * k;
-    cudaMemsetAsync(acc, 0, n * sizeof(long long), stream);
+    cuda_check(cudaMemsetAsync(acc, 0, n * sizeof(long long), stream),
+               "joint counts memset");
     segment_counts_kernel<T>
         <<<strided_grid((long long)n_seg * k, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
            stream>>>(R, ldr, k, seg_start, seg_group, n_seg, scales.count,

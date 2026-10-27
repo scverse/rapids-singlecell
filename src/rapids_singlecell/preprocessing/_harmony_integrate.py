@@ -164,7 +164,8 @@ def harmony_integrate(
         many clusters per pass as fit in 1 GiB of workspace (clusters x
         batches x components), and normalizes in the same pass. ``"fast"``
         corrects one cluster at a time with the least workspace (float
-        right-hand sides, a separate normalization pass).
+        right-hand sides, a separate normalization pass, one GPU with
+        ``multi_gpu``).
         With one key, ``None`` automatically selects ``"batched"`` unless one
         cluster's workspace would exceed 1 GiB, in which case ``"fast"`` is
         used.
@@ -304,7 +305,7 @@ def harmony_integrate(
     devices = (
         [cp.cuda.Device().id] if multi_gpu is None or multi_gpu is False else parse_device_ids(multi_gpu=multi_gpu)
     )
-    host_out = np.empty(X.shape, dtype=X.dtype)
+    host_out = np.empty(X.shape, dtype=dtype)
     with cp.cuda.Device(devices[0]):
         harmonize(
             X,
@@ -330,6 +331,7 @@ def harmony_integrate(
             batch_prune_threshold=batch_prune_threshold,
             verbose=verbose,
             bfloat16=bfloat16,
+            dtype=dtype,
             devices=devices,
             out=host_out,
         )

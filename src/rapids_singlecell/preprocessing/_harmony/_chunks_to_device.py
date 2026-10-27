@@ -27,16 +27,19 @@ def _upload_sorted(
     order: cp.ndarray,
     bounds: list[int],
     devices: list[int],
+    *,
     shard_rows: tuple[list, list] | None = None,
+    dtype=None,
 ) -> list[cp.ndarray]:
-    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU.
+    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU, in ``dtype`` (``Z``'s by default).
 
     Device input is gathered on its own GPU, the other GPUs' shards first and in chunks of _UPLOAD_BYTES, so only a
     shard's rows move and that GPU holds one extra chunk at a time. Host input is staged in pinned chunks by several
     host threads while the previous chunk is copied, then placed on the GPU (all GPUs at once), so no unsorted device
     copy is kept: one GPU reads the input in order, several GPUs each only their own rows (``shard_rows``, see
-    _shard_rows; gathered in input order, from C-ordered input).
+    _shard_rows; gathered in input order, from C-ordered input). The staging converts the dtype and layout.
     """
+    dtype = np.dtype(Z.dtype if dtype is None else dtype)
     shards = list(itertools.pairwise(bounds))
     n, d = Z.shape
     if isinstance(Z, cp.ndarray):
@@ -46,18 +49,18 @@ def _upload_sorted(
             for r in sorted(range(len(devices)), key=lambda r: devices[r] == source):
                 lo, hi = shards[r]  # the temporaries die with the statement
                 if devices[r] == source:
-                    parts[r] = Z[_copy(order[lo:hi], source)]
+                    parts[r] = Z[_copy(order[lo:hi], source)].astype(dtype, copy=False)
                     continue
                 with cp.cuda.Device(devices[r]):
-                    parts[r] = cp.empty((hi - lo, d), dtype=Z.dtype)
+                    parts[r] = cp.empty((hi - lo, d), dtype=dtype)
                 for a in range(lo, hi, step):
                     b = min(hi, a + step)
-                    chunk = Z[_copy(order[a:b], source)]
+                    chunk = Z[_copy(order[a:b], source)].astype(dtype, copy=False)
                     _copy(chunk, devices[r], out=parts[r][a - lo : b - lo])
                     del chunk  # before the next one
             cp.cuda.get_current_stream().synchronize()  # read on other streams
         return parts
-    rows = _staging_rows(n, d * Z.itemsize)
+    rows = _staging_rows(n, d * dtype.itemsize)
     sources, targets = shard_rows or _shard_rows(order, bounds, devices)
     if len(shards) > 1:
         Z = np.ascontiguousarray(Z)  # np.take copies other layouts whole
@@ -69,9 +72,9 @@ def _upload_sorted(
         with cp.cuda.Device(devices[rank]):
             target = targets[rank]
             stream = cp.cuda.get_current_stream()
-            X = cp.empty((hi - lo, d), dtype=Z.dtype)
+            X = cp.empty((hi - lo, d), dtype=dtype)
             step = max(1, min(rows, hi - lo))  # no larger than the shard
-            slots = [[_pinned(step, d, Z.dtype), cp.empty((step, d), dtype=Z.dtype), None] for _ in range(2)]
+            slots = [[_pinned(step, d, dtype), cp.empty((step, d), dtype=dtype), None] for _ in range(2)]
             for i, a in enumerate(range(0, hi - lo, step)):
                 host, staged, done = slots[i % 2]
                 if done is not None:

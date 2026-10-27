@@ -564,10 +564,10 @@ static void register_clustering_loop(nb::module_& m) {
            std::optional<gpu_array_c<long long, Device>> col_workspace,
            Opt dots_workspace, bool force_blocks, int n_cells,
            long long n_total, int n_pcs, int n_clusters, int n_batches,
-           int n_covariates, int n_joint_categories, int n_first, int n_blocks,
-           double sigma, double tol, int max_iter, unsigned int seed,
-           bool stabilized, std::uintptr_t stream, bool initialize,
-           std::uintptr_t comm, int rank) {
+           int n_covariates, int n_first, int n_blocks, double sigma,
+           double tol, int max_iter, unsigned int seed, bool stabilized,
+           std::uintptr_t stream, bool initialize, std::uintptr_t comm,
+           int rank) {
             bool multi = n_covariates > 1;
             int n_groups = multi ? 1 : n_batches;
             size_t cells = n_cells, kb = (size_t)n_batches * n_clusters;
@@ -654,18 +654,17 @@ static void register_clustering_loop(nb::module_& m) {
         "Pr_b"_a.noconvert(), "theta"_a.noconvert(), "Y_norm"_a.noconvert(),
         "idx_list"_a.noconvert(), "penalty"_a.noconvert(),
         "objective_partials"_a.noconvert(), "block_cat_offsets"_a.noconvert(),
-        "block_counts"_a.noconvert(), "seg_start"_a.noconvert(),
-        "y_bound"_a.noconvert(), "y_acc"_a.noconvert(),
-        "R_bf16"_a.noconvert() = nb::none(),
+        "block_starts"_a.noconvert(), "block_counts"_a.noconvert(),
+        "seg_start"_a.noconvert(), "y_bound"_a.noconvert(),
+        "y_acc"_a.noconvert(), "R_bf16"_a.noconvert() = nb::none(),
         "joint_cats"_a.noconvert() = nb::none(),
         "joints"_a.noconvert() = nb::none(), "y_t"_a.noconvert(),
         "col_workspace"_a.noconvert() = nb::none(),
         "dots_workspace"_a.noconvert() = nb::none(), "force_blocks"_a = false,
         "n_cells"_a, "n_total"_a = 0, "n_pcs"_a, "n_clusters"_a, "n_batches"_a,
-        "n_covariates"_a = 1, "n_joint_categories"_a = 0, "n_first"_a = 0,
-        "n_blocks"_a, "sigma"_a, "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0,
-        "stabilized"_a, "stream"_a = 0, "initialize"_a = false, "comm"_a = 0,
-        "rank"_a = 0);
+        "n_covariates"_a = 1, "n_first"_a = 0, "n_blocks"_a, "sigma"_a,
+        "tol"_a = 0.0, "max_iter"_a, "seed"_a = 0, "stabilized"_a,
+        "stream"_a = 0, "initialize"_a = false, "comm"_a = 0, "rank"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -826,6 +825,10 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_harmony_clustering_cuda, m) {
     m.attr("KMEANS_WEIGHT_TILE_ROWS") = nb::int_(KMEANS_WEIGHT_TILE_ROWS);
+    // Layout of the assignment workspace (see fused_assign_kernel).
+    m.attr("FUSED_CLUSTER_STRIDE") = nb::int_(FUSED_CLUSTER_STRIDE);
+    m.attr("FUSED_GROUP") = nb::int_(FUSED_GROUP);
+    m.attr("FUSED_WARPS") = nb::int_(FUSED_THREADS / 32);
     using harmony_comm::Comm;
     nb::class_<Comm>(m, "Comm")
         .def(nb::init<const std::vector<int>&, const std::vector<uintptr_t>&,
