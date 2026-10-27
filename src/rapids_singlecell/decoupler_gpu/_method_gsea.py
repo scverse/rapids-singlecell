@@ -201,7 +201,7 @@ def _func_gsea(
         cache.run(nvar, times, seed, consume, forward=bool(large_sources.size), size=size)
         valid = (same_count > 0) & (null_sum > 0)
         es = cp.where(valid, es * same_count / cp.where(valid, null_sum, 1), 0)
-        pv = cp.where(valid, extreme_count / cp.maximum(same_count, 1), 1)
+        pv = cp.where(valid, (extreme_count + 1) / (same_count + 1), 1)
     full_sources = cp.asarray(np.flatnonzero(set_sizes == nvar), dtype=cp.int32)
     if full_sources.size:
         es[:, full_sources] = cp.any(value_bits & 0x7FFFFFFF, axis=1)[:, None]
