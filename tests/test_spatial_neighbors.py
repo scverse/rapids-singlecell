@@ -374,7 +374,5 @@ def test_builder_positional_arguments(name, args, kwargs):
     coords = np.random.default_rng(4).normal(size=(16, 2)).astype(np.float32)
     positional, keyword = builder(*args), builder(**kwargs)
     assert positional.uns_params() == keyword.uns_params()
-    for actual, expected in zip(
-        positional.build(coords), keyword.build(coords), strict=True
-    ):
+    for actual, expected in zip(positional.build(coords), keyword.build(coords), strict=True):
         np.testing.assert_allclose(actual.toarray().get(), expected.toarray().get())

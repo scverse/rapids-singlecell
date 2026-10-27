@@ -17,6 +17,7 @@ def _calc_recall(distances, reference_distances, tolerance=0.9):
     for (p_start, p_stop), (g_start, g_stop) in zip(
         itertools.pairwise(distances.indptr),
         itertools.pairwise(reference_distances.indptr),
+        strict=False,
     ):
         inter = np.intersect1d(
             distances.indices[p_start:p_stop],
@@ -97,18 +98,14 @@ def test_all_neighbors(algo):
         pytest.param(1, (100_000_000, 100), 2e12, (20, 2), id="100M-1gpu"),
     ],
 )
-def test_all_neighbors_batching_defaults(
-    monkeypatch, n_devices, shape, host_memory, expected
-):
+def test_all_neighbors_batching_defaults(monkeypatch, n_devices, shape, host_memory, expected):
     import cupy as cp
 
     from rapids_singlecell.preprocessing._neighbors._algorithms import _all_neighbors
 
     monkeypatch.setattr(cp.cuda.runtime, "getDeviceCount", lambda: n_devices)
     # 80 GB GPUs, independent of the test machine
-    monkeypatch.setattr(
-        cp.cuda.runtime, "getDeviceProperties", lambda i: {"totalGlobalMem": 80e9}
-    )
+    monkeypatch.setattr(cp.cuda.runtime, "getDeviceProperties", lambda i: {"totalGlobalMem": 80e9})
     monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (78e9, 80e9))
     monkeypatch.setattr(_all_neighbors, "_available_host_memory", lambda: host_memory)
     n_clusters, overlap_factor = _all_neighbors._all_neighbors_batching({}, shape, 15)
@@ -185,9 +182,7 @@ def test_all_neighbors_inner_product(n_clusters):
         algorithm_kwds={"n_clusters": n_clusters},
     )
     distances = adata.obsp["distances"].copy()
-    rsc.pp.neighbors(
-        adata, n_pcs=50, n_neighbors=15, algorithm="brute", metric="inner_product"
-    )
+    rsc.pp.neighbors(adata, n_pcs=50, n_neighbors=15, algorithm="brute", metric="inner_product")
     # inner_product is a similarity, so the top-k are the *largest* dot products and
     # a point is not its own nearest neighbor. nn-descent refines a similarity graph
     # less well than a distance one: recall measures 0.933 here, against 0.995 for

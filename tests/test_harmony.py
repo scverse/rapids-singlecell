@@ -37,9 +37,7 @@ def _get_measure(x, base, norm):
         return np.linalg.norm(x - base) / np.linalg.norm(base)
 
 
-_HARMONY_DATA_BASE = (
-    "https://scverse-exampledata.s3.amazonaws.com/rapids-singlecell/harmony_data"
-)
+_HARMONY_DATA_BASE = "https://scverse-exampledata.s3.amazonaws.com/rapids-singlecell/harmony_data"
 _IRCOLITIS_HARMONYPY2_H5AD = (
     "ircolitis_blood_cd8_2048_harmonypy2_2_0_0.h5ad",
     "sha256:c52c4a916fc6b811134dbfb1dc105d83f53195ea3092f277f30c8dbb987d641a",
@@ -57,9 +55,7 @@ def test_harmony_multikey_marginal_codes_and_theta():
                 ["b0", "b1", "b2", "b3", "b4", "b0"],
                 categories=["b0", "b1", "b2", "b3", "b4"],
             ),
-            "sex": pd.Categorical(
-                ["f", "m", "f", "m", "f", "m"], categories=["f", "m"]
-            ),
+            "sex": pd.Categorical(["f", "m", "f", "m", "f", "m"], categories=["f", "m"]),
         }
     )
 
@@ -80,9 +76,7 @@ def test_harmony_multikey_marginal_codes_and_theta():
         cp.full(7, 2.0, dtype=cp.float32),
     )
     expanded_theta = cp.arange(7, dtype=cp.float32)
-    cp.testing.assert_array_equal(
-        _get_theta_array(expanded_theta, n_levels, cp.float32), expanded_theta
-    )
+    cp.testing.assert_array_equal(_get_theta_array(expanded_theta, n_levels, cp.float32), expanded_theta)
 
 
 @pytest.mark.parametrize("size", [1, 6])
@@ -128,16 +122,8 @@ def test_harmony_stratified_sample_random_offsets_and_groups(layout_seed):
     targets = [nonempty.size, max(nonempty.size, n_cells // 3), n_cells]
     for n_target in targets:
         # a fresh generator per call: same seed, same sample
-        sampled = cp.asnumpy(
-            _stratified_sample_indices(
-                gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)
-            )
-        )
-        repeated = cp.asnumpy(
-            _stratified_sample_indices(
-                gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)
-            )
-        )
+        sampled = cp.asnumpy(_stratified_sample_indices(gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)))
+        repeated = cp.asnumpy(_stratified_sample_indices(gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)))
 
         assert sampled.size == n_target
         assert np.unique(sampled).size == n_target
@@ -160,9 +146,7 @@ def test_harmony_stratified_sample_known_quotas():
     cell_indices = cp.asarray([12, 7, 15, 1, 10, 4, 13, 2, 14, 9, 0, 11, 5, 8, 3, 6])
     cell_groups = np.array([5, 3, 3, 5, 3, 5, 5, 2, 5, 5, 3, 5, 1, 3, 5, 2])
 
-    sampled = cp.asnumpy(
-        _stratified_sample_indices(offsets, cell_indices, 9, np.random.default_rng(0))
-    )
+    sampled = cp.asnumpy(_stratified_sample_indices(offsets, cell_indices, 9, np.random.default_rng(0)))
     counts = np.bincount(cell_groups[sampled], minlength=6)
 
     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
@@ -210,9 +194,7 @@ def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
         )
     )
 
-    joint_cats, joint_codes = _factorize_joint_codes(
-        batch_codes, np.full(n_covariates, 2, dtype=np.int32)
-    )
+    joint_cats, joint_codes = _factorize_joint_codes(batch_codes, np.full(n_covariates, 2, dtype=np.int32))
 
     assert joint_cats.shape == (2, n_covariates)
     assert joint_codes.shape == (3,)
@@ -282,9 +264,7 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("n_covariates", [2, 3, 4])
-def test_harmony_multikey_correction_matches_dense_design(
-    dtype, n_covariates, monkeypatch
-):
+def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, monkeypatch):
     rng = np.random.default_rng(734)
     levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
@@ -292,9 +272,7 @@ def test_harmony_multikey_correction_matches_dense_design(
     n_cells, n_pcs, n_clusters = 31, 5, 3
     np_dtype = np.dtype(dtype)
 
-    local_codes = np.column_stack(
-        [rng.integers(0, level, size=n_cells) for level in levels]
-    ).astype(np.int32)
+    local_codes = np.column_stack([rng.integers(0, level, size=n_cells) for level in levels]).astype(np.int32)
     cats_np = local_codes + offsets
     X_np = rng.normal(size=(n_cells, n_pcs)).astype(np_dtype)
     R_np = rng.random(size=(n_cells, n_clusters)).astype(np_dtype)
@@ -332,16 +310,12 @@ def test_harmony_multikey_correction_matches_dense_design(
         retained = np.concatenate(([True], active))
         weighted_design = R_np[:, cluster, None] * design
         gram = design.T @ weighted_design
-        gram[1:, 1:] += np.diag(
-            np.where(active, lambda_np[:, cluster], np_dtype.type(0))
-        )
+        gram[1:, 1:] += np.diag(np.where(active, lambda_np[:, cluster], np_dtype.type(0)))
         rhs = weighted_design.T @ X_np
 
         W = np.zeros((n_batches + 1, n_pcs), dtype=np_dtype)
         retained_indices = np.flatnonzero(retained)
-        W[retained] = np.linalg.solve(
-            gram[np.ix_(retained_indices, retained_indices)], rhs[retained]
-        )
+        W[retained] = np.linalg.solve(gram[np.ix_(retained_indices, retained_indices)], rhs[retained])
         W[0] = 0
         expected -= R_np[:, cluster, None] * (design @ W)
 
@@ -414,9 +388,7 @@ def test_harmony2_multikey_reference(
 @pytest.fixture(scope="module")
 def adata_harmonypy2_multikey():
     filename, known_hash = _HARMONYPY2_MULTIKEY_H5AD
-    reference_file = pooch.retrieve(
-        f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash
-    )
+    reference_file = pooch.retrieve(f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash)
     return ad.read_h5ad(reference_file)
 
 
@@ -448,9 +420,7 @@ def adata_reference():
 def adata_ircolitis_harmonypy2():
     """Stratified 2,048-cell IRcolitis harmonypy 2.0.0 reference."""
     filename, known_hash = _IRCOLITIS_HARMONYPY2_H5AD
-    reference_file = pooch.retrieve(
-        f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash
-    )
+    reference_file = pooch.retrieve(f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash)
     return ad.read_h5ad(reference_file)
 
 
@@ -467,9 +437,7 @@ def test_harmony_integrate_bad_prune_threshold(bad_threshold):
     """batch_prune_threshold outside [0, 1] raises ValueError."""
     adata = sc.datasets.pbmc68k_reduced()
     with pytest.raises(ValueError, match="batch_prune_threshold must be in"):
-        rsc.pp.harmony_integrate(
-            adata, "bulk_labels", batch_prune_threshold=bad_threshold
-        )
+        rsc.pp.harmony_integrate(adata, "bulk_labels", batch_prune_threshold=bad_threshold)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -556,9 +524,7 @@ def test_choose_colsum_algo(compute_capability):
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("column", ["gemm", "columns", "atomics"])
 @pytest.mark.parametrize("correction_method", ["fast", "batched"])
-def test_harmony_integrate_reference(
-    adata_reference, *, dtype, column, correction_method
-):
+def test_harmony_integrate_reference(adata_reference, *, dtype, column, correction_method):
     """
     Test that Harmony integrate works.
     """
@@ -688,9 +654,7 @@ def test_compute_lambda_kb_zero_denom(dtype):
         (cp.float64, "batched"),
     ],
 )
-def test_harmony2_ircolitis_reference(
-    adata_ircolitis_harmonypy2, correction_method, dtype
-):
+def test_harmony2_ircolitis_reference(adata_ircolitis_harmonypy2, correction_method, dtype):
     """Harmony2 on a real 11-batch CI subset matches harmonypy 2.0.0."""
     adata = adata_ircolitis_harmonypy2.copy()
     rsc.pp.harmony_integrate(
@@ -725,15 +689,11 @@ def test_harmony_unseeded_random_state():
     batch = np.resize(["a", "b", "c"], 60)
     adata = ad.AnnData(
         X=None,
-        obs=pd.DataFrame(
-            {"batch": batch}, index=[f"cell_{index}" for index in range(60)]
-        ),
+        obs=pd.DataFrame({"batch": batch}, index=[f"cell_{index}" for index in range(60)]),
         obsm={"X_pca": rng.normal(size=(60, 6)).astype(np.float32)},
     )
 
-    rsc.pp.harmony_integrate(
-        adata, "batch", n_clusters=3, max_iter_harmony=1, random_state=None
-    )
+    rsc.pp.harmony_integrate(adata, "batch", n_clusters=3, max_iter_harmony=1, random_state=None)
 
     assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
 
@@ -757,17 +717,11 @@ def _repeatability_adata(dtype):
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-@pytest.mark.parametrize(
-    "key", ["batch", ["batch", "second"], ["batch", "second", "third"]]
-)
+@pytest.mark.parametrize("key", ["batch", ["batch", "second"], ["batch", "second", "third"]])
 @pytest.mark.parametrize("kmeans_cells_per_cluster", [5000, 1])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_harmony_integrate_repeats_bitwise(
-    monkeypatch, key, kmeans_cells_per_cluster, dtype
-):
-    monkeypatch.setattr(
-        harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", kmeans_cells_per_cluster
-    )
+def test_harmony_integrate_repeats_bitwise(monkeypatch, key, kmeans_cells_per_cluster, dtype):
+    monkeypatch.setattr(harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", kmeans_cells_per_cluster)
     outputs = []
     for _ in range(2):
         adata = _repeatability_adata(dtype)

@@ -78,9 +78,7 @@ class TestComputeEigen:
     def test_decreasing_order(self, adata):
         conn = _load_connectivities(adata)
         tsym, _Z = _compute_transitions(conn)
-        evals, _evecs = _compute_eigen(
-            tsym, n_comps=10, sort="decrease", rng=np.random.default_rng(0)
-        )
+        evals, _evecs = _compute_eigen(tsym, n_comps=10, sort="decrease", rng=np.random.default_rng(0))
 
         evals_np = evals.get()
         assert np.all(evals_np[:-1] >= evals_np[1:])

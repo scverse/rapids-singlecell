@@ -67,8 +67,7 @@ def calculate_niche_neighborhood(
     library_key: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches from cell-type neighborhood profiles on the GPU.
+    """Compute spatial niches from cell-type neighborhood profiles on the GPU.
 
     Each cell is described by the frequency of ``groups`` labels among its spatial
     neighbors; the profiles are then clustered with leiden. Mirrors
@@ -159,8 +158,7 @@ def calculate_niche_utag(
     library_key: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches from UTAG-smoothed expression on the GPU.
+    """Compute spatial niches from UTAG-smoothed expression on the GPU.
 
     Expression is propagated over the L1-normalized spatial graph, PCA-reduced and
     clustered with leiden. Mirrors ``squidpy.gr.calculate_niche_utag``
@@ -230,8 +228,7 @@ def calculate_niche_cellcharter(
     library_key: str | None = None,
     inplace: bool = True,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches with the CellCharter approach on the GPU.
+    """Compute spatial niches with the CellCharter approach on the GPU.
 
     Expression is shell-aggregated over n-hop neighborhoods, PCA-reduced and clustered
     with a Gaussian mixture. Mirrors ``squidpy.gr.calculate_niche_cellcharter``
@@ -279,9 +276,7 @@ def calculate_niche_cellcharter(
     if distance < 0:
         raise ValueError(f"`distance` must be >= 0, got {distance}.")
     if aggregation not in ("mean", "variance"):
-        raise ValueError(
-            f"aggregation={aggregation!r} not supported. Use 'mean' or 'variance'."
-        )
+        raise ValueError(f"aggregation={aggregation!r} not supported. Use 'mean' or 'variance'.")
     if not isinstance(n_components, int) or n_components < 1:
         raise ValueError(f"`n_components` must be an int >= 1, got {n_components}.")
     if use_rep is not None:
@@ -319,8 +314,7 @@ def calculate_niche_cellcharter(
 @deprecated(
     Deprecation(
         "0.17.0",
-        "Use `calculate_niche_neighborhood`, `calculate_niche_utag`, or "
-        "`calculate_niche_cellcharter` instead.",
+        "Use `calculate_niche_neighborhood`, `calculate_niche_utag`, or `calculate_niche_cellcharter` instead.",
     )
 )
 def calculate_niche(
@@ -347,8 +341,7 @@ def calculate_niche(
     copy: bool | None = None,
     **kwargs,
 ) -> AnnData | None:
-    """\
-    Compute spatial niches on the GPU.
+    """Compute spatial niches on the GPU.
 
     .. deprecated:: 0.17.0
         ``calculate_niche`` is deprecated and will be removed in a future release,
@@ -424,21 +417,15 @@ def calculate_niche(
     """
     adata = _extract_adata(adata, table_key=table_key)
     if flavor not in FLAVORS:
-        raise ValueError(
-            f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'."
-        )
+        raise ValueError(f"Unknown flavor '{flavor}'. Use 'neighborhood', 'utag', or 'cellcharter'.")
     if kwargs.pop("gmm_init", None) is not None:
         warnings.warn(
-            f"`gmm_init` is no longer supported and is ignored; the CellCharter GMM "
-            f"always uses {GMM_INIT!r}.",
+            f"`gmm_init` is no longer supported and is ignored; the CellCharter GMM always uses {GMM_INIT!r}.",
             FutureWarning,
             stacklevel=3,
         )
     if kwargs:
-        raise TypeError(
-            f"calculate_niche() got an unexpected keyword argument "
-            f"{next(iter(kwargs))!r}."
-        )
+        raise TypeError(f"calculate_niche() got an unexpected keyword argument {next(iter(kwargs))!r}.")
     if copy is not None:
         warnings.warn(
             "`copy` is deprecated, use `inplace` instead.",
@@ -537,9 +524,7 @@ def _check_unnecessary_args(flavor: str, params: dict[str, object]) -> None:
     """Warn about arguments the chosen flavor ignores, following :mod:`squidpy`."""
     defaults = inspect.signature(calculate_niche).parameters
     unnecessary = [
-        name
-        for name in UNUSED_ARGS[flavor]
-        if params[name] is not None and params[name] != defaults[name].default
+        name for name in UNUSED_ARGS[flavor] if params[name] is not None and params[name] != defaults[name].default
     ]
     if unnecessary:
         warnings.warn(
@@ -552,8 +537,7 @@ def _check_unnecessary_args(flavor: str, params: dict[str, object]) -> None:
 def _check_key(adata: AnnData, key: str) -> None:
     if key not in adata.obsp:
         raise KeyError(
-            f"'{key}' not found in `adata.obsp`. "
-            "Compute it first with `rapids_singlecell.gr.spatial_neighbors_knn`."
+            f"'{key}' not found in `adata.obsp`. Compute it first with `rapids_singlecell.gr.spatial_neighbors_knn`."
         )
 
 
@@ -569,28 +553,21 @@ def _calculate_niche_custom(
 ) -> AnnData | None:
     """Run embed → cluster → postprocess, optionally stratified by ``library_key``."""
     if adata.n_obs == 0:
-        raise ValueError(
-            "Cannot calculate niches on an AnnData object with no observations."
-        )
+        raise ValueError("Cannot calculate niches on an AnnData object with no observations.")
 
     if library_key is not None:
         if library_key not in adata.obs.columns:
             raise KeyError(f"'{library_key}' not found in `adata.obs`.")
         n_missing = int(adata.obs[library_key].isna().sum())
         if n_missing:
-            raise ValueError(
-                f"`adata.obs[{library_key!r}]` contains {n_missing} missing "
-                "library value(s)."
-            )
+            raise ValueError(f"`adata.obs[{library_key!r}]` contains {n_missing} missing library value(s).")
 
     adata = adata if inplace else adata.copy()
 
     if library_key is None:
         embedding = None if adata.n_obs == 1 else embed(adata)
         cols = cluster(adata, embedding, library_id=None)
-        _postprocess_niche_results(
-            adata, cols, mask=mask, min_niche_size=min_niche_size, prefix=None
-        )
+        _postprocess_niche_results(adata, cols, mask=mask, min_niche_size=min_niche_size, prefix=None)
         return None if inplace else adata
 
     columns: list[str] = []
@@ -657,7 +634,7 @@ def _leiden_cluster(
     base_colname: str,
     library_id: object | None,
 ) -> list[str]:
-    """kNN graph + leiden over the embedding; one ``<base_colname>_res=<res>`` per resolution."""
+    """KNN graph + leiden over the embedding; one ``<base_colname>_res=<res>`` per resolution."""
     res_list = list(resolutions)
     result_columns = [f"{base_colname}_res={res}" for res in res_list]
     if adata.n_obs == 1:
@@ -746,8 +723,7 @@ def _warn_size_adaptation(
 ) -> None:
     scope = "the dataset" if library_id is None else f"library {library_id!r}"
     warnings.warn(
-        f"`{parameter}={requested}` exceeds the {n_obs} observation(s) in {scope}; "
-        f"using `{parameter}={effective}`.",
+        f"`{parameter}={requested}` exceeds the {n_obs} observation(s) in {scope}; using `{parameter}={effective}`.",
         UserWarning,
         stacklevel=3,
     )
@@ -781,11 +757,31 @@ def _nhood_embedding(
 
 def _utag_embedding(adata: AnnData, *, key: str) -> cp.ndarray:
     """UTAG-smoothed expression, PCA-reduced."""
-    inner = AnnData(
-        X=_utag_features(adata, key), obs=pd.DataFrame(index=adata.obs_names.copy())
+    adj, X = _utag_operands(adata, key)
+    if not sparse_gpu.issparse(X):
+        inner = AnnData(X=adj @ X, obs=pd.DataFrame(index=adata.obs_names.copy()))
+        rsc.pp.pca(inner, key_added=None)
+        return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
+
+    # Sparse A @ X has ~mean-degree times the nnz of X (billions on large panels):
+    # run the PCA on the implicit, mean-centered operator A @ X instead.
+    from cupyx.scipy.sparse.linalg import LinearOperator
+
+    from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import lanczos_svd
+
+    n = X.shape[0]
+    adj_t, X_t = adj.T, X.T  # CSC views, no copies
+    mean = X_t @ (adj_t @ cp.ones(n, dtype=X.dtype)) / n
+    op = LinearOperator(
+        X.shape,
+        matvec=lambda v: adj @ (X @ v) - mean @ v,
+        rmatvec=lambda u: X_t @ (adj_t @ u) - mean * u.sum(),
+        matmat=lambda V: adj @ (X @ V) - (mean @ V)[None, :],
+        rmatmat=lambda U: X_t @ (adj_t @ U) - cp.outer(mean, U.sum(axis=0)),
+        dtype=X.dtype,
     )
-    rsc.pp.pca(inner, key_added=None)
-    return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
+    U, S, _ = lanczos_svd(op, k=min(rsc.settings.N_PCS, min(X.shape) - 1), rng=0)
+    return U * S
 
 
 def _cellcharter_embedding(
@@ -876,6 +872,12 @@ def _neighborhood_profile(
 
 def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matrix:
     """L1-row-normalize the spatial adjacency and propagate expression: D^-1 A @ X."""
+    adj, X = _utag_operands(adata, key)
+    return adj @ X
+
+
+def _utag_operands(adata: AnnData, key: str) -> tuple[sparse_gpu.csr_matrix, cp.ndarray | sparse_gpu.csr_matrix]:
+    """L1-row-normalized spatial adjacency and float32 expression on the GPU."""
     from rapids_singlecell._cuda import _norm_cuda as _nc
 
     adj = rsc.get.X_to_GPU(adata.obsp[key]).copy()
@@ -889,12 +891,7 @@ def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matr
         stream=cp.cuda.get_current_stream().ptr,
     )
 
-    X = rsc.get.X_to_GPU(adata.X).astype(cp.float32)
-    if sparse_gpu.issparse(X):
-        out = adj @ X
-        return out.tocsr()
-    out = adj @ X
-    return out
+    return adj, rsc.get.X_to_GPU(adata.X).astype(cp.float32)
 
 
 def _cellcharter_features(
@@ -965,7 +962,5 @@ def _cellcharter_features(
 
     if all(not sparse_gpu.issparse(m) for m in aggregated):
         return cp.concatenate(aggregated, axis=1)
-    aggregated = [
-        m if sparse_gpu.issparse(m) else sparse_gpu.csr_matrix(m) for m in aggregated
-    ]
+    aggregated = [m if sparse_gpu.issparse(m) else sparse_gpu.csr_matrix(m) for m in aggregated]
     return sparse_gpu.hstack(aggregated, format="csr")

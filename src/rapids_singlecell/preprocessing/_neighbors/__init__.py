@@ -35,9 +35,7 @@ if TYPE_CHECKING:
 
     from anndata import AnnData
 
-_Algorithms_bbknn = Literal[
-    "brute", "cagra", "ivfflat", "ivfpq", "mg_ivfflat", "mg_ivfpq"
-]
+_Algorithms_bbknn = Literal["brute", "cagra", "ivfflat", "ivfpq", "mg_ivfflat", "mg_ivfpq"]
 
 _DEFAULT_SEED = 0
 
@@ -58,8 +56,7 @@ def neighbors(
     key_added: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
-    """\
-    Compute a neighborhood graph of observations :cite:p:`Ootomo2024`.
+    """Compute a neighborhood graph of observations :cite:p:`Ootomo2024`.
 
     The neighbor search efficiency of this heavily relies on cuVS,
     which also provides a method for estimating connectivities of data points -
@@ -199,6 +196,7 @@ def neighbors(
         warn(
             f"Parameter `rng`/`random_state` ignored if `method={method!r}`.",
             UserWarning,
+            stacklevel=2,
         )
         meta_random_state.pop("random_state", None)
 
@@ -208,10 +206,7 @@ def neighbors(
         adata._init_as_actual(adata.copy())
 
     if algorithm not in get_args(_Algorithms):
-        raise ValueError(
-            f"Invalid algorithm '{algorithm}' for KNN. "
-            f"Valid options are: {get_args(_Algorithms)}."
-        )
+        raise ValueError(f"Invalid algorithm '{algorithm}' for KNN. Valid options are: {get_args(_Algorithms)}.")
 
     X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     X_contiguous = _check_neighbors_X(X, algorithm)
@@ -297,9 +292,11 @@ def bbknn(
     key_added: str | None = None,
     copy: bool = False,
 ) -> AnnData | None:
-    """\
-    Batch balanced KNN :cite:p:`Polanski2019`, altering the KNN procedure to identify each cell's top neighbours in
+    """Batch balanced KNN :cite:p:`Polanski2019`.
+
+    Batch balanced KNN alters the KNN procedure to identify each cell's top neighbours in
     each batch separately instead of the entire cell pool with no accounting for batch.
+
     The nearest neighbours for each batch are then merged to create a final list of
     neighbours for the cell.
 
@@ -398,7 +395,6 @@ def bbknn(
     See `key_added` parameter description for the storage path of
     connectivities and distances.
     """
-
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
@@ -410,8 +406,7 @@ def bbknn(
 
     if algorithm not in get_args(_Algorithms_bbknn):
         raise ValueError(
-            f"Invalid algorithm '{algorithm}' for batch-balanced KNN. "
-            f"Valid options are: {get_args(_Algorithms_bbknn)}."
+            f"Invalid algorithm '{algorithm}' for batch-balanced KNN. Valid options are: {get_args(_Algorithms_bbknn)}."
         )
     adata = adata.copy() if copy else adata
     if adata.is_view:
@@ -444,9 +439,7 @@ def bbknn(
             algorithm_kwds=algorithm_kwds,
         )
 
-        col_range = cp.arange(
-            idx * neighbors_within_batch, (idx + 1) * neighbors_within_batch
-        )
+        col_range = cp.arange(idx * neighbors_within_batch, (idx + 1) * neighbors_within_batch)
         knn_indices[:, col_range] = ind_to[sub_ind]
         knn_dist[:, col_range] = sub_dist
 
@@ -483,9 +476,7 @@ def bbknn(
         n_neighbors=total_neighbors,
         rng=rng,
         metric=metric,
-        batch_codes=cp.asarray(np.searchsorted(unique_batches, batch_array))
-        if metric == "inner_product"
-        else None,
+        batch_codes=cp.asarray(np.searchsorted(unique_batches, batch_array)) if metric == "inner_product" else None,
     )
     if connectivities.nnz >= np.iinfo(np.int32).max:
         connectivities = connectivities.get().tocsr()

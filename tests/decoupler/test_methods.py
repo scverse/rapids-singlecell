@@ -25,9 +25,7 @@ import rapids_singlecell.decoupler_gpu as dc
 )
 @pytest.mark.parametrize("bsize", [None, 2])
 @pytest.mark.parametrize("positional", [False, True])
-def test_standard_method_execution_defaults(
-    name, default_bsize, batch_on, dense, bsize, *, positional, monkeypatch
-):
+def test_standard_method_execution_defaults(name, default_bsize, batch_on, dense, bsize, *, positional, monkeypatch):
     from unittest.mock import Mock
 
     from rapids_singlecell.decoupler_gpu._helper import _Method

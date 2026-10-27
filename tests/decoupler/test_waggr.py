@@ -31,12 +31,8 @@ def test_wsum_wmean(mat, adjmat):
     result_actual = dc._method_waggr._wsum(X, adjmat)
     expected_actual = X @ adjmat
 
-    print(
-        f"Expected shape: {expected_actual.shape}, Result shape: {result_actual.shape}"
-    )
-    print(
-        f"Expected min/max: {cp.min(expected_actual):.6f} / {cp.max(expected_actual):.6f}"
-    )
+    print(f"Expected shape: {expected_actual.shape}, Result shape: {result_actual.shape}")
+    print(f"Expected min/max: {cp.min(expected_actual):.6f} / {cp.max(expected_actual):.6f}")
     print(f"Result min/max: {cp.min(result_actual):.6f} / {cp.max(result_actual):.6f}")
 
     is_close_actual = cp.allclose(expected_actual, result_actual, rtol=1e-4)
@@ -70,9 +66,7 @@ def test_func_waggr(
     X, obs, var = mat
     X = cp.array(X)
     adjmat = cp.array(adjmat)
-    es, pv = dc._method_waggr._func_waggr(
-        mat=X, adj=adjmat, fun=fun, times=times, seed=seed
-    )
+    es, pv = dc._method_waggr._func_waggr(mat=X, adj=adjmat, fun=fun, times=times, seed=seed)
     assert np.isfinite(es).all()
     assert ((0 <= pv) & (pv <= 1)).all()
 
@@ -85,9 +79,7 @@ def test_func_waggr_permutation(mat, adjmat, fun):
     adjmat = cp.array(adjmat)
     times = 100
     seed = 42
-    es, pv = dc._method_waggr._func_waggr(
-        mat=X, adj=adjmat, fun=fun, times=times, seed=seed
-    )
+    es, pv = dc._method_waggr._func_waggr(mat=X, adj=adjmat, fun=fun, times=times, seed=seed)
     assert np.isfinite(es).all()
     assert ((0 <= pv) & (pv <= 1)).all()
     # With permutation, es becomes NES (normalized enrichment score)
@@ -122,9 +114,7 @@ def test_custom_callable(mat, adjmat):
     X, obs, var = mat
     X = cp.array(X, dtype=cp.float32)
     adjmat = cp.array(adjmat, dtype=cp.float32)
-    es, pv = dc._method_waggr._func_waggr(
-        mat=X, adj=adjmat, fun=custom_weighted_sum, times=0, seed=42
-    )
+    es, pv = dc._method_waggr._func_waggr(mat=X, adj=adjmat, fun=custom_weighted_sum, times=0, seed=42)
     assert np.isfinite(es).all()
     assert ((0 <= pv) & (pv <= 1)).all()
 
@@ -140,9 +130,7 @@ def test_custom_callable_with_permutation(mat, adjmat):
     X, obs, var = mat
     X = cp.array(X, dtype=cp.float32)
     adjmat = cp.array(adjmat, dtype=cp.float32)
-    es, pv = dc._method_waggr._func_waggr(
-        mat=X, adj=adjmat, fun=custom_wmean, times=50, seed=42
-    )
+    es, pv = dc._method_waggr._func_waggr(mat=X, adj=adjmat, fun=custom_wmean, times=50, seed=42)
     assert np.isfinite(es).all()
     assert ((0 <= pv) & (pv <= 1)).all()
 
@@ -162,8 +150,36 @@ def test_perm_function(mat, adjmat):
     idx = dc._method_waggr._ridx(times=times, nvar=nvar, seed=42)
 
     # Run permutation
-    nes, pv = dc._method_waggr._perm(
-        fun=dc._method_waggr._wmean, es=es, mat=X, adj=adjmat, idx=idx
-    )
+    nes, pv = dc._method_waggr._perm(fun=dc._method_waggr._wmean, es=es, mat=X, adj=adjmat, idx=idx)
     assert np.isfinite(nes.get()).all()
     assert ((0 <= pv.get()) & (pv.get() <= 1)).all()
+
+
+def test_waggr_pvalues():
+    """P-values grow as |ES| shrinks relative to the permuted scores (#854)."""
+    rng = np.random.default_rng(0)
+    nvar, times = 200, 1000
+    mat = rng.normal(size=(1, nvar))
+    adj = np.zeros((nvar, 2))
+    # Score of exactly 0: no evidence of enrichment
+    mat[0, :2] = 5.0
+    adj[:2, 0] = [1.0, -1.0]
+    # Strongly enriched set
+    mat[0, 50:70] += 3.0
+    adj[50:70, 1] = 1.0
+    es, pv = dc._method_waggr._func_waggr(mat=cp.array(mat), adj=cp.array(adj), fun="wmean", times=times, seed=42)
+    assert pv[0, 0] > 0.5
+    assert pv[0, 1] == pytest.approx(1 / (times + 1))
+
+    # A constant score is never more extreme than its permutations
+    def waggr_const_zero(x, w):
+        return cp.zeros((x.shape[0], w.shape[1]), dtype=x.dtype)
+
+    es, pv = dc._method_waggr._func_waggr(
+        mat=cp.array(mat),
+        adj=cp.array(adj),
+        fun=waggr_const_zero,
+        times=times,
+        seed=42,
+    )
+    assert (pv == 1).all()

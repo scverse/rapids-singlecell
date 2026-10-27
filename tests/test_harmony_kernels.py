@@ -29,12 +29,7 @@ from rapids_singlecell._cuda import (
 from rapids_singlecell._utils import _create_category_index_mapping
 
 pytestmark = pytest.mark.skipif(
-    _norm is None
-    or _pen is None
-    or _scatter is None
-    or _colsum is None
-    or _cl is None
-    or _corr is None,
+    _norm is None or _pen is None or _scatter is None or _colsum is None or _cl is None or _corr is None,
     reason="Harmony CUDA modules not available",
 )
 
@@ -203,9 +198,7 @@ def test_fused_pen_norm_multi_int(dtype, n_covariates):
 
     similarities = rng.random((n_rows + 13, n_cols), dtype=dtype)
     penalty = rng.random((int(levels.sum()), n_cols), dtype=dtype) + 0.2
-    local_codes = cp.stack(
-        [rng.integers(0, int(level), size=n_rows) for level in levels], axis=1
-    ).astype(cp.int32)
+    local_codes = cp.stack([rng.integers(0, int(level), size=n_rows) for level in levels], axis=1).astype(cp.int32)
     cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
     idx_in = _random_idx(n_rows + 13, n_rows, seed=734)
     R_out = cp.empty((n_rows, n_cols), dtype=dtype)
@@ -246,9 +239,7 @@ def test_fused_pen_norm_multi_int_avoids_product_overflow(dtype, n_covariates):
     scale = dtype(1e30 if dtype == np.float32 else 1e200)
     relative = rng.uniform(0.5, 1.0, size=(int(levels.sum()), n_cols)).astype(dtype)
     penalty = scale * relative
-    local_codes = cp.stack(
-        [rng.integers(0, int(level), size=n_rows) for level in levels], axis=1
-    ).astype(cp.int32)
+    local_codes = cp.stack([rng.integers(0, int(level), size=n_rows) for level in levels], axis=1).astype(cp.int32)
     cats = cp.ascontiguousarray(local_codes + cp.asarray(offsets))
     idx_in = cp.arange(n_rows, dtype=cp.int32)
     R_out = cp.empty((n_rows, n_cols), dtype=dtype)
@@ -365,23 +356,20 @@ def test_scatter_add(dtype, switcher, n_covariates, grouped, *, n_rows, n_catego
     n_cols = 17
     rng = np.random.default_rng(734)
     values_host = rng.normal(size=(n_rows, n_cols)).astype(dtype)
-    categories_host = np.arange(n_rows * n_covariates, dtype=np.int32).reshape(
-        n_rows, n_covariates
-    ) % (n_categories - 1)
+    categories_host = np.arange(n_rows * n_covariates, dtype=np.int32).reshape(n_rows, n_covariates) % (
+        n_categories - 1
+    )
     categories_host[:2100, 0] = 0
     expected = np.zeros((n_categories, n_cols), dtype=np.float64)
     np.add.at(
         expected,
         categories_host.ravel(),
-        np.repeat(values_host.astype(np.float64), n_covariates, axis=0)
-        * (1 if switcher else -1),
+        np.repeat(values_host.astype(np.float64), n_covariates, axis=0) * (1 if switcher else -1),
     )
     values, categories = cp.asarray(values_host), cp.asarray(categories_host)
     category_offsets = cell_indices = None
     if grouped:
-        category_offsets, cell_indices = _create_category_index_mapping(
-            categories.ravel(), n_categories
-        )
+        category_offsets, cell_indices = _create_category_index_mapping(categories.ravel(), n_categories)
     workspace_bytes = _cl.get_scatter_temp_bytes(
         n_rows=n_rows,
         n_cols=n_cols,
@@ -461,9 +449,7 @@ def _compute_objective_reference(R, similarities, *, O, E, theta, sigma, stabili
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize(
-    "n_cells,n_clusters,n_batches", [(500, 20, 3), (1000, 100, 10), (200, 5, 2)]
-)
+@pytest.mark.parametrize("n_cells,n_clusters,n_batches", [(500, 20, 3), (1000, 100, 10), (200, 5, 2)])
 @pytest.mark.parametrize("stabilized", [True, False])
 def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
     rng = cp.random.default_rng(42)
@@ -492,15 +478,11 @@ def test_compute_objective(dtype, n_cells, n_clusters, n_batches, stabilized):
         stabilized=stabilized,
         objective_partials=cp.empty(n_cells, dtype=dtype),
     )
-    with pytest.raises(
-        ValueError, match="objective_partials must hold at least n_cells elements"
-    ):
+    with pytest.raises(ValueError, match="objective_partials must hold at least n_cells elements"):
         compute_objective(objective_partials=cp.empty(n_cells - 1, dtype=dtype))
     result = compute_objective()
 
-    expected = _compute_objective_reference(
-        R, similarities, O=O, E=E, theta=theta, sigma=sigma, stabilized=stabilized
-    )
+    expected = _compute_objective_reference(R, similarities, O=O, E=E, theta=theta, sigma=sigma, stabilized=stabilized)
 
     rtol = 1e-5 if dtype == np.float32 else 1e-10
     np.testing.assert_allclose(result, expected, rtol=rtol)

@@ -45,9 +45,7 @@ def sdata():
             index=[f"cell{i}" for i in range(24)],
         ),
     )
-    table = TableModel.parse(
-        table, region=["a", "b"], region_key="region", instance_key="instance"
-    )
+    table = TableModel.parse(table, region=["a", "b"], region_key="region", instance_key="instance")
     return sd.SpatialData(points=points, tables={"cells": table, "other": table.copy()})
 
 
@@ -65,9 +63,7 @@ def _resolve(sdata, **kwargs):
 @pytest.mark.parametrize("shuffle", [False, True])
 def test_centroids_follow_table_order(sdata, shuffle):
     if shuffle:
-        sdata.tables["cells"] = sdata.tables["cells"][
-            np.random.default_rng(0).permutation(24)
-        ].copy()
+        sdata.tables["cells"] = sdata.tables["cells"][np.random.default_rng(0).permutation(24)].copy()
     table, library = _resolve(sdata)
     assert library == "region"
     for i, row in enumerate(table.obs.itertuples()):
@@ -99,9 +95,7 @@ def test_element_centroids(kind):
             index=["a", "b"],
         ),
     )
-    table = TableModel.parse(
-        table, region="cells", region_key="region", instance_key="instance"
-    )
+    table = TableModel.parse(table, region="cells", region_key="region", instance_key="instance")
     data = sd.SpatialData(**{kind: {"cells": element}}, tables={"table": table})
     result, _ = _resolve_spatial_data(
         data,
@@ -129,9 +123,7 @@ def test_neighbors_spatialdata(sdata, name, kwargs, copy):
     reference = table.copy()
     del table.obsm["coords"]
     func = getattr(rsc.gr, name)
-    expected = func(
-        reference, spatial_key="coords", library_key="region", copy=True, **kwargs
-    )
+    expected = func(reference, spatial_key="coords", library_key="region", copy=True, **kwargs)
     actual = func(
         sdata,
         table_key="cells",
@@ -145,9 +137,7 @@ def test_neighbors_spatialdata(sdata, name, kwargs, copy):
     if not copy:
         assert actual is None
         actual = (table.obsp["test_connectivities"], table.obsp["test_distances"])
-        assert (
-            table.uns["test_neighbors"]["connectivities_key"] == "test_connectivities"
-        )
+        assert table.uns["test_neighbors"]["connectivities_key"] == "test_connectivities"
     else:
         assert not table.obsp
         assert "test_neighbors" not in table.uns
@@ -167,6 +157,9 @@ _DOWNSTREAM = [
             "multi_gpu": False,
         },
     ),
+    ("ripley", {"cluster_key": "cluster", "mode": "G", "n_neigh": 1, "rng": 0}),
+    ("interaction_matrix", {"cluster_key": "cluster", "weights": True}),
+    ("nhood_enrichment", {"cluster_key": "cluster", "n_perms": 20, "seed": 0}),
     (
         "ligrec",
         {
@@ -220,11 +213,25 @@ def test_downstream_spatialdata(sdata, name, kwargs, copy):
             actual if copy else table.uns["moranI"],
             expected if copy else reference.uns["moranI"],
         )
+    elif name == "ripley":
+        a = actual if copy else table.uns["cluster_ripley_G"]
+        b = expected if copy else reference.uns["cluster_ripley_G"]
+        pd.testing.assert_frame_equal(a["G_stat"], b["G_stat"])
+        pd.testing.assert_frame_equal(a["sims_stat"], b["sims_stat"])
     elif name == "co_occurrence":
         a = actual if copy else table.uns["cluster_co_occurrence"].values()
         b = expected if copy else reference.uns["cluster_co_occurrence"].values()
         for x, y in zip(a, b, strict=True):
             np.testing.assert_allclose(x, y)
+    elif name == "interaction_matrix":
+        a = actual if copy else table.uns["cluster_interactions"]
+        b = expected if copy else reference.uns["cluster_interactions"]
+        np.testing.assert_array_equal(a, b)
+    elif name == "nhood_enrichment":
+        a = actual if copy else table.uns["cluster_nhood_enrichment"].values()
+        b = expected if copy else reference.uns["cluster_nhood_enrichment"].values()
+        for x, y in zip(a, b, strict=True):
+            np.testing.assert_array_equal(x, y)
     else:
         a = actual if copy else table.uns["cluster_ligrec"]
         b = expected if copy else reference.uns["cluster_ligrec"]
@@ -305,9 +312,7 @@ def test_invalid_input_without_spatialdata(monkeypatch):
 
     def without_spatialdata(name, *args, **kwargs):
         if name == "spatialdata":
-            raise ModuleNotFoundError(
-                "No module named 'spatialdata'", name="spatialdata"
-            )
+            raise ModuleNotFoundError("No module named 'spatialdata'", name="spatialdata")
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_spatialdata)

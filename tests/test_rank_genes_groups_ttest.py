@@ -72,9 +72,7 @@ def test_rank_genes_groups_ttest_matches_scanpy(reference, method, sparse):
             # nondeterministic ordering leaves ~1 ULP noise in mean/var that
             # the t-CDF tail amplifies to ~1e-13 rel in pvals (measured);
             # 1e-12 gives 10x margin over that noise floor.
-            np.testing.assert_allclose(
-                gpu_values, cpu_values, rtol=1e-12, atol=1e-15, equal_nan=True
-            )
+            np.testing.assert_allclose(gpu_values, cpu_values, rtol=1e-12, atol=1e-15, equal_nan=True)
 
     params = gpu_result["params"]
     assert params["use_raw"] is False
@@ -95,9 +93,7 @@ def test_rank_genes_groups_ttest_honors_layer_and_use_raw(reference, method):
     base.layers["signal"] = base.X.copy()
 
     ref_adata = base.copy()
-    rsc.tl.rank_genes_groups(
-        ref_adata, "blobs", method=method, use_raw=False, reference=reference
-    )
+    rsc.tl.rank_genes_groups(ref_adata, "blobs", method=method, use_raw=False, reference=reference)
     reference_names = ref_adata.uns["rank_genes_groups"]["names"].copy()
 
     rng = np.random.default_rng(0)
@@ -118,17 +114,14 @@ def test_rank_genes_groups_ttest_honors_layer_and_use_raw(reference, method):
 
     no_layer = base.copy()
     no_layer.X = perturbed_matrix
-    rsc.tl.rank_genes_groups(
-        no_layer, "blobs", method=method, use_raw=False, reference=reference
-    )
+    rsc.tl.rank_genes_groups(no_layer, "blobs", method=method, use_raw=False, reference=reference)
     no_layer_names = no_layer.uns["rank_genes_groups"]["names"].copy()
 
     assert layered_names.dtype.names == reference_names.dtype.names
     for group in reference_names.dtype.names:
         assert tuple(layered_names[group]) == tuple(reference_names[group])
     differences = [
-        tuple(no_layer_names[group]) != tuple(reference_names[group])
-        for group in reference_names.dtype.names
+        tuple(no_layer_names[group]) != tuple(reference_names[group]) for group in reference_names.dtype.names
     ]
     assert any(differences)
 
@@ -208,12 +201,8 @@ def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference
         gpu_names = list(gpu_result["names"][group])
         cpu_names = list(cpu_result["names"][group])
         for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
-            gpu_map = dict(
-                zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float))
-            )
-            cpu_map = dict(
-                zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float))
-            )
+            gpu_map = dict(zip(gpu_names, np.asarray(gpu_result[field][group], dtype=float), strict=False))
+            cpu_map = dict(zip(cpu_names, np.asarray(cpu_result[field][group], dtype=float), strict=False))
             for gene, gpu_val in gpu_map.items():
                 np.testing.assert_allclose(
                     gpu_val,
@@ -229,9 +218,7 @@ def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference
     [("rest", "rest"), ("1", "One")],
 )
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
-def test_rank_genes_groups_ttest_with_renamed_categories(
-    reference_before, reference_after, method
-):
+def test_rank_genes_groups_ttest_with_renamed_categories(reference_before, reference_after, method):
     """Test with renamed category labels."""
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=4, n_centers=3, n_observations=200)
@@ -252,9 +239,7 @@ def test_rank_genes_groups_ttest_with_renamed_categories(
     rsc.tl.rank_genes_groups(adata, "blobs", method=method, reference=reference_after)
     renamed_names = adata.uns["rank_genes_groups"]["names"]
     assert tuple(renamed_names[0]) == first_run
-    expected_renamed = (
-        ("Zero", "One", "Two") if reference_after == "rest" else ("Zero", "Two")
-    )
+    expected_renamed = ("Zero", "One", "Two") if reference_after == "rest" else ("Zero", "Two")
     assert renamed_names.dtype.names == expected_renamed
 
 
@@ -272,20 +257,12 @@ def test_rank_genes_groups_ttest_with_unsorted_groups(reference, method):
     groups = ["0", "1", "2", "3"] if reference != "rest" else ["0", "2", "3"]
     groups_reversed = list(reversed(groups))
 
-    rsc.tl.rank_genes_groups(
-        adata, "blobs", method=method, groups=groups, reference=reference
-    )
-    rsc.tl.rank_genes_groups(
-        bdata, "blobs", method=method, groups=groups_reversed, reference=reference
-    )
+    rsc.tl.rank_genes_groups(adata, "blobs", method=method, groups=groups, reference=reference)
+    rsc.tl.rank_genes_groups(bdata, "blobs", method=method, groups=groups_reversed, reference=reference)
 
     # Column order echoes the user-provided group order (reference excluded).
-    assert adata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
-        g for g in groups if g != reference
-    )
-    assert bdata.uns["rank_genes_groups"]["names"].dtype.names == tuple(
-        g for g in groups_reversed if g != reference
-    )
+    assert adata.uns["rank_genes_groups"]["names"].dtype.names == tuple(g for g in groups if g != reference)
+    assert bdata.uns["rank_genes_groups"]["names"].dtype.names == tuple(g for g in groups_reversed if g != reference)
 
     # Pick a group that's not the reference for comparison
     test_group = "3" if reference != "3" else "0"
@@ -349,9 +326,7 @@ def test_rank_genes_groups_ttest_pts(reference, method):
     assert list(gpu_pts.index) == list(cpu_pts.index)
 
     for col in gpu_pts.columns:
-        np.testing.assert_allclose(
-            gpu_pts[col].values, cpu_pts[col].values, rtol=1e-13, atol=1e-15
-        )
+        np.testing.assert_allclose(gpu_pts[col].values, cpu_pts[col].values, rtol=1e-13, atol=1e-15)
 
     # pts_rest only exists when reference='rest'
     if reference == "rest":
@@ -389,16 +364,12 @@ def test_rank_genes_groups_ttest_direct_scipy():
     adata.obs["group"] = adata.obs["group"].astype("category")
 
     # Run rapids_singlecell t-test (group A vs B as reference)
-    rsc.tl.rank_genes_groups(
-        adata, "group", method="t-test", reference="B", use_raw=False
-    )
+    rsc.tl.rank_genes_groups(adata, "group", method="t-test", reference="B", use_raw=False)
 
     # Get rsc scores for group A
     rsc_names = list(adata.uns["rank_genes_groups"]["names"]["A"])
-    rsc_scores = np.asarray(
-        adata.uns["rank_genes_groups"]["scores"]["A"], dtype=np.float64
-    )
-    rsc_score_map = dict(zip(rsc_names, rsc_scores))
+    rsc_scores = np.asarray(adata.uns["rank_genes_groups"]["scores"]["A"], dtype=np.float64)
+    rsc_score_map = dict(zip(rsc_names, rsc_scores, strict=False))
 
     # Compute scipy t-test directly on the two matrices
     scipy_scores, _ = stats.ttest_ind(X_group1, X_group2, equal_var=False)
@@ -461,10 +432,8 @@ def test_rank_genes_groups_ttest_matches_scipy():
 
         # Get rapids_singlecell scores (need to map by gene name since order differs)
         rsc_names = list(adata.uns["rank_genes_groups"]["names"][group])
-        rsc_scores = np.asarray(
-            adata.uns["rank_genes_groups"]["scores"][group], dtype=np.float64
-        )
-        rsc_score_map = dict(zip(rsc_names, rsc_scores))
+        rsc_scores = np.asarray(adata.uns["rank_genes_groups"]["scores"][group], dtype=np.float64)
+        rsc_score_map = dict(zip(rsc_names, rsc_scores, strict=False))
 
         # Compare scores for each gene
         # Gap is from GPU vs CPU mean/var computation (~float32 intermediates)
@@ -490,9 +459,7 @@ def test_rank_genes_groups_ttest_mask_var_array(method):
     mask = np.array([True] * 5 + [False] * 5)
 
     # Run with mask
-    rsc.tl.rank_genes_groups(
-        adata, "blobs", method=method, mask_var=mask, use_raw=False
-    )
+    rsc.tl.rank_genes_groups(adata, "blobs", method=method, mask_var=mask, use_raw=False)
 
     result = adata.uns["rank_genes_groups"]
 
@@ -518,9 +485,7 @@ def test_rank_genes_groups_ttest_mask_var_string(method):
     adata.var["highly_variable"] = [True] * 6 + [False] * 4
 
     # Run with mask string key
-    rsc.tl.rank_genes_groups(
-        adata, "blobs", method=method, mask_var="highly_variable", use_raw=False
-    )
+    rsc.tl.rank_genes_groups(adata, "blobs", method=method, mask_var="highly_variable", use_raw=False)
 
     result = adata.uns["rank_genes_groups"]
 
@@ -544,12 +509,8 @@ def test_rank_genes_groups_ttest_mask_var_matches_scanpy(method):
 
     mask = np.array([True, False, True, False, True, True, False, True])
 
-    rsc.tl.rank_genes_groups(
-        adata_gpu, "blobs", method=method, mask_var=mask, use_raw=False
-    )
-    sc.tl.rank_genes_groups(
-        adata_cpu, "blobs", method=method, mask_var=mask, use_raw=False
-    )
+    rsc.tl.rank_genes_groups(adata_gpu, "blobs", method=method, mask_var=mask, use_raw=False)
+    sc.tl.rank_genes_groups(adata_cpu, "blobs", method=method, mask_var=mask, use_raw=False)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -579,16 +540,12 @@ def test_rank_genes_groups_ttest_rankby_abs(method):
     rsc.tl.rank_genes_groups(adata, "blobs", method=method, use_raw=False)
 
     # Run with rankby_abs
-    rsc.tl.rank_genes_groups(
-        adata_abs, "blobs", method=method, rankby_abs=True, use_raw=False
-    )
+    rsc.tl.rank_genes_groups(adata_abs, "blobs", method=method, rankby_abs=True, use_raw=False)
 
     # When rankby_abs=True, genes are ranked by absolute score
     # So a gene with score -5 should rank higher than a gene with score 2
     for group in adata.uns["rank_genes_groups"]["scores"].dtype.names:
-        abs_scores = np.asarray(
-            adata_abs.uns["rank_genes_groups"]["scores"][group], dtype=float
-        )
+        abs_scores = np.asarray(adata_abs.uns["rank_genes_groups"]["scores"][group], dtype=float)
         # Scores themselves are not absolute, but ordering is by absolute value
         # So absolute values should be monotonically decreasing
         assert np.all(np.diff(np.abs(abs_scores)) <= 1e-10)
@@ -604,9 +561,7 @@ def test_rank_genes_groups_ttest_key_added(method):
 
     custom_key = "my_custom_key"
 
-    rsc.tl.rank_genes_groups(
-        adata, "blobs", method=method, key_added=custom_key, use_raw=False
-    )
+    rsc.tl.rank_genes_groups(adata, "blobs", method=method, key_added=custom_key, use_raw=False)
 
     # Check that results are stored under custom key
     assert custom_key in adata.uns
@@ -640,12 +595,8 @@ def test_ttest_host_csc_matches_scanpy(reference, method):
     cpu = a.copy()
     cpu.X = cpu.X.astype(np.float64)
 
-    rsc.tl.rank_genes_groups(
-        gpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference
-    )
-    sc.tl.rank_genes_groups(
-        cpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference
-    )
+    rsc.tl.rank_genes_groups(gpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference)
+    sc.tl.rank_genes_groups(cpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference)
     for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
         for group in gpu.uns["rank_genes_groups"][field].dtype.names:
             np.testing.assert_allclose(

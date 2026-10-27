@@ -50,30 +50,22 @@ class _PermutationCache:
                     for start in range(0, times, step):
                         consume(
                             inverse_transposed[:, start : start + step],
-                            None
-                            if forward_permutations is None
-                            else forward_permutations[start : start + step],
+                            None if forward_permutations is None else forward_permutations[start : start + step],
                         )
                     ready.record(stream)
                     return
             self.entry = None
             cache_fits = 4 * times * nvar * (1 + forward) <= self.max_bytes
-            inverse_transposed = (
-                cp.empty((nvar, times), dtype=cp.int32) if cache_fits else None
-            )
-            forward_permutations = (
-                cp.empty((times, nvar), dtype=cp.int32)
-                if cache_fits and forward
-                else None
-            )
+            inverse_transposed = cp.empty((nvar, times), dtype=cp.int32) if cache_fits else None
+            forward_permutations = cp.empty((times, nvar), dtype=cp.int32) if cache_fits and forward else None
             start = 0
             for host_permutations in _permutations(nvar, times, seed, chunk_size):
                 stop = start + len(host_permutations)
                 forward_chunk = cp.asarray(host_permutations)
                 inverse_chunk = cp.empty_like(forward_chunk)
-                inverse_chunk[
-                    cp.arange(len(host_permutations))[:, None], forward_chunk
-                ] = cp.arange(nvar, dtype=cp.int32)
+                inverse_chunk[cp.arange(len(host_permutations))[:, None], forward_chunk] = cp.arange(
+                    nvar, dtype=cp.int32
+                )
                 if cache_fits:
                     inverse_transposed[:, start:stop] = inverse_chunk.T
                     inverse_transposed_chunk = inverse_transposed[:, start:stop]
@@ -117,9 +109,7 @@ def _func_gsea(
     %(returns)s
     """
     for name, value in (("times", times), ("seed", seed)):
-        assert isinstance(value, int | float) and np.isfinite(value) and value >= 0, (
-            f"{name} must be numeric and >= 0"
-        )
+        assert isinstance(value, int | float) and np.isfinite(value) and value >= 0, f"{name} must be numeric and >= 0"
     times, seed = int(times), int(seed)
     mat = cp.ascontiguousarray(mat, dtype=cp.float32)
     nobs, nvar = mat.shape
@@ -135,20 +125,13 @@ def _func_gsea(
     # Sparse rows retain the positive prefix; general inputs retain every rank.
     hit_limits = cp.sum(value_bits > 0, axis=1, dtype=cp.int32)
     skip_zero_weights = bool(
-        cp.all(
-            ((value_bits[:, -1] >= 0) | (value_bits[:, -1] == -2147483648))
-            & (hit_limits * 2 < nvar)
-        )
+        cp.all(((value_bits[:, -1] >= 0) | (value_bits[:, -1] == -2147483648)) & (hit_limits * 2 < nvar))
     )
     if not skip_zero_weights:
         hit_limits.fill(nvar)
     groups, previous_capacity = [], 0
     for capacity in (8, 16, 32, 64, 128, 256, 512, 1024, 2048):
-        source_ids = np.flatnonzero(
-            (set_sizes > previous_capacity)
-            & (set_sizes <= capacity)
-            & (set_sizes < nvar)
-        )
+        source_ids = np.flatnonzero((set_sizes > previous_capacity) & (set_sizes <= capacity) & (set_sizes < nvar))
         if source_ids.size:
             groups.append((capacity, cp.asarray(source_ids, dtype=cp.int32)))
         previous_capacity = capacity
@@ -156,9 +139,7 @@ def _func_gsea(
     large_sources_gpu = cp.asarray(large_sources, dtype=cp.int32)
     large_membership = cp.zeros((len(large_sources), nvar), dtype=cp.bool_)
     for i, source in enumerate(large_sources):
-        large_membership[
-            i, cnct[set_starts[source] : set_starts[source] + set_sizes[source]]
-        ] = True
+        large_membership[i, cnct[set_starts[source] : set_starts[source] + set_sizes[source]]] = True
     es = cp.zeros((nobs, len(set_sizes)), dtype=cp.float64)
     same_count = cp.zeros(es.shape, dtype=cp.int64)
     extreme_count = cp.zeros_like(same_count)
@@ -182,12 +163,8 @@ def _func_gsea(
             )
 
     def score_large_sets(forward_permutations):
-        result = cp.empty(
-            (nobs, len(forward_permutations), len(large_sources)), dtype=cp.float64
-        )
-        _gs.dense(
-            values, order, large_membership, forward_permutations, result, stream=stream
-        )
+        result = cp.empty((nobs, len(forward_permutations), len(large_sources)), dtype=cp.float64)
+        _gs.dense(values, order, large_membership, forward_permutations, result, stream=stream)
         return result
 
     identity = cp.arange(nvar, dtype=cp.int32)[None, :]
@@ -217,15 +194,11 @@ def _func_gsea(
                         null_scores <= reference,
                     )
                 ).sum(axis=1)
-                null_sum[:, large_sources_gpu] += cp.where(
-                    same_sign, cp.abs(null_scores), 0
-                ).sum(axis=1)
+                null_sum[:, large_sources_gpu] += cp.where(same_sign, cp.abs(null_scores), 0).sum(axis=1)
 
         cache = _permutation_cache or _PermutationCache()
         size = max(1, min(128, 64 * 1024**2 // max(1, 8 * nobs * len(large_sources))))
-        cache.run(
-            nvar, times, seed, consume, forward=bool(large_sources.size), size=size
-        )
+        cache.run(nvar, times, seed, consume, forward=bool(large_sources.size), size=size)
         valid = (same_count > 0) & (null_sum > 0)
         es = cp.where(valid, es * same_count / cp.where(valid, null_sum, 1), 0)
         pv = cp.where(valid, extreme_count / cp.maximum(same_count, 1), 1)

@@ -26,9 +26,7 @@ def _build_kdtree(
     boxes = cp.empty((n, 2, dims), dtype=points.dtype)
     max_length = n if codes is None else int(sizes.max())  # Avoid a sync.
     stream = cp.cuda.get_current_stream().ptr
-    _spatial_cuda.build_tree(
-        points, ranks, codes, segments, max_length, index, boxes, stream
-    )
+    _spatial_cuda.build_tree(points, ranks, codes, segments, max_length, index, boxes, stream)
     return points[index], index, boxes, segments
 
 
@@ -62,9 +60,7 @@ def _tree_edges(coords, codes, k, radius):
     return rows, columns, distances
 
 
-def _edge_distances(
-    coords: cp.ndarray, rows: cp.ndarray, columns: cp.ndarray
-) -> cp.ndarray:
+def _edge_distances(coords: cp.ndarray, rows: cp.ndarray, columns: cp.ndarray) -> cp.ndarray:
     distances = cp.empty(len(rows), dtype=coords.dtype)
     stream = cp.cuda.get_current_stream().ptr
     _spatial_cuda.edge_distances(coords, rows, columns, distances, stream)

@@ -236,9 +236,7 @@ def test_sparse_layer_mask_and_neighbors_key() -> None:
         inplace=False,
     )
 
-    expected = (query_values[:, mask] - ref_values[:, mask].mean(axis=0)) @ ref.varm[
-        "PCs"
-    ][mask]
+    expected = (query_values[:, mask] - ref_values[:, mask].mean(axis=0)) @ ref.varm["PCs"][mask]
     assert np.isfinite(result.obsm["X_pca"]).all()
     np.testing.assert_allclose(
         result.obsm["X_pca"],
@@ -330,12 +328,8 @@ def test_label_transfer_matches_scanpy_on_X() -> None:
         inplace=False,
     )
 
-    np.testing.assert_array_equal(
-        result.obs["label"].to_numpy(), expected.obs["label"].to_numpy()
-    )
-    assert result.obs["label"].cat.categories.equals(
-        expected.obs["label"].cat.categories
-    )
+    np.testing.assert_array_equal(result.obs["label"].to_numpy(), expected.obs["label"].to_numpy())
+    assert result.obs["label"].cat.categories.equals(expected.obs["label"].cat.categories)
 
 
 @pytest.mark.parametrize("n_neighbors", [3, 4])
@@ -391,12 +385,8 @@ def test_automatic_neighbors_reuse_all_stored_pcs() -> None:
 
 def test_custom_neighbor_representation() -> None:
     ref, query = _clustered_data()
-    ref.obsm["shared"] = np.concatenate(
-        [np.zeros((40, 2)), np.full((40, 2), 10.0)]
-    ).astype(np.float32)
-    query.obsm["shared"] = np.concatenate(
-        [np.zeros((3, 2)), np.full((3, 2), 10.0)]
-    ).astype(np.float32)
+    ref.obsm["shared"] = np.concatenate([np.zeros((40, 2)), np.full((40, 2), 10.0)]).astype(np.float32)
+    query.obsm["shared"] = np.concatenate([np.zeros((3, 2)), np.full((3, 2), 10.0)]).astype(np.float32)
     rsc.pp.neighbors(ref, n_neighbors=3, use_rep="shared")
 
     result = rsc.tl.ingest(
@@ -484,12 +474,8 @@ def test_umap_mapping_uses_reference_state() -> None:
             ref_embedding[ref.obs["label"] == "high"].mean(axis=0),
         ]
     )
-    distances = np.linalg.norm(
-        result.obsm["X_umap"][:, None, :] - centroids[None, :, :], axis=2
-    )
-    scanpy_distances = np.linalg.norm(
-        scanpy_result.obsm["X_umap"][:, None, :] - centroids[None, :, :], axis=2
-    )
+    distances = np.linalg.norm(result.obsm["X_umap"][:, None, :] - centroids[None, :, :], axis=2)
+    scanpy_distances = np.linalg.norm(scanpy_result.obsm["X_umap"][:, None, :] - centroids[None, :, :], axis=2)
     expected_clusters = [0] * 3 + [1] * 3
     assert distances.argmin(axis=1).tolist() == expected_clusters
     assert scanpy_distances.argmin(axis=1).tolist() == expected_clusters

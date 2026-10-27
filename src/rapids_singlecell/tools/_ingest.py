@@ -44,9 +44,7 @@ _IngestAlgorithm = Literal[
 _MAX_VOTE_COMPARISONS = 16_000_000
 
 
-def _find_reference_pca_storage_keys(
-    adata_ref: AnnData, *, pca_key: str | None = None
-) -> _PcaKeys | None:
+def _find_reference_pca_storage_keys(adata_ref: AnnData, *, pca_key: str | None = None) -> _PcaKeys | None:
     candidates = (
         [_keys_for_obsm("pca", pca_key) or _embedding_keys("pca", pca_key)]
         if pca_key is not None
@@ -64,24 +62,18 @@ def _find_reference_pca_storage_keys(
     return None
 
 
-def _reference_pca_storage_keys(
-    adata_ref: AnnData, *, pca_key: str | None = None
-) -> _PcaKeys:
+def _reference_pca_storage_keys(adata_ref: AnnData, *, pca_key: str | None = None) -> _PcaKeys:
     storage_keys = _find_reference_pca_storage_keys(adata_ref, pca_key=pca_key)
     if storage_keys is not None:
         return storage_keys
-    raise ValueError(
-        "`adata_ref` is missing PCA results. Run `rsc.pp.pca(adata_ref)` first."
-    )
+    raise ValueError("`adata_ref` is missing PCA results. Run `rsc.pp.pca(adata_ref)` first.")
 
 
 def _reference_umap_storage_keys(adata_ref: AnnData) -> _EmbeddingKeys:
     for keys in _preset_keys("umap"):
         if keys.obsm in adata_ref.obsm and keys.uns in adata_ref.uns:
             return keys
-    raise ValueError(
-        "`adata_ref` is missing UMAP results. Run `rsc.tl.umap(adata_ref)` first."
-    )
+    raise ValueError("`adata_ref` is missing UMAP results. Run `rsc.tl.umap(adata_ref)` first.")
 
 
 def ingest(
@@ -160,24 +152,15 @@ def ingest(
     _validate_obs_keys(adata_ref, obs_keys)
 
     if algorithm not in get_args(_IngestAlgorithm):
-        raise ValueError(
-            f"Invalid algorithm {algorithm!r}. "
-            f"Valid options are: {get_args(_IngestAlgorithm)}."
-        )
+        raise ValueError(f"Invalid algorithm {algorithm!r}. Valid options are: {get_args(_IngestAlgorithm)}.")
 
     neighbors_key = "neighbors" if neighbors_key is None else neighbors_key
     if neighbors_key not in adata_ref.uns:
-        raise ValueError(
-            f"Did not find `adata_ref.uns[{neighbors_key!r}]`. "
-            "Run `rsc.pp.neighbors(adata_ref)` first."
-        )
+        raise ValueError(f"Did not find `adata_ref.uns[{neighbors_key!r}]`. Run `rsc.pp.neighbors(adata_ref)` first.")
 
     neighbor_params = adata_ref.uns[neighbors_key].get("params")
     if neighbor_params is None or "n_neighbors" not in neighbor_params:
-        raise ValueError(
-            f"`adata_ref.uns[{neighbors_key!r}]` does not contain valid "
-            "neighbor parameters."
-        )
+        raise ValueError(f"`adata_ref.uns[{neighbors_key!r}]` does not contain valid neighbor parameters.")
 
     need_representation = "umap" in embedding_methods or bool(obs_keys)
     if "modalities" in neighbor_params and need_representation:
@@ -190,9 +173,8 @@ def ingest(
     pca_output_key = _embedding_keys("pca").obsm
     umap_output_key = _embedding_keys("umap").obsm
     rep_key, n_rep_dims = _resolve_representation(adata_ref, neighbor_params)
-    need_pca = "pca" in embedding_methods or (
-        need_representation and rep_key in _preset_obsm_names("pca")
-    )
+    need_representation = "umap" in embedding_methods or bool(obs_keys)
+    need_pca = "pca" in embedding_methods or (need_representation and rep_key in _preset_obsm_names("pca"))
     query_pca = None
     if need_pca:
         pca_storage_keys = _reference_pca_storage_keys(
@@ -277,22 +259,15 @@ def _validate_methods(
     if len(labeling_methods) == 1 and len(obs_keys) > 1:
         labeling_methods *= len(obs_keys)
     if obs_keys and len(labeling_methods) != len(obs_keys):
-        raise ValueError(
-            "Provide one labeling_method or one method for each requested obs key."
-        )
+        raise ValueError("Provide one labeling_method or one method for each requested obs key.")
     invalid_labeling = set(labeling_methods).difference(get_args(_LabelingMethod))
     if invalid_labeling:
-        raise ValueError(
-            f"Invalid labeling_method values: {sorted(invalid_labeling)}. "
-            "Only 'knn' is supported."
-        )
+        raise ValueError(f"Invalid labeling_method values: {sorted(invalid_labeling)}. Only 'knn' is supported.")
 
 
 def _validate_var_names(adata: AnnData, adata_ref: AnnData) -> None:
     if not adata.var_names.str.upper().equals(adata_ref.var_names.str.upper()):
-        raise ValueError(
-            "Variables in `adata` are different from variables in `adata_ref`."
-        )
+        raise ValueError("Variables in `adata` are different from variables in `adata_ref`.")
 
 
 def _validate_obs_keys(adata_ref: AnnData, obs_keys: list[str]) -> None:
@@ -301,9 +276,7 @@ def _validate_obs_keys(adata_ref: AnnData, obs_keys: list[str]) -> None:
         raise ValueError(f"Did not find obs keys in `adata_ref`: {missing}.")
 
 
-def _resolve_representation(
-    adata_ref: AnnData, neighbor_params: Mapping[str, Any]
-) -> tuple[str, int | None]:
+def _resolve_representation(adata_ref: AnnData, neighbor_params: Mapping[str, Any]) -> tuple[str, int | None]:
     use_rep = neighbor_params.get("use_rep")
     n_pcs = neighbor_params.get("n_pcs")
 
@@ -314,11 +287,7 @@ def _resolve_representation(
     if n_pcs == 0 or (adata_ref.n_vars <= settings.N_PCS and adata_ref.X is not None):
         return "X", None
     pca_storage_keys = _find_reference_pca_storage_keys(adata_ref)
-    pca_key = (
-        _embedding_keys("pca", None).obsm
-        if pca_storage_keys is None
-        else pca_storage_keys.obsm
-    )
+    pca_key = _embedding_keys("pca", None).obsm if pca_storage_keys is None else pca_storage_keys.obsm
     if n_pcs is not None:
         return pca_key, int(n_pcs)
     return pca_key, None
@@ -337,8 +306,7 @@ def _project_query_pca(
     if source_obsm is not None:
         if source_obsm not in adata_ref.obsm or source_obsm not in adata.obsm:
             raise ValueError(
-                f"PCA was fitted from obsm[{source_obsm!r}], which must exist in "
-                "both `adata_ref` and `adata`."
+                f"PCA was fitted from obsm[{source_obsm!r}], which must exist in both `adata_ref` and `adata`."
             )
         if "components" not in pca_info:
             raise ValueError("Reference PCA metadata does not contain `components`.")
@@ -354,14 +322,9 @@ def _project_query_pca(
         components = adata_ref.varm[storage_keys.varm]
 
     if X_ref.shape[1] != X_query.shape[1]:
-        raise ValueError(
-            "The query and reference PCA source representations have different "
-            "numbers of features."
-        )
+        raise ValueError("The query and reference PCA source representations have different numbers of features.")
     if components.shape[0] != X_ref.shape[1]:
-        raise ValueError(
-            "Reference PCA loadings do not match the PCA source representation."
-        )
+        raise ValueError("Reference PCA loadings do not match the PCA source representation.")
 
     if source_obsm is None:
         feature_mask = _resolve_pca_feature_mask(adata_ref, pca_params, components)
@@ -370,13 +333,9 @@ def _project_query_pca(
             X_query = X_query[:, feature_mask]
             components = components[feature_mask]
 
-    compute_dtype = (
-        cp.float64 if np.dtype(components.dtype).itemsize > 4 else cp.float32
-    )
+    compute_dtype = cp.float64 if np.dtype(components.dtype).itemsize > 4 else cp.float32
     output_source = adata_ref.obsm.get(storage_keys.obsm, components)
-    output_dtype = (
-        cp.float64 if np.dtype(output_source.dtype).itemsize > 4 else cp.float32
-    )
+    output_dtype = cp.float64 if np.dtype(output_source.dtype).itemsize > 4 else cp.float32
     query_gpu = _as_gpu_matrix(X_query, dtype=compute_dtype)
     components_gpu = cp.asarray(components, dtype=compute_dtype, order="C")
     query_pca = query_gpu @ components_gpu
@@ -403,9 +362,7 @@ def _resolve_pca_feature_mask(
             raise ValueError(f"Did not find `adata_ref.var[{mask_key!r}]`.")
         mask = adata_ref.var[mask_key].to_numpy()
     elif mask is None:
-        components_host = (
-            cp.asnumpy(components) if isinstance(components, cp.ndarray) else components
-        )
+        components_host = cp.asnumpy(components) if isinstance(components, cp.ndarray) else components
         active = np.any(np.asarray(components_host) != 0, axis=1)
         mask = active if active.any() and not active.all() else None
     else:
@@ -450,21 +407,17 @@ def _get_representations(
             raise ValueError(f"Did not find `adata_ref.obsm[{rep_key!r}]`.")
         if rep_key not in adata.obsm:
             raise ValueError(
-                f"Reference neighbors use obsm[{rep_key!r}]. The same shared "
-                "representation must exist in `adata.obsm`."
+                f"Reference neighbors use obsm[{rep_key!r}]. The same shared representation must exist in `adata.obsm`."
             )
         ref_rep = adata_ref.obsm[rep_key]
         query_rep = adata.obsm[rep_key]
 
     if n_dims is not None:
         if n_dims < 1:
-            raise ValueError(
-                "The neighbor representation must use at least one dimension."
-            )
+            raise ValueError("The neighbor representation must use at least one dimension.")
         if ref_rep.shape[1] < n_dims or query_rep.shape[1] < n_dims:
             raise ValueError(
-                f"The neighbor metadata requests {n_dims} dimensions, but the "
-                "stored representation has fewer."
+                f"The neighbor metadata requests {n_dims} dimensions, but the stored representation has fewer."
             )
         ref_rep = ref_rep[:, :n_dims]
         query_rep = query_rep[:, :n_dims]
@@ -472,10 +425,7 @@ def _get_representations(
     ref_gpu = _as_gpu_matrix(ref_rep)
     query_gpu = _as_gpu_matrix(query_rep)
     if ref_gpu.shape[1] != query_gpu.shape[1]:
-        raise ValueError(
-            "The query and reference neighbor representations have different "
-            "numbers of dimensions."
-        )
+        raise ValueError("The query and reference neighbor representations have different numbers of dimensions.")
     return ref_gpu, query_gpu
 
 
@@ -548,9 +498,7 @@ def _knn_classify(ref_labels: pd.Series, knn_indices: cp.ndarray) -> pd.Categori
         best = counts.argmax(axis=1)
         mode_codes[start:stop] = values[cp.arange(stop - start), best]
 
-    return pd.Categorical.from_codes(
-        cp.asnumpy(mode_codes), categories=categories, ordered=ordered
-    )
+    return pd.Categorical.from_codes(cp.asnumpy(mode_codes), categories=categories, ordered=ordered)
 
 
 def _map_umap(
@@ -561,9 +509,7 @@ def _map_umap(
     neighbor_params: Mapping[str, Any],
     storage_keys: _EmbeddingKeys,
 ) -> cp.ndarray:
-    ref_embedding = cp.asarray(
-        adata_ref.obsm[storage_keys.obsm], dtype=cp.float32, order="C"
-    )
+    ref_embedding = cp.asarray(adata_ref.obsm[storage_keys.obsm], dtype=cp.float32, order="C")
     if ref_rep.shape[0] == 0:
         raise ValueError("`adata_ref` must contain at least one observation.")
     if ref_embedding.ndim != 2 or ref_embedding.shape[0] != ref_rep.shape[0]:

@@ -6,7 +6,7 @@
 
 - NVIDIA GPU with CUDA support
 - [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html), conda/mamba, or [uv](https://docs.astral.sh/uv/)
-- A CUDA-X Data Science environment (e.g., conda `rapids-26.08` or pip-installed CUDA-X Data Science)
+- A CUDA-X Data Science environment (e.g., conda `rapids-26.10` or pip-installed CUDA-X Data Science)
 - CUDA toolkit for building from source
 
 ```{note}
@@ -31,18 +31,30 @@ already cloned without `--recurse-submodules`, initialize them with
 The editable install compiles the CUDA kernels for your local GPU architecture.
 After the install, compiled `.so` modules and `.pyi` type stubs are placed in `src/rapids_singlecell/_cuda/`.
 
-### Pre-commit hooks
+### Code style and type checking
+
+The project follows the [scverse cookiecutter template](https://github.com/scverse/cookiecutter-scverse)
+and runs its checks with [prek](https://prek.j178.dev/) (a faster drop-in for pre-commit).
+Install the git hook once:
 
 ```bash
-pip install pre-commit
-pre-commit install
+uv tool install prek
+uv tool install hatch
+prek install
 ```
 
-Run manually on all files:
+Run the checks manually with hatch:
 
 ```bash
-pre-commit run --all-files
+hatch check fmt [--fix]  # formatters (ruff, clang-format, biome, pyproject-fmt, tombi)
+hatch check code [--fix]  # linters (ruff, codespell, zizmor, ...)
+hatch check types         # mypy, with the CuPy type stubs from cupy-stubs
 ```
+
+Type checking does not compile the CUDA extensions.
+Modules that do not type check yet are listed under `[[tool.mypy.overrides]]` in `pyproject.toml`;
+when you fix one, remove it from that list.
+On pull requests, the [autofix.ci](https://autofix.ci) workflow runs all hooks and pushes formatting fixes.
 
 ## Project structure
 

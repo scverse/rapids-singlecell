@@ -27,9 +27,7 @@ def regress_out(
     batchsize: int | Literal["all"] | None = None,
     verbose: bool = False,
 ) -> Union[cp.ndarray, None]:  # noqa: UP007
-    """
-    Use linear regression to adjust for the effects of unwanted noise
-    and variation.
+    """Use linear regression to adjust for the effects of unwanted noise and variation.
 
     Parameters
     ----------
@@ -78,15 +76,11 @@ def regress_out(
         keys = [keys]
 
     # Check for categorical covariates
-    categorical = any(
-        isinstance(adata.obs[key].dtype, CategoricalDtype) for key in keys
-    )
+    categorical = any(isinstance(adata.obs[key].dtype, CategoricalDtype) for key in keys)
 
     if categorical:
         if len(keys) > 1:
-            raise ValueError(
-                "Only a single categorical variable is supported for regress_out."
-            )
+            raise ValueError("Only a single categorical variable is supported for regress_out.")
         if isinstance(X, DaskArray):
             X = _regress_out_categorical_dask(X, adata.obs[keys[0]])
         else:
@@ -101,6 +95,7 @@ def regress_out(
         _set_obs_rep(adata, X, layer=layer)
     else:
         return X
+    return None
 
 
 def _regress_out_categorical(X, categorical_series):
@@ -148,9 +143,7 @@ def _prepare_regressors(adata, keys, *, n_obs, dtype, order):
 
 def _regress_out_continuous(X, adata, keys, batchsize):
     """Regress out continuous variables using linear regression."""
-    regressors, gram = _prepare_regressors(
-        adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="F"
-    )
+    regressors, gram = _prepare_regressors(adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="F")
 
     # Set default batch size based on the number of samples in X
     DEFAULT_GENE_BATCH = 100
@@ -185,10 +178,8 @@ def _regress_out_continuous(X, adata, keys, batchsize):
             stop_idx = min(batch * batchsize + batchsize, X.shape[1])
 
             arr_batch = X[:, start_idx:stop_idx].copy()
-            lr = LinearRegression(
-                fit_intercept=False, output_type="cupy", algorithm="svd"
-            )
-            lr.fit(regressors, arr_batch, convert_dtype=True)
+            lr = LinearRegression(fit_intercept=False, output_type="cupy", algorithm="svd")
+            lr.fit(regressors, arr_batch)
             X[:, start_idx:stop_idx] = arr_batch - lr.predict(regressors)
 
     return X
@@ -197,9 +188,7 @@ def _regress_out_continuous(X, adata, keys, batchsize):
 def _maybe_densify(X):
     """Phase 0: If X is a sparse dask array, densify all chunks upfront."""
     if sparse.issparse(X._meta):
-        X = X.map_blocks(
-            _sparse_to_dense, order="C", dtype=X.dtype, meta=_meta_dense(X.dtype)
-        )
+        X = X.map_blocks(_sparse_to_dense, order="C", dtype=X.dtype, meta=_meta_dense(X.dtype))
     return X
 
 
@@ -258,16 +247,11 @@ def _regress_out_continuous_dask(X, adata, keys):
     n_genes = X.shape[1]
 
     # Build full regressors array on GPU (matching the non-dask path)
-    regressors, gram = _prepare_regressors(
-        adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="C"
-    )
+    regressors, gram = _prepare_regressors(adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="C")
 
     # Check Gram matrix is invertible
     if np.linalg.det(cp.asnumpy(gram)) == 0:
-        raise ValueError(
-            "The Gram matrix (R^T R) is singular. "
-            "The regressor variables are linearly dependent."
-        )
+        raise ValueError("The Gram matrix (R^T R) is singular. The regressor variables are linearly dependent.")
 
     # Build a dask array of regressors aligned with X's row chunks
     regressors_dask = da.from_array(regressors, chunks=(X.chunks[0], (dim_regressor,)))

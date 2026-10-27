@@ -124,9 +124,7 @@ def _sum_on_device(arrays: list[cp.ndarray], device: int) -> cp.ndarray:
     return total
 
 
-def _concat_on_device(
-    arrays: list[cp.ndarray], device: int, axis: int = 0
-) -> cp.ndarray:
+def _concat_on_device(arrays: list[cp.ndarray], device: int, axis: int = 0) -> cp.ndarray:
     """Concatenate ``arrays`` on ``device``, holding one cross-device copy at a time."""
     shape = list(arrays[0].shape)
     shape[axis] = sum(array.shape[axis] for array in arrays)
@@ -175,17 +173,12 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
     elif isinstance(multi_gpu, list):
         device_ids = multi_gpu
     else:
-        raise ValueError(
-            f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}"
-        )
+        raise ValueError(f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}")
 
     # Validate device IDs
     invalid_ids = [d for d in device_ids if d < 0 or d >= n_available]
     if invalid_ids:
-        raise ValueError(
-            f"Invalid GPU device ID(s): {invalid_ids}. "
-            f"Available devices: {list(range(n_available))}"
-        )
+        raise ValueError(f"Invalid GPU device ID(s): {invalid_ids}. Available devices: {list(range(n_available))}")
 
     if len(device_ids) == 0:
         raise ValueError("multi_gpu must specify at least one device")
@@ -254,10 +247,7 @@ def _split_pairs(
     n_pairs = len(pair_left)
 
     if n_pairs == 0:
-        return [
-            (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32))
-            for _ in range(n_devices)
-        ]
+        return [(cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)) for _ in range(n_devices)]
 
     # Simple even split if no group sizes provided or single device
     if group_sizes is None or n_devices == 1:
@@ -269,9 +259,7 @@ def _split_pairs(
             if start < n_pairs:
                 chunks.append((pair_left[start:end], pair_right[start:end]))
             else:
-                chunks.append(
-                    (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32))
-                )
+                chunks.append((cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)))
         return chunks
 
     # Load-balanced split based on work per pair
@@ -324,9 +312,7 @@ def _calculate_blocks_per_pair(num_pairs: int) -> int:
     return blocks_per_pair
 
 
-def _create_category_index_mapping(
-    cats: cp.ndarray, n_batches: int
-) -> tuple[cp.ndarray, cp.ndarray]:
+def _create_category_index_mapping(cats: cp.ndarray, n_batches: int) -> tuple[cp.ndarray, cp.ndarray]:
     """Create a CSR-like data structure mapping categories to cell indices.
 
     Uses lexicographical sort to group cells by category.

@@ -22,8 +22,10 @@ SPARSE_NEGATIVE_SCAN_MAX_WORKERS = 64
 
 
 def _data_device(X):
-    """Enter the GPU holding ``X`` (no-op for host / Dask input), so kernels
-    never read another GPU's memory through implicit peer access."""
+    """Enter the GPU holding ``X`` (no-op for host / Dask input).
+
+    This way kernels never read another GPU's memory through implicit peer access.
+    """
     if isinstance(X, cp.ndarray):
         return cp.cuda.Device(X.device.id)
     if cpsp.issparse(X):
@@ -44,7 +46,9 @@ def _on_data_device(method):
 
 def _sparse_has_negative(X) -> bool:
     """Return whether an in-memory sparse matrix stores a negative value.
-    Signed sparse Wilcoxon needs the sign-safe sparse-dense ranker."""
+
+    Signed sparse Wilcoxon needs the sign-safe sparse-dense ranker.
+    """
     is_host = sp.issparse(X)
     if not is_host and not cpsp.issparse(X):
         return False
@@ -73,7 +77,9 @@ def _sparse_has_negative(X) -> bool:
 
 def _canonicalize_sparse(X):
     """Sum duplicates and sort sparse indices in place when needed.
-    Fast Wilcoxon ranks stored nnz once, so it expects scanpy's summed view."""
+
+    Fast Wilcoxon ranks stored nnz once, so it expects scanpy's summed view.
+    """
     if (
         (sp.issparse(X) or cpsp.issparse(X))
         and getattr(X, "format", None) in {"csr", "csc"}
@@ -91,7 +97,9 @@ def _select_groups(
     skip_empty_groups: bool = False,
 ) -> tuple[NDArray, NDArray[np.int32], NDArray[np.int64]]:
     """Build selected group names, per-cell int32 codes, and group sizes.
-    Unselected cells receive the sentinel code ``n_groups``."""
+
+    Unselected cells receive the sentinel code ``n_groups``.
+    """
     all_categories = labels.cat.categories
 
     if selected is None:
@@ -100,9 +108,7 @@ def _select_groups(
     # re-sort to category order, so the output column order echoes `groups=`.
 
     if skip_empty_groups:
-        counts = {
-            str(name): int(count) for name, count in labels.value_counts().items()
-        }
+        counts = {str(name): int(count) for name, count in labels.value_counts().items()}
         valid_selected = [group for group in selected if counts.get(str(group), 0) >= 2]
         if reference != "rest":
             ref_matches = [group for group in selected if str(group) == str(reference)]
@@ -116,10 +122,7 @@ def _select_groups(
                     raise ValueError(msg)
         selected = valid_selected
         if len(selected) == 0:
-            msg = (
-                "No groups with at least two samples remain after applying "
-                "skip_empty_groups=True."
-            )
+            msg = "No groups with at least two samples remain after applying skip_empty_groups=True."
             raise ValueError(msg)
 
     n_groups = len(selected)
@@ -134,9 +137,7 @@ def _select_groups(
         code_lookup[category_index] = str_to_sel.get(str(category), n_groups)
     group_codes = code_lookup[orig_codes]
 
-    group_sizes = np.bincount(group_codes, minlength=n_groups + 1)[:n_groups].astype(
-        np.int64
-    )
+    group_sizes = np.bincount(group_codes, minlength=n_groups + 1)[:n_groups].astype(np.int64)
 
     invalid_groups = {str(selected[i]) for i in range(n_groups) if group_sizes[i] < 2}
     if invalid_groups:
@@ -158,7 +159,9 @@ def _choose_chunk_size(requested: int | None) -> int:
 
 def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray:
     """Densify a CSC column window into an F-order float64 GPU block.
-    Slices by indptr so only window nonzeros are touched/transferred."""
+
+    Slices by indptr so only window nonzeros are touched/transferred.
+    """
     from rapids_singlecell._cuda import _rank_stats_cuda as _rs
 
     s_ptr = int(X_csc.indptr[start])
@@ -182,7 +185,9 @@ def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray
 
 def _csr_tile_to_dense_block(X, start: int, stop: int) -> cp.ndarray:
     """Densify a CSR column window into an F-order float64 GPU block.
-    Device CSR avoids rebuilding a CSR/CSC slice before densifying."""
+
+    Device CSR avoids rebuilding a CSR/CSC slice before densifying.
+    """
     from rapids_singlecell._cuda import _rank_stats_cuda as _rs
 
     n_rows = X.shape[0]

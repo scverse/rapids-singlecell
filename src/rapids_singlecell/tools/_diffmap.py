@@ -42,10 +42,7 @@ def _load_connectivities(
         neighbors_key = "neighbors"
 
     if neighbors_key not in adata.uns:
-        raise ValueError(
-            f"No neighbors found in `adata.uns[{neighbors_key!r}]`. "
-            "Run `pp.neighbors` first."
-        )
+        raise ValueError(f"No neighbors found in `adata.uns[{neighbors_key!r}]`. Run `pp.neighbors` first.")
 
     neighbors_dict = adata.uns[neighbors_key]
 
@@ -55,10 +52,7 @@ def _load_connectivities(
         conns_key = neighbors_dict["connectivities_key"]
 
     if conns_key not in adata.obsp:
-        raise ValueError(
-            f"No connectivities found at `adata.obsp[{conns_key!r}]`. "
-            "Run `pp.neighbors` first."
-        )
+        raise ValueError(f"No connectivities found at `adata.obsp[{conns_key!r}]`. Run `pp.neighbors` first.")
 
     connectivities = adata.obsp[conns_key]
     if issparse(connectivities):
@@ -204,9 +198,7 @@ def diffmap(
     """
     rng = np.random.default_rng(rng)
     connectivities = _load_connectivities(adata, neighbors_key)
-    transitions_sym, _Z = _compute_transitions(
-        connectivities, density_normalize=density_normalize
-    )
+    transitions_sym, _Z = _compute_transitions(connectivities, density_normalize=density_normalize)
     evals, evecs = _compute_eigen(transitions_sym, n_comps=n_comps, sort=sort, rng=rng)
 
     key_added = resolve_default(key_added)

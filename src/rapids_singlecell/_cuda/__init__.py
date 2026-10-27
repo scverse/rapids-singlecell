@@ -41,6 +41,7 @@ __all__ = [
     "_mean_var_cuda",
     "_mixscale_cuda",
     "_nanmean_cuda",
+    "_nhood_cuda",
     "_nn_descent_cuda",
     "_norm_cuda",
     "_ora_cuda",
@@ -51,6 +52,7 @@ __all__ = [
     "_rank_stats_cuda",
     "_rank_stream_cuda",
     "_scale_cuda",
+    "_sepal_cuda",
     "_sparse2dense_cuda",
     "_spatial_cuda",
     "_spca_cuda",
@@ -76,9 +78,7 @@ _preload_rapids_runtime_libs()
 # Modules whose CUDA kernels use device scratch. They allocate through a
 # CuPy-backed allocator injected here, so temporaries land on the caller's
 # current device resource (RMM pool / UVM aware) without linking librmm.
-_SCRATCH_MODULES = frozenset(
-    {"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"}
-)
+_SCRATCH_MODULES = frozenset({"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"})
 _scratch_allocator = None
 
 

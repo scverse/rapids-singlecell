@@ -5,7 +5,7 @@ set -euxo pipefail
 echo "Notice: project-provided container images will be deprecated in a future release. See docker/README.md." >&2
 
 docker_account=scverse
-rapids_version=26.08
+rapids_version=26.10
 
 declare -A cuda_versions=(
     [cu12]="12.9.1"
