@@ -258,8 +258,7 @@ def wnn(
     weight_key: str | None = "{}_weight",
     copy: bool = False,
 ) -> AnnData | MuData | None:
-    """\
-    Weighted nearest neighbor (WNN) graph across modalities :cite:p:`Hao2021`.
+    r"""Weighted nearest neighbor (WNN) graph across modalities :cite:p:`Hao2021`.
 
     GPU implementation of Seurat's ``FindMultiModalNeighbors``. For every cell,
     each modality gets a weight from how well the cell's neighbors in that
@@ -341,7 +340,7 @@ def wnn(
     **distances** : sparse matrix of dtype `float32`.
         The `n_neighbors` multimodal neighbors of every cell, excluding the
         cell itself, with Seurat's WNN distance
-        :math:`\\sqrt{(1 - s)/2}` of the weighted kernel similarity :math:`s`.
+        :math:`\sqrt{(1 - s)/2}` of the weighted kernel similarity :math:`s`.
         It is 0 for a neighbor that is the nearest one in every modality.
     **connectivities** : sparse matrix of dtype `float32`.
         Weighted adjacency matrix of the multimodal neighbors (and the cell
@@ -525,7 +524,7 @@ def wnn(
     adata.obsp[f"{prefix}distances"] = distances
     adata.obsp[f"{prefix}connectivities"] = connectivities
     adata.obsp[f"{prefix}snn"] = snn
-    for col, w in zip(weight_cols, weights.get()):
+    for col, w in zip(weight_cols, weights.get(), strict=True):
         adata.obs[col] = w
 
     return adata if copy else None

@@ -132,6 +132,7 @@ xref_overrides = {
 }
 
 nitpick_ignore = [
+    ("py:class", "muon.data.MuData"),
     ("py:class", "scipy.sparse.base.spmatrix"),
     ("py:meth", "pandas.DataFrame.iloc"),
     ("py:meth", "pandas.DataFrame.loc"),
