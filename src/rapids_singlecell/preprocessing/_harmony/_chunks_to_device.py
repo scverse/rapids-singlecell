@@ -15,21 +15,22 @@ _UPLOAD_BYTES = 1 << 28  # largest pinned staging chunk
 _UPLOAD_THREADS = 8
 
 
-def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
-    """``Z[order]`` on the GPU.
+def _sorted_device_copy(Z, order: cp.ndarray, dtype=None) -> cp.ndarray:
+    """``Z[order]`` on the GPU, in ``dtype`` (``Z``'s by default).
 
     Host input is staged in pinned chunks by several threads while the previous chunk is copied, and placed
-    directly, so no unsorted device copy is kept.
+    directly, so no unsorted device copy is kept; the staging converts the dtype and layout.
     """
+    dtype = np.dtype(Z.dtype if dtype is None else dtype)
     if isinstance(Z, cp.ndarray):
-        return Z[order]
+        return Z[order].astype(dtype, copy=False)
     n, d = Z.shape
-    rows = _staging_rows(n, d * Z.itemsize)
-    out = cp.empty(Z.shape, dtype=Z.dtype)
+    rows = _staging_rows(n, d * dtype.itemsize)
+    out = cp.empty(Z.shape, dtype=dtype)
     position = cp.empty_like(order)
     position[order] = cp.arange(order.size)
     stream = cp.cuda.get_current_stream()
-    slots = [[_pinned(rows, d, Z.dtype), cp.empty((rows, d), dtype=Z.dtype), None] for _ in range(2)]
+    slots = [[_pinned(rows, d, dtype), cp.empty((rows, d), dtype=dtype), None] for _ in range(2)]
     with ThreadPoolExecutor(_UPLOAD_THREADS) as pool:
         for j, a in enumerate(range(0, n, rows)):
             b = min(n, a + rows)

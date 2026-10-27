@@ -164,8 +164,7 @@ def harmony_integrate(
         many clusters per pass as fit in 1 GiB of workspace (clusters x
         batches x components), and normalizes in the same pass. ``"fast"``
         corrects one cluster at a time with the least workspace (float
-        right-hand sides, a separate normalization pass, one GPU with
-        ``multi_gpu``).
+        right-hand sides, a separate normalization pass).
         With one key, ``None`` automatically selects ``"batched"`` unless one
         cluster's workspace would exceed 1 GiB, in which case ``"fast"`` is
         used.
@@ -213,7 +212,10 @@ def harmony_integrate(
     if bfloat16:
         dtype = np.float32
     if dtype is not None:
-        dtype = np.dtype(dtype).newbyteorder("=")
+        try:
+            dtype = np.dtype(dtype).newbyteorder("=")
+        except TypeError:  # an unknown name, rejected below
+            pass
         if dtype not in (np.float32, np.float64):
             raise ValueError(f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}.")
 
@@ -269,9 +271,10 @@ def harmony_integrate(
     try:
         # Handle different array types
         if isinstance(input_data, np.ndarray):
-            # NumPy array: Harmony uploads it in chunks, so no unsorted device
-            # copy is kept. Harmony rejects NaN and infinite values.
-            X = np.ascontiguousarray(input_data, dtype=dtype)
+            # NumPy array: Harmony uploads it in chunks that convert the dtype
+            # and layout, so neither a host copy nor an unsorted device copy
+            # is kept. Harmony rejects NaN and infinite values.
+            X = input_data
         elif isinstance(input_data, cp.ndarray):
             # CuPy array: ensure correct dtype and layout with a copy
             X = input_data.astype(dtype, order="C", copy=False)
@@ -291,7 +294,7 @@ def harmony_integrate(
 
     # Fault in the host output while the GPU works; copying into touched pages
     # is about twice as fast as into a fresh allocation.
-    host_out = np.empty(X.shape, dtype=X.dtype)
+    host_out = np.empty(X.shape, dtype=dtype)
     prefault = threading.Thread(target=host_out.fill, args=(0,), daemon=True)
     prefault.start()
     harmony_out = harmonize(
@@ -318,6 +321,7 @@ def harmony_integrate(
         batch_prune_threshold=batch_prune_threshold,
         verbose=verbose,
         bfloat16=bfloat16,
+        dtype=dtype,
     )
 
     prefault.join()

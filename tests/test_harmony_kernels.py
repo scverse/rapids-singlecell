@@ -245,7 +245,8 @@ def test_group_absmax_is_exact_and_split_invariant(dtype):
 @pytest.mark.parametrize("n_pcs", [50, 1023])
 @pytest.mark.parametrize("n_keys", [1, 2])
 @pytest.mark.parametrize("stabilized", [True, False])
-def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_pcs, n_keys, *, stabilized):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_pcs, n_keys, *, stabilized, dtype):
     # One unpenalized assignment pass over the update blocks: R is the
     # softmax of -2/sigma (1 - z.y), O its column sums per batch level,
     # E = Pr_b x column sums, plus the objective. Large: one block of 384
@@ -259,18 +260,18 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
     levels, sigma = [3, 400][:n_keys], 0.1
     n_batches = sum(levels)
     n_cells, block_size = (384 * 4 * n_sm,) * 2 if large else (3000, 700)
-    Z = rng.standard_normal((n_cells, n_pcs), dtype=cp.float32)
+    Z = rng.standard_normal((n_cells, n_pcs), dtype=dtype)
     Z /= cp.linalg.norm(Z, axis=1, keepdims=True)
     Y = Z[:n_clusters] + 0.1
-    Y = (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).astype(cp.float32)
+    Y = (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).astype(dtype)
     # Marginal batch levels per key, cells sorted by joint category.
     codes = cp.sort(rng.integers(0, 3 * 400, n_cells))
     joint_ids, joints = cp.unique(codes, return_inverse=True)
     joints = joints.astype(cp.int32)
     joint_cats = cp.stack([joint_ids // 400, 3 + joint_ids % 400], axis=1)
     codes = cp.stack([codes // 400, 3 + codes % 400], axis=1)[:, :n_keys]
-    Pr_b = (cp.bincount(codes.ravel(), minlength=n_batches) / n_cells).astype(cp.float32)
-    theta = 0.5 + 2 * rng.random(n_batches, dtype=cp.float32)  # per level
+    Pr_b = (cp.bincount(codes.ravel(), minlength=n_batches) / n_cells).astype(dtype)
+    theta = 0.5 + 2 * rng.random(n_batches, dtype=dtype)  # per level
     n_blocks = -(-n_cells // block_size)
     n_groups = n_batches if n_keys == 1 else 1  # the tiles' groups
     n_tiles = 4 * n_sm + n_groups + 1
@@ -298,8 +299,8 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
         unit=n_cells,
         seed=3,
     )
-    R = cp.empty((n_cells, n_clusters), cp.float32)
-    O = cp.empty((n_batches, n_clusters), cp.float32)
+    R = cp.empty((n_cells, n_clusters), dtype)
+    O = cp.empty((n_batches, n_clusters), dtype)
     E = cp.empty_like(O)
     stride = -(-n_clusters // 128) * 128
     loop = partial(
@@ -313,15 +314,15 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
         Y_norm=Y,
         idx_list=idx_list,
         penalty=cp.empty_like(O),
-        objective_partials=cp.empty(n_cells + 8, cp.float32),
+        objective_partials=cp.empty(n_cells + 8, dtype),
         block_cat_offsets=block_cat_offsets,
         block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
         seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
         y_bound=cp.empty(n_pcs, cp.int16),
         y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
-        y_t=cp.empty((-(-n_pcs // 4) * 4, stride), cp.float32),
+        y_t=cp.empty((-(-n_pcs // 4) * 4, stride), dtype),
         col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),
-        dots_workspace=cp.empty(n_tiles * 64 * stride, cp.float32),
+        dots_workspace=cp.empty(n_tiles * 64 * stride, dtype),
         force_blocks=force_blocks,
         n_cells=n_cells,
         n_pcs=n_pcs,
@@ -342,17 +343,19 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
         E = Pr_b[:, None] * O[: levels[0]].sum(0)
         return E, theta[:, None] * cp.log((E + 1) / (O + stabilized * E + 1))
 
+    rtol, atol = (1e-4, 1e-6) if dtype == np.float32 else (1e-9, 1e-12)
+
     def check(objective, R_ref, sim):
-        cp.testing.assert_allclose(R, R_ref, rtol=1e-4, atol=1e-6)
+        cp.testing.assert_allclose(R, R_ref, rtol=rtol, atol=atol)
         O_ref = counts(R_ref, codes)
-        cp.testing.assert_allclose(O, O_ref, rtol=1e-4, atol=1e-6)
+        cp.testing.assert_allclose(O, O_ref, rtol=rtol, atol=atol)
         E_ref, log_pen = penalty(O_ref)
-        cp.testing.assert_allclose(E, E_ref, rtol=1e-4)
+        cp.testing.assert_allclose(E, E_ref, rtol=rtol)
         # Distance + sigma entropy; the diversity is -sigma O log penalty. The
-        # objective is an exact sum, rounded to float32 once.
+        # objective is an exact sum, rounded to the dtype once.
         terms = R_ref * (2 * (1 - sim) + sigma * cp.log(R_ref))
         expected = float(terms.sum() - sigma * (O_ref * log_pen).sum())
-        assert objective == pytest.approx(expected, rel=1e-6)
+        assert objective == pytest.approx(expected, rel=1e-6 if dtype == np.float32 else 1e-12)
 
     objective = loop(max_iter=0, initialize=True)
     Z64 = Z.astype(cp.float64)

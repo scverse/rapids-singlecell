@@ -77,6 +77,7 @@ def harmonize(
     batch_prune_threshold: float | None = 1e-5,
     verbose: bool = False,
     bfloat16: bool = False,
+    dtype: np.dtype | type | None = None,
 ) -> cp.ndarray:
     """
     Integrate data using Harmony algorithm.
@@ -85,6 +86,7 @@ def harmonize(
     ----------
     Z
         The input embedding with rows for cells (N) and columns for embedding coordinates (d).
+        Host input is uploaded in chunks, converted to ``dtype`` in the staging.
 
     batch_mat
         The cell barcode information as data frame, with rows for cells (N) and columns for cell attributes.
@@ -182,6 +184,9 @@ def harmonize(
     verbose
         Whether to print the number of iterations until convergence.
 
+    dtype
+        float32 or float64 for the computation; ``None`` keeps the dtype of ``Z``.
+
     Returns
     -------
     The integrated embedding by Harmony, of the same shape as the input embedding.
@@ -214,26 +219,26 @@ def harmonize(
     n_cells = Z.shape[0]
     if n_cells > 2**31 - 2**24:  # int32 cell indices, with room to round up
         raise ValueError(f"harmonize supports at most {2**31 - 2**24} cells, got {n_cells}.")
+    if n_clusters is None:
+        n_clusters = int(min(100, n_cells / 30))
+        n_clusters = max(n_clusters, 2)
+    n_clusters = operator.index(n_clusters)
+    if n_clusters < 1:
+        raise ValueError("n_clusters must be >= 1")
+    dtype = np.dtype(Z.dtype if dtype is None else dtype)
 
     rng = np.random.default_rng(rng)
     # Process batch information
-    n_levels, N_b, joint, offsets, order = _sort_by_batch(batch_mat, batch_key, n_cells=n_cells, dtype=Z.dtype, rng=rng)
+    n_levels, N_b, joint, offsets, order = _sort_by_batch(batch_mat, batch_key, n_cells=n_cells, dtype=dtype, rng=rng)
     n_covariates, n_batches = n_levels.size, int(n_levels.sum())
     n_groups = len(offsets) - 1  # batches, or joint categories with several keys
     # The sorted cells' groups, allocated before the upload (faster with a
     # non-pooled allocator)
     groups = _sorted_groups(offsets)
-    X = _sorted_device_copy(Z, order)
+    X = _sorted_device_copy(Z, order, dtype)
     rhs_bounds = _rhs_bounds(X, offsets)
     Z_norm = _normalize_cp(X)
 
-    # Set up parameters
-    if n_clusters is None:
-        n_clusters = int(min(100, n_cells / 30))
-        n_clusters = max(n_clusters, 2)
-    n_clusters = operator.index(n_clusters)
-
-    dtype = np.dtype(Z.dtype)
     theta_array = _get_theta_array(theta, n_levels, dtype)
     if tau > 0:
         theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
@@ -251,7 +256,7 @@ def harmonize(
         raise ValueError(
             f"ridge_lambda must be a finite positive number when dynamic_lambda=False, got {ridge_lambda}."
         )
-    correction_method = _choose_method(Z, n_levels, correction_method)
+    correction_method = _choose_method(X, n_levels, correction_method)
 
     # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
     # generator collapses into an integer here; the per-iteration offset keeps
@@ -273,8 +278,7 @@ def harmonize(
         )
     if bfloat16 and not (n_covariates == 1 and dtype == np.float32 and correction_method == "batched"):
         warnings.warn(
-            "dtype='bfloat16' needs one batch key and the batched correction; "
-            "using float32 assignments instead (twice the assignment memory).",
+            f"dtype='bfloat16' needs one batch key and the batched correction; using {dtype} assignments instead.",
             UserWarning,
             stacklevel=4,
         )
