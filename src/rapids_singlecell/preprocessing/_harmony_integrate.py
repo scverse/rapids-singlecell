@@ -227,7 +227,7 @@ def harmony_integrate(
         if dtype not in (np.float32, np.float64):
             raise ValueError(f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}.")
 
-    from rapids_singlecell._utils._multi_gpu import parse_device_ids
+    from rapids_singlecell._utils._multi_gpu import resolve_stream_devices
 
     from ._harmony import harmonize
 
@@ -302,9 +302,7 @@ def harmony_integrate(
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
 
-    devices = (
-        [cp.cuda.Device().id] if multi_gpu is None or multi_gpu is False else parse_device_ids(multi_gpu=multi_gpu)
-    )
+    devices = resolve_stream_devices(multi_gpu=multi_gpu)
     host_out = np.empty(X.shape, dtype=dtype)
     with cp.cuda.Device(devices[0]):
         harmonize(

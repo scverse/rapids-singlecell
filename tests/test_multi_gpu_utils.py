@@ -295,14 +295,42 @@ class TestDeviceCopy:
         assert not _multi_gpu._peer_copy_works(0, 1)
         assert checked == [(1, 0), (0, 1)]
 
-    def test_silent_copy_failure_is_detected(self, monkeypatch):
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
-        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
-        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", lambda *_: None)
-        monkeypatch.setattr(cp.cuda.runtime, "memcpyPeerAsync", lambda *_: None)
+    def test_one_way_peer_access_is_not_enabled(self, monkeypatch):
+        # Enabling the unsupported direction would fail with cudaErrorInvalidDevice.
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda device, peer: device == 1)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", lambda *_: pytest.fail("one-way access"))
 
         assert not _multi_gpu._peer_copy_works(1, 0)
+
+    @pytest.mark.two_gpus
+    def test_silent_copy_failure_is_detected(self, monkeypatch):
+        # The access enabled for the canary is disabled again, with a warning.
+        toggled = []
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+        monkeypatch.setattr(
+            cp.cuda.runtime, "deviceEnablePeerAccess", lambda peer: toggled.append(("on", cp.cuda.Device().id, peer))
+        )
+        monkeypatch.setattr(
+            cp.cuda.runtime, "deviceDisablePeerAccess", lambda peer: toggled.append(("off", cp.cuda.Device().id, peer))
+        )
+        monkeypatch.setattr(cp.cuda.runtime, "memcpyPeerAsync", lambda *_: None)
+
+        with pytest.warns(UserWarning, match="GPU 0 to GPU 1 do not work .the copies arrive corrupted"):
+            assert not _multi_gpu._peer_copy_works(1, 0)
+        assert toggled == [("on", 1, 0), ("on", 0, 1), ("off", 1, 0), ("off", 0, 1)]
+
+    @pytest.mark.two_gpus
+    def test_rejected_peer_access_is_reported(self, monkeypatch):
+        # A peer error while enabling (here: unsupported) means host copies, with the status in the warning.
+        def unsupported(peer):
+            raise cp.cuda.runtime.CUDARuntimeError(_multi_gpu._CUDA_ERROR_PEER_ACCESS_UNSUPPORTED)
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", unsupported)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceDisablePeerAccess", lambda *_: pytest.fail("nothing enabled"))
+
+        with pytest.warns(UserWarning, match="status 217"):
+            assert not _multi_gpu._peer_copy_works(1, 0)
 
     @pytest.mark.parametrize(
         ("works", "selected", "unused"),
@@ -316,8 +344,8 @@ class TestDeviceCopy:
         copied = object()
         destination = source.device.id + 1
         monkeypatch.setattr(_multi_gpu, "_peer_copy_works", lambda *_: works)
-        monkeypatch.setattr(_multi_gpu, selected, lambda *_: copied)
-        monkeypatch.setattr(_multi_gpu, unused, lambda *_: pytest.fail("wrong copy route"))
+        monkeypatch.setattr(_multi_gpu, selected, lambda *_, **__: copied)
+        monkeypatch.setattr(_multi_gpu, unused, lambda *_, **__: pytest.fail("wrong copy route"))
 
         assert _multi_gpu._copy_to_device(source, destination) is copied
 
@@ -331,18 +359,19 @@ class TestDeviceCopy:
 
         assert _multi_gpu._copy_to_device(source, source.device.id) is source
 
-    def test_host_copy(self):
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
+    @pytest.mark.two_gpus
+    def test_host_copy(self, monkeypatch):
+        monkeypatch.setattr(_multi_gpu, "_RELAY_BYTES", 24)  # several chunks through the two pinned buffers
         with cp.cuda.Device(0):
-            source = cp.arange(8)
+            source = cp.arange(80)
 
         copied = _multi_gpu._copy_to_device_via_host(source, 1)
 
         assert copied.device.id == 1
-        assert copied.get().tolist() == list(range(8))
+        assert copied.get().tolist() == list(range(80))
 
-    @pytest.mark.parametrize("copy", ["_copy_to_device_p2p", "_copy_to_device_via_host"])
+    @pytest.mark.two_gpus
+    @pytest.mark.parametrize("copy", ["_copy_to_device_p2p", "_copy_to_device_via_host", "_copy_to_device"])
     @pytest.mark.parametrize(
         "view",
         [
@@ -356,8 +385,6 @@ class TestDeviceCopy:
         ids=["C", "F", "transposed", "strided", "reversed", "empty"],
     )
     def test_copies_keep_values_and_layout(self, copy, view):
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
         if copy == "_copy_to_device_p2p" and not _multi_gpu._peer_copy_works(1, 0):
             pytest.skip("no working peer copies on this system")
         with cp.cuda.Device(0):
@@ -370,10 +397,28 @@ class TestDeviceCopy:
         if source.flags.c_contiguous or source.flags.f_contiguous:
             assert copied.flags.f_contiguous == source.flags.f_contiguous
 
+    @pytest.mark.two_gpus
+    @pytest.mark.parametrize("copy", ["_copy_to_device_p2p", "_copy_to_device_via_host", "_copy_to_device"])
+    def test_copies_into_out_check_it(self, copy):
+        if copy == "_copy_to_device_p2p" and not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        with cp.cuda.Device(0):
+            source = cp.arange(60, dtype=cp.float32).reshape(12, 5)
+            on_source = cp.empty_like(source)
+        with cp.cuda.Device(1):
+            out = cp.empty_like(source)
+            wrong = [cp.empty_like(source, dtype=cp.float64), cp.empty((5, 12), cp.float32), cp.asfortranarray(out)]
+
+        assert getattr(_multi_gpu, copy)(source, 1, out=out) is out
+
+        np.testing.assert_array_equal(out.get(), source.get())
+        for bad in [*wrong, on_source]:
+            with pytest.raises(ValueError, match="out must have"):
+                getattr(_multi_gpu, copy)(source, 1, out=bad)
+
+    @pytest.mark.two_gpus
     def test_check_enables_peer_access(self, monkeypatch):
         # The canary runs the direct path that later copies take.
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
         enable, enabled = cp.cuda.runtime.deviceEnablePeerAccess, []
 
         def record(peer):
@@ -385,37 +430,31 @@ class TestDeviceCopy:
             pytest.skip("no working peer copies on this system")
         assert enabled == [(1, 0), (0, 1)]
 
+    @pytest.mark.two_gpus
+    @pytest.mark.usefixtures("cupy_pool")  # stream-ordered block reuse
     @pytest.mark.parametrize("other_stream", [False, True])
     def test_peer_copy_orders_the_source_after_it(self, other_stream):
         # The source may be released right away: with the destination's stream
         # held up, the source GPU reuses its pool block only after the copy,
         # also when the block belongs to a stream other than the current one.
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
         if not _multi_gpu._peer_copy_works(1, 0):
             pytest.skip("no working peer copies on this system")
-        pool, previous = cp.cuda.MemoryPool(), cp.cuda.get_allocator()
-        cp.cuda.set_allocator(pool.malloc)  # stream-ordered block reuse
-        try:
-            n = 1 << 22
-            for device in (0, 1):  # loaded kernels and a pooled block
-                with cp.cuda.Device(device):
-                    cp.full(n, -1, dtype=cp.float32)
-                    cp.cuda.Device().synchronize()
-            with cp.cuda.Device(0):
-                allocating = cp.cuda.Stream(non_blocking=True) if other_stream else None
-                with allocating or cp.cuda.get_current_stream():
-                    source = cp.arange(n, dtype=cp.float32)
+        n = 1 << 22
+        for device in (0, 1):  # loaded kernels and a pooled block
+            with cp.cuda.Device(device):
+                cp.full(n, -1, dtype=cp.float32)
                 cp.cuda.Device().synchronize()
-            with cp.cuda.Device(1), cp.cuda.Stream(non_blocking=True) as stream:
-                stream.launch_host_func(lambda _: time.sleep(0.2), None)
-                copied = _multi_gpu._copy_to_device(source, 1)
-            del source
-            with cp.cuda.Device(0), allocating or cp.cuda.get_current_stream():
-                cp.full(n, -1, dtype=cp.float32)  # takes the source's block
-            with cp.cuda.Device(1):
-                cp.cuda.Device().synchronize()
-                assert bool((copied == cp.arange(n, dtype=cp.float32)).all())
-        finally:
-            cp.cuda.set_allocator(previous)
-            pool.free_all_blocks()
+        with cp.cuda.Device(0):
+            allocating = cp.cuda.Stream(non_blocking=True) if other_stream else None
+            with allocating or cp.cuda.get_current_stream():
+                source = cp.arange(n, dtype=cp.float32)
+            cp.cuda.Device().synchronize()
+        with cp.cuda.Device(1), cp.cuda.Stream(non_blocking=True) as stream:
+            stream.launch_host_func(lambda _: time.sleep(0.2), None)
+            copied = _multi_gpu._copy_to_device(source, 1)
+        del source
+        with cp.cuda.Device(0), allocating or cp.cuda.get_current_stream():
+            cp.full(n, -1, dtype=cp.float32)  # takes the source's block
+        with cp.cuda.Device(1):
+            cp.cuda.Device().synchronize()
+            assert bool((copied == cp.arange(n, dtype=cp.float32)).all())

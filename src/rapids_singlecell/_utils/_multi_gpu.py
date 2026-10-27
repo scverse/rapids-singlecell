@@ -14,6 +14,7 @@ distances and Harmony.
 from __future__ import annotations
 
 import numbers
+import warnings
 from contextlib import contextmanager
 from functools import cache
 from typing import TYPE_CHECKING
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 # Cache for device attributes per device (lazy initialization)
 _DEVICE_ATTRS_CACHE: dict[int, dict] = {}
 
+_RELAY_BYTES = 1 << 23  # pinned chunk of copies through the host
+_D2H, _H2D = cp.cuda.runtime.memcpyDeviceToHost, cp.cuda.runtime.memcpyHostToDevice
 _CANARY = np.arange(1, 9, dtype=np.float64)
 _CANARY_POISON = -_CANARY
 # Kept as a fallback: drivers that reject peer copies of stream-ordered pool
@@ -49,19 +52,22 @@ def _peer_copy_works(destination: int, source: int) -> bool:
     """Return whether a peer copy arrives intact.
 
     Peer access is enabled in both directions first, so the canary takes the direct path that later copies (and
-    Harmony's exchanges) use.
+    Harmony's exchanges) use. Where the canary fails, the access this call enabled is disabled again and a warning
+    names the pair, which then copies through the host.
     """
     if destination == source:
         return True
-    if not cp.cuda.runtime.deviceCanAccessPeer(destination, source):
+    runtime = cp.cuda.runtime
+    if not (runtime.deviceCanAccessPeer(destination, source) and runtime.deviceCanAccessPeer(source, destination)):
         return False
-
+    enabled, works, why = [], False, "the copies arrive corrupted"
     try:
         for device, peer in ((destination, source), (source, destination)):
             with cp.cuda.Device(device):
                 try:
-                    cp.cuda.runtime.deviceEnablePeerAccess(peer)
-                except cp.cuda.runtime.CUDARuntimeError as error:
+                    runtime.deviceEnablePeerAccess(peer)
+                    enabled.append((device, peer))
+                except runtime.CUDARuntimeError as error:
                     if error.status != _CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED:
                         raise
         with cp.cuda.Device(source):
@@ -69,12 +75,39 @@ def _peer_copy_works(destination: int, source: int) -> bool:
         with cp.cuda.Device(destination):
             actual = cp.asarray(_CANARY_POISON, blocking=True)
             _copy_to_device_p2p(expected, destination, out=actual)
-            actual = cp.asnumpy(actual)
-    except cp.cuda.runtime.CUDARuntimeError as error:
-        if error.status in _PEER_ERRORS:
-            return False
-        raise
-    return bool(np.array_equal(actual, _CANARY))
+            works = bool(np.array_equal(cp.asnumpy(actual), _CANARY))
+    except runtime.CUDARuntimeError as error:
+        if error.status not in _PEER_ERRORS:
+            raise
+        why = f"status {error.status}"
+    if not works:
+        for device, peer in enabled:
+            with cp.cuda.Device(device):
+                try:
+                    runtime.deviceDisablePeerAccess(peer)
+                except runtime.CUDARuntimeError as error:
+                    if error.status != _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED:
+                        raise
+        warnings.warn(
+            f"Peer copies from GPU {source} to GPU {destination} do not work ({why}); copying through the host.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return works
+
+
+def _peer_copies_work(devices: list[int]) -> bool:
+    """Whether validated peer copies work between every ordered pair of ``devices``."""
+    return all(_peer_copy_works(a, b) for a in devices for b in devices if a != b)
+
+
+def _copy_target(source: cp.ndarray, destination: int, out: cp.ndarray | None) -> cp.ndarray:
+    """``out`` checked against the contiguous ``source``, or a new array like it on ``destination`` (the current GPU)."""
+    if out is None:
+        return cp.empty_like(source)
+    if (out.shape, out.strides, out.dtype, out.device.id) != (source.shape, source.strides, source.dtype, destination):
+        raise ValueError("out must have the shape, layout and dtype of the array, on the destination GPU")
+    return out
 
 
 def _copy_to_device_p2p(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
@@ -95,10 +128,7 @@ def _copy_to_device_p2p(array: cp.ndarray, destination: int, *, out: cp.ndarray 
     with cp.cuda.Device(destination):
         stream = cp.cuda.get_current_stream()
         stream.wait_event(ready)
-        if out is None:
-            out = cp.empty_like(source)
-        elif out.shape != source.shape or out.strides != source.strides:
-            raise ValueError("out must have the shape and layout of the array")
+        out = _copy_target(source, destination, out)
         cp.cuda.runtime.memcpyPeerAsync(
             out.data.ptr,
             destination,
@@ -111,22 +141,47 @@ def _copy_to_device_p2p(array: cp.ndarray, destination: int, *, out: cp.ndarray 
     return out
 
 
-def _copy_to_device_via_host(array: cp.ndarray, destination: int) -> cp.ndarray:
-    """Copy an array to another GPU through host memory."""
+def _copy_to_device_via_host(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """Copy an array to another GPU through two pinned host buffers, keeping its C or F layout (into ``out`` if given).
+
+    One chunk of _RELAY_BYTES leaves its GPU while the previous one arrives. The copy has landed on return.
+    """
     with cp.cuda.Device(array.device.id):
-        host = array.get(order="A")
+        if not (array.flags.c_contiguous or array.flags.f_contiguous):
+            array = cp.ascontiguousarray(array)
+        stream = cp.cuda.get_current_stream()
     with cp.cuda.Device(destination):
-        return cp.asarray(host, blocking=True)
+        out = _copy_target(array, destination, out)
+        target = cp.cuda.get_current_stream()
+    step = max(1, min(array.nbytes, _RELAY_BYTES))
+    hosts, free = [cp.cuda.alloc_pinned_memory(step) for _ in range(2)], [None, None]
+    for i, at in enumerate(range(0, array.nbytes, step)):
+        size, host = min(step, array.nbytes - at), hosts[i % 2].ptr
+        with cp.cuda.Device(array.device.id):
+            if free[i % 2] is not None:
+                stream.wait_event(free[i % 2])  # the buffer's last chunk arrived
+            cp.cuda.runtime.memcpyAsync(host, array.data.ptr + at, size, _D2H, stream.ptr)
+            ready = stream.record()
+        with cp.cuda.Device(destination):
+            target.wait_event(ready)
+            cp.cuda.runtime.memcpyAsync(out.data.ptr + at, host, size, _H2D, target.ptr)
+            free[i % 2] = target.record()
+    with cp.cuda.Device(destination):
+        target.synchronize()  # also frees the buffers
+    return out
 
 
-def _copy_to_device(array: cp.ndarray, destination: int) -> cp.ndarray:
-    """Copy an array using P2P when it works, otherwise through the host."""
+def _copy_to_device(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """``array`` on ``destination``: itself (ignoring ``out``) when it is already there, else a copy that has landed.
+
+    Into ``out`` of the same layout if given, by a validated peer copy or through the host.
+    """
     source = array.device.id
     if source == destination:
         return array
     if _peer_copy_works(destination, source):
-        return _copy_to_device_p2p(array, destination)
-    return _copy_to_device_via_host(array, destination)
+        return _copy_to_device_p2p(array, destination, out=out)
+    return _copy_to_device_via_host(array, destination, out=out)
 
 
 @contextmanager
@@ -225,6 +280,13 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
 
     # Streams are keyed by device; a duplicate would drop a sync barrier
     return list(dict.fromkeys(device_ids))
+
+
+def resolve_stream_devices(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
+    """Device ids of a run: the current device when ``multi_gpu`` is off (``None`` or ``False``)."""
+    if multi_gpu is None or multi_gpu is False:
+        return [cp.cuda.Device().id]
+    return parse_device_ids(multi_gpu=multi_gpu)
 
 
 def _get_device_attrs(device_id: int | None = None) -> dict:

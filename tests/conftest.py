@@ -21,9 +21,48 @@ from __future__ import annotations
 
 import functools
 
+import cupy as cp
+import pytest
 import scanpy as sc
 
 _CACHED_LOADERS = ("pbmc3k", "pbmc3k_processed", "pbmc68k_reduced", "paul15")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "two_gpus: needs two GPUs (skipped with fewer)")
+
+
+def pytest_collection_modifyitems(items):
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        for item in items:
+            if "two_gpus" in item.keywords:
+                item.add_marker(pytest.mark.skip(reason="requires two GPUs"))
+
+
+@pytest.fixture
+def cupy_pool():
+    """A fresh memory pool as CuPy's allocator during the test."""
+    allocator, pool = cp.cuda.get_allocator(), cp.cuda.MemoryPool()
+    cp.cuda.set_allocator(pool.malloc)
+    try:
+        yield pool
+    finally:
+        cp.cuda.set_allocator(allocator)
+        for device in range(cp.cuda.runtime.getDeviceCount()):
+            with cp.cuda.Device(device):
+                pool.free_all_blocks()
+
+
+@pytest.fixture(params=[False, True], ids=["host", "peer"])
+def peer(request, monkeypatch):
+    """Copies between GPUs 0 and 1 forced through the host, or by peer copies (skipped where none are validated)."""
+    from rapids_singlecell._utils import _multi_gpu
+
+    if not request.param:
+        monkeypatch.setattr(_multi_gpu, "_peer_copy_works", lambda *_: False)
+    elif not _multi_gpu._peer_copies_work([0, 1]):
+        pytest.skip("no validated peer copies")
+    return request.param
 
 
 def _memoize_loader(loader):

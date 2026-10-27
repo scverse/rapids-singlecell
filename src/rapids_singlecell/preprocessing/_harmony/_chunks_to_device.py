@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from ._multi_gpu import _copy
+from rapids_singlecell._utils._multi_gpu import _copy_to_device
 
 if TYPE_CHECKING:
     import threading
@@ -49,14 +49,14 @@ def _upload_sorted(
             for r in sorted(range(len(devices)), key=lambda r: devices[r] == source):
                 lo, hi = shards[r]  # the temporaries die with the statement
                 if devices[r] == source:
-                    parts[r] = Z[_copy(order[lo:hi], source)].astype(dtype, copy=False)
+                    parts[r] = Z[_copy_to_device(order[lo:hi], source)].astype(dtype, copy=False)
                     continue
                 with cp.cuda.Device(devices[r]):
                     parts[r] = cp.empty((hi - lo, d), dtype=dtype)
                 for a in range(lo, hi, step):
                     b = min(hi, a + step)
-                    chunk = Z[_copy(order[a:b], source)].astype(dtype, copy=False)
-                    _copy(chunk, devices[r], out=parts[r][a - lo : b - lo])
+                    chunk = Z[_copy_to_device(order[a:b], source)].astype(dtype, copy=False)
+                    _copy_to_device(chunk, devices[r], out=parts[r][a - lo : b - lo])
                     del chunk  # before the next one
             cp.cuda.get_current_stream().synchronize()  # read on other streams
         return parts
@@ -107,12 +107,13 @@ def _shard_rows(order: cp.ndarray, bounds: list[int], devices: list[int]) -> tup
     position = cp.empty(n, dtype=cp.int32)
     position[order] = cp.arange(n, dtype=cp.int32)
     if len(bounds) == 2:
-        return [None], [_copy(position, devices[0])]
+        return [None], [_copy_to_device(position, devices[0])]
     sources, targets = [], []
     for (lo, hi), device in zip(itertools.pairwise(bounds), devices, strict=True):
         mine = cp.flatnonzero((position >= lo) & (position < hi))
-        targets.append(_copy(position[mine] - lo, device))
-        sources.append(cp.asnumpy(mine.astype(cp.int32)))
+        targets.append(_copy_to_device(position[mine] - lo, device))
+        sources.append(_pinned(mine.size, 1, np.int32).ravel())  # pinned: a faster download
+        mine.astype(cp.int32).get(out=sources[-1])
     return sources, targets
 
 

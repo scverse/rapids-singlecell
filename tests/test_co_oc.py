@@ -77,10 +77,7 @@ def test_co_occurrence_fast_kernel():
     cp.testing.assert_allclose(occ_prob_fast, occ_prob_slow)
 
 
-@pytest.mark.skipif(
-    cp.cuda.runtime.getDeviceCount() < 2,
-    reason="Requires multiple GPUs",
-)
+@pytest.mark.two_gpus
 def test_co_occurrence_multi_gpu_matches_single_gpu():
     """Multi-GPU results should match single GPU with large dataset (>=100k cells)."""
     n = 100_000  # Must be >= 100k to trigger multi-GPU dispatch
@@ -104,10 +101,7 @@ def test_co_occurrence_multi_gpu_matches_single_gpu():
     cp.testing.assert_allclose(occ_prob_multi, occ_prob_single)
 
 
-@pytest.mark.skipif(
-    cp.cuda.runtime.getDeviceCount() < 2,
-    reason="Requires multiple GPUs",
-)
+@pytest.mark.two_gpus
 def test_co_occurrence_multi_gpu_with_device_list():
     """Test with specific device IDs on large dataset."""
     n = 100_000  # Must be >= 100k to trigger multi-GPU dispatch
