@@ -127,9 +127,7 @@ def test_pca_dask_full_pipeline(client, data_kind):
         atol=1e-6,
     )
 
-    cp.testing.assert_allclose(
-        np.abs(adata_1.varm["PCs"]), np.abs(adata_2.varm["PCs"]), rtol=1e-7, atol=1e-6
-    )
+    cp.testing.assert_allclose(np.abs(adata_1.varm["PCs"]), np.abs(adata_2.varm["PCs"]), rtol=1e-7, atol=1e-6)
 
     cp.testing.assert_allclose(
         np.abs(adata_1.uns["pca"]["variance_ratio"]),

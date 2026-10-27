@@ -37,7 +37,7 @@ PanGPA.log
 # Compiled CUDA extensions and stubs copied for editable installs
 *.so
 *.pyi
-py.typed
+/src/rapids_singlecell/_cuda/py.typed
 
 # Test/coverage caches
 /.pytest_cache/
@@ -56,3 +56,13 @@ AGENTS.md
 # tmp_scripts
 tmp_scripts/
 /benchmarks/
+
+# From the scverse cookiecutter template
+*~
+buck-out/
+/.idea/
+.venv/
+uv.lock
+.*cache/
+/node_modules/
+/.coverage*

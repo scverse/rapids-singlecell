@@ -38,9 +38,7 @@ def compatibility_frame():
             [-3, 2, 1, -2, 3, 4, -4, 0.5, 1.5, 2.5, -0.5, 0],
             [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 0],
             [0] * 12,
-            1
-            + np.array([11, 0, 10, 1, 9, 2, 8, 3, 7, 4, 6, 5])
-            * np.finfo(np.float32).eps,
+            1 + np.array([11, 0, 10, 1, 9, 2, 8, 3, 7, 4, 6, 5]) * np.finfo(np.float32).eps,
         ],
         index=["sample_z", "sample_a", "sample_empty", "sample_tie"],
         columns=[f"g{i:02}" for i in range(12)],
@@ -104,9 +102,7 @@ def test_ora_rank_counts(nvar, n_up, n_bm, selected):
     b, c = targets.size - a, len(selected) - a
     d = nvar - a - b - c
     np.testing.assert_allclose(pvals, _test1t(a, b, c, d), rtol=1e-7)
-    np.testing.assert_allclose(
-        scores, np.log((a + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5)))
-    )
+    np.testing.assert_allclose(scores, np.log((a + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5))))
 
 
 @pytest.mark.parametrize(
@@ -123,17 +119,11 @@ def test_ora_rank_counts(nvar, n_up, n_bm, selected):
     ],
 )
 @pytest.mark.parametrize("background", [None, 0, 20_000])
-def test_ora_identical_cpu_calls(
-    compatibility_frame, compatibility_net, kwargs, background, cpu_ora
-):
+def test_ora_identical_cpu_calls(compatibility_frame, compatibility_net, kwargs, background, cpu_ora):
     original_frame = compatibility_frame.copy(deep=True)
     original_net = compatibility_net.copy(deep=True)
-    expected = cpu_ora(
-        compatibility_frame, compatibility_net, n_bg=background, tmin=2, **kwargs
-    )
-    actual = rdc.ora(
-        compatibility_frame, compatibility_net, n_bg=background, tmin=2, **kwargs
-    )
+    expected = cpu_ora(compatibility_frame, compatibility_net, n_bg=background, tmin=2, **kwargs)
+    actual = rdc.ora(compatibility_frame, compatibility_net, n_bg=background, tmin=2, **kwargs)
     _assert_cpu_equal(actual, expected)
     pd.testing.assert_frame_equal(compatibility_frame, original_frame)
     pd.testing.assert_frame_equal(compatibility_net, original_net)
@@ -149,9 +139,7 @@ def test_ora_all_defaults_match_cpu(compatibility_frame, compatibility_net, cpu_
 
 @pytest.mark.parametrize("pre_load", [False, True])
 @pytest.mark.parametrize("kind", ["list", "dense", "sparse", "gpu", "dask", "backed"])
-def test_ora_input_formats_match_cpu(
-    compatibility_frame, compatibility_net, tmp_path, kind, pre_load, *, cpu_ora
-):
+def test_ora_input_formats_match_cpu(compatibility_frame, compatibility_net, tmp_path, kind, pre_load, *, cpu_ora):
     kwargs = {
         "tmin": 2,
         "n_up": 10,
@@ -161,9 +149,7 @@ def test_ora_input_formats_match_cpu(
     }
     # Matrix data is float32; nearby float64 values become tied before ranking.
     compatibility_frame = compatibility_frame.copy()
-    compatibility_frame.iloc[-1] = (
-        1 + np.array([11, 0, 10, 1, 9, 2, 8, 3, 7, 4, 6, 5]) * np.finfo(np.float64).eps
-    )
+    compatibility_frame.iloc[-1] = 1 + np.array([11, 0, 10, 1, 9, 2, 8, 3, 7, 4, 6, 5]) * np.finfo(np.float64).eps
     rounded = compatibility_frame.astype(np.float32)
     expected = cpu_ora(rounded, compatibility_net, **kwargs)
     if kind == "list":
@@ -206,12 +192,8 @@ def test_ora_input_formats_match_cpu(
             gpu_data.file.close()
 
 
-@pytest.mark.parametrize(
-    "raw,layer", [(False, None), (True, None), (False, "other"), (True, "other")]
-)
-def test_ora_raw_layer_match_cpu(
-    compatibility_frame, compatibility_net, raw, layer, cpu_ora
-):
+@pytest.mark.parametrize("raw,layer", [(False, None), (True, None), (False, "other"), (True, "other")])
+def test_ora_raw_layer_match_cpu(compatibility_frame, compatibility_net, raw, layer, cpu_ora):
     cpu_data = ad.AnnData(compatibility_frame.copy())
     cpu_data.layers["other"] = cpu_data.X[:, ::-1].copy()
     cpu_data.raw = cpu_data.copy()
@@ -221,9 +203,7 @@ def test_ora_raw_layer_match_cpu(
     expected = cpu_ora(cpu_data, compatibility_net, 2, raw, False, 2, False, **kwargs)
     actual = rdc.ora(gpu_data, compatibility_net, 2, raw, False, 2, False, **kwargs)
     assert (actual is None) == (expected is None)
-    _assert_cpu_equal(
-        _anndata_results(gpu_data, actual), _anndata_results(cpu_data, expected)
-    )
+    _assert_cpu_equal(_anndata_results(gpu_data, actual), _anndata_results(cpu_data, expected))
 
 
 @pytest.mark.parametrize(
@@ -235,9 +215,7 @@ def test_ora_raw_layer_match_cpu(
         ({"raw": True, "layer": 1}, "layer must be str or None"),
     ],
 )
-def test_ora_preparation_validates_raw_and_layer(
-    compatibility_frame, compatibility_net, kwargs, match
-):
+def test_ora_preparation_validates_raw_and_layer(compatibility_frame, compatibility_net, kwargs, match):
     data = ad.AnnData(compatibility_frame)
     with pytest.raises(AssertionError, match=match):
         rdc.ora(data, compatibility_net, tmin=2, **kwargs)
@@ -251,9 +229,7 @@ def test_ora_cutoff_preserves_zero_rows_when_empty_true(cutoff):
         columns=list("abcd"),
         dtype=np.float32,
     )
-    net = pd.DataFrame(
-        {"source": ["hit", "hit", "zero", "zero"], "target": list("abcd")}
-    )
+    net = pd.DataFrame({"source": ["hit", "hit", "zero", "zero"], "target": list("abcd")})
     options = {"value_cutoff": cutoff, "n_bg": None, "tmin": 1}
     expected = rdc.ora(frame, net, empty=False, **options)
     data = ad.AnnData(frame)
@@ -280,15 +256,11 @@ def test_ora_and_query_set_public_parameter_contract():
             assert actual[name].default == parameter.default
 
 
-@pytest.mark.parametrize(
-    "background,correction", [(20_000.5, 0.5), (8.5, 0.5), (6.5, 0.5), (8, -0.1)]
-)
+@pytest.mark.parametrize("background,correction", [(20_000.5, 0.5), (8.5, 0.5), (6.5, 0.5), (8, -0.1)])
 def test_ora_numeric_options(background, correction, cpu_ora):
     # Every contingency-table cell stays positive after this correction.
     data = pd.DataFrame([np.arange(1, 9)], columns=list("abcdefgh"))
-    net = pd.DataFrame(
-        {"source": ["four"] * 4 + ["three"] * 3, "target": list("abefabe")}
-    )
+    net = pd.DataFrame({"source": ["four"] * 4 + ["three"] * 3, "target": list("abefabe")})
     kwargs = {"n_up": 4, "n_bg": background, "ha_corr": correction, "tmin": 2}
     _assert_cpu_equal(rdc.ora(data, net, **kwargs), cpu_ora(data, net, **kwargs))
 
@@ -305,9 +277,7 @@ def test_ora_warp_boundaries(monkeypatch, fallback, background):
     nobs, nvar, count = 80, 200, 70
     sizes = np.array([1, 31, 32, 33, 63, 64, 65], dtype=np.int32)
     starts = np.r_[0, np.cumsum(sizes)[:-1]].astype(np.int32)
-    cnct = np.concatenate(
-        [rng.choice(nvar, size, replace=False) for size in sizes]
-    ).astype(np.int32)
+    cnct = np.concatenate([rng.choice(nvar, size, replace=False) for size in sizes]).astype(np.int32)
     x = rng.normal(size=(nobs, nvar)).astype(np.float32)
     es, pv = _func_ora(
         cp.asarray(x),
@@ -325,9 +295,7 @@ def test_ora_warp_boundaries(monkeypatch, fallback, background):
             d = background - int(size) - c
             expected = _test1t(overlap, b, c, d)
             np.testing.assert_allclose(pv[i, j], expected, rtol=1e-7)
-            np.testing.assert_allclose(
-                es[i, j], np.log((overlap + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5)))
-            )
+            np.testing.assert_allclose(es[i, j], np.log((overlap + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5))))
 
 
 @pytest.mark.parametrize("background", range(2, 13))
@@ -341,9 +309,7 @@ def test_ora_compat_lookup_exhaustive_small_tables(background):
         for size, group in zip(range(1, background + 1), groups, strict=True):
             for a in range(max(0, size + count - background), min(size, count) + 1):
                 actual.append(pvals[group, a])
-                expected.append(
-                    _test1t(a, size - a, count - a, background - size - count + a)
-                )
+                expected.append(_test1t(a, size - a, count - a, background - size - count + a))
         np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
 
 
@@ -363,9 +329,7 @@ def test_ora_compat_lookup_exhaustive_small_tables(background):
         ({"n_up": 11.1, "n_bm": 0.1}, AssertionError, "overlap"),
     ],
 )
-def test_ora_invalid_parameters(
-    compatibility_frame, compatibility_net, kwargs, error, match
-):
+def test_ora_invalid_parameters(compatibility_frame, compatibility_net, kwargs, error, match):
     with pytest.raises(error, match=match):
         rdc.ora(compatibility_frame, compatibility_net, **kwargs)
 
@@ -399,9 +363,7 @@ def test_ora_selection_ties(nvar, dtype):
     ],
 )
 @pytest.mark.parametrize("fallback", [False, True])
-def test_ora_cpu_fisher_edge_cases(
-    monkeypatch, *, background, nvar, count, targets, pinned, fallback
-):
+def test_ora_cpu_fisher_edge_cases(monkeypatch, *, background, nvar, count, targets, pinned, fallback):
     if fallback:
         import rapids_singlecell.decoupler_gpu._method_ora as module
 

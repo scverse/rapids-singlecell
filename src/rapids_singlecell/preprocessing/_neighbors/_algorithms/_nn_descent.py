@@ -27,8 +27,7 @@ def _nn_descent_knn(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     if nn_descent is None:
         raise ImportError(
-            "The 'nn_descent' algorithm is only available in cuvs >= 25.02. "
-            "Please update your cuvs installation."
+            "The 'nn_descent' algorithm is only available in cuvs >= 25.02. Please update your cuvs installation."
         )
 
     # Extract intermediate_graph_degree from algorithm_kwds, with default
@@ -74,9 +73,7 @@ def _nn_descent_knn(
         # Add self-neighbors and self-distances for distance metrics.
         # This is not needed for inner_product, as it is a similarity metric.
         add_self_neighbors = cp.arange(X.shape[0], dtype=cp.uint32)
-        neighbors = cp.concatenate(
-            (add_self_neighbors[:, None], neighbors[:, :-1]), axis=1
-        )
+        neighbors = cp.concatenate((add_self_neighbors[:, None], neighbors[:, :-1]), axis=1)
         add_self_distances = cp.zeros((X.shape[0], 1), dtype=cp.float32)
         distances = cp.concatenate((add_self_distances, distances[:, :-1]), axis=1)
     return neighbors, distances

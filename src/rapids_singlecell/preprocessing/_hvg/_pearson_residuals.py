@@ -30,8 +30,8 @@ def _highly_variable_pearson_residuals(
     check_values: bool = True,
     layer: str | None = None,
 ):
-    """
-    Select highly variable genes using analytic Pearson residuals.
+    """Select highly variable genes using analytic Pearson residuals.
+
     Pearson residuals of a negative binomial offset model are computed
     (with overdispersion `theta` shared across genes). By default, overdispersion
     `theta=100` is used and residuals are clipped to `sqrt(n_obs)`. Finally, genes
@@ -44,12 +44,14 @@ def _highly_variable_pearson_residuals(
         warnings.warn(
             "`flavor='pearson_residuals'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
     if n_top_genes is None:
         n_top_genes = 2000
         warnings.warn(
             "`flavor='pearson_residuals'` expects `n_top_genes`  to be defined, defaulting to 2000 HVGs",
             UserWarning,
+            stacklevel=2,
         )
     if theta <= 0:
         raise ValueError("Pearson residuals require theta > 0")
@@ -145,9 +147,7 @@ def _highly_variable_pearson_residuals(
     ranks_residual_var = cp.argsort(cp.argsort(-residual_gene_vars, axis=1), axis=1)
     ranks_residual_var = ranks_residual_var.astype(X.dtype)
     # count in how many batches a genes was among the n_top_genes
-    highly_variable_nbatches = cp.sum(
-        (ranks_residual_var < n_top_genes).astype(int), axis=0
-    ).get()
+    highly_variable_nbatches = cp.sum((ranks_residual_var < n_top_genes).astype(int), axis=0).get()
     ranks_residual_var[ranks_residual_var >= n_top_genes] = np.nan
     ranks_residual_var = ranks_residual_var.get()
     ranks_masked_array = np.ma.masked_invalid(ranks_residual_var)
@@ -185,7 +185,5 @@ def _highly_variable_pearson_residuals(
     adata.var["highly_variable_rank"] = df["highly_variable_rank"].values
     if batch_key is not None:
         adata.var["highly_variable_nbatches"] = df["highly_variable_nbatches"].values
-        adata.var["highly_variable_intersection"] = df[
-            "highly_variable_intersection"
-        ].values
+        adata.var["highly_variable_intersection"] = df["highly_variable_intersection"].values
     adata.var["highly_variable"] = df["highly_variable"].values

@@ -1,0 +1,44 @@
+{
+  "template": "https://github.com/scverse/cookiecutter-scverse",
+  "commit": "8006e3d9e03e3fca5c00545dd18da4c114649bc7",
+  "checkout": "main",
+  "context": {
+    "cookiecutter": {
+      "project_name": "rapids-singlecell",
+      "package_name": "rapids_singlecell",
+      "project_description": "running single cell analysis on Nvidia GPUs",
+      "author_full_name": "Severin Dicks",
+      "author_email": "severin.dicks@scverse.org",
+      "github_user": "scverse",
+      "github_repo": "rapids-singlecell",
+      "license": "MIT License",
+      "ide_integration": false,
+      "issue_categorization": "issue types",
+      "_copy_without_render": [
+        ".github/workflows/build.yaml",
+        ".github/workflows/test.yaml",
+        "docs/_templates/autosummary/**.rst"
+      ],
+      "_exclude_on_template_update": [
+        "CHANGELOG.md",
+        "LICENSE",
+        "README.md",
+        "docs/api.md",
+        "docs/index.md",
+        "docs/notebooks/example.ipynb",
+        "docs/references.bib",
+        "docs/references.md",
+        "src/**",
+        "tests/**"
+      ],
+      "_render_devdocs": false,
+      "_jinja2_env_vars": {
+        "lstrip_blocks": true,
+        "trim_blocks": true
+      },
+      "_template": "https://github.com/scverse/cookiecutter-scverse",
+      "_commit": "8006e3d9e03e3fca5c00545dd18da4c114649bc7"
+    }
+  },
+  "directory": null
+}

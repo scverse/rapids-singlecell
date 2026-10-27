@@ -144,9 +144,7 @@ def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
     del canonical
     indptr = cp.zeros(coo.shape[0] + 1, dtype=cp.int64)
     cp.cumsum(cp.bincount(row, minlength=coo.shape[0]), out=indptr[1:])
-    csr = sc_sparse.csr_matrix(
-        (coo.data.get(), col.get(), indptr.get()), shape=coo.shape
-    )
+    csr = sc_sparse.csr_matrix((coo.data.get(), col.get(), indptr.get()), shape=coo.shape)
     csr.has_canonical_format = True
     return csr
 
@@ -351,9 +349,7 @@ def _calc_connectivities(
     CuPy sparse matrix on GPU.
     """
     if metric == "inner_product" and method != "jaccard":
-        knn_indices, knn_dist = _inner_product_distances(
-            knn_indices, knn_dist, batch_codes=batch_codes
-        )
+        knn_indices, knn_dist = _inner_product_distances(knn_indices, knn_dist, batch_codes=batch_codes)
     if method == "gauss":
         return _get_connectivities_gauss(
             knn_indices,

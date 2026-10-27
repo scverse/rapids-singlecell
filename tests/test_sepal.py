@@ -80,9 +80,7 @@ def _reference(adata: AnnData, max_neighs: int, *, n_iter=30000, dt=0.001):
                 ent = 0.0
             else:
                 p = x / xs
-                ent = float(
-                    (-np.log(np.maximum(p, np.finfo(np.float64).eps)) * p).sum()
-                )
+                ent = float((-np.log(np.maximum(p, np.finfo(np.float64).eps)) * p).sum())
             ent /= len(sat)
             if abs(ent - prev) <= 1e-8:
                 it_conv = it
@@ -96,9 +94,7 @@ def _reference(adata: AnnData, max_neighs: int, *, n_iter=30000, dt=0.001):
 def plan(request, monkeypatch):
     """Pin where the state lives and the blocks per gene."""
     name, cluster_size = request.param
-    store = {"smem2": _sepal._SMEM2, "smem1": _sepal._SMEM1, "global": _sepal._GLOBAL}[
-        name
-    ]
+    store = {"smem2": _sepal._SMEM2, "smem1": _sepal._SMEM1, "global": _sepal._GLOBAL}[name]
 
     def pinned(n_cells, max_neighs, dtype):
         n = _sep_cuda.occupancy(
@@ -167,9 +163,7 @@ def test_sepal_layer_raw_and_genes():
     adata.layers["counts"] = adata.X.copy()
     adata.raw = adata.copy()
     adata.X = sparse.csr_matrix(adata.X.shape, dtype=np.float32)
-    pd.testing.assert_frame_equal(
-        rsc.gr.sepal(adata, 6, layer="counts", copy=True), ref
-    )
+    pd.testing.assert_frame_equal(rsc.gr.sepal(adata, 6, layer="counts", copy=True), ref)
     pd.testing.assert_frame_equal(rsc.gr.sepal(adata, 6, use_raw=True, copy=True), ref)
     one = rsc.gr.sepal(adata, 6, genes="g2", layer="counts", copy=True)
     assert list(one.index) == ["g2"]
@@ -235,9 +229,7 @@ def test_sepal_spatialdata():
     adata = _grid("square", 12, 10, holes=0.0, n_genes=3, seed=10)
     ref = rsc.gr.sepal(adata, 4, copy=True)
     sdata = sd.SpatialData(tables={"cells": TableModel.parse(adata.copy())})
-    pd.testing.assert_frame_equal(
-        rsc.gr.sepal(sdata, 4, table_key="cells", copy=True), ref
-    )
+    pd.testing.assert_frame_equal(rsc.gr.sepal(sdata, 4, table_key="cells", copy=True), ref)
     assert rsc.gr.sepal(sdata, 4, table_key="cells") is None
     pd.testing.assert_frame_equal(sdata.tables["cells"].uns["sepal_score"], ref)
     with pytest.raises(TypeError, match="table_key"):

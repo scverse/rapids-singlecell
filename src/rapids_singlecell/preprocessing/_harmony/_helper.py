@@ -10,6 +10,8 @@ from rapids_singlecell._cuda import _harmony_normalize_cuda as _normalize_cuda
 from rapids_singlecell._cuda import _harmony_outer_cuda as _outer_cuda
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pandas as pd
 
 # Column-sum heuristic thresholds (rows x cols regions)
@@ -44,9 +46,7 @@ def _normalize_cp_p1(X: cp.ndarray) -> cp.ndarray:
     return X
 
 
-def _outer_cp(
-    E: cp.ndarray, Pr_b: cp.ndarray, R_sum: cp.ndarray, switcher: int
-) -> None:
+def _outer_cp(E: cp.ndarray, Pr_b: cp.ndarray, R_sum: cp.ndarray, switcher: int) -> None:
     n_cats, n_pcs = E.shape
 
     _outer_cuda.outer(
@@ -73,12 +73,8 @@ def _validate_output_buffer(
         raise ValueError(f"{operation} output must be C-contiguous")
 
 
-def _normalize_cp(
-    X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None
-) -> cp.ndarray:
-    """
-    Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`.
-    """
+def _normalize_cp(X: cp.ndarray, p: int = 2, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """Analogous to `torch.nn.functional.normalize` for `axis = 1`, `p` in numpy is known as `ord`."""
     if p == 2:
         X = cp.ascontiguousarray(X)
         if out is None:
@@ -101,9 +97,7 @@ def _normalize_cp(
         return _normalize_cp_p1(X)
 
 
-def _get_batch_codes(
-    batch_mat: pd.DataFrame, batch_key: str | list[str]
-) -> tuple[np.ndarray, np.ndarray]:
+def _get_batch_codes(batch_mat: pd.DataFrame, batch_key: str | list[str]) -> tuple[np.ndarray, np.ndarray]:
     """Encode each batch variable into a disjoint range of marginal codes."""
     keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
     if not keys:
@@ -127,9 +121,7 @@ def _get_batch_codes(
     return codes, n_levels
 
 
-def _factorize_joint_codes(
-    batch_codes: np.ndarray, n_levels: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+def _factorize_joint_codes(batch_codes: np.ndarray, n_levels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Factorize marginal category tuples in lexicographic order."""
     levels = np.asarray(n_levels, dtype=np.int64)
     if batch_codes.ndim != 2 or batch_codes.shape[1] != levels.size:
@@ -139,9 +131,7 @@ def _factorize_joint_codes(
     for level in levels:
         joint_cardinality *= int(level)
         if joint_cardinality > np.iinfo(np.int64).max:
-            joint_cats, joint_codes = np.unique(
-                batch_codes, axis=0, return_inverse=True
-            )
+            joint_cats, joint_codes = np.unique(batch_codes, axis=0, return_inverse=True)
             return joint_cats, np.asarray(joint_codes).reshape(-1)
 
     offsets = np.empty(levels.size, dtype=np.int64)
@@ -176,9 +166,7 @@ def _stratified_sample_indices(
     nonempty = np.flatnonzero(sizes)
     n_cells = int(cell_indices.size)
     if not nonempty.size <= n_target <= n_cells:
-        raise ValueError(
-            "n_target must cover every nonempty stratum without exceeding n_cells"
-        )
+        raise ValueError("n_target must cover every nonempty stratum without exceeding n_cells")
 
     quotas = np.zeros_like(sizes)
     quotas[nonempty] = 1
@@ -213,9 +201,7 @@ def _get_theta_array(
     n_levels: int | np.ndarray,
     dtype: cp.dtype,
 ) -> cp.ndarray:
-    """
-    Normalize scalar, per-variable, or per-category theta values.
-    """
+    """Normalize scalar, per-variable, or per-category theta values."""
     levels = np.atleast_1d(n_levels).astype(np.int64, copy=False)
     n_covariates = levels.size
     n_categories = int(levels.sum())
@@ -224,8 +210,7 @@ def _get_theta_array(
         theta_array = cp.asarray(theta, dtype=dtype)
     except (TypeError, ValueError) as e:
         raise ValueError(
-            "Theta must be a scalar or an array-like collection of numeric values, "
-            f"got {type(theta).__name__}"
+            f"Theta must be a scalar or an array-like collection of numeric values, got {type(theta).__name__}"
         ) from e
     if theta_array.ndim == 0:
         return cp.full(n_categories, theta_array, dtype=dtype)
@@ -243,8 +228,8 @@ def _get_theta_array(
 
 
 def _column_sum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column of the 2D, C-contiguous float32 array A.
+    """Sum each column of the 2D, C-contiguous float32 array A.
+
     Returns a 1D float32 cupy array of length A.shape[1].
     """
     rows, cols = X.shape
@@ -265,13 +250,11 @@ def _column_sum(X: cp.ndarray) -> cp.ndarray:
 
 
 def _gemm_colsum(X: cp.ndarray) -> cp.ndarray:
-    """
-    Sum each column with cuBLAS GEMM
-    """
+    """Sum each column with cuBLAS GEMM"""
     return X.T @ cp.ones(X.shape[0], dtype=X.dtype)
 
 
-def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> callable:
+def _choose_colsum_algo_heuristic(rows: int, cols: int, algo: str | None) -> Callable[..., cp.ndarray]:
     """Choose a deterministic column reduction from the shape and device."""
     if algo in {"atomics", "benchmark"}:
         algo = None

@@ -1,215 +1,375 @@
 [build-system]
-requires = [
-    "hatchling",
-    "scikit-build-core[hatchling]>=1.0.1",
-    "hatch-vcs",
-    "nanobind>=2.0.0",
-]
 build-backend = "hatchling.build"
+requires = [
+  "hatch-vcs",
+  "hatchling",
+  "nanobind>=2",
+  "scikit-build-core[hatchling]>=1.0.1",
+]
 
 [project]
 name = "rapids-singlecell"
 description = "running single cell analysis on Nvidia GPUs"
-requires-python = ">=3.12, <3.15"
-license = { file = "LICENSE" }
-authors = [ { name = "Severin Dicks" } ]
 readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE" }
+maintainers = [ { name = "Severin Dicks", email = "severin.dicks@scverse.org" } ]
+authors = [ { name = "Severin Dicks" } ]
+requires-python = ">=3.12,<3.15"
+classifiers = [
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
 dynamic = [ "version" ]
-scripts.rapids-singlecell-install-skills = "rapids_singlecell_skills.install:main"
-scripts.rapids-singlecell-check-kernel = "rapids_singlecell_skills.kernel:main"
-
 dependencies = [
-    "anndata>=0.12.14",
-    "scanpy>=1.10.0",
-    "scverse-misc[settings]>=0.1.3",
-    "numpy>=1.26",
-    "scipy!=1.17.0,>=1.12",
-    "pandas",
-    "natsort",
-    "scikit-misc>=0.1.3",
-    "scikit-learn",
-    "tqdm",
-    "statsmodels>=0.12.0",
-    "scikit-image",
-    "docrep",
+  "anndata>=0.12.14",
+  "docrep",
+  "natsort",
+  "numpy>=1.26",
+  "pandas",
+  "scanpy>=1.10",
+  "scikit-image",
+  "scikit-learn",
+  "scikit-misc>=0.1.3",
+  "scipy!=1.17,>=1.12",
+  "scverse-misc[settings]>=0.1.3",
+  # for debug logging (referenced from the issue template)
+  "session-info2",
+  "statsmodels>=0.12",
+  "tqdm",
 ]
-
-[project.optional-dependencies]
-rapids-cu13 = [
-    "cupy-cuda13x[ctk]>=14",
-    "cudf-cu13>=25.12",
-    "cuml-cu13>=25.12",
-    "cugraph-cu13>=25.12",
-    "cuvs-cu13>=25.12",
+optional-dependencies.rapids-cu12 = [
+  "cudf-cu12>=25.12",
+  "cugraph-cu12>=25.12",
+  "cuml-cu12>=25.12",
+  "cupy-cuda12x[ctk]>=14",
+  "cuvs-cu12>=25.12",
 ]
-rapids-cu12 = [
-    "cupy-cuda12x[ctk]>=14",
-    "cudf-cu12>=25.12",
-    "cuml-cu12>=25.12",
-    "cugraph-cu12>=25.12",
-    "cuvs-cu12>=25.12",
+optional-dependencies.rapids-cu13 = [
+  "cudf-cu13>=25.12",
+  "cugraph-cu13>=25.12",
+  "cuml-cu13>=25.12",
+  "cupy-cuda13x[ctk]>=14",
+  "cuvs-cu13>=25.12",
 ]
+urls.Documentation = "https://rapids-singlecell.scverse.org/"
+urls.Homepage = "https://github.com/scverse/rapids-singlecell"
+urls.Source = "https://github.com/scverse/rapids-singlecell"
+scripts.rapids-singlecell-check-kernel = "rapids_singlecell_skills.kernel:main"
+scripts.rapids-singlecell-install-skills = "rapids_singlecell_skills.install:main"
 
 [dependency-groups]
-docs = [
-    "sphinx>=4.5.0",
-    "sphinx-copybutton",
-    "nbsphinx>=0.8.12",
-    "myst-nb",
-    "sphinx-design",
-    "sphinx-tabs",
-    "sphinxext-opengraph",
-    "sphinxcontrib.bibtex",
-    "scanpydoc[typehints,theme]>=0.9.4",
-    "scverse-misc[sphinx]>=0.1.3",
-    "dask",
-    "pytest",
-    "spatialdata>=0.7.2",
-]
-test-minimal = [
-    "pytest",
-    "pytest-cov",
-    "pytest-timeout",
-    "pytest-rerunfailures",
-    "anyio",
-    "pooch",
-    "profimp",
-    "scanpy>=1.10.0",
-    "bbknn",
-    "decoupler",
-    "fast-array-utils",
-    # beta without a numpy cap: uv backtracks into it and pairs it with numpy 2.5,
-    # which numba-cuda (still imported by cudf) can't import against
-    "numba!=0.63.0b1",
+dev = [
+  "hatch-vcs",
+  "prek",
 ]
 test = [
-    "igraph",
-    "spatialdata>=0.7.2",
-    { include-group = "test-minimal" },
+  "igraph",
+  "spatialdata>=0.7.2",
+  { include-group = "test-minimal" },
+]
+docs = [
+  "dask",
+  "nbsphinx>=0.8.12",
+  "pytest",
+  "scverse-doc[full]>=0.3",
+  "scverse-misc[sphinx]>=0.1.3",
+  "spatialdata>=0.7.2",
+  "sphinx>=8.1",
+  "sphinx-autodoc-typehints",
+  "sphinxcontrib-bibtex",
+]
+test-minimal = [
+  "anyio",
+  "bbknn",
+  "decoupler",
+  "fast-array-utils",
+  # beta without a numpy cap: uv backtracks into it and pairs it with numpy 2.5,
+  # which numba-cuda (still imported by cudf) can't import against
+  "numba!=0.63.0b1",
+  "pooch",
+  "profimp",
+  "pytest",
+  "pytest-cov",
+  "pytest-rerunfailures",
+  "pytest-timeout",
+  "scanpy>=1.10",
+]
+typecheck = [
+  "cupy-stubs",
+  "mypy",
+  "pandas-stubs",
 ]
 
-dev = [
-    "hatch-vcs",
-    "pre-commit",
-]
-
-[project.urls]
-Documentation = "https://rapids-singlecell.scverse.org/"
-Source = "https://github.com/scverse/rapids_singlecell"
-
-[tool.ruff]
-src = [ "src" ]
-line-length = 88
-lint.select = [
-    "F",       # Errors detected by Pyflakes
-    "E",       # Error detected by Pycodestyle
-    "W",       # Warning detected by Pycodestyle
-    "I",       # isort
-    "TID",     # flake8-tidy-imports
-    "C4",      # flake8-comprehensions
-    "BLE",     # flake8-blind-except
-    "FBT",     # No boolean positional parameters
-    "UP",      # pyupgrade
-    "TID251",  # Banned imports
-    "RUF100",  # Report unused noqa directives
-    "ICN",     # Follow import conventions
-    "PTH",     # Pathlib instead of os.path
-    "TC",      # manage type checking blocks
-    "PLR0917", # Ban APIs with too many positional parameters
-]
-
-lint.ignore = [
-    # line too long -> we accept long comment lines; formatting gets rid of long code lines
-    "E501",
-    # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
-    "E731",
-    # allow I, O, l as variable names -> I is the identity matrix
-    "E741",
-    # Missing docstring in public package
-    "F403",
-]
-
-[tool.ruff.lint.per-file-ignores]
-"docs/*" = [ "I" ]
-"tests/*" = [ "D", "FBT" ]
-"*/__init__.py" = [ "F401" ]
-[tool.ruff.lint.isort]
-known-first-party = [ "rapids_singlecell" ]
-required-imports = [ "from __future__ import annotations" ]
-
-[tool.pytest.ini_options]
-addopts = [
-    "--import-mode=importlib",
-    "--strict-markers",
-    "--timeout=60",
-]
-markers = [
-    "gpu: tests that use a GPU (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
-    "array_api: array-API tests (currently unused, but needs to be specified here as we import anndata.tests.helpers, which uses it)",
-]
-
-[tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.version.raw-options]
-version_scheme = "guess-next-dev"
-local_scheme = "node-and-date"
-
-[tool.hatch.build.hooks.vcs]
-version-file = "src/rapids_singlecell/_version.py"
-
-[tool.hatch.build.targets.wheel]
-packages = [ "src/rapids_singlecell", "src/rapids_singlecell_skills", "src/testing" ]
-exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
-
-[tool.hatch.build.targets.wheel.hooks.scikit-build]
+[tool.hatch]
+version.source = "vcs"
+version.raw-options.local_scheme = "node-and-date"
+version.raw-options.version_scheme = "guess-next-dev"
+build.hooks.vcs.version-file = "src/rapids_singlecell/_version.py"
+build.targets.wheel.packages = [ "src/rapids_singlecell", "src/rapids_singlecell_skills", "src/testing" ]
+build.targets.wheel.exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
+build.targets.wheel.hooks.scikit-build = {}
 
 [tool.scikit-build]
-# Use limited ABI wheels (one wheel for all Python minor versions on one platform)
-wheel.py-api = "cp312"
-cmake.version = ">=3.24"
+build-dir = "build"
 cmake.build-type = "Release"
-ninja.version = ">=1.10"
 # Default: use native arch for source builds (auto-detect user's GPU)
 # CI overrides via SKBUILD_CMAKE_DEFINE_CMAKE_CUDA_ARCHITECTURES env var
 cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
-build-dir = "build"
+cmake.version = ">=3.24"
+ninja.version = ">=1.10"
+# Use limited ABI wheels (one wheel for all Python minor versions on one platform)
+wheel.py-api = "cp312"
 
+[tool.cibuildwheel]
 # Use abi3audit to catch issues with Limited API wheels
-[tool.cibuildwheel.linux]
 # Exclude CUDA runtime libs provided by dependency wheels.
 # Keep in sync with CIBW_REPAIR_WHEEL_COMMAND in publish.yml.
-repair-wheel-command = [
-    "auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude 'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}",
-    "pipx run abi3audit --strict --report {wheel}",
+linux.repair-wheel-command = [
+  """\
+  auditwheel repair --exclude 'libcublas.so.*' --exclude 'libcublasLt.so.*' --exclude 'libcudart.so.*' --exclude \
+  'libcusolver.so.*' --exclude 'libcusparse.so.*' --exclude 'libnvJitLink.so.*' -w {dest_dir} {wheel}\
+  """,
+  "pipx run abi3audit --strict --report {wheel}",
 ]
-[tool.cibuildwheel.macos]
-repair-wheel-command = [
-    "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}",
-    "pipx run abi3audit --strict --report {wheel}",
+macos.repair-wheel-command = [
+  "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}",
+  "pipx run abi3audit --strict --report {wheel}",
 ]
-[tool.cibuildwheel.windows]
-repair-wheel-command = [
-    "copy {wheel} {dest_dir}",
-    "pipx run abi3audit --strict --report {wheel}",
+windows.repair-wheel-command = [
+  "copy {wheel} {dest_dir}",
+  "pipx run abi3audit --strict --report {wheel}",
 ]
+
+[tool.ruff]
+line-length = 120
+src = [ "src" ]
+extend-include = [ "*.ipynb" ]
+# tutorials live in the rapids-singlecell-tutorials submodule (docs/notebooks are symlinks)
+extend-exclude = [ "docs/notebooks", "notebooks" ]
+format.docstring-code-format = true
+lint.select = [
+  "B",       # flake8-bugbear
+  "BLE",     # flake8-blind-except
+  "C4",      # flake8-comprehensions
+  "D",       # pydocstyle
+  "E",       # Error detected by Pycodestyle
+  "F",       # Errors detected by Pyflakes
+  "FBT",     # No boolean positional parameters
+  "I",       # isort
+  "ICN",     # Follow import conventions
+  "PLR0917", # Ban APIs with too many positional parameters
+  "PTH",     # Pathlib instead of os.path
+  "RUF100",  # Report unused noqa directives
+  "TC",      # manage type checking blocks
+  "TID",     # flake8-tidy-imports
+  "TID251",  # Banned imports
+  "UP",      # pyupgrade
+  "W",       # Warning detected by Pycodestyle
+]
+lint.ignore = [
+  "B008", # Errors from function calls in argument defaults. These are fine when the result is immutable.
+  "D100", # Missing docstring in public module
+  "D104", # Missing docstring in public package
+  "D105", # __magic__ methods are often self-explanatory, allow missing docstrings
+  "D107", # Missing docstring in __init__
+  # Disable one in each pair of mutually incompatible rules
+  "D203", # We don’t want a blank line before a class docstring
+  "D213", # <> We want docstrings to start immediately after the opening triple quote
+  "D400", # first line should end with a period [Bug: doesn’t work with single-line docstrings]
+  "D401", # First line should be in imperative mood; try rephrasing
+  "E501", # line too long -> we accept long comment lines; formatter gets rid of long code lines
+  "E731", # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
+  "E741", # allow I, O, l as variable names -> I is the identity matrix
+  "F403", # allow star imports
+]
+lint.per-file-ignores."*/__init__.py" = [ "F401" ]
+lint.per-file-ignores."docs/*" = [ "I" ]
+lint.per-file-ignores."tests/*" = [ "D", "FBT" ]
+lint.isort.known-first-party = [ "rapids_singlecell" ]
+lint.isort.required-imports = [ "from __future__ import annotations" ]
+lint.pydocstyle.convention = "numpy"
 
 [tool.codespell]
-skip = '*.ipynb,*.csv'
-ignore-words-list = "nd"
+ignore-words-list = "nd,indext,coo,alo,clen,fo,ot,numer"
+skip = "*.ipynb,*.csv"
 
-[tool.coverage.run]
-data_file = "test-data/coverage"
-source_pkgs = [ "rapids_singlecell" ]
-omit = [ "tests/*", "src/testing/*" ]
+[tool.mypy]
+mypy_path = "src"
+files = [ "src" ]
+explicit_package_bases = true
+python_version = "3.12"
+warn_redundant_casts = true
+warn_unused_ignores = true
+enable_error_code = [ "ignore-without-code" ]
+warn_unused_configs = true
 
-[tool.coverage.xml]
-output = "test-data/coverage.xml"
+# RAPIDS and friends ship without type information
+[[tool.mypy.overrides]]
+module = [ "cudf.*", "cuml.*", "cuvs.*", "numba.*", "pylibraft.*" ]
+ignore_missing_imports = true
 
-[tool.coverage.paths]
-source = [ "./src", "**/site-packages" ]
+# scanpy has inline annotations but no py.typed marker
+[[tool.mypy.overrides]]
+module = [ "scanpy", "scanpy.*" ]
+follow_untyped_imports = true
 
-[tool.coverage.report]
-exclude_also = [
-    "if TYPE_CHECKING:",
+# nanobind stubs are generated at build time and absent with RSC_BUILD_EXTENSIONS=OFF
+# (when present, their overloads trip `overload-cannot-match`: not ours to fix)
+[[tool.mypy.overrides]]
+module = [ "rapids_singlecell._cuda.*" ]
+ignore_missing_imports = true
+ignore_errors = true
+
+# Ratchet: modules that do not type check yet. Fix one, then delete it here.
+# Most failures are CuPy APIs that cupy-stubs does not cover yet.
+[[tool.mypy.overrides]]
+module = [
+  "rapids_singlecell._compat",
+  "rapids_singlecell._keys",
+  "rapids_singlecell._utils",
+  "rapids_singlecell._utils._multi_gpu",
+  "rapids_singlecell._utils._random",
+  "rapids_singlecell.decoupler_gpu._helper._data",
+  "rapids_singlecell.decoupler_gpu._helper._docs",
+  "rapids_singlecell.decoupler_gpu._helper._net",
+  "rapids_singlecell.decoupler_gpu._helper._pv",
+  "rapids_singlecell.decoupler_gpu._helper._run",
+  "rapids_singlecell.decoupler_gpu._method_aucell",
+  "rapids_singlecell.decoupler_gpu._method_gsva",
+  "rapids_singlecell.decoupler_gpu._method_mlm",
+  "rapids_singlecell.decoupler_gpu._method_ora",
+  "rapids_singlecell.decoupler_gpu._method_ulm",
+  "rapids_singlecell.decoupler_gpu._method_viper",
+  "rapids_singlecell.decoupler_gpu._method_waggr",
+  "rapids_singlecell.decoupler_gpu._method_zscore",
+  "rapids_singlecell.get._aggregated",
+  "rapids_singlecell.get._anndata",
+  "rapids_singlecell.get._kernels._aggr_elementwise",
+  "rapids_singlecell.get._utils",
+  "rapids_singlecell.gr",
+  "rapids_singlecell.pertpy_gpu._base",
+  "rapids_singlecell.pertpy_gpu._distance",
+  "rapids_singlecell.pertpy_gpu._guide_assignment",
+  "rapids_singlecell.pertpy_gpu._metrics._base_metric",
+  "rapids_singlecell.pertpy_gpu._metrics._edistance",
+  "rapids_singlecell.pertpy_gpu._metrics._pseudobulk",
+  "rapids_singlecell.pertpy_gpu._metrics._sinkhorn",
+  "rapids_singlecell.pertpy_gpu._metrics._utils._pseudobulk",
+  "rapids_singlecell.pertpy_gpu._metrics._wasserstein",
+  "rapids_singlecell.pertpy_gpu._mixscale",
+  "rapids_singlecell.pertpy_gpu._mixscape",
+  "rapids_singlecell.preprocessing._harmony",
+  "rapids_singlecell.preprocessing._harmony._helper",
+  "rapids_singlecell.preprocessing._harmony._kmeans",
+  "rapids_singlecell.preprocessing._harmony_integrate",
+  "rapids_singlecell.preprocessing._hvg",
+  "rapids_singlecell.preprocessing._hvg._pearson_residuals",
+  "rapids_singlecell.preprocessing._hvg._poisson",
+  "rapids_singlecell.preprocessing._hvg._seurat_cellranger",
+  "rapids_singlecell.preprocessing._hvg._seurat_v3",
+  "rapids_singlecell.preprocessing._kernels._mean_var_kernel",
+  "rapids_singlecell.preprocessing._neighbors",
+  "rapids_singlecell.preprocessing._neighbors._algorithms._all_neighbors",
+  "rapids_singlecell.preprocessing._neighbors._algorithms._cagra",
+  "rapids_singlecell.preprocessing._neighbors._algorithms._nn_descent",
+  "rapids_singlecell.preprocessing._neighbors._helper",
+  "rapids_singlecell.preprocessing._neighbors._neighbors",
+  "rapids_singlecell.preprocessing._normalize",
+  "rapids_singlecell.preprocessing._pca",
+  "rapids_singlecell.preprocessing._qc",
+  "rapids_singlecell.preprocessing._regress_out",
+  "rapids_singlecell.preprocessing._scale",
+  "rapids_singlecell.preprocessing._scrublet",
+  "rapids_singlecell.preprocessing._scrublet.core",
+  "rapids_singlecell.preprocessing._scrublet.pipeline",
+  "rapids_singlecell.preprocessing._scrublet.sparse_utils",
+  "rapids_singlecell.preprocessing._simple",
+  "rapids_singlecell.preprocessing._sparse_pca._block_lanczos",
+  "rapids_singlecell.preprocessing._sparse_pca._helper",
+  "rapids_singlecell.preprocessing._sparse_pca._operators",
+  "rapids_singlecell.preprocessing._sparse_pca._sparse_pca",
+  "rapids_singlecell.preprocessing._sparse_pca._sparse_svd_pca",
+  "rapids_singlecell.preprocessing._sparse_pca._svd_lanczos",
+  "rapids_singlecell.preprocessing._utils",
+  "rapids_singlecell.squidpy_gpu._autocorr",
+  "rapids_singlecell.squidpy_gpu._co_oc",
+  "rapids_singlecell.squidpy_gpu._gearysc",
+  "rapids_singlecell.squidpy_gpu._gmm",
+  "rapids_singlecell.squidpy_gpu._ligrec",
+  "rapids_singlecell.squidpy_gpu._moransi",
+  "rapids_singlecell.squidpy_gpu._nhood",
+  "rapids_singlecell.squidpy_gpu._niche",
+  "rapids_singlecell.squidpy_gpu._ripley",
+  "rapids_singlecell.squidpy_gpu._sepal",
+  "rapids_singlecell.squidpy_gpu._spatial_data",
+  "rapids_singlecell.squidpy_gpu._spatial_delaunay",
+  "rapids_singlecell.squidpy_gpu._spatial_graph",
+  "rapids_singlecell.squidpy_gpu._spatial_neighbors",
+  "rapids_singlecell.squidpy_gpu._spatial_neighbors_backend",
+  "rapids_singlecell.squidpy_gpu._utils",
+  "rapids_singlecell.squidpy_gpu.neighbors",
+  "rapids_singlecell.tl",
+  "rapids_singlecell.tools._clustering",
+  "rapids_singlecell.tools._diffmap",
+  "rapids_singlecell.tools._draw_graph",
+  "rapids_singlecell.tools._embedding_density",
+  "rapids_singlecell.tools._ingest",
+  "rapids_singlecell.tools._rank_genes_groups",
+  "rapids_singlecell.tools._rank_genes_groups._core",
+  "rapids_singlecell.tools._rank_genes_groups._logreg",
+  "rapids_singlecell.tools._rank_genes_groups._stream_multi_gpu",
+  "rapids_singlecell.tools._rank_genes_groups._ttest",
+  "rapids_singlecell.tools._rank_genes_groups._utils",
+  "rapids_singlecell.tools._rank_genes_groups._wilcoxon",
+  "rapids_singlecell.tools._rank_genes_groups._wilcoxon_binned",
+  "rapids_singlecell.tools._rank_genes_groups._wilcoxon_host",
+  "rapids_singlecell.tools._score_genes",
+  "rapids_singlecell.tools._tsne",
+  "rapids_singlecell.tools._umap",
+  "rapids_singlecell.tools._utils",
+  "rapids_singlecell_skills.api",
+  "rapids_singlecell_skills.kernel",
+  "testing.rapids_singlecell._helper",
+]
+ignore_errors = true
+
+[tool.pytest]
+ini_options.addopts = [
+  "--import-mode=importlib",
+  "--strict-markers",
+  "--timeout=60",
+]
+ini_options.markers = [
+  "array_api: unused, registered because anndata.tests.helpers uses it",
+  "gpu: unused, registered because anndata.tests.helpers uses it",
+]
+
+[tool.coverage]
+run.source_pkgs = [ "rapids_singlecell" ]
+run.omit = [ "src/testing/*", "tests/*" ]
+run.data_file = "test-data/coverage"
+paths.source = [ "./src", "**/site-packages" ]
+report.exclude_also = [
+  "if TYPE_CHECKING:",
+]
+xml.output = "test-data/coverage.xml"
+
+[tool.cruft]
+# project-specific files the scverse template must not touch on `cruft update`
+skip = [
+  ".git",
+  "src",
+  "tests",
+  "docs",
+  "README.md",
+  "CHANGELOG.md",
+  ".github/ISSUE_TEMPLATE",
+  # GPU CI: test-gpu.yml and publish.yml replace the template's CPU workflows
+  ".github/workflows/build.yaml",
+  ".github/workflows/release.yaml",
+  ".github/workflows/test.yaml",
 ]

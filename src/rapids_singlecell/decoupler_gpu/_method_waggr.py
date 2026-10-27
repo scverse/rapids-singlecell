@@ -74,15 +74,11 @@ def _validate_args(
     required_args = ["x", "w"]
     for arg in required_args:
         if arg not in args:
-            assert AssertionError(), (
-                f"fun={fun.__name__} must contain arguments x and w"
-            )
+            assert AssertionError(), f"fun={fun.__name__} must contain arguments x and w"
     # Check if any additional arguments have default values
     for param in args.values():
         if param.name not in required_args and param.default == inspect.Parameter.empty:
-            assert AssertionError(), (
-                f"fun={fun.__name__} has an argument {param.name} without a default value"
-            )
+            assert AssertionError(), f"fun={fun.__name__} has an argument {param.name} without a default value"
     return fun
 
 
@@ -101,9 +97,7 @@ def _validate_func(
             "output of fun must be a cp.ndarray with shape (x.shape[0], w.shape[1])"
         )
     except Exception as err:
-        raise ValueError(
-            f"fun failed to run with test data: fun(x={x}), w={w}"
-        ) from err
+        raise ValueError(f"fun failed to run with test data: fun(x={x}), w={w}") from err
     m = f"waggr - using function {fun.__name__}"
     _log(m, level="info", verbose=verbose)
     _fun(f=fun, verbose=verbose)
@@ -250,9 +244,7 @@ def _func_waggr(
         f_fun = fun
     _validate_func(f_fun, verbose=verbose)
     vfun = _cfuncs[f_fun.__name__]
-    assert isinstance(times, int | float) and times >= 0, (
-        "times must be numeric and >= 0"
-    )
+    assert isinstance(times, int | float) and times >= 0, "times must be numeric and >= 0"
     assert isinstance(seed, int | float) and seed >= 0, "seed must be numeric and >= 0"
     times, seed = int(times), int(seed)
     nobs, nvar = mat.shape

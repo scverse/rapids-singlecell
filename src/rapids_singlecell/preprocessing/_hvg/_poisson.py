@@ -56,9 +56,9 @@ def _poisson_gene_selection(
     if n_top_genes is None:
         n_top_genes = 2000
         warnings.warn(
-            "`flavor='poisson_gene_selection'` expects `n_top_genes` to be defined, "
-            "defaulting to 2000 HVGs",
+            "`flavor='poisson_gene_selection'` expects `n_top_genes` to be defined, defaulting to 2000 HVGs",
             UserWarning,
+            stacklevel=2,
         )
 
     X = _get_obs_rep(adata, layer=layer)
@@ -66,9 +66,9 @@ def _poisson_gene_selection(
     check_values = False if isinstance(X, DaskArray) else check_values
     if check_values and not _check_nonnegative_integers(X):
         warnings.warn(
-            "`flavor='poisson_gene_selection'` expects raw count data, "
-            "but non-integers were found.",
+            "`flavor='poisson_gene_selection'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
 
     # Handle batches
@@ -197,9 +197,7 @@ def _write_results(
         index=adata.var_names,
     )
 
-    top_genes = df.nlargest(
-        n_top_genes, ["prob_zero_enriched_nbatches", "prob_zero_enrichment_rank"]
-    ).index
+    top_genes = df.nlargest(n_top_genes, ["prob_zero_enriched_nbatches", "prob_zero_enrichment_rank"]).index
     df.loc[top_genes, "highly_variable"] = True
 
     # Update adata

@@ -121,8 +121,7 @@ def wilcoxon_binned(
     """Histogram-based approximate Wilcoxon rank-sum test."""
     if not rg.is_log1p:
         warnings.warn(
-            "wilcoxon_binned expects log-normalized data "
-            "(adata.uns['log1p'] not found).",
+            "wilcoxon_binned expects log-normalized data (adata.uns['log1p'] not found).",
             UserWarning,
             stacklevel=4,
         )
@@ -189,9 +188,7 @@ def wilcoxon_binned(
     # Warn for small groups
     if ireference is not None:
         n_ref = int(group_sizes[ireference])
-        for gi, (name, size) in enumerate(
-            zip(rg.groups_order, group_sizes, strict=True)
-        ):
+        for gi, (name, size) in enumerate(zip(rg.groups_order, group_sizes, strict=True)):
             if gi == ireference:
                 continue
             if size <= MIN_GROUP_SIZE_WARNING or n_ref <= MIN_GROUP_SIZE_WARNING:
@@ -271,23 +268,15 @@ def wilcoxon_binned(
     fuse_means = (
         is_host
         and not rg._sparse_negative_fallback
-        and (
-            isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"})
-        )
+        and (isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"}))
     )
     n_hist_groups = n_cells_per_group_hist.shape[0]
     from ._stream_multi_gpu import resolve_stream_devices
 
-    device_ids = (
-        resolve_stream_devices(multi_gpu=rg._multi_gpu)
-        if is_host
-        else [cp.cuda.Device().id]
-    )
+    device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [cp.cuda.Device().id]
     if fuse_means:
         group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
-        group_nnz_ext = (
-            cp.zeros((n_groups + 1, n_genes), dtype=cp.float64) if rg.comp_pts else None
-        )
+        group_nnz_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64) if rg.comp_pts else None
         batch_kwargs["group_sums"] = group_sums_ext
         batch_kwargs["group_nnz"] = group_nnz_ext
     else:
@@ -535,8 +524,10 @@ def _finish_binned_stats(
     tie_correct: bool,
     use_continuity: bool,
 ) -> tuple[cp.ndarray, cp.ndarray]:
-    """Zero-bin fill + z-scores/p-values from a full (n_genes, n_hist_groups, nbt)
-    histogram (single-GPU chunk or the gathered multi-GPU histogram)."""
+    """Zero-bin fill + z-scores/p-values from a full (n_genes, n_hist_groups, nbt) histogram.
+
+    The histogram is a single-GPU chunk or the gathered multi-GPU histogram.
+    """
     # Sparse kernels only fill bins 1..n_bins; compute bin 0 (zeros) here.
     if is_sparse:
         _fill_sparse_zero_bin(hist, n_cells_per_group_hist)
@@ -764,18 +755,16 @@ def _fill_binned_means(
     group_nnz_ext: cp.ndarray | None,
     n_cells: int,
 ) -> None:
-    """Fill exact means/pts from fused ``(n_groups+1, n_genes)`` sums (row
-    ``n_groups`` = unselected cells, so total = sum across rows)."""
+    """Fill exact means/pts from fused ``(n_groups+1, n_genes)`` sums.
+
+    Row ``n_groups`` holds the unselected cells, so the total is the sum across rows.
+    """
     n_groups = len(rg.groups_order)
     group_sums = group_sums_ext[:n_groups]
     sizes = cp.asarray(rg.group_sizes, dtype=cp.float64)[:, None]
     rg.means = cp.asnumpy(group_sums / sizes)
     rg.vars = None
-    rg.pts = (
-        cp.asnumpy(group_nnz_ext[:n_groups] / sizes)
-        if group_nnz_ext is not None
-        else None
-    )
+    rg.pts = cp.asnumpy(group_nnz_ext[:n_groups] / sizes) if group_nnz_ext is not None else None
     if rg.ireference is None:
         n_rest = cp.float64(n_cells) - sizes
         total_sums = group_sums_ext.sum(axis=0, keepdims=True)
@@ -918,15 +907,11 @@ def _process_dask(
 
         def _hist_block(block, block_info=None):
             if block_info is None or block_info == []:
-                return cp.zeros(
-                    (1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-                )
+                return cp.zeros((1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             row_start = block_info[0]["array-location"][0][0]
             row_stop = block_info[0]["array-location"][0][1]
             codes_chunk = group_codes[row_start:row_stop]
-            hist = cp.zeros(
-                (n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-            )
+            hist = cp.zeros((n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             _wb.csr_hist(
                 block.data,
                 block.indices,
@@ -948,17 +933,13 @@ def _process_dask(
 
         def _hist_block(block, block_info=None):
             if block_info is None or block_info == []:
-                return cp.zeros(
-                    (1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-                )
+                return cp.zeros((1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             row_start = block_info[0]["array-location"][0][0]
             row_stop = block_info[0]["array-location"][0][1]
             codes_chunk = group_codes[row_start:row_stop]
 
             blk = cp.asfortranarray(cp.asarray(block[:, start:stop]))
-            hist = cp.zeros(
-                (n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-            )
+            hist = cp.zeros((n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             _wb.dense_hist(
                 blk,
                 codes_chunk,

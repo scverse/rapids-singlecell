@@ -39,9 +39,7 @@ def _make_grouped_adata(
         X[g * cells_per_group : (g + 1) * cells_per_group] += g * shift
 
     labels = [f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(n_groups)])})
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = X.copy()
     return adata
@@ -174,9 +172,7 @@ def test_ragged_sinkhorn_batch_matches_individual() -> None:
     ]
 
     batched, _ = _ragged_solve(pairs, max_iter=10000, tol=1e-10)
-    singles = np.array(
-        [float(_ragged_solve([p], max_iter=10000, tol=1e-10)[0][0]) for p in pairs]
-    )
+    singles = np.array([float(_ragged_solve([p], max_iter=10000, tol=1e-10)[0][0]) for p in pairs])
     np.testing.assert_allclose(batched.get(), singles, rtol=1e-7, atol=1e-7)
 
 
@@ -230,9 +226,7 @@ def _auto_eps(X: np.ndarray, Y: np.ndarray) -> float:
 
 def test_pairwise_matches_reference_default_config() -> None:
     n_groups, cpg = 4, 20
-    adata = _make_grouped_adata(
-        n_groups=n_groups, cells_per_group=cpg, n_features=8, seed=0, dtype=np.float64
-    )
+    adata = _make_grouped_adata(n_groups=n_groups, cells_per_group=cpg, n_features=8, seed=0, dtype=np.float64)
     df = Distance(metric="wasserstein").pairwise(adata, groupby="group")
     X = adata.obsm["X_pca"]
     for i in range(n_groups):
@@ -240,16 +234,12 @@ def test_pairwise_matches_reference_default_config() -> None:
             Xi = X[i * cpg : (i + 1) * cpg]
             Xj = X[j * cpg : (j + 1) * cpg]
             ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
-            np.testing.assert_allclose(
-                df.loc[f"g{i}", f"g{j}"], ref, rtol=1e-4, atol=1e-4
-            )
+            np.testing.assert_allclose(df.loc[f"g{i}", f"g{j}"], ref, rtol=1e-4, atol=1e-4)
 
 
 def test_onesided_matches_reference_default_config() -> None:
     n_groups, cpg = 4, 20
-    adata = _make_grouped_adata(
-        n_groups=n_groups, cells_per_group=cpg, n_features=8, seed=0, dtype=np.float64
-    )
+    adata = _make_grouped_adata(n_groups=n_groups, cells_per_group=cpg, n_features=8, seed=0, dtype=np.float64)
     s = Distance(metric="wasserstein").onesided_distances(adata, "group", "g0")
     X = adata.obsm["X_pca"]
     Xi = X[0:cpg]
@@ -289,28 +279,20 @@ def test_matches_pertpy_ott_parity() -> None:
     pytest.importorskip("ott")
     from pertpy.tools import Distance as PertpyDistance
 
-    adata = _make_grouped_adata(
-        n_groups=4, cells_per_group=20, n_features=8, seed=0, dtype=np.float64
-    )
+    adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=8, seed=0, dtype=np.float64)
     ours = Distance(metric="wasserstein")
     upstream = PertpyDistance(metric="wasserstein", obsm_key="X_pca")
 
     # pairwise: full K x K matrix
     rp = ours.pairwise(adata, groupby="group")
-    pp = upstream.pairwise(adata, groupby="group", show_progressbar=False).loc[
-        rp.index, rp.columns
-    ]
+    pp = upstream.pairwise(adata, groupby="group", show_progressbar=False).loc[rp.index, rp.columns]
     np.testing.assert_allclose(rp.values, pp.values, rtol=1e-4, atol=1e-4)
 
     # onesided: distances from one group to the rest (compare the other groups)
     rs = ours.onesided_distances(adata, "group", "g0")
-    ps = upstream.onesided_distances(
-        adata, groupby="group", selected_group="g0", show_progressbar=False
-    )
+    ps = upstream.onesided_distances(adata, groupby="group", selected_group="g0", show_progressbar=False)
     others = [g for g in rs.index if g != "g0" and g in ps.index]
-    np.testing.assert_allclose(
-        rs.reindex(others).values, ps.reindex(others).values, rtol=1e-4, atol=1e-4
-    )
+    np.testing.assert_allclose(rs.reindex(others).values, ps.reindex(others).values, rtol=1e-4, atol=1e-4)
 
     # single call (X, Y)
     X = adata.obsm["X_pca"][:20]
@@ -389,9 +371,7 @@ def test_high_omega_diverges_gracefully() -> None:
     assert np.all(np.isfinite(df.values))  # diverged but finite, no crash
     wm = WassersteinMetric(relaxation=1.99)
     with pytest.warns(RuntimeWarning, match="did not converge"):
-        mean, var = wm.bootstrap(
-            adata, "group", "g0", "g1", n_bootstrap=5, random_state=0
-        )
+        mean, var = wm.bootstrap(adata, "group", "g0", "g1", n_bootstrap=5, random_state=0)
     assert np.isfinite(mean) and var >= 0
 
 
@@ -409,9 +389,7 @@ def test_distance_wasserstein_pairwise_shape_and_diag() -> None:
 
 def test_distance_wasserstein_pairwise_monotonic_in_separation() -> None:
     """Pairs farther apart in feature space should have larger distance."""
-    adata = _make_grouped_adata(
-        n_groups=4, cells_per_group=20, n_features=8, shift=1.0, seed=21
-    )
+    adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=8, shift=1.0, seed=21)
     distance = Distance(metric="wasserstein")
     df = distance.pairwise(adata, groupby="group")
     # g0-g3 (shift 3) > g0-g1 (shift 1)
@@ -446,9 +424,7 @@ def test_distance_wasserstein_onesided_single_control() -> None:
 def test_distance_wasserstein_onesided_multi_control_matches_single() -> None:
     adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=6, seed=5)
     distance = Distance(metric="wasserstein")
-    df = distance.onesided_distances(
-        adata, groupby="group", selected_group=["g0", "g2"]
-    )
+    df = distance.onesided_distances(adata, groupby="group", selected_group=["g0", "g2"])
     assert isinstance(df, pd.DataFrame)
     assert df.shape == (4, 2)
 
@@ -488,30 +464,22 @@ def test_distance_wasserstein_pairwise_subset_groups() -> None:
 def test_bootstrap_pairwise_variance_and_reproducible() -> None:
     adata = _make_grouped_adata(n_groups=3, cells_per_group=25, n_features=6, seed=1)
     distance = Distance(metric="wasserstein")
-    mean1, var1 = distance.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=30, random_state=7
-    )
+    mean1, var1 = distance.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=30, random_state=7)
     assert isinstance(mean1, pd.DataFrame) and isinstance(var1, pd.DataFrame)
     np.testing.assert_allclose(np.diag(mean1.values), 0.0, atol=1e-8)
     assert np.all(var1.values >= 0)
     assert np.all(var1.values[~np.eye(3, dtype=bool)] > 0)  # off-diagonal var > 0
     # same seed -> identical mean and variance
-    mean2, var2 = distance.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=30, random_state=7
-    )
+    mean2, var2 = distance.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=30, random_state=7)
     np.testing.assert_array_equal(mean1.values, mean2.values)
     np.testing.assert_array_equal(var1.values, var2.values)
 
 
 def test_bootstrap_mean_close_to_point_estimate() -> None:
-    adata = _make_grouped_adata(
-        n_groups=3, cells_per_group=60, n_features=8, shift=1.0, seed=2
-    )
+    adata = _make_grouped_adata(n_groups=3, cells_per_group=60, n_features=8, shift=1.0, seed=2)
     distance = Distance(metric="wasserstein")
     point = distance.pairwise(adata, groupby="group")
-    boot_mean, _ = distance.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=100, random_state=2
-    )
+    boot_mean, _ = distance.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=100, random_state=2)
     np.testing.assert_allclose(boot_mean.values, point.values, rtol=0.3, atol=0.5)
 
 
@@ -540,9 +508,7 @@ def test_bootstrap_arrays_and_onesided() -> None:
 def test_bootstrap_adata_method_and_multicontrol() -> None:
     adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=6, seed=4)
     # adata-based bootstrap(group_a, group_b) -> (mean, var) floats
-    mean, var = WassersteinMetric().bootstrap(
-        adata, "group", "g0", "g1", n_bootstrap=20, random_state=1
-    )
+    mean, var = WassersteinMetric().bootstrap(adata, "group", "g0", "g1", n_bootstrap=20, random_state=1)
     assert isinstance(mean, float) and isinstance(var, float) and var >= 0
     # multi-control onesided bootstrap -> (DataFrame, DataFrame)
     md, vd = Distance(metric="wasserstein").onesided_distances(
@@ -579,9 +545,7 @@ def test_bootstrap_guards() -> None:
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_pairwise_correctness_dtypes(dtype) -> None:
     cpg = 15
-    adata = _make_grouped_adata(
-        n_groups=3, cells_per_group=cpg, n_features=6, seed=4, dtype=dtype
-    )
+    adata = _make_grouped_adata(n_groups=3, cells_per_group=cpg, n_features=6, seed=4, dtype=dtype)
     df = Distance(metric="wasserstein").pairwise(adata, "group")
     X = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
     rtol = 1e-4 if dtype == np.float32 else 1e-5
@@ -643,9 +607,7 @@ def test_layer_key_matches_reference() -> None:
     ng, cpg, nf = 3, 15, 6
     data = rng.normal(size=(ng * cpg, nf)).astype(np.float64)
     labels = [f"g{i}" for i in range(ng) for _ in range(cpg)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(ng)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(ng)])})
     adata = AnnData(np.zeros((ng * cpg, nf), np.float32), obs=obs)
     adata.layers["counts"] = data
     df = Distance(metric="wasserstein", layer_key="counts").pairwise(adata, "group")
@@ -678,17 +640,13 @@ def test_groups_filter_values_match_full() -> None:
     sub = distance.pairwise(adata, "group", groups=["g0", "g2", "g4"])
     for a in ["g0", "g2", "g4"]:
         for b in ["g0", "g2", "g4"]:
-            np.testing.assert_allclose(
-                sub.loc[a, b], full.loc[a, b], rtol=1e-4, atol=1e-4
-            )
+            np.testing.assert_allclose(sub.loc[a, b], full.loc[a, b], rtol=1e-4, atol=1e-4)
 
 
 def test_onesided_invalid_group_raises() -> None:
     adata = _make_grouped_adata(n_groups=3, cells_per_group=10)
     with pytest.raises(ValueError):
-        Distance(metric="wasserstein").onesided_distances(
-            adata, "group", selected_group="nope"
-        )
+        Distance(metric="wasserstein").onesided_distances(adata, "group", selected_group="nope")
 
 
 def test_unused_categories_and_singletons() -> None:
@@ -702,9 +660,7 @@ def test_unused_categories_and_singletons() -> None:
         labels += [g] * n
     X = np.vstack(blocks)
     # categorical also lists 'gZ', which has zero cells (unused)
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])})
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = X.copy()
     distance = Distance(metric="wasserstein")
@@ -731,9 +687,7 @@ def test_call_and_bootstrap_input_handling() -> None:
     distance = Distance(metric="wasserstein")
     rng = np.random.default_rng(0)
     X = rng.normal(size=(20, 6)).astype(np.float32)
-    Y = rng.normal(size=(25, 6)).astype(
-        np.float64
-    )  # different dtype -> cast internally
+    Y = rng.normal(size=(25, 6)).astype(np.float64)  # different dtype -> cast internally
     assert np.isfinite(distance(X, Y))
     assert distance.bootstrap(X, Y, n_bootstrap=10, random_state=0).variance >= 0
     with pytest.raises(ValueError):  # empty input
@@ -750,9 +704,7 @@ def test_contrast_self_distance_zero_and_no_split() -> None:
     adata = AnnData(emb.copy(), obs=obs)
     adata.obsm["X_pca"] = emb.copy()
     distance = Distance(metric="wasserstein")
-    contrasts = Distance.create_contrasts(
-        adata, groupby="treatment", selected_group="ctrl"
-    )
+    contrasts = Distance.create_contrasts(adata, groupby="treatment", selected_group="ctrl")
     res = distance.contrast_distances(adata, contrasts=contrasts)
     assert len(res) == 1 and np.all(np.isfinite(res["wasserstein"].values))
     self_c = pd.DataFrame({"treatment": ["ctrl"], "reference": ["ctrl"]})
@@ -766,18 +718,14 @@ def test_contrast_distances_with_split_by() -> None:
     emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
     obs = pd.DataFrame(
         {
-            "treatment": pd.Categorical(
-                ["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n
-            ),
+            "treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n),
             "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2),
         }
     )
     adata = AnnData(emb.copy(), obs=obs)
     adata.obsm["X_pca"] = emb.copy()
     distance = Distance(metric="wasserstein")
-    contrasts = Distance.create_contrasts(
-        adata, groupby="treatment", selected_group="ctrl", split_by="celltype"
-    )
+    contrasts = Distance.create_contrasts(adata, groupby="treatment", selected_group="ctrl", split_by="celltype")
     res = distance.contrast_distances(adata, contrasts=contrasts)
     assert "wasserstein" in res.columns and len(res) == 2
     assert np.all(np.isfinite(res["wasserstein"].values))
@@ -807,12 +755,8 @@ def test_distance_wasserstein_multi_gpu_pairwise_matches_single() -> None:
 def test_distance_wasserstein_multi_gpu_onesided_matches_single() -> None:
     adata = _make_grouped_adata(n_groups=6, cells_per_group=40, n_features=8, seed=12)
     distance = Distance(metric="wasserstein")
-    s1 = distance.onesided_distances(
-        adata, groupby="group", selected_group="g0", multi_gpu=False
-    )
-    s2 = distance.onesided_distances(
-        adata, groupby="group", selected_group="g0", multi_gpu=[0, 1]
-    )
+    s1 = distance.onesided_distances(adata, groupby="group", selected_group="g0", multi_gpu=False)
+    s2 = distance.onesided_distances(adata, groupby="group", selected_group="g0", multi_gpu=[0, 1])
     np.testing.assert_allclose(s2.values, s1.values, rtol=1e-5, atol=1e-5)
 
 
@@ -823,9 +767,7 @@ def test_distance_wasserstein_multi_gpu_contrast_matches_single() -> None:
     contrasts = Distance.create_contrasts(adata, groupby="group", selected_group="g0")
     r1 = distance.contrast_distances(adata, contrasts=contrasts, multi_gpu=False)
     r2 = distance.contrast_distances(adata, contrasts=contrasts, multi_gpu=[0, 1])
-    np.testing.assert_allclose(
-        r2["wasserstein"].values, r1["wasserstein"].values, rtol=1e-5, atol=1e-5
-    )
+    np.testing.assert_allclose(r2["wasserstein"].values, r1["wasserstein"].values, rtol=1e-5, atol=1e-5)
 
 
 @requires_2_gpus

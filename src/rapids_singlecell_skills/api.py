@@ -26,9 +26,7 @@ _MIN_SCORE = 8
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _NAME_RE = re.compile(r"^[A-Za-z_]\w*$")
 _SYMBOL_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
-_SPHINX_ROLE_RE = re.compile(
-    r":(?P<role>[A-Za-z0-9_]+)(?::[A-Za-z0-9_]+)?:`(?P<value>[^`]+)`"
-)
+_SPHINX_ROLE_RE = re.compile(r":(?P<role>[A-Za-z0-9_]+)(?::[A-Za-z0-9_]+)?:`(?P<value>[^`]+)`")
 _STOPWORDS = {
     "a",
     "an",
@@ -78,9 +76,7 @@ def _resource_path(name: str) -> Path:
 
 
 def _string_list(value: Any, *, field: str) -> list[str]:
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) or not item.strip() for item in value
-    ):
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
         raise ApiError(f"{field} must be a list of non-empty strings")
     if len(set(value)) != len(value):
         raise ApiError(f"{field} contains duplicate values")
@@ -152,8 +148,7 @@ def _load_hand_layer() -> dict[str, dict[str, Any]]:
                 not isinstance(as_of, dict)
                 or not as_of
                 or any(
-                    not isinstance(key, str) or not isinstance(value, str) or not value
-                    for key, value in as_of.items()
+                    not isinstance(key, str) or not isinstance(value, str) or not value for key, value in as_of.items()
                 )
             ):
                 raise ApiError(f"{label}.as_of must map packages to versions")
@@ -186,14 +181,10 @@ def _distribution_version(module_name: str) -> tuple[str, str] | None:
 
 def _editable_source_root(module: Any) -> Path | None:
     source = Path(module.__file__).resolve()
-    distributions = importlib.metadata.packages_distributions().get(
-        "rapids_singlecell", ()
-    )
+    distributions = importlib.metadata.packages_distributions().get("rapids_singlecell", ())
     for name in sorted(distributions):
         try:
-            direct_url = importlib.metadata.distribution(name).read_text(
-                "direct_url.json"
-            )
+            direct_url = importlib.metadata.distribution(name).read_text("direct_url.json")
         except importlib.metadata.PackageNotFoundError:
             continue
         if direct_url is None:
@@ -297,8 +288,7 @@ def _freshness_diagnostics(built_against: dict[str, Any]) -> list[dict[str, str]
                 "kind": "generated",
                 "severity": "warning",
                 "message": (
-                    "the imported RSC source tree is dirty; its revision alone does "
-                    "not identify the observed code"
+                    "the imported RSC source tree is dirty; its revision alone does not identify the observed code"
                 ),
             }
         )
@@ -378,9 +368,7 @@ def _default(parameter: inspect.Parameter) -> str:
     return _stable_text(repr(parameter.default))
 
 
-def _interface(
-    rsc: Any, symbol: str, value: Any
-) -> tuple[str, inspect.Signature, dict[str, Any]]:
+def _interface(rsc: Any, symbol: str, value: Any) -> tuple[str, inspect.Signature, dict[str, Any]]:
     try:
         signature = inspect.signature(value)
     except (TypeError, ValueError) as error:
@@ -409,8 +397,7 @@ def _interface(
         parameter.name
         for parameter in constructor.parameters.values()
         if parameter.default is inspect.Parameter.empty
-        and parameter.kind
-        not in {inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL}
+        and parameter.kind not in {inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL}
     ]
     if required:
         instantiate = {
@@ -477,9 +464,7 @@ def _contract(rsc: Any) -> dict[str, Any]:
         class_names = {name for name, value in public.items() if inspect.isclass(value)}
         class_members = getattr(module, "__api_members__", {})
         if not isinstance(class_members, dict) or set(class_members) != class_names:
-            raise ApiError(
-                f"rsc.{namespace}.__api_members__ must exactly cover exported classes"
-            )
+            raise ApiError(f"rsc.{namespace}.__api_members__ must exactly cover exported classes")
         for class_name, members in class_members.items():
             _string_list(members, field=f"rsc.{namespace}.{class_name} members")
             owner = public[class_name]
@@ -488,14 +473,10 @@ def _contract(rsc: Any) -> dict[str, Any]:
                     value = getattr(owner, name)
                 except AttributeError as error:
                     raise ApiError(
-                        "public member contract references absent method: "
-                        f"{namespace}.{class_name}.{name}"
+                        f"public member contract references absent method: {namespace}.{class_name}.{name}"
                     ) from error
                 if not callable(value):
-                    raise ApiError(
-                        "public member contract is not callable: "
-                        f"{namespace}.{class_name}.{name}"
-                    )
+                    raise ApiError(f"public member contract is not callable: {namespace}.{class_name}.{name}")
                 contract[f"{namespace}.{class_name}.{name}"] = value
     return dict(sorted(contract.items()))
 
@@ -509,10 +490,7 @@ def _deprecated_contract(rsc: Any) -> dict[str, str]:
         public = set(_exports(module, label=f"rsc.{namespace}"))
         overlap = public & set(mapping)
         if overlap:
-            raise ApiError(
-                f"rsc.{namespace} exports deprecated names as public: "
-                + ", ".join(sorted(overlap))
-            )
+            raise ApiError(f"rsc.{namespace} exports deprecated names as public: " + ", ".join(sorted(overlap)))
         for name, message in mapping.items():
             if (
                 not isinstance(name, str)
@@ -521,9 +499,7 @@ def _deprecated_contract(rsc: Any) -> dict[str, str]:
                 or not message.strip()
                 or not callable(getattr(module, name, None))
             ):
-                raise ApiError(
-                    f"invalid rsc.{namespace}.__deprecated_exports__ entry: {name!r}"
-                )
+                raise ApiError(f"invalid rsc.{namespace}.__deprecated_exports__ entry: {name!r}")
             deprecated[f"{namespace}.{name}"] = message.strip()
     return dict(sorted(deprecated.items()))
 
@@ -572,9 +548,7 @@ def _normalize_symbol(requested: str) -> str:
     return normalized
 
 
-def _deprecated_match(
-    deprecated: dict[str, str], requested: str
-) -> tuple[str, str] | None:
+def _deprecated_match(deprecated: dict[str, str], requested: str) -> tuple[str, str] | None:
     try:
         normalized = _normalize_symbol(requested)
     except QueryError:
@@ -600,25 +574,16 @@ def _contract_lookup(
 ) -> dict[str, Any]:
     normalized = _normalize_symbol(requested)
     if "." not in normalized:
-        matches = [
-            symbol
-            for symbol in contract
-            if symbol.rsplit(".", maxsplit=1)[-1] == normalized
-        ]
+        matches = [symbol for symbol in contract if symbol.rsplit(".", maxsplit=1)[-1] == normalized]
         if len(matches) == 1:
             normalized = matches[0]
         elif len(matches) > 1:
             choices = ", ".join(matches)
-            raise QueryError(
-                f"ambiguous symbol {requested!r}; choose one of: {choices}"
-            )
+            raise QueryError(f"ambiguous symbol {requested!r}; choose one of: {choices}")
     if normalized not in contract:
         if match := _deprecated_match(deprecated, normalized):
             symbol, message = match
-            raise QueryError(
-                f"rsc.{symbol} is deprecated and excluded from the public "
-                f"contract: {message}"
-            )
+            raise QueryError(f"rsc.{symbol} is deprecated and excluded from the public contract: {message}")
         raise QueryError(f"symbol is not in RSC's live public contract: {requested}")
 
     value = contract[normalized]
@@ -638,41 +603,29 @@ def _contract_lookup(
     }
 
 
-def _validate_hand_symbols(
-    entries: dict[str, dict[str, Any]], contract: dict[str, Any]
-) -> None:
+def _validate_hand_symbols(entries: dict[str, dict[str, Any]], contract: dict[str, Any]) -> None:
     available = set(contract)
     for symbol, entry in entries.items():
         if symbol not in available:
             raise ApiError(f"hand layer references an absent live symbol: {symbol}")
         for related in entry.get("index", {}).get("related", ()):
             if related not in available:
-                raise ApiError(
-                    f"hand layer relation is absent from the live API: {symbol} -> {related}"
-                )
+                raise ApiError(f"hand layer relation is absent from the live API: {symbol} -> {related}")
 
 
-def _hand_entry(
-    entries: dict[str, dict[str, Any]], surface_entry: dict[str, Any]
-) -> dict[str, Any]:
+def _hand_entry(entries: dict[str, dict[str, Any]], surface_entry: dict[str, Any]) -> dict[str, Any]:
     candidates = [surface_entry["symbol"], *surface_entry["generated"]["aliases"]]
     return next((entries[item] for item in candidates if item in entries), {})
 
 
 def _query_tokens(value: str) -> tuple[str, ...]:
-    tokens = [
-        token
-        for token in _TOKEN_RE.findall(value.casefold())
-        if token not in _STOPWORDS
-    ]
+    tokens = [token for token in _TOKEN_RE.findall(value.casefold()) if token not in _STOPWORDS]
     if not tokens:
         raise QueryError("search query must contain an informative word")
     return tuple(tokens)
 
 
-def _search_score(
-    entry: dict[str, Any], hand_entry: dict[str, Any], query: str
-) -> int | None:
+def _search_score(entry: dict[str, Any], hand_entry: dict[str, Any], query: str) -> int | None:
     query_tokens = _query_tokens(query)
     generated = entry["generated"]
     symbol = entry["symbol"].casefold().replace("_", " ")
@@ -681,15 +634,9 @@ def _search_score(
     keywords = " ".join(hand_entry.get("index", {}).get("keywords", ())).casefold()
     summary = generated["summary"].casefold()
     signature = generated["signature"].casefold()
-    corpus = set(
-        _TOKEN_RE.findall(" ".join((symbol, aliases, keywords, summary, signature)))
-    )
+    corpus = set(_TOKEN_RE.findall(" ".join((symbol, aliases, keywords, summary, signature))))
     matched_tokens = [token for token in query_tokens if token in corpus]
-    required_matches = (
-        1
-        if len(query_tokens) == 1 or any(token == basename for token in query_tokens)
-        else 2
-    )
+    required_matches = 1 if len(query_tokens) == 1 or any(token == basename for token in query_tokens) else 2
     if len(matched_tokens) < required_matches:
         return None
 
@@ -725,10 +672,7 @@ def search(
         raise QueryError(f"limit must be between 1 and {_MAX_RESULTS}")
     namespaces = {entry["symbol"].split(".", maxsplit=1)[0] for entry in surface}
     if namespace is not None and namespace not in namespaces:
-        raise QueryError(
-            f"unknown live namespace {namespace!r}; choose one of: "
-            + ", ".join(sorted(namespaces))
-        )
+        raise QueryError(f"unknown live namespace {namespace!r}; choose one of: " + ", ".join(sorted(namespaces)))
 
     matches: list[tuple[int, dict[str, Any]]] = []
     prefix = f"{namespace}." if namespace else None
@@ -746,9 +690,7 @@ def search(
                     "generated": dict(entry["generated"]),
                     "symbol": symbol,
                 }
-                selected["generated"]["aliases"] = [
-                    path for path in paths if path != symbol
-                ]
+                selected["generated"]["aliases"] = [path for path in paths if path != symbol]
         if selected["generated"]["deprecated"]:
             continue
         score = _search_score(selected, _hand_entry(entries, selected), query)
@@ -800,9 +742,7 @@ def _parameter_docs(section: str) -> dict[str, str]:
     return descriptions
 
 
-def _parameter_records(
-    signature: inspect.Signature, sections: dict[str, str]
-) -> list[dict[str, str]]:
+def _parameter_records(signature: inspect.Signature, sections: dict[str, str]) -> list[dict[str, str]]:
     docs = _parameter_docs(sections.get("Parameters", ""))
     records = [
         {
@@ -815,10 +755,7 @@ def _parameter_records(
         for parameter in signature.parameters.values()
     ]
     names = {record["name"].removeprefix("*") for record in records}
-    if any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    ):
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
         records.extend(
             {
                 "annotation": "unspecified",
@@ -833,9 +770,7 @@ def _parameter_records(
     return records
 
 
-def _merge_notes(
-    hand_entry: dict[str, Any], built_against: dict[str, Any]
-) -> list[dict[str, Any]]:
+def _merge_notes(hand_entry: dict[str, Any], built_against: dict[str, Any]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     freshness = _freshness_diagnostics(built_against)
     for note in hand_entry.get("notes", ()):
@@ -850,9 +785,7 @@ def _merge_notes(
             if mismatches:
                 item["mismatches"] = mismatches
             if freshness:
-                item["freshness_diagnostics"] = [
-                    diagnostic["message"] for diagnostic in freshness
-                ]
+                item["freshness_diagnostics"] = [diagnostic["message"] for diagnostic in freshness]
         else:
             item["status"] = "cited"
         merged.append(item)
@@ -885,28 +818,17 @@ def _merged_view(
     if parameter is not None:
         requested = parameter.removeprefix("*")
         match = next(
-            (
-                item
-                for item in parameters
-                if item["name"].removeprefix("*") == requested
-            ),
+            (item for item in parameters if item["name"].removeprefix("*") == requested),
             None,
         )
         if match is None:
             available = ", ".join(item["name"] for item in parameters)
-            raise QueryError(
-                f"{symbol} has no parameter {parameter!r}; available: {available}"
-            )
+            raise QueryError(f"{symbol} has no parameter {parameter!r}; available: {available}")
         generated["parameter"] = match
     elif section is not None:
-        match = next(
-            (name for name in sections if name.casefold() == section.casefold()), None
-        )
+        match = next((name for name in sections if name.casefold() == section.casefold()), None)
         if match is None:
-            raise QueryError(
-                f"{symbol} has no section {section!r}; available: "
-                + ", ".join(sorted(sections))
-            )
+            raise QueryError(f"{symbol} has no section {section!r}; available: " + ", ".join(sorted(sections)))
         generated["section"] = {"name": match, "body": sections[match]}
     elif full:
         generated["doc"] = doc
@@ -969,11 +891,7 @@ def _print_search(
         return
     for entry in entries:
         aliases = entry["generated"]["aliases"]
-        suffix = (
-            " (aliases: " + ", ".join(f"rsc.{alias}" for alias in aliases) + ")"
-            if aliases
-            else ""
-        )
+        suffix = " (aliases: " + ", ".join(f"rsc.{alias}" for alias in aliases) + ")" if aliases else ""
         print(f"rsc.{entry['symbol']}{suffix} — {_short_summary(entry)}")
 
 
@@ -1051,9 +969,7 @@ def _print_view(view: dict[str, Any]) -> None:
 
 
 def _print_json(payload: dict[str, Any]) -> None:
-    print(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    )
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
 
 
 _MAP_SUMMARY_CHARS = 68
@@ -1096,9 +1012,7 @@ def _parameter_choices(value: Any) -> dict[str, list[str]]:
     return choices
 
 
-def _map_rows(
-    contract: dict[str, Any], *, namespace: str | None
-) -> list[tuple[str, str]]:
+def _map_rows(contract: dict[str, Any], *, namespace: str | None) -> list[tuple[str, str]]:
     """Return one compact (symbol, summary) row per public symbol."""
     rows = []
     for symbol in sorted(contract):
@@ -1139,9 +1053,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    map_parser = subparsers.add_parser(
-        "map", help="print the whole public API surface in one pass"
-    )
+    map_parser = subparsers.add_parser("map", help="print the whole public API surface in one pass")
     map_parser.add_argument("--namespace")
     map_parser.add_argument(
         "--options",
@@ -1156,9 +1068,7 @@ def _parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--limit", type=int, default=8)
     search_parser.add_argument("--json", action="store_true")
 
-    describe_parser = subparsers.add_parser(
-        "describe", help="build one ephemeral merged API view"
-    )
+    describe_parser = subparsers.add_parser("describe", help="build one ephemeral merged API view")
     describe_parser.add_argument("symbol")
     detail = describe_parser.add_mutually_exclusive_group()
     detail.add_argument("--parameter")
@@ -1167,9 +1077,7 @@ def _parser() -> argparse.ArgumentParser:
     describe_parser.add_argument("--probe", action="store_true")
     describe_parser.add_argument("--json", action="store_true")
 
-    validate_parser = subparsers.add_parser(
-        "validate", help="validate the hand layer against the live API"
-    )
+    validate_parser = subparsers.add_parser("validate", help="validate the hand layer against the live API")
     validate_parser.add_argument("--json", action="store_true")
     return parser
 
@@ -1199,10 +1107,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 _print_json(payload)
             else:
-                print(
-                    f"hand layer is valid for {len(surface)} live symbols; "
-                    f"{len(entries)} have sparse annotations"
-                )
+                print(f"hand layer is valid for {len(surface)} live symbols; {len(entries)} have sparse annotations")
                 _print_diagnostics(_freshness_diagnostics(built_against))
             return 0
 
@@ -1217,15 +1122,11 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 if args.options:
                     payload["choices"] = {
-                        f"rsc.{s}": choices
-                        for s, _ in rows
-                        if (choices := _parameter_choices(contract[s]))
+                        f"rsc.{s}": choices for s, _ in rows if (choices := _parameter_choices(contract[s]))
                     }
                 _print_json(payload)
             else:
-                _print_map(
-                    built_against, rows, contract=contract if args.options else None
-                )
+                _print_map(built_against, rows, contract=contract if args.options else None)
             return 0
 
         if args.command == "search":
@@ -1238,16 +1139,11 @@ def main(argv: list[str] | None = None) -> int:
                 namespace=args.namespace,
                 limit=args.limit,
             )
-            deprecated_match = (
-                _deprecated_match(deprecated, query) if not matches else None
-            )
+            deprecated_match = _deprecated_match(deprecated, query) if not matches else None
             miss_message = None
             if deprecated_match is not None:
                 symbol, message = deprecated_match
-                miss_message = (
-                    f"rsc.{symbol} is deprecated and excluded from the public "
-                    f"contract: {message}"
-                )
+                miss_message = f"rsc.{symbol} is deprecated and excluded from the public contract: {message}"
             if args.json:
                 payload: dict[str, Any] = {
                     "built_against": built_against,
@@ -1255,10 +1151,7 @@ def main(argv: list[str] | None = None) -> int:
                     "query": query,
                     "results": [
                         {
-                            "aliases": [
-                                f"rsc.{alias}"
-                                for alias in entry["generated"]["aliases"]
-                            ],
+                            "aliases": [f"rsc.{alias}" for alias in entry["generated"]["aliases"]],
                             "deprecated": entry["generated"]["deprecated"],
                             "summary": _short_summary(entry),
                             "symbol": f"rsc.{entry['symbol']}",
@@ -1267,9 +1160,7 @@ def main(argv: list[str] | None = None) -> int:
                     ],
                 }
                 if not matches:
-                    payload["warning"] = miss_message or (
-                        "lexical miss; this is not evidence that RSC lacks the API"
-                    )
+                    payload["warning"] = miss_message or ("lexical miss; this is not evidence that RSC lacks the API")
                 _print_json(payload)
             else:
                 _print_search(

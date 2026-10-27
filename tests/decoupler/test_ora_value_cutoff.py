@@ -48,9 +48,7 @@ def _assert_fisher(result, selected, *, background=8, alternative="two-sided"):
             a, b, c = len(genes & term), len(genes - term), len(term - genes)
             d = background - a - b - c
             pvals[i, j] = fisher_exact([[a, b], [c, d]], alternative=alternative).pvalue
-            expected_scores[i, j] = np.log(
-                (a + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5))
-            )
+            expected_scores[i, j] = np.log((a + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5)))
     for actual, values, tolerance in (
         (scores, expected_scores, 1e-10),
         (padj, false_discovery_control(pvals, axis=1), 1e-7),
@@ -146,9 +144,7 @@ def test_value_cutoff_float32_threshold(deg_data, direction, pre_load):
         ("backed", 2**24, False),
     ],
 )
-def test_value_cutoff_sparse_precision_and_batches(
-    deg_data, kind, offset, pre_load, tmp_path
-):
+def test_value_cutoff_sparse_precision_and_batches(deg_data, kind, offset, pre_load, tmp_path):
     labels, net = deg_data
     values = labels if not offset else labels.astype(np.int64) + offset
     original = values.copy(deep=True)
