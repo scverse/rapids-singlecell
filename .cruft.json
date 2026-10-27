@@ -1,7 +1,7 @@
 {
   "template": "https://github.com/scverse/cookiecutter-scverse",
   "commit": "8006e3d9e03e3fca5c00545dd18da4c114649bc7",
-  "checkout": null,
+  "checkout": "main",
   "context": {
     "cookiecutter": {
       "project_name": "rapids-singlecell",
