@@ -21,22 +21,20 @@
 #include <cstring>
 #include <type_traits>
 
+#include "fixed_point.cuh"
+
 namespace harmony_segments {
 
 constexpr int kThreads = 256, kSmemBudget = 48 * 1024, kLimbBits = 30;
 
 // Output (g, k, d) is summed in units of 2^-scale_exp(bound_exp[g D + d]):
 // bound_exp (the same on every shard) is the exponent e of a bound below 2^e
-// on the sum over group g of |A_id| R_ik for every k (bound_exponent): N_total
+// on the sum over group g of |A_id| R_ik for every k (bound_exponent,
+// fixed_point.cuh): N_total
 // for the centroids (|Z| <= 1, R in [0, 1]); n_g max |X_gd| over the cells of
 // group g for the right-hand sides, so no other group or PC coarsens them. The
 // top limb stays below 2^62; one unit of the last limb is 2^-61, 2^-91,
 // 2^-121 of 2^e for 1, 2, 3 limbs.
-inline int bound_exponent(double bound) {
-    int e;
-    std::frexp(bound > 0 ? bound : 1.0, &e);
-    return e;
-}
 __host__ __device__ inline int scale_exp(int bound_exp, int limbs) {
     return 61 - bound_exp + kLimbBits * (limbs - 1);
 }

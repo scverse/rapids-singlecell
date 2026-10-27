@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <type_traits>
 
 #include "../../nb_types.h"
 #include "../storage.cuh"
@@ -109,5 +111,56 @@ __global__ void gather_column_kernel(const T* __restrict__ src,
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
          i < n_rows; i += (long long)blockDim.x * gridDim.x) {
         dst[i] = src[(size_t)i * n_cols + col];
+    }
+}
+
+// a[cat + 1, pc0 .. pc0 + 1] = sum over the category's cells (sorted by
+// category: cat_offsets) of v * bias; one block per (category, pair of PCs).
+template <typename T>
+__global__ void scatter_add_kernel_with_bias_block(
+    const T* __restrict__ v, const int* __restrict__ cat_offsets, int n_pcs,
+    int n_batches, T* __restrict__ a, const T* __restrict__ bias) {
+    using VecPC = std::conditional_t<std::is_same_v<T, float>, float2, double2>;
+    int pairs = (n_pcs + 1) / 2;
+    if ((int)blockIdx.x >= n_batches * pairs) return;
+    int cat = blockIdx.x / pairs + 1, pc0 = blockIdx.x % pairs * 2;
+    bool has_pc1 = pc0 + 1 < n_pcs;
+    T acc0 = T(0), acc1 = T(0);
+    for (int cell = cat_offsets[cat - 1] + threadIdx.x; cell < cat_offsets[cat];
+         cell += blockDim.x) {
+        const T* ptr = v + (size_t)cell * n_pcs + pc0;
+        T bb = __ldg(bias + cell);
+        if (has_pc1 && ((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0) {
+            VecPC vv = *(const VecPC*)ptr;
+            acc0 += vv.x * bb;
+            acc1 += vv.y * bb;
+        } else {
+            acc0 += ptr[0] * bb;
+            if (has_pc1) acc1 += ptr[1] * bb;
+        }
+    }
+    acc0 = block_sum(acc0);
+    acc1 = block_sum(acc1);
+    if (threadIdx.x == 0) {
+        a[cat * n_pcs + pc0] = acc0;
+        if (has_pc1) a[cat * n_pcs + pc0 + 1] = acc1;
+    }
+}
+
+// Z -= R W[cat + 1] element by element.
+template <typename T>
+__global__ void harmony_correction_kernel(T* __restrict__ Z,
+                                          const T* __restrict__ W,
+                                          const int* __restrict__ cats,
+                                          const T* __restrict__ R,
+                                          long long n_cells, long long n_pcs) {
+    long long N = n_cells * n_pcs;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < N;
+         i += (long long)blockDim.x * gridDim.x) {
+        long long cell_idx = i / n_pcs;
+        long long pc_idx = i % n_pcs;
+        int cat = cats[cell_idx];
+        T correction = W[(cat + 1) * n_pcs + pc_idx] * R[cell_idx];
+        Z[i] -= correction;
     }
 }

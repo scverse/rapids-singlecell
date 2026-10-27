@@ -59,10 +59,11 @@ static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
                          long long group_stride, int ld_out,
                          cudaStream_t stream) {
     const int limbs = RHS_LIMBS<T>;
-    cudaMemsetAsync(
-        acc, 0,
-        (size_t)n_groups * limbs * n_clusters * n_pcs * sizeof(long long),
-        stream);
+    cuda_check(cudaMemsetAsync(acc, 0,
+                               (size_t)n_groups * limbs * n_clusters * n_pcs *
+                                   sizeof(long long),
+                               stream),
+               "segment sums memset");
     cuda_check(harmony_segments::segment_rtz(X, R, n_pcs, n_clusters, ldr,
                                              seg_start, seg_group, n_seg,
                                              bounds, acc, limbs, stream),
@@ -87,8 +88,10 @@ static void prepare_multi_impl(const T* joint_O, const double* joint_rhs,
                                int n_joint_categories, double* gram,
                                double* rhs, cudaStream_t stream) {
     int nb1 = n_batches + 1;
-    cudaMemsetAsync(gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double),
-                    stream);
+    cuda_check(
+        cudaMemsetAsync(
+            gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double), stream),
+        "gram memset");
     initialize_multi_gram_kernel<T><<<n_clusters, MAX_BLOCK_DIM, 0, stream>>>(
         lambda, joint_O, marginal_joint_offsets, marginal_joint_indices, gram,
         n_batches, n_clusters, n_joint_categories);
@@ -280,7 +283,8 @@ static void joint_counts(const T* R, int ldr, int k, const int* seg_start,
                          cudaStream_t stream) {
     FixedScales<T> scales(n_cells, 0, k);
     size_t n = (size_t)J * k;
-    cudaMemsetAsync(acc, 0, n * sizeof(long long), stream);
+    cuda_check(cudaMemsetAsync(acc, 0, n * sizeof(long long), stream),
+               "joint counts memset");
     segment_counts_kernel<T>
         <<<strided_grid((long long)n_seg * k, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
            stream>>>(R, ldr, k, seg_start, seg_group, n_seg, scales.count,
@@ -379,7 +383,9 @@ static void register_correction_batched(nb::module_& m) {
                 seg_group.size() + 1 != seg_start.size())
                 throw std::invalid_argument("group_absmax: bad shapes");
             auto s = (cudaStream_t)stream;
-            cudaMemsetAsync(out.data(), 0, out.size() * sizeof(T), s);
+            cuda_check(
+                cudaMemsetAsync(out.data(), 0, out.size() * sizeof(T), s),
+                "group_absmax memset");
             if (seg_group.size() == 0) return;
             group_absmax_kernel<T>
                 <<<(unsigned)seg_group.size(), dim3(32, 8), 0, s>>>(
@@ -446,7 +452,8 @@ static void register_correction_batched(nb::module_& m) {
                     reinterpret_cast<const __nv_bfloat16*>(R_bf16->data()));
             throw std::invalid_argument("bfloat16 assignments require float32");
         },
-        "X"_a.noconvert(), nb::kw_only(), "R"_a.noconvert(), "O"_a.noconvert(),
+        nb::call_guard<nb::gil_scoped_release>(), "X"_a.noconvert(),
+        nb::kw_only(), "R"_a.noconvert(), "O"_a.noconvert(),
         "lambda_kb"_a.noconvert(), "seg_start"_a.noconvert(),
         "seg_group"_a.noconvert(), "bounds"_a.noconvert(), "Z"_a.noconvert(),
         "chunk"_a, "normalize"_a = false, "R_bf16"_a.noconvert() = nb::none(),

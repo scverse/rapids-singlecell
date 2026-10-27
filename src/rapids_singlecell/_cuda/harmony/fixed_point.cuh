@@ -28,9 +28,16 @@ __device__ __forceinline__ long long count_to_fixed(T value, T scale) {
         return __double2ll_rn(value * scale);
 }
 
+// The exponent e with 2^(e - 1) <= bound < 2^e (1 for bound <= 0).
+inline int bound_exponent(double bound) {
+    int e;
+    std::frexp(bound > 0 ? bound : 1.0, &e);
+    return e;
+}
+
 // Largest s with bound * 2^s < 2^62.
 inline int fixed_shift(double bound) {
-    return 62 - (int)std::ceil(std::log2(std::max(bound, 1.0)));
+    return 62 - bound_exponent(bound);
 }
 
 // Fixed-point scales (see to_fixed) from global bounds: R values <= 1, so a

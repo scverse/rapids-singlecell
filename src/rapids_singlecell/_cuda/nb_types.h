@@ -30,6 +30,18 @@ inline void cuda_check(cudaError_t err, const char* what) {
     }
 }
 
+/// An attribute of the current device: the error code, or checked.
+inline cudaError_t device_attribute(cudaDeviceAttr attribute, int& value) {
+    int device;
+    if (cudaError_t err = cudaGetDevice(&device)) return err;
+    return cudaDeviceGetAttribute(&value, attribute, device);
+}
+inline int device_attribute(cudaDeviceAttr attribute) {
+    int value;
+    cuda_check(device_attribute(attribute, value), "cudaDeviceGetAttribute");
+    return value;
+}
+
 /// Validate a binding-argument precondition (array dims vs. scalar shapes).
 /// Mismatches become clean Python errors, not out-of-bounds launches.
 inline void nb_require(bool cond, const char* what) {

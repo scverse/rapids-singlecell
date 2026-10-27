@@ -276,14 +276,13 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
     n_groups = n_batches if n_keys == 1 else 1  # the tiles' groups
     n_tiles = 4 * n_sm + n_groups + 1
     idx_list = cp.empty(n_cells, cp.int32)
-    block_cat_offsets = cp.empty(n_blocks * n_groups + n_groups + 2, cp.int32)
+    block_cat_offsets = cp.empty(n_blocks * (2 * n_groups + 1) + 1, cp.int32)
     joint_args = {}
     if n_keys > 1:
         joint_args = {
             "joint_cats": joint_cats.astype(cp.int32),
             "joints": joints,
             "n_covariates": n_keys,
-            "n_joint_categories": len(joint_cats),
             "n_first": levels[0],
         }
     _cl.draw_blocks(
@@ -302,7 +301,7 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
     R = cp.empty((n_cells, n_clusters), dtype)
     O = cp.empty((n_batches, n_clusters), dtype)
     E = cp.empty_like(O)
-    stride = -(-n_clusters // 128) * 128
+    stride = -(-n_clusters // _cl.FUSED_CLUSTER_STRIDE) * _cl.FUSED_CLUSTER_STRIDE
     loop = partial(
         _cl.clustering_loop,
         Z,
@@ -316,13 +315,14 @@ def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_p
         penalty=cp.empty_like(O),
         objective_partials=cp.empty(n_cells + 8, dtype),
         block_cat_offsets=block_cat_offsets,
+        block_starts=block_cat_offsets[: n_blocks * n_groups + 1 : n_groups].get(),
         block_counts=cp.empty((n_blocks + 3) * n_batches * n_clusters, cp.int64),
         seg_start=cp.asarray([0, n_cells], dtype=cp.int32),
-        y_bound=cp.empty(n_pcs, cp.int16),
+        y_bound=cp.full(n_pcs, np.frexp(n_cells)[1], cp.int16),
         y_acc=cp.empty(3 * n_clusters * n_pcs, cp.int64),
-        y_t=cp.empty((-(-n_pcs // 4) * 4, stride), dtype),
-        col_workspace=cp.empty(n_tiles * 8 * n_clusters, cp.int64),
-        dots_workspace=cp.empty(n_tiles * 64 * stride, dtype),
+        y_t=cp.empty((_cl.fused_padded_pcs(n_pcs), stride), dtype),
+        col_workspace=cp.empty(n_tiles * _cl.FUSED_WARPS * n_clusters, cp.int64),
+        dots_workspace=cp.empty(n_tiles * _cl.FUSED_GROUP * stride, dtype),
         force_blocks=force_blocks,
         n_cells=n_cells,
         n_pcs=n_pcs,

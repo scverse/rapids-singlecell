@@ -759,7 +759,7 @@ __device__ __forceinline__ void fused_assign_tile(
 // One CTA per tile; with cluster blocks one per slot of the scratch (the
 // resident CTAs). Each takes tile blockIdx.x, then blockIdx.x + gridDim.x (in
 // launch order: one more per SM before any SM takes two), then claims tiles
-// from `next_tile` (zeroed with the tile offsets) as it finishes one, which
+// from `next_tile` (zeroed before the pass) as it finishes one, which
 // evens out uneven tiles.
 template <typename T, typename RT, int V, bool BLOCKS, bool JOINT>
 __global__ void __launch_bounds__(FUSED_THREADS,
@@ -910,8 +910,8 @@ __global__ void kmeans_closest_kernel(const T* __restrict__ X,
     }
 }
 
-// dst = src with rows scaled to unit L2 norm (scale capped at 1e12); one
-// block of whole warps per row, src == dst allowed.
+// dst = src with rows scaled to unit L2 norm (inv_norm_scale); one block of
+// whole warps per row, src == dst allowed.
 template <typename T>
 __global__ void l2_row_normalize_kernel(const T* src, T* dst, int n_cols) {
     const T* s = src + (size_t)blockIdx.x * n_cols;
@@ -919,8 +919,7 @@ __global__ void l2_row_normalize_kernel(const T* src, T* dst, int n_cols) {
     T acc = T(0);
     for (int col = threadIdx.x; col < n_cols; col += blockDim.x)
         acc += s[col] * s[col];
-    T scale = rsqrt(block_sum(acc));
-    if (scale > T(1e12)) scale = T(1e12);
+    T scale = inv_norm_scale(block_sum(acc));
     for (int col = threadIdx.x; col < n_cols; col += blockDim.x)
         d[col] = s[col] * scale;
 }

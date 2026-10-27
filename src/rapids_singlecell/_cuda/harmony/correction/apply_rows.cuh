@@ -3,8 +3,8 @@
 // Fused Harmony correction apply: for every cell i of a segment of group g,
 //   z_d = X_id - sum_k R_ik W[g * w_group_stride + k * w_k_stride + d]
 // (one fma chain over k = 0, 1, ..., K - 1 from 0), then optionally
-// z *= min(rsqrt(sum_d z_d^2), 1e12) (lane l: fma chain over z_l^2,
-// z_{l+32}^2, ...; xor butterfly 16 .. 1; the same order for D <= 256 in
+// z *= inv_norm_scale(sum_d z_d^2) (lane l: fma chain over z_l^2,
+// z_{l+32}^2, ...; warp_sum; the same order for D <= 256 in
 // registers and D > 256 in a second pass). Each element depends only on its row
 // and W[g]: results do not depend on how rows are split into segments, shards
 // or CTAs, nor on the launch configuration. CTAs take runs of row tiles of one
@@ -21,6 +21,9 @@
 #include <climits>
 #include <cstddef>
 #include <type_traits>
+
+#include "../../nb_types.h"
+#include "../storage.cuh"
 
 namespace harmony_apply {
 namespace detail {
@@ -59,14 +62,6 @@ __device__ __forceinline__ void stage(int v, unsigned char* dst, int dn,
         for (int o = n + (threadIdx.x & 31) * 2; o < dn; o += 64)
             *reinterpret_cast<short*>(dst + row * dn + o) = 0;
     }
-}
-
-// Lane partial sums of squares -> min(rsqrt(row sum), 1e12), NaN kept.
-template <typename T>
-__device__ __forceinline__ T inv_norm(T sq) {
-    for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffff, sq, o);
-    T s = rsqrt(sq);
-    return s > T(1e12) ? T(1e12) : s;
 }
 
 template <typename T, typename RT, int SLOTS>
@@ -181,7 +176,8 @@ __global__ void __launch_bounds__(NT)
                             acc[j][c] = x[j][c] - acc[j][c];
                             sq = fma(acc[j][c], acc[j][c], sq);
                         }
-                    if (last && normalize && D <= DW) scale = inv_norm(sq);
+                    if (last && normalize && D <= DW)
+                        scale = inv_norm_scale(warp_sum(sq));
                     T* z = Z + (size_t)(r0 + j) * D + d0 + lane;
 #pragma unroll
                     for (int c = 0; c < SLOTS; ++c)
@@ -198,7 +194,7 @@ __global__ void __launch_bounds__(NT)
                 T* z = Z + (size_t)(r + j) * D;
                 T sq = T(0);
                 for (int d = lane; d < D; d += 32) sq = fma(z[d], z[d], sq);
-                const T scale = inv_norm(sq);
+                const T scale = inv_norm_scale(warp_sum(sq));
                 for (int d = lane; d < D; d += 32) z[d] *= scale;
             }
 }
@@ -263,11 +259,10 @@ cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
     if (D <= 0 || K <= 0 || ldr < K) return cudaErrorInvalidValue;
     if (reinterpret_cast<size_t>(R) % sizeof(RT))
         return cudaErrorMisalignedAddress;
-    int dev, smem_max;
-    if (cudaGetDevice(&dev) ||
-        cudaDeviceGetAttribute(&smem_max,
-                               cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))
-        return cudaGetLastError();
+    int smem_max;
+    if (cudaError_t err =
+            device_attribute(cudaDevAttrMaxSharedMemoryPerBlockOptin, smem_max))
+        return err;
     // 96 KB: opt-in limit of sm_86, sm_89, sm_120 (sm_75: 64 KB). Speed only:
     // W resident if it fits, else in the largest chunks.
     const int slots = D <= 32 ? 1 : D <= 64 ? 2 : D <= 128 ? 4 : 8;

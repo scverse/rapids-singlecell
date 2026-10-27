@@ -479,7 +479,6 @@ def test_harmony_correction_matches_dense_design(
         cats=cp.asarray(cats_np),
         n_batches=n_batches,
         cat_offsets=cp.asarray(offsets),
-        cell_indices=cp.arange(n_cells, dtype=cp.int32),
         normalize=normalize,
         segments=(*_segments(offsets), _rhs_bounds(cp.asarray(X_np), offsets)),
     )
@@ -509,7 +508,6 @@ def test_harmony_correction_keeps_a_large_single_batch_cluster(dtype, method):
         cats=cp.zeros(n, dtype=cp.int32),
         n_batches=1,
         cat_offsets=cp.asarray(offsets),
-        cell_indices=cp.arange(n, dtype=cp.int32),
         segments=(*_segments(offsets), _rhs_bounds(X, offsets)),
     )
     cp.testing.assert_allclose(result, X, rtol=1e-12 if dtype == cp.float64 else 0)
@@ -1283,11 +1281,11 @@ def test_harmony_multikey_workspace_is_per_level(monkeypatch):
     monkeypatch.setattr(harmony_module, "_KEEP_BLOCK_COUNTS", True)
     adata = _repeatability_adata(np.float32)
     rsc.pp.harmony_integrate(adata, ["batch", "fine"], rng=734, n_clusters=300, max_iter_harmony=1)
-    n_blocks, n_slots = 20, harmony_module._clustering_cuda.assign_slots(itemsize=4)
+    cl, n_blocks = harmony_module._clustering_cuda, 20
     (shape,) = shapes
     assert shape["block_counts"] == (n_blocks + 3, 5 + 37, 300)
-    assert shape["block_cat_offsets"] == (n_blocks + 3,)
-    assert shape["dots_workspace"] == (n_slots * 64 * 384,)
+    assert shape["block_cat_offsets"] == (3 * n_blocks + 1,)
+    assert shape["dots_workspace"] == (cl.assign_slots(itemsize=4) * cl.FUSED_GROUP * 3 * cl.FUSED_CLUSTER_STRIDE,)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -1302,8 +1300,8 @@ def test_harmony_clustering_workspace_is_bounded(monkeypatch):
     assert (few["block_counts"], many["block_counts"]) == ((6, 5, 300), (6, 37, 300))
     assert few["col_workspace"] == many["col_workspace"]
     assert few["dots_workspace"] == many["dots_workspace"]
-    n_slots = harmony_module._clustering_cuda.assign_slots(itemsize=4)
-    assert few["dots_workspace"] == (n_slots * 64 * 384,)
+    cl = harmony_module._clustering_cuda
+    assert few["dots_workspace"] == (cl.assign_slots(itemsize=4) * cl.FUSED_GROUP * 3 * cl.FUSED_CLUSTER_STRIDE,)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

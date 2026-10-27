@@ -42,6 +42,14 @@ __device__ __forceinline__ T warp_max(T value) {
     return value;
 }
 
+// Scale of a row from its squared norm: rsqrt capped at 1e12 (a zero row
+// stays zero), NaN kept.
+template <typename T>
+__device__ __forceinline__ T inv_norm_scale(T sum_sq) {
+    T scale = rsqrt(sum_sq);
+    return scale > T(1e12) ? T(1e12) : scale;
+}
+
 // Sum over a block of whole warps, returned to every thread.
 template <typename T>
 __device__ T block_sum(T value) {
