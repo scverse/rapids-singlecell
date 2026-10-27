@@ -76,9 +76,9 @@ def _func_zscore(
     m = f"zscore - calculating {nsrc} scores with flavor={flavor}"
     _log(m, level="info", verbose=verbose)
     stds = cp.std(mat, axis=1, ddof=1, keepdims=True)
-    if flavor == "RoKAI":
+    if flavor == "KSEA":
         mean_all = cp.mean(mat, axis=1, keepdims=True)
-    elif flavor == "KSEA":
+    elif flavor == "RoKAI":
         mean_all = cp.zeros(stds.shape, dtype=mat.dtype)
     n = cp.sqrt(cp.count_nonzero(adj, axis=0))
     mean = mat.dot(adj) / cp.sum(cp.abs(adj), axis=0)

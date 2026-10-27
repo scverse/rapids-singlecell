@@ -65,7 +65,7 @@ def _reference(mat, sets, times, seed):
             mass = np.abs(same).sum()
             scores[i, j] = es * same.size / mass if mass else 0
             if mass:
-                pvals[i, j] = np.mean(same >= es if es >= 0 else same <= es)
+                pvals[i, j] = ((same >= es if es >= 0 else same <= es).sum() + 1) / (same.size + 1)
     return scores, pvals
 
 
