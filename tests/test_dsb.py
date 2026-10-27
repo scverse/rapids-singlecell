@@ -232,7 +232,7 @@ def test_fast_km_is_optimal_two_means(counts):
     cells, empty = counts
     res = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, fast_km=True, copy=True)
     step1 = rsc.pp.dsb(cells, empty, denoise_counts=False, copy=True).X
-    for x, low in zip(step1, res.obs["dsb_cell_background_mean"]):
+    for x, low in zip(step1, res.obs["dsb_cell_background_mean"], strict=True):
         xs = np.sort(x)
         sse = [((xs[:s] - xs[:s].mean()) ** 2).sum() + ((xs[s:] - xs[s:].mean()) ** 2).sum() for s in range(1, len(xs))]
         best = int(np.argmin(sse)) + 1
@@ -342,7 +342,7 @@ def test_mixture_fits_subset_path():
     cp.testing.assert_array_equal(fit.params, again.params)
 
     sub_rng = np.random.default_rng(7)
-    for x, got in zip(X, cp.asnumpy(fit.params)):
+    for x, got in zip(X, cp.asnumpy(fit.params), strict=True):
         ref = _ref_mclust2(x, x[sub_rng.choice(n, 2000, replace=False)])
         np.testing.assert_allclose(got[:2], ref[0], rtol=1e-9, atol=1e-10)
 

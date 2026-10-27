@@ -60,8 +60,7 @@ def dsb(
     rng: SeedLike | RNGLike | None = None,
     copy: bool = False,
 ) -> AnnData | None:
-    """\
-    Normalize and denoise protein (ADT) counts with dsb :cite:p:`Mule2022`.
+    """Normalize and denoise protein (ADT) counts with dsb :cite:p:`Mule2022`.
 
     With empty droplets (`adata_empty`) this mirrors ``dsb::DSBNormalizeProtein``:
 
@@ -422,8 +421,9 @@ def _kmeans_low_centers(M: cp.ndarray) -> cp.ndarray:
 
 
 def _first_pc_scores(A: cp.ndarray) -> cp.ndarray:
-    """First principal component scores of the standardized columns, oriented
-    along the last column (the background mean).
+    """First principal component scores of the standardized columns.
+
+    Oriented along the last column (the background mean).
     """
     Z = (A - A.mean(axis=0)) / A.std(axis=0, ddof=1)
     v = cp.linalg.eigh(Z.T @ Z)[1][:, -1]
