@@ -65,9 +65,7 @@ def _seurat_wnn_reference(reps, *, k, knn_range, cross=1e-4, smooth=False):
         cand = np.concatenate([o[i, 1:knn_range] for o in order])
         cand = np.array(list(dict.fromkeys(cand)))
         s = sum(
-            weights[m, i]
-            * np.exp(-np.maximum(D[m][i, cand] - nearest[m][i], 0) / sigma[m][i])
-            for m in range(n_mod)
+            weights[m, i] * np.exp(-np.maximum(D[m][i, cand] - nearest[m][i], 0) / sigma[m][i]) for m in range(n_mod)
         )
         best = np.argsort(-s, kind="stable")[:k]
         idx[i], sim[i] = cand[best], s[best]
@@ -119,9 +117,7 @@ def test_wnn_matches_seurat_fixture():
     _assert_matches(adata, ["RNA", "ADT"], ref)
 
 
-@pytest.mark.parametrize(
-    ("k", "max_keys"), [(30, None), (30, 1024), (70, None), (150, None)]
-)
+@pytest.mark.parametrize(("k", "max_keys"), [(30, None), (30, 1024), (70, None), (150, None)])
 def test_wnn_snn_kernels(monkeypatch, k, max_keys):
     """SNN bandwidths and graph match Seurat, with the partners in shared memory
     (by row length) or sorted globally in chunks (bit-identical). k=150 has more
@@ -143,9 +139,7 @@ def test_wnn_snn_kernels(monkeypatch, k, max_keys):
         monkeypatch.setattr(_wnn, "_snn_max_keys", lambda s, key_bytes: max_keys)
     sigma, snn = run()
     np.testing.assert_allclose(snn.toarray(), _ref_jaccard(nn, 1 / 15), atol=1e-7)
-    np.testing.assert_allclose(
-        sigma, _ref_bandwidth(D, nn, nearest), rtol=1e-4, atol=1e-6
-    )
+    np.testing.assert_allclose(sigma, _ref_bandwidth(D, nn, nearest), rtol=1e-4, atol=1e-6)
     monkeypatch.setattr(_wnn, "_snn_max_keys", lambda s, key_bytes: 0)
     ref_sigma, ref_snn = run()
     np.testing.assert_array_equal(sigma, ref_sigma)
@@ -220,9 +214,7 @@ def test_wnn_mudata():
         rsc.pp.wnn(mdata, ["X_pca", "X_pca"])
     rsc.pp.wnn(mdata, {"rna": "X_pca", "prot": "X_pca"}, n_pcs=[12, None], knn_range=50)
     rsc.pp.wnn(adata, ["X_pca", "X_apca"], knn_range=50)
-    np.testing.assert_allclose(
-        mdata.obs["rna_weight"], adata.obs["X_pca_weight"], rtol=1e-6
-    )
+    np.testing.assert_allclose(mdata.obs["rna_weight"], adata.obs["X_pca_weight"], rtol=1e-6)
     assert (mdata.obsp["distances"] != adata.obsp["distances"]).nnz == 0
     params = mdata.uns["neighbors"]["params"]
     assert params["modalities"] == {

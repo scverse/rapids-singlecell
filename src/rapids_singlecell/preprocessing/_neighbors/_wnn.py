@@ -89,9 +89,7 @@ def _snn_max_keys(s: int, key_bytes: int) -> int:
     return 1 << (fit.bit_length() - 1) if fit >= 128 else 0
 
 
-def _snn_launches(
-    knn: cp.ndarray, s: int, *, key_bytes: int, emb: cp.ndarray | None = None
-):
+def _snn_launches(knn: cp.ndarray, s: int, *, key_bytes: int, emb: cp.ndarray | None = None):
     """Return a function yielding the SNN kernel arguments for all rows.
 
     Row ``i``'s shared-neighbor (SNN) partners are the reverse neighbor lists
@@ -119,9 +117,7 @@ def _snn_launches(
     group = cp.searchsorted(cp.asarray(caps), n_keys)
     key = group.astype(cp.uint64) << 30
     if emb is not None:
-        proj = emb @ cp.asarray(
-            np.random.default_rng(0).standard_normal((emb.shape[1], 3)), emb.dtype
-        )
+        proj = emb @ cp.asarray(np.random.default_rng(0).standard_normal((emb.shape[1], 3)), emb.dtype)
         lo, hi = proj.min(axis=0), proj.max(axis=0)
         q = ((proj - lo) / cp.maximum(hi - lo, 1e-30) * 1023).astype(cp.uint64)
         for shift, bits in _SPREAD3:  # bit b of the 10-bit q to bit 3b
@@ -159,9 +155,7 @@ def _snn_launches(
     return launches
 
 
-def _snn_bandwidth(
-    knn: cp.ndarray, emb: cp.ndarray, nearest: cp.ndarray, *, s_nn: int
-) -> cp.ndarray:
+def _snn_bandwidth(knn: cp.ndarray, emb: cp.ndarray, nearest: cp.ndarray, *, s_nn: int) -> cp.ndarray:
     """Seurat's ``ComputeSNNwidth``: mean distance to the least shared neighbors."""
     from rapids_singlecell._cuda._wnn_cuda import snn_bandwidth
 
@@ -195,16 +189,12 @@ def _snn_graph(knn: cp.ndarray, *, prune: float) -> sc_sparse.csr_matrix:
             snn_graph(knn, s=k, **args, **out, prune=prune, stream=_stream())
     if cols.size <= np.iinfo(np.int32).max:
         indptr = indptr.astype(cp.int32)
-    snn = sc_sparse.csr_matrix(
-        (_to_host(vals), _to_host(cols), _to_host(indptr)), shape=(n, n)
-    )
+    snn = sc_sparse.csr_matrix((_to_host(vals), _to_host(cols), _to_host(indptr)), shape=(n, n))
     snn.has_canonical_format = True
     return snn
 
 
-def _get_reps(
-    adata, use_rep: Sequence[str] | Mapping[str, str], n_pcs
-) -> tuple[dict[str, dict], list[cp.ndarray]]:
+def _get_reps(adata, use_rep: Sequence[str] | Mapping[str, str], n_pcs) -> tuple[dict[str, dict], list[cp.ndarray]]:
     """Per-modality `use_rep` and resolved `n_pcs`, and the representations."""
     is_mudata = hasattr(adata, "mod")
     if isinstance(use_rep, str):
@@ -384,10 +374,7 @@ def wnn(
         meta_random_state["random_state"] = None if seed is None else int(seed)
 
     if algorithm not in get_args(_Algorithms):
-        raise ValueError(
-            f"Invalid algorithm '{algorithm}' for KNN. "
-            f"Valid options are: {get_args(_Algorithms)}."
-        )
+        raise ValueError(f"Invalid algorithm '{algorithm}' for KNN. Valid options are: {get_args(_Algorithms)}.")
     adata = adata.copy() if copy else adata
     if adata.is_view:
         adata._init_as_actual(adata.copy())
@@ -404,10 +391,7 @@ def wnn(
     # validate before any work, so that errors leave `adata` unchanged
     weight_cols = [] if weight_key is None else [weight_key.format(n) for n in names]
     if len(set(weight_cols)) < len(weight_cols) or "" in weight_cols:
-        raise ValueError(
-            f"`weight_key` {weight_key!r} must give a distinct column per "
-            "modality, e.g. '{}_weight'."
-        )
+        raise ValueError(f"`weight_key` {weight_key!r} must give a distinct column per modality, e.g. '{{}}_weight'.")
     n_mod = len(reps)
     n_obs = adata.n_obs
     n_neighbors, knn_range = operator.index(n_neighbors), operator.index(knn_range)

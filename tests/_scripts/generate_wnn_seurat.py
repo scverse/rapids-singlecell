@@ -31,9 +31,7 @@ def main():
     reps = {}
     for name, dims, groups in (("pca", 12, 4), ("apca", 8, 2)):
         centers = rng.normal(size=(4, dims)) * 3
-        reps[name] = (centers[labels % groups] + rng.normal(size=(n, dims))).astype(
-            np.float32
-        )
+        reps[name] = (centers[labels % groups] + rng.normal(size=(n, dims))).astype(np.float32)
 
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
@@ -49,9 +47,7 @@ def main():
             for name in ("weights", "indices", "distances", "snn")
         }
         outputs["indices"] = outputs["indices"].astype(np.int32)
-        provenance = (
-            f"NumPy {np.__version__}\n" + (directory / "provenance.txt").read_text()
-        )
+        provenance = f"NumPy {np.__version__}\n" + (directory / "provenance.txt").read_text()
 
     destination = script_dir.parent / "_data" / "wnn_seurat_5.5.1.npz"
     np.savez_compressed(destination, **reps, **outputs, provenance=provenance)
