@@ -57,18 +57,17 @@ _STOPPING_HARMONY1 = (200, 1e-5, 1e-4)
 
 
 def _prefaulted(func):
-    """Zero the host output ``out`` in a thread while ``func`` runs (copying
-    into touched pages is about twice as fast as into a fresh allocation) and
-    join it before the call returns or raises, so it never writes ``out``
-    afterwards. An output sharing memory with the host input is left alone:
-    the input is read later."""
+    """Zero the host output ``out`` in a thread while ``func`` runs.
+
+    Copying into touched pages is about twice as fast as into a fresh allocation. The thread is joined before the call
+    returns or raises, so it never writes ``out`` afterwards. An output sharing memory with the host input is left
+    alone: the input is read later.
+    """
 
     @functools.wraps(func)
     def wrapper(Z, *args, out=None, **kwargs):
         prefault = None
-        if out is not None and not (
-            isinstance(Z, np.ndarray) and np.may_share_memory(out, Z)
-        ):
+        if out is not None and not (isinstance(Z, np.ndarray) and np.may_share_memory(out, Z)):
             prefault = threading.Thread(target=out.fill, args=(0,), daemon=True)
             prefault.start()
         try:
@@ -240,12 +239,8 @@ def harmonize(
     max_iter_clustering = operator.index(max_iter_clustering)
     if max_iter_harmony < 1:
         raise ValueError("max_iter_harmony must be >= 1")
-    if out is not None and (
-        not isinstance(out, np.ndarray) or out.shape != Z.shape or out.dtype != Z.dtype
-    ):
-        raise ValueError(
-            f"out must be a NumPy array of shape {Z.shape} and dtype {Z.dtype}."
-        )
+    if out is not None and (not isinstance(out, np.ndarray) or out.shape != Z.shape or out.dtype != Z.dtype):
+        raise ValueError(f"out must be a NumPy array of shape {Z.shape} and dtype {Z.dtype}.")
     if devices is not None and len(devices) > 1 and out is None:
         raise ValueError("Several GPUs write the result into a host array `out`.")
     try:
@@ -267,9 +262,7 @@ def harmonize(
 
     rng = np.random.default_rng(rng)
     # Process batch information
-    n_levels, N_b, joint, offsets, order = _sort_by_batch(
-        batch_mat, batch_key, n_cells=n_cells, dtype=Z.dtype, rng=rng
-    )
+    n_levels, N_b, joint, offsets, order = _sort_by_batch(batch_mat, batch_key, n_cells=n_cells, dtype=Z.dtype, rng=rng)
     n_covariates, n_batches = n_levels.size, int(n_levels.sum())
     n_groups = len(offsets) - 1  # batches, or joint categories with several keys
 
@@ -355,14 +348,11 @@ def harmonize(
     chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
     devices = devices[: max(1, n_cells // unit)]
     n_ranks, n_pcs = len(devices), Z.shape[1]
-    bounds = [
-        min(n_cells, round(n_cells * r / n_ranks / unit) * unit) for r in range(n_ranks)
-    ] + [n_cells]
+    bounds = [min(n_cells, round(n_cells * r / n_ranks / unit) * unit) for r in range(n_ranks)] + [n_cells]
     # Each GPU's sorted groups, allocated before the upload (faster with a
     # non-pooled allocator)
     shard_groups = [
-        _sorted_groups(offsets, lo, hi, device)
-        for device, lo, hi in zip(devices, bounds[:-1], bounds[1:], strict=True)
+        _sorted_groups(offsets, lo, hi, device) for device, lo, hi in zip(devices, bounds[:-1], bounds[1:], strict=True)
     ]
     # Exact int64 sums of block counts, right-hand sides and centroids.
     capacity = n_clusters * max(
@@ -475,9 +465,7 @@ def harmonize(
             rank=rank,
         )
         # Every cell assigned to the k-means centroids without penalty
-        objectives = [
-            clustering(**_assignment_args(R, dtype), max_iter=0, initialize=True)
-        ]
+        objectives = [clustering(**_assignment_args(R, dtype), max_iter=0, initialize=True)]
 
         # Main harmony iterations
         for i in range(max_iter_harmony):
@@ -564,9 +552,11 @@ def _sort_by_batch(
     dtype: np.dtype,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, cp.ndarray, dict, np.ndarray, cp.ndarray]:
-    """The levels of each key, the cells per level, the joint categories with
-    several keys (else empty), and the offsets (host) and order of the cells
-    sorted by group (batch, or joint category with several keys)."""
+    """Sort the cells by group (batch, or joint category with several keys).
+
+    Returns the levels of each key, the cells per level, the joint categories with several keys (else empty), and
+    the offsets (host) and order of the sorted cells.
+    """
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates, n_batches = int(n_levels.size), int(n_levels.sum())
     # Several keys solve a dense float64 system over all their levels per
@@ -585,8 +575,7 @@ def _sort_by_batch(
         joint_cats, groups = _factorize_joint_codes(batch_codes, n_levels)
         if joint_cats.size > 2**31 - 2**24:  # int32 (category, key) positions
             raise ValueError(
-                f"harmonize supports at most {2**31 - 2**24} joint categories x "
-                f"keys, got {joint_cats.size}."
+                f"harmonize supports at most {2**31 - 2**24} joint categories x keys, got {joint_cats.size}."
             )
         counts = cp.zeros(joint_cats.shape[0], dtype=cp.int32)
         cp.add.at(counts, groups, 1)
@@ -606,9 +595,7 @@ def _sort_by_batch(
     return n_levels, N_b.astype(dtype), joint, offsets, order
 
 
-def _choose_method(
-    Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_method: str | None
-) -> str:
+def _choose_method(Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_method: str | None) -> str:
     """The correction method (with a warning where the choice is replaced)."""
     n_covariates, n_batches = n_levels.size, int(n_levels.sum())
     if correction_method not in {None, "fast", "original", "batched"}:
@@ -645,22 +632,24 @@ def _choose_method(
 
 
 def _shard(X: cp.ndarray, **sizes) -> tuple[cp.ndarray, cp.ndarray, dict]:
-    """One GPU's sorted cells, normalized, and their clustering buffers (the
-    k-means' many small temporaries then allocate faster)."""
+    """One GPU's sorted cells, normalized, and their clustering buffers.
+
+    The k-means' many small temporaries then allocate faster.
+    """
     with cp.cuda.Device(X.device.id):
         Z_norm = _normalize_cp(X)
-        workspace = _allocate_clustering_workspace(
-            X.shape[0], n_pcs=X.shape[1], dtype=X.dtype, **sizes
-        )
+        workspace = _allocate_clustering_workspace(X.shape[0], n_pcs=X.shape[1], dtype=X.dtype, **sizes)
         return X, Z_norm, workspace
 
 
 def _on_gpus(
     run, devices: list[int], *, offsets: np.ndarray, bounds: list[int], capacity: int
 ) -> tuple[list[cp.ndarray], bool, int]:
-    """``run(rank, comm)`` under every GPU: one in this thread, several in a
-    thread each, exchanging exact sums of up to ``capacity`` int64 values over
-    ``comm``. The first error on any GPU is raised once every thread stopped."""
+    """``run(rank, comm)`` under every GPU: one in this thread, several in a thread each.
+
+    They exchange exact sums of up to ``capacity`` int64 values over ``comm``. The first error on any GPU is raised
+    once every thread stopped.
+    """
     if len(devices) == 1:
         with cp.cuda.Device(devices[0]):
             Z_hat, is_converged, i = run(0, 0)
@@ -734,16 +723,14 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
     return {"R": R}
 
 
-def _rhs_bounds(
-    parts: list[cp.ndarray], offsets: np.ndarray, bounds: list[int]
-) -> cp.ndarray:
-    """Bounds of the exact right-hand side sums (segment_gemm.cuh): the
-    exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells
-    (sorted by group, ``offsets`` on the host) and PC d, so no other group or
-    PC coarsens a sum. ``parts`` hold the cells ``bounds[r] .. bounds[r + 1]``;
-    each GPU takes the maxima of its own groups (a group spanning GPUs from
-    each), which are exact, so every split gives the same bounds (on the
-    current GPU)."""
+def _rhs_bounds(parts: list[cp.ndarray], offsets: np.ndarray, bounds: list[int]) -> cp.ndarray:
+    """Bounds of the exact right-hand side sums (segment_gemm.cuh), on the current GPU.
+
+    The exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells (sorted by group, ``offsets`` on
+    the host) and PC d, so no other group or PC coarsens a sum. ``parts`` hold the cells
+    ``bounds[r] .. bounds[r + 1]``; each GPU takes the maxima of its own groups (a group spanning GPUs from each),
+    which are exact, so every split gives the same bounds.
+    """
     maxima = cp.zeros((len(offsets) - 1, parts[0].shape[1]), dtype=parts[0].dtype)
     for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
         if hi == lo:
@@ -777,11 +764,12 @@ def _rhs_bounds(
 def _segments(
     offsets: np.ndarray, unit: int = _SEGMENT, lo: int = 0, hi: int | None = None
 ) -> tuple[cp.ndarray, cp.ndarray]:
-    """Segments of the exact sums over cells sorted by group (``offsets`` on
-    the host): runs of one group cut at multiples of _SEGMENT and of ``unit``
-    (the block draw's units, where several GPUs split the cells). Start rows
-    (and the end) and the group of each segment of the cells ``lo .. hi``
-    (multiples of ``unit``), in rows from ``lo``."""
+    """Segments of the exact sums over cells sorted by group (``offsets`` on the host).
+
+    Runs of one group cut at multiples of _SEGMENT and of ``unit`` (the block draw's units, where several GPUs split
+    the cells). Start rows (and the end) and the group of each segment of the cells ``lo .. hi`` (multiples of
+    ``unit``), in rows from ``lo``.
+    """
     hi = offsets[-1] if hi is None else hi
     grid = np.arange(-(-lo // _SEGMENT) * _SEGMENT, hi, _SEGMENT)
     start = np.union1d(np.clip(offsets, lo, hi), np.arange(lo, hi, unit))
@@ -791,8 +779,10 @@ def _segments(
 
 
 def _sorted_groups(offsets: np.ndarray, lo: int, hi: int, device: int) -> cp.ndarray:
-    """The groups of the sorted cells ``lo .. hi`` (``offsets`` on the host) on
-    ``device``: the sum of a 1 at the first cell of every later group."""
+    """The groups of the sorted cells ``lo .. hi`` (``offsets`` on the host) on ``device``.
+
+    The sum of a 1 at the first cell of every later group.
+    """
     first = int(np.searchsorted(offsets, lo, side="right")) - 1
     starts = offsets[first + 1 :]
     with cp.cuda.Device(device):
@@ -824,11 +814,12 @@ def _draw_blocks(
     first: int,
     workspace: dict,
 ) -> None:
-    """Draw the update blocks of a harmonize call into the workspace's
-    ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here).
-    ``groups`` are the sorted cells ``first ..`` of a call (``chunk`` and
-    ``unit`` from _block_layout); a cell's block depends only on its position
-    among all cells."""
+    """Draw the update blocks of a harmonize call into the workspace.
+
+    Writes ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here). ``groups`` are the sorted cells
+    ``first ..`` of a call (``chunk`` and ``unit`` from _block_layout); a cell's block depends only on its position
+    among all cells.
+    """
     n = groups.size
     _clustering_cuda.draw_blocks(
         groups,
@@ -858,8 +849,10 @@ def _kmeans_centroids(
     n_clusters: int,
     rng: np.random.Generator,
 ) -> cp.ndarray:
-    """Normalized k-means centroids of a stratified sample of the normalized
-    sorted cells (shards ``parts``), on the current GPU."""
+    """Normalized k-means centroids of a stratified sample of the normalized sorted cells.
+
+    The sorted cells are the shards ``parts``; the centroids are on the current GPU.
+    """
     # Fit only the initialization sample, retaining every observed stratum.
     n_cells = bounds[-1]
     n_init_cells = min(n_cells, _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
@@ -884,8 +877,10 @@ def _allocate_clustering_workspace(
     n_stored: int,
     dtype: cp.dtype,
 ) -> dict:
-    """Buffers of the clustering loop. The tiles' groups are the batches, or
-    one group for several keys; counts are kept per batch level."""
+    """Buffers of the clustering loop.
+
+    The tiles' groups are the batches, or one group for several keys; counts are kept per batch level.
+    """
     workspace = {
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and the exponents of their
@@ -1004,9 +999,11 @@ def _correction_multi(
     n_total: int = 0,
     sums: dict | None = None,
 ) -> cp.ndarray:
-    """Apply the exact general-design correction in bounded cluster chunks to
-    cells sorted by joint category (``segments`` as for _correction_batched),
-    with the joint counts of R over the ``n_total`` cells of all GPUs."""
+    """Apply the exact general-design correction in bounded cluster chunks.
+
+    The cells are sorted by joint category (``segments`` as for _correction_batched), with the joint counts of R over
+    the ``n_total`` cells of all GPUs.
+    """
     seg_start, seg_group, bounds = segments
     Z = _correction_output(X, output)
     _correction_batched_cuda.correction_multi(

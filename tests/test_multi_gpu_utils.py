@@ -342,9 +342,7 @@ class TestDeviceCopy:
         assert copied.device.id == 1
         assert copied.get().tolist() == list(range(8))
 
-    @pytest.mark.parametrize(
-        "copy", ["_copy_to_device_p2p", "_copy_to_device_via_host"]
-    )
+    @pytest.mark.parametrize("copy", ["_copy_to_device_p2p", "_copy_to_device_via_host"])
     @pytest.mark.parametrize(
         "view",
         [

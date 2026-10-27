@@ -1,6 +1,8 @@
-"""Chunked copies between the host and the GPUs: the cells uploaded in sorted
-order (each GPU its shard) and the results downloaded in input order, through
-pinned chunks that several host threads fill or drain."""
+"""Chunked copies between the host and the GPUs.
+
+The cells are uploaded in sorted order (each GPU its shard) and the results downloaded in input order, through pinned
+chunks that several host threads fill or drain.
+"""
 
 from __future__ import annotations
 
@@ -27,14 +29,14 @@ def _upload_sorted(
     devices: list[int],
     shard_rows: tuple[list, list] | None = None,
 ) -> list[cp.ndarray]:
-    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU. Device input is
-    gathered on its own GPU, the other GPUs' shards first and in chunks of
-    _UPLOAD_BYTES, so only a shard's rows move and that GPU holds one extra
-    chunk at a time. Host input is staged in pinned chunks by several host
-    threads while the previous chunk is copied, then placed on the GPU (all
-    GPUs at once), so no unsorted device copy is kept: one GPU reads the input
-    in order, several GPUs each only their own rows (``shard_rows``, see
-    _shard_rows; gathered in input order, from C-ordered input)."""
+    """Rows ``Z[order[lo:hi]]`` of every shard on its GPU.
+
+    Device input is gathered on its own GPU, the other GPUs' shards first and in chunks of _UPLOAD_BYTES, so only a
+    shard's rows move and that GPU holds one extra chunk at a time. Host input is staged in pinned chunks by several
+    host threads while the previous chunk is copied, then placed on the GPU (all GPUs at once), so no unsorted device
+    copy is kept: one GPU reads the input in order, several GPUs each only their own rows (``shard_rows``, see
+    _shard_rows; gathered in input order, from C-ordered input).
+    """
     shards = list(itertools.pairwise(bounds))
     n, d = Z.shape
     if isinstance(Z, cp.ndarray):
@@ -69,10 +71,7 @@ def _upload_sorted(
             stream = cp.cuda.get_current_stream()
             X = cp.empty((hi - lo, d), dtype=Z.dtype)
             step = max(1, min(rows, hi - lo))  # no larger than the shard
-            slots = [
-                [_pinned(step, d, Z.dtype), cp.empty((step, d), dtype=Z.dtype), None]
-                for _ in range(2)
-            ]
+            slots = [[_pinned(step, d, Z.dtype), cp.empty((step, d), dtype=Z.dtype), None] for _ in range(2)]
             for i, a in enumerate(range(0, hi - lo, step)):
                 host, staged, done = slots[i % 2]
                 if done is not None:
@@ -95,12 +94,12 @@ def _upload_sorted(
             return list(pool.map(lambda rank: upload(rank, fill), range(len(devices))))
 
 
-def _shard_rows(
-    order: cp.ndarray, bounds: list[int], devices: list[int]
-) -> tuple[list, list]:
-    """Each shard's cells in input order: their input rows (increasing, on the
-    host; ``None`` for a single shard, which has them all) and their rows in
-    the shard (on its GPU)."""
+def _shard_rows(order: cp.ndarray, bounds: list[int], devices: list[int]) -> tuple[list, list]:
+    """Each shard's cells in input order.
+
+    Their input rows (increasing, on the host; ``None`` for a single shard, which has them all) and their rows in the
+    shard (on its GPU).
+    """
     n = order.size
     position = cp.empty(n, dtype=cp.int32)
     position[order] = cp.arange(n, dtype=cp.int32)
@@ -121,10 +120,11 @@ def _write_shards(
     out: np.ndarray,
     prefault: threading.Thread | None,
 ) -> None:
-    """``out[order] = concatenated results`` (the shards' rows in sorted
-    order): every GPU puts its rows in input order and copies them into
-    theirs of ``out`` (see _shard_rows), so no row moves between the GPUs.
-    ``out`` is written once ``prefault`` (see _prefaulted) has finished."""
+    """``out[order] = concatenated results`` (the shards' rows in sorted order).
+
+    Every GPU puts its rows in input order and copies them into theirs of ``out`` (see _shard_rows), so no row moves
+    between the GPUs. ``out`` is written once ``prefault`` (see _prefaulted) has finished.
+    """
     sources, targets = shard_rows
 
     def write(rank):
@@ -165,9 +165,10 @@ def _parallel_copy(
     *,
     scatter: bool = False,
 ) -> None:
-    """``dst[...] = src``, ``src[index]`` or (``scatter``) ``dst[index] = src``
-    for increasing ``index`` into C-ordered arrays, by several threads (host
-    memory bound)."""
+    """``dst[...] = src``, ``src[index]`` or (``scatter``) ``dst[index] = src`` by several threads.
+
+    ``index`` is increasing, into C-ordered arrays (host memory bound).
+    """
     n = len(src if scatter else dst)
     cuts = np.linspace(0, n, _UPLOAD_THREADS + 1, dtype=np.int64)
 
@@ -185,12 +186,11 @@ def _parallel_copy(
     list(pool.map(copy, cuts[:-1], cuts[1:]))
 
 
-def _download(
-    src: cp.ndarray, out: np.ndarray, index: np.ndarray | None = None
-) -> None:
-    """``out[...] = src``, or ``out[index] = src`` for increasing ``index``,
-    through pinned chunks: the next chunk is copied from the GPU while host
-    threads move the previous one into ``out``."""
+def _download(src: cp.ndarray, out: np.ndarray, index: np.ndarray | None = None) -> None:
+    """``out[...] = src``, or ``out[index] = src`` for increasing ``index``, through pinned chunks.
+
+    The next chunk is copied from the GPU while host threads move the previous one into ``out``.
+    """
     n, d = src.shape
     rows = _staging_rows(n, d * src.itemsize)
     stream = cp.cuda.get_current_stream()

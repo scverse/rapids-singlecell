@@ -302,9 +302,7 @@ def harmony_integrate(
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
 
     devices = (
-        [cp.cuda.Device().id]
-        if multi_gpu is None or multi_gpu is False
-        else parse_device_ids(multi_gpu=multi_gpu)
+        [cp.cuda.Device().id] if multi_gpu is None or multi_gpu is False else parse_device_ids(multi_gpu=multi_gpu)
     )
     host_out = np.empty(X.shape, dtype=X.dtype)
     with cp.cuda.Device(devices[0]):

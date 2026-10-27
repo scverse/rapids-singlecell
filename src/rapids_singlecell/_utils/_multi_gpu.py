@@ -46,9 +46,11 @@ _PEER_ERRORS = {
 
 @cache
 def _peer_copy_works(destination: int, source: int) -> bool:
-    """Return whether a peer copy arrives intact. Peer access is enabled in
-    both directions first, so the canary takes the direct path that later
-    copies (and Harmony's exchanges) use."""
+    """Return whether a peer copy arrives intact.
+
+    Peer access is enabled in both directions first, so the canary takes the direct path that later copies (and
+    Harmony's exchanges) use.
+    """
     if destination == source:
         return True
     if not cp.cuda.runtime.deviceCanAccessPeer(destination, source):
@@ -75,11 +77,8 @@ def _peer_copy_works(destination: int, source: int) -> bool:
     return bool(np.array_equal(actual, _CANARY))
 
 
-def _copy_to_device_p2p(
-    array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None
-) -> cp.ndarray:
-    """Copy an array directly to another GPU, keeping its C or F layout (into
-    ``out`` if given, of the same layout).
+def _copy_to_device_p2p(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """Copy an array directly to another GPU, keeping its C or F layout (into ``out`` if given, of the same layout).
 
     The copy runs on the destination's current stream after the work on the
     source's current stream and has landed on return, so ``array`` may be
@@ -215,9 +214,7 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
         raise ValueError(f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}")
 
     # Validate device IDs
-    if not all(
-        isinstance(d, numbers.Integral) and not isinstance(d, bool) for d in device_ids
-    ):
+    if not all(isinstance(d, numbers.Integral) and not isinstance(d, bool) for d in device_ids):
         raise ValueError(f"multi_gpu device ids must be integers, got {device_ids}.")
     invalid_ids = [d for d in device_ids if d < 0 or d >= n_available]
     if invalid_ids:

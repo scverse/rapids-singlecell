@@ -587,9 +587,7 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
             segments=(
                 *_segments(joint_offsets),
-                cp.asarray(
-                    _rhs_bounds([cp.asarray(X_np)], joint_offsets, [0, n_cells])
-                ),
+                cp.asarray(_rhs_bounds([cp.asarray(X_np)], joint_offsets, [0, n_cells])),
             ),
             marginal_joint_offsets=cp.asarray(marginal_offsets),
             marginal_joint_indices=cp.asarray([joint for _, joint in marginal], dtype=cp.int32),
@@ -964,9 +962,7 @@ def _repeatability_adata(dtype, n_pcs=17, n_cells=480):
                 # in chunks of 2.
                 "many": pd.Categorical(ordinal % 300, categories=range(2100)),
                 # One level on every shard of multi_gpu, and an empty one.
-                "skewed": pd.Categorical(
-                    np.where(ordinal % 10, "a", "c"), categories=["a", "b", "c"]
-                ),
+                "skewed": pd.Categorical(np.where(ordinal % 10, "a", "c"), categories=["a", "b", "c"]),
             },
             index=ordinal.astype(str),
         ),
@@ -1366,9 +1362,7 @@ def test_harmony_many_clusters(key, dtype):
     assert outputs[0].tobytes() == outputs[1].tobytes()
 
 
-requires_two_gpus = pytest.mark.skipif(
-    cp.cuda.runtime.getDeviceCount() < 2, reason="requires two GPUs"
-)
+requires_two_gpus = pytest.mark.skipif(cp.cuda.runtime.getDeviceCount() < 2, reason="requires two GPUs")
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -1389,12 +1383,9 @@ requires_two_gpus = pytest.mark.skipif(
 )
 @pytest.mark.parametrize(
     "devices",
-    [[0, 0], [0, 0, 0]]
-    + [pytest.param(d, marks=requires_two_gpus) for d in ([0, 1], [0, 1, 0])],
+    [[0, 0], [0, 0, 0]] + [pytest.param(d, marks=requires_two_gpus) for d in ([0, 1], [0, 1, 0])],
 )
-def test_harmony_several_ranks_match_one(
-    monkeypatch, *, key, n_pcs, dtype, n_clusters, options, devices
-):
+def test_harmony_several_ranks_match_one(monkeypatch, *, key, n_pcs, dtype, n_clusters, options, devices):
     # Every sum is exact and the blocks and segments follow the global cell
     # order, so ranks on one GPU (which one-GPU CI covers) or two give the
     # bits of one; three reduce-scatter and all-gather the larger sums.
@@ -1426,9 +1417,7 @@ def test_harmony_several_ranks_match_one(
     # parse_device_ids), on cells whose shards start past _SEGMENT; the GPU
     # threads copy from no other GPU (that would wait for its queued work).
     if len(set(devices)) < len(devices):
-        monkeypatch.setattr(
-            utils_multi_gpu, "parse_device_ids", lambda multi_gpu: multi_gpu
-        )
+        monkeypatch.setattr(utils_multi_gpu, "parse_device_ids", lambda multi_gpu: multi_gpu)
     threads, copy = set(), harmony_module._copy
     monkeypatch.setattr(
         harmony_module,
@@ -1470,9 +1459,7 @@ def test_harmony_several_ranks_match_one(
         with pytest.warns(UserWarning, match="is ignored"):
             run(devices, correction_method="fast")
         # Cluster chunks of the correction, each with its own exchange.
-        monkeypatch.setattr(
-            harmony_module, "_multi_correction_cluster_chunk_size", lambda **_: 2
-        )
+        monkeypatch.setattr(harmony_module, "_multi_correction_cluster_chunk_size", lambda **_: 2)
         solved, multi = [], harmony_module._correction_batched_cuda.correction_multi
         monkeypatch.setattr(
             harmony_module._correction_batched_cuda,
@@ -1489,9 +1476,7 @@ def test_harmony_several_ranks_match_one(
     # sorted by batch.
     monkeypatch.setattr(multi_gpu_module, "_FORCE_HOST_COPIES", True)
     monkeypatch.setattr(multi_gpu_module, "_RELAY_BYTES", 1000)
-    monkeypatch.setattr(
-        chunks_module, "_UPLOAD_BYTES", 40 * adata.obsm["X_pca"][0].nbytes
-    )
+    monkeypatch.setattr(chunks_module, "_UPLOAD_BYTES", 40 * adata.obsm["X_pca"][0].nbytes)
     one = run([0])
     assert run(devices).tobytes() == one.tobytes()
     assert run(devices, X=on_gpu(devices[-1])).tobytes() == one.tobytes()
@@ -1525,9 +1510,7 @@ def test_harmony_device_input_is_gathered_on_its_gpu(monkeypatch, source, peer):
         parts = harmony_module._upload_sorted(X, order, [0, 2048, 4096], [0, 1])
         assert [part.device.id for part in parts] == [0, 1]
         expected = cp.asnumpy(X)[cp.asnumpy(order)]
-        np.testing.assert_array_equal(
-            np.concatenate(list(map(cp.asnumpy, parts))), expected
-        )
+        np.testing.assert_array_equal(np.concatenate(list(map(cp.asnumpy, parts))), expected)
     finally:
         cp.cuda.set_allocator(allocator)
 
@@ -1548,9 +1531,7 @@ def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout):
     # Several GPUs stage only their own input rows (runs and scattered rows),
     # so every row crosses the host once.
     X = np.random.default_rng(0).standard_normal((1000, 8)).astype(np.float32)
-    order = np.concatenate(
-        [np.arange(500, 1000), np.random.default_rng(1).permutation(500)]
-    )
+    order = np.concatenate([np.arange(500, 1000), np.random.default_rng(1).permutation(500)])
     staged, copy = [], chunks_module._parallel_copy
     monkeypatch.setattr(
         chunks_module,
@@ -1559,9 +1540,7 @@ def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout):
     )
     monkeypatch.setattr(chunks_module, "_UPLOAD_BYTES", 40 * X[0].nbytes)
     bounds = [0, 300, 650, 1000]
-    parts = harmony_module._upload_sorted(
-        np.asarray(X, order=layout), cp.asarray(order), bounds, [0, 0, 0]
-    )
+    parts = harmony_module._upload_sorted(np.asarray(X, order=layout), cp.asarray(order), bounds, [0, 0, 0])
     assert sum(staged) == len(X)
     for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
         np.testing.assert_array_equal(cp.asnumpy(part), X[order[lo:hi]])
@@ -1642,9 +1621,7 @@ def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch, devices, where):
             if len(interrupts) == 1:
                 interrupt()
 
-        return SimpleNamespace(
-            handle=comm.handle, synchronize=comm.synchronize, abort=abort
-        ), buffers
+        return SimpleNamespace(handle=comm.handle, synchronize=comm.synchronize, abort=abort), buffers
 
     class Pool(ThreadPoolExecutor):
         def submit(self, fn, *args):
@@ -1773,9 +1750,7 @@ def test_harmony_shards_write_their_own_rows(monkeypatch):
     monkeypatch.setattr(harmony_module, "_write_shards", write_tracked)
     for devices in ([0, 0], [0]):
         out, refs[:] = np.empty_like(X), []
-        harmony_module.harmonize(
-            X, adata.obs, "batch", devices=devices, out=out, **options
-        )
+        harmony_module.harmonize(X, adata.obs, "batch", devices=devices, out=out, **options)
         assert out.tobytes() == one.tobytes()
         monkeypatch.setattr(chunks_module, "_download", download_checked)
     assert len(refs) == 2
@@ -1790,9 +1765,7 @@ def test_harmony_kmeans_beside_the_clustering_buffers(monkeypatch):
         monkeypatch.setattr(
             harmony_module,
             name,
-            lambda *a, f=getattr(harmony_module, name), name=name, **k: (
-                calls.append(name) or f(*a, **k)
-            ),
+            lambda *a, f=getattr(harmony_module, name), name=name, **k: calls.append(name) or f(*a, **k),
         )
     adata = _repeatability_adata(np.float32)
     rsc.pp.harmony_integrate(adata, "batch", rng=734, max_iter_harmony=1)
@@ -1814,9 +1787,7 @@ def test_harmony_threads_wait_for_the_callers_stream(monkeypatch, other_gpu):
         pytest.skip("requires two GPUs")
     # Two GPU threads, on one GPU too ([0, 0], kept by a patched parse_device_ids)
     devices = [0, min(1, cp.cuda.runtime.getDeviceCount() - 1)]
-    monkeypatch.setattr(
-        utils_multi_gpu, "parse_device_ids", lambda multi_gpu: multi_gpu
-    )
+    monkeypatch.setattr(utils_multi_gpu, "parse_device_ids", lambda multi_gpu: multi_gpu)
     rng = np.random.default_rng(11)
     n_cells = 6000
     obs = pd.DataFrame(
@@ -1829,9 +1800,7 @@ def test_harmony_threads_wait_for_the_callers_stream(monkeypatch, other_gpu):
     def run(data):
         if other_gpu:
             out = np.empty_like(data)
-            harmony_module.harmonize(
-                data, obs, "batch", devices=[1, 1], out=out, **options
-            )
+            harmony_module.harmonize(data, obs, "batch", devices=[1, 1], out=out, **options)
             return out
         adata = ad.AnnData(obs=obs, obsm={"X_pca": data.copy()})
         rsc.pp.harmony_integrate(adata, "batch", multi_gpu=devices, **options)
