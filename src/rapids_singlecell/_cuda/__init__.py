@@ -89,10 +89,9 @@ def _get_scratch_allocator():
             live[int(mem.ptr)] = mem
             return int(mem.ptr)
 
-        def _free(ptr: int) -> None:
-            live.pop(int(ptr), None)
-
-        _scratch_allocator = (_alloc, _free)
+        # A builtin: frees (in C++ destructors) run no bytecode, so a pending
+        # signal (Ctrl-C) is raised after the CUDA call, not inside it.
+        _scratch_allocator = (_alloc, live.pop)
     return _scratch_allocator
 
 

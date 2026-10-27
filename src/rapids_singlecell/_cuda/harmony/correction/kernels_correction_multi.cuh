@@ -12,6 +12,22 @@
 // same values, so the intercept and category rows stay consistent and a small
 // ridge lambda does not lose the solution to rounding.
 
+// The ridge penalties of a chunk's clusters (rows of stride ld, those of
+// lambda_kb): a category is active unless its penalty suppresses it (a pruned
+// batch).
+template <typename T>
+struct Penalties {
+    const T* lambda;
+    int ld;
+    T suppress;
+    __device__ T operator()(int batch, int cluster) const {
+        return lambda[(size_t)batch * ld + cluster];
+    }
+    __device__ bool active(int batch, int cluster) const {
+        return (*this)(batch, cluster) < suppress;
+    }
+};
+
 // Initialize the intercept, intercept/category, and within-covariate diagonal
 // entries of every regression Gram matrix.  All other entries are already
 // zero.  An inactive category is represented by an isolated unit diagonal,
@@ -19,8 +35,7 @@
 // and then restoring a zero coefficient.
 template <typename T>
 __global__ void initialize_multi_gram_kernel(
-    const T* __restrict__ lambda_kb, const uint8_t* __restrict__ active,
-    const T* __restrict__ joint_O,
+    Penalties<T> lambda, const T* __restrict__ joint_O,
     const int* __restrict__ marginal_joint_offsets,
     const int* __restrict__ marginal_joint_indices, double* __restrict__ gram,
     int n_batches, int n_clusters, int n_joint_categories) {
@@ -43,15 +58,15 @@ __global__ void initialize_multi_gram_kernel(
 
     for (int batch = threadIdx.x; batch < n_batches; batch += blockDim.x) {
         int row = batch + 1;
-        size_t bk = (size_t)batch * n_clusters + cluster;
-        if (active[bk] != 0) {
+        if (lambda.active(batch, cluster)) {
             double observed = 0;
             for (int position = marginal_joint_offsets[batch];
                  position < marginal_joint_offsets[batch + 1]; ++position)
                 observed += count(marginal_joint_indices[position]);
             cluster_gram[row] = observed;
             cluster_gram[(size_t)row * nb1] = observed;
-            cluster_gram[(size_t)row * nb1 + row] = observed + lambda_kb[bk];
+            cluster_gram[(size_t)row * nb1 + row] =
+                observed + lambda(batch, cluster);
         } else {
             cluster_gram[(size_t)row * nb1 + row] = 1;
         }
@@ -65,9 +80,9 @@ template <typename T, int N_COVARIATES>
 __global__ void add_joint_cross_kernel(
     const T* __restrict__ joint_O, const int* __restrict__ joint_cats,
     const int* __restrict__ marginal_joint_offsets,
-    const int* __restrict__ marginal_joint_indices,
-    const uint8_t* __restrict__ active, double* __restrict__ gram,
-    int n_covariates, int n_batches, int n_clusters) {
+    const int* __restrict__ marginal_joint_indices, Penalties<T> lambda,
+    double* __restrict__ gram, int n_covariates, int n_batches,
+    int n_clusters) {
     size_t total = (size_t)n_batches * n_clusters;
     int nb1 = n_batches + 1;
 
@@ -75,7 +90,7 @@ __global__ void add_joint_cross_kernel(
          idx < total; idx += (size_t)blockDim.x * gridDim.x) {
         int batch = (int)(idx / n_clusters);
         int cluster = (int)(idx % n_clusters);
-        if (active[idx] == 0) continue;
+        if (!lambda.active(batch, cluster)) continue;
         int row = batch + 1;
         double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
         // The lower category owns each symmetric pair and visits its joint
@@ -93,7 +108,7 @@ __global__ void add_joint_cross_kernel(
             for (int other = 0; other < count; ++other) {
                 int other_batch = levels[other];
                 if (other_batch <= batch ||
-                    active[(size_t)other_batch * n_clusters + cluster] == 0)
+                    !lambda.active(other_batch, cluster))
                     continue;
                 int col = other_batch + 1;
                 double updated = cluster_gram[(size_t)row * nb1 + col] + value;
@@ -134,7 +149,8 @@ __global__ void marginal_from_joint_rhs_kernel(
 // Row 0 (intercept) sums every joint: the rows of the first key's n_first
 // categories, which hold every joint once. Then the rows of inactive
 // categories are zeroed.
-__global__ void intercept_and_mask_kernel(const uint8_t* __restrict__ active,
+template <typename T>
+__global__ void intercept_and_mask_kernel(Penalties<T> lambda,
                                           double* __restrict__ rhs, int n_pcs,
                                           int n_clusters, int n_batches,
                                           int n_first) {
@@ -147,8 +163,7 @@ __global__ void intercept_and_mask_kernel(const uint8_t* __restrict__ active,
         for (int b = 0; b < n_first; ++b) value += row[(size_t)(b + 1) * n_pcs];
         row[0] = value;
         for (int b = 0; b < n_batches; ++b)
-            if (!active[(size_t)b * n_clusters + cluster])
-                row[(size_t)(b + 1) * n_pcs] = 0;
+            if (!lambda.active(b, cluster)) row[(size_t)(b + 1) * n_pcs] = 0;
     }
 }
 
@@ -156,7 +171,7 @@ __global__ void intercept_and_mask_kernel(const uint8_t* __restrict__ active,
 // marginal rows W_all[k][b + 1][:] over the categories b of joint j. The
 // intercept is deliberately retained in the embedding, as in Harmony.
 template <typename T>
-__global__ void joint_coefficients_kernel(const T* __restrict__ W_all,
+__global__ void joint_coefficients_kernel(const double* __restrict__ W_all,
                                           const int* __restrict__ joint_cats,
                                           T* __restrict__ W_joint, int n_pcs,
                                           int n_clusters, int n_batches,
@@ -173,7 +188,7 @@ __global__ void joint_coefficients_kernel(const T* __restrict__ W_all,
         T value = T(0);
         for (int c = 0; c < n_covariates; ++c)
             value +=
-                W_all[((size_t)cluster * nb1 + levels[c] + 1) * n_pcs + pc];
+                (T)W_all[((size_t)cluster * nb1 + levels[c] + 1) * n_pcs + pc];
         W_joint[idx] = value;
     }
 }

@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <type_traits>
 
@@ -235,10 +236,14 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
     // widest copy dividing every R row start, length and stage row
     size_t a =
         reinterpret_cast<size_t>(R) | 16 | ((size_t)ldr | kc | K) * sizeof(RT);
-    kernel<<<n_seg * CPS, NT, smem, s>>>(
-        X, R, ldr, W, wks, wgs, D, K, seg_start, seg_group, normalize, resume,
-        finish, Z, kc, (int)(a & (~a + 1)));
-    return cudaGetLastError();
+    // at most 2^31 - 1 CTAs per launch
+    for (int s0 = 0, step = INT_MAX / CPS; s0 < n_seg; s0 += step) {
+        kernel<<<std::min(n_seg - s0, step) * CPS, NT, smem, s>>>(
+            X, R, ldr, W, wks, wgs, D, K, seg_start + s0, seg_group + s0,
+            normalize, resume, finish, Z, kc, (int)(a & (~a + 1)));
+        if (cudaError_t e = cudaGetLastError()) return e;
+    }
+    return cudaSuccess;
 }
 
 }  // namespace detail

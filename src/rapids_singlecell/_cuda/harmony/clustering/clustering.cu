@@ -55,9 +55,10 @@ static void draw_blocks(const int* group_codes, int n_cells, long long first,
         throw std::invalid_argument(
             "draw_blocks: unit must divide the shard "
             "start and be a multiple of chunk");
-    int n_runs = (n_cells + chunk - 1) / chunk, unit_runs = unit / chunk;
-    int n_units = (n_runs + unit_runs - 1) / unit_runs;
-    int n_keys = n_blocks * n_groups;
+    int n_runs = int(((long long)n_cells + chunk - 1) / chunk),
+        unit_runs = unit / chunk;
+    int n_units = int(((long long)n_runs + unit_runs - 1) / unit_runs);
+    int n_keys = n_blocks * n_groups;  // below 2^31 (see harmonize)
     auto sort = [&](unsigned int* k_in, unsigned int* k_out, int* v_in,
                     int* v_out, int n, int bits) {
         cuda_check(
@@ -143,24 +144,6 @@ struct ClusteringArgs {
 
 // ---------- Clustering loop ----------
 
-// Fixed-point scales (see to_fixed) from global bounds: R values <= 1, so a
-// count is at most n_total; a cell's objective term is at most
-// 4 + sigma log K in magnitude.
-template <typename T>
-struct FixedScales {
-    T count, objective;
-    double count_inv, objective_inv;
-    FixedScales(long long n_total, double sigma, int n_clusters) {
-        int c = std::min(fixed_shift((double)n_total + 1),
-                         sizeof(T) == 4 ? 31 : 62);
-        int o = fixed_shift(
-            (double)n_total *
-            (5.0 + std::abs(sigma) * std::log(std::max(n_clusters, 2))));
-        count = (T)std::ldexp(1.0, c), count_inv = std::ldexp(1.0, -c);
-        objective = (T)std::ldexp(1.0, o), objective_inv = std::ldexp(1.0, -o);
-    }
-};
-
 // One assignment pass over the cells `idx_list[offsets[0] ..
 // offsets[n_groups])` grouped by category: writes R and the per-cell objective
 // terms, and adds the exact (fixed-point) counts per category to `counts`.
@@ -180,7 +163,7 @@ static void transpose_centroids(const ClusteringArgs<T>& a) {
     int k_stride = (a.n_clusters + FUSED_CLUSTER_STRIDE - 1) /
                    FUSED_CLUSTER_STRIDE * FUSED_CLUSTER_STRIDE;
     transpose_centroids_kernel<T>
-        <<<(pcs * k_stride + 255) / 256, 256, 0, a.stream>>>(
+        <<<strided_grid((long long)pcs * k_stride, 256), 256, 0, a.stream>>>(
             a.Y_norm, a.y_t, a.n_pcs, pcs, a.n_clusters, k_stride);
     CUDA_CHECK_LAST_ERROR(transpose_centroids_kernel);
 }
@@ -307,6 +290,13 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
     // Centroid sums: 2 (float32) or 3 limbs of 30 bits; |Z_norm|, R <= 1.
     int y_limbs = sizeof(T) == 4 ? 2 : 3;
     size_t kd = (size_t)a.n_clusters * a.n_pcs;
+    // Every segment adds into the top limb, whose atomics ran about half as
+    // fast across a 128 KiB boundary (measured on an RTX PRO 6000 Blackwell):
+    // float32 moves it up to the next one when its spare limb allows.
+    const uintptr_t span = 1 << 17,
+                    gap = (span - (uintptr_t)a.y_acc % span) % span;
+    const size_t spare = (3 - y_limbs) * kd * sizeof(long long);
+    long long* y_acc = a.y_acc + (gap <= spare ? gap / sizeof(long long) : 0);
     std::vector<short> y_bound(
         a.n_pcs, (short)harmony_segments::bound_exponent((double)a.n_total));
     cudaMemcpyAsync(a.y_bound, y_bound.data(), a.n_pcs * sizeof(short),
@@ -378,14 +368,14 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
     constexpr int WINDOW_SIZE = 3;
     for (int iter = 0; iter < a.max_iter; iter++) {
         // Centroids Y = Z_norm^T R, exact over the segments.
-        cudaMemsetAsync(a.y_acc, 0, y_limbs * kd * sizeof(long long), a.stream);
+        cudaMemsetAsync(y_acc, 0, y_limbs * kd * sizeof(long long), a.stream);
         cuda_check(
             harmony_segments::segment_rtz(
                 a.Z_norm, R, a.n_pcs, a.n_clusters, a.n_clusters, a.seg_start,
-                nullptr, a.n_seg, a.y_bound, a.y_acc, y_limbs, a.stream),
+                nullptr, a.n_seg, a.y_bound, y_acc, y_limbs, a.stream),
             "centroids");
         cuda_check(harmony_segments::finalize_rtz(
-                       a.y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_bound,
+                       y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_bound,
                        a.Y_norm, 0, a.n_pcs, a.stream),
                    "centroids");
         l2_row_normalize(a.Y_norm, a.Y_norm, a.n_clusters, a.n_pcs, a.stream);
@@ -396,7 +386,9 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
         // the block after next), the same on any number of GPUs, where their
         // exchange overlaps the next assignment.
         int shift = (int)((a.seed + (unsigned)iter) % (unsigned)n_blocks);
-        auto block = [&](int step) { return (step + shift) % n_blocks; };
+        auto block = [&](int step) {
+            return int(((long long)step + shift) % n_blocks);
+        };
         auto kept = [&](int step) {  // block(step)'s kept counts, if kept
             return keep && step >= 0 ? stored(block(step)) : nullptr;
         };
@@ -604,46 +596,6 @@ static void register_clustering_loop(nb::module_& m) {
         "stabilized"_a, "stream"_a = 0, "initialize"_a = false);
 }
 
-// out (groups x K) = the clustering's counts of R's columns per segment
-// group (see segment_counts_kernel); acc: groups x K scratch.
-template <typename T, typename Device>
-static void register_joint_counts(nb::module_& m) {
-    m.def(
-        "joint_counts",
-        [](gpu_array<const T, Device> R,
-           gpu_array_c<const int, Device> seg_start,
-           gpu_array_c<const int, Device> seg_group, gpu_array_c<T, Device> out,
-           gpu_array_c<long long, Device> acc, long long n_total,
-           std::uintptr_t stream) {
-            int K = (int)R.shape(1), n_seg = (int)seg_group.size();
-            size_t n = out.size();
-            if (R.ndim() != 2 || R.stride(1) != 1 || out.ndim() != 2 ||
-                (int)out.shape(1) != K || acc.size() < n ||
-                seg_start.size() != (size_t)n_seg + 1)
-                throw std::invalid_argument("joint_counts: bad shapes");
-            FixedScales<T> scales(n_total > 0 ? n_total : (long long)R.shape(0),
-                                  0, K);
-            auto s = (cudaStream_t)stream;
-            cudaMemsetAsync(acc.data(), 0, n * sizeof(long long), s);
-            segment_counts_kernel<T>
-                <<<strided_grid((long long)n_seg * K, BLOCK_DIM_1D),
-                   BLOCK_DIM_1D, 0, s>>>(
-                    R.data(), (int)R.stride(0), K, seg_start.data(),
-                    seg_group.data(), n_seg, scales.count,
-                    reinterpret_cast<unsigned long long*>(acc.data()));
-            CUDA_CHECK_LAST_ERROR(segment_counts_kernel);
-            update_counts_kernel<T>
-                <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D,
-                   0, s>>>(acc.data(), nullptr, nullptr, nullptr, nullptr,
-                           scales.count_inv, out.data(), (int)n);
-            CUDA_CHECK_LAST_ERROR(update_counts_kernel);
-        },
-        nb::call_guard<nb::gil_scoped_release>(), "R"_a.noconvert(),
-        nb::kw_only(), "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
-        "out"_a.noconvert(), "acc"_a.noconvert(), "n_total"_a = 0,
-        "stream"_a = 0);
-}
-
 template <typename T, typename Device>
 static void register_kmeans(nb::module_& m) {
     m.def(
@@ -795,8 +747,6 @@ void register_bindings(nb::module_& m) {
         "itemsize"_a = 4);
     register_clustering_loop<float, Device>(m);
     register_clustering_loop<double, Device>(m);
-    register_joint_counts<float, Device>(m);
-    register_joint_counts<double, Device>(m);
     register_kmeans<float, Device>(m);
     register_kmeans<double, Device>(m);
 }

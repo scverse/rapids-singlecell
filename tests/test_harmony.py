@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import anndata as ad
 import cupy as cp
 import numpy as np
@@ -11,6 +14,7 @@ from scipy.stats import pearsonr
 
 import rapids_singlecell as rsc
 import rapids_singlecell.preprocessing._harmony as harmony_module
+import rapids_singlecell.preprocessing._harmony._chunks_to_device as chunks_module
 from rapids_singlecell.preprocessing._harmony import (
     _SUPPRESS_PENALTY,
     _compute_lambda_kb,
@@ -18,7 +22,6 @@ from rapids_singlecell.preprocessing._harmony import (
     _correction_multi,
     _rhs_bounds,
     _segments,
-    _solve_spd_batched,
 )
 from rapids_singlecell.preprocessing._harmony._helper import (
     _factorize_joint_codes,
@@ -26,6 +29,21 @@ from rapids_singlecell.preprocessing._harmony._helper import (
     _get_theta_array,
     _stratified_sample_indices,
 )
+
+
+def _solve_spd_batched(gram, rhs, *, one_at_a_time=False):
+    # The cluster-system solve of the multi-key correction (C++).
+    x = cp.empty_like(rhs)
+    harmony_module._correction_batched_cuda.solve_spd(
+        gram,
+        rhs,
+        x,
+        one_at_a_time=one_at_a_time,
+        stream=cp.cuda.get_current_stream().ptr,
+        blas=cp.cuda.device.get_cublas_handle(),
+        solver=cp.cuda.device.get_cusolver_handle(),
+    )
+    return x
 
 
 def _get_measure(x, base, norm):
@@ -124,8 +142,20 @@ def test_harmony_stratified_sample_random_offsets_and_groups(layout_seed):
     targets = [nonempty.size, max(nonempty.size, n_cells // 3), n_cells]
     for n_target in targets:
         # a fresh generator per call: same seed, same sample
-        sampled = cp.asnumpy(_stratified_sample_indices(gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)))
-        repeated = cp.asnumpy(_stratified_sample_indices(gpu_offsets, gpu_indices, n_target, np.random.default_rng(17)))
+        sampled = cp.asnumpy(
+            gpu_indices[
+                _stratified_sample_indices(
+                    gpu_offsets, n_target, np.random.default_rng(17)
+                )
+            ]
+        )
+        repeated = cp.asnumpy(
+            gpu_indices[
+                _stratified_sample_indices(
+                    gpu_offsets, n_target, np.random.default_rng(17)
+                )
+            ]
+        )
 
         assert sampled.size == n_target
         assert np.unique(sampled).size == n_target
@@ -148,7 +178,9 @@ def test_harmony_stratified_sample_known_quotas():
     cell_indices = cp.asarray([12, 7, 15, 1, 10, 4, 13, 2, 14, 9, 0, 11, 5, 8, 3, 6])
     cell_groups = np.array([5, 3, 3, 5, 3, 5, 5, 2, 5, 5, 3, 5, 1, 3, 5, 2])
 
-    sampled = cp.asnumpy(_stratified_sample_indices(offsets, cell_indices, 9, np.random.default_rng(0)))
+    sampled = cp.asnumpy(
+        cell_indices[_stratified_sample_indices(offsets, 9, np.random.default_rng(0))]
+    )
     counts = np.bincount(cell_groups[sampled], minlength=6)
 
     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
@@ -203,9 +235,10 @@ def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
     np.testing.assert_array_equal(joint_codes, np.array([0, 1, 0]))
 
 
-def test_harmony_large_multikey_systems_solve_one_at_a_time():
-    # 256+ levels take the blocked per-matrix factorization; a singular system
-    # still falls back to least squares.
+@pytest.mark.parametrize("one_at_a_time", [False, True])
+def test_harmony_large_multikey_systems_solve_one_at_a_time(one_at_a_time):
+    # Few large systems take the blocked per-matrix factorization, others the
+    # batched one; a singular system still falls back to least squares.
     rng = np.random.default_rng(0)
     n, d = 300, 7
     M = rng.standard_normal((2, n, n))
@@ -214,11 +247,40 @@ def test_harmony_large_multikey_systems_solve_one_at_a_time():
         [M[0] @ M[0].T + n * np.eye(n), M[1] @ M[1].T + n * np.eye(n), B @ B.T]
     )
     rhs = gram @ rng.standard_normal((3, n, d))
-    result = cp.asnumpy(_solve_spd_batched(cp.asarray(gram), cp.asarray(rhs)))
+    result = _solve_spd_batched(
+        cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time
+    )
+    result = cp.asnumpy(result)
     np.testing.assert_allclose(
         result[:2], np.linalg.solve(gram[:2], rhs[:2]), rtol=1e-9
     )
     np.testing.assert_allclose(gram[2] @ result[2], rhs[2], rtol=1e-7, atol=1e-7)
+
+
+def test_harmony_interrupt_during_the_solve_is_raised_after_it():
+    # Ctrl-C while the main thread waits for the GPU in the C++ solve: its
+    # scratch frees run no Python, so KeyboardInterrupt follows the call (a
+    # Python free raised it in a destructor, which aborted the process).
+    script = """
+import _thread, time
+import cupy as cp
+from rapids_singlecell._cuda import _harmony_correction_batched_cuda as m
+gram, rhs = 2 * cp.eye(2)[None], cp.ones((1, 2, 3))
+stream = cp.cuda.get_current_stream()
+kw = {"stream": stream.ptr, "blas": cp.cuda.device.get_cublas_handle(),
+      "solver": cp.cuda.device.get_cusolver_handle()}
+m.solve_spd(gram, rhs, cp.empty_like(rhs), **kw)
+# The stream waits for this until the solve has queued its work behind it.
+stream.launch_host_func(lambda _: time.sleep(0.2) or _thread.interrupt_main(), 0)
+try:
+    m.solve_spd(gram, rhs, cp.empty_like(rhs), **kw)
+except KeyboardInterrupt:
+    print("interrupted")
+"""
+    run = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+    )
+    assert (run.returncode, run.stdout) == (0, "interrupted\n"), run.stderr
 
 
 def test_harmony_multikey_singular_gram_uses_least_squares():
@@ -539,7 +601,6 @@ def test_harmony_multikey_correction_matches_dense_design(
             cp.asarray(X_np),
             cp.asarray(R_np),
             lambda_kb=cp.asarray(lambda_np),
-            n_batches=n_batches,
             n_first=int(levels[0]),
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
             segments=(
@@ -1011,8 +1072,11 @@ def test_harmony_large_theta_stays_finite(
     # keys: a unit pivot, no least-squares fallback).
     kwargs = dict(kwargs)
     key = kwargs.pop("key", "batch")
-    monkeypatch.setattr(
-        cp.linalg, "lstsq", lambda *a, **k: pytest.fail("singular cluster system")
+    multi = harmony_module._correction_batched_cuda.correction_multi
+    monkeypatch.setattr(  # no least-squares fallback
+        harmony_module._correction_batched_cuda,
+        "correction_multi",
+        lambda *a, **k: multi(*a, **k)[1] and pytest.fail("singular cluster system"),
     )
     objectives = []
     convergent = harmony_module._is_convergent_harmony
@@ -1062,7 +1126,7 @@ def test_harmony_host_input_matches_device_input(monkeypatch):
     device = _integrate(X_pca=cp.asarray(host))
     assert _integrate(X_pca=host).tobytes() == device.tobytes()
     # Small chunks: the upload and the download reuse their staging slots.
-    monkeypatch.setattr(harmony_module, "_UPLOAD_BYTES", 40 * host[0].nbytes)
+    monkeypatch.setattr(chunks_module, "_UPLOAD_BYTES", 40 * host[0].nbytes)
     assert _integrate(X_pca=host).tobytes() == device.tobytes()
     for value in (np.nan, np.inf, -np.inf):
         bad = host.copy()
@@ -1076,9 +1140,9 @@ def test_harmony_host_input_matches_device_input(monkeypatch):
 def test_harmony_small_host_input_stages_its_rows(monkeypatch):
     # Pinned and GPU staging chunks hold at most the input's rows.
     rows = []
-    pinned = harmony_module._pinned
+    pinned = chunks_module._pinned
     monkeypatch.setattr(
-        harmony_module,
+        chunks_module,
         "_pinned",
         lambda n, d, dtype: rows.append(n) or pinned(n, d, dtype),
     )
@@ -1095,15 +1159,15 @@ def test_harmony_auto_batched_in_cluster_chunks(monkeypatch, dtype):
         harmony_module, "_CORRECTION_WORKSPACE_LIMIT_BYTES", 3 * 37 * 17 * 16
     )
     monkeypatch.setattr(harmony_module, "_correction_fast", None)
-    starts = []
+    passes = []
     batched = harmony_module._correction_batched_cuda.correction_batched
     monkeypatch.setattr(
         harmony_module._correction_batched_cuda,
         "correction_batched",
-        lambda *a, **k: starts.append(k["cluster_start"]) or batched(*a, **k),
+        lambda *a, **k: passes.append(k["chunk"]) or batched(*a, **k),
     )
     auto = _integrate(dtype, key="fine")
-    assert starts[:3] == [0, 3, 6]
+    assert passes[0] == 3  # the workspace of one pass of 3 clusters
     forced = _integrate(dtype, key="fine", correction_method="batched")
     assert auto.tobytes() == forced.tobytes()
 

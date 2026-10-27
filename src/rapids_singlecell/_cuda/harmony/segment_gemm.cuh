@@ -245,7 +245,8 @@ __global__ void __launch_bounds__(kThreads, 2)
     const int g = seg_group ? seg_group[blockIdx.x] : 0;
     const short* bg = bound_exp + (size_t)g * D + d0;  // this tile's columns
     const size_t ls = (size_t)K * D;
-    unsigned long long* out = acc + g * limbs * ls + (size_t)k0 * D + d0;
+    unsigned long long* out =
+        acc + (size_t)g * limbs * ls + (size_t)k0 * D + d0;
     auto put = [&](T v, int d, int k) {
         if (d < dv && k < kv)
             emit(v, scale_exp(bg[d], limbs), out + (size_t)k * D + d, ls,
@@ -286,7 +287,8 @@ __global__ void finalize_kernel(const long long* __restrict__ acc, int n_groups,
         const long long e = i - g * kd;
         double v = 0.0;
         for (int l = 0; l < limbs; ++l)
-            v = ldexp(v, kLimbBits) + (double)acc[(g * limbs + l) * kd + e];
+            v = ldexp(v, kLimbBits) +
+                (double)acc[((long long)g * limbs + l) * kd + e];
         out[g * out_group_stride + e / D * ld_out + e % D] =
             T(ldexp(v, -scale_exp(bound_exp[(size_t)g * D + e % D], limbs)));
     }

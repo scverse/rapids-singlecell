@@ -119,7 +119,8 @@ if (RSC_BUILD_EXTENSIONS)
   # Harmony CUDA modules
   add_nb_cuda_module(_harmony_clustering_cuda src/rapids_singlecell/_cuda/harmony/clustering/clustering.cu)
   add_nb_cuda_module(_harmony_correction_cuda src/rapids_singlecell/_cuda/harmony/correction/correction_fast.cu)
-  add_nb_cuda_module(_harmony_correction_batched_cuda src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu)
+  add_rmm_cuda_module(_harmony_correction_batched_cuda src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu)
+  target_link_libraries(_harmony_correction_batched_cuda PRIVATE CUDA::cublas CUDA::cusolver)
   # Wilcoxon binned histogram CUDA module
   add_nb_cuda_module(_wilcoxon_binned_cuda   src/rapids_singlecell/_cuda/wilcoxon_binned/wilcoxon_binned.cu)
 endif()

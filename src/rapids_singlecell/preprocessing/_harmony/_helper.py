@@ -103,20 +103,20 @@ def _factorize_joint_codes(
 
 
 def _stratified_sample_indices(
-    cat_offsets: cp.ndarray,
-    cell_indices: cp.ndarray,
+    cat_offsets: np.ndarray | cp.ndarray,
     n_target: int,
     rng: np.random.Generator,
 ) -> cp.ndarray:
     """Draw exactly ``n_target`` cells while representing every observed stratum.
 
-    ``cell_indices`` lists each stratum's cells in a seeded random order (as
-    Harmony sorts them), so its first ``quota`` cells are a uniform draw.
+    Returns positions of cells sorted by stratum (``cat_offsets``), each
+    stratum's in a seeded random order (as Harmony sorts them), so its first
+    ``quota`` cells are a uniform draw.
     """
     offsets = cp.asnumpy(cat_offsets).astype(np.int64, copy=False)
     sizes = np.diff(offsets)
     nonempty = np.flatnonzero(sizes)
-    n_cells = int(cell_indices.size)
+    n_cells = int(offsets[-1])
     if not nonempty.size <= n_target <= n_cells:
         raise ValueError("n_target must cover every nonempty stratum without exceeding n_cells")
 
@@ -138,7 +138,7 @@ def _stratified_sample_indices(
             quotas[eligible[order[:leftover]]] += 1
 
     starts = offsets[:-1] - np.concatenate([[0], np.cumsum(quotas)[:-1]])
-    return cell_indices[cp.asarray(np.repeat(starts, quotas) + np.arange(n_target))]
+    return cp.asarray(np.repeat(starts, quotas) + np.arange(n_target), dtype=cp.int32)
 
 
 def _get_theta_array(

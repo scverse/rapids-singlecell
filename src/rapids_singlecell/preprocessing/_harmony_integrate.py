@@ -219,7 +219,8 @@ def harmony_integrate(
                 f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}."
             )
 
-    from ._harmony import _download, harmonize
+    from ._harmony import harmonize
+    from ._harmony._chunks_to_device import _download
 
     # Resolve flavor into internal flags
     if flavor not in {"harmony1", "harmony2"}:
