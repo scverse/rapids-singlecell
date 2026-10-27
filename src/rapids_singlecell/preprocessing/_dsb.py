@@ -150,9 +150,7 @@ def dsb(
         is arbitrary in R; here it increases with the background mean.
     """
     if scale_factor not in (vals := get_args(_ScaleFactor)):
-        raise ValueError(
-            f"`scale_factor` must be one of {list(vals)}, got {scale_factor!r}."
-        )
+        raise ValueError(f"`scale_factor` must be one of {list(vals)}, got {scale_factor!r}.")
     if adata_empty is None and scale_factor != "standardize":
         raise ValueError("`scale_factor` only applies with `adata_empty`.")
     if fast_km and not denoise_counts:
@@ -165,14 +163,10 @@ def dsb(
     if not pseudocount > 0:
         raise ValueError(f"`pseudocount` must be positive, got {pseudocount}.")
     if quantile_clip is not None and not 0 <= quantile_clip[0] < quantile_clip[1] <= 1:
-        raise ValueError(
-            f"`quantile_clip` must be increasing quantiles in [0, 1], got {quantile_clip}."
-        )
+        raise ValueError(f"`quantile_clip` must be increasing quantiles in [0, 1], got {quantile_clip}.")
     proteins = adata.var_names
     if not proteins.is_unique:
-        raise ValueError(
-            f"`adata.var_names` are not unique: {list(proteins[proteins.duplicated()])}"
-        )
+        raise ValueError(f"`adata.var_names` are not unique: {list(proteins[proteins.duplicated()])}")
     iso_idx = _isotype_indices(
         proteins,
         isotype_controls,
@@ -180,9 +174,7 @@ def dsb(
         required=denoise_counts,
     )
     if adata.n_obs < 2 or (denoise_counts and adata.n_vars < 2):
-        raise ValueError(
-            "dsb needs at least 2 cells, and 2 proteins with `denoise_counts`."
-        )
+        raise ValueError("dsb needs at least 2 cells, and 2 proteins with `denoise_counts`.")
     if adata_empty is not None:
         adata_empty = _match_proteins(adata_empty, proteins)
         if adata_empty.n_obs < 2:
@@ -274,8 +266,7 @@ def dsb(
             norm -= vc[:, None] * ((vc @ norm) / (vc @ vc))
         else:
             warnings.warn(
-                "The technical component is constant; step 2 leaves the data "
-                "unchanged.",
+                "The technical component is constant; step 2 leaves the data unchanged.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -306,22 +297,16 @@ def dsb(
     return adata if copy else None
 
 
-def _isotype_indices(
-    proteins, isotype_controls, *, use_isotype_controls: bool, required: bool
-):
+def _isotype_indices(proteins, isotype_controls, *, use_isotype_controls: bool, required: bool):
     if isinstance(isotype_controls, str):
         isotype_controls = [isotype_controls]
     elif isotype_controls is not None:
         isotype_controls = list(isotype_controls)
     if isotype_controls:
         if not use_isotype_controls:
-            raise ValueError(
-                "Pass `isotype_controls` or `use_isotype_controls=False`, not both."
-            )
+            raise ValueError("Pass `isotype_controls` or `use_isotype_controls=False`, not both.")
         if missing := [p for p in isotype_controls if p not in proteins]:
-            raise ValueError(
-                f"isotype controls not found in `adata.var_names`: {missing}"
-            )
+            raise ValueError(f"isotype controls not found in `adata.var_names`: {missing}")
         return proteins.get_indexer(isotype_controls)
     if required and use_isotype_controls:
         detected = [p for p in proteins if _ISOTYPE_PATTERN.search(p)]
@@ -335,9 +320,7 @@ def _isotype_indices(
 
 def _check_counts(x: cp.ndarray, name: str) -> None:
     if not bool(cp.isfinite(x).all() and (x >= 0).all()):
-        raise ValueError(
-            f"`{name}` must contain raw counts: finite and non-negative values."
-        )
+        raise ValueError(f"`{name}` must contain raw counts: finite and non-negative values.")
 
 
 def _dense_gpu(X, dtype: np.dtype) -> cp.ndarray:
@@ -359,11 +342,7 @@ def _match_proteins(adata_empty: AnnData, proteins) -> AnnData:
     names = adata_empty.var_names
     if names.equals(proteins):
         return adata_empty
-    if (
-        not names.is_unique
-        or len(names) != len(proteins)
-        or set(names) != set(proteins)
-    ):
+    if not names.is_unique or len(names) != len(proteins) or set(names) != set(proteins):
         diff = sorted(set(names).symmetric_difference(proteins))
         dup = list(names[names.duplicated()])
         raise ValueError(
@@ -444,7 +423,8 @@ def _kmeans_low_centers(M: cp.ndarray) -> cp.ndarray:
 
 def _first_pc_scores(A: cp.ndarray) -> cp.ndarray:
     """First principal component scores of the standardized columns, oriented
-    along the last column (the background mean)."""
+    along the last column (the background mean).
+    """
     Z = (A - A.mean(axis=0)) / A.std(axis=0, ddof=1)
     v = cp.linalg.eigh(Z.T @ Z)[1][:, -1]
     return Z @ (v if float(v[-1]) >= 0 else -v)

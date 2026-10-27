@@ -35,9 +35,7 @@ def counts() -> tuple[AnnData, AnnData]:
 
     def to_adata(df, prefix):
         obs = pd.DataFrame(index=[f"{prefix}{i}" for i in range(len(df))])
-        return AnnData(
-            df.to_numpy(dtype=np.float64), obs=obs, var=pd.DataFrame(index=df.columns)
-        )
+        return AnnData(df.to_numpy(dtype=np.float64), obs=obs, var=pd.DataFrame(index=df.columns))
 
     return to_adata(cells, "c"), to_adata(empty, "e")
 
@@ -68,13 +66,9 @@ CONFIGS = {
 def test_matches_r(counts, config, dtype):
     cells, empty = counts
     kwargs, with_empty = CONFIGS[config]
-    res = rsc.pp.dsb(
-        cells, empty if with_empty else None, dtype=dtype, copy=True, **kwargs
-    )
+    res = rsc.pp.dsb(cells, empty if with_empty else None, dtype=dtype, copy=True, **kwargs)
     assert res.X.dtype == dtype
-    np.testing.assert_allclose(
-        res.X, _read(config).to_numpy(), rtol=0, atol=_tol(dtype)
-    )
+    np.testing.assert_allclose(res.X, _read(config).to_numpy(), rtol=0, atol=_tol(dtype))
 
 
 @pytest.mark.parametrize("dtype", [np.float64, np.float32])
@@ -97,12 +91,8 @@ def test_stats(counts, dtype):
     assert np.corrcoef(tech, res.obs["dsb_cell_background_mean"])[0, 1] > 0
 
     log_empty = np.log(empty.X + 10)
-    np.testing.assert_allclose(
-        res.var["dsb_ambient_mean"], log_empty.mean(0), rtol=1e-5
-    )
-    np.testing.assert_allclose(
-        res.var["dsb_ambient_sd"], log_empty.std(0, ddof=1), rtol=1e-5
-    )
+    np.testing.assert_allclose(res.var["dsb_ambient_mean"], log_empty.mean(0), rtol=1e-5)
+    np.testing.assert_allclose(res.var["dsb_ambient_sd"], log_empty.std(0, ddof=1), rtol=1e-5)
 
 
 def test_no_denoising(counts):
@@ -244,11 +234,7 @@ def test_fast_km_is_optimal_two_means(counts):
     step1 = rsc.pp.dsb(cells, empty, denoise_counts=False, copy=True).X
     for x, low in zip(step1, res.obs["dsb_cell_background_mean"]):
         xs = np.sort(x)
-        sse = [
-            ((xs[:s] - xs[:s].mean()) ** 2).sum()
-            + ((xs[s:] - xs[s:].mean()) ** 2).sum()
-            for s in range(1, len(xs))
-        ]
+        sse = [((xs[:s] - xs[:s].mean()) ** 2).sum() + ((xs[s:] - xs[s:].mean()) ** 2).sum() for s in range(1, len(xs))]
         best = int(np.argmin(sse)) + 1
         assert low == pytest.approx(xs[:best].mean(), abs=1e-12)
 
@@ -279,11 +265,7 @@ def _ref_mclust2(x, sub=None, *, eps=np.finfo(np.float64).eps):
         return mu, np.full(2, ss.sum() / len(v)) if equal else ss / nk, nk / len(v)
 
     def estep(mu, s2, pro):
-        lg = (
-            np.log(pro)
-            - 0.5 * np.log(2 * np.pi * s2)
-            - 0.5 * (x[:, None] - mu) ** 2 / s2
-        )
+        lg = np.log(pro) - 0.5 * np.log(2 * np.pi * s2) - 0.5 * (x[:, None] - mu) ** 2 / s2
         ll = np.logaddexp(lg[:, 0], lg[:, 1])
         return np.exp(lg - ll[:, None]), ll.sum()
 
