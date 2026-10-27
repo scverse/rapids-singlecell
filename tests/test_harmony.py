@@ -142,20 +142,8 @@ def test_harmony_stratified_sample_random_offsets_and_groups(layout_seed):
     targets = [nonempty.size, max(nonempty.size, n_cells // 3), n_cells]
     for n_target in targets:
         # a fresh generator per call: same seed, same sample
-        sampled = cp.asnumpy(
-            gpu_indices[
-                _stratified_sample_indices(
-                    gpu_offsets, n_target, np.random.default_rng(17)
-                )
-            ]
-        )
-        repeated = cp.asnumpy(
-            gpu_indices[
-                _stratified_sample_indices(
-                    gpu_offsets, n_target, np.random.default_rng(17)
-                )
-            ]
-        )
+        sampled = cp.asnumpy(gpu_indices[_stratified_sample_indices(gpu_offsets, n_target, np.random.default_rng(17))])
+        repeated = cp.asnumpy(gpu_indices[_stratified_sample_indices(gpu_offsets, n_target, np.random.default_rng(17))])
 
         assert sampled.size == n_target
         assert np.unique(sampled).size == n_target
@@ -178,9 +166,7 @@ def test_harmony_stratified_sample_known_quotas():
     cell_indices = cp.asarray([12, 7, 15, 1, 10, 4, 13, 2, 14, 9, 0, 11, 5, 8, 3, 6])
     cell_groups = np.array([5, 3, 3, 5, 3, 5, 5, 2, 5, 5, 3, 5, 1, 3, 5, 2])
 
-    sampled = cp.asnumpy(
-        cell_indices[_stratified_sample_indices(offsets, 9, np.random.default_rng(0))]
-    )
+    sampled = cp.asnumpy(cell_indices[_stratified_sample_indices(offsets, 9, np.random.default_rng(0))])
     counts = np.bincount(cell_groups[sampled], minlength=6)
 
     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
@@ -243,17 +229,11 @@ def test_harmony_large_multikey_systems_solve_one_at_a_time(one_at_a_time):
     n, d = 300, 7
     M = rng.standard_normal((2, n, n))
     B = rng.standard_normal((n, 50))
-    gram = np.stack(
-        [M[0] @ M[0].T + n * np.eye(n), M[1] @ M[1].T + n * np.eye(n), B @ B.T]
-    )
+    gram = np.stack([M[0] @ M[0].T + n * np.eye(n), M[1] @ M[1].T + n * np.eye(n), B @ B.T])
     rhs = gram @ rng.standard_normal((3, n, d))
-    result = _solve_spd_batched(
-        cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time
-    )
+    result = _solve_spd_batched(cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time)
     result = cp.asnumpy(result)
-    np.testing.assert_allclose(
-        result[:2], np.linalg.solve(gram[:2], rhs[:2]), rtol=1e-9
-    )
+    np.testing.assert_allclose(result[:2], np.linalg.solve(gram[:2], rhs[:2]), rtol=1e-9)
     np.testing.assert_allclose(gram[2] @ result[2], rhs[2], rtol=1e-7, atol=1e-7)
 
 
@@ -277,9 +257,7 @@ try:
 except KeyboardInterrupt:
     print("interrupted")
 """
-    run = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
-    )
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300)
     assert (run.returncode, run.stdout) == (0, "interrupted\n"), run.stderr
 
 
@@ -438,9 +416,7 @@ def _dense_design_correction(X, R, cats, lambda_kb, n_batches):
         gram = design.T @ weighted_design
         gram[1:, 1:] += np.diag(np.where(active, lambda_kb[:, cluster], 0))
         W = np.zeros((n_batches + 1, X.shape[1]), dtype=X.dtype)
-        W[retained] = np.linalg.solve(
-            gram[np.ix_(retained, retained)], (weighted_design.T @ X)[retained]
-        )
+        W[retained] = np.linalg.solve(gram[np.ix_(retained, retained)], (weighted_design.T @ X)[retained])
         W[0] = 0
         expected -= R[:, cluster, None] * (design @ W)
     return expected
@@ -547,21 +523,15 @@ def test_harmony_extreme_batch_keeps_the_others(big, mixed):
 
     def run(method):
         adata = ad.AnnData(obs=obs, obsm={"X_pca": X})
-        rsc.pp.harmony_integrate(
-            adata, "batch", n_clusters=2, sigma=0.01, correction_method=method, rng=0
-        )
+        rsc.pp.harmony_integrate(adata, "batch", n_clusters=2, sigma=0.01, correction_method=method, rng=0)
         return adata.obsm["X_pca_harmony"][X[:, 0] != big]
 
     np.testing.assert_allclose(run("batched"), run("fast"), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-@pytest.mark.parametrize(
-    ("n_covariates", "n_cells"), [(2, 31), (3, 31), (4, 31), (2, 1_000_000)]
-)
-def test_harmony_multikey_correction_matches_dense_design(
-    dtype, n_covariates, n_cells, monkeypatch
-):
+@pytest.mark.parametrize(("n_covariates", "n_cells"), [(2, 31), (3, 31), (4, 31), (2, 1_000_000)])
+def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n_cells, monkeypatch):
     rng = np.random.default_rng(734)
     levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
@@ -586,15 +556,9 @@ def test_harmony_multikey_correction_matches_dense_design(
     order = np.argsort(joint_codes_np, kind="stable")
     cats_np, X_np, R_np = cats_np[order], X_np[order], R_np[order]
     joint_codes_np = joint_codes_np[order]
-    joint_offsets = np.searchsorted(
-        joint_codes_np, np.arange(len(joint_cats_np) + 1)
-    ).astype(np.int32)
-    marginal = sorted(
-        (level, joint) for joint, levels in enumerate(joint_cats_np) for level in levels
-    )
-    marginal_offsets = np.searchsorted(
-        [level for level, _ in marginal], np.arange(n_batches + 1)
-    ).astype(np.int32)
+    joint_offsets = np.searchsorted(joint_codes_np, np.arange(len(joint_cats_np) + 1)).astype(np.int32)
+    marginal = sorted((level, joint) for joint, levels in enumerate(joint_cats_np) for level in levels)
+    marginal_offsets = np.searchsorted([level for level, _ in marginal], np.arange(n_batches + 1)).astype(np.int32)
 
     def correct(normalize=False):
         return _correction_multi(
@@ -608,9 +572,7 @@ def test_harmony_multikey_correction_matches_dense_design(
                 _rhs_bounds(cp.asarray(X_np), joint_offsets),
             ),
             marginal_joint_offsets=cp.asarray(marginal_offsets),
-            marginal_joint_indices=cp.asarray(
-                [joint for _, joint in marginal], dtype=cp.int32
-            ),
+            marginal_joint_indices=cp.asarray([joint for _, joint in marginal], dtype=cp.int32),
             normalize=normalize,
         )
 
@@ -630,9 +592,7 @@ def test_harmony_multikey_correction_matches_dense_design(
     chunked = correct()  # chunks continue the sums in the output
     cp.testing.assert_allclose(chunked, cp.asarray(expected), atol=atol, rtol=atol)
     expected /= np.linalg.norm(expected, axis=1, keepdims=True)
-    cp.testing.assert_allclose(
-        correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol
-    )
+    cp.testing.assert_allclose(correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -992,12 +952,8 @@ def _repeatability_adata(dtype, n_pcs=17):
 @pytest.mark.parametrize("kmeans_cells_per_cluster", [5000, 1])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("n_pcs", [17, 300])
-def test_harmony_integrate_repeats_bitwise(
-    monkeypatch, key, kmeans_cells_per_cluster, dtype, n_pcs
-):
-    monkeypatch.setattr(
-        harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", kmeans_cells_per_cluster
-    )
+def test_harmony_integrate_repeats_bitwise(monkeypatch, key, kmeans_cells_per_cluster, dtype, n_pcs):
+    monkeypatch.setattr(harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", kmeans_cells_per_cluster)
     outputs = []
     for _ in range(2):
         adata = _repeatability_adata(dtype, n_pcs)
@@ -1062,9 +1018,7 @@ def test_harmony_bfloat16_assignments(n_clusters):
         ("harmony1", 50.0, 20, 0.1, {"key": ["batch", "second"]}),
     ],
 )
-def test_harmony_large_theta_stays_finite(
-    monkeypatch, *, flavor, theta, n_clusters, sigma, kwargs
-):
+def test_harmony_large_theta_stays_finite(monkeypatch, *, flavor, theta, n_clusters, sigma, kwargs):
     # theta=200 takes float32 penalties of evenly mixed batches to about
     # 0.5**200, far below the smallest float: log-space penalties keep the
     # assignments and the objective finite (sigma=0.02: shifted per row).
@@ -1114,10 +1068,7 @@ def test_harmony_shuffle_chunk_size():
     exact = _integrate(shuffle_chunk_size=1)
     assert exact.tobytes() == _integrate(shuffle_chunk_size=1).tobytes()
     assert exact.tobytes() != _integrate(shuffle_chunk_size=8).tobytes()
-    assert (
-        _integrate(shuffle_chunk_size=8.0).tobytes()
-        == _integrate(shuffle_chunk_size=8).tobytes()
-    )
+    assert _integrate(shuffle_chunk_size=8.0).tobytes() == _integrate(shuffle_chunk_size=8).tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -1155,9 +1106,7 @@ def test_harmony_small_host_input_stages_its_rows(monkeypatch):
 def test_harmony_auto_batched_in_cluster_chunks(monkeypatch, dtype):
     # The batched workspace of 3 of the 7 clusters (37 batches x 17 PCs x 16
     # bytes each) fits the limit: no fast correction, chunks of 3 clusters.
-    monkeypatch.setattr(
-        harmony_module, "_CORRECTION_WORKSPACE_LIMIT_BYTES", 3 * 37 * 17 * 16
-    )
+    monkeypatch.setattr(harmony_module, "_CORRECTION_WORKSPACE_LIMIT_BYTES", 3 * 37 * 17 * 16)
     monkeypatch.setattr(harmony_module, "_correction_fast", None)
     passes = []
     batched = harmony_module._correction_batched_cuda.correction_batched
@@ -1196,9 +1145,7 @@ def test_harmony_bfloat16_falls_back_to_float32():
         ("batch", 50, 64, {"dtype": np.float64}),
     ],
 )
-def test_harmony_cluster_blocks_match_fused(
-    monkeypatch, *, key, n_pcs, n_clusters, kwargs
-):
+def test_harmony_cluster_blocks_match_fused(monkeypatch, *, key, n_pcs, n_clusters, kwargs):
     # The cluster-block path (more than 128 clusters) gives the bits of the
     # single-block one.
     X = np.random.default_rng(3).standard_normal((480, n_pcs)).astype(np.float32)
@@ -1206,9 +1153,7 @@ def test_harmony_cluster_blocks_match_fused(
     def run():
         adata = _repeatability_adata(np.float32)
         adata.obsm["X_pca"] = X
-        rsc.pp.harmony_integrate(
-            adata, key, rng=734, n_clusters=n_clusters, max_iter_harmony=2, **kwargs
-        )
+        rsc.pp.harmony_integrate(adata, key, rng=734, n_clusters=n_clusters, max_iter_harmony=2, **kwargs)
         return adata.obsm["X_pca_harmony"]
 
     fused = run()
@@ -1229,9 +1174,7 @@ def test_harmony_cluster_blocks_match_fused(
         ("float32", 50, ["batch", "fine"]),
     ],
 )
-def test_harmony_fused_tiles_of_several_groups(
-    monkeypatch, cells_per_sm, dtype, n_pcs, key
-):
+def test_harmony_fused_tiles_of_several_groups(monkeypatch, cells_per_sm, dtype, n_pcs, key):
     # One block of 160 cells per SM: tiles of two or three groups of 64 rows
     # with one or two CTAs per SM (T4, float64: one); 480 per SM: the tiles of
     # large blocks (three groups, or one with one CTA per SM). Centroids are
@@ -1285,9 +1228,7 @@ def test_harmony_multikey_workspace_is_per_level(monkeypatch):
     shapes = _workspace_shapes(monkeypatch)
     monkeypatch.setattr(harmony_module, "_KEEP_BLOCK_COUNTS", True)
     adata = _repeatability_adata(np.float32)
-    rsc.pp.harmony_integrate(
-        adata, ["batch", "fine"], rng=734, n_clusters=300, max_iter_harmony=1
-    )
+    rsc.pp.harmony_integrate(adata, ["batch", "fine"], rng=734, n_clusters=300, max_iter_harmony=1)
     n_blocks, n_slots = 20, harmony_module._clustering_cuda.assign_slots(itemsize=4)
     (shape,) = shapes
     assert shape["block_counts"] == (n_blocks + 3, 5 + 37, 300)
@@ -1322,18 +1263,12 @@ def test_harmony_clustering_workspace_is_bounded(monkeypatch):
         (["batch", "fine"], np.float32, 300, 0.01),
     ],
 )
-def test_harmony_recounted_block_counts_are_exact(
-    monkeypatch, key, dtype, n_clusters, block_proportion
-):
+def test_harmony_recounted_block_counts_are_exact(monkeypatch, key, dtype, n_clusters, block_proportion):
     # Block counts recounted from R give the bits of the kept ones.
     outputs = []
     for keep in (True, False):
         monkeypatch.setattr(harmony_module, "_KEEP_BLOCK_COUNTS", keep)
-        outputs.append(
-            _integrate(
-                dtype, key=key, n_clusters=n_clusters, block_proportion=block_proportion
-            )
-        )
+        outputs.append(_integrate(dtype, key=key, n_clusters=n_clusters, block_proportion=block_proportion))
     assert outputs[0].tobytes() == outputs[1].tobytes()
 
 
@@ -1343,9 +1278,7 @@ def test_harmony_recounted_block_counts_are_exact(
 def test_harmony_cluster_blocks_on_few_slots(monkeypatch, key, n_slots):
     # A scratch of one or three CTAs: they claim every tile, with the same bits.
     expected = _integrate(key=key, n_clusters=300)
-    monkeypatch.setattr(
-        harmony_module._clustering_cuda, "assign_slots", lambda itemsize: n_slots
-    )
+    monkeypatch.setattr(harmony_module._clustering_cuda, "assign_slots", lambda itemsize: n_slots)
     assert _integrate(key=key, n_clusters=300).tobytes() == expected.tobytes()
 
 
@@ -1359,9 +1292,7 @@ def test_harmony_many_clusters(key, dtype):
     outputs = []
     for _ in range(2):
         adata = _repeatability_adata(np.float32)
-        rsc.pp.harmony_integrate(
-            adata, key, dtype=dtype, rng=734, n_clusters=300, max_iter_harmony=2
-        )
+        rsc.pp.harmony_integrate(adata, key, dtype=dtype, rng=734, n_clusters=300, max_iter_harmony=2)
         outputs.append(adata.obsm["X_pca_harmony"])
     assert np.isfinite(outputs[0]).all()
     assert outputs[0].tobytes() == outputs[1].tobytes()

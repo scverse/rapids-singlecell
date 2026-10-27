@@ -89,9 +89,7 @@ def test_scatter_add(dtype, n_rows, n_categories):
     outputs = []
     for _ in range(2):
         out = cp.zeros((n_categories, n_cols), dtype=dtype)
-        scatter_add = partial(
-            _cl.scatter_add, values, categories=categories, out=out, workspace=workspace
-        )
+        scatter_add = partial(_cl.scatter_add, values, categories=categories, out=out, workspace=workspace)
         scatter_add()
         outputs.append(out.copy())
     with pytest.raises(ValueError, match="scatter workspace is too small"):
@@ -206,9 +204,7 @@ def test_draw_blocks_split_invariant():
         return out
 
     full = blocks(0, n)
-    cp.testing.assert_array_equal(
-        full, cp.concatenate([blocks(0, 2 * unit), blocks(2 * unit, n)])
-    )
+    cp.testing.assert_array_equal(full, cp.concatenate([blocks(0, 2 * unit), blocks(2 * unit, n)]))
     whole = n // unit * unit
     per_unit = cp.bincount(cp.arange(whole) // unit * n_blocks + full[:whole])
     assert (per_unit == unit // n_blocks).all()
@@ -228,22 +224,15 @@ def test_group_absmax_is_exact_and_split_invariant(dtype):
     def absmax(lo, hi):
         out = cp.full((4, 7), 9, dtype=dtype)
         seg_start, seg_group = _segments(np.clip(offsets, lo, hi) - lo)
-        _cbat.group_absmax(
-            cp.asarray(X[lo:hi]), seg_start=seg_start, seg_group=seg_group, out=out
-        )
+        _cbat.group_absmax(cp.asarray(X[lo:hi]), seg_start=seg_start, seg_group=seg_group, out=out)
         return cp.asnumpy(out)
 
     expected = np.stack(
-        [
-            np.abs(X[a:b]).max(0) if b > a else np.zeros(7, dtype)
-            for a, b in zip(offsets[:-1], offsets[1:])
-        ]
+        [np.abs(X[a:b]).max(0) if b > a else np.zeros(7, dtype) for a, b in zip(offsets[:-1], offsets[1:], strict=True)]
     )
     whole = absmax(0, 9000)
     np.testing.assert_array_equal(whole, expected)
-    np.testing.assert_array_equal(
-        np.maximum(absmax(0, 4096), absmax(4096, 9000)), whole
-    )
+    np.testing.assert_array_equal(np.maximum(absmax(0, 4096), absmax(4096, 9000)), whole)
 
 
 # ---------- fused initialization (assignment kernels) ----------
@@ -256,9 +245,7 @@ def test_group_absmax_is_exact_and_split_invariant(dtype):
 @pytest.mark.parametrize("n_pcs", [50, 1023])
 @pytest.mark.parametrize("n_keys", [1, 2])
 @pytest.mark.parametrize("stabilized", [True, False])
-def test_fused_initialize_matches_reference(
-    n_clusters, force_blocks, large, n_pcs, n_keys, *, stabilized
-):
+def test_fused_initialize_matches_reference(n_clusters, force_blocks, large, n_pcs, n_keys, *, stabilized):
     # One unpenalized assignment pass over the update blocks: R is the
     # softmax of -2/sigma (1 - z.y), O its column sums per batch level,
     # E = Pr_b x column sums, plus the objective. Large: one block of 384
@@ -282,9 +269,7 @@ def test_fused_initialize_matches_reference(
     joints = joints.astype(cp.int32)
     joint_cats = cp.stack([joint_ids // 400, 3 + joint_ids % 400], axis=1)
     codes = cp.stack([codes // 400, 3 + codes % 400], axis=1)[:, :n_keys]
-    Pr_b = (cp.bincount(codes.ravel(), minlength=n_batches) / n_cells).astype(
-        cp.float32
-    )
+    Pr_b = (cp.bincount(codes.ravel(), minlength=n_batches) / n_cells).astype(cp.float32)
     theta = 0.5 + 2 * rng.random(n_batches, dtype=cp.float32)  # per level
     n_blocks = -(-n_cells // block_size)
     n_groups = n_batches if n_keys == 1 else 1  # the tiles' groups
@@ -385,7 +370,7 @@ def test_fused_initialize_matches_reference(
     Y = R0.T @ Z64
     sim = Z64 @ (Y / cp.linalg.norm(Y, axis=1, keepdims=True)).T
     starts = block_cat_offsets[: n_blocks * n_groups + 1 : n_groups].tolist()
-    blocks = [idx_list[a:b] for a, b in zip(starts, starts[1:])]
+    blocks = [idx_list[a:b] for a, b in zip(starts, starts[1:], strict=False)]
     old = [counts(R0[c], codes[c]) for c in blocks]
     total, new, R_ref = sum(old), [], cp.empty_like(R0)
     for b, c in enumerate(blocks):

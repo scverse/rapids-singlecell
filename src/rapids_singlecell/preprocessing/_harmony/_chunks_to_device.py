@@ -1,6 +1,8 @@
-"""Chunked copies between the host and the GPU: the cells uploaded in sorted
-order and the result downloaded, through pinned chunks that several host
-threads fill or drain."""
+"""Chunked copies between the host and the GPU.
+
+The cells are uploaded in sorted order and the result downloaded, through pinned chunks that several host threads
+fill or drain.
+"""
 
 from __future__ import annotations
 
@@ -14,9 +16,11 @@ _UPLOAD_THREADS = 8
 
 
 def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
-    """``Z[order]`` on the GPU. Host input is staged in pinned chunks by
-    several threads while the previous chunk is copied, and placed directly,
-    so no unsorted device copy is kept."""
+    """``Z[order]`` on the GPU.
+
+    Host input is staged in pinned chunks by several threads while the previous chunk is copied, and placed
+    directly, so no unsorted device copy is kept.
+    """
     if isinstance(Z, cp.ndarray):
         return Z[order]
     n, d = Z.shape
@@ -25,10 +29,7 @@ def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
     position = cp.empty_like(order)
     position[order] = cp.arange(order.size)
     stream = cp.cuda.get_current_stream()
-    slots = [
-        [_pinned(rows, d, Z.dtype), cp.empty((rows, d), dtype=Z.dtype), None]
-        for _ in range(2)
-    ]
+    slots = [[_pinned(rows, d, Z.dtype), cp.empty((rows, d), dtype=Z.dtype), None] for _ in range(2)]
     with ThreadPoolExecutor(_UPLOAD_THREADS) as pool:
         for j, a in enumerate(range(0, n, rows)):
             b = min(n, a + rows)
@@ -45,7 +46,9 @@ def _sorted_device_copy(Z, order: cp.ndarray) -> cp.ndarray:
 
 def _staging_rows(n: int, row_bytes: int) -> int:
     """Rows per pinned staging chunk: about 1/32 of the data, 64-256 MiB.
-    Pinning costs time on first use; every chunk costs a host sync."""
+
+    Pinning costs time on first use; every chunk costs a host sync.
+    """
     chunk = min(_UPLOAD_BYTES, max(_UPLOAD_BYTES >> 2, n * row_bytes >> 5))
     return max(1, min(n, chunk // row_bytes))
 
@@ -64,8 +67,10 @@ def _parallel_copy(pool: ThreadPoolExecutor, dst: np.ndarray, src: np.ndarray) -
 
 
 def _download(src: cp.ndarray, out: np.ndarray) -> None:
-    """``out[...] = src`` through pinned chunks: the next chunk is copied from
-    the GPU while host threads move the previous one into ``out``."""
+    """``out[...] = src`` through pinned chunks.
+
+    The next chunk is copied from the GPU while host threads move the previous one into ``out``.
+    """
     n, d = src.shape
     rows = _staging_rows(n, d * src.itemsize)
     stream = cp.cuda.get_current_stream()

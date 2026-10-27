@@ -29,8 +29,6 @@ from ._helper import (
 from ._kmeans import _FUSED_MAX_CLUSTERS, _kmeans
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     import pandas as pd
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -79,7 +77,7 @@ def harmonize(
     batch_prune_threshold: float | None = 1e-5,
     verbose: bool = False,
     bfloat16: bool = False,
-) -> cp.array:
+) -> cp.ndarray:
     """
     Integrate data using Harmony algorithm.
 
@@ -205,9 +203,7 @@ def harmonize(
     except (TypeError, ValueError, OverflowError):
         valid = False
     if not valid:
-        raise ValueError(
-            f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size!r}."
-        )
+        raise ValueError(f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size!r}.")
     shuffle_chunk_size = int(shuffle_chunk_size)
     if not np.isfinite(sigma) or sigma <= 0:
         raise ValueError(f"sigma must be a finite positive number, got {sigma}.")
@@ -217,15 +213,11 @@ def harmonize(
         raise ValueError(f"Unknown colsum_algo {colsum_algo!r}.")
     n_cells = Z.shape[0]
     if n_cells > 2**31 - 2**24:  # int32 cell indices, with room to round up
-        raise ValueError(
-            f"harmonize supports at most {2**31 - 2**24} cells, got {n_cells}."
-        )
+        raise ValueError(f"harmonize supports at most {2**31 - 2**24} cells, got {n_cells}.")
 
     rng = np.random.default_rng(rng)
     # Process batch information
-    n_levels, N_b, joint, offsets, order = _sort_by_batch(
-        batch_mat, batch_key, n_cells=n_cells, dtype=Z.dtype, rng=rng
-    )
+    n_levels, N_b, joint, offsets, order = _sort_by_batch(batch_mat, batch_key, n_cells=n_cells, dtype=Z.dtype, rng=rng)
     n_covariates, n_batches = n_levels.size, int(n_levels.sum())
     n_groups = len(offsets) - 1  # batches, or joint categories with several keys
     # The sorted cells' groups, allocated before the upload (faster with a
@@ -279,9 +271,7 @@ def harmonize(
             f"or batches x clusters (or PCs), got {pairs}; raise block_proportion "
             "or use fewer batch levels."
         )
-    if bfloat16 and not (
-        n_covariates == 1 and dtype == np.float32 and correction_method == "batched"
-    ):
+    if bfloat16 and not (n_covariates == 1 and dtype == np.float32 and correction_method == "batched"):
         warnings.warn(
             "dtype='bfloat16' needs one batch key and the batched correction; "
             "using float32 assignments instead (twice the assignment memory).",
@@ -443,9 +433,11 @@ def _sort_by_batch(
     dtype: np.dtype,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, cp.ndarray, dict, np.ndarray, cp.ndarray]:
-    """The levels of each key, the cells per level, the joint categories with
-    several keys (else empty), and the offsets (host) and order of the cells
-    sorted by group (batch, or joint category with several keys)."""
+    """Sort the cells by group (batch, or joint category with several keys).
+
+    Returns the levels of each key, the cells per level, the joint categories with several keys (else empty), and
+    the offsets (host) and order of the sorted cells.
+    """
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates, n_batches = int(n_levels.size), int(n_levels.sum())
     # Several keys solve a dense float64 system over all their levels per
@@ -464,8 +456,7 @@ def _sort_by_batch(
         joint_cats, groups = _factorize_joint_codes(batch_codes, n_levels)
         if joint_cats.size > 2**31 - 2**24:  # int32 (category, key) positions
             raise ValueError(
-                f"harmonize supports at most {2**31 - 2**24} joint categories x "
-                f"keys, got {joint_cats.size}."
+                f"harmonize supports at most {2**31 - 2**24} joint categories x keys, got {joint_cats.size}."
             )
         counts = cp.zeros(joint_cats.shape[0], dtype=cp.int32)
         cp.add.at(counts, groups, 1)
@@ -485,9 +476,7 @@ def _sort_by_batch(
     return n_levels, N_b.astype(dtype), joint, offsets, order
 
 
-def _choose_method(
-    Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_method: str | None
-) -> str:
+def _choose_method(Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_method: str | None) -> str:
     """The correction method (with a warning where the choice is replaced)."""
     n_covariates, n_batches = n_levels.size, int(n_levels.sum())
     if correction_method not in {None, "fast", "original", "batched"}:
@@ -524,18 +513,21 @@ def _choose_method(
 
 
 def _assignment_args(R: cp.ndarray, dtype) -> dict:
-    """Pass R to the CUDA modules; bfloat16 R (stored as uint16) travels as
-    ``R_bf16`` next to a placeholder ``R``."""
+    """Pass R to the CUDA modules.
+
+    bfloat16 R (stored as uint16) travels as ``R_bf16`` next to a placeholder ``R``.
+    """
     if R.dtype == cp.uint16:
         return {"R": cp.empty((1, R.shape[1]), dtype=dtype), "R_bf16": R}
     return {"R": R}
 
 
 def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
-    """Bounds of the exact right-hand side sums (segment_gemm.cuh): the
-    exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells
-    (sorted by group, ``offsets`` on the host) and PC d, so no other group or
-    PC coarsens a sum."""
+    """Bounds of the exact right-hand side sums (segment_gemm.cuh).
+
+    The exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells (sorted by group, ``offsets`` on
+    the host) and PC d, so no other group or PC coarsens a sum.
+    """
     seg_start, seg_group = _segments(offsets)  # any single-group segments
     maxima = cp.empty((len(offsets) - 1, Z.shape[1]), dtype=Z.dtype)
     _correction_batched_cuda.group_absmax(
@@ -547,8 +539,7 @@ def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
     )
     if not bool(cp.isfinite(maxima).all()):
         raise ValueError(
-            "Input data contains NaN or infinite values. Please handle these "
-            "before running harmony_integrate."
+            "Input data contains NaN or infinite values. Please handle these before running harmony_integrate."
         )
     n = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None]
     bounds = n * maxima  # beyond float64 near 1e308: n < 2^a, max < 2^b
@@ -557,13 +548,12 @@ def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
     return exp.astype(cp.int16)
 
 
-def _segments(
-    offsets: np.ndarray, unit: int = _SEGMENT
-) -> tuple[cp.ndarray, cp.ndarray]:
-    """Segments of the exact sums over cells sorted by group (``offsets`` on
-    the host): runs of one group cut at multiples of _SEGMENT and of ``unit``
-    (the block draw's units, where several GPUs split the cells). Start rows
-    (and the end), and the group of each segment."""
+def _segments(offsets: np.ndarray, unit: int = _SEGMENT) -> tuple[cp.ndarray, cp.ndarray]:
+    """Segments of the exact sums over cells sorted by group (``offsets`` on the host).
+
+    Runs of one group cut at multiples of _SEGMENT and of ``unit`` (the block draw's units, where several GPUs split
+    the cells). Start rows (and the end), and the group of each segment.
+    """
     start = np.union1d(offsets, np.arange(0, offsets[-1], _SEGMENT))
     start = np.union1d(start, np.arange(0, offsets[-1], unit))
     group = np.searchsorted(offsets, start[:-1], side="right") - 1
@@ -571,8 +561,10 @@ def _segments(
 
 
 def _sorted_groups(offsets: np.ndarray) -> cp.ndarray:
-    """The groups of the sorted cells (``offsets`` on the host): the sum of a 1
-    at the first cell of every later group."""
+    """The groups of the sorted cells (``offsets`` on the host).
+
+    The sum of a 1 at the first cell of every later group.
+    """
     n_cells, starts = int(offsets[-1]), offsets[1:]
     groups = cp.zeros(n_cells, dtype=cp.int32)
     cp.add.at(groups, cp.asarray(starts[starts < n_cells]), 1)
@@ -581,8 +573,10 @@ def _sorted_groups(offsets: np.ndarray) -> cp.ndarray:
 
 
 def _block_layout(n_total: int, n_blocks: int, shuffle_chunk: int) -> tuple[int, int]:
-    """Shuffle runs and units of the block draw (see _draw_blocks): about
-    _BLOCK_UNITS units, each dealing every block the same share."""
+    """Shuffle runs and units of the block draw (see _draw_blocks).
+
+    About _BLOCK_UNITS units, each dealing every block the same share.
+    """
     chunk = max(1, min(shuffle_chunk, n_total // n_blocks))
     step = n_blocks * chunk
     return chunk, step * -(-n_total // (step * _BLOCK_UNITS))
@@ -598,9 +592,11 @@ def _draw_blocks(
     unit: int,
     workspace: dict,
 ) -> None:
-    """Draw the update blocks of a harmonize call into the workspace's
-    ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here);
-    ``chunk`` and ``unit`` from _block_layout."""
+    """Draw the update blocks of a harmonize call into the workspace.
+
+    Writes ``idx_list`` and ``block_cat_offsets`` (sort scratch only lives here); ``chunk`` and ``unit`` come from
+    _block_layout.
+    """
     n = groups.size
     _clustering_cuda.draw_blocks(
         groups,
@@ -609,9 +605,7 @@ def _draw_blocks(
         idx_list_alt=cp.empty(n, dtype=cp.int32),
         sort_keys=cp.empty(n, dtype=cp.uint32),
         sort_keys_alt=cp.empty(n, dtype=cp.uint32),
-        cub_temp=cp.empty(
-            _clustering_cuda.get_cub_sort_temp_bytes(n_cells=n), dtype=cp.uint8
-        ),
+        cub_temp=cp.empty(_clustering_cuda.get_cub_sort_temp_bytes(n_cells=n), dtype=cp.uint8),
         n_groups=n_groups,
         n_blocks=n_blocks,
         unit=unit,
@@ -628,8 +622,7 @@ def _kmeans_centroids(
     n_clusters: int,
     rng: np.random.Generator,
 ) -> cp.ndarray:
-    """Normalized k-means centroids of a stratified sample of the normalized
-    sorted cells."""
+    """Normalized k-means centroids of a stratified sample of the normalized sorted cells."""
     # Fit only the initialization sample, retaining every observed stratum.
     n_cells = Z_norm.shape[0]
     n_init_cells = min(n_cells, _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
@@ -653,8 +646,10 @@ def _allocate_clustering_workspace(
     n_stored: int,
     dtype: cp.dtype,
 ) -> dict:
-    """Buffers of the clustering loop. The tiles' groups are the batches, or
-    one group for several keys; counts are kept per batch level."""
+    """Buffers of the clustering loop.
+
+    The tiles' groups are the batches, or one group for several keys; counts are kept per batch level.
+    """
     workspace = {
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and their scale.
@@ -664,9 +659,7 @@ def _allocate_clustering_workspace(
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
         "objective_partials": cp.empty(n_cells + 8, dtype=dtype),
         # Block-group offsets, then the assignment tiles of one block.
-        "block_cat_offsets": cp.empty(
-            n_blocks * n_groups + 1 + n_groups + 1, dtype=cp.int32
-        ),
+        "block_cat_offsets": cp.empty(n_blocks * n_groups + 1 + n_groups + 1, dtype=cp.int32),
         # Fixed-point counts of each block (the blocks are fixed per harmonize
         # call) or three recounted ones, of O, and two slots of new counts.
         "block_counts": cp.empty((n_stored + 3, n_batches, n_clusters), dtype=cp.int64),
@@ -771,8 +764,10 @@ def _correction_multi(
     output: cp.ndarray | None = None,
     normalize: bool = False,
 ) -> cp.ndarray:
-    """Apply the exact general-design correction in bounded cluster chunks to
-    cells sorted by joint category (``segments`` as for _correction_batched)."""
+    """Apply the exact general-design correction in bounded cluster chunks.
+
+    The cells are sorted by joint category (``segments`` as for _correction_batched).
+    """
     seg_start, seg_group, bounds = segments
     Z = _correction_output(X, output)
     _correction_batched_cuda.correction_multi(
@@ -811,8 +806,7 @@ def _multi_correction_cluster_chunk_size(
     n_joint_categories: int,
     itemsize: int,
 ) -> int:
-    """Choose a cluster chunk that keeps multi-key scratch below 1 GiB (one
-    cluster at a time above that)."""
+    """Choose a cluster chunk that keeps multi-key scratch below 1 GiB (one cluster at a time above that)."""
     nb1 = n_batches + 1
     # Double Gram and RHS with the solver's copies, joint right-hand sides
     # (double) and coefficients, exact joint sums, and joint counts. The chunk
@@ -894,10 +888,9 @@ def _correction_batched(
     output: cp.ndarray | None = None,
     normalize: bool = False,
 ) -> cp.ndarray:
-    """
-    Batched correction of cells sorted by batch, as many clusters per pass as
-    fit in 1 GiB of workspace: right-hand sides and the correction over
-    ``segments`` (see _segments, plus the right-hand side bounds).
+    """Batched correction of cells sorted by batch, as many clusters per pass as fit in 1 GiB of workspace.
+
+    Right-hand sides and the correction over ``segments`` (see _segments, plus the right-hand side bounds).
     """
     seg_start, seg_group, bounds = segments
     n_pcs, n_clusters, n_batches = X.shape[1], R.shape[1], len(bounds)
@@ -922,8 +915,10 @@ def _correction_batched(
 
 
 def _batched_cluster_chunk(n_pcs: int, n_batches: int, itemsize: int) -> int:
-    """Clusters per pass of the batched correction whose right-hand sides,
-    coefficients and exact sums fit in 1 GiB (0: not even one)."""
+    """Clusters per pass of the batched correction that fit in 1 GiB (0: not even one).
+
+    Counts their right-hand sides, coefficients and exact sums.
+    """
     per_cluster = n_batches * n_pcs * (2 * itemsize + 8 * _limbs(itemsize))
     return _CORRECTION_WORKSPACE_LIMIT_BYTES // per_cluster
 

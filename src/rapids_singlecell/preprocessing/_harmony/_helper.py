@@ -27,17 +27,15 @@ def _normalize_cp(X: cp.ndarray, *, out: cp.ndarray | None = None) -> cp.ndarray
         out = cp.empty_like(X)
     else:
         _validate_output_buffer(X, out, operation="Normalization")
-    _clustering_cuda.l2_row_normalize(
-        X, dst=out, stream=cp.cuda.get_current_stream().ptr
-    )
+    _clustering_cuda.l2_row_normalize(X, dst=out, stream=cp.cuda.get_current_stream().ptr)
     return out
 
 
-def _get_batch_codes(
-    batch_mat: pd.DataFrame, batch_key: str | list[str]
-) -> tuple[cp.ndarray, np.ndarray]:
-    """Encode each batch variable into a disjoint range of marginal codes
-    (device ``int32``, one column per variable)."""
+def _get_batch_codes(batch_mat: pd.DataFrame, batch_key: str | list[str]) -> tuple[cp.ndarray, np.ndarray]:
+    """Encode each batch variable into a disjoint range of marginal codes.
+
+    The codes are device ``int32``, one column per variable.
+    """
     keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
     if not keys:
         raise ValueError("batch_key must contain at least one column name")
@@ -66,8 +64,7 @@ def _get_batch_codes(
 def _factorize_joint_codes(
     batch_codes: np.ndarray | cp.ndarray, n_levels: np.ndarray
 ) -> tuple[np.ndarray | cp.ndarray, np.ndarray | cp.ndarray]:
-    """Factorize marginal category tuples in lexicographic order, on the
-    device of ``batch_codes``."""
+    """Factorize marginal category tuples in lexicographic order, on the device of ``batch_codes``."""
     xp = cp.get_array_module(batch_codes)
     levels = np.asarray(n_levels, dtype=np.int64)
     if batch_codes.ndim != 2 or batch_codes.shape[1] != levels.size:
@@ -77,9 +74,7 @@ def _factorize_joint_codes(
     for level in levels:
         joint_cardinality *= int(level)
         if joint_cardinality > np.iinfo(np.int64).max:
-            joint_cats, joint_codes = np.unique(
-                cp.asnumpy(batch_codes), axis=0, return_inverse=True
-            )
+            joint_cats, joint_codes = np.unique(cp.asnumpy(batch_codes), axis=0, return_inverse=True)
             return xp.asarray(joint_cats), xp.asarray(joint_codes).reshape(-1)
 
     offsets = np.empty(levels.size, dtype=np.int64)

@@ -263,10 +263,10 @@ cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
     if (D <= 0 || K <= 0 || ldr < K) return cudaErrorInvalidValue;
     if (reinterpret_cast<size_t>(R) % sizeof(RT))
         return cudaErrorMisalignedAddress;
-    int dev, optin;
+    int dev, smem_max;
     if (cudaGetDevice(&dev) ||
-        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                               dev))
+        cudaDeviceGetAttribute(&smem_max,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin, dev))
         return cudaGetLastError();
     // 96 KB: opt-in limit of sm_86, sm_89, sm_120 (sm_75: 64 KB). Speed only:
     // W resident if it fits, else in the largest chunks.
@@ -274,7 +274,7 @@ cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
     return detail::launch(X, R, ldr, W, w_k_stride, w_group_stride, D, K,
                           seg_start, seg_group, n_seg, normalize, resume,
                           finish, Z, slots, K,
-                          std::min<size_t>(96 * 1024, optin), s);
+                          std::min<size_t>(96 * 1024, smem_max), s);
 }
 
 }  // namespace harmony_apply

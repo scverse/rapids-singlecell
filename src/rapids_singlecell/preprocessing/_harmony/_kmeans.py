@@ -14,14 +14,13 @@ _FUSED_MAX_CLUSTERS = 128  # fused distance kernels: exact squared distances
 
 
 def _fused_distances(X, n_clusters: int) -> bool:
-    """Whether the fused distance kernels fit: at most 128 centers and their
-    shared memory (centers plus staged rows, see kmeans_assign)."""
+    """Whether the fused distance kernels fit.
+
+    At most 128 centers and their shared memory (centers plus staged rows, see kmeans_assign).
+    """
     cols = -(-X.shape[1] // 4) * 4
     smem = cols * (_FUSED_MAX_CLUSTERS + 8 * 8) * X.itemsize
-    return (
-        n_clusters <= _FUSED_MAX_CLUSTERS
-        and smem <= cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
-    )
+    return n_clusters <= _FUSED_MAX_CLUSTERS and smem <= cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
 
 
 _refine_squared_distances = cp.ElementwiseKernel(
@@ -79,9 +78,7 @@ def _assign_labels(X, centers, *, squared_norms, labels, minimum):
     rows = max(1, _ASSIGNMENT_BATCH_BYTES // (centers.shape[0] * X.itemsize))
     for begin in range(0, X.shape[0], rows):
         end = min(begin + rows, X.shape[0])
-        distances = _squared_distances(
-            X[begin:end], centers, squared_norms=squared_norms[begin:end]
-        )
+        distances = _squared_distances(X[begin:end], centers, squared_norms=squared_norms[begin:end])
         batch_labels = cp.argmin(distances, axis=1).astype(cp.int32)
         labels[begin:end] = batch_labels
         minimum[begin:end] = distances[cp.arange(end - begin), batch_labels]
@@ -101,9 +98,7 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
     uniforms = cp.asarray(deepcopy(rng).random(n_clusters - 1))
     n_draws = cp.zeros(1, dtype=cp.int32)
     weight_tile_rows = _clustering_cuda.KMEANS_WEIGHT_TILE_ROWS
-    totals = cp.empty(
-        (n_rows + weight_tile_rows - 1) // weight_tile_rows, dtype=cp.float64
-    )
+    totals = cp.empty((n_rows + weight_tile_rows - 1) // weight_tile_rows, dtype=cp.float64)
     fused = _fused_distances(X, n_clusters)
     for cluster in range(n_clusters):
         if fused:
@@ -114,9 +109,7 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
                 stream=cp.cuda.get_current_stream().ptr,
             )
         else:
-            candidate = _squared_distances(
-                X, centers[cluster : cluster + 1], squared_norms=squared_norms
-            ).ravel()
+            candidate = _squared_distances(X, centers[cluster : cluster + 1], squared_norms=squared_norms).ravel()
             cp.minimum(closest, candidate, out=closest)
         if cluster + 1 < n_clusters:
             _clustering_cuda.select_kmeans_center(

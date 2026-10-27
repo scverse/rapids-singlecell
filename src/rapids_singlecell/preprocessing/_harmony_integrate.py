@@ -215,9 +215,7 @@ def harmony_integrate(
     if dtype is not None:
         dtype = np.dtype(dtype).newbyteorder("=")
         if dtype not in (np.float32, np.float64):
-            raise ValueError(
-                f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}."
-            )
+            raise ValueError(f"dtype must be float32, float64, 'bfloat16' or None, got {dtype}.")
 
     from ._harmony import harmonize
     from ._harmony._chunks_to_device import _download
