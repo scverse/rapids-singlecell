@@ -471,7 +471,7 @@ def _sort_by_batch(
     # (waiting for the GPU) before the sort is queued.
     offsets = np.zeros(counts.size + 1, dtype=np.int32)
     np.cumsum(counts.get(), out=offsets[1:])
-    keys = cp.random.default_rng(int(rng.integers(2**63))).random(n_cells)
+    keys = cp.random.default_rng(_seed_from_rng(rng, allow_none=False)).random(n_cells)
     order = cp.argsort(groups.astype(cp.float64) + keys)
     return n_levels, N_b.astype(dtype), joint, offsets, order
 
