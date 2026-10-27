@@ -52,9 +52,7 @@ def paul15_means() -> pd.DataFrame:
 
 class TestInvalidBehavior:
     def test_not_adata(self, interactions: Interactions_t):
-        with pytest.raises(
-            TypeError, match=r"Expected `adata` to be of type `anndata.AnnData`"
-        ):
+        with pytest.raises(TypeError, match=r"Expected `adata` to be of type `anndata.AnnData`"):
             ligrec(None, _CK, interactions=interactions)
 
     def test_adata_no_raw(self, adata: AnnData, interactions: Interactions_t):
@@ -66,33 +64,23 @@ class TestInvalidBehavior:
         with pytest.raises(KeyError, match=r"Cluster key `foobar` not found"):
             ligrec(adata, cluster_key="foobar", interactions=interactions)
 
-    def test_cluster_key_is_not_categorical(
-        self, adata: AnnData, interactions: Interactions_t
-    ):
+    def test_cluster_key_is_not_categorical(self, adata: AnnData, interactions: Interactions_t):
         adata.obs[_CK] = adata.obs[_CK].astype("string")
-        with pytest.raises(
-            TypeError, match=rf"Expected `adata.obs\[{_CK!r}\]` to be `categorical`"
-        ):
+        with pytest.raises(TypeError, match=rf"Expected `adata.obs\[{_CK!r}\]` to be `categorical`"):
             ligrec(adata, _CK, interactions=interactions)
 
     def test_only_1_cluster(self, adata: AnnData, interactions: Interactions_t):
         adata.obs["foo"] = 1
         adata.obs["foo"] = adata.obs["foo"].astype("category")
-        with pytest.raises(
-            ValueError, match=r"Expected at least `2` clusters, found `1`."
-        ):
+        with pytest.raises(ValueError, match=r"Expected at least `2` clusters, found `1`."):
             ligrec(adata, "foo", interactions=interactions)
 
     def test_invalid_complex_policy(self, adata: AnnData, interactions: Interactions_t):
-        with pytest.raises(
-            ValueError, match=r"Invalid option `'foobar'` for `ComplexPolicy`."
-        ):
+        with pytest.raises(ValueError, match=r"Invalid option `'foobar'` for `ComplexPolicy`."):
             ligrec(adata, _CK, interactions=interactions, complex_policy="foobar")
 
     def test_invalid_fdr_axis(self, adata: AnnData, interactions: Interactions_t):
-        with pytest.raises(
-            ValueError, match=r"Invalid option `foobar` for `CorrAxis`."
-        ):
+        with pytest.raises(ValueError, match=r"Invalid option `foobar` for `CorrAxis`."):
             ligrec(
                 adata,
                 _CK,
@@ -115,9 +103,7 @@ class TestInvalidBehavior:
         with pytest.raises(KeyError, match=r"Column .* is not in `interactions`."):
             ligrec(adata, _CK, interactions={"source": ["foo"], "bar": ["bar"]})
 
-    def test_invalid_interactions_dataframe(
-        self, adata: AnnData, interactions: Interactions_t
-    ):
+    def test_invalid_interactions_dataframe(self, adata: AnnData, interactions: Interactions_t):
         df = pd.DataFrame(interactions, columns=["foo", "target"])
         with pytest.raises(KeyError, match=r"Column .* is not in `interactions`."):
             ligrec(adata, _CK, interactions=df)
@@ -126,13 +112,9 @@ class TestInvalidBehavior:
         with pytest.raises(KeyError, match=r"Column .* is not in `interactions`."):
             ligrec(adata, _CK, interactions=df)
 
-    def test_interactions_invalid_sequence(
-        self, adata: AnnData, interactions: Interactions_t
-    ):
+    def test_interactions_invalid_sequence(self, adata: AnnData, interactions: Interactions_t):
         interactions += ("foo", "bar", "bar")  # type: ignore
-        with pytest.raises(
-            ValueError, match=r"Not all interactions are of length `2`."
-        ):
+        with pytest.raises(ValueError, match=r"Not all interactions are of length `2`."):
             ligrec(adata, _CK, interactions=interactions)
 
     def test_interactions_only_invalid_names(self, adata: AnnData):
@@ -144,12 +126,8 @@ class TestInvalidBehavior:
             ligrec(adata, _CK, interactions=interactions, clusters=["foo"])
 
     def test_invalid_clusters_mix(self, adata: AnnData, interactions: Interactions_t):
-        with pytest.raises(
-            ValueError, match=r"Expected a `tuple` of length `2`, found `3`."
-        ):
-            ligrec(
-                adata, _CK, interactions=interactions, clusters=["foo", ("bar", "baz")]
-            )
+        with pytest.raises(ValueError, match=r"Expected a `tuple` of length `2`, found `3`."):
+            ligrec(adata, _CK, interactions=interactions, clusters=["foo", ("bar", "baz")])
 
 
 class TestValidBehavior:
@@ -171,9 +149,7 @@ class TestValidBehavior:
             copy=True,
         )
 
-        np.testing.assert_array_equal(
-            np.where(np.isnan(rc["pvalues"])), np.where(np.isnan(ri["pvalues"]))
-        )
+        np.testing.assert_array_equal(np.where(np.isnan(rc["pvalues"])), np.where(np.isnan(ri["pvalues"])))
         mask = np.isnan(rc["pvalues"])
 
         assert not np.allclose(rc["pvalues"].values[mask], ri["pvalues"].values[mask])
@@ -215,9 +191,7 @@ class TestValidBehavior:
         assert isinstance(r["metadata"], pd.DataFrame)
 
     @pytest.mark.parametrize("fdr_method", [None, "fdr_bh"])
-    def test_pvals_in_correct_range(
-        self, adata: AnnData, interactions: Interactions_t, fdr_method: str | None
-    ):
+    def test_pvals_in_correct_range(self, adata: AnnData, interactions: Interactions_t, fdr_method: str | None):
         r = ligrec(
             adata,
             _CK,
@@ -261,9 +235,7 @@ class TestValidBehavior:
             _ = r["metadata"].sparse
 
         np.testing.assert_array_equal(r["metadata"].columns, ["metadata"])
-        np.testing.assert_array_equal(
-            r["metadata"]["metadata"], interactions["metadata"]
-        )
+        np.testing.assert_array_equal(r["metadata"]["metadata"], interactions["metadata"])
 
     def test_paul15_correct_means(self, paul15: AnnData, paul15_means: pd.DataFrame):
         res = ligrec(
@@ -278,9 +250,7 @@ class TestValidBehavior:
 
         np.testing.assert_array_equal(res["means"].index, paul15_means.index)
         np.testing.assert_array_equal(res["means"].columns, paul15_means.columns)
-        np.testing.assert_allclose(
-            res["means"].values, paul15_means.values, rtol=1e-5, atol=1e-6
-        )
+        np.testing.assert_allclose(res["means"].values, paul15_means.values, rtol=1e-5, atol=1e-6)
 
     def test_non_uniqueness(self, adata: AnnData, interactions: Interactions_t):
         # add complexes
@@ -317,12 +287,6 @@ class TestValidBehavior:
             gene_symbols="gene_ids",
         )
 
-        np.testing.assert_array_equal(
-            res["means"].index, pd.MultiIndex.from_tuples(interactions)
-        )
-        np.testing.assert_array_equal(
-            res["pvalues"].index, pd.MultiIndex.from_tuples(interactions)
-        )
-        np.testing.assert_array_equal(
-            res["metadata"].index, pd.MultiIndex.from_tuples(interactions)
-        )
+        np.testing.assert_array_equal(res["means"].index, pd.MultiIndex.from_tuples(interactions))
+        np.testing.assert_array_equal(res["pvalues"].index, pd.MultiIndex.from_tuples(interactions))
+        np.testing.assert_array_equal(res["metadata"].index, pd.MultiIndex.from_tuples(interactions))

@@ -43,8 +43,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
     table_key: str | None = None,
     dtype: np.dtype | type = np.float32,
 ) -> pd.DataFrame | None:
-    """\
-    Identify spatially variable genes with *Sepal*.
+    """Identify spatially variable genes with *Sepal*.
 
     *Sepal* simulates a diffusion process to quantify spatial structure in
     tissue :cite:`andersson2021`. This is a GPU port of :func:`squidpy.gr.sepal`
@@ -111,9 +110,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
     _assert_connectivity_key(adata, connectivity_key)
     _assert_spatial_basis(adata, key=spatial_key)
     if max_neighs not in (4, 6):
-        raise ValueError(
-            f"Expected `max_neighs` to be either `4` or `6`, found `{max_neighs}`."
-        )
+        raise ValueError(f"Expected `max_neighs` to be either `4` or `6`, found `{max_neighs}`.")
     dtype = np.dtype(dtype)
     if dtype not in (np.float32, np.float64):
         raise ValueError(f"`dtype` must be float32 or float64, found `{dtype}`.")
@@ -131,13 +128,9 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
     degrees = cp.diff(g.indptr)
     max_n = int(degrees.max())
     if max_n != max_neighs:
-        raise ValueError(
-            f"Expected `max_neighs={max_neighs}`, found node with `{max_n}` neighbors."
-        )
+        raise ValueError(f"Expected `max_neighs={max_neighs}`, found node with `{max_n}` neighbors.")
 
-    spatial = cp.ascontiguousarray(
-        cp.asarray(adata.obsm[spatial_key], dtype=cp.float64)[:, :2]
-    )
+    spatial = cp.ascontiguousarray(cp.asarray(adata.obsm[spatial_key], dtype=cp.float64)[:, :2])
     nbrs, ctr, n_sat = _compute_idxs(g, degrees, spatial, max_neighs)
 
     vals, genes = _extract_expression(adata, genes=genes, use_raw=use_raw, layer=layer)
@@ -159,9 +152,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
     sepal_score = pd.DataFrame(score, index=genes, columns=[key_added])
 
     if sepal_score[key_added].isna().any():
-        logg.warning(
-            "Found `NaN` in sepal scores, consider increasing `n_iter` to a higher value"
-        )
+        logg.warning("Found `NaN` in sepal scores, consider increasing `n_iter` to a higher value")
     sepal_score = sepal_score.sort_values(by=key_added, ascending=False)
 
     if copy:
@@ -174,6 +165,7 @@ def sepal(  # noqa: PLR0917 (squidpy's positional signature)
         time=start,
         deep=f"Adding `adata.uns[{key_added!r}]`",
     )
+    return None
 
 
 def _assert_non_empty_sequence(seq, *, name: str) -> list:
@@ -185,17 +177,13 @@ def _assert_non_empty_sequence(seq, *, name: str) -> list:
     return res
 
 
-def _extract_expression(
-    adata: AnnData, *, genes: Sequence[str], use_raw: bool, layer: str | None
-):
+def _extract_expression(adata: AnnData, *, genes: Sequence[str], use_raw: bool, layer: str | None):
     if use_raw and adata.raw is None:
         logg.warning("AnnData object has no attribute `raw`. Setting `use_raw=False`")
         use_raw = False
     if use_raw:
         raw_names = set(adata.raw.var_names)
-        genes = _assert_non_empty_sequence(
-            [gene for gene in genes if gene in raw_names], name="genes"
-        )
+        genes = _assert_non_empty_sequence([gene for gene in genes if gene in raw_names], name="genes")
         return adata.raw.X[:, adata.raw.var_names.get_indexer(genes)], genes
     idx = adata.var_names.get_indexer(genes)
     if (idx < 0).any():
@@ -321,7 +309,5 @@ def _compute_idxs(
     ctr = cp.arange(degrees.shape[0], dtype=cp.int32)
     ctr[unsat] = nearest
     # (max_neighs, n_cells): coalesced loads of the m-th neighbour
-    nbrs = cp.ascontiguousarray(
-        indices[indptr[ctr][None, :] + cp.arange(sat_thresh, dtype=cp.int32)[:, None]]
-    )
+    nbrs = cp.ascontiguousarray(indices[indptr[ctr][None, :] + cp.arange(sat_thresh, dtype=cp.int32)[:, None]])
     return nbrs, ctr, int(sat.shape[0])

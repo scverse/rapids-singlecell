@@ -21,8 +21,8 @@ def flag_gene_family(
     gene_family_prefix: str = None,
     gene_list: list = None,
 ) -> None:
-    """
-    Flags a gene or gene_family in .var with boolean. (e.g all mitochondrial genes).
+    """Flags a gene or gene_family in .var with boolean. (e.g all mitochondrial genes).
+
     Please only choose gene_family prefix or gene_list
 
     Parameters
@@ -45,13 +45,9 @@ def flag_gene_family(
 
     """
     if gene_family_prefix is not None:
-        adata.var[gene_family_name] = cp.asnumpy(
-            adata.var.index.str.startswith(gene_family_prefix)
-        ).ravel()
+        adata.var[gene_family_name] = cp.asnumpy(adata.var.index.str.startswith(gene_family_prefix)).ravel()
     if gene_list is not None:
-        adata.var[gene_family_name] = cp.asnumpy(
-            adata.var.index.isin(gene_list)
-        ).ravel()
+        adata.var[gene_family_name] = cp.asnumpy(adata.var.index.isin(gene_list)).ravel()
 
 
 def filter_genes(
@@ -64,8 +60,7 @@ def filter_genes(
     inplace: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """\
-    Filter genes based on number of cells or counts.
+    """Filter genes based on number of cells or counts.
 
     Keep genes that have at least `min_counts` counts or are expressed in at
     least `min_cells` cells or have at most `max_counts` counts or are expressed
@@ -104,13 +99,10 @@ def filter_genes(
         Depending on what was thresholded (`counts` or `cells`), the array stores
         `n_counts` or `n_cells` per gene.
     """
-    n_given_options = sum(
-        option is not None for option in [min_cells, min_counts, max_cells, max_counts]
-    )
+    n_given_options = sum(option is not None for option in [min_cells, min_counts, max_cells, max_counts])
     if n_given_options != 1:
         msg = (
-            "Only provide one of the optional parameters `min_counts`, "
-            "`min_cells`, `max_counts`, `max_cells` per call."
+            "Only provide one of the optional parameters `min_counts`, `min_cells`, `max_counts`, `max_cells` per call."
         )
         raise ValueError(msg)
 
@@ -123,11 +115,7 @@ def filter_genes(
     _, sums_genes, _, n_cells_per_gene = _basic_qc(X=X)
     min_number = min_counts if min_cells is None else min_cells
     max_number = max_counts if max_cells is None else max_cells
-    number_per_gene = (
-        n_cells_per_gene
-        if (min_cells is not None or max_cells is not None)
-        else sums_genes
-    )
+    number_per_gene = n_cells_per_gene if (min_cells is not None or max_cells is not None) else sums_genes
     if min_number is not None:
         gene_subset = number_per_gene >= min_number
     if max_number is not None:
@@ -139,18 +127,10 @@ def filter_genes(
             msg = f"filtered out {s} genes that are detected "
             if min_cells is not None or min_counts is not None:
                 msg += "in less than "
-                msg += (
-                    f"{min_cells} cells"
-                    if min_counts is None
-                    else f"{min_counts} counts"
-                )
+                msg += f"{min_cells} cells" if min_counts is None else f"{min_counts} counts"
             if max_cells is not None or max_counts is not None:
                 msg += "in more than "
-                msg += (
-                    f"{max_cells} cells"
-                    if max_counts is None
-                    else f"{max_counts} counts"
-                )
+                msg += f"{max_cells} cells" if max_counts is None else f"{max_counts} counts"
             print(msg)
 
     if isinstance(data, AnnData) and inplace:
@@ -159,6 +139,7 @@ def filter_genes(
         data._inplace_subset_var(gene_subset.get())
     else:
         return gene_subset.get(), number_per_gene.get()
+    return None
 
 
 def filter_cells(
@@ -171,8 +152,7 @@ def filter_cells(
     inplace: bool = True,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """\
-    Filter cell outliers based on counts and numbers of genes expressed.
+    """Filter cell outliers based on counts and numbers of genes expressed.
 
     For instance, only keep cells with at least `min_counts` counts or
     `min_genes` genes expressed. This is to filter measurement outliers,
@@ -229,28 +209,25 @@ def filter_cells(
     >>> sc.pp.filter_cells(adata, min_genes=0)
     >>> adata.n_obs
     640
-    >>> int(adata.obs['n_genes'].min())
+    >>> int(adata.obs["n_genes"].min())
     1
     >>> # filter manually
-    >>> adata_copy = adata[adata.obs['n_genes'] >= 3]
+    >>> adata_copy = adata[adata.obs["n_genes"] >= 3]
     >>> adata_copy.n_obs
     554
-    >>> int(adata_copy.obs['n_genes'].min())
+    >>> int(adata_copy.obs["n_genes"].min())
     3
     >>> # actually do some filtering
     >>> sc.pp.filter_cells(adata, min_genes=3)
     >>> adata.n_obs
     554
-    >>> int(adata.obs['n_genes'].min())
+    >>> int(adata.obs["n_genes"].min())
     3
     """
-    n_given_options = sum(
-        option is not None for option in [min_genes, min_counts, max_genes, max_counts]
-    )
+    n_given_options = sum(option is not None for option in [min_genes, min_counts, max_genes, max_counts])
     if n_given_options != 1:
         msg = (
-            "Only provide one of the optional parameters `min_counts`, "
-            "`min_genes`, `max_counts`, `max_genes` per call."
+            "Only provide one of the optional parameters `min_counts`, `min_genes`, `max_counts`, `max_genes` per call."
         )
         raise ValueError(msg)
     if isinstance(data, AnnData):
@@ -262,11 +239,7 @@ def filter_cells(
     sums_cells, _, n_genes_per_cell, _ = _basic_qc(X=X)
     min_number = min_counts if min_genes is None else min_genes
     max_number = max_counts if max_genes is None else max_genes
-    number_per_cell = (
-        n_genes_per_cell
-        if (min_genes is not None or max_genes is not None)
-        else sums_cells
-    )
+    number_per_cell = n_genes_per_cell if (min_genes is not None or max_genes is not None) else sums_cells
 
     if min_number is not None:
         cell_subset = number_per_cell >= min_number
@@ -279,18 +252,10 @@ def filter_cells(
             msg = f"filtered out {s} cells that have "
             if min_genes is not None or min_counts is not None:
                 msg += "less than "
-                msg += (
-                    f"{min_genes} genes expressed"
-                    if min_counts is None
-                    else f"{min_counts} counts"
-                )
+                msg += f"{min_genes} genes expressed" if min_counts is None else f"{min_counts} counts"
             if max_genes is not None or max_counts is not None:
                 msg += "more than "
-                msg += (
-                    f"{max_genes} genes expressed"
-                    if max_counts is None
-                    else f"{max_counts} counts"
-                )
+                msg += f"{max_genes} genes expressed" if max_counts is None else f"{max_counts} counts"
             print(msg)
 
     if isinstance(data, AnnData) and inplace:
@@ -299,6 +264,7 @@ def filter_cells(
         data._inplace_subset_obs(cell_subset.get())
     else:
         return cell_subset.get(), number_per_cell.get()
+    return None
 
 
 def filter_highly_variable(adata: AnnData) -> None:

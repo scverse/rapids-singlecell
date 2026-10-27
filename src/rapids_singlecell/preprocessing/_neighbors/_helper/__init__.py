@@ -43,31 +43,23 @@ def _check_neighbors_X(
     """
     if cp_sparse.issparse(X) or sc_sparse.issparse(X):
         if algorithm != "brute":
-            raise ValueError(
-                f"Sparse input is not supported for {algorithm} algorithm. Use 'brute' instead."
-            )
+            raise ValueError(f"Sparse input is not supported for {algorithm} algorithm. Use 'brute' instead.")
         X_contiguous = X.tocsr()
     # all_neighbors moves X itself once batching is resolved
-    elif algorithm in ["mg_ivfflat", "mg_ivfpq"] or (
-        algorithm == "all_neighbors" and isinstance(X, np.ndarray)
-    ):
+    elif algorithm in ["mg_ivfflat", "mg_ivfpq"] or (algorithm == "all_neighbors" and isinstance(X, np.ndarray)):
         if isinstance(X, np.ndarray):
             X_contiguous = np.asarray(X, order="C", dtype=np.float32)
         elif isinstance(X, cp.ndarray):
             X_contiguous = cp.ascontiguousarray(X, dtype=cp.float32).get()
         else:
-            raise TypeError(
-                "Unsupported type for X. Expected ndarray or sparse matrix."
-            )
+            raise TypeError("Unsupported type for X. Expected ndarray or sparse matrix.")
     else:
         if isinstance(X, np.ndarray):
             X_contiguous = cp.asarray(X, order="C", dtype=np.float32)
         elif isinstance(X, cp.ndarray):
             X_contiguous = cp.ascontiguousarray(X, dtype=np.float32)
         else:
-            raise TypeError(
-                "Unsupported type for X. Expected ndarray or sparse matrix."
-            )
+            raise TypeError("Unsupported type for X. Expected ndarray or sparse matrix.")
 
     return X_contiguous
 
@@ -90,9 +82,7 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
         return True
     elif algorithm == "cagra":
         if metric not in ["euclidean", "sqeuclidean", "inner_product"]:
-            raise ValueError(
-                "cagra only supports 'euclidean', 'inner_product' and 'sqeuclidean' metrics."
-            )
+            raise ValueError("cagra only supports 'euclidean', 'inner_product' and 'sqeuclidean' metrics.")
     elif algorithm in ["ivfpq", "ivfflat", "mg_ivfflat", "mg_ivfpq"]:
         if metric not in ["euclidean", "sqeuclidean", "inner_product", "cosine"]:
             raise ValueError(
@@ -106,8 +96,7 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
     elif algorithm == "all_neighbors":
         if metric not in ["euclidean", "sqeuclidean", "cosine", "inner_product"]:
             raise ValueError(
-                "all_neighbors only supports 'euclidean', 'sqeuclidean', "
-                "'inner_product' and 'cosine' metrics."
+                "all_neighbors only supports 'euclidean', 'sqeuclidean', 'inner_product' and 'cosine' metrics."
             )
     else:
         raise NotImplementedError(f"The {algorithm} algorithm is not implemented yet.")

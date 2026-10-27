@@ -10,9 +10,7 @@
 ## Pseudobulk DE
 
 ```python
-pb = rsc.get.aggregate(
-    adata, by=["sample", "cell_type", "condition"], func="sum", layer="counts"
-)
+pb = rsc.get.aggregate(adata, by=["sample", "cell_type", "condition"], func="sum", layer="counts")
 pb.X = rsc.get.X_to_CPU(pb.layers.pop("sum"))
 n_cells = adata.obs.value_counts(["sample", "cell_type"]).rename("n_cells")
 pb.obs = pb.obs.join(n_cells, on=["sample", "cell_type"])

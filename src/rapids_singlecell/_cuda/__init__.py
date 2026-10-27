@@ -77,9 +77,7 @@ _preload_rapids_runtime_libs()
 # Modules whose CUDA kernels use device scratch. They allocate through a
 # CuPy-backed allocator injected here, so temporaries land on the caller's
 # current device resource (RMM pool / UVM aware) without linking librmm.
-_SCRATCH_MODULES = frozenset(
-    {"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"}
-)
+_SCRATCH_MODULES = frozenset({"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"})
 _scratch_allocator = None
 
 

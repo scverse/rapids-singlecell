@@ -220,9 +220,7 @@ def test_scanpy_v2_hvg_default_reaches_implementation(monkeypatch):
 
     monkeypatch.setattr(hvg_module, "_highly_variable_genes_seurat_v3", record_call)
     with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
-        rsc.pp.highly_variable_genes(
-            AnnData(np.ones((3, 2), dtype=np.float32)), n_top_genes=1
-        )
+        rsc.pp.highly_variable_genes(AnnData(np.ones((3, 2), dtype=np.float32)), n_top_genes=1)
 
     assert called["flavor"] == "seurat_v3_paper"
 
@@ -255,9 +253,7 @@ def test_scanpy_v2_rank_genes_groups_defaults():
 )
 @pytest.mark.parametrize("method", ["t-test", "wilcoxon"])
 @pytest.mark.parametrize("array_type", ["numpy", "scipy_csr", "cupy", "cupy_csr"])
-def test_rank_genes_groups_mean_in_log_space_default(
-    preset, expected_logfc, method, array_type
-):
+def test_rank_genes_groups_mean_in_log_space_default(preset, expected_logfc, method, array_type):
     n_genes = 5
     n_group = 30
     group_a = np.zeros((n_group, n_genes))
@@ -271,9 +267,7 @@ def test_rank_genes_groups_mean_in_log_space_default(
         "cupy_csr": lambda: cp_sparse.csr_matrix(cp.asarray(X)),
     }[array_type]()
     group = pd.Categorical(["a"] * n_group + ["b"] * n_group)
-    obs = pd.DataFrame(
-        {"group": group}, index=[f"cell_{i}" for i in range(2 * n_group)]
-    )
+    obs = pd.DataFrame({"group": group}, index=[f"cell_{i}" for i in range(2 * n_group)])
     adata = AnnData(X=X, obs=obs)
 
     with rsc.settings.override(preset=preset):

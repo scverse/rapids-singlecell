@@ -25,9 +25,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-CLICKHOUSE_URL = (
-    "https://sql-clickhouse.clickhouse.com/?user=demo&default_format=JSONEachRow"
-)
+CLICKHOUSE_URL = "https://sql-clickhouse.clickhouse.com/?user=demo&default_format=JSONEachRow"
 
 PACKAGES = [
     "rapids-singlecell",
@@ -70,20 +68,19 @@ def query(sql: str, *, attempts: int = MAX_ATTEMPTS, timeout: int = 60) -> list[
             return rows
         if attempt < attempts - 1:
             time.sleep(2**attempt)
-    raise RuntimeError(
-        f"ClickHouse query failed after {attempts} attempts: {last_error}"
-    )
+    raise RuntimeError(f"ClickHouse query failed after {attempts} attempts: {last_error}")
 
 
 def fetch_totals(projects: str) -> dict[str, int]:
+    """All-time downloads per project."""
     rows = query(
-        f"SELECT project, sum(count) AS total FROM pypi.pypi_downloads "
-        f"WHERE project IN ({projects}) GROUP BY project"
+        f"SELECT project, sum(count) AS total FROM pypi.pypi_downloads WHERE project IN ({projects}) GROUP BY project"
     )
     return {row["project"]: int(row["total"]) for row in rows}
 
 
 def fetch_recent(projects: str) -> tuple[dict[str, int], str]:
+    """Downloads per project over the last `RECENT_DAYS` days, and the latest date covered."""
     rows = query(
         f"SELECT project, sum(count) AS recent, max(date) AS latest "
         f"FROM pypi.pypi_downloads_per_day "
@@ -96,6 +93,7 @@ def fetch_recent(projects: str) -> tuple[dict[str, int], str]:
 
 
 def previous_value(previous: dict | None, package: str, key: str) -> int:
+    """Return the last published figure `key` for `package`, or 0 if there is none."""
     if previous is None:
         return 0
     return int(previous.get("packages", {}).get(package, {}).get(key, 0))
@@ -124,34 +122,24 @@ def collect(previous: dict | None = None) -> dict:
         recent, data_date, recent_error = {}, None, error
 
     if totals_error and recent_error:
-        raise RuntimeError(
-            f"all queries failed; totals: {totals_error}; recent: {recent_error}"
-        )
+        raise RuntimeError(f"all queries failed; totals: {totals_error}; recent: {recent_error}")
 
     if totals_error:
         if previous is None:
-            raise RuntimeError(
-                f"no previous data to fall back on; totals: {totals_error}"
-            )
+            raise RuntimeError(f"no previous data to fall back on; totals: {totals_error}")
         stale.append("total")
         warn(f"keeping previously published all-time totals: {totals_error}")
     if recent_error:
         if previous is None:
-            raise RuntimeError(
-                f"no previous data to fall back on; recent: {recent_error}"
-            )
+            raise RuntimeError(f"no previous data to fall back on; recent: {recent_error}")
         stale.append(RECENT_KEY)
         data_date = previous["data_date"]
         warn(f"keeping previously published {RECENT_DAYS}-day totals: {recent_error}")
 
     packages = {
         name: {
-            "total": previous_value(previous, name, "total")
-            if totals_error
-            else totals.get(name, 0),
-            RECENT_KEY: previous_value(previous, name, RECENT_KEY)
-            if recent_error
-            else recent.get(name, 0),
+            "total": previous_value(previous, name, "total") if totals_error else totals.get(name, 0),
+            RECENT_KEY: previous_value(previous, name, RECENT_KEY) if recent_error else recent.get(name, 0),
         }
         for name in PACKAGES
     }
@@ -181,6 +169,7 @@ def humanize(count: int) -> str:
 
 
 def write_badge(path: Path, label: str, count: int) -> None:
+    """Write a shields.io endpoint badge showing `count`."""
     path.write_text(
         json.dumps(
             {
@@ -212,11 +201,7 @@ def append_history(path: Path, report: dict) -> None:
     rows = []
     if path.exists():
         with path.open(newline="") as handle:
-            rows = [
-                row
-                for row in csv.DictReader(handle)
-                if row["date"] != report["data_date"]
-            ]
+            rows = [row for row in csv.DictReader(handle) if row["date"] != report["data_date"]]
 
     for name, entry in report["packages"].items():
         rows.append(
@@ -236,6 +221,7 @@ def append_history(path: Path, report: dict) -> None:
 
 
 def main() -> None:
+    """Collect the download numbers and write the report, badges and history."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output-dir",
@@ -250,9 +236,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     report_path.write_text(json.dumps(report, indent=2) + "\n")
-    write_badge(
-        args.output_dir / "badge-total.json", "downloads", report["combined"]["total"]
-    )
+    write_badge(args.output_dir / "badge-total.json", "downloads", report["combined"]["total"])
     write_badge(
         args.output_dir / "badge-month.json",
         "downloads/month",
@@ -264,8 +248,7 @@ def main() -> None:
         print(f"{name:28} {entry['total']:>9,} total  {entry[RECENT_KEY]:>7,} /30d")
     combined = report["combined"]
     print(
-        f"{'combined':28} {combined['total']:>9,} total  "
-        f"{combined[RECENT_KEY]:>7,} /30d  (as of {report['data_date']})"
+        f"{'combined':28} {combined['total']:>9,} total  {combined[RECENT_KEY]:>7,} /30d  (as of {report['data_date']})"
     )
     if report.get("stale"):
         print(f"note: carried over from the previous run: {', '.join(report['stale'])}")

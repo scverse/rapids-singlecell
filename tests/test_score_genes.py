@@ -25,12 +25,7 @@ def _create_random_gene_names(n_genes, name_length) -> NDArray[np.str_]:
     """
     creates a bunch of random gene names (just CAPS letters)
     """
-    return np.array(
-        [
-            "".join(map(chr, np.random.randint(65, 90, name_length)))
-            for _ in range(n_genes)
-        ]
-    )
+    return np.array(["".join(map(chr, np.random.randint(65, 90, name_length))) for _ in range(n_genes)])
 
 
 def _create_sparse_nan_matrix(rows, cols, percent_zero, percent_nan):
@@ -73,9 +68,7 @@ def test_score_with_reference(array_type):
 
     sc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_cpu")
     rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_gpu")
-    np.testing.assert_allclose(
-        adata.obs["Test_cpu"].to_numpy(), adata.obs["Test_gpu"].to_numpy()
-    )
+    np.testing.assert_allclose(adata.obs["Test_cpu"].to_numpy(), adata.obs["Test_gpu"].to_numpy())
 
 
 def test_add_score():
@@ -91,9 +84,7 @@ def test_add_score():
     # the actual genes names are all 6letters
     # create some non-estinsting names with 7 letters:
     non_existing_genes = _create_random_gene_names(n_genes=3, name_length=7)
-    some_genes = np.r_[
-        np.unique(np.random.choice(adata.var_names, 10)), np.unique(non_existing_genes)
-    ]
+    some_genes = np.r_[np.unique(np.random.choice(adata.var_names, 10)), np.unique(non_existing_genes)]
     rsc.tl.score_genes(adata, some_genes, score_name="Test")
     assert adata.obs["Test"].dtype == "float64"
 
@@ -141,9 +132,7 @@ def test_score_genes_sparse_vs_dense():
     rsc.tl.score_genes(adata_sparse, gene_list=gene_set, score_name="Test")
     rsc.tl.score_genes(adata_dense, gene_list=gene_set, score_name="Test")
 
-    np.testing.assert_allclose(
-        adata_sparse.obs["Test"].values, adata_dense.obs["Test"].values
-    )
+    np.testing.assert_allclose(adata_sparse.obs["Test"].values, adata_dense.obs["Test"].values)
 
 
 def test_score_genes_deplete():
@@ -237,11 +226,5 @@ def test_no_control_gene():
 def test_gene_list_is_control(ctrl_as_ref: bool):
     np.random.seed(0)
     adata = sc.datasets.blobs(n_variables=10, n_observations=100, n_centers=20)
-    with (
-        pytest.raises(RuntimeError, match=r"No control genes found in any cut")
-        if ctrl_as_ref
-        else nullcontext()
-    ):
-        rsc.tl.score_genes(
-            adata, gene_list="3", ctrl_size=1, n_bins=5, ctrl_as_ref=ctrl_as_ref
-        )
+    with pytest.raises(RuntimeError, match=r"No control genes found in any cut") if ctrl_as_ref else nullcontext():
+        rsc.tl.score_genes(adata, gene_list="3", ctrl_size=1, n_bins=5, ctrl_as_ref=ctrl_as_ref)

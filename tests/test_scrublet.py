@@ -93,12 +93,8 @@ def test_scrublet_batched_preserves_obs(monkeypatch, copy):
     from rapids_singlecell.preprocessing import _scrublet
 
     adata = AnnData(np.ones((4, 3)))
-    adata.obs["batch"] = pd.Categorical(
-        ["b", "a", "b", "a"], categories=["b", "a", "unused"], ordered=True
-    )
-    adata.obs["cell_type"] = pd.Categorical(
-        ["T", "B", "T", "B"], categories=["B", "T", "unused"]
-    )
+    adata.obs["batch"] = pd.Categorical(["b", "a", "b", "a"], categories=["b", "a", "unused"], ordered=True)
+    adata.obs["cell_type"] = pd.Categorical(["T", "B", "T", "B"], categories=["B", "T", "unused"])
     adata.obs["count"] = pd.array([1, None, 3, 4], dtype="Int64")
     original_obs = adata.obs.copy(deep=True)
 
@@ -110,9 +106,7 @@ def test_scrublet_batched_preserves_obs(monkeypatch, copy):
         return adata_obs
 
     monkeypatch.setattr(_scrublet, "_scrublet_call_doublets", fake_call_doublets)
-    result = rsc.pp.scrublet(
-        adata, adata_sim=adata.copy(), batch_key="batch", copy=copy, verbose=False
-    )
+    result = rsc.pp.scrublet(adata, adata_sim=adata.copy(), batch_key="batch", copy=copy, verbose=False)
     if copy:
         pd.testing.assert_frame_equal(adata.obs, original_obs)
     else:
@@ -179,9 +173,7 @@ def test_scrublet_data():
     adata_in = rsc.get.anndata_to_GPU(pbmc200(), copy=True)
     adata_obs = _preprocess_for_scrublet(adata_in)
     # Simulate doublets using the same parents
-    adata_sim = _create_sim_from_parents(
-        adata_obs, adata_scrublet_auto_sim.uns["scrublet"]["doublet_parents"]
-    )
+    adata_sim = _create_sim_from_parents(adata_obs, adata_scrublet_auto_sim.uns["scrublet"]["doublet_parents"])
 
     # Apply the same post-normalisation the Scrublet function would
     rsc.pp.normalize_total(adata_obs, target_sum=1e6)
@@ -240,9 +232,7 @@ def test_scrublet_params(scrub_small: AnnData, param: str, value: Any):
 
     Check that changes to parameters change scrublet results.
     """
-    curr = rsc.pp.scrublet(
-        adata=scrub_small, use_approx_neighbors=False, copy=True, **{param: value}
-    )
+    curr = rsc.pp.scrublet(adata=scrub_small, use_approx_neighbors=False, copy=True, **{param: value})
     with pytest.raises(AssertionError):
         assert_equal(scrub_small, curr)
 
@@ -260,9 +250,7 @@ def test_scrublet_simulate_doublets():
     _ = rsc.pp.highly_variable_genes(logged)
     adata_obs = adata_obs[:, logged.var["highly_variable"]]
 
-    adata_sim = rsc.pp.scrublet_simulate_doublets(
-        adata_obs, sim_doublet_ratio=0.02, layer="raw"
-    )
+    adata_sim = rsc.pp.scrublet_simulate_doublets(adata_obs, sim_doublet_ratio=0.02, layer="raw")
 
     assert_array_equal(
         adata_sim.obsm["doublet_parents"],
@@ -281,23 +269,17 @@ def test_subsample_counts_uses_seeded_gpu_rng(dtype):
     seed = int(expected_host_rng.integers(0, 2**32))
     expected_gpu_rng = cp.random.default_rng(seed)
     expected = matrix.copy()
-    expected.data = expected_gpu_rng.binomial(
-        cp.round(expected.data).astype(np.int64), rate
-    ).astype(dtype, copy=False)
+    expected.data = expected_gpu_rng.binomial(cp.round(expected.data).astype(np.int64), rate).astype(dtype, copy=False)
     expected_current_totals = expected.sum(axis=1).ravel()
     expected_unsampled_totals = expected_gpu_rng.binomial(
         cp.round(original_totals - expected_current_totals).astype(np.int64), rate
     ).astype(dtype, copy=False)
 
     rng = np.random.default_rng(17)
-    actual, actual_totals = subsample_counts(
-        matrix.copy(), rate=rate, original_totals=original_totals, rng=rng
-    )
+    actual, actual_totals = subsample_counts(matrix.copy(), rate=rate, original_totals=original_totals, rng=rng)
 
     cp.testing.assert_array_equal(actual.toarray(), expected.toarray())
-    cp.testing.assert_array_equal(
-        actual_totals, expected_current_totals + expected_unsampled_totals
-    )
+    cp.testing.assert_array_equal(actual_totals, expected_current_totals + expected_unsampled_totals)
     assert actual.dtype == dtype
     assert actual_totals.dtype == dtype
     assert rng.integers(0, 2**32) == expected_host_rng.integers(0, 2**32)

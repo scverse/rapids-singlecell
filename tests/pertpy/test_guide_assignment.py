@@ -105,13 +105,9 @@ def test_assign_to_max_guide(guide_adata: AnnData) -> None:
         max_val = row.max()
         if max_val >= 5:
             expected_guide = guide_adata.var_names[int(row.argmax())]
-            assert assigned.iloc[i] == expected_guide, (
-                f"Cell {i}: expected {expected_guide}, got {assigned.iloc[i]}"
-            )
+            assert assigned.iloc[i] == expected_guide, f"Cell {i}: expected {expected_guide}, got {assigned.iloc[i]}"
         else:
-            assert assigned.iloc[i] == "Negative", (
-                f"Cell {i}: expected Negative, got {assigned.iloc[i]}"
-            )
+            assert assigned.iloc[i] == "Negative", f"Cell {i}: expected Negative, got {assigned.iloc[i]}"
 
 
 def test_assign_to_max_guide_sparse(guide_adata_sparse: AnnData) -> None:
@@ -174,8 +170,7 @@ def test_mixture_model_separation(guide_adata: AnnData) -> None:
         has_guide = assigned.str.contains(guide_name, na=False)
         overlap = (high_count_cells & has_guide.values).sum()
         assert overlap / high_count_cells.sum() >= 0.8, (
-            f"Guide {guide_name}: only {overlap}/{high_count_cells.sum()} "
-            "high-count cells assigned"
+            f"Guide {guide_name}: only {overlap}/{high_count_cells.sum()} high-count cells assigned"
         )
 
 
@@ -243,9 +238,7 @@ def test_mixture_model_layer_is_honored(guide_adata: AnnData, layer_kind: str) -
     ga = rsc.ptg.GuideAssignment()
     with pytest.warns(UserWarning, match="No guides"):
         x_result = ga.assign_mixture_model(adata, only_return_results=True)
-    layer_result = ga.assign_mixture_model(
-        adata, layer="raw_guides", only_return_results=True
-    )
+    layer_result = ga.assign_mixture_model(adata, layer="raw_guides", only_return_results=True)
 
     assert (x_result == "negative").all()
     assert np.count_nonzero(layer_result != "negative") > 0
@@ -426,6 +419,4 @@ def test_multiple_guide_max_cap() -> None:
 
     assigned = adata.obs["assigned_guide"]
     # Some cells should be capped
-    assert (assigned == "too_many").any(), (
-        "Expected some cells capped at max assignments"
-    )
+    assert (assigned == "too_many").any(), "Expected some cells capped at max assignments"

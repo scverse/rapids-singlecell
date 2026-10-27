@@ -71,9 +71,7 @@ def test_query_set_named_background(query_net, factory, alternative):
     expected_pvals = []
     for source in result.index:
         (a, b), (c, d) = tables[source]
-        expected_pvals.append(
-            fisher_exact(tables[source], alternative=alternative).pvalue
-        )
+        expected_pvals.append(fisher_exact(tables[source], alternative=alternative).pvalue)
         np.testing.assert_allclose(
             result.loc[source, "stat"],
             np.log((a + 0.5) * (d + 0.5) / ((b + 0.5) * (c + 0.5))),
@@ -107,20 +105,14 @@ def test_query_set_named_background(query_net, factory, alternative):
 )
 def test_query_set_invalid_input(query_net, kwargs, error, match):
     with pytest.raises(error, match=match):
-        rsc.dcg.query_set(
-            net=query_net, tmin=3, **{"features": ["a", "outside"], **kwargs}
-        )
+        rsc.dcg.query_set(net=query_net, tmin=3, **{"features": ["a", "outside"], **kwargs})
 
 
 @pytest.mark.parametrize("alternative", ["greater", "less", "two-sided"])
-@pytest.mark.parametrize(
-    "background,count,size", [(10, 4, 5), (20, 20, 5), (20_000, 100, 150)]
-)
+@pytest.mark.parametrize("background,count,size", [(10, 4, 5), (20, 20, 5), (20_000, 100, 150)])
 def test_query_fisher_tails(alternative, background, count, size):
     a = np.arange(max(0, count + size - background), min(count, size) + 1)
-    actual = _fisher(
-        cp.asarray(a), count, size, background, alternative=alternative
-    ).get()
+    actual = _fisher(cp.asarray(a), count, size, background, alternative=alternative).get()
     expected = [
         fisher_exact(
             [

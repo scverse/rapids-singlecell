@@ -202,8 +202,7 @@ def harmony_integrate(
     # Warn when flavor-incompatible parameters are explicitly set
     if flavor == "harmony2" and ridge_lambda != 1.0:
         warnings.warn(
-            "ridge_lambda is ignored when flavor='harmony2'; "
-            "use alpha to control regularization strength.",
+            "ridge_lambda is ignored when flavor='harmony2'; use alpha to control regularization strength.",
             UserWarning,
             stacklevel=2,
         )
@@ -228,8 +227,7 @@ def harmony_integrate(
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:
         raise ValueError(
-            f"The specified basis '{basis}' is not available in adata.obsm. "
-            f"Available bases: {list(adata.obsm.keys())}"
+            f"The specified basis '{basis}' is not available in adata.obsm. Available bases: {list(adata.obsm.keys())}"
         )
 
     # Get the input data
@@ -262,9 +260,7 @@ def harmony_integrate(
 
         # Verify array is valid
         if cp.isnan(X).any():
-            raise ValueError(
-                "Input data contains NaN values. Please handle these before running harmony_integrate."
-            )
+            raise ValueError("Input data contains NaN values. Please handle these before running harmony_integrate.")
 
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e

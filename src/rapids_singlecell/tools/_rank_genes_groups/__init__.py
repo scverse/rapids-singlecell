@@ -17,18 +17,12 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 type _CorrMethod = Literal["benjamini-hochberg", "bonferroni"]
-type _Method = Literal[
-    "logreg", "t-test", "t-test_overestim_var", "wilcoxon", "wilcoxon_binned"
-]
+type _Method = Literal["logreg", "t-test", "t-test_overestim_var", "wilcoxon", "wilcoxon_binned"]
 
 
-def _matrix_to_records(
-    values: np.ndarray, group_names: Iterable[object], dtype: str | np.dtype
-) -> np.ndarray:
+def _matrix_to_records(values: np.ndarray, group_names: Iterable[object], dtype: str | np.dtype) -> np.ndarray:
     field_dtype = np.dtype(dtype)
-    record_dtype = np.dtype(
-        [(str(group_name), field_dtype) for group_name in group_names]
-    )
+    record_dtype = np.dtype([(str(group_name), field_dtype) for group_name in group_names])
     if values.shape[1] == 0:
         return np.empty(0, dtype=record_dtype)
     record_matrix = np.ascontiguousarray(values.T, dtype=field_dtype)
@@ -36,9 +30,7 @@ def _matrix_to_records(
     return np.ndarray(values.shape[1], dtype=record_dtype, buffer=record_matrix)
 
 
-def _array_result_to_records(
-    arrays: dict[str, object], field: str, dtype: str | np.dtype
-) -> np.ndarray:
+def _array_result_to_records(arrays: dict[str, object], field: str, dtype: str | np.dtype) -> np.ndarray:
     return _matrix_to_records(np.asarray(arrays[field]), arrays["group_names"], dtype)
 
 
@@ -67,9 +59,7 @@ def rank_genes_groups(
     use_continuity: bool = False,
     return_u_values: bool = False,
     layer: str | None = None,
-    mean_in_log_space: bool | Default = Default(
-        ("rank_genes_groups", "mean_in_log_space")
-    ),
+    mean_in_log_space: bool | Default = Default(("rank_genes_groups", "mean_in_log_space")),
     chunk_size: int | None = None,
     multi_gpu: bool | list[int] | str | None = None,
     n_bins: int | None = None,
@@ -265,8 +255,7 @@ def rank_genes_groups(
     if (
         multi_gpu is not None
         and multi_gpu is not False
-        and method
-        not in {"wilcoxon", "t-test", "t-test_overestim_var", "wilcoxon_binned"}
+        and method not in {"wilcoxon", "t-test", "t-test_overestim_var", "wilcoxon_binned"}
     ):
         msg = (
             "multi_gpu is only supported for method in {'wilcoxon', 't-test', "
@@ -352,9 +341,7 @@ def rank_genes_groups(
 
     groups_names = [str(name) for name in test_obj.groups_order]
     if test_obj.pts is not None:
-        adata.uns[key_added]["pts"] = pd.DataFrame(
-            test_obj.pts.T, index=test_obj.var_names, columns=groups_names
-        )
+        adata.uns[key_added]["pts"] = pd.DataFrame(test_obj.pts.T, index=test_obj.var_names, columns=groups_names)
     if test_obj.pts_rest is not None:
         adata.uns[key_added]["pts_rest"] = pd.DataFrame(
             test_obj.pts_rest.T, index=test_obj.var_names, columns=groups_names

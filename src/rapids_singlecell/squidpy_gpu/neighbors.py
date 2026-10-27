@@ -147,10 +147,12 @@ class GraphBuilderCSR(GraphBuilder[cp.ndarray, cp_sparse.csr_matrix], ABC):
     """
 
     def build(self, coords: cp.ndarray) -> CSRPair:
+        """Validate ``coords`` and build the ``(adjacency, distances)`` graphs."""
         return super().build(_validate_coordinates(coords))
 
     def combine(self, mats: Sequence[CSRPair], ixs: Sequence[int]) -> CSRPair:
-        adj, dst = (_block_diag(m) for m in zip(*mats))
+        """Stack per-library graphs block-diagonally, in the original observation order ``ixs``."""
+        adj, dst = (_block_diag(m) for m in zip(*mats, strict=False))
         ixs = cp.asarray(ixs)
         if bool((cp.diff(ixs) < 0).any()):
             order = cp.argsort(ixs)
@@ -356,6 +358,7 @@ class GridBuilder(_SpatialBuilder):
         super().__init__(transform, set_diag=set_diag)
 
     def build_graph(self, coords: cp.ndarray, codes: cp.ndarray | None = None):
+        """Build the ``n_rings``-hop grid graphs, independently within each library of ``codes``."""
         if self.delaunay:
             rows, cols = _delaunay_edges(coords, codes)
         else:
@@ -405,6 +408,7 @@ class DistanceIntervalPostprocessor:
         object.__setattr__(self, "interval", (lower, upper))
 
     def __call__(self, adj: CSR, dst: CSR) -> CSRPair:
+        """Prune the ``(adjacency, distances)`` pair."""
         lower, upper = self.interval
         # Compare in float64: a float32 bound 1 + 1e-8 would keep length 1.
         values = dst.data.astype(cp.float64, copy=False)
@@ -431,6 +435,7 @@ class PercentilePostprocessor:
         object.__setattr__(self, "percentile", percentile)
 
     def __call__(self, adj: CSR, dst: CSR, codes: cp.ndarray | None = None) -> CSRPair:
+        """Prune the ``(adjacency, distances)`` pair, per library of ``codes`` if given."""
         if not dst.nnz:
             return adj, dst
         if codes is None:
@@ -441,9 +446,7 @@ class PercentilePostprocessor:
             index = self.percentile / 100 * (sizes - 1.0)
             threshold = cp.empty(len(sizes), dtype=values.dtype)
             stream = cp.cuda.get_current_stream().ptr
-            _spatial_cuda.library_percentile(
-                index, values, starts, sizes, threshold, stream
-            )
+            _spatial_cuda.library_percentile(index, values, starts, sizes, threshold, stream)
             threshold = threshold[library]
         return _prune(adj, dst, dst.data > threshold)
 
@@ -466,6 +469,7 @@ class TransformPostprocessor:
         object.__setattr__(self, "transform", _transform(self.transform))
 
     def __call__(self, adj: CSR, dst: CSR) -> CSRPair:
+        """Transform the adjacency of the ``(adjacency, distances)`` pair."""
         adj.eliminate_zeros()
         dst.eliminate_zeros()
         if self.transform == "spectral":
@@ -491,16 +495,14 @@ def _block_diag(mats: Sequence[CSR]) -> CSR:
     offsets = np.cumsum([0, *(m.nnz for m in mats)])
     data = cp.concatenate([m.data for m in mats])
     # CuPy CSR stores int32 indices; Python-int offsets keep that dtype.
-    indices = cp.concatenate([m.indices + int(start) for m, start in zip(mats, sizes)])
+    indices = cp.concatenate([m.indices + int(start) for m, start in zip(mats, sizes, strict=False)])
     indptr = cp.concatenate(
         [
-            *(m.indptr[:-1] + int(start) for m, start in zip(mats, offsets)),
+            *(m.indptr[:-1] + int(start) for m, start in zip(mats, offsets, strict=False)),
             cp.asarray(offsets[-1:], dtype=cp.int32),
         ]
     )
-    return cp_sparse.csr_matrix(
-        (data, indices, indptr), shape=(int(sizes[-1]), int(sizes[-1]))
-    )
+    return cp_sparse.csr_matrix((data, indices, indptr), shape=(int(sizes[-1]), int(sizes[-1])))
 
 
 def _prune(adj: CSR, dst: CSR, outside: cp.ndarray, *, keep_diagonal=False) -> CSRPair:
@@ -536,7 +538,7 @@ def _sparse_product(left: CSR, right: Any, *, min_nnz: int) -> CSR:
     if len(bounds) == 2:
         product = _spgemm(left, right)
     else:
-        blocks = [_spgemm(left[a:b], right) for a, b in zip(bounds, bounds[1:])]
+        blocks = [_spgemm(left[a:b], right) for a, b in zip(bounds, bounds[1:], strict=False)]
         product = cp_sparse.vstack(blocks, "csr")
     if product.nnz < min_nnz:
         raise RuntimeError("cuSPARSE returned an incomplete sparse matrix product.")
@@ -553,9 +555,7 @@ def _spgemm(left: CSR, right: CSR) -> CSR:
             m.indices, m.indptr = m.indices.astype(cp.int64), m.indptr.astype(cp.int64)
         product = left @ right
         # The constructor restores int32 indices when they fit.
-        return cp_sparse.csr_matrix(
-            (product.data, product.indices, product.indptr), shape=product.shape
-        )
+        return cp_sparse.csr_matrix((product.data, product.indices, product.indptr), shape=product.shape)
 
 
 def _library_sort(values: cp.ndarray, library: cp.ndarray) -> tuple[cp.ndarray, ...]:
@@ -584,10 +584,7 @@ def _knn(coords: cp.ndarray, n_neighs: int, codes: cp.ndarray | None):
 
 def _validate_coordinates(coords: Any) -> cp.ndarray:
     coords = coords.to_numpy() if hasattr(coords, "to_numpy") else coords
-    if (
-        not isinstance(coords, (np.ndarray, cp.ndarray))
-        or coords.dtype.kind not in "iuf"
-    ):
+    if not isinstance(coords, (np.ndarray, cp.ndarray)) or coords.dtype.kind not in "iuf":
         raise TypeError("Spatial coordinates must be a dense array of real numbers.")
     coords = cp.asarray(coords, dtype=cp.float32, order="C")
     if coords.ndim != 2 or 0 in coords.shape:

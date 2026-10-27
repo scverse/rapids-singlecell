@@ -44,9 +44,7 @@ class PCA_sparse:
             covariance = _cov_sparse(x, return_gram=True)
             self.mean_ = None
 
-        self.explained_variance_, self.components_ = cp.linalg.eigh(
-            covariance, UPLO="U"
-        )
+        self.explained_variance_, self.components_ = cp.linalg.eigh(covariance, UPLO="U")
 
         # NOTE: We reverse the eigen vector and eigen values here
         # because cupy provides them in ascending order. Make a copy otherwise
@@ -58,18 +56,14 @@ class PCA_sparse:
 
         self.components_ = self.components_.T[: self.n_components_, :]
 
-        self.explained_variance_ratio_ = self.explained_variance_ / cp.sum(
-            self.explained_variance_
-        )
+        self.explained_variance_ratio_ = self.explained_variance_ / cp.sum(self.explained_variance_)
 
         self.explained_variance_ = self.explained_variance_[: self.n_components_]
         if not self.zero_center:
             # Gram eigenvalues are S**2; report S**2 / (n - 1) like PCA_sparse_svd
             self.explained_variance_ = self.explained_variance_ / (x.shape[0] - 1)
 
-        self.explained_variance_ratio_ = self.explained_variance_ratio_[
-            : self.n_components_
-        ]
+        self.explained_variance_ratio_ = self.explained_variance_ratio_[: self.n_components_]
 
         return self
 
@@ -87,9 +81,7 @@ class PCA_sparse:
     def _transform_cupy(self, X: spmatrix) -> spmatrix:
         if self.zero_center:
             precomputed_mean_impact = self.mean_ @ self.components_.T
-            mean_impact = cp.ones(
-                (X.shape[0], 1), dtype=cp.float32
-            ) @ precomputed_mean_impact.reshape(1, -1)
+            mean_impact = cp.ones((X.shape[0], 1), dtype=cp.float32) @ precomputed_mean_impact.reshape(1, -1)
             X_transformed = X.dot(self.components_.T) - mean_impact
         else:
             # Uncentered projection for truncated SVD
@@ -102,9 +94,7 @@ class PCA_sparse:
 
             def _transform(X_part, mean_, components_):
                 pre_mean = mean_ @ components_.T
-                mean_impact = cp.ones(
-                    (X_part.shape[0], 1), dtype=X_part.dtype
-                ) @ pre_mean.reshape(1, -1)
+                mean_impact = cp.ones((X_part.shape[0], 1), dtype=X_part.dtype) @ pre_mean.reshape(1, -1)
                 X_transformed = X_part.dot(components_.T) - mean_impact
                 return X_transformed
         else:
@@ -129,21 +119,13 @@ class PCA_sparse:
 
 
 @overload
-def _cov_sparse(
-    x: spmatrix | DaskArray, *, return_gram: Literal[False] = False
-) -> tuple[cp.ndarray, cp.ndarray]: ...
+def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: Literal[False] = False) -> tuple[cp.ndarray, cp.ndarray]: ...
 @overload
-def _cov_sparse(
-    x: spmatrix | DaskArray, *, return_gram: Literal[True]
-) -> cp.ndarray: ...
+def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: Literal[True]) -> cp.ndarray: ...
 
 
-def _cov_sparse(
-    x: spmatrix | DaskArray, *, return_gram: bool = False
-) -> cp.ndarray | tuple[cp.ndarray, cp.ndarray]:
-    """
-    Computes the mean and the covariance of matrix X of
-    the form Cov(X, X) = E(XX) - E(X)E(X)
+def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.ndarray | tuple[cp.ndarray, cp.ndarray]:
+    """Computes the mean and the covariance of matrix X of the form Cov(X, X) = E(XX) - E(X)E(X)
 
     This is a temporary fix for
     cuml issue #5475 and cupy issue #7699,
@@ -152,7 +134,6 @@ def _cov_sparse(
 
     Parameters
     ----------
-
     x : cupyx.scipy.sparse of size (m, n)
     return_gram : boolean (default = False)
         If True, gram matrix of the form (1 / n) * X.T.dot(X)
@@ -168,7 +149,6 @@ def _cov_sparse(
 
     Returns
     -------
-
     result : cov(X, X) when return_gram and return_mean are False
             cov(X, X), gram(X, X) when return_gram is True,
             return_mean is False
@@ -177,7 +157,6 @@ def _cov_sparse(
             cov(X, X), gram(X, X), mean(X), mean(X)
             when return_gram is True and return_mean is True
     """
-
     gram_matrix = _create_gram_matrix(x)
 
     if return_gram:

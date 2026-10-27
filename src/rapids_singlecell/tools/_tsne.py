@@ -38,7 +38,7 @@ def tsne(
     key_added: str | Default | None = Default(("tsne", "key_added")),
     copy: bool = False,
 ) -> AnnData | None:
-    """
+    r"""
     t-SNE :cite:p:`vanDerMaaten2008` :cite:p:`Chan2018`.
 
     Performs t-distributed stochastic neighborhood embedding (tSNE) using cuml library.
@@ -84,11 +84,11 @@ def tsne(
             The superseded `random_state` argument is still accepted.
         key_added
             If not specified, the embedding is stored as
-            :attr:`~anndata.AnnData.obsm`\\ `['X_tsne']` and the the parameters in
-            :attr:`~anndata.AnnData.uns`\\ `['tsne']`.
+            :attr:`~anndata.AnnData.obsm`\ `['X_tsne']` and the the parameters in
+            :attr:`~anndata.AnnData.uns`\ `['tsne']`.
             If specified, the embedding is stored as
-            :attr:`~anndata.AnnData.obsm`\\ ``[key_added]`` and the the parameters in
-            :attr:`~anndata.AnnData.uns`\\ ``[key_added]``.
+            :attr:`~anndata.AnnData.obsm`\ ``[key_added]`` and the the parameters in
+            :attr:`~anndata.AnnData.uns`\ ``[key_added]``.
         copy
             Return a copy instead of writing to adata.
 
@@ -102,7 +102,6 @@ def tsne(
                 tSNE parameters `perplexity`, `early_exaggeration`,
                 `learning_rate`, `method`, `metric`, and `use_rep`.
     """
-
     adata = adata.copy() if copy else adata
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}

@@ -25,11 +25,10 @@ def _mg_ivf_pq_knn(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     try:
         from cuvs.neighbors.mg import ivf_pq as mg_ivf_pq
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
-            "The 'mg_ivf_pq' algorithm is only available in cuvs >= 25.10. "
-            "Please update your cuvs installation."
-        )
+            "The 'mg_ivf_pq' algorithm is only available in cuvs >= 25.10. Please update your cuvs installation."
+        ) from e
     distribution_mode = algorithm_kwds.get("distribution_mode", "replicated")
     n_lists = algorithm_kwds.get("n_lists", _compute_nlist(X.shape[0]))
     n_probes = algorithm_kwds.get("n_probes", 20)

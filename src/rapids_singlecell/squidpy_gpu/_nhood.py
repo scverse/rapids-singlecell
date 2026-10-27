@@ -51,9 +51,7 @@ def _cluster_edges(
     valid = codes >= 0
     n_valid = int(valid.sum())
     if n_valid == 0:
-        raise RuntimeError(
-            f"After removing NaNs in `adata.obs[{cluster_key!r}]`, none remain."
-        )
+        raise RuntimeError(f"After removing NaNs in `adata.obs[{cluster_key!r}]`, none remain.")
 
     g = adata.obsp[connectivity_key]
     if g.format != "csr":
@@ -122,16 +120,9 @@ def interaction_matrix(
         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_interactions']`` - the interaction matrix.
     """
     adata = _extract_adata(adata, table_key=table_key)
-    rows, cols, data, labels, _, k = _cluster_edges(
-        adata, cluster_key, connectivity_key, weights=weights
-    )
+    rows, cols, data, labels, _, k = _cluster_edges(adata, cluster_key, connectivity_key, weights=weights)
     graph_dtype = adata.obsp[connectivity_key].dtype
-    dtype = (
-        int
-        if pd.api.types.is_bool_dtype(graph_dtype)
-        or pd.api.types.is_integer_dtype(graph_dtype)
-        else float
-    )
+    dtype = int if pd.api.types.is_bool_dtype(graph_dtype) or pd.api.types.is_integer_dtype(graph_dtype) else float
     out = _pair_counts(rows, cols, labels, k, data).get().astype(dtype)
 
     if normalized:
@@ -140,6 +131,7 @@ def interaction_matrix(
     if copy:
         return out
     adata.uns[f"{cluster_key}_interactions"] = out
+    return None
 
 
 def nhood_enrichment(
@@ -195,9 +187,7 @@ def nhood_enrichment(
     adata = _extract_adata(adata, table_key=table_key)
     if n_perms <= 0:
         raise ValueError(f"Expected `n_perms` to be positive, found `{n_perms}`.")
-    rows, cols, _, labels, valid, k = _cluster_edges(
-        adata, cluster_key, connectivity_key, weights=False
-    )
+    rows, cols, _, labels, valid, k = _cluster_edges(adata, cluster_key, connectivity_key, weights=False)
     if k <= 1:
         raise ValueError(f"Expected at least `2` clusters, found `{k}`.")
     n = labels.shape[0]
@@ -214,9 +204,7 @@ def nhood_enrichment(
 
     count = _pair_counts(rows, cols, labels, k).astype(cp.float64)
     # One SplitMix64 seed per permutation; the GPU shuffles by sorting its stream.
-    seeds = cp.asarray(
-        np.random.default_rng(seed).integers(0, 2**64, size=n_perms, dtype=np.uint64)
-    )
+    seeds = cp.asarray(np.random.default_rng(seed).integers(0, 2**64, size=n_perms, dtype=np.uint64))
     perms = cp.zeros((n_perms, k, k), dtype=cp.uint64)
     _nh.permuted_counts(
         rows,
@@ -237,3 +225,4 @@ def nhood_enrichment(
     if copy:
         return NhoodEnrichmentResult(zscore=zscore, counts=count)
     adata.uns[f"{cluster_key}_nhood_enrichment"] = {"zscore": zscore, "count": count}
+    return None

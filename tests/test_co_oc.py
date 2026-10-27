@@ -58,14 +58,10 @@ def test_co_occurrence_explicit_interval(adata: AnnData, size: int):
         with pytest.raises(ValueError, match=r"Expected interval to be of length"):
             _ = co_occurrence(adata, cluster_key="leiden", copy=True, interval=interval)
     else:
-        _, interval_1 = co_occurrence(
-            adata, cluster_key="leiden", copy=True, interval=interval
-        )
+        _, interval_1 = co_occurrence(adata, cluster_key="leiden", copy=True, interval=interval)
 
         assert interval is not interval_1
-        cp.testing.assert_allclose(
-            interval, interval_1
-        )  # allclose because in the func, we use f32
+        cp.testing.assert_allclose(interval, interval_1)  # allclose because in the func, we use f32
 
 
 def test_co_occurrence_fast_kernel():
@@ -96,17 +92,13 @@ def test_co_occurrence_multi_gpu_matches_single_gpu():
     label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
 
     # Single GPU result (explicitly request 1 GPU)
-    occ_prob_single = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=True, device_ids=[0]
-    )
+    occ_prob_single = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=[0])
     cp.cuda.Stream.null.synchronize()
 
     # Multi-GPU result (uses all available GPUs)
     n_gpus = cp.cuda.runtime.getDeviceCount()
     device_ids = list(range(n_gpus))
-    occ_prob_multi = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=True, device_ids=device_ids
-    )
+    occ_prob_multi = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=device_ids)
     cp.cuda.Stream.null.synchronize()
 
     cp.testing.assert_allclose(occ_prob_multi, occ_prob_single)
@@ -128,9 +120,7 @@ def test_co_occurrence_multi_gpu_with_device_list():
     # Use multiple GPUs with explicit device list
     n_gpus = cp.cuda.runtime.getDeviceCount()
     device_ids = list(range(n_gpus))
-    occ_prob = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=True, device_ids=device_ids
-    )
+    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=device_ids)
     cp.cuda.Stream.null.synchronize()
 
     # Verify output shape
@@ -152,9 +142,7 @@ def test_co_occurrence_small_dataset_uses_single_gpu():
     # Even with multiple GPUs requested, small dataset should work correctly
     n_gpus = cp.cuda.runtime.getDeviceCount()
     device_ids = list(range(n_gpus))
-    occ_prob = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=True, device_ids=device_ids
-    )
+    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=device_ids)
     cp.cuda.Stream.null.synchronize()
 
     # Verify output shape
@@ -166,14 +154,10 @@ def test_co_occurrence_small_dataset_uses_single_gpu():
 def test_co_occurrence_with_multi_gpu_param(adata: AnnData):
     """Test co_occurrence function with multi_gpu parameter."""
     # Test with multi_gpu=False (single GPU)
-    arr_single, interval_single = co_occurrence(
-        adata, cluster_key="leiden", copy=True, multi_gpu=False
-    )
+    arr_single, interval_single = co_occurrence(adata, cluster_key="leiden", copy=True, multi_gpu=False)
 
     # Test with multi_gpu=True (all GPUs - but small dataset so uses single GPU path)
-    arr_multi, interval_multi = co_occurrence(
-        adata, cluster_key="leiden", copy=True, multi_gpu=True
-    )
+    arr_multi, interval_multi = co_occurrence(adata, cluster_key="leiden", copy=True, multi_gpu=True)
 
     # Results should match
     np.testing.assert_array_equal(interval_single, interval_multi)
@@ -226,9 +210,7 @@ def test_co_occurrence_single_gpu_large_dataset():
     label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
 
     # Explicitly use single GPU
-    occ_prob = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=True, device_ids=[0]
-    )
+    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=[0])
     cp.cuda.Stream.null.synchronize()
 
     # Verify output shape
@@ -265,15 +247,11 @@ def test_co_occurrence_block_sizes(n, k, expected_block_size):
     label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
 
     # Run fast kernel
-    occ_prob_fast = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=True, device_ids=[0]
-    )
+    occ_prob_fast = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=[0])
     cp.cuda.Stream.null.synchronize()
 
     # Run slow (pairwise) kernel as reference
-    occ_prob_slow = _co_occurrence_helper(
-        spatial, thresholds, label_idx, fast=False, device_ids=[0]
-    )
+    occ_prob_slow = _co_occurrence_helper(spatial, thresholds, label_idx, fast=False, device_ids=[0])
     cp.cuda.Stream.null.synchronize()
 
     # Verify results match

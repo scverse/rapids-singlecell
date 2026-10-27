@@ -64,14 +64,10 @@ def _available_host_memory() -> float:
     return available
 
 
-def _batched_bytes_per_row(
-    n_features: int, k: int, graph_degree: int
-) -> tuple[int, int]:
+def _batched_bytes_per_row(n_features: int, k: int, graph_degree: int) -> tuple[int, int]:
     """Host and device bytes per cluster row of cuVS's batched nn-descent."""
     # padded node / intermediate degrees as in cuVS's nn-descent
-    node = 32 * math.ceil(
-        (graph_degree * 1.3 if graph_degree > 32 else graph_degree) / 32
-    )
+    node = 32 * math.ceil((graph_degree * 1.3 if graph_degree > 32 else graph_degree) / 32)
     internal = 32 * math.ceil(max(128, 1.5 * graph_degree) * 1.3 / 32)
     # pinned buffers, graph, bloom filter, gathered rows, outputs
     host = 912 + 8 * node + 2 * internal + 4 * n_features + 16 * k
@@ -80,9 +76,7 @@ def _batched_bytes_per_row(
     return host, device
 
 
-def _all_neighbors_batching(
-    algorithm_kwds: Mapping, shape: tuple[int, int] = (0, 0), k: int = 0
-) -> tuple[int, int]:
+def _all_neighbors_batching(algorithm_kwds: Mapping, shape: tuple[int, int] = (0, 0), k: int = 0) -> tuple[int, int]:
     """Resolve ``(n_clusters, overlap_factor)``, sized to the data and free memory."""
     n_devices = cp.cuda.runtime.getDeviceCount()
     n_clusters = algorithm_kwds.get("n_clusters")
@@ -102,20 +96,13 @@ def _all_neighbors_batching(
                 overlap_factor = _DEFAULT_OVERLAP_FACTOR
             graph_degree = max(algorithm_kwds.get("graph_degree", k), k)
             host_row, device_row = _batched_bytes_per_row(n_features, k, graph_degree)
-            device_memory = min(
-                cp.cuda.runtime.getDeviceProperties(i)["totalGlobalMem"]
-                for i in range(n_devices)
-            )
+            device_memory = min(cp.cuda.runtime.getDeviceProperties(i)["totalGlobalMem"] for i in range(n_devices))
             rows_per_cluster = min(
                 _MAX_ROWS_PER_CLUSTER,
-                _MEMORY_FRACTION
-                * _available_host_memory()
-                / (n_devices * _CLUSTER_IMBALANCE * host_row),
+                _MEMORY_FRACTION * _available_host_memory() / (n_devices * _CLUSTER_IMBALANCE * host_row),
                 _MEMORY_FRACTION * device_memory / (_CLUSTER_IMBALANCE * device_row),
             )
-            n_clusters = n_devices * max(
-                1, math.ceil(n_obs * overlap_factor / (n_devices * rows_per_cluster))
-            )
+            n_clusters = n_devices * max(1, math.ceil(n_obs * overlap_factor / (n_devices * rows_per_cluster)))
             while n_clusters <= overlap_factor:
                 n_clusters += n_devices
     if overlap_factor is None:
@@ -141,17 +128,13 @@ def _all_neighbors_knn(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     if all_neighbors is None:
         raise ImportError(
-            "The 'all_neighbors' algorithm is only available in cuvs >= 25.10. "
-            "Please update your cuvs installation."
+            "The 'all_neighbors' algorithm is only available in cuvs >= 25.10. Please update your cuvs installation."
         )
     algo = algorithm_kwds.get("algo", "nn_descent")
     n_clusters, overlap_factor = _all_neighbors_batching(algorithm_kwds, X.shape, k)
     # batched builds read from host, unbatched ones from device
     X = cp.asnumpy(X) if n_clusters > 1 else cp.asarray(X)
-    use_host_output = (
-        n_clusters > 1
-        and parse_version(cuvs.__version__) >= _CUVS_HOST_OUTPUT_MIN_VERSION
-    )
+    use_host_output = n_clusters > 1 and parse_version(cuvs.__version__) >= _CUVS_HOST_OUTPUT_MIN_VERSION
     if use_host_output:
         from cuvs.common import MultiGpuResources
 
@@ -179,9 +162,7 @@ def _all_neighbors_knn(
         # the cluster overlap recovers the recall of degree 64
         default_degree = 64 if n_clusters == 1 else k
         graph_degree = max(algorithm_kwds.get("graph_degree", default_degree), k)
-        intermediate_graph_degree = algorithm_kwds.get(
-            "intermediate_graph_degree", max(128, int(1.5 * graph_degree))
-        )
+        intermediate_graph_degree = algorithm_kwds.get("intermediate_graph_degree", max(128, int(1.5 * graph_degree)))
         intermediate_graph_degree = max(intermediate_graph_degree, graph_degree)
         nn_descent_params = nn_descent.IndexParams(
             graph_degree=graph_degree,
