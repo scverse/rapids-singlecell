@@ -17,10 +17,11 @@
 #include <atomic>
 #include <cstdint>
 #include <stdexcept>
-#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "../nb_types.h"
 
 namespace harmony_comm {
 
@@ -29,7 +30,9 @@ struct Comm {
         int device;
         long long *send[2], *recv[2];  // recv: capacity + n_ranks values
         // reduced: this rank's summed piece is in send; read: slot free again
-        cudaEvent_t sent[2], reduced[2], read[2];
+        cudaEvent_t sent[2]{}, reduced[2]{}, read[2]{};
+        cudaStream_t copies{};  // see pull
+        cudaEvent_t queued{}, copied{};
         unsigned count = 0;
     };
     std::vector<Rank> ranks;
@@ -54,30 +57,63 @@ struct Comm {
                 "harmony comm: 4 buffers and 2 group bounds per GPU");
         int previous;
         cudaGetDevice(&previous);
-        for (size_t r = 0; r < devices.size(); ++r) {
-            Rank& me = ranks[r];
-            me.device = devices[r];
-            check(cudaSetDevice(me.device));
-            for (int s = 0; s < 2; ++s) {
-                me.send[s] = reinterpret_cast<long long*>(buffers[4 * r + s]);
-                me.recv[s] =
-                    reinterpret_cast<long long*>(buffers[4 * r + 2 + s]);
-                for (cudaEvent_t* e :
-                     {&me.sent[s], &me.reduced[s], &me.read[s]})
-                    check(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+        try {
+            for (size_t r = 0; r < devices.size(); ++r) {
+                Rank& me = ranks[r];
+                me.device = devices[r];
+                check(cudaSetDevice(me.device));
+                for (int s = 0; s < 2; ++s) {
+                    me.send[s] =
+                        reinterpret_cast<long long*>(buffers[4 * r + s]);
+                    me.recv[s] =
+                        reinterpret_cast<long long*>(buffers[4 * r + 2 + s]);
+                    for (cudaEvent_t* e :
+                         {&me.sent[s], &me.reduced[s], &me.read[s]})
+                        create(e, cudaEventCreateWithFlags,
+                               cudaEventDisableTiming);
+                }
+                create(&me.copies, cudaStreamCreateWithFlags,
+                       cudaStreamNonBlocking);
+                for (cudaEvent_t* e : {&me.queued, &me.copied})
+                    create(e, cudaEventCreateWithFlags, cudaEventDisableTiming);
+                for (int other : devices)
+                    if (peer && other != me.device &&
+                        cudaDeviceEnablePeerAccess(other, 0) != cudaSuccess)
+                        cudaGetLastError();  // already enabled
             }
-            for (int other : devices)
-                if (peer && other != me.device &&
-                    cudaDeviceEnablePeerAccess(other, 0) != cudaSuccess)
-                    cudaGetLastError();  // already enabled
+        } catch (...) {  // no destructor runs on a half-built object
+            release(previous);
+            throw;
         }
         cudaSetDevice(previous);
     }
     ~Comm() {
-        for (Rank& me : ranks)
-            for (int s = 0; s < 2; ++s)
-                for (cudaEvent_t e : {me.sent[s], me.reduced[s], me.read[s]})
-                    cudaEventDestroy(e);
+        int previous;
+        cudaGetDevice(&previous);
+        release(previous);
+    }
+    // *handle = a new event or stream; left null when that fails (a failed
+    // create can write an invalid handle).
+    template <typename Handle>
+    static void create(Handle* handle, cudaError_t (*make)(Handle*, unsigned),
+                       unsigned flags) {
+        Handle made;
+        check(make(&made, flags));
+        *handle = made;
+    }
+    // Destroys the streams and events created, each on its GPU, then makes
+    // `device` current again.
+    void release(int device) {
+        for (Rank& me : ranks) {
+            if (!me.sent[0]) continue;  // none created on this GPU
+            cudaSetDevice(me.device);
+            if (me.copies) cudaStreamDestroy(me.copies);
+            for (cudaEvent_t e :
+                 {me.sent[0], me.reduced[0], me.read[0], me.sent[1],
+                  me.reduced[1], me.read[1], me.queued, me.copied})
+                if (e) cudaEventDestroy(e);
+        }
+        cudaSetDevice(device);
     }
     // After a failure, other ranks may still have exchanges in flight on the
     // buffers: wait for their GPUs before the buffers are released.
@@ -91,9 +127,7 @@ struct Comm {
         cudaSetDevice(previous);
     }
     static void check(cudaError_t status) {
-        if (status != cudaSuccess)
-            throw std::runtime_error(std::string("harmony comm: ") +
-                                     cudaGetErrorString(status));
+        cuda_check(status, "harmony comm");
     }
     // Host barrier of the rank threads (spins: exchanges are microseconds).
     void barrier() {
@@ -109,15 +143,22 @@ struct Comm {
             std::this_thread::yield();
         }
     }
-    // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU.
+    // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU,
+    // in order on `stream` but copied on the rank's own stream: on a legacy
+    // default stream, a peer copy would also wait for the other GPU's work.
     void pull(int to, int from, long long* dst, const long long* src, size_t n,
               cudaStream_t stream) {
         if (n == 0) return;
+        Rank& me = ranks[to];
+        check(cudaEventRecord(me.queued, stream));
+        check(cudaStreamWaitEvent(me.copies, me.queued));
         // Peer copies: stream-ordered pool memory needs the peer API.
-        check(peer ? cudaMemcpyPeerAsync(dst, ranks[to].device, src,
-                                         ranks[from].device, n * 8, stream)
+        check(peer ? cudaMemcpyPeerAsync(dst, me.device, src,
+                                         ranks[from].device, n * 8, me.copies)
                    : cudaMemcpyAsync(dst, src, n * 8, cudaMemcpyHostToDevice,
-                                     stream));
+                                     me.copies));
+        check(cudaEventRecord(me.copied, me.copies));
+        check(cudaStreamWaitEvent(stream, me.copied));
     }
 };
 

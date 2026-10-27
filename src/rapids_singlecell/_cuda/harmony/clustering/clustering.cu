@@ -427,8 +427,7 @@ static double fused_clustering_loop_body(const ClusteringArgs<T>& a, RT* R) {
                 a.Z_norm, R, a.n_pcs, a.n_clusters, a.n_clusters, a.seg_start,
                 nullptr, a.n_seg, a.y_bound, y_acc, y_limbs, a.stream),
             "centroids");
-        harmony_comm::allreduce(a.comm, a.rank, a.y_acc, y_limbs * kd,
-                                a.stream);
+        harmony_comm::allreduce(a.comm, a.rank, y_acc, y_limbs * kd, a.stream);
         cuda_check(harmony_segments::finalize_rtz(
                        y_acc, 1, a.n_pcs, a.n_clusters, y_limbs, a.y_bound,
                        a.Y_norm, 0, a.n_pcs, a.stream),
@@ -669,73 +668,6 @@ static void register_clustering_loop(nb::module_& m) {
         "rank"_a = 0);
 }
 
-// out (groups x K) = the clustering's counts of R's columns per segment
-// group (see segment_counts_kernel); acc: groups x K scratch.
-template <typename T, typename Device>
-static void register_joint_counts(nb::module_& m) {
-    m.def(
-        "joint_counts",
-        [](gpu_array<const T, Device> R,
-           gpu_array_c<const int, Device> seg_start,
-           gpu_array_c<const int, Device> seg_group, gpu_array_c<T, Device> out,
-           gpu_array_c<long long, Device> acc, long long n_total,
-           std::uintptr_t stream, std::uintptr_t comm, int rank) {
-            int K = (int)R.shape(1), n_seg = (int)seg_group.size();
-            size_t n = out.size();
-            if (R.ndim() != 2 || R.stride(1) != 1 || out.ndim() != 2 ||
-                (int)out.shape(1) != K || acc.size() < n ||
-                seg_start.size() != (size_t)n_seg + 1)
-                throw std::invalid_argument("joint_counts: bad shapes");
-            FixedScales<T> scales(n_total > 0 ? n_total : (long long)R.shape(0),
-                                  0, K);
-            auto s = (cudaStream_t)stream;
-            cudaMemsetAsync(acc.data(), 0, n * sizeof(long long), s);
-            segment_counts_kernel<T>
-                <<<strided_grid((long long)n_seg * K, BLOCK_DIM_1D),
-                   BLOCK_DIM_1D, 0, s>>>(
-                    R.data(), (int)R.stride(0), K, seg_start.data(),
-                    seg_group.data(), n_seg, scales.count,
-                    reinterpret_cast<unsigned long long*>(acc.data()));
-            CUDA_CHECK_LAST_ERROR(segment_counts_kernel);
-            harmony_comm::allgather_groups((harmony_comm::Comm*)comm, rank,
-                                           acc.data(), K, s);
-            update_counts_kernel<T>
-                <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D,
-                   0, s>>>(acc.data(), nullptr, nullptr, nullptr, nullptr,
-                           scales.count_inv, out.data(), (int)n);
-            CUDA_CHECK_LAST_ERROR(update_counts_kernel);
-        },
-        nb::call_guard<nb::gil_scoped_release>(), "R"_a.noconvert(),
-        nb::kw_only(), "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
-        "out"_a.noconvert(), "acc"_a.noconvert(), "n_total"_a = 0,
-        "stream"_a = 0, "comm"_a = 0, "rank"_a = 0);
-}
-
-// data (rows x n int64) on every GPU of comm: GPU r's rows starts[r] ..
-// starts[r + 1] are copied to the others.
-template <typename Device>
-static void register_allgather_rows(nb::module_& m) {
-    m.def(
-        "allgather_rows",
-        [](gpu_array_c<long long, Device> data,
-           const std::vector<size_t>& starts, std::uintptr_t stream,
-           std::uintptr_t comm, int rank) {
-            auto* c = (harmony_comm::Comm*)comm;
-            size_t n = data.ndim() == 2 ? data.shape(1) : 1;
-            if (c && (starts.size() != c->ranks.size() + 1 ||
-                      starts.back() > data.shape(0)))
-                throw std::invalid_argument("allgather_rows: bad starts");
-            harmony_comm::allgather(
-                c, rank, data.data(),
-                [&](int r) {
-                    return std::pair{starts[r] * n, starts[r + 1] * n};
-                },
-                (cudaStream_t)stream);
-        },
-        nb::call_guard<nb::gil_scoped_release>(), "data"_a.noconvert(),
-        nb::kw_only(), "starts"_a, "stream"_a = 0, "comm"_a = 0, "rank"_a = 0);
-}
-
 template <typename T, typename Device>
 static void register_kmeans(nb::module_& m) {
     m.def(
@@ -888,9 +820,6 @@ void register_bindings(nb::module_& m) {
         "itemsize"_a = 4);
     register_clustering_loop<float, Device>(m);
     register_clustering_loop<double, Device>(m);
-    register_joint_counts<float, Device>(m);
-    register_joint_counts<double, Device>(m);
-    register_allgather_rows<Device>(m);
     register_kmeans<float, Device>(m);
     register_kmeans<double, Device>(m);
 }

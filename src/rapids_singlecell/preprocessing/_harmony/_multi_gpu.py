@@ -64,11 +64,15 @@ def _copy(a: cp.ndarray, device: int, *, out: cp.ndarray | None = None) -> cp.nd
 
 
 def _gather_rows(
-    parts: list[cp.ndarray], bounds: list[int], positions: cp.ndarray
+    parts: list[cp.ndarray], bounds: list[int], positions: cp.ndarray | None
 ) -> cp.ndarray:
-    """Rows ``positions`` (increasing, in sorted order) of the shards, on the
-    current GPU."""
-    current, rows = cp.cuda.Device().id, []
+    """Rows ``positions`` (increasing, in sorted order; None: all) of the
+    shards, on the current GPU (a shard already there is not copied)."""
+    current = cp.cuda.Device().id
+    if positions is None:
+        rows = [_copy(part, current) for part in parts]
+        return rows[0] if len(rows) == 1 else cp.concatenate(rows)
+    rows = []
     cuts = cp.searchsorted(positions, cp.asarray(bounds)).get()
     for part, lo, a, b in zip(parts, bounds[:-1], cuts[:-1], cuts[1:], strict=True):
         with cp.cuda.Device(part.device.id):
@@ -77,13 +81,13 @@ def _gather_rows(
     return rows[0] if len(rows) == 1 else cp.concatenate(rows)
 
 
-def _comm(devices: list[int], capacity: int, *, peer: bool, groups: list[int]):
+def _comm(devices: list[int], capacity: int, *, groups: list[int]):
     """The exchange of int64 sums across ``devices`` and its buffers, which
     must outlive it: per GPU two send slots (device memory, or pinned host
     memory without peer copies) and two receive slots of capacity + one value
     per GPU (comm.cuh sums what would not fit in pieces). ``groups``: first
     and end group of each GPU's cells (sorted by group)."""
-    buffers = []
+    buffers, peer = [], _peer_copies_work(devices)
     for device in devices:
         with cp.cuda.Device(device):
             for _ in range(2):
