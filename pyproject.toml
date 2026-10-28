@@ -263,6 +263,7 @@ module = [
   "rapids_singlecell.pertpy_gpu._mixscale",
   "rapids_singlecell.pertpy_gpu._mixscape",
   "rapids_singlecell.preprocessing._harmony",
+  "rapids_singlecell.preprocessing._harmony._chunks_to_device",
   "rapids_singlecell.preprocessing._harmony._helper",
   "rapids_singlecell.preprocessing._harmony._kmeans",
   "rapids_singlecell.preprocessing._harmony_integrate",
