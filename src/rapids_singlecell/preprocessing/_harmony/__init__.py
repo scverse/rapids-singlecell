@@ -507,6 +507,7 @@ def harmonize(
                     Z_hat = _correction_multi(
                         X,
                         R,
+                        O=O,
                         lambda_kb=lambda_kb,
                         n_first=int(n_levels[0]),
                         **joint_args,
@@ -1005,6 +1006,7 @@ def _correction_multi(
     X: cp.ndarray,
     R: cp.ndarray,
     *,
+    O: cp.ndarray,
     lambda_kb: cp.ndarray,
     n_first: int,
     joint_cats: cp.ndarray,
@@ -1019,7 +1021,8 @@ def _correction_multi(
     """Apply the exact general-design correction in bounded cluster chunks.
 
     The cells are sorted by joint category (``segments`` as for _correction_batched), with the joint counts of R over
-    the ``n_total`` cells of all GPUs.
+    the ``n_total`` cells of all GPUs. The cluster systems are solved in float32 and refined in float64 as the counts
+    ``O`` and the ridge call for (_refinement_steps; correction_batched.cu).
     """
     seg_start, seg_group, bounds = segments
     Z = _correction_output(X, output)
@@ -1045,12 +1048,30 @@ def _correction_multi(
         ),
         suppress=_SUPPRESS_PENALTY,
         n_total=n_total,
+        refine=_refinement_steps(O, lambda_kb, joint_cats.shape[1], X.dtype.itemsize),
         stream=cp.cuda.get_current_stream().ptr,
         blas=cp.cuda.device.get_cublas_handle(),
         solver=cp.cuda.device.get_cusolver_handle(),
         **({} if sums is None else sums),
     )
     return Z
+
+
+def _refinement_steps(O: cp.ndarray, lambda_kb: cp.ndarray, n_covariates: int, itemsize: int) -> int:
+    """Float64 refinement steps of the float32 cluster solves of the several-keys correction, or -1 for float64.
+
+    Equilibrated, a cluster's system has a unit diagonal and a largest eigenvalue below the number of design blocks
+    (intercept and keys); in the design's null directions only the ridge acts, spread over those blocks, and the
+    intercept has none, so the smallest eigenvalue is at least ``lambda / ((O + lambda) (n_covariates + 1))`` and the
+    condition number at most ``(n_covariates + 1)**2 max (O + lambda) / lambda``. Each step gains that factor times
+    2**-24; the count reaches 2**-20 relative error for float32 data and the rounding level of a float64 solve
+    (1e-15 as the proxy) for float64, else the float64 solve (more steps would cost more than its factorization).
+    """
+    rho = (n_covariates + 1) ** 2 * float(cp.max((O + lambda_kb) / lambda_kb)) * 2.0**-24  # suppressed levels: ~1
+    if not rho < 0.1:
+        return -1
+    steps = math.ceil(math.log(2.0**-20 if itemsize == 4 else 1e-15) / math.log(rho)) - 1
+    return steps if steps <= 4 else -1
 
 
 def _multi_correction_cluster_chunk_size(
@@ -1063,13 +1084,16 @@ def _multi_correction_cluster_chunk_size(
 ) -> int:
     """Choose a cluster chunk that keeps multi-key scratch below 1 GiB (one cluster at a time above that)."""
     nb1 = n_batches + 1
-    # Double Gram and RHS with the solver's copies, joint right-hand sides
-    # (double) and coefficients, exact joint sums, and joint counts. The chunk
-    # sets the results (correction_batched.cu), so the terms of buffers that
-    # are gone stay: the solver's Gram copies, coefficients in X's dtype and a
-    # sliced lambda and mask.
+    # Double Gram and RHS with the solver's copies, its float32 systems,
+    # scaling and residuals, joint right-hand sides (double) and coefficients,
+    # exact joint sums, and joint counts. The chunk sets the results
+    # (correction_batched.cu), so the terms of buffers that are gone stay: the
+    # solver's Gram copies, coefficients in X's dtype and a sliced lambda and
+    # mask.
     per_cluster = (
         16 * (nb1 * nb1 + nb1 * n_pcs)
+        + 4 * (nb1 * nb1 + nb1 * n_pcs)
+        + 8 * nb1 * (1 + 2 * n_pcs)
         + itemsize * nb1 * n_pcs
         + n_joint_categories * ((8 + itemsize) * n_pcs + itemsize)
         + 8 * _limbs(itemsize) * n_joint_categories * n_pcs

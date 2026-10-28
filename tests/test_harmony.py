@@ -40,19 +40,22 @@ from rapids_singlecell.preprocessing._harmony._helper import (
 )
 
 
-def _solve_spd_batched(gram, rhs, *, one_at_a_time=False):
-    # The cluster-system solve of the multi-key correction (C++).
+def _solve_spd_batched(gram, rhs, *, one_at_a_time=False, refine=1, with_info=False):
+    # The cluster-system solve of the multi-key correction (C++): float32
+    # factors, `refine` float64 refinement steps, float64 for a chunk whose
+    # float32 factorization failed. with_info: also (least squares, fell back).
     x = cp.empty_like(rhs)
-    harmony_module._correction_batched_cuda.solve_spd(
+    info = harmony_module._correction_batched_cuda.solve_spd(
         gram,
         rhs,
         x,
         one_at_a_time=one_at_a_time,
+        refine=refine,
         stream=cp.cuda.get_current_stream().ptr,
         blas=cp.cuda.device.get_cublas_handle(),
         solver=cp.cuda.device.get_cusolver_handle(),
     )
-    return x
+    return (x, info) if with_info else x
 
 
 def _get_measure(x, base, norm):
@@ -244,6 +247,74 @@ def test_harmony_large_multikey_systems_solve_one_at_a_time(one_at_a_time):
     result = cp.asnumpy(result)
     np.testing.assert_allclose(result[:2], np.linalg.solve(gram[:2], rhs[:2]), rtol=1e-9)
     np.testing.assert_allclose(gram[2] @ result[2], rhs[2], rtol=1e-7, atol=1e-7)
+
+
+@pytest.mark.parametrize("one_at_a_time", [False, True])
+def test_harmony_multikey_solve_refines_float32_to_float64(one_at_a_time):
+    # The systems of two keys with Zipf-distributed level sizes (plus the
+    # intercept, dynamic ridge, a pruned level): the float32 solve alone is
+    # within 1e-5, one float64 refinement step within 1e-9 of float64.
+    rng = np.random.default_rng(1)
+    L1, L2, n_cells, p = 300, 200, 200_000, 7
+    prob = [1 / np.arange(1, L + 1) for L in (L1, L2)]
+    c1, c2 = (rng.choice(L, n_cells, p=q / q.sum()) for L, q in zip((L1, L2), prob, strict=True))
+    systems = []
+    for seed in range(3):
+        r = np.random.default_rng(seed).random(n_cells)  # soft assignments
+        O = np.concatenate([np.bincount(c1, r, L1), np.bincount(c2, r, L2)])
+        C = np.bincount(c1 * L2 + c2, r, L1 * L2).reshape(L1, L2)
+        lam = 0.2 * r.sum() * np.concatenate([np.bincount(c1, minlength=L1), np.bincount(c2, minlength=L2)]) / n_cells
+        lam[-1] = 1e30  # a pruned level
+        A = np.zeros((1 + L1 + L2,) * 2)
+        A[0, 0], A[0, 1:], A[1:, 0] = r.sum(), O, O
+        A[1:, 1:][np.diag_indices(L1 + L2)] = O + lam
+        A[1 : 1 + L1, 1 + L1 :], A[1 + L1 :, 1 : 1 + L1] = C, C.T
+        systems.append(A)
+    gram = np.stack(systems)
+    rhs = rng.standard_normal((3, gram.shape[1], p)) * 100
+    expected = np.linalg.solve(gram, rhs)
+    for refine, rtol in ((0, 1e-5), (1, 1e-9)):
+        x, (n_least_squares, fell_back) = _solve_spd_batched(
+            cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time, refine=refine, with_info=True
+        )
+        assert (n_least_squares, fell_back) == (0, False)
+        np.testing.assert_allclose(cp.asnumpy(x), expected, rtol=rtol, atol=rtol * np.abs(expected).max())
+
+
+def test_harmony_refinement_steps_follow_the_ridge():
+    # The dynamic ridge keeps the systems well conditioned: one step for float32
+    # data, two for float64; a fixed ridge of 1 against levels of 1e5 cells
+    # needs four for float32 data and, for float64, more than a float64 solve
+    # costs, so float64 it is. Where the count is tight, two balanced keys with
+    # the intercept, the float32 target holds.
+    O = cp.full((4, 3), 1e5)
+    assert harmony_module._refinement_steps(O, 0.2 * O, 2, 4) == 1
+    assert harmony_module._refinement_steps(O, 0.2 * O, 2, 8) == 2
+    assert harmony_module._refinement_steps(O, cp.ones_like(O), 2, 4) == 4
+    assert harmony_module._refinement_steps(O, cp.ones_like(O), 2, 8) == -1
+    assert harmony_module._refinement_steps(O, cp.full_like(O, 1e30), 2, 4) == 0  # all suppressed
+    A = np.array(
+        [[2e5, 1e5, 1e5, 1e5, 1e5], [1e5, 1e5 + 1, 0, 5e4, 5e4], [1e5, 0, 1e5 + 1, 5e4, 5e4]]
+        + [[1e5, 5e4, 5e4, 1e5 + 1, 0], [1e5, 5e4, 5e4, 0, 1e5 + 1]]
+    )
+    rhs = np.random.default_rng(0).standard_normal((1, 5, 3)) * 1e5
+    x = _solve_spd_batched(cp.asarray(A[None]), cp.asarray(rhs), refine=4)
+    expected = np.linalg.solve(A[None], rhs)
+    assert np.abs(cp.asnumpy(x) - expected).max() <= 2**-20 * np.abs(expected).max()
+
+
+@pytest.mark.parametrize("one_at_a_time", [False, True])
+def test_harmony_multikey_solve_falls_back_to_float64(one_at_a_time):
+    # A system that is positive definite in float64 but not in float32 sends
+    # its chunk through the float64 solve.
+    gram = np.array([[[1.0, 1 - 1e-9], [1 - 1e-9, 1.0]], [[2.0, 0.5], [0.5, 2.0]]])
+    rhs = np.array([[[1.0, 2.0], [1.0, 3.0]], [[1.0, 0.0], [0.0, 1.0]]])
+    for refine in (1, -1):  # by failure, and on request
+        x, (n_least_squares, fell_back) = _solve_spd_batched(
+            cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time, refine=refine, with_info=True
+        )
+        assert (n_least_squares, fell_back) == (0, True)
+        np.testing.assert_allclose(cp.asnumpy(x), np.linalg.solve(gram, rhs), rtol=1e-9)
 
 
 def test_harmony_interrupt_during_the_solve_is_raised_after_it():
@@ -601,6 +672,7 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
         return _correction_multi(
             cp.asarray(X_np),
             cp.asarray(R_np),
+            O=cp.asarray(O_np),
             lambda_kb=cp.asarray(lambda_np),
             n_first=int(levels[0]),
             joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),

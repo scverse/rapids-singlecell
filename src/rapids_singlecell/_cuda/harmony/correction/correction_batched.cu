@@ -132,7 +132,8 @@ static void prepare_multi_impl(const T* joint_O, const double* joint_rhs,
 
 // A chunk's k systems of n unknowns solve faster batched than one at a time
 // (blocked factorization) unless they are few and large, n > 1000 k: measured
-// on an RTX PRO 6000 Blackwell for n = 64 .. 6000, k = 1 .. 100, 20 .. 100 PCs.
+// on an RTX PRO 6000 Blackwell for n = 64 .. 6000, k = 1 .. 100, 20 .. 100 PCs
+// (float64; the float32 factorization below keeps the rule).
 // The two give different bits, and batched ones also depend on k (cuBLAS
 // picks its batched trsm by the batch size), so this rule and the chunk
 // budget (_multi_correction_cluster_chunk_size) set the results: changing
@@ -172,6 +173,48 @@ __global__ void restore_failed_kernel(double* gram, const double* diag,
     }
 }
 
+// The systems equilibrated for float32: D_i = 1/sqrt(diag gram_i) (into D)
+// and As_i = D_i gram_i D_i.
+__global__ void equilibrate_kernel(const double* gram, int k, int n, double* D,
+                                   float* As) {
+    long long total = (long long)k * n * n;
+    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         e < total; e += (long long)gridDim.x * blockDim.x) {
+        long long i = e / ((long long)n * n), rem = e % ((long long)n * n);
+        int r = (int)(rem / n), c = (int)(rem % n);
+        const double* g = gram + i * (size_t)n * n;
+        double dr = rsqrt(g[(size_t)r * n + r]);
+        if (c == r) D[i * n + r] = dr;
+        As[e] =
+            (float)(g[(size_t)r * n + c] * dr * rsqrt(g[(size_t)c * n + c]));
+    }
+}
+
+// out (+)= D in, row by row (k x n x p): right-hand sides and residuals to the
+// equilibrated systems' scale (float32; a value beyond float32 sets *bad),
+// solutions and corrections back to the systems' scale (float64).
+template <typename In, typename Out>
+__global__ void scale_rows_kernel(const In* in, const double* D, int k, int n,
+                                  int p, bool add, Out* out, int* bad) {
+    long long total = (long long)k * n * p;
+    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         e < total; e += (long long)gridDim.x * blockDim.x) {
+        double v = D[e / p] * (double)in[e];
+        if (add) v += out[e];
+        out[e] = (Out)v;
+        if (sizeof(Out) == 4 && !isfinite((float)v)) *bad = 1;
+    }
+}
+
+__global__ void float_pointers_kernel(float* As, float* ys, int k,
+                                      size_t gram_stride, size_t rhs_stride,
+                                      float** ptrs) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    ptrs[i] = As + i * gram_stride;
+    ptrs[k + i] = ys + i * rhs_stride;
+}
+
 // x = cupy.linalg.lstsq(G, b)[0], the minimum-norm solution by SVD, for a
 // G (n x n) whose Cholesky factorization failed; b, x: n x p, C-ordered, on
 // the current device and CuPy's current stream (the caller's).
@@ -194,17 +237,18 @@ static void least_squares(const double* G, const double* b, double* x, int n,
 }
 
 // Solves the k systems gram_i x_i = rhs_i (n x n, n x p; C-ordered) into x by
-// Cholesky factors of gram_i (a symmetric C-ordered matrix is its own
+// float64 Cholesky factors of gram_i (a symmetric C-ordered matrix is its own
 // column-major form), by least squares where gram_i is singular. Batched,
 // gram_i is factored in place (gram is overwritten) and a C-ordered x_i is
 // the column-major x_i^T: two right-side triangular solves give
 // rhs_i^T inv(L_i L_i^T) = x_i^T in place. One at a time, a copy of gram_i is
 // factored and a column-major copy of rhs_i solved (faster than right-side
 // solves at that size). Returns how many needed least squares.
-static int solve_systems(double* gram, const double* rhs, double* x, int k,
-                         int n, int p, bool one_at_a_time, cudaStream_t stream,
-                         cublasHandle_t blas, cusolverDnHandle_t solver,
-                         harmony_comm::Comm* comm = nullptr) {
+static int solve_systems_double(double* gram, const double* rhs, double* x,
+                                int k, int n, int p, bool one_at_a_time,
+                                cudaStream_t stream, cublasHandle_t blas,
+                                cusolverDnHandle_t solver,
+                                harmony_comm::Comm* comm) {
     if (k == 0) return 0;
     const double one = 1.0, zero = 0.0;
     const auto lower = CUBLAS_FILL_MODE_LOWER;
@@ -283,6 +327,159 @@ static int solve_systems(double* gram, const double* rhs, double* x, int k,
     return n_least_squares;
 }
 
+// Solves the k systems in float32 after equilibration (D_i gram_i D_i has a
+// unit diagonal and a condition number bounded by the ridge's share of it
+// over the design's blocks, see _refinement_steps) and refines the solution
+// `refine` times with float64 residuals: each step gains a factor of that
+// condition number times 2^-24, so the caller picks the count from its bound,
+// at a fraction of a float64 factorization's cost on GPUs with slow float64.
+// refine < 0, a system whose float32 factorization fails (near-singular) or
+// a value beyond float32 take the float64 path for the chunk
+// (solve_systems_double; least squares for singular systems). Returns how
+// many systems needed least squares; *fell_back: that the chunk took the
+// float64 path.
+static int solve_systems(double* gram, const double* rhs, double* x, int k,
+                         int n, int p, bool one_at_a_time, int refine,
+                         cudaStream_t stream, cublasHandle_t blas,
+                         cusolverDnHandle_t solver,
+                         harmony_comm::Comm* comm = nullptr,
+                         bool* fell_back = nullptr) {
+    if (fell_back) *fell_back = refine < 0;
+    if (k == 0) return 0;
+    if (refine < 0)
+        return solve_systems_double(gram, rhs, x, k, n, p, one_at_a_time,
+                                    stream, blas, solver, comm);
+    const float onef = 1.0f, zerof = 0.0f;
+    const double one = 1.0, minus_one = -1.0;
+    const auto lower = CUBLAS_FILL_MODE_LOWER;
+    const size_t gram_stride = (size_t)n * n, rhs_stride = (size_t)n * p;
+    cublas_check_status(cublasSetStream(blas, stream), "cublasSetStream");
+    cusolver_check(cusolverDnSetStream(solver, stream), "cusolverDnSetStream");
+    // Plain float32 for the float32 solves (CuPy may have set TF32 on the
+    // handle), and the residual GEMM from an aligned copy of x, so one GPU and
+    // several (x at a rank's offset) get the same cuBLAS kernels.
+    struct MathMode {
+        cublasHandle_t h;
+        cublasMath_t m;
+        ~MathMode() {
+            cublasSetMathMode(h, m);
+        }
+    } saved{blas, CUBLAS_DEFAULT_MATH};
+    cublas_check_status(cublasGetMathMode(blas, &saved.m), "cublasGetMathMode");
+    cublas_check_status(cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH),
+                        "cublasSetMathMode");
+    std::vector<int> failed(k + 1);  // info of the k systems, then `bad`
+    {
+        RmmScratchPool pool;
+        float *As, *ys, *work = nullptr, *Bt = nullptr;
+        float** ptrs = nullptr;
+        double *D, *res, *xs;
+        int *info, *solve_info = nullptr, lwork = 0;
+        if (one_at_a_time) {
+            cusolver_check(cusolverDnSpotrf_bufferSize(solver, lower, n,
+                                                       nullptr, n, &lwork),
+                           "cusolverDnSpotrf_bufferSize");
+            pool.alloc_all(As, k * gram_stride, ys, k * rhs_stride, D,
+                           (size_t)k * n, res, k * rhs_stride, xs,
+                           k * rhs_stride, info, (size_t)k + 1, work, lwork, Bt,
+                           rhs_stride, solve_info, 1);
+        } else {
+            pool.alloc_all(As, k * gram_stride, ys, k * rhs_stride, D,
+                           (size_t)k * n, res, k * rhs_stride, xs,
+                           k * rhs_stride, info, (size_t)k + 1, ptrs,
+                           2 * (size_t)k);
+            float_pointers_kernel<<<(k + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
+                                    BLOCK_DIM_1D, 0, stream>>>(
+                As, ys, k, gram_stride, rhs_stride, ptrs);
+            CUDA_CHECK_LAST_ERROR(float_pointers_kernel);
+        }
+        int* bad = info + k;
+        cuda_check(cudaMemsetAsync(info, 0, (k + 1) * sizeof(int), stream),
+                   "solve info memset");
+        equilibrate_kernel<<<strided_grid((long long)k * gram_stride,
+                                          BLOCK_DIM_1D),
+                             BLOCK_DIM_1D, 0, stream>>>(gram, k, n, D, As);
+        CUDA_CHECK_LAST_ERROR(equilibrate_kernel);
+        auto scale = [&](auto* in, bool add, auto* out) {
+            scale_rows_kernel<<<strided_grid((long long)k * rhs_stride,
+                                             BLOCK_DIM_1D),
+                                BLOCK_DIM_1D, 0, stream>>>(in, D, k, n, p, add,
+                                                           out, bad);
+            CUDA_CHECK_LAST_ERROR(scale_rows_kernel);
+        };
+        // ys = As^-1 ys in place, by the factors of As (factored on the first
+        // call).
+        auto solve = [&](bool factor) {
+            if (one_at_a_time) {
+                for (int i = 0; i < k; ++i) {
+                    float *A_i = As + i * gram_stride,
+                          *y_i = ys + i * rhs_stride;
+                    if (factor)
+                        cusolver_check(
+                            cusolverDnSpotrf(solver, lower, n, A_i, n, work,
+                                             lwork, info + i),
+                            "cusolverDnSpotrf");
+                    cublas_check_status(
+                        cublasSgeam(blas, CUBLAS_OP_T, CUBLAS_OP_N, n, p, &onef,
+                                    y_i, p, &zerof, Bt, n, Bt, n),
+                        "cublasSgeam");
+                    cusolver_check(cusolverDnSpotrs(solver, lower, n, p, A_i, n,
+                                                    Bt, n, solve_info),
+                                   "cusolverDnSpotrs");
+                    cublas_check_status(
+                        cublasSgeam(blas, CUBLAS_OP_T, CUBLAS_OP_N, p, n, &onef,
+                                    Bt, n, &zerof, y_i, p, y_i, p),
+                        "cublasSgeam");
+                }
+                return;
+            }
+            if (factor)
+                cusolver_check(
+                    cusolverDnSpotrfBatched(solver, lower, n, ptrs, n, info, k),
+                    "cusolverDnSpotrfBatched");
+            for (auto op : {CUBLAS_OP_T, CUBLAS_OP_N})
+                cublas_check_status(
+                    cublasStrsmBatched(blas, CUBLAS_SIDE_RIGHT, lower, op,
+                                       CUBLAS_DIAG_NON_UNIT, p, n, &onef, ptrs,
+                                       n, ptrs + k, p, k),
+                    "cublasStrsmBatched");
+        };
+        scale(rhs, false, ys);
+        solve(true);
+        scale(ys, false, xs);
+        for (int step = 0; step < refine; ++step) {
+            // res_i^T = rhs_i^T - xs_i^T gram_i (p x n column-major; gram_i
+            // is symmetric)
+            cuda_check(
+                cudaMemcpyAsync(res, rhs, k * rhs_stride * sizeof(double),
+                                cudaMemcpyDeviceToDevice, stream),
+                "refine copy");
+            cublas_check_status(
+                cublas_gemm_strided_batched<double>(
+                    blas, CUBLAS_OP_N, CUBLAS_OP_N, p, n, n, &minus_one, xs, p,
+                    (long long)rhs_stride, gram, n, (long long)gram_stride,
+                    &one, res, p, (long long)rhs_stride, k),
+                "cublasDgemmStridedBatched");
+            scale(res, false, ys);
+            solve(false);
+            scale(ys, true, xs);
+        }
+        cuda_check(cudaMemcpyAsync(x, xs, k * rhs_stride * sizeof(double),
+                                   cudaMemcpyDeviceToDevice, stream),
+                   "solve copy");
+        harmony_comm::synchronize(comm, stream, "solve");
+        cuda_check(cudaMemcpyAsync(failed.data(), info, (k + 1) * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream),
+                   "solve info");
+        cuda_check(cudaStreamSynchronize(stream), "solve");
+    }
+    if (std::all_of(failed.begin(), failed.end(), [](int f) { return !f; }))
+        return 0;
+    if (fell_back) *fell_back = true;
+    return solve_systems_double(gram, rhs, x, k, n, p, one_at_a_time, stream,
+                                blas, solver, comm);
+}
+
 // joint_O (J x k) = the clustering's counts of R's columns (row stride ldr)
 // per joint category, exact over the n_total cells on all GPUs of comm
 // (segment_counts_kernel); acc: J x k scratch. Only GPU `to` (-1: every one)
@@ -325,7 +522,7 @@ static std::pair<int, int> correction_multi_impl(
     int n_pcs, int n_clusters, int n_batches, int n_first, int n_covariates,
     int J, const int* seg_start, const int* seg_group, int n_seg,
     const short* bounds, T* Z, bool normalize, int chunk, T suppress,
-    long long n_total, cudaStream_t stream, cublasHandle_t blas,
+    long long n_total, int refine, cudaStream_t stream, cublasHandle_t blas,
     cusolverDnHandle_t solver, harmony_comm::Comm* comm, int rank) {
     const int nb1 = n_batches + 1, P = comm ? (int)comm->ranks.size() : 1;
     const size_t system = (size_t)nb1 * nb1, coefs = (size_t)nb1 * n_pcs;
@@ -377,9 +574,10 @@ static std::pair<int, int> correction_multi_impl(
                     Penalties<T>{lambda_kb + c0, n_clusters, suppress}, n_pcs,
                     k, n_batches, n_first, n_covariates, J, gram, rhs, stream);
             }
-            solved.second += solve_systems(
-                gram, rhs, W + cut(rank) * coefs, mine, nb1, n_pcs,
-                solve_one_at_a_time(mine, nb1), stream, blas, solver, comm);
+            solved.second +=
+                solve_systems(gram, rhs, W + cut(rank) * coefs, mine, nb1,
+                              n_pcs, solve_one_at_a_time(mine, nb1), refine,
+                              stream, blas, solver, comm);
             solved.first += mine;
         }
         if (P > 1)
@@ -524,8 +722,8 @@ static void register_correction_batched(nb::module_& m) {
            gpu_array_c<const int, Device> seg_group,
            gpu_array_c<const short, Device> bounds, gpu_array_c<T, Device> Z,
            bool normalize, int chunk, double suppress, long long n_total,
-           std::uintptr_t stream, std::uintptr_t blas, std::uintptr_t solver,
-           std::uintptr_t comm, int rank) {
+           int refine, std::uintptr_t stream, std::uintptr_t blas,
+           std::uintptr_t solver, std::uintptr_t comm, int rank) {
             if (R.ndim() != 2 || R.shape(0) != X.shape(0) ||
                 Z.size() != X.size() || lambda_kb.ndim() != 2 ||
                 lambda_kb.shape(1) != R.shape(1) || joint_cats.ndim() != 2 ||
@@ -542,7 +740,7 @@ static void register_correction_batched(nb::module_& m) {
                 (int)joint_cats.shape(1), bound_groups(bounds, X.shape(1)),
                 seg_start.data(), seg_group.data(), (int)seg_group.size(),
                 bounds.data(), Z.data(), normalize, chunk, (T)suppress,
-                n_total > 0 ? n_total : (long long)X.shape(0),
+                n_total > 0 ? n_total : (long long)X.shape(0), refine,
                 (cudaStream_t)stream, (cublasHandle_t)blas,
                 (cusolverDnHandle_t)solver, (harmony_comm::Comm*)comm, rank);
         },
@@ -552,8 +750,8 @@ static void register_correction_batched(nb::module_& m) {
         "marginal_joint_indices"_a.noconvert(), "n_first"_a,
         "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
         "bounds"_a.noconvert(), "Z"_a.noconvert(), "normalize"_a = false,
-        "chunk"_a, "suppress"_a, "n_total"_a = 0, "stream"_a = 0, "blas"_a,
-        "solver"_a, "comm"_a = 0, "rank"_a = 0);
+        "chunk"_a, "suppress"_a, "n_total"_a = 0, "refine"_a, "stream"_a = 0,
+        "blas"_a, "solver"_a, "comm"_a = 0, "rank"_a = 0);
 }
 
 template <typename Device>
@@ -565,21 +763,24 @@ void register_bindings(nb::module_& m) {
         "solve_spd",
         [](gpu_array_c<double, Device> gram,  // batched: overwritten
            gpu_array_c<const double, Device> rhs, gpu_array_c<double, Device> x,
-           bool one_at_a_time, std::uintptr_t stream, std::uintptr_t blas,
-           std::uintptr_t solver) {
+           bool one_at_a_time, int refine, std::uintptr_t stream,
+           std::uintptr_t blas, std::uintptr_t solver) {
             if (gram.ndim() != 3 || gram.shape(1) != gram.shape(2) ||
                 rhs.ndim() != 3 || rhs.shape(0) != gram.shape(0) ||
                 rhs.shape(1) != gram.shape(1) || x.size() != rhs.size())
                 throw std::invalid_argument("solve_spd: bad shapes");
-            return solve_systems(gram.data(), rhs.data(), x.data(),
-                                 (int)gram.shape(0), (int)gram.shape(1),
-                                 (int)rhs.shape(2), one_at_a_time,
-                                 (cudaStream_t)stream, (cublasHandle_t)blas,
-                                 (cusolverDnHandle_t)solver);
+            bool fell_back;
+            int n_least_squares = solve_systems(
+                gram.data(), rhs.data(), x.data(), (int)gram.shape(0),
+                (int)gram.shape(1), (int)rhs.shape(2), one_at_a_time, refine,
+                (cudaStream_t)stream, (cublasHandle_t)blas,
+                (cusolverDnHandle_t)solver, nullptr, &fell_back);
+            return std::pair{n_least_squares, fell_back};
         },
         nb::call_guard<nb::gil_scoped_release>(), "gram"_a.noconvert(),
         "rhs"_a.noconvert(), "x"_a.noconvert(), nb::kw_only(),
-        "one_at_a_time"_a = false, "stream"_a = 0, "blas"_a, "solver"_a);
+        "one_at_a_time"_a = false, "refine"_a = 1, "stream"_a = 0, "blas"_a,
+        "solver"_a);
 }
 
 NB_MODULE(_harmony_correction_batched_cuda, m) {
