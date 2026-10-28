@@ -825,6 +825,7 @@ NB_MODULE(_harmony_clustering_cuda, m) {
         .def("abort", [](Comm& c) { c.aborted = true; })
         .def("synchronize", &Comm::synchronize,
              nb::call_guard<nb::gil_scoped_release>(), "timeout"_a = 10.0)
+        .def("wait", &Comm::wait, nb::call_guard<nb::gil_scoped_release>())
         // Tests: one sum, and a stream synchronization that gives up.
         .def(
             "allreduce",

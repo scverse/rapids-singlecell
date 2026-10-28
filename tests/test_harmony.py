@@ -1721,6 +1721,56 @@ def test_harmony_multi_gpu_reports_the_failing_gpu(monkeypatch, devices, where, 
     assert len(drawn) == len(devices)  # also the GPU thread that could not start
 
 
+def test_on_gpus_keeps_the_buffers_of_a_stuck_gpu(monkeypatch):
+    # A GPU whose stream never completes its exchange (blocked by a host
+    # function) after another GPU failed: the bounded wait gives up and a
+    # daemon thread holds the exchange buffers until that GPU completes them.
+    class Failure(Exception):
+        pass
+
+    make_comm, made, gate = harmony_module._comm, [], threading.Event()
+
+    def comm_short_wait(*args, **kwargs):
+        comm, buffers = make_comm(*args, **kwargs)
+        made.append((comm, buffers))
+        short = SimpleNamespace(
+            handle=comm.handle, abort=comm.abort, wait=comm.wait, synchronize=lambda: comm.synchronize(0.3)
+        )
+        return short, buffers
+
+    monkeypatch.setattr(harmony_module, "_comm", comm_short_wait)
+    streams = [cp.cuda.Stream(non_blocking=True) for _ in range(2)]
+    data = [cp.arange(8, dtype=cp.int64) for _ in range(2)]
+
+    def run(rank, handle):
+        comm = made[0][0]
+        comm.allreduce(rank, data[rank].data.ptr, 8, streams[rank].ptr)  # loads the sum kernel's module before the gate
+        comm.wait(streams[rank].ptr)
+        if rank == 1:  # its staging and copies of the next exchange stay behind the gate
+            streams[1].launch_host_func(lambda _: gate.wait(), None)
+        comm.allreduce(rank, data[rank].data.ptr, 8, streams[rank].ptr)
+        if rank == 0:  # fails with rank 1's exchange in flight
+            raise Failure
+        comm.wait(streams[rank].ptr)  # raises once rank 0 aborted
+
+    threads = threading.active_count()
+    try:
+        with pytest.raises(Failure):
+            harmony_module._on_gpus(run, [0, 0], offsets=np.array([0, 8]), bounds=[0, 4, 8], capacity=16)
+        assert threading.active_count() == threads + 1  # the thread holding the buffers
+    finally:
+        gate.set()
+        for stream in streams:
+            stream.synchronize()
+    for _ in range(100):  # it lets go once the exchanges completed
+        if threading.active_count() == threads:
+            break
+        time.sleep(0.1)
+    assert threading.active_count() == threads
+    for d in data:  # both exchanges complete once released
+        cp.testing.assert_array_equal(d, 4 * cp.arange(8))
+
+
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 def test_harmonize_into_its_input():
     adata = _repeatability_adata(np.float32)

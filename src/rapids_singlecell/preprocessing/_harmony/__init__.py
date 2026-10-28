@@ -650,6 +650,16 @@ def _shard(X: cp.ndarray, **sizes) -> tuple[cp.ndarray, cp.ndarray, dict]:
         return X, Z_norm, workspace
 
 
+def _settle(pool, comm, buffers: list) -> None:
+    """Wait for the GPU threads, then for the exchanges still in flight (without the GIL).
+
+    A GPU that has not completed them after 10 s may still write ``buffers``: a daemon thread holds them until it has.
+    """
+    pool.shutdown()
+    if not comm.synchronize():
+        threading.Thread(target=lambda keep=buffers: comm.wait(), daemon=True).start()
+
+
 def _on_gpus(
     run, devices: list[int], *, offsets: np.ndarray, bounds: list[int], capacity: int
 ) -> tuple[list[cp.ndarray], bool, int]:
@@ -700,14 +710,12 @@ def _on_gpus(
             try:
                 if not done:  # e.g. Ctrl-C: release the other GPUs' threads
                     comm.abort()
-                pool.shutdown()  # waits for the GPU threads
-                if not done:  # exchanges may be in flight: wait, without the GIL
-                    comm.synchronize()
+                _settle(pool, comm, comm_buffers)
                 break
             except KeyboardInterrupt:
                 interrupts += 1
-                if interrupts > 1:  # left behind, with the buffers they may still use
-                    threading.Thread(target=lambda keep=comm_buffers: pool.shutdown(), daemon=True).start()
+                if interrupts > 1:  # left behind, settled by a daemon thread
+                    threading.Thread(target=_settle, args=(pool, comm, comm_buffers), daemon=True).start()
                     raise
         del comm_buffers  # and comm (also guarded's): no traceback holds them
         comm = None

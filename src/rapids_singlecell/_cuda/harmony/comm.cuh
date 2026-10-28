@@ -122,21 +122,38 @@ struct Comm {
         }
         cudaSetDevice(device);
     }
+    // The events every exchange of a rank precedes: all its work precedes its
+    // sent, reduced or read event (its pulls the copied event), and a slot's
+    // reuse waits for its previous use, so the latest of them cover every
+    // exchange.
+    template <typename F>
+    void each_event(F&& f) {
+        for (Rank& me : ranks)
+            for (cudaEvent_t e :
+                 {me.sent[0], me.reduced[0], me.read[0], me.sent[1],
+                  me.reduced[1], me.read[1], me.copied})
+                if (e) f(e);
+    }
     // After a failure, other ranks may still have exchanges in flight on the
-    // buffers: wait for them before the buffers are released. All work of an
-    // exchange precedes its rank's sent, reduced or read event, and a slot's
-    // reuse waits for its previous use, so the latest of those events cover
-    // every exchange. A failed GPU may never complete them (nor the streams
-    // waiting on them): give up after `timeout` seconds.
-    void synchronize(double timeout) {
+    // buffers: wait for them before the buffers are released. A failed GPU
+    // may never complete them (nor the streams waiting on them): give up
+    // after `timeout` seconds and return false; wait() then blocks until it
+    // does, for a thread that holds the buffers meanwhile.
+    bool synchronize(double timeout) {
         auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::duration<double>(timeout);
-        for (Rank& me : ranks)
-            for (cudaEvent_t e : {me.sent[0], me.reduced[0], me.read[0],
-                                  me.sent[1], me.reduced[1], me.read[1]})
-                while (e && cudaEventQuery(e) == cudaErrorNotReady &&
-                       std::chrono::steady_clock::now() < deadline)
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+        while (true) {
+            bool pending = false;
+            each_event([&](cudaEvent_t e) {
+                pending |= cudaEventQuery(e) == cudaErrorNotReady;
+            });
+            if (!pending) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+    void wait() {
+        each_event([](cudaEvent_t e) { cudaEventSynchronize(e); });
     }
     static void check(cudaError_t status) {
         cuda_check(status, "harmony comm");

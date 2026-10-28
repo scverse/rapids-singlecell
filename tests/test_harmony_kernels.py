@@ -473,18 +473,21 @@ def test_comm_gives_up_on_a_stuck_gpu():
     # A GPU whose stream never completes (here: blocked by a host function)
     # holds the other ranks' streams through the events they wait on. Once a
     # rank aborts, their host synchronizations raise instead of waiting
-    # forever, and the comm's final wait for in-flight exchanges is bounded.
+    # forever, and the comm's final wait for in-flight exchanges is bounded
+    # and reports that it gave up.
     comm, buffers = _comm([0, 0], 16, groups=[0, 1, 0, 1])
     gate, n = threading.Event(), 8
     streams = [cp.cuda.Stream(non_blocking=True) for _ in range(2)]
     data = [cp.arange(n, dtype=cp.int64) for _ in range(2)]
-    cp.cuda.Device().synchronize()
-    streams[1].launch_host_func(lambda _: gate.wait(), None)
 
     def rank(r):
         comm.allreduce(r, data[r].data.ptr, n, streams[r].ptr)
         comm.wait(streams[r].ptr)
 
+    with ThreadPoolExecutor(2) as pool:  # one exchange first: loading the sum kernel's module waits for the GPU
+        list(pool.map(rank, range(2)))
+    cp.cuda.Device().synchronize()
+    streams[1].launch_host_func(lambda _: gate.wait(), None)
     try:
         with ThreadPoolExecutor(2) as pool:
             ranks = [pool.submit(rank, r) for r in range(2)]
@@ -495,11 +498,13 @@ def test_comm_gives_up_on_a_stuck_gpu():
                 with pytest.raises(RuntimeError, match="another GPU failed"):
                     rank.result(timeout=10)
         start = time.monotonic()
-        comm.synchronize(0.3)  # rank 1's staging is still behind the gate
+        assert comm.synchronize(0.3) is False  # rank 1's staging is still behind the gate
         assert 0.25 < time.monotonic() - start < 3
     finally:
         gate.set()
         for stream in streams:
             stream.synchronize()
-    for d in data:  # the exchange completes once released
-        cp.testing.assert_array_equal(d, 2 * cp.arange(n))
+    assert comm.synchronize(0.0) is True  # complete once released
+    comm.wait()  # and the blocking form returns at once
+    for d in data:  # the second exchange completes once released
+        cp.testing.assert_array_equal(d, 4 * cp.arange(n))
