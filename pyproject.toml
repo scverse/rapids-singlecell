@@ -24,79 +24,34 @@ classifiers = [
   "Typing :: Typed",
 ]
 dynamic = [ "version" ]
-scripts.rapids-singlecell-install-skills = "rapids_singlecell_skills.install:main"
-scripts.rapids-singlecell-check-kernel = "rapids_singlecell_skills.kernel:main"
-# lets zarr find `rapids_singlecell_zarr.KvikioCodecPipeline` in every process
-entry-points."zarr.codec_pipeline".kvikio = "rapids_singlecell_zarr:KvikioCodecPipeline"
-
 dependencies = [
-    "anndata>=0.12.14",
-    "scanpy>=1.10.0",
-    "scverse-misc[settings]>=0.1.3",
-    "numpy>=1.26",
-    "scipy!=1.17.0,>=1.12",
-    "pandas",
-    "natsort",
-    "scikit-misc>=0.1.3",
-    "scikit-learn",
-    "tqdm",
-    "statsmodels>=0.12.0",
-    "scikit-image",
-    "docrep",
-    # the codec pipeline zarr loads through the entry point builds on zarr ≥ 3.3
-    "zarr>=3.3",
-]
-
-[project.optional-dependencies]
-rapids-cu13 = [
-    "cupy-cuda13x[ctk]>=14",
-    "cudf-cu13>=25.12",
-    "cuml-cu13>=25.12",
-    "cugraph-cu13>=25.12",
-    "cuvs-cu13>=25.12",
+  "anndata>=0.12.14",
+  "docrep",
+  "natsort",
+  "numpy>=1.26",
+  "pandas",
+  "scanpy>=1.10",
+  "scikit-image",
+  "scikit-learn",
+  "scikit-misc>=0.1.3",
+  "scipy!=1.17,>=1.12",
+  "scverse-misc[settings]>=0.1.3",
+  # for debug logging (referenced from the issue template)
+  "session-info2",
+  "statsmodels>=0.12",
+  "tqdm",
+  # `rapids_singlecell.io` reads and writes zarr v3 (sharded arrays, codec pipelines)
+  "zarr>=3.3",
 ]
 # reading zarr straight into GPU memory (`rapids_singlecell.io`)
-io-cu13 = [ "kvikio-cu13>=26.4", "nvidia-nvcomp-cu13>=5.2" ]
-io-cu12 = [ "kvikio-cu12>=26.4", "nvidia-nvcomp-cu12>=5.2" ]
-rapids-cu12 = [
-    "cupy-cuda12x[ctk]>=14",
-    "cudf-cu12>=25.12",
-    "cuml-cu12>=25.12",
-    "cugraph-cu12>=25.12",
-    "cuvs-cu12>=25.12",
-]
-
-[dependency-groups]
-docs = [
-    "sphinx>=4.5.0",
-    "sphinx-copybutton",
-    "nbsphinx>=0.8.12",
-    "myst-nb",
-    "sphinx-design",
-    "sphinx-tabs",
-    "sphinxext-opengraph",
-    "sphinxcontrib.bibtex",
-    "scanpydoc[typehints,theme]>=0.9.4",
-    "scverse-misc[sphinx]>=0.1.3",
-    "dask",
-    "pytest",
-    "spatialdata>=0.7.2",
-]
-test-minimal = [
-    "pytest",
-    "pytest-cov",
-    "pytest-timeout",
-    "pytest-rerunfailures",
-    "anyio",
-    "pooch",
-    "profimp",
-    "scanpy>=1.10.0",
-    "bbknn",
-    "decoupler",
-    "fast-array-utils",
-    # beta without a numpy cap: uv backtracks into it and pairs it with numpy 2.5,
-    # which numba-cuda (still imported by cudf) can't import against
-    "numba!=0.63.0b1",
+optional-dependencies.io-cu12 = [ "zarr-kvikio[cuda12]" ]
+optional-dependencies.io-cu13 = [ "zarr-kvikio[cuda13]" ]
+optional-dependencies.rapids-cu12 = [
+  "cudf-cu12>=25.12",
+  "cugraph-cu12>=25.12",
+  "cuml-cu12>=25.12",
+  "cupy-cuda12x[ctk]>=14",
+  "cuvs-cu12>=25.12",
 ]
 optional-dependencies.rapids-cu13 = [
   "cudf-cu13>=25.12",
@@ -154,26 +109,6 @@ typecheck = [
   "pandas-stubs",
 ]
 
-[tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.version.raw-options]
-version_scheme = "guess-next-dev"
-local_scheme = "node-and-date"
-
-[tool.hatch.build.hooks.vcs]
-version-file = "src/rapids_singlecell/_version.py"
-
-[tool.hatch.build.targets.wheel]
-packages = [
-    "src/rapids_singlecell",
-    "src/rapids_singlecell_skills",
-    "src/rapids_singlecell_zarr",
-    "src/testing",
-]
-exclude = [ "**/*.cu", "**/*.cuh", "**/*.h" ]
-
-[tool.hatch.build.targets.wheel.hooks.scikit-build]
 [tool.hatch]
 version.source = "vcs"
 version.raw-options.local_scheme = "node-and-date"
@@ -279,7 +214,17 @@ warn_unused_configs = true
 
 # RAPIDS and friends ship without type information
 [[tool.mypy.overrides]]
-module = [ "cudf.*", "cuml.*", "cuvs.*", "numba.*", "pylibraft.*" ]
+module = [
+  "cudf.*",
+  "cuml.*",
+  "cuvs.*",
+  "dask_cuda.*",
+  "distributed.*",
+  "numba.*",
+  "pylibraft.*",
+  "pynvml",
+  "zarr_kvikio.*",
+]
 ignore_missing_imports = true
 
 # scanpy has inline annotations but no py.typed marker

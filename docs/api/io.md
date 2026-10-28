@@ -1,9 +1,8 @@
 # Reading data: `io`
 
 Read AnnData zarr stores lazily for out-of-core analysis, with chunks read straight into GPU memory
-and decompressed there if KvikIO and nvCOMP are installed (see {doc}`/out_of_core`).
-The codec pipeline that does so is registered with zarr as `"rapids_singlecell_zarr.KvikioCodecPipeline"`
-(also importable as `rapids_singlecell.io.KvikioCodecPipeline`).
+and decompressed there if zarr-kvikio, KvikIO and nvCOMP are installed (see {doc}`/out_of_core`).
+The codec pipeline that does so comes from zarr-kvikio (`"zarr_kvikio.KvikioCodecPipeline"`).
 
 ```{eval-rst}
 .. module:: rapids_singlecell.io

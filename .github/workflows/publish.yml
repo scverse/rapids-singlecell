@@ -84,7 +84,7 @@ jobs:
               out = []
               i = 0
               while i < len(lines):
-                  if lines[i].startswith(f"{key} = ["):
+                  if lines[i].startswith((f"{key} = [", f"optional-dependencies.{key} = [")):
                       depth = lines[i].count("[") - lines[i].count("]")
                       i += 1
                       while i < len(lines) and depth > 0:

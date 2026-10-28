@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import anndata as ad
 import cupyx.scipy.sparse as cpx
 import numpy as np
@@ -12,6 +14,8 @@ from zarr.codecs import BloscCodec
 import rapids_singlecell as rsc
 from rapids_singlecell.dask._cluster import _devices
 from rapids_singlecell.io._config import PIPELINE_PATH, gpu_io_available
+
+needs_zarr_kvikio = pytest.mark.skipif(find_spec("zarr_kvikio") is None, reason="needs zarr-kvikio")
 
 # small pools: other dask tests may share the GPU
 CLUSTER_KW = {
@@ -33,15 +37,12 @@ def client():
 
 def test_start_cluster(client):
     assert len(client.scheduler_info()["workers"]) == 1
-    pipelines = set(
-        client.run(
-            lambda: __import__("zarr").config.get("codec_pipeline.path")
-        ).values()
-    )
+    pipelines = set(client.run(lambda: __import__("zarr").config.get("codec_pipeline.path")).values())
     default = zarr.config.get("codec_pipeline.path")
     assert pipelines == ({PIPELINE_PATH} if gpu_io_available() else {default})
 
 
+@needs_zarr_kvikio
 def test_read_lazy_and_persist(tmp_path, client):
     rng = np.random.default_rng(0)
     X = sparse.random(1000, 200, density=0.1, format="csr", dtype=np.float32, rng=rng)
@@ -55,6 +56,7 @@ def test_read_lazy_and_persist(tmp_path, client):
     assert (adata.X.compute().get() != X).nnz == 0
 
 
+@needs_zarr_kvikio
 def test_read_lazy_without_gpu_reads_on_workers(tmp_path):
     X = sparse.random(500, 100, density=0.1, format="csr", dtype=np.float32)
     ad.io.write_zarr(tmp_path / "src.zarr", ad.AnnData(X), compressors=[BloscCodec()])
@@ -86,9 +88,7 @@ def test_plain_dask_and_anndata(tmp_path, store):
         path = tmp_path / "dst.zarr"
 
     before = zarr.config.get("codec_pipeline.path")
-    cluster = LocalCUDACluster(
-        CUDA_VISIBLE_DEVICES="0", n_workers=1, protocol="tcp", rmm_pool_size="256MB"
-    )
+    cluster = LocalCUDACluster(CUDA_VISIBLE_DEVICES="0", n_workers=1, protocol="tcp", rmm_pool_size="256MB")
     client = Client(cluster)
     try:
         rsc.io.enable(client)
@@ -106,9 +106,7 @@ def test_cluster_in_spawned_process(monkeypatch):
     # what an unguarded `start_cluster()` in a script does in the workers it starts
     import multiprocessing
 
-    monkeypatch.setattr(
-        multiprocessing.current_process(), "_inheriting", True, raising=False
-    )
+    monkeypatch.setattr(multiprocessing.current_process(), "_inheriting", True, raising=False)
     with pytest.raises(RuntimeError, match=r"if __name__ == '__main__':"):
         rsc.dask.start_cluster(**CLUSTER_KW)
 
@@ -124,8 +122,6 @@ def test_cluster_missing_workers(monkeypatch):
         rsc.dask.start_cluster(**CLUSTER_KW)
 
 
-@pytest.mark.parametrize(
-    ("gpus", "expected"), [("0,1", [0, 1]), ([2, 3], [2, 3]), ((1,), [1])]
-)
+@pytest.mark.parametrize(("gpus", "expected"), [("0,1", [0, 1]), ([2, 3], [2, 3]), ((1,), [1])])
 def test_devices(gpus, expected):
     assert _devices(gpus) == expected

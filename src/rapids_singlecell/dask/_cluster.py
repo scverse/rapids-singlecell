@@ -27,8 +27,7 @@ def start_cluster(
     gpu_reads: bool | Literal["auto"] = "auto",
     **cluster_kwargs,
 ) -> Client:
-    """\
-    Start a local Dask cluster with one worker per GPU, for out-of-core analysis.
+    """Start a local Dask cluster with one worker per GPU, for out-of-core analysis.
 
     This only saves the setup: the result is a regular :class:`~distributed.Client`
     for a :class:`~dask_cuda.LocalCUDACluster`, which keeps running until you shut it down::
@@ -53,7 +52,7 @@ def start_cluster(
       With CUDA managed memory (`rmm_managed_memory=True`), RMM's pool allocator is used.
     * UCX for communication between workers if available (`protocol="auto"`), else TCP.
       With CUDA managed memory (`rmm_managed_memory=True`), which UCX does not support, TCP.
-    * If KvikIO and nvCOMP are installed, the workers read zarr chunks straight into
+    * If zarr-kvikio, KvikIO and nvCOMP are installed (`io` extra), the workers read zarr chunks straight into
       GPU memory (see :func:`rapids_singlecell.io.enable`).
 
     Parameters
@@ -109,11 +108,7 @@ def start_cluster(
         ucx = find_spec("distributed_ucxx") is not None
         protocol = "ucx" if ucx and not managed else "tcp"
     local_cluster = LocalCUDACluster(
-        **(
-            {"CUDA_VISIBLE_DEVICES": ",".join(map(str, devices))}
-            if devices is not None
-            else {}
-        ),
+        **({"CUDA_VISIBLE_DEVICES": ",".join(map(str, devices))} if devices is not None else {}),
         threads_per_worker=threads_per_worker,
         protocol=protocol,
         rmm_pool_size=pool_size or (None if use_async else _POOL_SIZE),
@@ -166,7 +161,7 @@ def _warn_if_busy(devices: list[int] | None) -> None:
         if devices is None:
             visible = os.environ.get("CUDA_VISIBLE_DEVICES")
             devices = (
-                range(pynvml.nvmlDeviceGetCount())
+                list(range(pynvml.nvmlDeviceGetCount()))
                 if visible is None
                 # GPUs given by UUID are not checked
                 else [int(g) for g in visible.split(",") if g.strip().isdigit()]

@@ -1,48 +1,39 @@
 from __future__ import annotations
 
+import warnings
+from contextlib import nullcontext
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
-
-import zarr
-
-from rapids_singlecell_zarr._pipeline import HOST_PIPELINE_KEY
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from distributed import Client
-    from donfig.config_obj import ConfigSet
 
-PIPELINE_PATH = "rapids_singlecell_zarr.KvikioCodecPipeline"
+# the codec pipeline of zarr-kvikio (installed by the `io` extras)
+PIPELINE_PATH = "zarr_kvikio.KvikioCodecPipeline"
 INSTALL_HINT = (
-    "Reading zarr into GPU memory needs KvikIO and nvCOMP: "
+    "Reading zarr into GPU memory needs zarr-kvikio with KvikIO and nvCOMP: "
     "`pip install 'rapids-singlecell[io-cu13]'` (or `[io-cu12]`)."
 )
 
 
-def _missing_gpu_io() -> str | None:
-    """Why zarr arrays can't be read into GPU memory here, if they can't."""
-    # `find_spec("nvidia.nvcomp")` raises if there is no `nvidia` package at all
-    if any(find_spec(m) is None for m in ("kvikio", "nvidia", "nvidia.nvcomp")):
-        return INSTALL_HINT
-    return None
-
-
 def gpu_io_available() -> bool:
-    """Whether zarr arrays can be read into GPU memory (KvikIO and nvCOMP are installed)."""
-    return _missing_gpu_io() is None
+    """Whether zarr arrays can be read into GPU memory (zarr-kvikio, KvikIO and nvCOMP are installed)."""
+    if find_spec("zarr_kvikio") is None:
+        return False
+    import zarr_kvikio
+
+    return zarr_kvikio.available()
 
 
 def require_gpu_io() -> None:
-    if (msg := _missing_gpu_io()) is not None:
-        raise ImportError(msg)
+    if not gpu_io_available():
+        raise ImportError(INSTALL_HINT)
 
 
-def enable(
-    client: Client | None = None, *, num_threads: int = 8
-) -> AbstractContextManager:
-    """\
-    Read :mod:`zarr` arrays straight into GPU memory with KvikIO and nvCOMP.
+def enable(client: Client | None = None, *, num_threads: int = 8) -> AbstractContextManager:
+    """Read :mod:`zarr` arrays straight into GPU memory with KvikIO and nvCOMP.
 
     zarr reads the compressed chunks of an array with KvikIO (using GPUDirect Storage
     if available) and decompresses them on the GPU with nvCOMP, instead of decompressing
@@ -52,6 +43,8 @@ def enable(
     Other chunks (e.g. blosc-compressed) are decompressed on the CPU and then copied to the GPU,
     so any store can be read. The CPU uses the codec pipeline zarr was configured with before
     (e.g. zarrs), or else zarr's fused pipeline.
+    The reads are done by the codec pipeline of zarr-kvikio. Without it (or without KvikIO and
+    nvCOMP), this warns and changes nothing: zarr keeps decoding on the CPU.
 
     Parameters
     ----------
@@ -71,51 +64,24 @@ def enable(
     The change takes effect right away. Used as a context manager, it is undone at the end
     of the ``with`` block, here and on the workers of `client`.
     """
-    require_gpu_io()
-    host = _host_pipeline()
+    if not gpu_io_available():
+        warnings.warn(
+            f"{INSTALL_HINT} Without them, zarr keeps decoding chunks on the CPU.",
+            stacklevel=2,
+        )
+        return nullcontext()
+    import zarr_kvikio
+
     if client is None:
-        return enable_local(num_threads, host)
-    from ._dask_plugin import KvikioPlugin
+        return zarr_kvikio.enable(num_threads=num_threads)
+    import zarr_kvikio.dask
 
-    client.register_plugin(KvikioPlugin(num_threads=num_threads, host_pipeline=host))
-    # zarr fixes an array's codec pipeline when the array is opened, and arrays opened here
-    # are shipped to the workers with it.
-    local = zarr.config.set(
-        {"codec_pipeline.path": PIPELINE_PATH, HOST_PIPELINE_KEY: host}
-    )
-    return _ClusterConfigSet(local, client, KvikioPlugin.name)
+    return zarr_kvikio.dask.enable(client, num_threads=num_threads)
 
 
-def enable_local(num_threads: int, host_pipeline: str | None) -> ConfigSet:
-    """Read zarr arrays into GPU memory in this process."""
-    import kvikio.defaults
+def release_memory() -> None:
+    """Release the GPU scratch space held for decoding chunks (see :func:`~rapids_singlecell.io.enable`)."""
+    if find_spec("zarr_kvikio") is not None:
+        import zarr_kvikio
 
-    kvikio.defaults.set({"num_threads": num_threads})
-    return zarr.config.set(
-        {
-            "codec_pipeline.path": PIPELINE_PATH,
-            HOST_PIPELINE_KEY: host_pipeline,
-            "buffer": "zarr.buffer.gpu.Buffer",
-            "ndbuffer": "zarr.buffer.gpu.NDBuffer",
-        }
-    )
-
-
-def _host_pipeline() -> str | None:
-    """The pipeline zarr is configured with, unless it is ours (then the one before that)."""
-    path = zarr.config.get("codec_pipeline.path")
-    return zarr.config.get(HOST_PIPELINE_KEY, None) if path == PIPELINE_PATH else path
-
-
-class _ClusterConfigSet:
-    """Undoes :func:`enable` with a client here and on the workers."""
-
-    def __init__(self, local: ConfigSet, client: Client, plugin: str) -> None:
-        self._local, self._client, self._plugin = local, client, plugin
-
-    def __enter__(self) -> _ClusterConfigSet:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._client.unregister_worker_plugin(self._plugin)
-        self._local.__exit__(*exc)
+        zarr_kvikio.release_memory()

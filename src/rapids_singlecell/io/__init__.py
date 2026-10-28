@@ -1,28 +1,14 @@
-"""\
-Reading data for out-of-core analysis on the GPU.
+"""Reading data for out-of-core analysis on the GPU.
 
-With KvikIO and nvCOMP installed (``pip install 'rapids-singlecell[io-cu13]'``),
+With zarr-kvikio, KvikIO and nvCOMP installed (``pip install 'rapids-singlecell[io-cu13]'``),
 zarr chunks are read straight into GPU memory and decompressed there.
 """
 
 from __future__ import annotations
 
-from rapids_singlecell_zarr import KvikioCodecPipeline, release_memory
-
 from ._check import check
-from ._config import enable
+from ._config import enable, release_memory
 from ._convert import convert_zarr
 from ._read import read_lazy
 
-__all__ = [
-    "KvikioCodecPipeline",
-    "check",
-    "convert_zarr",
-    "enable",
-    "read_lazy",
-    "release_memory",
-]
-
-# Public class members are part of the installed API contract used by agent tooling.
-# ``KvikioCodecPipeline`` is called by zarr (see ``enable``), it has no methods for users.
-__api_members__: dict[str, list[str]] = {"KvikioCodecPipeline": []}
+__all__ = ["check", "convert_zarr", "enable", "read_lazy", "release_memory"]

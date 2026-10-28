@@ -56,14 +56,14 @@ The rest of this page shows how to set up the same things yourself.
 ## Reading data straight into GPU memory
 
 By default, the compressed chunks of `X` are decompressed on the CPU and then copied to the GPU.
-With [KvikIO](https://docs.rapids.ai/api/kvikio/stable/) and [nvCOMP](https://developer.nvidia.com/nvcomp) installed,
+With zarr-kvikio, [KvikIO](https://docs.rapids.ai/api/kvikio/stable/) and [nvCOMP](https://developer.nvidia.com/nvcomp) installed (`io` extra),
 they are read straight into GPU memory and decompressed there:
 
 ```bash
 pip install 'rapids-singlecell[io-cu13]'  # or [io-cu12]; `rapids-singlecell-cu13[io]` for the CUDA wheels
 ```
 
-zarr then finds a codec pipeline that reads into GPU memory, `rapids_singlecell_zarr.KvikioCodecPipeline`,
+zarr then finds a codec pipeline that reads into GPU memory, zarr-kvikio's `zarr_kvikio.KvikioCodecPipeline`,
 which {func}`~rapids_singlecell.io.enable` switches on. It works with any store, and the GPU decodes chunks that are
 zstd-compressed (or uncompressed), ideally small (nvCOMP decodes every chunk with one thread block) and in shards
 (few files per read). Other chunks, e.g. blosc-compressed ones like in most existing stores, are decompressed on the CPU

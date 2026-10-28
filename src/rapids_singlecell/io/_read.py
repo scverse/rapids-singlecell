@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import zarr
 from anndata.experimental import read_elem_lazy
 
@@ -22,8 +23,7 @@ _CPU_CHUNK = 20_000
 
 
 def read_lazy(path: StoreLike, *, chunks: int | Literal["auto"] = "auto") -> ad.AnnData:
-    """\
-    Lazily read an AnnData zarr store for out-of-core analysis on the GPU.
+    """Lazily read an AnnData zarr store for out-of-core analysis on the GPU.
 
     `obs` and `var` are read into memory, `X` becomes a Dask array of GPU (CuPy) chunks of
     `chunks` observations each, read from disk only when computed.
@@ -50,20 +50,16 @@ def read_lazy(path: StoreLike, *, chunks: int | Literal["auto"] = "auto") -> ad.
     from rapids_singlecell.get import X_to_GPU
 
     g = zarr.open_group(path, mode="r")
-    with zarr.config.set(
-        {"buffer": "zarr.buffer.cpu.Buffer", "ndbuffer": "zarr.buffer.cpu.NDBuffer"}
-    ):
+    with zarr.config.set({"buffer": "zarr.buffer.cpu.Buffer", "ndbuffer": "zarr.buffer.cpu.NDBuffer"}):
         obs, var = ad.io.read_elem(g["obs"]), ad.io.read_elem(g["var"])
+        assert isinstance(obs, pd.DataFrame) and isinstance(var, pd.DataFrame)
     x = g["X"]
     encoding = x.attrs.get("encoding-type")
     if encoding not in {"csr_matrix", "array"}:
         msg = f"`X` must be a CSR matrix or a dense array to be chunked by observations, got {encoding}."
         raise ValueError(msg)
 
-    gpu_reads = (
-        zarr.config.get("codec_pipeline.path") == PIPELINE_PATH
-        and check_store(path)["gpu_readable"]
-    )
+    gpu_reads = zarr.config.get("codec_pipeline.path") == PIPELINE_PATH and check_store(path)["gpu_readable"]
     rows = _chunk_size(len(obs), chunks, gpu_reads=gpu_reads, n_gpus=_n_gpus())
     # chunks read into GPU memory already stay as they are
     X = X_to_GPU(read_elem_lazy(x, chunks=(rows, -1)))
@@ -81,12 +77,10 @@ def _n_gpus() -> int:
     except (ImportError, ValueError):  # no distributed, or no client
         pass
 
-    return max(1, cp.cuda.runtime.getDeviceCount())
+    return max(1, cp.cuda.runtime.getDeviceCount())  # type: ignore[attr-defined]  # cupy-stubs lacks cuda.runtime
 
 
-def _chunk_size(
-    n_obs: int, chunks: int | Literal["auto"], *, gpu_reads: bool, n_gpus: int
-) -> int:
+def _chunk_size(n_obs: int, chunks: int | Literal["auto"], *, gpu_reads: bool, n_gpus: int) -> int:
     if chunks != "auto":
         return int(chunks)
     if gpu_reads:

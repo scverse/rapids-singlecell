@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from rapids_singlecell.io._config import gpu_io_available
 from rapids_singlecell.io._read import _chunk_size
 
 gpu_io = pytest.mark.skipif(not gpu_io_available(), reason="needs KvikIO and nvCOMP")
+needs_zarr_kvikio = pytest.mark.skipif(find_spec("zarr_kvikio") is None, reason="needs zarr-kvikio")
 
 
 def make_adata(fmt: str = "csr", n_obs: int = 500, n_vars: int = 300) -> ad.AnnData:
@@ -53,6 +55,7 @@ def convert(adata: ad.AnnData, tmp_path: Path) -> Path:
     return dst
 
 
+@needs_zarr_kvikio
 @pytest.mark.parametrize("fmt", ["csr", "csc", "dense"])
 def test_convert_zarr(tmp_path, fmt):
     adata = make_adata(fmt)
@@ -137,6 +140,7 @@ def test_chunk_size(n_obs, gpu_reads, n_gpus, expected):
     assert _chunk_size(n_obs, 1234, gpu_reads=gpu_reads, n_gpus=n_gpus) == 1234
 
 
+@needs_zarr_kvikio
 def test_check(tmp_path, capsys):
     dst = convert(make_adata(), tmp_path)
     report = rio.check(dst)
@@ -160,12 +164,10 @@ def _offsets_in_order(arr: zarr.Array) -> bool:
     return True
 
 
+@needs_zarr_kvikio
 @pytest.mark.skipif(find_spec("zarrs") is None, reason="needs zarrs")
 def test_convert_zarr_orders_shards(tmp_path):
     """The chunks of every shard are stored in order, even with zarrs (which doesn't) installed."""
-    from rapids_singlecell.io._check import _shard_unordered
-    from rapids_singlecell_zarr._pipeline import KvikioCodecPipeline, _layout_of
-
     adata = make_adata(n_obs=4000)
     src = write_blosc(adata, tmp_path / "src.zarr")
     rio.convert_zarr(src, tmp_path / "dst.zarr", chunk_bytes=1024, chunks_per_shard=64)
@@ -173,21 +175,32 @@ def test_convert_zarr_orders_shards(tmp_path):
     assert _offsets_in_order(x["data"])
     assert _offsets_in_order(x["indices"])
 
-    # zarrs writes them in whatever order they were compressed in, which `check` reports
-    import zarrs  # noqa: F401
 
-    rng = np.random.default_rng(0)
-    with zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"}):
-        arr = zarr.create_array(
-            tmp_path / "zarrs.zarr",
-            shape=(1 << 16,),
-            dtype="float32",
-            chunks=(256,),
-            shards=(1 << 14,),
-        )
-        arr[:] = rng.random(1 << 16).astype("float32")
-    if _offsets_in_order(arr):
-        pytest.skip("zarrs wrote these shards in order")
-    layout = _layout_of(KvikioCodecPipeline.from_codecs(arr.metadata.codecs))
-    assert _shard_unordered(arr, layout)
-    assert not _shard_unordered(x["data"], layout)
+def test_without_zarr_kvikio(tmp_path, monkeypatch, capsys):
+    """Without zarr-kvikio, everything but `convert_zarr` works with zarr's default pipeline."""
+    from rapids_singlecell.io import _check, _config
+
+    # (before hiding zarr-kvikio: zarr loads the codec pipelines registered here on first use)
+    adata = make_adata()
+    src = write_blosc(adata, tmp_path / "src.zarr")
+    pipeline = zarr.config.get("codec_pipeline.path")
+    real = _config.find_spec
+
+    def hide(name, *args):
+        return None if name.split(".")[0] == "zarr_kvikio" else real(name, *args)
+
+    monkeypatch.setattr(_config, "find_spec", hide)
+    monkeypatch.setattr(_check, "find_spec", hide)
+    monkeypatch.setitem(sys.modules, "zarr_kvikio", None)
+
+    with pytest.warns(UserWarning, match="zarr-kvikio"), rio.enable():
+        lazy = rio.read_lazy(src, chunks=100)
+        assert zarr.config.get("codec_pipeline.path") == pipeline
+    assert (lazy.X.compute().get() != adata.X).nnz == 0
+    report = rio.check(src)
+    assert not report["gpu_io_available"]
+    assert report["store"] is None
+    assert "needs zarr-kvikio" in capsys.readouterr().out
+    rio.release_memory()
+    with pytest.raises(ImportError, match="pip install zarr-kvikio"):
+        rio.convert_zarr(src, tmp_path / "dst.zarr")
