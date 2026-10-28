@@ -809,7 +809,7 @@ template <typename T>
 __global__ void objective_diversity_kernel(const T* O, const T* E,
                                            const T* theta, T sigma,
                                            int n_batches, int n_clusters,
-                                           bool stabilized, T* out) {
+                                           bool stabilized, long long* out) {
     T diversity = T(0);
     for (size_t i = threadIdx.x; i < (size_t)n_batches * n_clusters;
          i += blockDim.x) {
@@ -818,7 +818,11 @@ __global__ void objective_diversity_kernel(const T* O, const T* E,
                      log(numerator / (E[i] + T(1)));
     }
     diversity = block_sum(diversity);
-    if (threadIdx.x == 0) *out = diversity;
+    if (threadIdx.x == 0) {  // its bits, summed over the GPUs as an int64
+        long long bits = 0;
+        memcpy(&bits, &diversity, sizeof(T));
+        *out = bits;
+    }
 }
 
 // ---- k-means initialization ----

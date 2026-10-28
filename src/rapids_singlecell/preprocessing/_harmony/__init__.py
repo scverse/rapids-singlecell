@@ -3,7 +3,10 @@ from __future__ import annotations
 import functools
 import math
 import operator
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
@@ -15,9 +18,10 @@ from rapids_singlecell._cuda import (
 )
 from rapids_singlecell._cuda import _harmony_correction_cuda as _correction_cuda
 from rapids_singlecell._utils import _create_category_index_mapping
+from rapids_singlecell._utils._multi_gpu import _copy_to_device
 from rapids_singlecell._utils._random import _seed_from_rng
 
-from ._chunks_to_device import _sorted_device_copy
+from ._chunks_to_device import _shard_rows, _upload_sorted, _write_shards
 from ._helper import (
     _factorize_joint_codes,
     _get_batch_codes,
@@ -27,8 +31,11 @@ from ._helper import (
     _validate_output_buffer,
 )
 from ._kmeans import _kmeans
+from ._multi_gpu import _comm, _gather_rows
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import pandas as pd
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -42,6 +49,7 @@ _KMEANS_INIT_CELLS_PER_CLUSTER = 5_000
 _FORCE_CLUSTER_BLOCKS = False
 # Tests: whether every block's counts are kept (None: unless they outgrow R).
 _KEEP_BLOCK_COUNTS = None
+_COMM_VALUES = 1 << 22  # int64 values per exchange; larger sums take several
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
 _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
 
@@ -50,6 +58,33 @@ _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
 # harmony-pytorch. Keys are (max_iter_clustering, tol_clustering, tol_harmony).
 _STOPPING_HARMONY2 = (4, 1e-3, 1e-2)
 _STOPPING_HARMONY1 = (200, 1e-5, 1e-4)
+
+
+def _touch_pages(out: np.ndarray) -> None:
+    """Map the pages of ``out``: one write per 4 KiB page (the kernel zero-fills new pages), a strided array whole."""
+    if out.flags.c_contiguous or out.flags.f_contiguous:
+        np.ravel(out, order="K").view(np.uint8)[::4096] = 0
+    else:
+        out.fill(0)
+
+
+@contextmanager
+def _prefaulted(out: np.ndarray | None, Z) -> Iterator[threading.Thread | None]:
+    """Map the pages of the host output ``out`` in a thread while the block runs.
+
+    Copying into mapped pages is about twice as fast as into a fresh allocation. The thread is joined when the block
+    exits, so it never writes ``out`` afterwards. An output sharing memory with the host input is left alone: the
+    input is read later.
+    """
+    if out is None or (isinstance(Z, np.ndarray) and np.may_share_memory(out, Z)):
+        yield None
+        return
+    prefault = threading.Thread(target=_touch_pages, args=(out,), daemon=True)
+    prefault.start()
+    try:
+        yield prefault
+    finally:
+        prefault.join()
 
 
 def harmonize(
@@ -78,7 +113,9 @@ def harmonize(
     verbose: bool = False,
     bfloat16: bool = False,
     dtype: np.dtype | type | None = None,
-) -> cp.ndarray:
+    devices: list[int] | None = None,
+    out: np.ndarray | None = None,
+) -> cp.ndarray | np.ndarray:
     """
     Integrate data using Harmony algorithm.
 
@@ -187,6 +224,16 @@ def harmonize(
     dtype
         float32 or float64 for the computation; ``None`` keeps the dtype of ``Z``.
 
+    devices
+        GPUs to split the cells across (default: the current one). Several
+        GPUs give the bits of a single-GPU run; they need the batched
+        correction and the host output ``out``. A small input uses fewer
+        of them, with a warning.
+
+    out
+        Host array receiving the corrected embedding (then returned). Its
+        pages are mapped in a thread while the GPUs work.
+
     Returns
     -------
     The integrated embedding by Harmony, of the same shape as the input embedding.
@@ -203,6 +250,12 @@ def harmonize(
     max_iter_clustering = operator.index(max_iter_clustering)
     if max_iter_harmony < 1:
         raise ValueError("max_iter_harmony must be >= 1")
+    dtype = np.dtype(Z.dtype if dtype is None else dtype)
+    if out is not None:
+        if not isinstance(out, np.ndarray) or out.shape != Z.shape or out.dtype != dtype:
+            raise ValueError(f"out must be a NumPy array of shape {Z.shape} and dtype {dtype}.")
+        if not out.flags.writeable:
+            raise ValueError("out must be writeable.")
     try:
         valid = int(shuffle_chunk_size) == shuffle_chunk_size >= 1
     except (TypeError, ValueError, OverflowError):
@@ -225,27 +278,8 @@ def harmonize(
     n_clusters = operator.index(n_clusters)
     if n_clusters < 1:
         raise ValueError("n_clusters must be >= 1")
-    dtype = np.dtype(Z.dtype if dtype is None else dtype)
-
-    rng = np.random.default_rng(rng)
-    # Process batch information
-    n_levels, N_b, joint, offsets, order = _sort_by_batch(batch_mat, batch_key, n_cells=n_cells, dtype=dtype, rng=rng)
-    n_covariates, n_batches = n_levels.size, int(n_levels.sum())
-    # The sorted cells' groups, allocated before the upload (faster with a
-    # non-pooled allocator)
-    groups = _sorted_groups(offsets)
-    X = _sorted_device_copy(Z, order, dtype)
-    rhs_bounds = _rhs_bounds(X, offsets)
-    Z_norm = _normalize_cp(X)
-
-    theta_array = _get_theta_array(theta, n_levels, dtype)
-    if tau > 0:
-        theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
-    theta_array = cp.ascontiguousarray(theta_array.ravel())
-    if not bool(cp.isfinite(theta_array).all()):
-        raise ValueError(f"theta must be finite, got {theta}.")
-
-    # Validate parameters
+    if correction_method not in {None, "fast", "original", "batched"}:
+        raise ValueError("correction_method must be 'fast' or 'batched'.")
     if dynamic_lambda:
         if not np.isfinite(alpha) or alpha <= 0:
             raise ValueError(f"alpha must be a finite positive number when dynamic_lambda=True, got {alpha}.")
@@ -255,174 +289,267 @@ def harmonize(
         raise ValueError(
             f"ridge_lambda must be a finite positive number when dynamic_lambda=False, got {ridge_lambda}."
         )
-    correction_method = _choose_method(X, n_levels, correction_method)
-
-    # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
-    # generator collapses into an integer here; the per-iteration offset keeps
-    # successive kernel launches decorrelated.
-    kernel_seed = _seed_from_rng(rng, allow_none=False)
-
-    n_blocks = -(-n_cells // max(1, math.ceil(n_cells * block_proportion)))
-    # 32-bit indices over update blocks x batches (the block draw, one key)
-    # and batches x clusters or PCs (counts, fast correction).
-    pairs = max(
-        n_blocks * (n_batches if n_covariates == 1 else 1),
-        (n_batches + 1) * max(Z.shape[1], n_clusters),
-    )
-    if pairs > 2**31 - 2**24:
-        raise ValueError(
-            f"harmonize supports at most {2**31 - 2**24} update blocks x batches "
-            f"or batches x clusters (or PCs), got {pairs}; raise block_proportion "
-            "or use fewer batch levels."
+    with _prefaulted(out, Z) as prefault:
+        rng = np.random.default_rng(rng)
+        # Process batch information
+        n_levels, N_b, joint, offsets, order = _sort_by_batch(
+            batch_mat, batch_key, n_cells=n_cells, dtype=dtype, rng=rng
         )
-    if bfloat16 and not (n_covariates == 1 and dtype == np.float32 and correction_method == "batched"):
-        warnings.warn(
-            f"dtype='bfloat16' needs one batch key and the batched correction; using {dtype} assignments instead.",
-            UserWarning,
-            stacklevel=4,
+        n_covariates, n_batches = n_levels.size, int(n_levels.sum())
+        n_groups = len(offsets) - 1  # batches, or joint categories with several keys
+
+        theta_array = _get_theta_array(theta, n_levels, dtype)
+        if tau > 0:
+            theta_array = theta_array * (1 - cp.exp(-N_b / (n_clusters * tau)) ** 2)
+        theta_array = cp.ascontiguousarray(theta_array.ravel())
+        correction_method = _choose_method(Z, n_levels, correction_method, dtype)
+
+        # The clustering loop is a CUDA kernel taking a `uint32` seed, so the
+        # generator collapses into an integer here; the per-iteration offset keeps
+        # successive kernel launches decorrelated.
+        kernel_seed = _seed_from_rng(rng, allow_none=False)
+
+        n_blocks = -(-n_cells // max(1, math.ceil(n_cells * block_proportion)))
+        # 32-bit indices over update blocks x batches (the block draw, one key)
+        # and batches x clusters or PCs (counts, fast correction).
+        pairs = max(
+            n_blocks * (n_batches if n_covariates == 1 else 1),
+            (n_batches + 1) * max(Z.shape[1], n_clusters),
         )
-        bfloat16 = False
-    # Each block's counts are kept unless they would outgrow R; then three
-    # blocks' are recounted from R at a time (see clustering.cu).
-    keep = _KEEP_BLOCK_COUNTS
-    if keep is None:
-        keep = (n_blocks + 3) * n_batches * 8 <= n_cells * dtype.itemsize
-    chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
-
-    # Initialize algorithm: the clustering buffers exist before the k-means,
-    # whose many small temporaries then allocate faster.
-    workspace = _allocate_clustering_workspace(
-        n_cells,
-        n_pcs=X.shape[1],
-        n_clusters=n_clusters,
-        n_batches=n_batches,
-        n_groups=n_batches if n_covariates == 1 else 1,
-        n_blocks=n_blocks,
-        n_stored=n_blocks if keep else min(n_blocks, 3),
-        dtype=dtype,
-    )
-    Y_norm = _kmeans_centroids(Z_norm, offsets=offsets, n_clusters=n_clusters, rng=rng)
-    seg_start, seg_group = _segments(offsets, unit)
-    segments = (seg_start, seg_group, rhs_bounds)
-    if n_covariates > 1:  # centroid sums need no group cuts
-        seg_start = _segments(offsets[[0, -1]], unit)[0]
-    Pr_b = (N_b / n_cells).astype(dtype)
-    # The update blocks are drawn once per call, before the large arrays
-    # exist; with several keys the assignment tiles take any cells.
-    _draw_blocks(
-        groups if n_covariates == 1 else cp.zeros(n_cells, dtype=cp.int32),
-        n_groups=n_batches if n_covariates == 1 else 1,
-        n_blocks=n_blocks,
-        seed=kernel_seed,
-        chunk=chunk,
-        unit=unit,
-        workspace=workspace,
-    )
-    cats = cat_offsets = None
-    if correction_method == "fast":  # the batch of every cell
-        cats, cat_offsets = groups, cp.asarray(offsets)
-    # joint runs, or the groups of recounted block counts
-    joints = groups if n_covariates > 1 or not keep else None
-    del groups
-
-    workspace["Y_norm"][...] = Y_norm
-    del Y_norm
-    R = cp.empty((n_cells, n_clusters), dtype=cp.uint16 if bfloat16 else dtype)
-    O = cp.empty((n_batches, n_clusters), dtype=dtype)
-    E = cp.empty_like(O)
-    # Clustering updates of R, O and E in place: the update blocks of cells are
-    # reassigned against the counts of all other cells until convergence or
-    # max_iter passes (the workspace holds its buffers).
-    clustering = functools.partial(
-        _clustering_cuda.clustering_loop,
-        Z_norm,
-        E=E,
-        O=O,
-        Pr_b=Pr_b,
-        theta=theta_array,
-        seg_start=seg_start,
-        joint_cats=joint.get("joint_cats"),
-        joints=joints,
-        **workspace,
-        force_blocks=_FORCE_CLUSTER_BLOCKS,
-        n_cells=n_cells,
-        n_pcs=Z_norm.shape[1],
-        n_clusters=n_clusters,
-        n_batches=n_batches,
-        n_covariates=n_covariates,
-        n_first=int(n_levels[0]),
-        n_blocks=n_blocks,
-        sigma=float(sigma),
-        stabilized=stabilized_penalty,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
-    # Every cell assigned to the k-means centroids without penalty
-    objectives = [clustering(**_assignment_args(R, dtype), max_iter=0, initialize=True)]
-
-    # Main harmony iterations
-    for i in range(max_iter_harmony):
-        # Clustering step
-        objectives.append(
-            clustering(
-                **_assignment_args(R, dtype),
-                tol=float(tol_clustering),
-                max_iter=max_iter_clustering,
-                seed=(kernel_seed + i * 1000003) & 0xFFFFFFFF,
+        if pairs > 2**31 - 2**24:
+            raise ValueError(
+                f"harmonize supports at most {2**31 - 2**24} update blocks x batches "
+                f"or batches x clusters (or PCs), got {pairs}; raise block_proportion "
+                "or use fewer batch levels."
             )
-        )
-        # Compute per-(k,b) ridge regularization
-        lambda_kb = _compute_lambda_kb(
-            E,
-            O=O,
-            N_b=N_b,
-            alpha=alpha,
-            threshold=batch_prune_threshold,
-            ridge_lambda=ridge_lambda,
-            dynamic_lambda=dynamic_lambda,
-        )
-        # Check for convergence: it depends only on the clustering
-        # objective, so the correction writes the normalized embedding
-        # for the next clustering (into Z_norm) unless this is the last.
-        is_converged = _is_convergent_harmony(objectives, tol=tol_harmony)
-        normalize = not is_converged and i + 1 < max_iter_harmony
-        # Correction step
-        if n_covariates > 1:
-            Z_hat = _correction_multi(
-                X,
-                R,
-                lambda_kb=lambda_kb,
-                n_first=int(n_levels[0]),
-                **joint,
-                segments=segments,
-                output=Z_norm,
-                normalize=normalize,
+        if bfloat16 and not (n_covariates == 1 and dtype == np.float32 and correction_method == "batched"):
+            warnings.warn(
+                f"dtype='bfloat16' needs one batch key and the batched correction; using {dtype} assignments instead.",
+                UserWarning,
+                stacklevel=4,
             )
-        else:
-            Z_hat = _correction(
+            bfloat16 = False
+        # Each block's counts are kept (on every GPU) unless they would outgrow
+        # R; then three blocks' are recounted from R at a time (see clustering.cu).
+        keep = _KEEP_BLOCK_COUNTS
+        if keep is None:
+            keep = (n_blocks + 3) * n_batches * 8 <= n_cells * dtype.itemsize
+        devices = devices or [cp.cuda.Device().id]
+        if len(devices) > 1 and correction_method != "batched":
+            warnings.warn(
+                "The fast correction runs on one GPU (it is also chosen when one "
+                "cluster's batched correction workspace would exceed 1 GiB).",
+                UserWarning,
+                stacklevel=4,
+            )
+            devices = devices[:1]
+        # Shards: contiguous runs of the sorted cells, one per GPU, cut at
+        # multiples of the block draw's units (which also cut the segments), so
+        # that every GPU draws the blocks and sums the segments of a single-GPU run.
+        chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
+        if len(devices) > n_cells // unit:
+            warnings.warn(
+                f"Using {n_cells // unit} of {len(devices)} GPUs: {n_cells} cells split into at most that many shards.",
+                UserWarning,
+                stacklevel=4,
+            )
+            devices = devices[: max(1, n_cells // unit)]
+        if len(devices) > 1 and out is None:
+            raise ValueError("Several GPUs write the result into a host array `out`.")
+        n_ranks, n_pcs = len(devices), Z.shape[1]
+        bounds = [round(n_cells * r / n_ranks / unit) * unit for r in range(n_ranks)] + [n_cells]
+        # Each GPU's sorted groups, allocated before the upload (faster with a
+        # non-pooled allocator)
+        shard_groups = [
+            _sorted_groups(offsets, lo, hi, device)
+            for device, lo, hi in zip(devices, bounds[:-1], bounds[1:], strict=True)
+        ]
+        # Exact int64 sums of block counts, right-hand sides and centroids.
+        capacity = n_clusters * max(
+            (n_blocks if keep else 1) * n_batches,
+            _limbs(dtype.itemsize) * n_groups * n_pcs,
+            3 * n_pcs,
+        )
+
+        # Every GPU writes its rows of the output (see _write_shards).
+        shard_rows = _shard_rows(order, bounds, devices)
+        shards = _upload_sorted(Z, order, bounds, devices, shard_rows=shard_rows, dtype=dtype)
+        del Z, order
+        # Read after the upload, whose host staging overlaps the sort.
+        if not bool(cp.isfinite(theta_array).all()):
+            raise ValueError(f"theta must be finite, got {theta}.")
+        rhs_bounds = _rhs_bounds(shards, offsets, bounds)
+
+        # Initialize algorithm
+        shards = [
+            _shard(
                 X,
-                R=R,
-                O=O,
-                lambda_kb=lambda_kb,
-                correction_method=correction_method,
-                cats=cats,
+                n_clusters=n_clusters,
                 n_batches=n_batches,
-                cat_offsets=cat_offsets,
-                output=Z_norm,
-                normalize=normalize,
-                segments=segments,
+                n_groups=n_batches if n_covariates == 1 else 1,
+                n_blocks=n_blocks,
+                n_stored=n_blocks if keep else min(n_blocks, 3),
+                n_total=n_cells,
             )
-        if is_converged:
-            break
-
-    if is_converged and verbose:
-        print(f"Harmony converged in {i + 1} iterations")
-    if not is_converged:
-        warnings.warn(
-            "Harmony did not converge. Consider increasing the number of iterations",
-            stacklevel=4,
+            for X in shards
+        ]
+        Y_norm = _kmeans_centroids(
+            [Z_norm for _, Z_norm, _ in shards],
+            bounds=bounds,
+            offsets=offsets,
+            n_clusters=n_clusters,
+            rng=rng,
         )
-    X[order] = Z_hat  # the result in input order, into the sorted cells' buffer
-    return X
+        # Every GPU's copies of the shared arrays, made before the GPU threads: a
+        # thread's copy from another GPU would wait for that GPU's queued work.
+        shared = {**joint, "N_b": N_b, "theta": theta_array, "Y_norm": Y_norm}
+        shared["rhs_bounds"] = rhs_bounds
+        local = [{k: _copy_to_device(a, d) for k, a in shared.items()} for d in devices]
+        del Y_norm, rhs_bounds, shared  # each GPU's copies: until its workspace has them
+
+        def run(rank: int, comm: int) -> tuple[cp.ndarray, bool, int]:
+            # Harmony on one GPU's shard; several GPUs run it at once, ``comm``
+            # summing over all cells exactly, so each gives the bits of one GPU.
+            X, Z_norm, workspace = shards[rank]
+            lo, hi = bounds[rank], bounds[rank + 1]
+            groups, shard_groups[rank] = shard_groups[rank], None
+            mine, local[rank] = local[rank], None
+            joint_args = {name: mine[name] for name in joint}
+            N_b_local, sums = mine["N_b"], {"comm": comm, "rank": rank}
+            seg_start, seg_group = _segments(offsets, unit, lo, hi)
+            segments = (seg_start, seg_group, mine["rhs_bounds"])
+            if n_covariates > 1:  # centroid sums need no group cuts
+                seg_start = _segments(offsets[[0, -1]], unit, lo, hi)[0]
+            Pr_b = (N_b_local / n_cells).astype(dtype)
+            # The update blocks are drawn once per call, before the large arrays
+            # exist; with several keys the assignment tiles take any cells.
+            _draw_blocks(
+                groups if n_covariates == 1 else cp.zeros(hi - lo, dtype=cp.int32),
+                n_groups=n_batches if n_covariates == 1 else 1,
+                n_blocks=n_blocks,
+                seed=kernel_seed,
+                chunk=chunk,
+                unit=unit,
+                first=lo,
+                workspace=workspace,
+            )
+            cats = cat_offsets = None
+            if correction_method == "fast":  # the batch of every cell (one GPU)
+                cats, cat_offsets = groups, cp.asarray(offsets)
+            # joint runs, or the groups of recounted block counts
+            joints = groups if n_covariates > 1 or not keep else None
+            del groups
+
+            workspace["Y_norm"][...] = mine.pop("Y_norm")
+            R = cp.empty((hi - lo, n_clusters), dtype=cp.uint16 if bfloat16 else dtype)
+            O = cp.empty((n_batches, n_clusters), dtype=dtype)
+            E = cp.empty_like(O)
+            # Clustering updates of R, O and E in place: the update blocks of cells
+            # are reassigned against the counts of all other cells until
+            # convergence or max_iter passes (the workspace holds its buffers).
+            clustering = functools.partial(
+                _clustering_cuda.clustering_loop,
+                Z_norm,
+                E=E,
+                O=O,
+                Pr_b=Pr_b,
+                theta=mine["theta"],
+                seg_start=seg_start,
+                joint_cats=joint_args.get("joint_cats"),
+                joints=joints,
+                **workspace,
+                force_blocks=_FORCE_CLUSTER_BLOCKS,
+                n_cells=hi - lo,
+                n_total=n_cells,
+                n_pcs=n_pcs,
+                n_clusters=n_clusters,
+                n_batches=n_batches,
+                n_covariates=n_covariates,
+                n_first=int(n_levels[0]),
+                n_blocks=n_blocks,
+                sigma=float(sigma),
+                stabilized=stabilized_penalty,
+                stream=cp.cuda.get_current_stream().ptr,
+                comm=comm,
+                rank=rank,
+            )
+            # Every cell assigned to the k-means centroids without penalty
+            objectives = [clustering(**_assignment_args(R, dtype), max_iter=0, initialize=True)]
+
+            # Main harmony iterations
+            for i in range(max_iter_harmony):
+                # Clustering step
+                objectives.append(
+                    clustering(
+                        **_assignment_args(R, dtype),
+                        tol=float(tol_clustering),
+                        max_iter=max_iter_clustering,
+                        seed=(kernel_seed + i * 1000003) & 0xFFFFFFFF,
+                    )
+                )
+                # Compute per-(k,b) ridge regularization
+                lambda_kb = _compute_lambda_kb(
+                    E,
+                    O=O,
+                    N_b=N_b_local,
+                    alpha=alpha,
+                    threshold=batch_prune_threshold,
+                    ridge_lambda=ridge_lambda,
+                    dynamic_lambda=dynamic_lambda,
+                )
+                # Check for convergence: it depends only on the clustering
+                # objective, so the correction writes the normalized embedding
+                # for the next clustering (into Z_norm) unless this is the last.
+                is_converged = _is_convergent_harmony(objectives, tol=tol_harmony)
+                normalize = not is_converged and i + 1 < max_iter_harmony
+                # Correction step
+                if n_covariates > 1:
+                    Z_hat = _correction_multi(
+                        X,
+                        R,
+                        lambda_kb=lambda_kb,
+                        n_first=int(n_levels[0]),
+                        **joint_args,
+                        segments=segments,
+                        output=Z_norm,
+                        normalize=normalize,
+                        n_total=n_cells,
+                        sums=sums,
+                    )
+                else:
+                    Z_hat = _correction(
+                        X,
+                        R=R,
+                        O=O,
+                        lambda_kb=lambda_kb,
+                        correction_method=correction_method,
+                        cats=cats,
+                        n_batches=n_batches,
+                        cat_offsets=cat_offsets,
+                        output=Z_norm,
+                        normalize=normalize,
+                        segments=segments,
+                        sums=sums,
+                    )
+                if is_converged:
+                    break
+            return Z_hat, is_converged, i
+
+        shards, is_converged, i = _on_gpus(  # rebinding frees the inputs before the output
+            run, devices, offsets=offsets, bounds=bounds, capacity=capacity
+        )
+        if is_converged and verbose:
+            print(f"Harmony converged in {i + 1} iterations")
+        if not is_converged:
+            warnings.warn(
+                "Harmony did not converge. Consider increasing the number of iterations",
+                stacklevel=4,
+            )
+        if out is None:  # one GPU: the result in input order, on its GPU
+            with cp.cuda.Device(devices[0]):
+                return shards[0][shard_rows[1][0]]
+        _write_shards(shards, shard_rows, devices, out, prefault)
+        return out
 
 
 def _sort_by_batch(
@@ -476,11 +603,11 @@ def _sort_by_batch(
     return n_levels, N_b.astype(dtype), joint, offsets, order
 
 
-def _choose_method(Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_method: str | None) -> str:
+def _choose_method(
+    Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_method: str | None, dtype: np.dtype
+) -> str:
     """The correction method (with a warning where the choice is replaced)."""
     n_covariates, n_batches = n_levels.size, int(n_levels.sum())
-    if correction_method not in {None, "fast", "original", "batched"}:
-        raise ValueError("correction_method must be 'fast' or 'batched'.")
     if correction_method == "original":
         correction_method = "fast" if n_covariates == 1 else "batched"
         warnings.warn(
@@ -507,9 +634,101 @@ def _choose_method(Z: cp.ndarray | np.ndarray, n_levels: np.ndarray, correction_
         correction_method = "batched"  # several keys: the multi-key solve
     # One key: the batched correction unless one cluster's workspace is too large.
     if correction_method is None:
-        fit = _batched_cluster_chunk(Z.shape[1], n_batches, Z.dtype.itemsize)
+        fit = _batched_cluster_chunk(Z.shape[1], n_batches, dtype.itemsize)
         correction_method = "batched" if fit else "fast"
     return correction_method
+
+
+def _shard(X: cp.ndarray, **sizes) -> tuple[cp.ndarray, cp.ndarray, dict]:
+    """One GPU's sorted cells, normalized, and their clustering buffers.
+
+    The k-means' many small temporaries then allocate faster.
+    """
+    with cp.cuda.Device(X.device.id):
+        Z_norm = _normalize_cp(X)
+        workspace = _allocate_clustering_workspace(X.shape[0], n_pcs=X.shape[1], dtype=X.dtype, **sizes)
+        return X, Z_norm, workspace
+
+
+def _settle(pool, comm, buffers: list) -> None:
+    """Wait for the GPU threads, then for the exchanges still in flight (without the GIL).
+
+    A GPU that has not completed them after 10 s may still write ``buffers``: a daemon thread holds them until it has.
+    """
+    pool.shutdown()
+    if not comm.synchronize():
+        threading.Thread(target=lambda keep=buffers: comm.wait(), daemon=True).start()
+
+
+def _on_gpus(
+    run, devices: list[int], *, offsets: np.ndarray, bounds: list[int], capacity: int
+) -> tuple[list[cp.ndarray], bool, int]:
+    """``run(rank, comm)`` under every GPU: one in this thread, several in a thread each.
+
+    They exchange exact sums of up to ``capacity`` int64 values over ``comm``. The first error on any GPU is raised
+    once every thread stopped.
+    """
+    if len(devices) == 1:
+        with cp.cuda.Device(devices[0]):
+            Z_hat, is_converged, i = run(0, 0)
+        return [Z_hat], is_converged, i
+    # Per-group sums move only each GPU's groups.
+    first = np.searchsorted(offsets, bounds[:-1], side="right") - 1
+    end = np.searchsorted(offsets, np.subtract(bounds[1:], 1), side="right")
+    comm, comm_buffers = _comm(  # held until the GPU threads stopped
+        devices,
+        min(capacity, _COMM_VALUES),
+        groups=np.column_stack([first, end]).ravel().tolist(),
+    )
+    errors = []  # the first is the cause; the other GPUs then fail on the abort
+
+    def guarded(rank: int):
+        try:
+            with cp.cuda.Device(devices[rank]):
+                result = run(rank, comm.handle)
+                cp.cuda.get_current_stream().synchronize()  # read by other threads
+                return result
+        except BaseException as error:
+            errors.append(error)
+            comm.abort()  # release the other GPUs' threads
+            raise
+
+    # The GPU threads read this thread's arrays on their own streams.
+    for device in {cp.cuda.Device().id, *devices}:
+        with cp.cuda.Device(device):
+            cp.cuda.get_current_stream().synchronize()
+    pool, done, interrupts = ThreadPoolExecutor(len(devices)), False, 0
+    try:
+        futures = [pool.submit(guarded, rank) for rank in range(len(devices))]
+        wait(futures)
+        done = not errors
+    except KeyboardInterrupt:
+        interrupts += 1
+        raise
+    finally:
+        while True:  # the GPU threads stop first; a second Ctrl-C gives up on them
+            try:
+                if not done:  # e.g. Ctrl-C: release the other GPUs' threads
+                    comm.abort()
+                _settle(pool, comm, comm_buffers)
+                break
+            except KeyboardInterrupt:
+                interrupts += 1
+                if interrupts > 1:  # left behind, settled by a daemon thread
+                    threading.Thread(target=_settle, args=(pool, comm, comm_buffers), daemon=True).start()
+                    raise
+        del comm_buffers  # and comm (also guarded's): no traceback holds them
+        comm = None
+    if interrupts and not errors:  # in a call that had not failed
+        raise KeyboardInterrupt
+    if errors:
+        try:
+            raise errors[0]
+        finally:  # cycle error -> traceback -> errors/futures holds GPU arrays until gc
+            errors.clear()
+            futures.clear()
+    results = [future.result() for future in futures]
+    return [result[0] for result in results], *results[0][1:]
 
 
 def _assignment_args(R: cp.ndarray, dtype) -> dict:
@@ -522,54 +741,72 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
     return {"R": R}
 
 
-def _rhs_bounds(Z: cp.ndarray, offsets: np.ndarray) -> cp.ndarray:
-    """Bounds of the exact right-hand side sums (segment_gemm.cuh).
+def _rhs_bounds(parts: list[cp.ndarray], offsets: np.ndarray, bounds: list[int]) -> cp.ndarray:
+    """Bounds of the exact right-hand side sums (segment_gemm.cuh), on the current GPU.
 
     The exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells (sorted by group, ``offsets`` on
-    the host) and PC d, so no other group or PC coarsens a sum.
+    the host) and PC d, so no other group or PC coarsens a sum. ``parts`` hold the cells
+    ``bounds[r] .. bounds[r + 1]``; each GPU takes the maxima of its own groups (a group spanning GPUs from each),
+    which are exact, so every split gives the same bounds.
     """
-    seg_start, seg_group = _segments(offsets)  # any single-group segments
-    maxima = cp.empty((len(offsets) - 1, Z.shape[1]), dtype=Z.dtype)
-    _correction_batched_cuda.group_absmax(
-        Z,
-        seg_start=seg_start,
-        seg_group=seg_group,
-        out=maxima,
-        stream=cp.cuda.get_current_stream().ptr,
-    )
+    maxima = cp.zeros((len(offsets) - 1, parts[0].shape[1]), dtype=parts[0].dtype)
+    for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
+        # the groups of the cells lo .. hi - 1
+        first, end = np.searchsorted(offsets, [lo, hi - 1], side="right") - [1, 0]
+        with cp.cuda.Device(part.device.id):
+            seg_start, seg_group = _segments(offsets, _SEGMENT, lo, hi)
+            seg_group -= int(first)  # rows of m
+            m = cp.empty((end - first, part.shape[1]), dtype=part.dtype)
+            _correction_batched_cuda.group_absmax(
+                part,
+                seg_start=seg_start,
+                seg_group=seg_group,
+                out=m,
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+        rows = maxima[first:end]
+        cp.maximum(rows, _copy_to_device(m, maxima.device.id), out=rows)
     if not bool(cp.isfinite(maxima).all()):
         raise ValueError(
             "Input data contains NaN or infinite values. Please handle these before running harmony_integrate."
         )
     n = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None]
-    bounds = n * maxima  # beyond float64 near 1e308: n < 2^a, max < 2^b
-    exp = cp.frexp(cp.where(bounds > 0, bounds, 1.0))[1]
-    exp = cp.where(cp.isinf(bounds), cp.frexp(n)[1] + cp.frexp(maxima)[1], exp)
+    rhs = n * maxima  # beyond float64 near 1e308: n < 2^a, max < 2^b
+    exp = cp.frexp(cp.where(rhs > 0, rhs, 1.0))[1]
+    exp = cp.where(cp.isinf(rhs), cp.frexp(n)[1] + cp.frexp(maxima)[1], exp)
     return exp.astype(cp.int16)
 
 
-def _segments(offsets: np.ndarray, unit: int = _SEGMENT) -> tuple[cp.ndarray, cp.ndarray]:
+def _segments(
+    offsets: np.ndarray, unit: int = _SEGMENT, lo: int = 0, hi: int | None = None
+) -> tuple[cp.ndarray, cp.ndarray]:
     """Segments of the exact sums over cells sorted by group (``offsets`` on the host).
 
     Runs of one group cut at multiples of _SEGMENT and of ``unit`` (the block draw's units, where several GPUs split
-    the cells). Start rows (and the end), and the group of each segment.
+    the cells). Start rows (and the end) and the group of each segment of the cells ``lo .. hi`` (multiples of
+    ``unit``), in rows from ``lo``.
     """
-    start = np.union1d(offsets, np.arange(0, offsets[-1], _SEGMENT))
-    start = np.union1d(start, np.arange(0, offsets[-1], unit))
+    hi = offsets[-1] if hi is None else hi
+    grid = np.arange(-(-lo // _SEGMENT) * _SEGMENT, hi, _SEGMENT)
+    start = np.union1d(np.clip(offsets, lo, hi), np.arange(lo, hi, unit))
+    start = np.union1d(start, grid)
     group = np.searchsorted(offsets, start[:-1], side="right") - 1
-    return cp.asarray(start, dtype=cp.int32), cp.asarray(group, dtype=cp.int32)
+    return cp.asarray(start - lo, dtype=cp.int32), cp.asarray(group, dtype=cp.int32)
 
 
-def _sorted_groups(offsets: np.ndarray) -> cp.ndarray:
-    """The groups of the sorted cells (``offsets`` on the host).
+def _sorted_groups(offsets: np.ndarray, lo: int, hi: int, device: int) -> cp.ndarray:
+    """The groups of the sorted cells ``lo .. hi`` (``offsets`` on the host) on ``device``.
 
     The sum of a 1 at the first cell of every later group.
     """
-    n_cells, starts = int(offsets[-1]), offsets[1:]
-    groups = cp.zeros(n_cells, dtype=cp.int32)
-    cp.add.at(groups, cp.asarray(starts[starts < n_cells]), 1)
-    cp.cumsum(groups, dtype=cp.int32, out=groups)
-    return groups
+    first = int(np.searchsorted(offsets, lo, side="right")) - 1
+    starts = offsets[first + 1 :]
+    with cp.cuda.Device(device):
+        groups = cp.zeros(hi - lo, dtype=cp.int32)
+        cp.add.at(groups, cp.asarray(starts[starts < hi] - lo), 1)
+        cp.cumsum(groups, dtype=cp.int32, out=groups)
+        groups += first
+        return groups
 
 
 def _block_layout(n_total: int, n_blocks: int, shuffle_chunk: int) -> tuple[int, int]:
@@ -590,12 +827,14 @@ def _draw_blocks(
     seed: int,
     chunk: int,
     unit: int,
+    first: int,
     workspace: dict,
 ) -> None:
     """Draw the update blocks of a harmonize call into the workspace.
 
-    Writes ``idx_list``, ``block_cat_offsets`` and the host ``block_starts`` (sort scratch only lives here);
-    ``chunk`` and ``unit`` come from _block_layout.
+    Writes ``idx_list``, ``block_cat_offsets`` and the host ``block_starts`` (sort scratch only lives here).
+    ``groups`` are the sorted cells ``first ..`` of a call (``chunk`` and ``unit`` from _block_layout); a cell's
+    block depends only on its position among all cells.
     """
     n = groups.size
     _clustering_cuda.draw_blocks(
@@ -611,6 +850,7 @@ def _draw_blocks(
         unit=unit,
         seed=seed & 0xFFFFFFFF,
         shuffle_chunk=chunk,
+        first=first,
         stream=cp.cuda.get_current_stream().ptr,
     )
     # Block b is idx_list[starts[b] : starts[b + 1]]; read once for the loop.
@@ -618,21 +858,26 @@ def _draw_blocks(
 
 
 def _kmeans_centroids(
-    Z_norm: cp.ndarray,
+    parts: list[cp.ndarray],
     *,
+    bounds: list[int],
     offsets: np.ndarray,
     n_clusters: int,
     rng: np.random.Generator,
 ) -> cp.ndarray:
-    """Normalized k-means centroids of a stratified sample of the normalized sorted cells."""
+    """Normalized k-means centroids of a stratified sample of the normalized sorted cells.
+
+    The sorted cells are the shards ``parts``; the centroids are on the current GPU.
+    """
     # Fit only the initialization sample, retaining every observed stratum.
-    n_cells = Z_norm.shape[0]
+    n_cells = bounds[-1]
     n_init_cells = min(n_cells, _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
     if n_init_cells < len(offsets) - 1:
         n_init_cells = max(n_init_cells, int(np.count_nonzero(np.diff(offsets))))
-    rows = Z_norm  # all cells, which _kmeans only reads
+    sample = None  # all cells: on one GPU the shard itself, which _kmeans only reads
     if n_init_cells < n_cells:
-        rows = Z_norm[_stratified_sample_indices(offsets, n_init_cells, rng)]
+        sample = _stratified_sample_indices(offsets, n_init_cells, rng)
+    rows = _gather_rows(parts, bounds, sample)
     Y = _kmeans(rows, n_clusters, max_iter=_KMEANS_MAX_ITER, rng=_seed_from_rng(rng))
     return _normalize_cp(Y)
 
@@ -646,18 +891,19 @@ def _allocate_clustering_workspace(
     n_groups: int,
     n_blocks: int,
     n_stored: int,
+    n_total: int,
     dtype: cp.dtype,
 ) -> dict:
-    """Buffers of the clustering loop.
+    """Buffers of the clustering loop of ``n_cells`` of the ``n_total`` cells (all GPUs).
 
     The tiles' groups are the batches, or one group for several keys; counts are kept per batch level.
     """
     workspace = {
         "Y_norm": cp.empty((n_clusters, n_pcs), dtype=dtype),
         # Exact centroid sums (at most 3 limbs) and the exponents of their
-        # bound, n_cells per PC (|Z_norm|, R <= 1; see segment_gemm.cuh).
+        # bound, n_total per PC (|Z_norm|, R <= 1; see segment_gemm.cuh).
         "y_acc": cp.empty((3, n_clusters, n_pcs), dtype=cp.int64),
-        "y_bound": cp.full(n_pcs, np.frexp(n_cells)[1], dtype=cp.int16),
+        "y_bound": cp.full(n_pcs, np.frexp(n_total)[1], dtype=cp.int16),
         "idx_list": cp.empty(n_cells, dtype=cp.int32),
         "penalty": cp.empty((n_batches, n_clusters), dtype=dtype),
         "objective_partials": cp.empty(n_cells + 8, dtype=dtype),
@@ -722,6 +968,7 @@ def _correction(
     output: cp.ndarray | None = None,
     normalize: bool = False,
     segments: tuple | None = None,
+    sums: dict | None = None,
 ) -> cp.ndarray:
     """
     Apply correction to the embedding based on the specified method.
@@ -737,6 +984,7 @@ def _correction(
             segments=segments,
             output=output,
             normalize=normalize,
+            sums=sums,
         )
     elif correction_method == "fast":
         Z = _correction_fast(
@@ -765,10 +1013,13 @@ def _correction_multi(
     segments: tuple,
     output: cp.ndarray | None = None,
     normalize: bool = False,
+    n_total: int = 0,
+    sums: dict | None = None,
 ) -> cp.ndarray:
     """Apply the exact general-design correction in bounded cluster chunks.
 
-    The cells are sorted by joint category (``segments`` as for _correction_batched).
+    The cells are sorted by joint category (``segments`` as for _correction_batched), with the joint counts of R over
+    the ``n_total`` cells of all GPUs.
     """
     seg_start, seg_group, bounds = segments
     Z = _correction_output(X, output)
@@ -793,9 +1044,11 @@ def _correction_multi(
             itemsize=X.dtype.itemsize,
         ),
         suppress=_SUPPRESS_PENALTY,
+        n_total=n_total,
         stream=cp.cuda.get_current_stream().ptr,
         blas=cp.cuda.device.get_cublas_handle(),
         solver=cp.cuda.device.get_cusolver_handle(),
+        **({} if sums is None else sums),
     )
     return Z
 
@@ -887,6 +1140,7 @@ def _correction_batched(
     segments: tuple,
     output: cp.ndarray | None = None,
     normalize: bool = False,
+    sums: dict | None = None,
 ) -> cp.ndarray:
     """Batched correction of cells sorted by batch, as many clusters per pass as fit in 1 GiB of workspace.
 
@@ -910,6 +1164,7 @@ def _correction_batched(
         chunk=chunk,
         normalize=normalize,
         stream=cp.cuda.get_current_stream().ptr,
+        **({} if sums is None else sums),
     )
     return Z
 

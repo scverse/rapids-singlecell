@@ -20,7 +20,6 @@ from rapids_singlecell._cuda import _rank_stream_cuda as _rss
 from rapids_singlecell._utils import (
     _concat_on_device,
     _sum_on_device,
-    parse_device_ids,
 )
 
 if TYPE_CHECKING:
@@ -29,13 +28,6 @@ if TYPE_CHECKING:
 
 # Host pageable->pinned copy is the multi-GPU bottleneck; base on core count.
 _MAX_HOST_STAGING_WORKERS = os.cpu_count() or 32
-
-
-def resolve_stream_devices(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
-    """Device ids for a host-streaming run (single current device when off)."""
-    if multi_gpu is None or multi_gpu is False:
-        return [cp.cuda.Device().id]
-    return list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
 
 
 def _limit_host_workers(n_devices: int) -> None:

@@ -266,6 +266,7 @@ module = [
   "rapids_singlecell.preprocessing._harmony._chunks_to_device",
   "rapids_singlecell.preprocessing._harmony._helper",
   "rapids_singlecell.preprocessing._harmony._kmeans",
+  "rapids_singlecell.preprocessing._harmony._multi_gpu",
   "rapids_singlecell.preprocessing._harmony_integrate",
   "rapids_singlecell.preprocessing._hvg",
   "rapids_singlecell.preprocessing._hvg._pearson_residuals",
