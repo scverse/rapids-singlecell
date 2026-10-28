@@ -184,8 +184,10 @@ def _parallel_copy(
             np.copyto(*((dst[run], src[a:b]) if scatter else (dst[a:b], src[run])))
         elif scatter:
             dst[index[a:b]] = src[a:b]
-        elif b > a:  # mode="raise" would buffer the output
+        elif b > a and np.can_cast(dst.dtype, src.dtype):  # mode="raise" would buffer the output
             np.take(src, index[a:b], axis=0, out=dst[a:b], mode="clip")
+        elif b > a:  # take(out=) casts only towards the source dtype
+            dst[a:b] = src[index[a:b]]
 
     list(pool.map(copy, cuts[:-1], cuts[1:]))
 

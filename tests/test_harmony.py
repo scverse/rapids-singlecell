@@ -1537,10 +1537,10 @@ def _record_ranks(monkeypatch) -> list:
     return ranks
 
 
-@pytest.mark.parametrize("layout", ["C", "F"])
-def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout):
+@pytest.mark.parametrize("layout, dtype", [("C", np.float32), ("F", np.float32), ("C", np.float64)])
+def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout, dtype):
     # Several GPUs stage only their own input rows (runs and scattered rows),
-    # so every row crosses the host once.
+    # so every row crosses the host once; the staging converts the dtype.
     X = np.random.default_rng(0).standard_normal((1000, 8)).astype(np.float32)
     order = np.concatenate([np.arange(500, 1000), np.random.default_rng(1).permutation(500)])
     staged, copy = [], chunks_module._parallel_copy
@@ -1551,9 +1551,12 @@ def test_harmony_host_input_shards_stage_only_their_rows(monkeypatch, layout):
     )
     monkeypatch.setattr(chunks_module, "_UPLOAD_BYTES", 40 * X[0].nbytes)
     bounds = [0, 300, 650, 1000]
-    parts = harmony_module._upload_sorted(np.asarray(X, order=layout), cp.asarray(order), bounds, [0, 0, 0])
+    parts = harmony_module._upload_sorted(
+        np.asarray(X, order=layout), cp.asarray(order), bounds, [0, 0, 0], dtype=dtype
+    )
     assert sum(staged) == len(X)
     for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
+        assert part.dtype == dtype
         np.testing.assert_array_equal(cp.asnumpy(part), X[order[lo:hi]])
 
 
