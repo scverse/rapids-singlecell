@@ -10,14 +10,15 @@ from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
 _ASSIGNMENT_BATCH_BYTES = 1 << 28
 _DISTANCE_ERROR_FACTOR = 4
 _HOST_COUNTS_MAX_CLUSTERS = 4096
-# Fused distance kernels (exact squared distances): a warp's clusters.
-_FUSED_MAX_CLUSTERS = _clustering_cuda.FUSED_CLUSTER_STRIDE
 
 
 def _fused_distances(X, n_clusters: int) -> bool:
-    """Whether the fused distance kernels fit: the centers and their shared memory (see kmeans_assign)."""
+    """Whether the fused distance kernels (exact squared distances) fit: a warp's clusters and their shared memory."""
     smem = _clustering_cuda.kmeans_assign_smem(n_cols=X.shape[1], itemsize=X.itemsize)
-    return n_clusters <= _FUSED_MAX_CLUSTERS and smem <= cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
+    return (
+        n_clusters <= _clustering_cuda.FUSED_CLUSTER_STRIDE
+        and smem <= cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
+    )
 
 
 _refine_squared_distances = cp.ElementwiseKernel(

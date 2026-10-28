@@ -26,7 +26,7 @@ from ._helper import (
     _stratified_sample_indices,
     _validate_output_buffer,
 )
-from ._kmeans import _FUSED_MAX_CLUSTERS, _kmeans
+from ._kmeans import _kmeans
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -668,9 +668,10 @@ def _allocate_clustering_workspace(
         "block_counts": cp.empty((n_stored + 3, n_batches, n_clusters), dtype=cp.int64),
     }
     # Centroids transposed: padded PCs x cluster blocks.
-    stride = -(-n_clusters // _FUSED_MAX_CLUSTERS) * _FUSED_MAX_CLUSTERS
+    warp_clusters = _clustering_cuda.FUSED_CLUSTER_STRIDE
+    stride = -(-n_clusters // warp_clusters) * warp_clusters
     workspace["y_t"] = cp.empty((_clustering_cuda.fused_padded_pcs(n_pcs), stride), dtype=dtype)
-    if _FORCE_CLUSTER_BLOCKS or n_clusters > _FUSED_MAX_CLUSTERS:
+    if _FORCE_CLUSTER_BLOCKS or n_clusters > warp_clusters:
         # Cluster blocks: per-warp column sums and a group's dot products for
         # each resident CTA, and the CTAs' tile counter.
         n_slots = _clustering_cuda.assign_slots(itemsize=dtype.itemsize)
