@@ -49,8 +49,7 @@ def pca(
     copy: bool = False,
     **kwargs,
 ) -> None | AnnData | ArrayTypesDask:
-    """\
-    Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
+    r"""Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
 
     Uses the following implementations based on data type (defaults for `svd_solver` in parentheses):
 
@@ -138,13 +137,13 @@ def pca(
 
     key_added
         If not specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\\ `['X_pca']`, the loadings as
-        :attr:`~anndata.AnnData.varm`\\ `['PCs']`, and the parameters in
-        :attr:`~anndata.AnnData.uns`\\ `['pca']`.
+        :attr:`~anndata.AnnData.obsm`\ `['X_pca']`, the loadings as
+        :attr:`~anndata.AnnData.varm`\ `['PCs']`, and the parameters in
+        :attr:`~anndata.AnnData.uns`\ `['pca']`.
         If specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\\ `[key_added]`, the loadings as
-        :attr:`~anndata.AnnData.varm`\\ `[key_added]`, and the parameters in
-        :attr:`~anndata.AnnData.uns`\\ `[key_added]`.
+        :attr:`~anndata.AnnData.obsm`\ `[key_added]`, the loadings as
+        :attr:`~anndata.AnnData.varm`\ `[key_added]`, and the parameters in
+        :attr:`~anndata.AnnData.uns`\ `[key_added]`.
 
     return_info
         Only relevant when passing a matrix instead of an
@@ -165,9 +164,7 @@ def pca(
 
     Returns
     -------
-        If a matrix is passed and `return_info=False`, the PCA representation is \
-        returned. If a matrix is passed and `return_info=True`, a tuple of \
-        ``(X_pca, components, variance_ratio, variance)`` is returned.
+        If a matrix is passed and `return_info=False`, the PCA representation is returned. If a matrix is passed and `return_info=True`, a tuple of ``(X_pca, components, variance_ratio, variance)`` is returned.
 
         If an AnnData object is passed, adds fields to `adata`:
 
@@ -178,13 +175,10 @@ def pca(
             `.uns['pca' | key_added]['variance_ratio']`
                 Ratio of explained variance.
             `.uns['pca' | key_added]['variance']`
-                Explained variance, equivalent to the eigenvalues of the \
-                covariance matrix.
+                Explained variance, equivalent to the eigenvalues of the covariance matrix.
     """
     if "use_highly_variable" in kwargs:
-        raise TypeError(
-            "pca() got an unexpected keyword argument 'use_highly_variable'"
-        )
+        raise TypeError("pca() got an unexpected keyword argument 'use_highly_variable'")
 
     rng = np.random.default_rng(rng)
 
@@ -192,9 +186,7 @@ def pca(
         if layer is not None:
             raise ValueError("`layer` can only be used with an AnnData object.")
         X = data
-        mask_var = (
-            None if isinstance(mask_var, Default) else _check_mask(X, mask_var, "var")
-        )
+        mask_var = None if isinstance(mask_var, Default) else _check_mask(X, mask_var, "var")
         X = X[:, mask_var] if mask_var is not None else X
         pca_func, X_pca, _ = _pca_compute(
             X,
@@ -267,6 +259,7 @@ def pca(
 
     if copy:
         return adata
+    return None
 
 
 def _pca_compute(
@@ -300,22 +293,15 @@ def _pca_compute(
 
     if isinstance(X, DaskArray):
         if chunked:
-            raise ValueError(
-                "Dask arrays are not supported for chunked PCA computation."
-            )
+            raise ValueError("Dask arrays are not supported for chunked PCA computation.")
         _check_gpu_X(X, allow_dask=True)
         if svd_solver in ("lanczos", "randomized"):
             raise NotImplementedError(
-                f"'{svd_solver}' SVD solver does not support Dask arrays. "
-                "Use svd_solver='covariance_eigh' instead."
+                f"'{svd_solver}' SVD solver does not support Dask arrays. Use svd_solver='covariance_eigh' instead."
             )
         if svd_solver is None:
             svd_solver = "covariance_eigh"
-        if (
-            isinstance(X._meta, cp.ndarray)
-            and svd_solver != "covariance_eigh"
-            and zero_center
-        ):
+        if isinstance(X._meta, cp.ndarray) and svd_solver != "covariance_eigh" and zero_center:
             pca_func, X_pca = _run_cuml_pca_dask(X, n_comps, svd_solver=svd_solver)
         else:
             pca_func, X_pca = _run_covariance_pca(X, n_comps, zero_center)
@@ -427,9 +413,7 @@ def _run_chunked_pca(X, n_comps, chunk_size):
 
     X_pca = np.zeros((X.shape[0], n_comps), X.dtype)
 
-    pca_func = IncrementalPCA(
-        n_components=n_comps, output_type="numpy", batch_size=chunk_size
-    )
+    pca_func = IncrementalPCA(n_components=n_comps, output_type="numpy", batch_size=chunk_size)
     pca_func.fit(X)
 
     n_batches = math.ceil(X.shape[0] / chunk_size)

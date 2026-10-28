@@ -45,9 +45,7 @@ _WilcoxonResult = tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None]
 
 def _host_sparse_kernel_source(X):
     """Normalize sparse values once while sharing index metadata."""
-    data = (
-        X.data if X.data.dtype == np.float64 else X.data.astype(np.float32, copy=False)
-    )
+    data = X.data if X.data.dtype == np.float64 else X.data.astype(np.float32, copy=False)
     if data is X.data:
         return X
     source = copy(X)
@@ -103,14 +101,9 @@ def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
     if n_groups < OVO_STABLE_GROUPING_MIN_GROUPS:
         ref_row_ids = np.flatnonzero(codes == ireference).astype(np.int32, copy=False)
         row_id_parts = [
-            np.flatnonzero(codes == group_index).astype(np.int32, copy=False)
-            for group_index in test_group_indices
+            np.flatnonzero(codes == group_index).astype(np.int32, copy=False) for group_index in test_group_indices
         ]
-        all_grp_row_ids = (
-            np.concatenate(row_id_parts)
-            if row_id_parts
-            else np.empty(0, dtype=np.int32)
-        )
+        all_grp_row_ids = np.concatenate(row_id_parts) if row_id_parts else np.empty(0, dtype=np.int32)
     else:
         # One stable grouping pass replaces a full-cell boolean scan per group.
         # Selected codes are [0, n_groups); the unselected-cell sentinel sorts
@@ -123,9 +116,7 @@ def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
         ref_stop = int(group_starts[ireference + 1])
         ref_row_ids = grouped_rows[ref_start:ref_stop]
         selected_total = int(group_starts[-1])
-        all_grp_row_ids = np.concatenate(
-            (grouped_rows[:ref_start], grouped_rows[ref_stop:selected_total])
-        )
+        all_grp_row_ids = np.concatenate((grouped_rows[:ref_start], grouped_rows[ref_stop:selected_total]))
     test_indices_np = np.asarray(test_group_indices, dtype=np.intp)
     offsets_np = np.empty(len(test_group_indices) + 1, dtype=np.int32)
     offsets_np[0] = 0
@@ -153,9 +144,7 @@ def _csr_column_weights(indices, n_genes: int, xp) -> np.ndarray:
         last_start = indices.size - block_size
         for block_index in range(SPARSE_SPLIT_SAMPLE_BLOCKS):
             start = last_start * block_index // (SPARSE_SPLIT_SAMPLE_BLOCKS - 1)
-            weights += xp.bincount(
-                indices[start : start + block_size], minlength=n_genes
-            )
+            weights += xp.bincount(indices[start : start + block_size], minlength=n_genes)
     if xp is cp:
         weights = cp.asnumpy(weights)
     return weights.astype(np.int64, copy=False)
@@ -325,19 +314,13 @@ def _device_column_shard(X, start: int, stop: int, device_id: int):
 
 def _prepare_device_column_shards(X, ranges, device_ids):
     source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id
-    if (
-        len(device_ids) == 1
-        and device_ids[0] == source_device
-        and ranges[0] == (0, X.shape[1])
-    ):
+    if len(device_ids) == 1 and device_ids[0] == source_device and ranges[0] == (0, X.shape[1]):
         return [X]
     with cp.cuda.Device(source_device):
         cp.cuda.get_current_stream().synchronize()
 
     # Build remote shards first to limit concurrent source-side buffers.
-    order = sorted(
-        range(len(device_ids)), key=lambda index: device_ids[index] == source_device
-    )
+    order = sorted(range(len(device_ids)), key=lambda index: device_ids[index] == source_device)
     shards = [None] * len(device_ids)
     for index in order:
         start, stop = ranges[index]
@@ -372,18 +355,10 @@ def _run_sharded_wilcoxon(
     X = rg.X
     n_cells, n_total_genes = X.shape
     is_device_input = isinstance(X, cp.ndarray) or cpsp.issparse(X)
-    source_device = (
-        X.device.id
-        if isinstance(X, cp.ndarray)
-        else X.data.device.id
-        if cpsp.issparse(X)
-        else None
-    )
+    source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id if cpsp.issparse(X) else None
     auto_single_device = multi_gpu is None and is_device_input and rg.ireference is None
     if multi_gpu is False or auto_single_device:
-        device_ids = [
-            source_device if source_device is not None else cp.cuda.Device().id
-        ]
+        device_ids = [source_device if source_device is not None else cp.cuda.Device().id]
     else:
         device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
         device_ids.sort(key=lambda device_id: device_id != source_device)
@@ -393,9 +368,7 @@ def _run_sharded_wilcoxon(
         dense_fallback=rg._sparse_negative_fallback,
     )
     device_ids = device_ids[: len(ranges)]
-    ovo_host_context = (
-        _build_ovo_host_context(rg) if rg.ireference is not None else None
-    )
+    ovo_host_context = _build_ovo_host_context(rg) if rg.ireference is not None else None
     dense_source = _host_dense_matrix(X) if isinstance(X, np.ndarray) else None
     csr_row_spans = [None] * len(ranges)
     if is_device_input:
@@ -424,20 +397,13 @@ def _run_sharded_wilcoxon(
                 )
                 csr_row_spans = [
                     (
-                        sparse_source.indptr[:-1]
-                        if shard_index == 0
-                        else boundaries[shard_index - 1],
-                        sparse_source.indptr[1:]
-                        if shard_index == len(ranges) - 1
-                        else boundaries[shard_index],
+                        sparse_source.indptr[:-1] if shard_index == 0 else boundaries[shard_index - 1],
+                        sparse_source.indptr[1:] if shard_index == len(ranges) - 1 else boundaries[shard_index],
                     )
                     for shard_index in range(len(ranges))
                 ]
         else:
-            kernel_inputs = [
-                _host_csc_column_shard(sparse_source, start, stop)
-                for start, stop in ranges
-            ]
+            kernel_inputs = [_host_csc_column_shard(sparse_source, start, stop) for start, stop in ranges]
 
     def run_shard(
         shard_index: int,
@@ -492,20 +458,13 @@ def _run_sharded_wilcoxon(
         raise RuntimeError(msg)
     complete_gpu_results = [result for result in gpu_results if result is not None]
     group_indices = complete_gpu_results[0][0]
-    if any(
-        not np.array_equal(result[0], group_indices)
-        for result in complete_gpu_results[1:]
-    ):
+    if any(not np.array_equal(result[0], group_indices) for result in complete_gpu_results[1:]):
         msg = "Inconsistent sharded Wilcoxon group ordering."
         raise RuntimeError(msg)
     result_device = device_ids[0]
     with cp.cuda.Device(result_device):
-        scores = _concat_gpu_shards(
-            [result[1] for result in complete_gpu_results], result_device
-        )
-        pvals = _concat_gpu_shards(
-            [result[2] for result in complete_gpu_results], result_device
-        )
+        scores = _concat_gpu_shards([result[1] for result in complete_gpu_results], result_device)
+        pvals = _concat_gpu_shards([result[2] for result in complete_gpu_results], result_device)
         logfoldchange_parts = [result[3] for result in complete_gpu_results]
         logfoldchanges = (
             _concat_gpu_shards(

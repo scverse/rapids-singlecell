@@ -13,9 +13,7 @@ import rapids_singlecell as rsc
 def adata_grid():
     """3x3 grid embedding where center cell (index 4) should have highest density."""
     adata = AnnData(X=np.ones((9, 10), dtype=np.float32))
-    adata.obsm["X_test"] = np.array(
-        [[x, y] for x in range(3) for y in range(3)], dtype=np.float32
-    )
+    adata.obsm["X_test"] = np.array([[x, y] for x in range(3) for y in range(3)], dtype=np.float32)
     return adata
 
 
@@ -28,12 +26,8 @@ def adata_grouped():
 
     # Group A clustered around (0, 0), Group B clustered around (5, 5)
     embed = np.zeros((n, 2), dtype=np.float32)
-    embed[: n // 2] = rng.normal(loc=0.0, scale=0.5, size=(n // 2, 2)).astype(
-        np.float32
-    )
-    embed[n // 2 :] = rng.normal(loc=5.0, scale=0.5, size=(n // 2, 2)).astype(
-        np.float32
-    )
+    embed[: n // 2] = rng.normal(loc=0.0, scale=0.5, size=(n // 2, 2)).astype(np.float32)
+    embed[n // 2 :] = rng.normal(loc=5.0, scale=0.5, size=(n // 2, 2)).astype(np.float32)
     adata.obsm["X_umap"] = embed
 
     adata.obs["group"] = pd.Categorical(["A"] * (n // 2) + ["B"] * (n // 2))
@@ -134,9 +128,7 @@ def test_groupby_not_categorical():
 def test_diffmap_component_offset():
     """diffmap components are offset by 1 internally."""
     adata = AnnData(X=np.ones((9, 3), dtype=np.float32))
-    adata.obsm["X_diffmap"] = np.array(
-        [[0, x, y] for x in range(3) for y in range(3)], dtype=np.float32
-    )
+    adata.obsm["X_diffmap"] = np.array([[0, x, y] for x in range(3) for y in range(3)], dtype=np.float32)
 
     rsc.tl.embedding_density(adata, "diffmap")
     assert "diffmap_density" in adata.obs.columns
@@ -148,9 +140,7 @@ def test_diffmap_component_offset():
 def test_fa_alias():
     """'fa' basis is aliased to 'draw_graph_fa'."""
     adata = AnnData(X=np.ones((9, 3), dtype=np.float32))
-    adata.obsm["X_draw_graph_fa"] = np.array(
-        [[x, y] for x in range(3) for y in range(3)], dtype=np.float32
-    )
+    adata.obsm["X_draw_graph_fa"] = np.array([[x, y] for x in range(3) for y in range(3)], dtype=np.float32)
 
     rsc.tl.embedding_density(adata, "fa")
     assert "draw_graph_fa_density" in adata.obs.columns

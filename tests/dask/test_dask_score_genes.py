@@ -28,7 +28,5 @@ def test_mean_var(client, data_kind, dtype):
         rsc.get.anndata_to_GPU(adata)
 
     rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_gpu")
-    rsc.tl.score_genes(
-        dask_data, gene_list=adata.var_names[:100], score_name="Test_gpu"
-    )
+    rsc.tl.score_genes(dask_data, gene_list=adata.var_names[:100], score_name="Test_gpu")
     cp.testing.assert_allclose(adata.obs["Test_gpu"], dask_data.obs["Test_gpu"])

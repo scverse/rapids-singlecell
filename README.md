@@ -41,7 +41,7 @@ For more information please have a look through the [documentation](https://rapi
 
 If you use this tool, please cite: [![arXiv](https://img.shields.io/badge/arXiv-2603.02402-b31b1b.svg)](https://doi.org/10.48550/arXiv.2603.02402)
 
-Please cite the relevant tools if used: [decoupler](https://doi.org/10.1093/bioadv/vbac016) for decoupler functions, [squidpy](https://doi.org/10.1038/s41592-021-01358-2) for spatial analysis, and [pertpy](https://doi.org/10.1038/s41592-024-02233-6) for perturbation analysis.
+Please cite the relevant tools if used: [decoupler](https://doi.org/10.1093/bioadv/vbac016) for decoupler functions, [squidpy](https://doi.org/10.1038/s41592-021-01358-2) for spatial analysis, and [pertpy](https://doi.org/10.1038/s41592-025-02909-7) for perturbation analysis.
 
 [//]: # (numfocus-fiscal-sponsor-attribution)
 

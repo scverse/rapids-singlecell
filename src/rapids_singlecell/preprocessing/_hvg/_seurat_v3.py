@@ -101,8 +101,8 @@ def _highly_variable_genes_seurat_v3(
     check_values=True,
     flavor: str = "seurat_v3",
 ):
-    """\
-    See `highly_variable_genes`.
+    """See `highly_variable_genes`.
+
     For further implementation details see https://www.overleaf.com/read/ckptrbgzzzpg
 
     Returns
@@ -126,13 +126,12 @@ def _highly_variable_genes_seurat_v3(
         warnings.warn(
             "`flavor='seurat_v3'` expects `n_top_genes`  to be defined, defaulting to 2000 HVGs",
             UserWarning,
+            stacklevel=2,
         )
     try:
         from skmisc.loess import loess
-    except ImportError:
-        raise ImportError(
-            "Please install skmisc package via `pip install --user scikit-misc"
-        )
+    except ImportError as e:
+        raise ImportError("Please install skmisc package via `pip install --user scikit-misc") from e
 
     df = pd.DataFrame(index=adata.var.index)
     X = _get_obs_rep(adata, layer=layer)
@@ -144,6 +143,7 @@ def _highly_variable_genes_seurat_v3(
         warnings.warn(
             "`flavor='seurat_v3'` expects raw count data, but non-integers were found.",
             UserWarning,
+            stacklevel=2,
         )
 
     mean, var = _get_mean_var(X, axis=0)
@@ -187,9 +187,7 @@ def _highly_variable_genes_seurat_v3(
         squared_batch_counts_sum, batch_counts_sum = _clip_square_sum(X_batch, clip_val)
 
         norm_gene_var = (1 / ((N - 1) * cp.square(reg_std))) * (
-            (N * cp.square(mean))
-            + squared_batch_counts_sum
-            - 2 * batch_counts_sum * mean
+            (N * cp.square(mean)) + squared_batch_counts_sum - 2 * batch_counts_sum * mean
         )
 
         norm_gene_vars.append(norm_gene_var.reshape(1, -1))
@@ -197,9 +195,7 @@ def _highly_variable_genes_seurat_v3(
     ranked_norm_gene_vars = cp.argsort(cp.argsort(-norm_gene_vars, axis=1), axis=1)
 
     ranked_norm_gene_vars = ranked_norm_gene_vars.astype(np.float32)
-    num_batches_high_var = cp.sum(
-        (ranked_norm_gene_vars < n_top_genes).astype(int), axis=0
-    )
+    num_batches_high_var = cp.sum((ranked_norm_gene_vars < n_top_genes).astype(int), axis=0)
     ranked_norm_gene_vars[ranked_norm_gene_vars >= n_top_genes] = np.nan
     ranked_norm_gene_vars = ranked_norm_gene_vars.get()
     ma_ranked = np.ma.masked_invalid(ranked_norm_gene_vars)
@@ -216,20 +212,14 @@ def _highly_variable_genes_seurat_v3(
         sort_ascending = [False, True]
     else:
         raise ValueError(f"Did not recognize flavor {flavor}")
-    sorted_index = (
-        df[sort_cols]
-        .sort_values(sort_cols, ascending=sort_ascending, na_position="last")
-        .index
-    )
+    sorted_index = df[sort_cols].sort_values(sort_cols, ascending=sort_ascending, na_position="last").index
     df["highly_variable"] = False
     df.loc[sorted_index[: int(n_top_genes)], "highly_variable"] = True
     adata.var["highly_variable"] = df["highly_variable"].values
     adata.var["highly_variable_rank"] = df["highly_variable_rank"].values
     adata.var["means"] = df["means"].values
     adata.var["variances"] = df["variances"].values
-    adata.var["variances_norm"] = df["variances_norm"].values.astype(
-        "float64", copy=False
-    )
+    adata.var["variances_norm"] = df["variances_norm"].values.astype("float64", copy=False)
     if batch_key:
         adata.var["highly_variable_nbatches"] = df["highly_variable_nbatches"].values
     adata.uns["hvg"] = {"flavor": flavor}

@@ -41,8 +41,8 @@ def _compare_scores(gpu_result, dask_result):
         dask_names = list(dask_result["names"][group])
         dask_scores = np.asarray(dask_result["scores"][group], dtype=float)
 
-        gpu_score_map = dict(zip(gpu_names, gpu_scores))
-        dask_score_map = dict(zip(dask_names, dask_scores))
+        gpu_score_map = dict(zip(gpu_names, gpu_scores, strict=False))
+        dask_score_map = dict(zip(dask_names, dask_scores, strict=False))
 
         for gene in gpu_score_map:
             np.testing.assert_allclose(

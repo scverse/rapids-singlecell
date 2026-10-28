@@ -106,11 +106,7 @@ def _logfoldchanges_from_means(
     mean_reference: cp.ndarray,
 ) -> cp.ndarray:
     if rg.mean_in_log_space:
-        scale = (
-            cp.float64(np.log(rg._log1p_base))
-            if rg._log1p_base is not None
-            else cp.float64(1.0)
-        )
+        scale = cp.float64(np.log(rg._log1p_base)) if rg._log1p_base is not None else cp.float64(1.0)
         group_expr = cp.expm1(mean_group * scale)
         reference_expr = cp.expm1(mean_reference * scale)
     else:
@@ -164,11 +160,7 @@ def _finish_wilcoxon(
     z = diff / cp.sqrt(variance)
     cp.nan_to_num(z, copy=False)
     p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
-    scores = (
-        rank_sums - sizes[:, None] * (sizes[:, None] + 1.0) / 2.0
-        if return_u_values
-        else z
-    )
+    scores = rank_sums - sizes[:, None] * (sizes[:, None] + 1.0) / 2.0 if return_u_values else z
     return (
         group_indices,
         scores,
@@ -214,13 +206,7 @@ def _finish_ovo(
 ):
     n_combined = ctx.test_sizes + ctx.n_ref
     expected = ctx.test_sizes[:, None] * (n_combined[:, None] + 1) / 2.0
-    variance = (
-        ctx.test_sizes[:, None]
-        * ctx.n_ref
-        * (n_combined[:, None] + 1)
-        * tie_corr_arr
-        / 12.0
-    )
+    variance = ctx.test_sizes[:, None] * ctx.n_ref * (n_combined[:, None] + 1) * tie_corr_arr / 12.0
     return _finish_wilcoxon(
         rank_sums,
         expected,
@@ -238,24 +224,17 @@ def _validate_wilcoxon_sparse_dtype(X) -> None:
         return
     if X.format not in {"csr", "csc"}:
         raise TypeError(
-            "Wilcoxon sparse input must be CSR or CSC; refusing hidden "
-            f"full-matrix conversion from {X.format!r}."
+            f"Wilcoxon sparse input must be CSR or CSC; refusing hidden full-matrix conversion from {X.format!r}."
         )
     data_dtype = np.dtype(X.data.dtype)
     if data_dtype.kind == "c":
-        msg = (
-            "Wilcoxon sparse input data dtype must be real; complex sparse "
-            "data is not supported."
-        )
+        msg = "Wilcoxon sparse input data dtype must be real; complex sparse data is not supported."
         raise TypeError(msg)
     if cpsp.issparse(X) and data_dtype not in {
         np.dtype(np.float32),
         np.dtype(np.float64),
     }:
-        msg = (
-            "Wilcoxon device sparse input data dtype must be float32 or "
-            f"float64; got {data_dtype}."
-        )
+        msg = f"Wilcoxon device sparse input data dtype must be float32 or float64; got {data_dtype}."
         raise TypeError(msg)
     if (
         sp.issparse(X)
@@ -266,10 +245,7 @@ def _validate_wilcoxon_sparse_dtype(X) -> None:
         }
         and data_dtype.kind not in {"b", "i", "u"}
     ):
-        msg = (
-            "Wilcoxon sparse input data dtype must be float32, float64, bool, "
-            f"or integer; got {data_dtype}."
-        )
+        msg = f"Wilcoxon sparse input data dtype must be float32, float64, bool, or integer; got {data_dtype}."
         raise TypeError(msg)
     if getattr(X, "format", None) in {"csr", "csc"}:
         indices_dtype = np.dtype(X.indices.dtype)
@@ -281,10 +257,7 @@ def _validate_wilcoxon_sparse_dtype(X) -> None:
             )
             raise TypeError(msg)
         if indices_dtype not in {np.dtype(np.int32), np.dtype(np.int64)}:
-            msg = (
-                "Wilcoxon sparse indices and indptr must be int32 or int64; "
-                f"got {indices_dtype}."
-            )
+            msg = f"Wilcoxon sparse indices and indptr must be int32 or int64; got {indices_dtype}."
             raise TypeError(msg)
 
 
@@ -388,9 +361,7 @@ def _run_wilcoxon_device_shard(
             logfoldchanges_gpu=logfoldchanges_gpu,
         )
 
-    host_ctx = (
-        _build_ovo_host_context(rg) if ovo_host_context is None else ovo_host_context
-    )
+    host_ctx = _build_ovo_host_context(rg) if ovo_host_context is None else ovo_host_context
     ctx = _OvoContext(
         **vars(host_ctx),
         test_sizes=cp.asarray(
@@ -471,8 +442,7 @@ def _warn_small_ovo_groups(rg: _RankGenes, group_sizes: NDArray) -> None:
     if n_ref <= MIN_GROUP_SIZE_WARNING:
         parts.append(f"reference has size {n_ref}")
     warnings.warn(
-        f"Small groups detected: {'; '.join(parts)}. normal approximation "
-        "of the Wilcoxon statistic may be inaccurate.",
+        f"Small groups detected: {'; '.join(parts)}. normal approximation of the Wilcoxon statistic may be inaccurate.",
         RuntimeWarning,
         stacklevel=4,
     )
@@ -646,11 +616,7 @@ def _run_ovr_device(
 
     if sparse_format is not None:
         data, indices, indptr = _device_sparse_arrays(X)
-        kernel = (
-            _wcs.ovr_sparse_csc_device
-            if sparse_format == "csc"
-            else _wcs.ovr_sparse_csr_device
-        )
+        kernel = _wcs.ovr_sparse_csc_device if sparse_format == "csc" else _wcs.ovr_sparse_csr_device
         kernel(
             data,
             indices,
@@ -685,11 +651,7 @@ def _run_ovr_device(
                 block_f32 = cp.asarray(X[:, start:stop], dtype=cp.float32, order="F")
                 n_cols = stop - start
                 sub_rank_sums = cp.empty((n_groups, n_cols), dtype=cp.float64)
-                sub_tie_corr = (
-                    cp.empty(n_cols, dtype=cp.float64)
-                    if tie_correct
-                    else cp.ones(n_cols, dtype=cp.float64)
-                )
+                sub_tie_corr = cp.empty(n_cols, dtype=cp.float64) if tie_correct else cp.ones(n_cols, dtype=cp.float64)
                 _wc.ovr_rank_dense_streaming(
                     block_f32,
                     group_codes_gpu,
@@ -719,9 +681,7 @@ def _run_ovo_host(
     col_start, col_stop = column_range
     n_total_genes = col_stop - col_start
     rank_sums = cp.zeros((ctx.n_test, n_total_genes), dtype=cp.float64)
-    tie_corr_arr = cp.ones(
-        (ctx.n_test, n_total_genes) if tie_correct else (1,), dtype=cp.float64
-    )
+    tie_corr_arr = cp.ones((ctx.n_test, n_total_genes) if tie_correct else (1,), dtype=cp.float64)
     n_groups_stats = ctx.n_test + 1
     compute_nnz = rg.comp_pts
     stats_shape = (n_groups_stats, n_total_genes)
@@ -737,9 +697,7 @@ def _run_ovo_host(
             ireference = int(rg.ireference)
             stats_code_lookup = np.full(n_groups + 1, n_groups_stats, dtype=np.int32)
             test_group_indices_np = np.asarray(ctx.test_group_indices, dtype=np.intp)
-            stats_code_lookup[test_group_indices_np] = np.arange(
-                ctx.n_test, dtype=np.int32
-            )
+            stats_code_lookup[test_group_indices_np] = np.arange(ctx.n_test, dtype=np.int32)
             stats_code_lookup[ireference] = ctx.n_test
             stats_codes = stats_code_lookup[rg.group_codes]
             ref_row_map = np.full(X.shape[0], -1, dtype=np.int32)
@@ -828,9 +786,7 @@ def _run_ovo_device(
         if sparse_format is not None
         else cp.empty((ctx.n_test, n_total_genes), dtype=cp.float64)
     )
-    tie_corr_arr = cp.ones(
-        (ctx.n_test, n_total_genes) if tie_correct else (1,), dtype=cp.float64
-    )
+    tie_corr_arr = cp.ones((ctx.n_test, n_total_genes) if tie_correct else (1,), dtype=cp.float64)
 
     if sparse_format is not None:
         data, indices, indptr = _device_sparse_arrays(X)
@@ -870,11 +826,7 @@ def _run_ovo_device(
             ref_f32 = cp.asarray(X[ref_rows, start:stop], dtype=cp.float32, order="F")
             grp_f32 = cp.asarray(X[grp_rows, start:stop], dtype=cp.float32, order="F")
             sub_rank_sums = cp.empty((ctx.n_test, n_cols), dtype=cp.float64)
-            sub_tie_corr = (
-                cp.ones((ctx.n_test, n_cols), dtype=cp.float64)
-                if tie_correct
-                else tie_corr_arr
-            )
+            sub_tie_corr = cp.ones((ctx.n_test, n_cols), dtype=cp.float64) if tie_correct else tie_corr_arr
             _wc.ovo_rank_dense_tiered_unsorted_ref(
                 ref_f32,
                 grp_f32,

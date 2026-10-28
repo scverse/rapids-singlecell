@@ -108,9 +108,7 @@ def test_scale_simple(dtype):
     rsc.pp.scale(adata)
 
     cp.testing.assert_allclose(adata.X.var(axis=0), cp.ones(adata.shape[1]), atol=0.01)
-    cp.testing.assert_allclose(
-        adata.X.mean(axis=0), cp.zeros(adata.shape[1]), atol=0.00001
-    )
+    cp.testing.assert_allclose(adata.X.mean(axis=0), cp.zeros(adata.shape[1]), atol=0.00001)
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.int64])
@@ -137,9 +135,7 @@ def test_scale_obsm_does_not_write_var_statistics():
     assert "std" not in adata.var
 
 
-@pytest.mark.parametrize(
-    "typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
-)
+@pytest.mark.parametrize("typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__)
 def test_mask(typ):
     adata = _get_anndata()
     adata.X = typ(adata.X.toarray(), dtype=np.float64)
@@ -149,15 +145,11 @@ def test_mask(typ):
     rsc.pp.scale(adata_mask, zero_center=False)
     rsc.pp.scale(adata, mask_obs=mask, zero_center=False)
     adata = adata[mask].copy()
-    cp.testing.assert_allclose(
-        cp_csr_matrix(adata_mask.X).toarray(), cp_csr_matrix(adata.X).toarray()
-    )
+    cp.testing.assert_allclose(cp_csr_matrix(adata_mask.X).toarray(), cp_csr_matrix(adata.X).toarray())
 
 
 @pytest.mark.parametrize("use_array", [False, True])
-@pytest.mark.parametrize(
-    "typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
-)
+@pytest.mark.parametrize("typ", [np.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__)
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize(
     ("mask_obs", "X", "X_centered", "X_scaled"),

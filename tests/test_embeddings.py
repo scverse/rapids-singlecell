@@ -24,9 +24,7 @@ def test_umap(kwargs):
 def test_umap_device_coo(index_dtype):
     graph = sparse.random(50, 50, density=0.2, format="csr", rng=0, dtype=np.float32)
     # empty rows at the start, middle and end
-    graph = sparse.csr_matrix(
-        graph.multiply(np.isin(np.arange(50), [0, 1, 25, 49], invert=True)[:, None])
-    )
+    graph = sparse.csr_matrix(graph.multiply(np.isin(np.arange(50), [0, 1, 25, 49], invert=True)[:, None]))
     graph.indices = graph.indices.astype(index_dtype)
     graph.indptr = graph.indptr.astype(index_dtype)
     ref = graph.tocoo()

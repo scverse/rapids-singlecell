@@ -74,15 +74,11 @@ def _validate_args(
     required_args = ["x", "w"]
     for arg in required_args:
         if arg not in args:
-            assert AssertionError(), (
-                f"fun={fun.__name__} must contain arguments x and w"
-            )
+            assert AssertionError(), f"fun={fun.__name__} must contain arguments x and w"
     # Check if any additional arguments have default values
     for param in args.values():
         if param.name not in required_args and param.default == inspect.Parameter.empty:
-            assert AssertionError(), (
-                f"fun={fun.__name__} has an argument {param.name} without a default value"
-            )
+            assert AssertionError(), f"fun={fun.__name__} has an argument {param.name} without a default value"
     return fun
 
 
@@ -101,9 +97,7 @@ def _validate_func(
             "output of fun must be a cp.ndarray with shape (x.shape[0], w.shape[1])"
         )
     except Exception as err:
-        raise ValueError(
-            f"fun failed to run with test data: fun(x={x}), w={w}"
-        ) from err
+        raise ValueError(f"fun failed to run with test data: fun(x={x}), w={w}") from err
     m = f"waggr - using function {fun.__name__}"
     _log(m, level="info", verbose=verbose)
     _fun(f=fun, verbose=verbose)
@@ -138,7 +132,7 @@ def _perm(
         # Update running statistics
         sum_null += perm_result
         sum_null_sq += perm_result**2
-        extreme_count += cp.abs(perm_result) > es_abs
+        extreme_count += cp.abs(perm_result) >= es_abs
 
     # Compute final statistics
     null_mean = sum_null / times
@@ -153,13 +147,8 @@ def _perm(
         cp.where(cp.abs(es) > 1e-10, cp.sign(es) * 1e6, 0.0),
     )
 
-    # Compute empirical p-value
-    pvals = extreme_count.astype(cp.float32)
-    pvals = cp.where(pvals == 0.0, 1.0, pvals)
-    pvals = cp.where(pvals == times, times - 1, pvals)
-    pvals = pvals / times
-    pvals = cp.where(pvals >= 0.5, 1 - pvals, pvals)
-    pvals = pvals * 2  # Two-tailed test
+    # Two-sided empirical p-value, counting the observed score as one of the permutations
+    pvals = (extreme_count.astype(cp.float32) + 1.0) / (times + 1.0)
 
     return nes.astype(cp.float32), pvals
 
@@ -205,12 +194,14 @@ def _func_waggr(
 
     .. math::
 
-        p_{value}=\frac{ES_{rand} \geq ES}{P}
+        p_{value}=\frac{1 + \#\{|ES_{rand}| \geq |ES|\}}{1 + P}
 
     Where:
 
     - :math:`ES_{rand}` are the enrichment scores of the random permutations
     - :math:`P` is the total number of permutations
+
+    The observed score is counted as one of the permutations, so that :math:`p_{value}` is never 0 :cite:`phipson2010`.
 
     Additionally, :math:`ES` is updated to a normalized enrichment score :math:`NES`.
 
@@ -253,9 +244,7 @@ def _func_waggr(
         f_fun = fun
     _validate_func(f_fun, verbose=verbose)
     vfun = _cfuncs[f_fun.__name__]
-    assert isinstance(times, int | float) and times >= 0, (
-        "times must be numeric and >= 0"
-    )
+    assert isinstance(times, int | float) and times >= 0, "times must be numeric and >= 0"
     assert isinstance(seed, int | float) and seed >= 0, "seed must be numeric and >= 0"
     times, seed = int(times), int(seed)
     nobs, nvar = mat.shape

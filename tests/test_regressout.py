@@ -24,15 +24,11 @@ def test_regress_out_ordinal(dtype):
     adata.obs["n_counts"] = adata.X.sum(axis=1).get()
 
     # results using only one processor
-    rapids = rsc.pp.regress_out(
-        adata, keys=["n_counts", "percent_mito"], batchsize=100, inplace=False
-    )
+    rapids = rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=100, inplace=False)
     assert adata.X.shape == rapids.shape
 
     # results using 8 processors
-    cupy = rsc.pp.regress_out(
-        adata, keys=["n_counts", "percent_mito"], batchsize="all", inplace=False
-    )
+    cupy = rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize="all", inplace=False)
     if dtype == "float32":
         cp.testing.assert_allclose(cupy, rapids, atol=1e-5)
     else:
@@ -51,9 +47,7 @@ def test_regress_out_layer(dtype, batchsize):
     adata.obs["n_counts"] = adata.X.sum(axis=1).get()
     adata.layers["counts"] = adata.X.copy()
 
-    single = rsc.pp.regress_out(
-        adata, keys=["n_counts", "percent_mito"], batchsize=batchsize, inplace=False
-    )
+    single = rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=batchsize, inplace=False)
     assert adata.X.shape == single.shape
 
     layer = rsc.pp.regress_out(
@@ -78,9 +72,7 @@ def test_regress_out_categorical(dtype, sparse_format):
     else:
         adata = AnnData(sp_random(1000, 100, density=0.6, format=sparse_format))
     adata.X = adata.X.astype(dtype)
-    adata.obs["batch"] = pd.Categorical(
-        np.random.choice(["a", "b", "c"], size=adata.n_obs)
-    )
+    adata.obs["batch"] = pd.Categorical(np.random.choice(["a", "b", "c"], size=adata.n_obs))
 
     # scanpy reference
     adata_sc = adata.copy()

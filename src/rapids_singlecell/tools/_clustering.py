@@ -78,9 +78,7 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
     import dask.dataframe as dd
     from cugraph import Graph
 
-    rows = np.repeat(np.arange(adjacency.shape[0]), np.diff(adjacency.indptr)).astype(
-        np.int32
-    )
+    rows = np.repeat(np.arange(adjacency.shape[0]), np.diff(adjacency.indptr)).astype(np.int32)
     cols = adjacency.indices
     weights = adjacency.data
 
@@ -271,9 +269,7 @@ def leiden(
             modularities.append(modularity)
 
             # Format output
-            groups = (
-                leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-            )
+            groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
             key_added_to_use = key_added
             if restrict_to is not None:
                 if key_added == "leiden":
@@ -308,9 +304,7 @@ def leiden(
         **meta_random_state,
         "n_iterations": n_iterations,
     }
-    adata.uns[key_added]["modularity"] = (
-        modularities if len(modularities) > 1 else modularities[0]
-    )
+    adata.uns[key_added]["modularity"] = modularities if len(modularities) > 1 else modularities[0]
     return adata if copy else None
 
 
@@ -436,9 +430,7 @@ def louvain(
             modularities.append(modularity)
 
             # Format output
-            groups = (
-                louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-            )
+            groups = louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
             key_added_to_use = key_added
             if restrict_to is not None:
                 if key_added == "louvain":
@@ -472,9 +464,7 @@ def louvain(
         "n_iterations": n_iterations,
         "threshold": threshold,
     }
-    adata.uns[key_added]["modularity"] = (
-        modularities if len(modularities) > 1 else modularities[0]
-    )
+    adata.uns[key_added]["modularity"] = modularities if len(modularities) > 1 else modularities[0]
     return adata if copy else None
 
 

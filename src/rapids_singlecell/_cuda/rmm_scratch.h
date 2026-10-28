@@ -41,14 +41,39 @@ struct RmmScratchPool {
 
     template <typename T>
     T* alloc(size_t count) {
+        size_t bytes = size_of<T>(count);
+        void* ptr = rmm_allocate(bytes);
+        bufs.push_back({ptr, bytes});
+        return static_cast<T*>(ptr);
+    }
+
+    // Arrays freed together, from one allocation: alloc_all(a, n_a, b, n_b,
+    // ...) points T* a, b, ... at n_a, n_b, ... values, each 256-byte aligned
+    // as by cudaMalloc.
+    template <typename... Arrays>
+    void alloc_all(Arrays&&... arrays) {
+        char* base = alloc<char>(carve(nullptr, 0, arrays...));
+        carve(base, 0, arrays...);
+    }
+
+   private:
+    template <typename T>
+    static size_t size_of(size_t count) {
         if (count == 0) count = 1;
         if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
             throw std::runtime_error("RMM scratch allocation size overflow");
         }
-        size_t bytes = count * sizeof(T);
-        void* ptr = rmm_allocate(bytes);
-        bufs.push_back({ptr, bytes});
-        return static_cast<T*>(ptr);
+        return count * sizeof(T);
+    }
+    static size_t carve(char*, size_t end) {
+        return end;
+    }
+    template <typename T, typename... Rest>
+    static size_t carve(char* base, size_t end, T*& array, size_t count,
+                        Rest&... rest) {
+        end = (end + 255) / 256 * 256;
+        if (base) array = reinterpret_cast<T*>(base + end);
+        return carve(base, end + size_of<T>(count), rest...);
     }
 };
 

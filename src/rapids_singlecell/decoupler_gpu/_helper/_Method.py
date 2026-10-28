@@ -92,8 +92,7 @@ class Method(MethodMeta):
         call_signature = signature(self.__call__)
         self.__signature__ = call_signature.replace(
             parameters=[
-                p.replace(default=default_bsize) if p.name == "bsize" else p
-                for p in call_signature.parameters.values()
+                p.replace(default=default_bsize) if p.name == "bsize" else p for p in call_signature.parameters.values()
             ]
         )
 

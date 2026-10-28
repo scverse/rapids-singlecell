@@ -103,8 +103,8 @@ void register_tree(nb::module_& m) {
         "offsets"_a.noconvert().none(),
         "rows"_a.noconvert().none() = nb::none(),
         "columns"_a.noconvert().none() = nb::none(),
-        "distances"_a.noconvert().none() = nb::none(), "stream"_a,
-        "external"_a = false);
+        "distances"_a.noconvert().none() = nb::none(), nb::kw_only(),
+        "stream"_a, "external"_a = false);
     m.def(
         "library_percentile",
         [](gpu_array_c<const double, Device> index,

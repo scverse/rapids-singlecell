@@ -58,7 +58,6 @@ def anndata_to_GPU(
     -------
     Updates `adata` inplace or returns an updated copy
     """
-
     if copy:
         adata = adata.copy()
 
@@ -75,11 +74,10 @@ def anndata_to_GPU(
 
     if copy:
         return adata
+    return None
 
 
-def X_to_GPU(
-    X: CPU_ARRAY_TYPE | DaskArray, warning: str = "X"
-) -> GPU_ARRAY_TYPE | DaskArray:
+def X_to_GPU(X: CPU_ARRAY_TYPE | DaskArray, warning: str = "X") -> GPU_ARRAY_TYPE | DaskArray:
     """
     Transfers matrices and arrays to the GPU
 
@@ -94,26 +92,16 @@ def X_to_GPU(
         pass
     elif isinstance(X, DaskArray):
         if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu | np.ndarray):
-            meta = (
-                _meta_sparse
-                if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu)
-                else _meta_dense
-            )
+            meta = _meta_sparse if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu) else _meta_dense
             X = X.map_blocks(X_to_GPU, meta=meta(X.dtype))
     elif isinstance(X, csr_array_cpu | csr_matrix_cpu):
-        X = csr_matrix_gpu(
-            (X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape
-        )
+        X = csr_matrix_gpu((X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape)
     elif isinstance(X, csc_array_cpu | csc_matrix_cpu):
-        X = csc_matrix_gpu(
-            (X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape
-        )
+        X = csc_matrix_gpu((X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape)
     elif isinstance(X, np.ndarray):
         X = cp.array(X)
     else:
-        warnings.warn(
-            f"{warning} not supported for GPU conversion returning {warning}", Warning
-        )
+        warnings.warn(f"{warning} not supported for GPU conversion returning {warning}", Warning, stacklevel=2)
     return X
 
 
@@ -145,7 +133,6 @@ def anndata_to_CPU(
     -------
     Updates `adata` inplace or returns an updated copy
     """
-
     if copy:
         adata = adata.copy()
 
@@ -161,6 +148,7 @@ def anndata_to_CPU(
 
     if copy:
         return adata
+    return None
 
 
 def X_to_CPU(X: GPU_ARRAY_TYPE | DaskArray) -> CPU_ARRAY_TYPE | DaskArray:
