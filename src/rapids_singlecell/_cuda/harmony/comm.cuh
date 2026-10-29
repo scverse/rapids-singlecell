@@ -230,6 +230,15 @@ __global__ void sum_pieces_kernel(const long long* __restrict__ recv,
     }
 }
 
+// data[i] = recv[i] outside this rank's own piece [first, first + m).
+__global__ void land_pieces_kernel(const long long* __restrict__ recv,
+                                   long long* data, size_t n, size_t first,
+                                   size_t m) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t)blockDim.x * gridDim.x)
+        if (i < first || i >= first + m) data[i] = recv[i];
+}
+
 // One exchange of n <= capacity values (see allreduce).
 inline void exchange(Comm* comm, int rank, long long* data, size_t n,
                      cudaStream_t stream) {
@@ -255,7 +264,10 @@ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
     }
     if (pieces) {
         // The summed piece replaces this rank's own in its send slot (the
-        // others read only their pieces of it), then the others' are copied.
+        // others read only their pieces of it); the others' land in the
+        // receive slot and a kernel moves them into data, so data may be
+        // freed in stream order (cudaFree waits for kernels, not for a peer
+        // copy in flight).
         Comm::check(cudaMemcpyAsync(me.send[slot] + first, data + first,
                                     m * sizeof(long long), cudaMemcpyDefault,
                                     stream));
@@ -265,17 +277,21 @@ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
             if (r == rank) continue;
             Comm::check(
                 cudaStreamWaitEvent(stream, comm->ranks[r].reduced[slot]));
-            comm->pull(rank, r, data + lo(r), comm->ranks[r].send[slot] + lo(r),
-                       hi(r) - lo(r), stream);
+            comm->pull(rank, r, me.recv[slot] + lo(r),
+                       comm->ranks[r].send[slot] + lo(r), hi(r) - lo(r),
+                       stream);
         }
+        land_pieces_kernel<<<(int)std::min<size_t>((n + 255) / 256, 1024), 256,
+                             0, stream>>>(me.recv[slot], data, n, first, m);
+        Comm::check(cudaGetLastError());
     }
     Comm::check(cudaEventRecord(me.read[slot], stream));
 }
 
 // data (n values on rank's GPU, stream-ordered) = its sum over the GPUs, in
 // exchanges of at most `capacity` values. Every rank makes the same sequence
-// of calls; without comm this is a no-op. Summed pieces land in data by peer
-// copy: read it with a kernel, or synchronize before freeing it.
+// of calls; without comm this is a no-op. data may be freed in stream order
+// afterwards.
 inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
                       cudaStream_t stream) {
     if (!comm || comm->ranks.size() < 2) return;
