@@ -212,20 +212,14 @@ __device__ inline unsigned long long order_key(double v) {
     return (bits >> 63) ? ~bits : (bits | 0x8000000000000000ull);
 }
 
-// Inverse of order_key.
-__device__ inline double key_value(unsigned long long key) {
-    return __longlong_as_double((key >> 63) ? (key & 0x7FFFFFFFFFFFFFFFull)
-                                            : ~key);
-}
-
-// CSR: one warp per row; the largest stored value and its first guide.
-// guides[row] is -1 for rows without stored values.
+// CSR: one warp per row; the key of the largest stored value and its first
+// guide. guides[row] is -1 for rows without stored values.
 template <typename T, typename IdxT>
 __global__ void max_guide_csr_kernel(const IdxT* __restrict__ indptr,
                                      const IdxT* __restrict__ indices,
                                      const T* __restrict__ data,
                                      long long n_rows,
-                                     double* __restrict__ values,
+                                     unsigned long long* __restrict__ keys,
                                      int* __restrict__ guides) {
     const long long row =
         (blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x) / 32;
@@ -253,7 +247,7 @@ __global__ void max_guide_csr_kernel(const IdxT* __restrict__ indptr,
         }
     }
     if (lane == 0) {
-        values[row] = best_key ? key_value(best_key) : 0.0;
+        keys[row] = best_key;
         guides[row] = best_key ? best_guide : -1;
     }
 }
@@ -269,8 +263,8 @@ __global__ void max_key_csc_kernel(CscColumns<T, IdxT> columns, long long chunk,
     }
 }
 
-// CSC, second pass: the first guide holding each row's largest value.
-// guides must start at INT_MAX.
+// CSC, second pass: the first guide holding each row's largest value. guides
+// start at -1, which as unsigned no guide undercuts.
 template <typename T, typename IdxT>
 __global__ void max_guide_csc_kernel(
     CscColumns<T, IdxT> columns, long long chunk,
@@ -281,22 +275,8 @@ __global__ void max_guide_csc_kernel(
     for (long long j = first + threadIdx.x; j < last; j += blockDim.x) {
         const IdxT row = columns.indices[j];
         if (order_key(columns.data[j]) == keys[row]) {
-            atomicMin(&guides[row], guide);
-        }
-    }
-}
-
-// CSC, last pass: decode the keys; -1 marks rows without stored values.
-__global__ void max_guide_finish_kernel(const unsigned long long* keys,
-                                        long long n_rows, double* values,
-                                        int* guides) {
-    for (long long row =
-             blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
-         row < n_rows; row += static_cast<long long>(gridDim.x) * blockDim.x) {
-        const unsigned long long key = keys[row];
-        values[row] = key ? key_value(key) : 0.0;
-        if (!key) {
-            guides[row] = -1;
+            atomicMin(reinterpret_cast<unsigned int*>(&guides[row]),
+                      static_cast<unsigned int>(guide));
         }
     }
 }

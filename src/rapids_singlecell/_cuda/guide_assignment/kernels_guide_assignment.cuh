@@ -11,7 +11,10 @@ constexpr int NUM_WARPS = BLOCK_SIZE / 32;
 constexpr int NEWTON_STEPS = 12;
 constexpr int PRIOR_SAMPLES = 15;
 constexpr int N_QUANTILES = 5;
+constexpr int N_PARAMS = 4;
 constexpr int N_OUTPUTS = 6;
+// Relative change of the loss below which the EM stops.
+constexpr float TOL = 1e-7f;
 constexpr float LOG_SQRT_2PI = 0.91893853320467274f;
 constexpr double LOG_SQRT_2PI_D = 0.91893853320467274;
 constexpr float SCALE_FLOOR = 1e-3f;
@@ -212,7 +215,10 @@ __device__ inline void mixture_terms(float value, const Params& p,
     resp = expf(log_norm_weighted - log_mix);
 }
 
-// Log prior density without its additive constants.
+// Priors of crispat's model: rate ~ LogNormal(0, 1), mu ~ Normal(3, 2),
+// scale ~ LogNormal(2, 1) and Poisson and Gaussian weights ~ Dirichlet(0.9,
+// 0.1), which give the exponents 0.9 - 1 and 0.1 - 1 here and 3 / 2^2 = 0.75
+// and 1 / 2^2 = 0.25 in the update of mu. Additive constants are left out.
 __device__ inline float log_prior(const Params& p) {
     const float log_scale = logf(p.scale);
     const float log_rate = logf(p.rate);
@@ -229,7 +235,12 @@ __device__ inline float solve_log_scale(float sum_squares, float n_norm) {
     for (int i = 0; i < NEWTON_STEPS; ++i) {
         const float e = sum_squares * expf(-2.0f * v);
         const float f = e - (v - 2.0f) - n_norm - 1.0f;
-        v = fminf(fmaxf(v - f / (-2.0f * e - 1.0f), LOG_SCALE_FLOOR), 10.0f);
+        const float next =
+            fminf(fmaxf(v - f / (-2.0f * e - 1.0f), LOG_SCALE_FLOOR), 10.0f);
+        if (next == v) {
+            break;
+        }
+        v = next;
     }
     return v;
 }
@@ -241,7 +252,12 @@ __device__ inline float solve_log_rate(float sum_values, float n_pois) {
     for (int i = 0; i < NEWTON_STEPS; ++i) {
         const float e = n_pois * expf(log_rate);
         const float g = sum_values - 1.0f - log_rate - e;
-        log_rate = fminf(fmaxf(log_rate - g / (-1.0f - e), -20.0f), 10.0f);
+        const float next =
+            fminf(fmaxf(log_rate - g / (-1.0f - e), -20.0f), 10.0f);
+        if (next == log_rate) {
+            break;
+        }
+        log_rate = next;
     }
     return log_rate;
 }
@@ -283,13 +299,13 @@ __device__ inline void e_step_sums(const float* __restrict__ values,
 }
 
 // One block per (guide, start): MAP-EM until the relative loss change is below
-// tol. Values are [guides, width] with n_values used entries per guide, outputs
+// TOL. Values are [guides, width] with n_values used entries per guide, outputs
 // [starts, guides, 4] and [starts, guides].
 __global__ void fit_poisson_gauss_kernel(
     const float* __restrict__ values, const float* __restrict__ weights,
     const int* __restrict__ n_values, const float* __restrict__ draws,
     float* __restrict__ params_out, float* __restrict__ loss_out, int n_guides,
-    int width, int n_init_seeds, int n_iter, float tol) {
+    int width, int n_init_seeds, int n_iter) {
     const int guide = blockIdx.x;
     const int start = blockIdx.y;
     const int nv = n_values[guide];
@@ -335,17 +351,17 @@ __global__ void fit_poisson_gauss_kernel(
         p = Params{rate_new, mu_new, scale_new, w_new};
         previous = current;
         current = loss;
-        if (!(fabsf(previous - current) > tol * fabsf(current))) {
+        if (!(fabsf(previous - current) > TOL * fabsf(current))) {
             break;
         }
     }
 
     e_step_sums<false>(v, w, nv, p, 0.0f, s, partials);
     if (threadIdx.x == 0) {
-        params_out[slot * 4] = p.rate;
-        params_out[slot * 4 + 1] = p.mu;
-        params_out[slot * 4 + 2] = p.scale;
-        params_out[slot * 4 + 3] = p.w_norm;
+        params_out[slot * N_PARAMS] = p.rate;
+        params_out[slot * N_PARAMS + 1] = p.mu;
+        params_out[slot * N_PARAMS + 2] = p.scale;
+        params_out[slot * N_PARAMS + 3] = p.w_norm;
         loss_out[slot] = -(s[0] + log_prior(p));
     }
 }
@@ -369,19 +385,18 @@ __device__ inline bool posterior_above_half(double log_count, double rate,
 // counts 1..max_count for the first with a Gaussian posterior above 0.5.
 // out is [guides, 6]: rate, mu, scale, w_norm, loss, threshold, and stays nan
 // without an admissible start or threshold.
-__global__ void select_threshold_kernel(const float* __restrict__ params,
-                                        const float* __restrict__ loss,
-                                        const int* __restrict__ max_counts,
-                                        float* __restrict__ out, int n_guides,
-                                        int n_starts) {
+__global__ void select_threshold_kernel(
+    const float* __restrict__ params, const float* __restrict__ loss,
+    const long long* __restrict__ max_counts, float* __restrict__ out,
+    int n_guides, int n_starts) {
     const int guide = blockIdx.x;
-    __shared__ int first;
+    __shared__ long long first;
 
     int best = -1;
     float best_loss = INFINITY;
     for (int start = 0; start < n_starts; ++start) {
         const long long slot = static_cast<long long>(start) * n_guides + guide;
-        const float* q = params + slot * 4;
+        const float* q = params + slot * N_PARAMS;
         const bool admissible = isfinite(loss[slot]) && q[1] > q[0] &&
                                 q[3] > 2.0f * WEIGHT_FLOOR &&
                                 q[2] > 2.0f * SCALE_FLOOR;
@@ -394,13 +409,13 @@ __global__ void select_threshold_kernel(const float* __restrict__ params,
         return;
     }
     const float* q =
-        params + (static_cast<long long>(best) * n_guides + guide) * 4;
-    const int max_count = max_counts[guide];
+        params + (static_cast<long long>(best) * n_guides + guide) * N_PARAMS;
+    const long long max_count = max_counts[guide];
     if (threadIdx.x == 0) {
         first = max_count + 1;
     }
     __syncthreads();
-    for (int t = threadIdx.x + 1; t <= max_count; t += BLOCK_SIZE) {
+    for (long long t = threadIdx.x + 1; t <= max_count; t += BLOCK_SIZE) {
         if (posterior_above_half(log2(static_cast<double>(t)), q[0], q[1], q[2],
                                  q[3])) {
             atomicMin(&first, t);
@@ -410,11 +425,11 @@ __global__ void select_threshold_kernel(const float* __restrict__ params,
     __syncthreads();
     if (threadIdx.x == 0) {
         float* o = out + static_cast<long long>(guide) * N_OUTPUTS;
-        for (int k = 0; k < 4; ++k) {
+        for (int k = 0; k < N_PARAMS; ++k) {
             o[k] = q[k];
         }
-        o[4] = best_loss;
-        o[5] = first <= max_count ? static_cast<float>(first) : NAN;
+        o[N_PARAMS] = best_loss;
+        o[N_PARAMS + 1] = first <= max_count ? static_cast<float>(first) : NAN;
     }
 }
 

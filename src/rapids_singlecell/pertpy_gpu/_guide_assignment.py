@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from functools import cache, partial
+from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
@@ -16,14 +16,12 @@ from scverse_misc import Deprecation, deprecated_arg
 from rapids_singlecell._cuda import _guide_assignment_cuda as _ga
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
 
-_N_QUANTILE_STARTS = 5
-_PRIOR_INIT_SAMPLES = 15
 _HISTOGRAM_CAP = 1024
 # Histogram bins over all guides, so wide guide libraries get fewer bins each.
 _HISTOGRAM_BINS = 1 << 24
 _COLUMN_CHUNK = 4096
-# Blocks per CSC or dense column launch; long columns get longer chunks instead.
-_COLUMN_BLOCKS = 1 << 16
+# Blocks per CSC or dense column launch, so wide guide libraries get fewer chunks each.
+_COLUMN_BLOCKS = 1 << 20
 # Size of fixed-width label strings above which labels are joined as objects.
 _LABEL_BYTES = 1 << 28
 _LEARNING_RATE_DEPRECATION = Deprecation(
@@ -55,32 +53,25 @@ def _format_guides(names: Sequence[str], limit: int = 10) -> str:
 def _layout(X):
     """CSR or CSC ``X`` with float32 or float64 values for the sparse kernels, or dense ``X`` likewise.
 
-    Other sparse formats become CSR, other dtypes float32, and matrices with mixed index dtypes or strided data are copied.
+    Other sparse formats become CSR, other dtypes float32, and matrices with mixed index dtypes or strided arrays are rebuilt.
     """
     if cp_issparse(X):
         if not (isspmatrix_csc(X) or isspmatrix_csr(X)):
             X = X.tocsr()
-        if X.indptr.dtype != X.indices.dtype or not X.data.flags.c_contiguous:
-            X = X.copy()
+        arrays = (X.data, X.indices, X.indptr)
+        if X.indices.dtype != X.indptr.dtype or not all(a.flags.c_contiguous for a in arrays):
+            X = type(X)(tuple(map(cp.ascontiguousarray, arrays)), shape=X.shape)
     return X if X.dtype in (cp.float32, cp.float64) else X.astype(cp.float32)
-
-
-@cache
-def _max_grid_y() -> int:
-    return cp.cuda.Device().attributes["MaxGridDimY"]
 
 
 def _column_chunks(X) -> tuple[int, int]:
     """Entries per block and blocks per column of CSC or dense ``X``, so long columns fill the GPU."""
-    if isspmatrix_csc(X):
-        longest = int(cp.diff(X.indptr).max()) if X.shape[1] else 0
+    if isspmatrix_csc(X) and X.shape[1]:
+        longest = int(cp.diff(X.indptr).max())
     else:
         longest = X.shape[0]
-    n_chunks = min(
-        -(-longest // _COLUMN_CHUNK),
-        _COLUMN_BLOCKS // max(X.shape[1], 1),
-        _max_grid_y(),
-    )
+    # Grid dimension y allows 65535 blocks per column.
+    n_chunks = min(-(-longest // _COLUMN_CHUNK), _COLUMN_BLOCKS // max(X.shape[1], 1), 65535)
     n_chunks = max(n_chunks, 1)
     return max(-(-longest // n_chunks), 1), n_chunks
 
@@ -126,32 +117,24 @@ def _distinct_values(X, n_guides: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarr
         ]
     )
     counts = cp.concatenate([hist.ravel()[bins], cp.ones(tail.size, dtype=cp.uint32)])
-    if keys.size == 0:
-        empty = cp.zeros((n_guides, 0), dtype=cp.float32)
-        zeros = cp.zeros(n_guides, dtype=cp.float32)
-        return empty, empty, zeros.astype(cp.int32), zeros, zeros
-    order = cp.argsort(keys)
-    keys, counts = keys[order], counts[order]
-    starts = cp.flatnonzero(cp.concatenate([cp.ones(1, dtype=cp.bool_), keys[1:] != keys[:-1]]))
-    total = cp.concatenate([cp.zeros(1, dtype=cp.int64), cp.cumsum(counts, dtype=cp.int64)])
-    multiplicity = cp.diff(total[cp.append(starts, keys.size)])
-    distinct_cols = (keys[starts] >> 32).astype(cp.int64)
-    distinct_values = (keys[starts] & 0xFFFFFFFF).astype(cp.uint32).view(cp.float32)
-    n_distinct = cp.diff(cp.searchsorted(distinct_cols, cp.arange(n_guides + 1)))
-    first_of_guide = cp.cumsum(n_distinct) - n_distinct
-    rank = cp.arange(starts.size) - cp.repeat(first_of_guide, n_distinct)
-    width = int(n_distinct.max())
+    keys, inverse = cp.unique(keys, return_inverse=True)
+    multiplicity = cp.bincount(inverse, weights=counts).astype(cp.float32)
+    guide = (keys >> 32).astype(cp.int64)
+    value = (keys & 0xFFFFFFFF).astype(cp.uint32).view(cp.float32)
+    n_distinct = cp.bincount(guide, minlength=n_guides).astype(cp.int32)
+    rank = cp.arange(keys.size) - (cp.cumsum(n_distinct) - n_distinct)[guide]
+    width = int(n_distinct.max()) if n_guides else 0
     values_padded = cp.zeros((n_guides, width), dtype=cp.float32)
     weights_padded = cp.zeros((n_guides, width), dtype=cp.float32)
-    values_padded[distinct_cols, rank] = cp.log2(distinct_values)
-    weights_padded[distinct_cols, rank] = multiplicity.astype(cp.float32)
-    has_values = n_distinct > 0
+    values_padded[guide, rank] = cp.log2(value)
+    weights_padded[guide, rank] = multiplicity
+    last = cp.flatnonzero(cp.diff(guide, append=-1))
     max_counts = cp.zeros(n_guides, dtype=cp.float32)
-    max_counts[has_values] = distinct_values[(first_of_guide + n_distinct - 1)[has_values]]
+    max_counts[guide[last]] = value[last]
     return (
         values_padded,
         weights_padded,
-        n_distinct.astype(cp.int32),
+        n_distinct,
         weights_padded.sum(axis=1),
         max_counts,
     )
@@ -174,21 +157,20 @@ def _fit_mixture(
     n_guides = values.shape[0]
     rng = cp.random.default_rng(seed)
     draws = cp.stack(
-        [rng.standard_normal((n_init_seeds, _PRIOR_INIT_SAMPLES, n_guides), dtype=cp.float32) for _ in range(3)]
+        [rng.standard_normal((n_init_seeds, _ga.PRIOR_SAMPLES, n_guides), dtype=cp.float32) for _ in range(3)]
     )
-    n_starts = n_init_seeds + _N_QUANTILE_STARTS
-    out = cp.full((n_guides, 6), cp.nan, dtype=cp.float32)
+    n_starts = n_init_seeds + _ga.N_QUANTILES
+    out = cp.full((n_guides, _ga.N_OUTPUTS), cp.nan, dtype=cp.float32)
     _ga.fit_poisson_gauss(
         values,
         weights,
-        n_values.astype(cp.int32),
-        max_counts.astype(cp.int32),
+        n_values,
+        max_counts.astype(cp.int64),
         draws,
-        cp.empty((n_starts, n_guides, 4), dtype=cp.float32),
+        cp.empty((n_starts, n_guides, _ga.N_PARAMS), dtype=cp.float32),
         cp.empty((n_starts, n_guides), dtype=cp.float32),
         out,
         n_iter=n_iter,
-        tol=1e-7,
         stream=cp.cuda.get_current_stream().ptr,
     )
     return cp.asnumpy(out).astype(np.float64)
@@ -228,15 +210,13 @@ def _assigned(X, thresholds: cp.ndarray):
 
 def _cell_major(binary):
     """CSR form of a binary assignment matrix with sorted guides in every cell; duplicate entries are summed, as in pertpy."""
-    if not cp_issparse(binary):
-        rows, cols = cp.nonzero(binary)
-        if not rows.size:
-            return cp_csr(binary.shape, dtype=cp.float32)
-        ones = cp.ones(rows.size, dtype=cp.float32)
-        return cp_csr((ones, (rows, cols)), shape=binary.shape)
-    cells = binary.tocsr() if binary.nnz else cp_csr(binary.shape, dtype=cp.float32)
-    cells.sum_duplicates()
-    return cells
+    if cp_issparse(binary):
+        cells = binary.tocsr()
+        cells.sum_duplicates()
+        return cells
+    rows, cols = cp.nonzero(binary)
+    indptr = cp.searchsorted(rows, cp.arange(binary.shape[0] + 1))
+    return cp_csr((cp.ones(cols.size, dtype=cp.float32), cols, indptr), shape=binary.shape)
 
 
 def _max_guide(X) -> tuple[np.ndarray, np.ndarray]:
@@ -245,26 +225,25 @@ def _max_guide(X) -> tuple[np.ndarray, np.ndarray]:
     As in pertpy's sparse path implicit zeros are ignored; ties go to the first guide, which is pertpy's first stored entry for canonical input.
     """
     stream = cp.cuda.get_current_stream().ptr
-    values = cp.empty(X.shape[0], dtype=cp.float64)
+    keys = cp.zeros(X.shape[0], dtype=cp.uint64)
+    guides = cp.full(X.shape[0], -1, dtype=cp.int32)
     if isspmatrix_csc(X):
         chunk, n_chunks = _column_chunks(X)
-        guides = cp.full(X.shape[0], np.iinfo(np.int32).max, dtype=cp.int32)
-        keys = cp.zeros(X.shape[0], dtype=cp.uint64)
         _ga.max_guide_csc(
             X.indptr,
             X.indices,
             X.data,
             keys,
-            values,
             guides,
             chunk=chunk,
             n_chunks=n_chunks,
             stream=stream,
         )
     else:
-        guides = cp.empty(X.shape[0], dtype=cp.int32)
-        _ga.max_guide_csr(X.indptr, X.indices, X.data, values, guides, stream=stream)
-    return cp.asnumpy(values), cp.asnumpy(guides)
+        _ga.max_guide_csr(X.indptr, X.indices, X.data, keys, guides, stream=stream)
+    # Inverse of the kernels' order_key; the key 0 of cells without counts decodes to NaN.
+    bits = cp.where((keys >> 63) != 0, keys & 0x7FFFFFFFFFFFFFFF, ~keys)
+    return cp.asnumpy(bits.view(cp.float64)).astype(X.dtype), cp.asnumpy(guides)
 
 
 def _per_cell_assignments(
@@ -400,11 +379,13 @@ class GuideAssignment:
             Label for cells with no guide above threshold.
         """
         X = X_to_GPU(_get_obs_rep(adata, layer=layer))
-        if cp_issparse(X):
+        if not X.shape[1]:
+            max_values = max_positions = np.full(X.shape[0], -1)
+        elif cp_issparse(X):
             max_values, max_positions = _max_guide(_layout(X))
         else:
-            max_values = cp.asnumpy(X.max(axis=1)).ravel()
-            max_positions = cp.asnumpy(X.argmax(axis=1)).ravel()
+            max_values = cp.asnumpy(X.max(axis=1))
+            max_positions = cp.asnumpy(X.argmax(axis=1))
         # Position -1 picks the appended key.
         labels = np.append(adata.var_names.to_numpy(), no_grna_assigned_key)
         assigned = (max_positions >= 0) & (max_values >= assignment_threshold)
@@ -499,13 +480,13 @@ class GuideAssignment:
         if skipped.size:
             warnings.warn(
                 f"Skipping {skipped.size} guides with fewer than 2 expressing cells or a "
-                f"maximum count below 2: {_format_guides(list(guide_names[skipped]))}.",
+                f"maximum count below 2: {_format_guides(guide_names[skipped])}.",
                 UserWarning,
                 stacklevel=3,
             )
 
         fittable_idx = np.flatnonzero(fittable)
-        estimates = np.full((n_guides, 6), np.nan)
+        estimates = np.full((n_guides, _ga.N_OUTPUTS), np.nan)
         if fittable_idx.size > 0:
             if show_progress:
                 print(f"Fitting Poisson-Gaussian mixture for {fittable_idx.size} guides in parallel.")
@@ -524,7 +505,7 @@ class GuideAssignment:
                 warnings.warn(
                     f"No positive population found for {unassignable.size} guides, which "
                     "are not assigned to any cell: "
-                    f"{_format_guides(list(guide_names[unassignable]))}.",
+                    f"{_format_guides(guide_names[unassignable])}.",
                     UserWarning,
                     stacklevel=3,
                 )

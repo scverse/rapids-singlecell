@@ -10,6 +10,7 @@ from cupyx.scipy.sparse import csr_matrix as gpu_csr
 
 import rapids_singlecell as rsc
 from rapids_singlecell.get import X_to_CPU
+from rapids_singlecell.pertpy_gpu import _guide_assignment
 
 
 def _synthetic_counts(
@@ -47,16 +48,6 @@ def guide_adata() -> tuple[AnnData, np.ndarray]:
 
 
 @pytest.fixture
-def guide_adata_sparse(
-    guide_adata: tuple[AnnData, np.ndarray],
-) -> tuple[AnnData, np.ndarray]:
-    adata, truth = guide_adata
-    adata = adata.copy()
-    adata.X = gpu_csr(adata.X)
-    return adata, truth
-
-
-@pytest.fixture
 def tiny_adata() -> AnnData:
     return _adata(np.array([[6, 0, 2], [1, 5, 0], [0, 1, 7]], dtype=np.float32))
 
@@ -89,9 +80,10 @@ def test_assign_to_max_guide(tiny_adata: AnnData, storage: str) -> None:
     assert tuple(tiny_adata.obs["assigned_guide"]) == ("guide_0", "Negative", "guide_2")
 
 
-@pytest.mark.parametrize("fixture", ["guide_adata", "guide_adata_sparse"])
-def test_mixture_model_recovers_known_positives(request, fixture: str) -> None:
-    adata, truth = request.getfixturevalue(fixture)
+def test_mixture_model_recovers_known_positives(
+    guide_adata: tuple[AnnData, np.ndarray],
+) -> None:
+    adata, truth = guide_adata
     rsc.ptg.GuideAssignment().assign_mixture_model(adata)
 
     thresholds = np.nan_to_num(adata.var["threshold"].to_numpy(), nan=np.inf)
@@ -114,19 +106,6 @@ def test_mixture_model_recovers_known_positives(request, fixture: str) -> None:
     ):
         assert np.isfinite(adata.var[col]).all()
     assert (adata.var["gaussian_mean"] > adata.var["poisson_rate"]).all()
-
-
-def test_mixture_model_dense_matches_sparse(
-    guide_adata: tuple[AnnData, np.ndarray],
-    guide_adata_sparse: tuple[AnnData, np.ndarray],
-) -> None:
-    dense, _ = guide_adata
-    sparse, _ = guide_adata_sparse
-    rsc.ptg.GuideAssignment().assign_mixture_model(dense)
-    rsc.ptg.GuideAssignment().assign_mixture_model(sparse)
-
-    assert list(dense.obs["assigned_guide"]) == list(sparse.obs["assigned_guide"])
-    np.testing.assert_array_equal(dense.var["threshold"], sparse.var["threshold"])
 
 
 def test_mixture_model_high_moi_keeps_component_order() -> None:
@@ -222,13 +201,20 @@ def test_mixture_model_rejects_negative_values_next_to_nan(tiny_adata: AnnData, 
 
 
 def _layouts(X: np.ndarray) -> dict:
-    """The same counts as dense C/F, CSR, CSC, COO, int64-indexed, float64 and unsorted CSR."""
+    """The same counts as dense C/F, CSR, CSC, COO, int64 or mixed indices, float64 and unsorted CSR."""
     csr = gpu_csr(cp.asarray(X))
     wide = csr.copy()
     wide.indptr, wide.indices = (
         wide.indptr.astype(cp.int64),
         wide.indices.astype(cp.int64),
     )
+    wide_csc = gpu_csc(cp.asarray(X, dtype=cp.float64))
+    wide_csc.indptr, wide_csc.indices = (
+        wide_csc.indptr.astype(cp.int64),
+        wide_csc.indices.astype(cp.int64),
+    )
+    mixed = csr.copy()
+    mixed.indptr = mixed.indptr.astype(cp.int64)
     indptr = cp.asnumpy(csr.indptr)
     reverse = np.concatenate([np.arange(start, end)[::-1] for start, end in zip(indptr[:-1], indptr[1:], strict=True)])
     unsorted = gpu_csr((csr.data[reverse], csr.indices[reverse], csr.indptr), shape=csr.shape)
@@ -239,14 +225,14 @@ def _layouts(X: np.ndarray) -> dict:
         "csc": gpu_csc(cp.asarray(X)),
         "coo": csr.tocoo(),
         "int64 indices": wide,
+        "int64 float64 csc": wide_csc,
+        "mixed index dtypes": mixed,
         "float64": csr.astype(cp.float64),
         "unsorted csr": unsorted,
     }
 
 
 def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pytest.MonkeyPatch) -> None:
-    from rapids_singlecell.pertpy_gpu import _guide_assignment
-
     adata, _ = guide_adata
     X = cp.asnumpy(adata.X)
     ga = rsc.ptg.GuideAssignment()
@@ -259,6 +245,8 @@ def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pyt
     for name, layout in _layouts(X).items():
         a = AnnData(X=layout, obs=adata.obs.copy(), var=adata.var.copy())
         ga.assign_mixture_model(a)
+        if name != "coo":
+            assert type(a.layers["assigned_guides"]) is type(layout)
         ga.assign_to_max_guide(a, assignment_threshold=3, obs_key="max_guide")
         ga.assign_by_threshold(a, assignment_threshold=3, output_layer="threshold")
         np.testing.assert_array_equal(a.var["threshold"], reference.var["threshold"], err_msg=name)
@@ -291,21 +279,44 @@ def test_assign_to_max_guide_nan_ties_and_empty_cells(storage: str) -> None:
     ]
 
 
-@pytest.mark.parametrize("storage", ["csr", "csc"])
+@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
 def test_assign_to_max_guide_without_guides(storage: str) -> None:
     adata = _adata(np.zeros((3, 0), np.float32))
-    adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
+    if storage != "dense":
+        adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
     rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=1)
     assert list(adata.obs["assigned_guide"]) == ["Negative"] * 3
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
-def test_assign_by_threshold_compares_in_data_precision(storage: str) -> None:
+def test_thresholds_compare_in_data_precision(storage: str) -> None:
     adata = _adata(np.array([[0.7, 0.2]], np.float32))
     if storage != "dense":
         adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
     rsc.ptg.GuideAssignment().assign_by_threshold(adata, assignment_threshold=0.7)
+    rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=0.7)
     np.testing.assert_array_equal(_dense(adata.layers["assigned_guides"]), [[1, 0]])
+    assert list(adata.obs["assigned_guide"]) == ["guide_0"]
+
+
+def test_mixture_model_rejects_too_many_starts_and_bad_shapes(
+    tiny_adata: AnnData,
+) -> None:
+    with pytest.raises(ValueError, match="n_init_seeds"):
+        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata, n_init_seeds=70000)
+    zeros = cp.zeros((2, 1), cp.float32)
+    with pytest.raises(ValueError, match="shapes"):
+        _guide_assignment._ga.fit_poisson_gauss(
+            zeros,
+            zeros,
+            cp.zeros(2, cp.int32),
+            cp.zeros(2, cp.int64),
+            cp.zeros((3, 1, 15, 2), cp.float32),
+            cp.zeros((6, 2, 4), cp.float32),
+            cp.zeros((6, 2), cp.float32),
+            cp.zeros((1, 6), cp.float32),
+            n_iter=1,
+        )
 
 
 def _pertpy_labels(binary: np.ndarray, names: np.ndarray, **kwargs) -> pd.Categorical:
