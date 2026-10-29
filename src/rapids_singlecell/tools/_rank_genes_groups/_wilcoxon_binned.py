@@ -271,7 +271,7 @@ def wilcoxon_binned(
         and (isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"}))
     )
     n_hist_groups = n_cells_per_group_hist.shape[0]
-    from ._stream_multi_gpu import resolve_stream_devices
+    from rapids_singlecell._utils._multi_gpu import resolve_stream_devices
 
     device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [cp.cuda.Device().id]
     if fuse_means:

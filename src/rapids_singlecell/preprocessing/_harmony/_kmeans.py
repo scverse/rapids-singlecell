@@ -7,9 +7,19 @@ import numpy as np
 
 from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
 
-_ASSIGNMENT_BATCH_ROWS = 65_536
+_ASSIGNMENT_BATCH_BYTES = 1 << 28
 _DISTANCE_ERROR_FACTOR = 4
 _HOST_COUNTS_MAX_CLUSTERS = 4096
+
+
+def _fused_distances(X, n_clusters: int) -> bool:
+    """Whether the fused distance kernels (exact squared distances) fit: a warp's clusters and their shared memory."""
+    smem = _clustering_cuda.kmeans_assign_smem(n_cols=X.shape[1], itemsize=X.itemsize)
+    return (
+        n_clusters <= _clustering_cuda.FUSED_CLUSTER_STRIDE
+        and smem <= cp.cuda.Device().attributes["MaxSharedMemoryPerBlockOptin"]
+    )
+
 
 _refine_squared_distances = cp.ElementwiseKernel(
     "T distance, raw T X, raw T centers, raw T x_norm, raw T center_norm, "
@@ -53,8 +63,19 @@ def _squared_distances(X, centers, *, squared_norms):
 
 
 def _assign_labels(X, centers, *, squared_norms, labels, minimum):
-    for begin in range(0, X.shape[0], _ASSIGNMENT_BATCH_ROWS):
-        end = min(begin + _ASSIGNMENT_BATCH_ROWS, X.shape[0])
+    if _fused_distances(X, centers.shape[0]):
+        _clustering_cuda.kmeans_assign(
+            X,
+            centers=centers,
+            labels=labels,
+            minimum=minimum,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+        return
+    # Bound the distance matrix of one batch by _ASSIGNMENT_BATCH_BYTES.
+    rows = max(1, _ASSIGNMENT_BATCH_BYTES // (centers.shape[0] * X.itemsize))
+    for begin in range(0, X.shape[0], rows):
+        end = min(begin + rows, X.shape[0])
         distances = _squared_distances(X[begin:end], centers, squared_norms=squared_norms[begin:end])
         batch_labels = cp.argmin(distances, axis=1).astype(cp.int32)
         labels[begin:end] = batch_labels
@@ -76,9 +97,18 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
     n_draws = cp.zeros(1, dtype=cp.int32)
     weight_tile_rows = _clustering_cuda.KMEANS_WEIGHT_TILE_ROWS
     totals = cp.empty((n_rows + weight_tile_rows - 1) // weight_tile_rows, dtype=cp.float64)
+    fused = _fused_distances(X, n_clusters)
     for cluster in range(n_clusters):
-        candidate = _squared_distances(X, centers[cluster : cluster + 1], squared_norms=squared_norms).ravel()
-        cp.minimum(closest, candidate, out=closest)
+        if fused:
+            _clustering_cuda.kmeans_closest(
+                X,
+                center=centers[cluster],
+                closest=closest,
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+        else:
+            candidate = _squared_distances(X, centers[cluster : cluster + 1], squared_norms=squared_norms).ravel()
+            cp.minimum(closest, candidate, out=closest)
         if cluster + 1 < n_clusters:
             _clustering_cuda.select_kmeans_center(
                 X,
@@ -119,10 +149,6 @@ def _kmeans(X, n_clusters, *, max_iter, rng):
             categories=labels,
             out=sums,
             workspace=workspace,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            n_categories=n_clusters,
-            switcher=1,
             stream=cp.cuda.get_current_stream().ptr,
         )
         cp.divide(sums, counts[:, None], out=centers)

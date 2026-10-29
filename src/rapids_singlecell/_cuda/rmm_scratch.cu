@@ -1,6 +1,5 @@
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <utility>
 
 #include <cuda_runtime.h>
@@ -16,47 +15,49 @@ using namespace nb::literals;
 // resource as the caller's CuPy arrays (RMM pool / UVM aware) without linking
 // librmm's C++ ABI, which is versioned per RAPIDS release.
 namespace {
-std::function<std::uintptr_t(std::size_t)> g_alloc;
-std::function<void(std::uintptr_t)> g_dealloc;
+// Read and replaced under the GIL. Never destroyed: static destructors run
+// after Py_Finalize, when releasing a Python object crashes.
+nb::object& g_alloc = *new nb::object();
+nb::object& g_dealloc = *new nb::object();
 
 void set_scratch_allocator(nb::callable alloc, nb::callable dealloc) {
-    g_alloc = [alloc](std::size_t bytes) -> std::uintptr_t {
-        nb::gil_scoped_acquire gil;
-        return nb::cast<std::uintptr_t>(alloc(bytes));
-    };
-    g_dealloc = [dealloc](std::uintptr_t ptr) {
-        nb::gil_scoped_acquire gil;
-        dealloc(ptr);
-    };
-}
-
-void ensure_scratch_allocator() {
-    nb::gil_scoped_acquire gil;
-    if (g_alloc) return;
-    nb::tuple callbacks =
-        nb::cast<nb::tuple>(nb::module_::import_("rapids_singlecell._cuda")
-                                .attr("_get_scratch_allocator")());
-    set_scratch_allocator(nb::borrow<nb::callable>(callbacks[0]),
-                          nb::borrow<nb::callable>(callbacks[1]));
+    g_alloc = std::move(alloc);
+    g_dealloc = std::move(dealloc);
 }
 }  // namespace
 
 void register_scratch_allocator(nb::module_& m) {
-    m.def(
-        "_set_scratch_allocator",
-        [](nb::callable alloc, nb::callable dealloc) {
-            set_scratch_allocator(std::move(alloc), std::move(dealloc));
-        },
-        "alloc"_a, "dealloc"_a);
+    m.def("_set_scratch_allocator", &set_scratch_allocator, "alloc"_a,
+          "dealloc"_a);
 }
 
 void* rmm_allocate(size_t bytes) {
-    ensure_scratch_allocator();
-    return reinterpret_cast<void*>(g_alloc(bytes));
+    nb::gil_scoped_acquire gil;
+    if (!g_alloc) {
+        nb::tuple callbacks =
+            nb::cast<nb::tuple>(nb::module_::import_("rapids_singlecell._cuda")
+                                    .attr("_get_scratch_allocator")());
+        // Python can switch threads above: install once, so that every
+        // pointer is freed by the allocator that made it.
+        if (!g_alloc)
+            set_scratch_allocator(nb::borrow<nb::callable>(callbacks[0]),
+                                  nb::borrow<nb::callable>(callbacks[1]));
+    }
+    nb::object alloc = g_alloc;  // alive should Python replace it meanwhile
+    return reinterpret_cast<void*>(nb::cast<std::uintptr_t>(alloc(bytes)));
 }
 
+// Frees run in destructors and must not throw: a dealloc's error (e.g. a
+// signal handler's KeyboardInterrupt at its first bytecode) is reported as
+// unraisable. The default dealloc runs no bytecode.
 void rmm_deallocate(void* ptr, size_t /*bytes*/) {
-    if (g_dealloc) g_dealloc(reinterpret_cast<std::uintptr_t>(ptr));
+    nb::gil_scoped_acquire gil;
+    nb::object dealloc = g_dealloc;
+    try {
+        if (dealloc) dealloc(reinterpret_cast<std::uintptr_t>(ptr));
+    } catch (nb::python_error& e) {
+        e.discard_as_unraisable("rapids_singlecell scratch free");
+    }
 }
 
 // Plain cudaMemGetInfo budget query, never a pool-probing trial allocation.

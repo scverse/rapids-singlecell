@@ -170,11 +170,9 @@ class _RankGenes:
 
     def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
         """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
-        from ._stream_multi_gpu import (
-            aggr_host_planes,
-            resolve_stream_devices,
-            stream_planes_multi,
-        )
+        from rapids_singlecell._utils._multi_gpu import resolve_stream_devices
+
+        from ._stream_multi_gpu import aggr_host_planes, stream_planes_multi
 
         codes = self.group_codes
         device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)

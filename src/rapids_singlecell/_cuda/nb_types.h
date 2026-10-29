@@ -24,9 +24,22 @@ inline void cuda_check_last_error(const char* kernel_name) {
 /// Failed calls surface with a clear label instead of corrupted output later.
 inline void cuda_check(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
+        cudaGetLastError();  // clear it, so later launch checks do not see it
         throw std::runtime_error(std::string(what) +
                                  " failed: " + cudaGetErrorString(err));
     }
+}
+
+/// An attribute of the current device: the error code, or checked.
+inline cudaError_t device_attribute(cudaDeviceAttr attribute, int& value) {
+    int device;
+    if (cudaError_t err = cudaGetDevice(&device)) return err;
+    return cudaDeviceGetAttribute(&value, attribute, device);
+}
+inline int device_attribute(cudaDeviceAttr attribute) {
+    int value;
+    cuda_check(device_attribute(attribute, value), "cudaDeviceGetAttribute");
+    return value;
 }
 
 /// Validate a binding-argument precondition (array dims vs. scalar shapes).
