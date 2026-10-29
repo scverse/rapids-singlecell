@@ -46,8 +46,7 @@ inline int device_attribute(cudaDeviceAttr attribute) {
 /// Mismatches become clean Python errors, not out-of-bounds launches.
 inline void nb_require(bool cond, const char* what) {
     if (!cond) {
-        throw std::invalid_argument(
-            std::string("rank_genes_groups CUDA binding: ") + what);
+        throw std::invalid_argument(std::string("CUDA binding: ") + what);
     }
 }
 
