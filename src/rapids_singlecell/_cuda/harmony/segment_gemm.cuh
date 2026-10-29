@@ -196,6 +196,24 @@ __global__ void __launch_bounds__(kThreads, 2)
         }
         __pipeline_commit();
     };
+    // The segment's rows under every grouping, this tile's columns: thread 0
+    // resolves them with constant indices into the parameter (a runtime index
+    // would copy it to local memory) and the barriers below publish them.
+    __shared__ const short* sbg[kMaxGroupings];
+    __shared__ unsigned long long* sout[kMaxGroupings];
+    const size_t ls = (size_t)K * D;
+    const int ng = gs.n;
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < kMaxGroupings; ++j)
+            if (j < ng) {
+                const int g =
+                    (gs.seg_group[j] ? gs.seg_group[j][blockIdx.x] : 0) +
+                    gs.offset[j];
+                sbg[j] = bound_exp + (size_t)g * D + d0;
+                sout[j] = acc + (size_t)g * limbs * ls + (size_t)k0 * D + d0;
+            }
+    }
     load(0);
     const int nto = p.dgt * p.kgt, sp = threadIdx.x / nto;
     const int o = threadIdx.x % nto, dg = o / p.kgt, kg = o % p.kgt;
@@ -249,21 +267,12 @@ __global__ void __launch_bounds__(kThreads, 2)
     __pipeline_wait_prior(0);
     __syncthreads();
 
-    // the segment's rows under every grouping, this tile's columns
-    const size_t ls = (size_t)K * D;
-    const short* bg[kMaxGroupings];
-    unsigned long long* out[kMaxGroupings];
-    for (int j = 0; j < gs.n; ++j) {
-        const int g =
-            (gs.seg_group[j] ? gs.seg_group[j][blockIdx.x] : 0) + gs.offset[j];
-        bg[j] = bound_exp + (size_t)g * D + d0;
-        out[j] = acc + (size_t)g * limbs * ls + (size_t)k0 * D + d0;
-    }
     auto put = [&](T v, int d, int k) {
         if (d < dv && k < kv)
-            for (int j = 0; j < gs.n; ++j)
-                emit(v, scale_exp(bg[j][d], limbs), out[j] + (size_t)k * D + d,
-                     ls, limbs);
+#pragma unroll 1
+            for (int j = 0; j < ng; ++j)
+                emit(v, scale_exp(sbg[j][d], limbs),
+                     sout[j] + (size_t)k * D + d, ls, limbs);
     };
     if (p.nsplit == 1 && sp == 0)
 #pragma unroll

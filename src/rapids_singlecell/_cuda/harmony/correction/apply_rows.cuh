@@ -98,9 +98,15 @@ __global__ void __launch_bounds__(NT)
     if (t0 == t1) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int K4 = (K + 3) & ~3, WS = min(D, DW);
-    const T* wg[kMaxTables];  // the segment's rows of every table
-    for (int t = 0; t < tb.n; ++t)
-        wg[t] = tb.w[t] + (size_t)tb.seg_group[t][seg] * wgs;
+    // The segment's rows of every table: thread 0 resolves them with constant
+    // indices into the parameter (a runtime index would copy it to local
+    // memory); the barrier below publishes them.
+    __shared__ const T* wg[kMaxTables];
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int t = 0; t < kMaxTables; ++t)
+            if (t < tb.n) wg[t] = tb.w[t] + (size_t)tb.seg_group[t][seg] * wgs;
+    }
     // shared: 2 stages of R tiles (TM x kc as RT) | CONV: the tile as T | W
     // chunk, element (k, j) at ((k / 4) * WS + j) * 4 + k % 4, + slack read by
     // lanes past WS (results unused)
