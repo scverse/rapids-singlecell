@@ -13,7 +13,6 @@ constexpr int PRIOR_SAMPLES = 15;
 constexpr int N_QUANTILES = 5;
 constexpr int N_PARAMS = 4;
 constexpr int N_OUTPUTS = 6;
-// Relative change of the loss below which the EM stops.
 constexpr float TOL = 1e-7f;
 constexpr float LOG_SQRT_2PI = 0.91893853320467274f;
 constexpr double LOG_SQRT_2PI_D = 0.91893853320467274;
@@ -87,7 +86,6 @@ __device__ inline float block_max(float v, float (*partials)[4]) {
     return result;
 }
 
-// Inclusive prefix sum over the block; `total` receives the block-wide sum.
 __device__ inline float block_inclusive_scan(float v, float& total,
                                              float (*partials)[4]) {
     const int lane = threadIdx.x & 31;
@@ -114,7 +112,6 @@ __device__ inline float block_inclusive_scan(float v, float& total,
     return v;
 }
 
-// Median of 15 samples stored `stride` apart, as the 8th smallest value.
 __device__ inline float median15(const float* x, long long stride) {
     float a[PRIOR_SAMPLES];
     for (int i = 0; i < PRIOR_SAMPLES; ++i) {
@@ -129,7 +126,6 @@ __device__ inline float median15(const float* x, long long stride) {
     return a[PRIOR_SAMPLES / 2];
 }
 
-// Start from prior medians, as crispat: 15 standard normal draws per parameter.
 // draws is [3, n_init_seeds, 15, guides] for the rate, mean and scale.
 __device__ inline Params prior_init(const float* draws, int n_init_seeds,
                                     int start, int guide, int n_guides) {
@@ -146,8 +142,6 @@ __device__ inline Params prior_init(const float* draws, int n_init_seeds,
     return p;
 }
 
-// Start that splits the values at a weight quantile: Poisson below, Gaussian
-// above.
 __device__ inline Params data_init(const float* __restrict__ v,
                                    const float* __restrict__ w, int nv,
                                    float sum_w, float vmax, float q,
@@ -199,7 +193,6 @@ __device__ inline Params data_init(const float* __restrict__ v,
     return p;
 }
 
-// Log mixture density of one log2 count and the Gaussian responsibility.
 __device__ inline void mixture_terms(float value, const Params& p,
                                      float log_rate, float log_scale,
                                      float log_w, float log1m_w, float& log_mix,
@@ -215,10 +208,7 @@ __device__ inline void mixture_terms(float value, const Params& p,
     resp = expf(log_norm_weighted - log_mix);
 }
 
-// Priors of crispat's model: rate ~ LogNormal(0, 1), mu ~ Normal(3, 2),
-// scale ~ LogNormal(2, 1) and Poisson and Gaussian weights ~ Dirichlet(0.9,
-// 0.1), which give the exponents 0.9 - 1 and 0.1 - 1 here and 3 / 2^2 = 0.75
-// and 1 / 2^2 = 0.25 in the update of mu. Additive constants are left out.
+// crispat's priors, up to additive constants.
 __device__ inline float log_prior(const Params& p) {
     const float log_scale = logf(p.scale);
     const float log_rate = logf(p.rate);
@@ -228,7 +218,6 @@ __device__ inline float log_prior(const Params& p) {
            log_rate - 0.5f * log_rate * log_rate;
 }
 
-// MAP log scale of the Gaussian: the root of a convex decreasing function.
 __device__ inline float solve_log_scale(float sum_squares, float n_norm) {
     float v = 0.5f * logf(fmaxf(sum_squares, 1e-12f) / fmaxf(n_norm, 1e-12f));
     v = fminf(fmaxf(v, LOG_SCALE_FLOOR), 10.0f);
@@ -245,7 +234,6 @@ __device__ inline float solve_log_scale(float sum_squares, float n_norm) {
     return v;
 }
 
-// MAP log rate of the Poisson: the root of a concave decreasing function.
 __device__ inline float solve_log_rate(float sum_values, float n_pois) {
     float log_rate = logf(fmaxf(sum_values, 1e-12f) / fmaxf(n_pois, 1e-12f));
     log_rate = fminf(fmaxf(log_rate, -20.0f), 10.0f);
@@ -262,9 +250,7 @@ __device__ inline float solve_log_rate(float sum_values, float n_pois) {
     return log_rate;
 }
 
-// Sums of w*log_mix, w*resp and w*resp*value, or of w*resp*(value - center)^2,
-// w_rest = w - w*resp and w_rest*value, the Poisson sums summed per value as in
-// pertpy rather than as differences of large totals.
+// Poisson sums per value, as in pertpy, not as differences of totals.
 template <bool SECOND_PASS>
 __device__ inline void e_step_sums(const float* __restrict__ values,
                                    const float* __restrict__ weights, int nv,
@@ -298,9 +284,6 @@ __device__ inline void e_step_sums(const float* __restrict__ values,
     block_sum<3>(s, partials);
 }
 
-// One block per (guide, start): MAP-EM until the relative loss change is below
-// TOL. Values are [guides, width] with n_values used entries per guide, outputs
-// [starts, guides, 4] and [starts, guides].
 __global__ void fit_poisson_gauss_kernel(
     const float* __restrict__ values, const float* __restrict__ weights,
     const int* __restrict__ n_values, const float* __restrict__ draws,
@@ -381,10 +364,7 @@ __device__ inline bool posterior_above_half(double log_count, double rate,
     return exp(log_num - log_den) > 0.5;
 }
 
-// One block per guide: keep the admissible start with the lowest loss and scan
-// counts 1..max_count for the first with a Gaussian posterior above 0.5.
-// out is [guides, 6]: rate, mu, scale, w_norm, loss, threshold, and stays nan
-// without an admissible start or threshold.
+// out: rate, mu, scale, w_norm, loss, threshold; nan without a fit.
 __global__ void select_threshold_kernel(
     const float* __restrict__ params, const float* __restrict__ loss,
     const long long* __restrict__ max_counts, float* __restrict__ out,

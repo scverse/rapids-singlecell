@@ -238,8 +238,6 @@ def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pyt
     ga = rsc.ptg.GuideAssignment()
     reference = adata.copy()
     ga.assign_mixture_model(reference)
-    # Tiny histograms and column chunks run the histogram tail, its retry and
-    # many chunks per column on this small data.
     monkeypatch.setattr(_guide_assignment, "_HISTOGRAM_CAP", 8)
     monkeypatch.setattr(_guide_assignment, "_COLUMN_CHUNK", 7)
     for name, layout in _layouts(X).items():
@@ -264,8 +262,6 @@ def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pyt
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
 def test_assign_to_max_guide_nan_ties_and_empty_cells(storage: str) -> None:
-    # A NaN is the largest count but fails the threshold, ties go to the first
-    # guide and cells without counts stay unassigned, as in pertpy.
     X = np.array([[np.nan, 5, 0], [2, 2, 0], [0, 0, 0], [-0.0, 0, 0]], np.float32)
     adata = _adata(X)
     if storage != "dense":

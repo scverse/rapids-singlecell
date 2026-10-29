@@ -17,7 +17,6 @@ ga::CscColumns<T, IdxT> csc_columns(gpu_array_c<const IdxT, Device>& indptr,
     return {indptr.data(), indices.data(), data.data()};
 }
 
-// Blocks for one warp per row.
 inline unsigned int warp_blocks(long long n_rows) {
     return static_cast<unsigned int>((n_rows * 32 + SPARSE_BLOCK - 1) /
                                      SPARSE_BLOCK);
@@ -40,8 +39,6 @@ void histogram_columns(Columns columns, long long n_guides, long long chunk,
     CUDA_CHECK_LAST_ERROR(value_histogram_columns_kernel);
 }
 
-// Fits every (guide, start) by MAP-EM, then keeps the best admissible start of
-// every guide and its threshold in out.
 template <typename Device>
 void def_fit(nb::module_& m) {
     m.def(

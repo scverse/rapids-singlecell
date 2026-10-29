@@ -6,7 +6,6 @@
 
 namespace guide_assignment {
 
-// Column-wise access to CSC input: entries j in [begin, end) of column g.
 template <typename T, typename IdxT>
 struct CscColumns {
     const IdxT* indptr;
@@ -23,7 +22,6 @@ struct CscColumns {
     }
 };
 
-// Column-wise access to dense input of any memory order.
 template <typename T>
 struct DenseColumns {
     const T* x;
@@ -41,7 +39,6 @@ struct DenseColumns {
     }
 };
 
-// Entries of column blockIdx.x handled by this block: chunk blockIdx.y.
 template <typename Columns>
 __device__ inline void column_chunk(const Columns& columns, long long chunk,
                                     long long& first, long long& last) {
@@ -50,8 +47,6 @@ __device__ inline void column_chunk(const Columns& columns, long long chunk,
     last = min(columns.end(g), first + chunk);
 }
 
-// Counts a positive integer value below `cap` in `bins`; other non-zero values
-// go to the tail as guide << 32 | float bits, which sorts by guide, then value.
 __device__ inline void count_value(double v, int guide, int cap,
                                    unsigned int* bins,
                                    unsigned long long* n_tail,
@@ -71,7 +66,6 @@ __device__ inline void count_value(double v, int guide, int cap,
     }
 }
 
-// CSR: one thread per stored entry, the guide is the column index.
 template <typename T, typename IdxT>
 __global__ void value_histogram_csr_kernel(
     const IdxT* __restrict__ indices, const T* __restrict__ data, long long nnz,
@@ -87,8 +81,6 @@ __global__ void value_histogram_csr_kernel(
     }
 }
 
-// CSC or dense: one block per chunk of a guide column, counted in shared
-// memory and added to the guide's histogram.
 template <typename Columns>
 __global__ void value_histogram_columns_kernel(Columns columns, long long chunk,
                                                int cap,
@@ -119,9 +111,6 @@ __global__ void value_histogram_columns_kernel(Columns columns, long long chunk,
     }
 }
 
-// CSR: one warp per row. Without FILL, counts the entries at or above their
-// guide's threshold; with FILL, writes their column indices in order from
-// offsets[row]. A NaN threshold assigns nothing.
 template <typename T, typename IdxT, bool FILL>
 __global__ void assigned_csr_kernel(const IdxT* __restrict__ indptr,
                                     const IdxT* __restrict__ indices,
@@ -153,10 +142,7 @@ __global__ void assigned_csr_kernel(const IdxT* __restrict__ indptr,
     }
 }
 
-// CSC: one block per chunk of a guide column, so few long columns still fill
-// the GPU. Without FILL, counts the entries at or above the threshold into
-// offsets[guide * n_chunks + chunk]; with FILL, writes their row indices in
-// order from there.
+// Counts go to offsets[guide * n_chunks + chunk].
 template <typename T, typename IdxT, bool FILL>
 __global__ void assigned_csc_kernel(CscColumns<T, IdxT> columns,
                                     const double* __restrict__ thresholds,
@@ -201,9 +187,7 @@ __global__ void assigned_csc_kernel(CscColumns<T, IdxT> columns,
     }
 }
 
-// Order-preserving key of a value: larger values have larger keys, -0.0 and
-// 0.0 are equal and every NaN is largest, as for np.argmax. Key 0 is below
-// every value.
+// NaN is largest, as for np.argmax; key 0 is below every value.
 __device__ inline unsigned long long order_key(double v) {
     if (isnan(v)) {
         return ~0ull;
@@ -212,8 +196,6 @@ __device__ inline unsigned long long order_key(double v) {
     return (bits >> 63) ? ~bits : (bits | 0x8000000000000000ull);
 }
 
-// CSR: one warp per row; the key of the largest stored value and its first
-// guide. guides[row] is -1 for rows without stored values.
 template <typename T, typename IdxT>
 __global__ void max_guide_csr_kernel(const IdxT* __restrict__ indptr,
                                      const IdxT* __restrict__ indices,
@@ -252,7 +234,6 @@ __global__ void max_guide_csr_kernel(const IdxT* __restrict__ indptr,
     }
 }
 
-// CSC, first pass: the largest key of every row's stored values.
 template <typename T, typename IdxT>
 __global__ void max_key_csc_kernel(CscColumns<T, IdxT> columns, long long chunk,
                                    unsigned long long* __restrict__ keys) {
@@ -263,8 +244,7 @@ __global__ void max_key_csc_kernel(CscColumns<T, IdxT> columns, long long chunk,
     }
 }
 
-// CSC, second pass: the first guide holding each row's largest value. guides
-// start at -1, which as unsigned no guide undercuts.
+// guides start at -1, which as unsigned is above every guide.
 template <typename T, typename IdxT>
 __global__ void max_guide_csc_kernel(
     CscColumns<T, IdxT> columns, long long chunk,

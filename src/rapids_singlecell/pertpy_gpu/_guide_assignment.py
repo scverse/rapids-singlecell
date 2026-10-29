@@ -17,12 +17,9 @@ from rapids_singlecell._cuda import _guide_assignment_cuda as _ga
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
 
 _HISTOGRAM_CAP = 1024
-# Histogram bins over all guides, so wide guide libraries get fewer bins each.
 _HISTOGRAM_BINS = 1 << 24
 _COLUMN_CHUNK = 4096
-# Blocks per CSC or dense column launch, so wide guide libraries get fewer chunks each.
 _COLUMN_BLOCKS = 1 << 20
-# Size of fixed-width label strings above which labels are joined as objects.
 _LABEL_BYTES = 1 << 28
 _LEARNING_RATE_DEPRECATION = Deprecation(
     "0.19.0",
@@ -194,7 +191,6 @@ def _assigned(X: cp.ndarray | cp_csr | cp_csc, thresholds: cp.ndarray) -> cp.nda
         n_slots = X.shape[1] * n_chunks
     else:
         assigned, n_chunks, n_slots = _ga.assigned_csr, 1, X.shape[0]
-    # Count the assigned entries of every row or column chunk, then write them.
     args = (X.indptr, X.indices, X.data, thresholds.astype(cp.float64))
     stream = cp.cuda.get_current_stream().ptr
     offsets = cp.zeros(n_slots + 1, dtype=X.indptr.dtype)
@@ -283,7 +279,6 @@ def _per_cell_assignments(
     multi = (n_assigned > 1) & (n_assigned <= max_assignments_per_cell)
     with_separator = np.char.add(multiple_grna_assignment_string, guide_names)
     offset = 2 + n_guides
-    # Cells are grouped by their number of guides, so one cell with many guides does not widen the others.
     for size in cp.asnumpy(cp.unique(n_assigned[multi])).tolist():
         cells = cp.flatnonzero(multi & (n_assigned == size))
         members = indices[indptr[cells][:, None] + cp.arange(size)]
