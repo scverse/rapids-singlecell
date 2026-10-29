@@ -198,7 +198,7 @@ def test_mixture_model_rejects_negative_values_next_to_nan(tiny_adata: AnnData, 
 
 
 def _layouts(X: np.ndarray) -> dict:
-    """The same counts as dense C/F, CSR, CSC, COO, int64 or mixed indices, float64 and unsorted CSR."""
+    """The same counts as dense C/F, CSR, CSC, int64 or mixed indices, float64 and unsorted CSR."""
     csr = gpu_csr(cp.asarray(X))
     wide = csr.copy()
     wide.indptr, wide.indices = (
@@ -220,7 +220,6 @@ def _layouts(X: np.ndarray) -> dict:
         "dense F": cp.asfortranarray(cp.asarray(X)),
         "csr": csr,
         "csc": gpu_csc(cp.asarray(X)),
-        "coo": csr.tocoo(),
         "int64 indices": wide,
         "int64 float64 csc": wide_csc,
         "mixed index dtypes": mixed,
@@ -240,8 +239,7 @@ def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pyt
     for name, layout in _layouts(X).items():
         a = AnnData(X=layout, obs=adata.obs.copy(), var=adata.var.copy())
         ga.assign_mixture_model(a)
-        if name != "coo":
-            assert type(a.layers["assigned_guides"]) is type(layout)
+        assert type(a.layers["assigned_guides"]) is type(layout)
         ga.assign_to_max_guide(a, assignment_threshold=3, obs_key="max_guide")
         ga.assign_by_threshold(a, assignment_threshold=3, output_layer="threshold")
         np.testing.assert_array_equal(a.var["threshold"], reference.var["threshold"], err_msg=name)
@@ -255,6 +253,8 @@ def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pyt
         best = np.where(X.max(axis=1) >= 3, X.argmax(axis=1), -1)
         expected = np.append(adata.var_names, "Negative")[best]
         np.testing.assert_array_equal(a.obs["max_guide"], expected, err_msg=name)
+    # anndata >= 0.14 refuses COO as X, so the kernels' COO fallback is checked on the helper alone.
+    assert type(_guide_assignment._layout(gpu_csr(cp.asarray(X)).tocoo())) is gpu_csr
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
