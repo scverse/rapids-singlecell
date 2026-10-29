@@ -1,15 +1,17 @@
 #pragma once
 
 // Fused Harmony correction apply: for every cell i of a segment of group g,
-//   z_d = X_id - sum_k R_ik W[g * w_group_stride + k * w_k_stride + d]
-// (one fma chain over k = 0, 1, ..., K - 1 from 0), then optionally
+//   z_d = X_id - sum_k R_ik W[g][k][d]
+// (W[g]: the segment's row of the table, or the sum of its rows of several
+// tables; one fma chain over k = 0, 1, ..., K - 1 from 0), then optionally
 // z *= inv_norm_scale(sum_d z_d^2) (lane l: fma chain over z_l^2,
 // z_{l+32}^2, ...; warp_sum; the same order for D <= 256 in
 // registers and D > 256 in a second pass). Each element depends only on its row
 // and W[g]: results do not depend on how rows are split into segments, shards
 // or CTAs, nor on the launch configuration. CTAs take runs of row tiles of one
 // segment; R tiles are staged in shared memory by cp.async, W[g] stays there
-// (in k chunks when it does not fit; partial sums then wait in Z). Callers
+// (summed as it is staged; in k chunks when it does not fit, partial sums then
+// wait in Z). Callers
 // chunk clusters the same way: a call without `finish` leaves the sums in Z,
 // and one with `resume` continues them (the same bits for the same W).
 
@@ -26,6 +28,19 @@
 #include "../storage.cuh"
 
 namespace harmony_apply {
+
+constexpr int kMaxTables = 8;
+
+// The coefficients W[g] of a segment s: the sum over its tables t < n of
+// w[t][seg_group[t][s]] (K x D each, common strides), added in that order as
+// they are staged.
+template <typename T>
+struct Tables {
+    const T* w[kMaxTables];
+    const int* seg_group[kMaxTables];
+    int n;
+};
+
 namespace detail {
 
 constexpr int NT = 256;  // 8 warps; warp w owns rows w * RM .. w * RM + RM - 1
@@ -67,12 +82,10 @@ __device__ __forceinline__ void stage(int v, unsigned char* dst, int dn,
 template <typename T, typename RT, int SLOTS>
 __global__ void __launch_bounds__(NT)
     apply_rows_kernel(const T* __restrict__ X, const RT* __restrict__ R,
-                      int ldr, const T* __restrict__ W, long long wks,
-                      long long wgs, int D, int K,
-                      const int* __restrict__ seg_start,
-                      const int* __restrict__ seg_group, bool normalize,
-                      bool resume, bool finish, T* __restrict__ Z, int kc,
-                      int v) {
+                      int ldr, Tables<T> tb, long long wks, long long wgs,
+                      int D, int K, const int* __restrict__ seg_start,
+                      bool normalize, bool resume, bool finish,
+                      T* __restrict__ Z, int kc, int v) {
     constexpr int RM = SLOTS < 8 ? 4 : 2, TM = 8 * RM, DW = 32 * SLOTS;
     constexpr bool CONV = !std::is_same_v<T, RT>;
     static_assert(!CONV || std::is_same_v<T, float> &&
@@ -85,7 +98,9 @@ __global__ void __launch_bounds__(NT)
     if (t0 == t1) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int K4 = (K + 3) & ~3, WS = min(D, DW);
-    const T* wg = W + seg_group[seg] * wgs;
+    const T* wg[kMaxTables];  // the segment's rows of every table
+    for (int t = 0; t < tb.n; ++t)
+        wg[t] = tb.w[t] + (size_t)tb.seg_group[t][seg] * wgs;
     // shared: 2 stages of R tiles (TM x kc as RT) | CONV: the tile as T | W
     // chunk, element (k, j) at ((k / 4) * WS + j) * 4 + k % 4, + slack read by
     // lanes past WS (results unused)
@@ -102,11 +117,16 @@ __global__ void __launch_bounds__(NT)
             for (int i = threadIdx.x; i < kn * wn; i += NT) {
                 int k = i / wn, d = i - k * wn;
                 T* p = ws + ((k >> 2) * WS + d) * 4 + (k & 3);
-                if (k0 + k < K)
-                    __pipeline_memcpy_async(p, wg + (k0 + k) * wks + d0 + d,
-                                            sizeof(T));
-                else  // R pad +0: fma(+0, -0, acc) == acc, also for acc = -0
+                const long long e = (k0 + k) * wks + d0 + d;
+                if (k0 + k >= K)  // R pad +0: fma(+0, -0, acc) == acc, -0 too
                     *p = T(-0.0);
+                else if (tb.n == 1)
+                    __pipeline_memcpy_async(p, wg[0] + e, sizeof(T));
+                else {
+                    T sum = wg[0][e];
+                    for (int t = 1; t < tb.n; ++t) sum += wg[t][e];
+                    *p = sum;
+                }
             }
             const int dn = kn * sizeof(RT), n = min(kn, K - k0) * sizeof(RT);
             auto load = [&](int t) {
@@ -211,9 +231,9 @@ auto kernel_for(int slots) {
 // of at most kc clusters (rounded up to 4) and at most `budget` bytes of
 // shared memory; results depend on none of them.
 template <typename T, typename RT>
-cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
-                   long long wgs, int D, int K, const int* seg_start,
-                   const int* seg_group, int n_seg, bool normalize, bool resume,
+cudaError_t launch(const T* X, const RT* R, int ldr, const Tables<T>& tb,
+                   long long wks, long long wgs, int D, int K,
+                   const int* seg_start, int n_seg, bool normalize, bool resume,
                    bool finish, T* Z, int slots, int kc, size_t budget,
                    cudaStream_t s) {
     // shared T per cluster: 2 R stages (or 2 bfloat16 + widened), W column
@@ -234,9 +254,11 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
         reinterpret_cast<size_t>(R) | 16 | ((size_t)ldr | kc | K) * sizeof(RT);
     // at most 2^31 - 1 CTAs per launch
     for (int s0 = 0, step = INT_MAX / CPS; s0 < n_seg; s0 += step) {
+        Tables<T> part = tb;
+        for (int t = 0; t < tb.n; ++t) part.seg_group[t] += s0;
         kernel<<<std::min(n_seg - s0, step) * CPS, NT, smem, s>>>(
-            X, R, ldr, W, wks, wgs, D, K, seg_start + s0, seg_group + s0,
-            normalize, resume, finish, Z, kc, (int)(a & (~a + 1)));
+            X, R, ldr, part, wks, wgs, D, K, seg_start + s0, normalize, resume,
+            finish, Z, kc, (int)(a & (~a + 1)));
         if (cudaError_t e = cudaGetLastError()) return e;
     }
     return cudaSuccess;
@@ -244,19 +266,21 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
 
 }  // namespace detail
 
-// Z (rows x D) for segments [seg_start[s], seg_start[s + 1]) (local rows) of
-// groups seg_group[s]; see the top of this file. R(i, k) = R[i * ldr + k]
-// (T, or bfloat16 with T = float; ldr >= K); W[g] is K x D with element
-// strides w_k_stride and w_group_stride. Z must not alias X, R or W. resume:
-// Z holds the sums of earlier clusters; finish: Z = X - sums (normalized on
-// request), else Z = sums and X is not read.
+// Z (rows x D) for segments [seg_start[s], seg_start[s + 1]) (local rows) with
+// the coefficients W (Tables): the sum of its tables' rows for the segment, K x
+// D each with element strides w_k_stride and w_group_stride; see the top of
+// this file. R(i, k) = R[i * ldr + k] (T, or bfloat16 with T = float; ldr >=
+// K). Z must not alias X, R or W. resume: Z holds the sums of earlier
+// clusters; finish: Z = X - sums (normalized on request), else Z = sums and X
+// is not read.
 template <typename T, typename RT>
-cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
+cudaError_t apply_rows(const T* X, const RT* R, int ldr, const Tables<T>& W,
                        long long w_k_stride, long long w_group_stride, int D,
-                       int K, const int* seg_start, const int* seg_group,
-                       int n_seg, bool normalize, T* Z, cudaStream_t s,
-                       bool resume = false, bool finish = true) {
-    if (D <= 0 || K <= 0 || ldr < K) return cudaErrorInvalidValue;
+                       int K, const int* seg_start, int n_seg, bool normalize,
+                       T* Z, cudaStream_t s, bool resume = false,
+                       bool finish = true) {
+    if (D <= 0 || K <= 0 || ldr < K || W.n < 1 || W.n > kMaxTables)
+        return cudaErrorInvalidValue;
     if (reinterpret_cast<size_t>(R) % sizeof(RT))
         return cudaErrorMisalignedAddress;
     int smem_max;
@@ -267,9 +291,20 @@ cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
     // W resident if it fits, else in the largest chunks.
     const int slots = D <= 32 ? 1 : D <= 64 ? 2 : D <= 128 ? 4 : 8;
     return detail::launch(X, R, ldr, W, w_k_stride, w_group_stride, D, K,
-                          seg_start, seg_group, n_seg, normalize, resume,
-                          finish, Z, slots, K,
-                          std::min<size_t>(96 * 1024, smem_max), s);
+                          seg_start, n_seg, normalize, resume, finish, Z, slots,
+                          K, std::min<size_t>(96 * 1024, smem_max), s);
+}
+
+// One table: W[g] = W + g * w_group_stride, the segments' groups seg_group[s].
+template <typename T, typename RT>
+cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
+                       long long w_k_stride, long long w_group_stride, int D,
+                       int K, const int* seg_start, const int* seg_group,
+                       int n_seg, bool normalize, T* Z, cudaStream_t s,
+                       bool resume = false, bool finish = true) {
+    return apply_rows(X, R, ldr, Tables<T>{{W}, {seg_group}, 1}, w_k_stride,
+                      w_group_stride, D, K, seg_start, n_seg, normalize, Z, s,
+                      resume, finish);
 }
 
 }  // namespace harmony_apply
