@@ -7,9 +7,9 @@ import pytest
 from anndata import AnnData
 from cupyx.scipy.sparse import csc_matrix as gpu_csc
 from cupyx.scipy.sparse import csr_matrix as gpu_csr
+from fast_array_utils.conv import to_dense
 
 import rapids_singlecell as rsc
-from rapids_singlecell.get import X_to_CPU
 from rapids_singlecell.pertpy_gpu import _guide_assignment
 
 
@@ -52,11 +52,6 @@ def tiny_adata() -> AnnData:
     return _adata(np.array([[6, 0, 2], [1, 5, 0], [0, 1, 7]], dtype=np.float32))
 
 
-def _dense(X) -> np.ndarray:
-    X = X_to_CPU(X)
-    return X.toarray() if hasattr(X, "toarray") else np.asarray(X)
-
-
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
 def test_assign_by_threshold(tiny_adata: AnnData, storage: str) -> None:
     if storage != "dense":
@@ -69,7 +64,9 @@ def test_assign_by_threshold(tiny_adata: AnnData, storage: str) -> None:
         assert result.dtype == cp.int8
     else:
         assert result.nnz == 3
-    np.testing.assert_array_equal(_dense(result), (_dense(tiny_adata.X) >= 5).astype(np.int8))
+    np.testing.assert_array_equal(
+        to_dense(result, to_cpu_memory=True), (to_dense(tiny_adata.X, to_cpu_memory=True) >= 5).astype(np.int8)
+    )
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
@@ -87,14 +84,14 @@ def test_mixture_model_recovers_known_positives(
     rsc.ptg.GuideAssignment().assign_mixture_model(adata)
 
     thresholds = np.nan_to_num(adata.var["threshold"].to_numpy(), nan=np.inf)
-    pred = _dense(adata.X) >= thresholds[None, :]
+    pred = to_dense(adata.X, to_cpu_memory=True) >= thresholds[None, :]
     assert (pred == truth).mean() > 0.98
     assert (pred & truth).sum() / truth.sum() > 0.9
     assert (pred & ~truth).sum() <= 0.005 * truth.size
 
     layer = adata.layers["assigned_guides"]
     assert type(layer) is type(adata.X)
-    np.testing.assert_array_equal(_dense(layer), pred.astype(np.int8))
+    np.testing.assert_array_equal(to_dense(layer, to_cpu_memory=True), pred.astype(np.int8))
     for col in (
         "poisson_rate",
         "gaussian_mean",
@@ -125,7 +122,7 @@ def test_mixture_model_multiple_guides(guide_adata: tuple[AnnData, np.ndarray]) 
     rsc.ptg.GuideAssignment().assign_mixture_model(
         adata, max_assignments_per_cell=1, multiple_grna_assigned_key="too_many"
     )
-    n_assigned = _dense(adata.layers["assigned_guides"]).sum(axis=1)
+    n_assigned = to_dense(adata.layers["assigned_guides"], to_cpu_memory=True).sum(axis=1)
     assigned = adata.obs["assigned_guide"].astype(str).to_numpy()
     assert (n_assigned > 1).any()
     assert (assigned[n_assigned == 0] == "negative").all()
@@ -250,11 +247,11 @@ def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pyt
         np.testing.assert_array_equal(a.var["threshold"], reference.var["threshold"], err_msg=name)
         np.testing.assert_array_equal(a.obs["assigned_guide"], reference.obs["assigned_guide"], err_msg=name)
         np.testing.assert_array_equal(
-            _dense(a.layers["assigned_guides"]),
-            _dense(reference.layers["assigned_guides"]),
+            to_dense(a.layers["assigned_guides"], to_cpu_memory=True),
+            to_dense(reference.layers["assigned_guides"], to_cpu_memory=True),
             err_msg=name,
         )
-        np.testing.assert_array_equal(_dense(a.layers["threshold"]), X >= 3, err_msg=name)
+        np.testing.assert_array_equal(to_dense(a.layers["threshold"], to_cpu_memory=True), X >= 3, err_msg=name)
         best = np.where(X.max(axis=1) >= 3, X.argmax(axis=1), -1)
         expected = np.append(adata.var_names, "Negative")[best]
         np.testing.assert_array_equal(a.obs["max_guide"], expected, err_msg=name)
@@ -291,7 +288,7 @@ def test_thresholds_compare_in_data_precision(storage: str) -> None:
         adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
     rsc.ptg.GuideAssignment().assign_by_threshold(adata, assignment_threshold=0.7)
     rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=0.7)
-    np.testing.assert_array_equal(_dense(adata.layers["assigned_guides"]), [[1, 0]])
+    np.testing.assert_array_equal(to_dense(adata.layers["assigned_guides"], to_cpu_memory=True), [[1, 0]])
     assert list(adata.obs["assigned_guide"]) == ["guide_0"]
 
 
@@ -345,7 +342,7 @@ def test_mixture_model_labels_match_pertpy(
         adata.var_names = names
     rsc.ptg.GuideAssignment().assign_mixture_model(adata, **kwargs)
     expected = _pertpy_labels(
-        _dense(adata.layers["assigned_guides"]) > 0,
+        to_dense(adata.layers["assigned_guides"], to_cpu_memory=True) > 0,
         np.asarray(adata.var_names, dtype=object),
         **kwargs,
     )
