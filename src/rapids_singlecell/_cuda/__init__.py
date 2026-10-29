@@ -27,13 +27,8 @@ __all__ = [
     "_gmm_cuda",
     "_guide_assignment_cuda",
     "_harmony_clustering_cuda",
-    "_harmony_colsum_cuda",
     "_harmony_correction_batched_cuda",
     "_harmony_correction_cuda",
-    "_harmony_normalize_cuda",
-    "_harmony_outer_cuda",
-    "_harmony_pen_cuda",
-    "_harmony_scatter_cuda",
     "_hvg_cuda",
     "_jaccard_cuda",
     "_kde_cuda",
@@ -77,9 +72,7 @@ _preload_rapids_runtime_libs()
 # Modules whose CUDA kernels use device scratch. They allocate through a
 # CuPy-backed allocator injected here, so temporaries land on the caller's
 # current device resource (RMM pool / UVM aware) without linking librmm.
-_SCRATCH_MODULES = frozenset(
-    {"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"}
-)
+_SCRATCH_MODULES = frozenset({"_wilcoxon_cuda", "_wilcoxon_sparse_cuda", "_rank_stream_cuda"})
 _scratch_allocator = None
 
 
@@ -96,10 +89,9 @@ def _get_scratch_allocator():
             live[int(mem.ptr)] = mem
             return int(mem.ptr)
 
-        def _free(ptr: int) -> None:
-            live.pop(int(ptr), None)
-
-        _scratch_allocator = (_alloc, _free)
+        # A builtin: frees (in C++ destructors) run no bytecode, so a pending
+        # signal (Ctrl-C) is raised after the CUDA call, not inside it.
+        _scratch_allocator = (_alloc, live.pop)
     return _scratch_allocator
 
 

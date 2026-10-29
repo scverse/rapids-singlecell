@@ -81,9 +81,7 @@ class _RankGenes:
         self.labels = pd.Series(adata.obs[groupby]).reset_index(drop=True)
         all_categories = self.labels.cat.categories
 
-        if reference != "rest" and str(reference) not in {
-            str(c) for c in all_categories
-        }:
+        if reference != "rest" and str(reference) not in {str(c) for c in all_categories}:
             cats = all_categories.tolist()
             msg = f"reference = {reference} needs to be one of groupby = {cats}."
             raise ValueError(msg)
@@ -95,9 +93,7 @@ class _RankGenes:
             skip_empty_groups=skip_empty_groups,
         )
         # Scanpy groups omitted categories and missing labels into one remainder.
-        self._aggregation_groupby = pd.Categorical(
-            self.group_codes, categories=range(len(self.groups_order) + 1)
-        )
+        self._aggregation_groupby = pd.Categorical(self.group_codes, categories=range(len(self.groups_order) + 1))
 
         if layer is not None:
             if use_raw is True:
@@ -174,11 +170,9 @@ class _RankGenes:
 
     def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
         """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
-        from ._stream_multi_gpu import (
-            aggr_host_planes,
-            resolve_stream_devices,
-            stream_planes_multi,
-        )
+        from rapids_singlecell._utils._multi_gpu import resolve_stream_devices
+
+        from ._stream_multi_gpu import aggr_host_planes, stream_planes_multi
 
         codes = self.group_codes
         device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
@@ -228,9 +222,7 @@ class _RankGenes:
 
             if self.comp_pts:
                 nnz_total = nnz_all.sum(axis=0)
-                self.pts_rest = cp.asnumpy(
-                    (nnz_total - nnz_all[:n_groups]).astype(cp.float64) / n_rest
-                )
+                self.pts_rest = cp.asnumpy((nnz_total - nnz_all[:n_groups]).astype(cp.float64) / n_rest)
             else:
                 self.pts_rest = None
         else:
@@ -242,9 +234,7 @@ class _RankGenes:
         self.vars = cp.asnumpy(vars_)
         self.pts = cp.asnumpy(pts) if pts is not None else None
 
-    def t_test(
-        self, method: Literal["t-test", "t-test_overestim_var"]
-    ) -> list[tuple[int, NDArray, NDArray]]:
+    def t_test(self, method: Literal["t-test", "t-test_overestim_var"]) -> list[tuple[int, NDArray, NDArray]]:
         """Compute t-test statistics using Welch's t-test."""
         from ._ttest import t_test
 
@@ -430,9 +420,7 @@ class _RankGenes:
         n_tests = sorted_p.shape[1]
         scale = n_tests / np.arange(1, n_tests + 1, dtype=np.float64)
         corrected_sorted = sorted_p * scale
-        corrected_sorted = np.minimum.accumulate(corrected_sorted[:, ::-1], axis=1)[
-            :, ::-1
-        ]
+        corrected_sorted = np.minimum.accumulate(corrected_sorted[:, ::-1], axis=1)[:, ::-1]
         corrected_sorted[corrected_sorted > 1.0] = 1.0
         corrected = np.empty_like(corrected_sorted)
         np.put_along_axis(corrected, order, corrected_sorted, axis=1)
@@ -443,21 +431,15 @@ class _RankGenes:
         pvals_clean = cp.nan_to_num(pvals, nan=1.0)
         order = cp.argsort(pvals_clean, axis=1)
         corrected_sorted = cp.take_along_axis(pvals_clean, order, axis=1)
-        corrected_sorted *= corrected_sorted.shape[1] / cp.arange(
-            1, corrected_sorted.shape[1] + 1, dtype=cp.float64
-        )
+        corrected_sorted *= corrected_sorted.shape[1] / cp.arange(1, corrected_sorted.shape[1] + 1, dtype=cp.float64)
         from rapids_singlecell._cuda import _rank_stats_cuda as _rs
 
-        _rs.fdr_bh_reverse_cummin(
-            corrected_sorted, stream=cp.cuda.get_current_stream().ptr
-        )
+        _rs.fdr_bh_reverse_cummin(corrected_sorted, stream=cp.cuda.get_current_stream().ptr)
         corrected = cp.empty_like(corrected_sorted)
         cp.put_along_axis(corrected, order, corrected_sorted, axis=1)
         return corrected
 
-    def _logfoldchanges_into(
-        self, arrays: dict, group_indices: np.ndarray, top_idx: np.ndarray
-    ) -> None:
+    def _logfoldchanges_into(self, arrays: dict, group_indices: np.ndarray, top_idx: np.ndarray) -> None:
         mean_group = self.means[group_indices]
         if self.ireference is None:
             mean_rest = self.means_rest[group_indices]
@@ -469,9 +451,7 @@ class _RankGenes:
             else (mean_group + EPS) / (mean_rest + EPS)
         )
         logfoldchanges = np.log2(foldchanges)
-        arrays["logfoldchanges"] = np.take_along_axis(
-            logfoldchanges, top_idx, axis=1
-        ).astype(np.float32, copy=False)
+        arrays["logfoldchanges"] = np.take_along_axis(logfoldchanges, top_idx, axis=1).astype(np.float32, copy=False)
 
     def _compute_statistics_arrays(
         self,
@@ -489,14 +469,10 @@ class _RankGenes:
 
         arrays: dict[str, object] = {
             "group_indices": group_indices,
-            "group_names": np.asarray(
-                [str(self.groups_order[i]) for i in group_indices], dtype=object
-            ),
+            "group_names": np.asarray([str(self.groups_order[i]) for i in group_indices], dtype=object),
             "var_names": np.asarray(self.var_names),
             "gene_indices": top_idx.astype(np.intp, copy=False),
-            "scores": np.take_along_axis(scores, top_idx, axis=1).astype(
-                self._score_dtype, copy=False
-            ),
+            "scores": np.take_along_axis(scores, top_idx, axis=1).astype(self._score_dtype, copy=False),
         }
 
         if test_results[0][2] is not None:
@@ -536,20 +512,14 @@ class _RankGenes:
 
         arrays: dict[str, object] = {
             "group_indices": group_indices,
-            "group_names": np.asarray(
-                [str(self.groups_order[i]) for i in group_indices], dtype=object
-            ),
+            "group_names": np.asarray([str(self.groups_order[i]) for i in group_indices], dtype=object),
             "var_names": np.asarray(self.var_names),
             "gene_indices": top_idx.astype(np.intp, copy=False),
             "scores": cp.asnumpy(
-                cp.take_along_axis(scores_gpu, top_idx_gpu, axis=1).astype(
-                    self._score_dtype, copy=False
-                ),
+                cp.take_along_axis(scores_gpu, top_idx_gpu, axis=1).astype(self._score_dtype, copy=False),
                 order="F",
             ),
-            "pvals": cp.asnumpy(
-                cp.take_along_axis(pvals_gpu, top_idx_gpu, axis=1), order="F"
-            ),
+            "pvals": cp.asnumpy(cp.take_along_axis(pvals_gpu, top_idx_gpu, axis=1), order="F"),
         }
 
         if corr_method == "benjamini-hochberg":
@@ -559,15 +529,11 @@ class _RankGenes:
         else:
             msg = f"Unsupported correction method: {corr_method!r}."
             raise ValueError(msg)
-        arrays["pvals_adj"] = cp.asnumpy(
-            cp.take_along_axis(pvals_adj_gpu, top_idx_gpu, axis=1), order="F"
-        )
+        arrays["pvals_adj"] = cp.asnumpy(cp.take_along_axis(pvals_adj_gpu, top_idx_gpu, axis=1), order="F")
 
         if logfoldchanges_gpu is not None:
             arrays["logfoldchanges"] = cp.asnumpy(
-                cp.take_along_axis(logfoldchanges_gpu, top_idx_gpu, axis=1).astype(
-                    cp.float32, copy=False
-                ),
+                cp.take_along_axis(logfoldchanges_gpu, top_idx_gpu, axis=1).astype(cp.float32, copy=False),
                 order="F",
             )
         elif self.means is not None:

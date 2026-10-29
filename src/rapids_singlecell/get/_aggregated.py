@@ -58,8 +58,7 @@ def _planes_for_funcs(funcs):
 
 
 class Aggregate:
-    """\
-    Functionality for generic grouping and aggregating.
+    """Functionality for generic grouping and aggregating.
 
     There is currently support for count_nonzero, sum, mean, and variance.
 
@@ -148,8 +147,10 @@ class Aggregate:
             return self.count_mean_var_dense(funcs, dof=dof)
 
     def count_mean_var_host(self, funcs=None, *, dof: int = 1):
-        """Aggregate in-memory host input (numpy / scipy sparse) by streaming
-        row/column blocks to the GPU without materializing the full matrix."""
+        """Aggregate in-memory host input (numpy / scipy sparse) on the GPU.
+
+        Streams row/column blocks to the GPU without materializing the full matrix.
+        """
         from rapids_singlecell._cuda import _rank_stream_cuda as _rss
 
         assert dof >= 0
@@ -159,9 +160,7 @@ class Aggregate:
 
         sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
         counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
-        sq_sums = (
-            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
-        )
+        sq_sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
         kw = {}
         if sums is not None:
             kw["out_sum"] = sums
@@ -195,13 +194,11 @@ class Aggregate:
             if not (X.flags.c_contiguous or X.flags.f_contiguous):
                 X = np.ascontiguousarray(X)
             _rss.aggr_dense_host(X, self.groupby, **kw)
-        return self._build_result(
-            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
-        )
+        return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
     def count_mean_var_dask(self, funcs=None, *, dof: int = 1, split_every: int = 2):
-        """
-        This function is used to calculate the sum, mean, and variance of the data matrix.
+        """Calculate the sum, mean, and variance of the data matrix.
+
         It automatically detects sparse vs dense matrices and uses the appropriate
         CUDA kernel for aggregation. Only the accumulator planes the requested
         ``funcs`` need are allocated and reduced across blocks.
@@ -229,9 +226,7 @@ class Aggregate:
         n_groups = self.n_cells.shape[0]
 
         def __aggregate_dask(X_part, mask_part, groupby_part):
-            out = cp.zeros(
-                (1, n_planes, n_groups, self.data.shape[1]), dtype=cp.float64
-            )
+            out = cp.zeros((1, n_planes, n_groups, self.data.shape[1]), dtype=cp.float64)
             gb = groupby_part.ravel()
             mk = mask_part.ravel()
             out_sum = out[0, i_sum] if need_sum else None
@@ -270,9 +265,7 @@ class Aggregate:
 
         # Prepare Dask arrays
         mask = self._get_mask()
-        mask_dask = da.from_array(
-            mask, chunks=(self.data.chunks[0]), meta=_meta_dense(mask.dtype)
-        )
+        mask_dask = da.from_array(mask, chunks=(self.data.chunks[0]), meta=_meta_dense(mask.dtype))
         groupby_dask = da.from_array(
             self.groupby,
             chunks=(self.data.chunks[0]),
@@ -301,17 +294,14 @@ class Aggregate:
         sums = out[i_sum] if need_sum else None
         counts = out[i_count] if need_count else None
         sq_sums = out[i_sqsum] if need_sqsum else None
-        return self._build_result(
-            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
-        )
+        return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
     def count_mean_var_sparse(self, funcs=None, *, dof: int = 1):
-        """
-        This function is used to calculate the sum, mean, and variance of the sparse data matrix.
+        """Calculate the sum, mean, and variance of the sparse data matrix.
+
         It uses a custom cuda-kernel to perform the aggregation. Only the
         accumulator planes the requested ``funcs`` need are allocated.
         """
-
         assert dof >= 0
         funcs = _ALL_FUNCS if funcs is None else set(funcs)
         need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
@@ -319,9 +309,7 @@ class Aggregate:
 
         sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
         counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
-        sq_sums = (
-            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
-        )
+        sq_sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
         mask = self._get_mask()
 
         _aggr_cuda.sparse_aggr(
@@ -338,16 +326,13 @@ class Aggregate:
             is_csc=self.data.format == "csc",
             stream=cp.cuda.get_current_stream().ptr,
         )
-        return self._build_result(
-            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
-        )
+        return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
     def count_mean_var_sparse_sparse(self, funcs, dof: int = 1):
-        """
-        This function is used to calculate the sum, mean, and variance of the sparse data matrix.
+        """Calculate the sum, mean, and variance of the sparse data matrix.
+
         It uses a custom cuda-kernel to perform the aggregation.
         """
-
         assert dof >= 0
         undefined_mean = "mean" in funcs and bool(cp.any(self.n_cells == 0))
         undefined_var = "var" in funcs and bool(cp.any(self.n_cells <= dof))
@@ -471,12 +456,11 @@ class Aggregate:
         return results
 
     def count_mean_var_dense(self, funcs=None, *, dof: int = 1):
-        """
-        This function is used to calculate the sum, mean, and variance of the dense data matrix.
+        """Calculate the sum, mean, and variance of the dense data matrix.
+
         It uses a custom cuda-kernel to perform the aggregation. Only the
         accumulator planes the requested ``funcs`` need are allocated.
         """
-
         assert dof >= 0
         funcs = _ALL_FUNCS if funcs is None else set(funcs)
         need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
@@ -484,9 +468,7 @@ class Aggregate:
 
         sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
         counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
-        sq_sums = (
-            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
-        )
+        sq_sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
         mask = self._get_mask()
 
         _aggr_cuda.dense_aggr(
@@ -501,9 +483,7 @@ class Aggregate:
             is_fortran=self.data.flags.f_contiguous,
             stream=cp.cuda.get_current_stream().ptr,
         )
-        return self._build_result(
-            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
-        )
+        return self._build_result(funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof)
 
 
 def _normalize_by(
@@ -521,10 +501,7 @@ def _normalize_by(
 
     if isinstance(resolved[0], AdRef):
         if axis is not None:
-            raise TypeError(
-                "`axis` cannot be used when `by` is given as AdRef(s); "
-                "the axis is inferred from `by`."
-            )
+            raise TypeError("`axis` cannot be used when `by` is given as AdRef(s); the axis is inferred from `by`.")
         return resolved, _refs_dim(resolved)
 
     if axis is not None:
@@ -536,9 +513,7 @@ def _normalize_by(
     return resolved, dim
 
 
-def _group_counts_host(
-    categorical: pd.Categorical, mask: NDArray[np.bool_] | None
-) -> NDArray[np.int64]:
+def _group_counts_host(categorical: pd.Categorical, mask: NDArray[np.bool_] | None) -> NDArray[np.int64]:
     """Count selected observations in every categorical group."""
     codes = np.asarray(categorical.codes)
     selected = codes >= 0
@@ -549,11 +524,7 @@ def _group_counts_host(
 
 def aggregate(
     adata: AnnData,
-    by: (
-        str
-        | Collection[str | AdRef[Idx2D | int, AnnData]]
-        | AdRef[Idx2D | int, AnnData]
-    ),
+    by: (str | Collection[str | AdRef[Idx2D | int, AnnData]] | AdRef[Idx2D | int, AnnData]),
     func: AggType | Iterable[AggType],
     *,
     acc: LayerAcc | MultiAcc | GraphAcc | str | None = None,
@@ -566,8 +537,7 @@ def aggregate(
     return_sparse: bool = False,
     **kwargs,
 ) -> AnnData:
-    """\
-    Aggregate data matrix based on some categorical grouping.
+    """Aggregate data matrix based on some categorical grouping.
 
     This function is useful for pseudobulking as well as plotting.
 
@@ -617,7 +587,6 @@ def aggregate(
 
     Examples
     --------
-
     Calculating mean expression and number of nonzero entries per cluster:
 
     >>> import scanpy as sc, pandas as pd
@@ -644,9 +613,7 @@ def aggregate(
 
     Note that this filters out any combination of groups that wasn't present in the original data.
     """
-    if settings.preset is Preset.ScanpyV2Preview and any(
-        value is not None for value in (axis, layer, obsm, varm)
-    ):
+    if settings.preset is Preset.ScanpyV2Preview and any(value is not None for value in (axis, layer, obsm, varm)):
         msg = "`acc` will replace `layer`, `obsm`, and `varm` arguments in Scanpy 2."
         if axis is not None:
             msg += " `axis` is no longer necessary because it is inferred from `by`."
@@ -682,13 +649,7 @@ def aggregate(
     values = _get_vec(adata, by_refs, dim=axis_name)
     dim_df = pd.DataFrame(
         {
-            (
-                ref
-                if isinstance(ref, str)
-                else ref.idx
-                if isinstance(ref.idx, str)
-                else str(ref)
-            ): _to_numpy_1d(value)
+            (ref if isinstance(ref, str) else ref.idx if isinstance(ref.idx, str) else str(ref)): _to_numpy_1d(value)
             for ref, value in zip(by_refs, values, strict=True)
         }
     )
@@ -733,11 +694,7 @@ def aggregate(
 
     if obsm is not None or varm is not None or isinstance(acc, MultiAcc):
         var = pd.DataFrame(
-            index=(
-                data_columns
-                if data_columns is not None
-                else pd.RangeIndex(data.shape[1]).astype(str)
-            )
+            index=(data_columns if data_columns is not None else pd.RangeIndex(data.shape[1]).astype(str))
         )
     elif isinstance(acc, GraphAcc):
         var = getattr(adata, axis_name)

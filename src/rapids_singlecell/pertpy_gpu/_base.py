@@ -105,9 +105,7 @@ class PerturbationEfficacyAnalyzer:
         if ref_selection_mode not in ("nn", "split_by"):
             raise ValueError("ref_selection_mode must be either 'nn' or 'split_by'.")
         if ref_selection_mode == "split_by" and split_by is None:
-            raise ValueError(
-                "split_by must be provided if ref_selection_mode is 'split_by'."
-            )
+            raise ValueError("split_by must be provided if ref_selection_mode is 'split_by'.")
 
         if copy:
             adata = adata.copy()
@@ -122,8 +120,7 @@ class PerturbationEfficacyAnalyzer:
                 control_group_np = control_mask & split_mask
                 if not control_group_np.any():
                     warnings.warn(
-                        f"No control cells in split {split!r}; leaving its "
-                        "perturbation signature equal to the input.",
+                        f"No control cells in split {split!r}; leaving its perturbation signature equal to the input.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -136,25 +133,18 @@ class PerturbationEfficacyAnalyzer:
                 split_masks = [np.ones(adata.n_obs, dtype=bool)]
             else:
                 split_obs = adata.obs[split_by]
-                split_masks = [
-                    (split_obs == cat).to_numpy() for cat in split_obs.unique()
-                ]
+                split_masks = [(split_obs == cat).to_numpy() for cat in split_obs.unique()]
 
             from rapids_singlecell.preprocessing._neighbors._neighbors import (
                 KNN_ALGORITHMS,
             )
 
             if knn_algorithm not in KNN_ALGORITHMS:
-                raise ValueError(
-                    f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, "
-                    f"got {knn_algorithm!r}"
-                )
+                raise ValueError(f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, got {knn_algorithm!r}")
             knn = KNN_ALGORITHMS[knn_algorithm]
             algorithm_kwds = dict(knn_kwargs) if knn_kwargs is not None else {}
 
-            representation = _choose_representation_gpu(
-                adata, use_rep=use_rep, n_pcs=n_pcs
-            )
+            representation = _choose_representation_gpu(adata, use_rep=use_rep, n_pcs=n_pcs)
             if n_dims is not None and n_dims < representation.shape[1]:
                 representation = representation[:, :n_dims]
             representation = cp.ascontiguousarray(representation)
@@ -165,8 +155,7 @@ class PerturbationEfficacyAnalyzer:
                 n_control = int(control_mask_split.sum())
                 if n_control == 0:
                     warnings.warn(
-                        "No control cells in a split; leaving its perturbation "
-                        "signature equal to the input.",
+                        "No control cells in a split; leaving its perturbation signature equal to the input.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -195,9 +184,7 @@ class PerturbationEfficacyAnalyzer:
                     shape=(n_split, n_control),
                 )
                 split_dev = cp.asarray(split_mask)
-                X_pert[split_dev] = (
-                    cp.log1p(neigh_matrix @ X_control) - X_pert[split_dev]
-                )
+                X_pert[split_dev] = cp.log1p(neigh_matrix @ X_control) - X_pert[split_dev]
 
         _set_obs_rep(adata, X_pert, layer="X_pert")
 
@@ -283,9 +270,7 @@ def _to_dense_gpu(X) -> cp.ndarray:
     return X
 
 
-def _choose_representation_gpu(
-    adata: AnnData, *, use_rep: str | None, n_pcs: int | None
-) -> cp.ndarray:
+def _choose_representation_gpu(adata: AnnData, *, use_rep: str | None, n_pcs: int | None) -> cp.ndarray:
     """Select a representation and return it as a dense GPU array.
 
     Always returns a float32 representation: neighbor selection does not need

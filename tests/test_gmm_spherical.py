@@ -209,6 +209,4 @@ def test_batched_spherical_degenerate_segments(dtype):
             tol=1e-6,
             reg_covar=1e-6,
         )
-        np.testing.assert_allclose(
-            r1[s:e], ref, atol=2e-3 if dtype == np.float32 else 1e-6
-        )
+        np.testing.assert_allclose(r1[s:e], ref, atol=2e-3 if dtype == np.float32 else 1e-6)

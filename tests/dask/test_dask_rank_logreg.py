@@ -70,6 +70,4 @@ def test_rank_genes_groups_logreg(dist_client, data_kind, dtype):
     rsc.tl.rank_genes_groups_logreg(adata, groupby=groupby, use_raw=False)
     rsc.tl.rank_genes_groups_logreg(dask_data, groupby=groupby, use_raw=False)
 
-    assert _compare_top_genes(
-        adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"]
-    )
+    assert _compare_top_genes(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])

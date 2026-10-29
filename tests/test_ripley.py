@@ -121,9 +121,9 @@ def test_ripley_rng(adata: AnnData, mode: str):
 
     def sims(rng):
         res = rsc.gr.ripley(adata, rng=rng, **kw)
-        return res["sims_stat"].pivot(
-            index="bins", columns="simulations", values="stats"
-        ).to_numpy(), res[f"{mode}_stat"]
+        return res["sims_stat"].pivot(index="bins", columns="simulations", values="stats").to_numpy(), res[
+            f"{mode}_stat"
+        ]
 
     sims1, obs1 = sims(np.random.default_rng(42))
     sims2, obs2 = sims(42)
@@ -143,9 +143,7 @@ def test_ripley_g_matches_reference(clustered: AnnData):
     for cluster in observed.columns:
         tree = NearestNeighbors(n_neighbors=3).fit(coords[labels == cluster])
         distances, _ = tree.kneighbors(coords[labels != cluster])
-        np.testing.assert_allclose(
-            observed[cluster].to_numpy(), _f_g_reference(distances, support)
-        )
+        np.testing.assert_allclose(observed[cluster].to_numpy(), _f_g_reference(distances, support))
 
 
 def test_ripley_l_matches_reference(clustered: AnnData):
@@ -172,11 +170,7 @@ def test_ripley_f_matches_reference(clustered: AnnData):
     tree = _build_kdtree(cp.asarray(coords), cp.asarray(codes))
     for cluster in range(codes.max() + 1):
         distances = _query(cp.asarray(queries), tree, cluster, 2)
-        expected, _ = (
-            NearestNeighbors(n_neighbors=2)
-            .fit(coords[codes == cluster])
-            .kneighbors(queries)
-        )
+        expected, _ = NearestNeighbors(n_neighbors=2).fit(coords[codes == cluster]).kneighbors(queries)
         np.testing.assert_allclose(distances.get(), expected)
 
 

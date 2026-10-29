@@ -88,9 +88,7 @@ def test_filter_cells(array_type, max_genes, max_counts, min_genes, min_counts):
 
 
 # integer counts so n_counts (value sum) differs from n_cells (nonzero count)
-_COUNTS = (np.random.default_rng(0).random((40, 12)) > 0.4) * np.random.default_rng(
-    1
-).integers(1, 5, (40, 12))
+_COUNTS = (np.random.default_rng(0).random((40, 12)) > 0.4) * np.random.default_rng(1).integers(1, 5, (40, 12))
 
 
 @pytest.mark.parametrize(
@@ -109,9 +107,7 @@ def test_filter_genes_single_column(kwargs, expected, unexpected):
     sc.pp.filter_genes(sc_ad, **kwargs)
     assert expected in rsc_ad.var.columns
     assert unexpected not in rsc_ad.var.columns
-    np.testing.assert_allclose(
-        rsc_ad.var[expected].to_numpy(), sc_ad.var[expected].to_numpy()
-    )
+    np.testing.assert_allclose(rsc_ad.var[expected].to_numpy(), sc_ad.var[expected].to_numpy())
 
 
 @pytest.mark.parametrize(
@@ -130,6 +126,4 @@ def test_filter_cells_single_column(kwargs, expected, unexpected):
     sc.pp.filter_cells(sc_ad, **kwargs)
     assert expected in rsc_ad.obs.columns
     assert unexpected not in rsc_ad.obs.columns
-    np.testing.assert_allclose(
-        rsc_ad.obs[expected].to_numpy(), sc_ad.obs[expected].to_numpy()
-    )
+    np.testing.assert_allclose(rsc_ad.obs[expected].to_numpy(), sc_ad.obs[expected].to_numpy())

@@ -17,12 +17,7 @@ def _pbmc3k_with_missing_leiden():
     adata = adata.raw.to_adata()[:, var_names]
 
     groups = adata.obs["louvain"].value_counts().index[:3].tolist()
-    rows = np.concatenate(
-        [
-            np.flatnonzero((adata.obs["louvain"] == group).to_numpy())[:40]
-            for group in groups
-        ]
-    )
+    rows = np.concatenate([np.flatnonzero((adata.obs["louvain"] == group).to_numpy())[:40] for group in groups])
     adata = adata[rows].copy()
     X = adata.X.toarray()
     test_and_reference = adata.obs["louvain"].isin(groups[:2]).to_numpy()
@@ -49,11 +44,9 @@ def _assert_group_results_match(actual, expected, group):
     assert set(actual_names) == set(expected_names)
 
     for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
-        actual_by_gene = dict(
-            zip(actual_names, np.asarray(actual_result[field][group], dtype=float))
-        )
+        actual_by_gene = dict(zip(actual_names, np.asarray(actual_result[field][group], dtype=float), strict=False))
         expected_by_gene = dict(
-            zip(expected_names, np.asarray(expected_result[field][group], dtype=float))
+            zip(expected_names, np.asarray(expected_result[field][group], dtype=float), strict=False)
         )
         for gene, value in actual_by_gene.items():
             np.testing.assert_allclose(
@@ -68,9 +61,7 @@ def _assert_group_results_match(actual, expected, group):
     for field in ("pts", "pts_rest"):
         if field not in expected_result:
             continue
-        assert list(actual_result[field].columns) == list(
-            expected_result[field].columns
-        )
+        assert list(actual_result[field].columns) == list(expected_result[field].columns)
         assert list(actual_result[field].index) == list(expected_result[field].index)
         np.testing.assert_allclose(
             actual_result[field].to_numpy(),
@@ -88,18 +79,14 @@ def _assert_group_results_match(actual, expected, group):
         pytest.param(
             "t-test",
             "multi-gpu",
-            marks=pytest.mark.skipif(
-                not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs"
-            ),
+            marks=pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs"),
         ),
         pytest.param("wilcoxon", "host"),
         pytest.param("wilcoxon", "device"),
     ],
 )
 @pytest.mark.parametrize("reference_kind", ["rest", "explicit"])
-def test_rank_genes_groups_missing_leiden_matches_scanpy(
-    method, execution, reference_kind
-):
+def test_rank_genes_groups_missing_leiden_matches_scanpy(method, execution, reference_kind):
     adata, test_group, reference_group = _pbmc3k_with_missing_leiden()
     expected = adata.copy()
     actual = adata.copy()
@@ -135,9 +122,7 @@ def test_rank_genes_groups_missing_leiden_matches_scanpy(
         missing = labels.isna().to_numpy()
         rest = missing | (labels != test_group).to_numpy()
         expected_pts_rest = np.count_nonzero(adata.X[rest], axis=0) / rest.sum()
-        dropped_pts_rest = (
-            np.count_nonzero(adata.X[rest & ~missing], axis=0) / (rest & ~missing).sum()
-        )
+        dropped_pts_rest = np.count_nonzero(adata.X[rest & ~missing], axis=0) / (rest & ~missing).sum()
         assert not np.array_equal(expected_pts_rest, dropped_pts_rest)
         np.testing.assert_allclose(
             actual.uns["rank_genes_groups"]["pts_rest"][test_group].to_numpy(),

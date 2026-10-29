@@ -20,9 +20,7 @@ def small_adata() -> AnnData:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding, obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -49,13 +47,9 @@ def test_unused_categories_dropped() -> None:
     group (shared subsetting on BaseMetric handles this for all metrics)."""
     rng = np.random.default_rng(0)
     cpg, nf = 15, 5
-    X = np.vstack(
-        [(rng.normal(size=(cpg, nf)) + i).astype(np.float32) for i in range(3)]
-    )
+    X = np.vstack([(rng.normal(size=(cpg, nf)) + i).astype(np.float32) for i in range(3)])
     labels = [c for c in ["g0", "g1", "g2"] for _ in range(cpg)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])})
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X, dtype=cp.float32)
     df = Distance(metric="edistance").pairwise(adata, groupby="group")
@@ -89,9 +83,7 @@ def test_distance_class_pairwise_with_bootstrap(small_adata: AnnData) -> None:
 def test_distance_class_onesided_distances(small_adata: AnnData) -> None:
     """Test Distance.onesided_distances() method."""
     distance = Distance(metric="edistance")
-    result = distance.onesided_distances(
-        small_adata, groupby="group", selected_group="g0"
-    )
+    result = distance.onesided_distances(small_adata, groupby="group", selected_group="g0")
 
     assert isinstance(result, pd.Series)
     assert len(result) == 3  # 3 groups total
@@ -109,13 +101,9 @@ def test_distance_class_onesided_matches_pairwise(small_adata: AnnData) -> None:
 
     # Get onesided distances for each group and verify it matches pairwise row
     for group in ["g0", "g1", "g2"]:
-        onesided = distance.onesided_distances(
-            small_adata, groupby="group", selected_group=group
-        )
+        onesided = distance.onesided_distances(small_adata, groupby="group", selected_group=group)
         # Should match the row from pairwise matrix
-        np.testing.assert_allclose(
-            onesided.values, pairwise_df.loc[group].values, atol=1e-6
-        )
+        np.testing.assert_allclose(onesided.values, pairwise_df.loc[group].values, atol=1e-6)
         # Self-distance should be 0
         assert onesided.loc[group] == pytest.approx(0.0, abs=1e-6)
 
@@ -125,9 +113,7 @@ def test_distance_class_onesided_multiple_controls(small_adata: AnnData) -> None
     distance = Distance(metric="edistance")
 
     # Multiple controls in a single call
-    result = distance.onesided_distances(
-        small_adata, groupby="group", selected_group=["g0", "g1"]
-    )
+    result = distance.onesided_distances(small_adata, groupby="group", selected_group=["g0", "g1"])
 
     assert isinstance(result, pd.DataFrame)
     assert list(result.columns) == ["g0", "g1"]
@@ -136,18 +122,14 @@ def test_distance_class_onesided_multiple_controls(small_adata: AnnData) -> None
     # Each column should match the corresponding row from pairwise
     pairwise_df = distance.pairwise(small_adata, groupby="group")
     for group in ["g0", "g1"]:
-        np.testing.assert_allclose(
-            result[group].values, pairwise_df.loc[group].values, atol=1e-7
-        )
+        np.testing.assert_allclose(result[group].values, pairwise_df.loc[group].values, atol=1e-7)
 
 
 def test_distance_class_onesided_invalid_group(small_adata: AnnData) -> None:
     """Test Distance.onesided_distances() raises error for invalid group."""
     distance = Distance(metric="edistance")
     with pytest.raises(ValueError, match="not found"):
-        distance.onesided_distances(
-            small_adata, groupby="group", selected_group="invalid"
-        )
+        distance.onesided_distances(small_adata, groupby="group", selected_group="invalid")
 
 
 def test_distance_class_onesided_bootstrap(small_adata: AnnData) -> None:
@@ -208,9 +190,7 @@ def test_distance_class_onesided_bootstrap_matches_pairwise(
 
     # Should match the corresponding row from pairwise
     np.testing.assert_allclose(onesided.values, pairwise_df.loc["g0"].values, atol=1e-7)
-    np.testing.assert_allclose(
-        onesided_var.values, pairwise_var_df.loc["g0"].values, atol=1e-7
-    )
+    np.testing.assert_allclose(onesided_var.values, pairwise_var_df.loc["g0"].values, atol=1e-7)
 
 
 def test_distance_class_repr() -> None:
@@ -257,9 +237,7 @@ def _compute_energy_distance_cpu(X: np.ndarray, Y: np.ndarray) -> float:
 def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
     distance = Distance(metric="edistance")
     values = small_adata.obsm["X_pca"].get()
-    contrasts = distance.create_contrasts(
-        small_adata, groupby="group", selected_group="g0"
-    )
+    contrasts = distance.create_contrasts(small_adata, groupby="group", selected_group="g0")
 
     def compute(order):
         small_adata.obsm["X_pca"] = xp.asarray(values, order=order)
@@ -268,7 +246,7 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
             distance.contrast_distances(small_adata, contrasts)["edistance"].to_numpy(),
         )
 
-    for actual, expected in zip(compute("F"), compute("C")):
+    for actual, expected in zip(compute("F"), compute("C"), strict=False):
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
@@ -314,9 +292,7 @@ def test_edistance_correctness_larger_dataset() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -330,9 +306,7 @@ def test_edistance_correctness_larger_dataset() -> None:
         Y = cpu_embedding[np.array(groups) == g2]
         expected = _compute_energy_distance_cpu(X, Y)
         actual = result_df.loc[g1, g2]
-        np.testing.assert_allclose(
-            actual, expected, rtol=1e-6, atol=1e-6, err_msg=f"Mismatch for ({g1}, {g2})"
-        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6, err_msg=f"Mismatch for ({g1}, {g2})")
 
 
 # ============================================================================
@@ -350,9 +324,7 @@ def test_onesided_distances_correctness_vs_cpu(small_adata: AnnData) -> None:
 
     # Test onesided from each group
     for selected_group in ["g0", "g1", "g2"]:
-        onesided = distance.onesided_distances(
-            small_adata, groupby="group", selected_group=selected_group
-        )
+        onesided = distance.onesided_distances(small_adata, groupby="group", selected_group=selected_group)
 
         # Verify against CPU reference for each target group
         X = cpu_embedding[groups == selected_group]
@@ -387,9 +359,7 @@ def contrast_adata() -> AnnData:
     cpu_emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
     obs = pd.DataFrame(
         {
-            "treatment": pd.Categorical(
-                ["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n
-            ),
+            "treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n),
             "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2),
         }
     )
@@ -436,8 +406,7 @@ def test_contrast_distances_matches_compute_distance(
             row["edistance"],
             expected,
             atol=1e-6,
-            err_msg=f"Contrast {row['treatment']} vs {row['reference']} "
-            f"in {row['celltype']} mismatch",
+            err_msg=f"Contrast {row['treatment']} vs {row['reference']} in {row['celltype']} mismatch",
         )
 
 
@@ -503,12 +472,7 @@ def test_contrast_distances_multiple_references() -> None:
     obs = pd.DataFrame(
         {
             "treatment": pd.Categorical(
-                ["ref1"] * n
-                + ["ref2"] * n
-                + ["drugA"] * n
-                + ["drugB"] * n
-                + ["ref1"] * n
-                + ["drugA"] * n
+                ["ref1"] * n + ["ref2"] * n + ["drugA"] * n + ["drugB"] * n + ["ref1"] * n + ["drugA"] * n
             ),
             "celltype": pd.Categorical(["T"] * n * 4 + ["B"] * n * 2),
         }
@@ -564,9 +528,7 @@ def test_contrast_distances_multiple_references_no_split() -> None:
     cpu_emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
     obs = pd.DataFrame(
         {
-            "treatment": pd.Categorical(
-                ["ref1"] * n + ["ref2"] * n + ["drugA"] * n + ["drugB"] * n
-            ),
+            "treatment": pd.Categorical(["ref1"] * n + ["ref2"] * n + ["drugA"] * n + ["drugB"] * n),
         }
     )
     adata = AnnData(cpu_emb.copy(), obs=obs)
@@ -617,12 +579,8 @@ def test_contrast_distances_filtered(contrast_adata: AnnData) -> None:
     assert result["celltype"].iloc[0] == "T"
 
     # Verify the distance matches compute_distance
-    mask_target = (contrast_adata.obs["treatment"].values == "drugA") & (
-        contrast_adata.obs["celltype"].values == "T"
-    )
-    mask_ref = (contrast_adata.obs["treatment"].values == "ctrl") & (
-        contrast_adata.obs["celltype"].values == "T"
-    )
+    mask_target = (contrast_adata.obs["treatment"].values == "drugA") & (contrast_adata.obs["celltype"].values == "T")
+    mask_ref = (contrast_adata.obs["treatment"].values == "ctrl") & (contrast_adata.obs["celltype"].values == "T")
     expected = d.compute_distance(
         contrast_adata.obsm["X_pca"][mask_target],
         contrast_adata.obsm["X_pca"][mask_ref],
@@ -646,12 +604,7 @@ def test_contrast_distances_two_split_by() -> None:
     obs = pd.DataFrame(
         {
             "treatment": pd.Categorical(
-                ["ctrl"] * n
-                + ["drugA"] * n
-                + ["ctrl"] * n
-                + ["drugA"] * n
-                + ["ctrl"] * n
-                + ["drugA"] * n
+                ["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n
             ),
             "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2 + ["T"] * n * 2),
             "batch": pd.Categorical(["b1"] * n * 4 + ["b2"] * n * 2),
@@ -722,17 +675,13 @@ def test_bootstrap_variance_is_positive(small_adata: AnnData) -> None:
     )
 
     # All variances should be >= 0
-    assert np.all(distances_var_df.values >= 0), (
-        "Bootstrap variance should be non-negative"
-    )
+    assert np.all(distances_var_df.values >= 0), "Bootstrap variance should be non-negative"
 
     # Off-diagonal variances should be > 0 (with bootstrap resampling)
     for i, g1 in enumerate(["g0", "g1", "g2"]):
         for j, g2 in enumerate(["g0", "g1", "g2"]):
             if i != j:
-                assert distances_var_df.loc[g1, g2] > 0, (
-                    f"Off-diagonal variance should be positive for ({g1}, {g2})"
-                )
+                assert distances_var_df.loc[g1, g2] > 0, f"Off-diagonal variance should be positive for ({g1}, {g2})"
 
 
 def test_bootstrap_mean_close_to_point_estimate() -> None:
@@ -746,9 +695,7 @@ def test_bootstrap_mean_close_to_point_estimate() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -989,9 +936,7 @@ def test_distance_layer_key_basic() -> None:
     # Create expression data with proper shape for both X and layer
     cpu_data = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     # Create AnnData with n_features as n_vars (required for layer to match)
     adata = AnnData(np.zeros((total_cells, n_features), dtype=np.float32), obs=obs)
@@ -1056,9 +1001,7 @@ def test_float64_matches_float32_results() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata_f32 = AnnData(cpu_embedding, obs=obs)
     adata_f32.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1090,17 +1033,13 @@ def test_bootstrap_different_feature_counts(n_features: int) -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
 
     distance = Distance(metric="edistance")
-    distances, variances = distance.pairwise(
-        adata, groupby="group", bootstrap=True, n_bootstrap=10, random_state=42
-    )
+    distances, variances = distance.pairwise(adata, groupby="group", bootstrap=True, n_bootstrap=10, random_state=42)
 
     assert isinstance(distances, pd.DataFrame)
     assert isinstance(variances, pd.DataFrame)
@@ -1130,9 +1069,7 @@ def test_pairwise_correctness_parametrized(dtype) -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(dtype)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=dtype)
@@ -1168,9 +1105,7 @@ def test_correctness_float32_features(n_features) -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=np.float32)
@@ -1202,9 +1137,7 @@ def test_correctness_float64_small() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float64)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=np.float64)
@@ -1253,9 +1186,7 @@ def test_block_size_consistency() -> None:
     # Use float64 since block size difference only matters for float64 on pre-Ampere
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float64)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float64)
@@ -1268,9 +1199,7 @@ def test_block_size_consistency() -> None:
     device_id = cp.cuda.Device().id
     original_cc = device_attrs["cc_major"]
     try:
-        _multi_gpu._DEVICE_ATTRS_CACHE[device_id]["cc_major"] = (
-            7  # Force pre-Ampere path
-        )
+        _multi_gpu._DEVICE_ATTRS_CACHE[device_id]["cc_major"] = 7  # Force pre-Ampere path
         distance_256 = Distance(metric="edistance")
         result_256 = distance_256.pairwise(adata, groupby="group")
     finally:
@@ -1330,9 +1259,7 @@ def test_distance_axioms(
         cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
 
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1342,9 +1269,7 @@ def test_distance_axioms(
 
     # Definiteness: d(x, x) = 0
     for group in result_df.index:
-        assert result_df.loc[group, group] == pytest.approx(0.0, abs=1e-10), (
-            f"Self-distance for {group} should be 0"
-        )
+        assert result_df.loc[group, group] == pytest.approx(0.0, abs=1e-10), f"Self-distance for {group} should be 0"
 
     # Symmetry: d(x, y) = d(y, x)
     np.testing.assert_allclose(
@@ -1359,9 +1284,7 @@ def test_distance_axioms(
         for g1 in result_df.index:
             for g2 in result_df.columns:
                 if g1 != g2:
-                    assert result_df.loc[g1, g2] >= 0, (
-                        f"Distance ({g1}, {g2}) should be non-negative"
-                    )
+                    assert result_df.loc[g1, g2] >= 0, f"Distance ({g1}, {g2}) should be non-negative"
 
 
 # ============================================================================
@@ -1424,13 +1347,10 @@ def test_triangle_inequality_pertpy_data(pertpy_adata: AnnData) -> None:
 
         # Triangle inequality: d(a,c) <= d(a,b) + d(b,c)
         if d_ac > d_ab + d_bc + 1e-6:
-            violations.append(
-                f"d({a},{c})={d_ac:.2f} > d({a},{b})={d_ab:.2f} + d({b},{c})={d_bc:.2f}"
-            )
+            violations.append(f"d({a},{c})={d_ac:.2f} > d({a},{b})={d_ab:.2f} + d({b},{c})={d_bc:.2f}")
 
     assert len(violations) <= max_violations, (
-        f"Too many triangle inequality violations ({len(violations)}/{n_tests}): "
-        f"{violations[:3]}..."  # Show first 3
+        f"Too many triangle inequality violations ({len(violations)}/{n_tests}): {violations[:3]}..."  # Show first 3
     )
 
 
@@ -1451,9 +1371,7 @@ def test_pairwise_output_format(small_adata: AnnData) -> None:
     assert list(result.index) == list(result.columns), "Index and columns should match"
 
     # Symmetric
-    np.testing.assert_allclose(
-        result.values, result.values.T, atol=1e-10, err_msg="Matrix should be symmetric"
-    )
+    np.testing.assert_allclose(result.values, result.values.T, atol=1e-10, err_msg="Matrix should be symmetric")
 
     # Proper names
     assert result.index.name == "group", "Index name should match groupby key"
@@ -1468,13 +1386,9 @@ def test_pairwise_output_format(small_adata: AnnData) -> None:
 def test_onesided_output_format(small_adata: AnnData) -> None:
     """Test onesided_distances output format: DataFrame with proper structure."""
     distance = Distance(metric="edistance")
-    result = distance.onesided_distances(
-        small_adata, groupby="group", selected_group="g0"
-    )
+    result = distance.onesided_distances(small_adata, groupby="group", selected_group="g0")
 
-    assert isinstance(result, pd.Series), (
-        "onesided_distances with single control should return Series"
-    )
+    assert isinstance(result, pd.Series), "onesided_distances with single control should return Series"
     assert result.index.name == "group"
 
 
@@ -1504,26 +1418,18 @@ def test_pairwise_groups_parameter_values_correct(small_adata: AnnData) -> None:
     full_result = distance.pairwise(small_adata, groupby="group")
 
     # Filtered pairwise
-    filtered_result = distance.pairwise(
-        small_adata, groupby="group", groups=["g0", "g2"]
-    )
+    filtered_result = distance.pairwise(small_adata, groupby="group", groups=["g0", "g2"])
 
     # Values should match
-    np.testing.assert_allclose(
-        filtered_result.loc["g0", "g2"], full_result.loc["g0", "g2"], atol=1e-10
-    )
-    np.testing.assert_allclose(
-        filtered_result.loc["g0", "g0"], full_result.loc["g0", "g0"], atol=1e-10
-    )
+    np.testing.assert_allclose(filtered_result.loc["g0", "g2"], full_result.loc["g0", "g2"], atol=1e-10)
+    np.testing.assert_allclose(filtered_result.loc["g0", "g0"], full_result.loc["g0", "g0"], atol=1e-10)
 
 
 def test_onesided_groups_parameter_filters_output(small_adata: AnnData) -> None:
     """Test that groups parameter filters onesided_distances output."""
     distance = Distance(metric="edistance")
 
-    result = distance.onesided_distances(
-        small_adata, groupby="group", selected_group="g0", groups=["g0", "g1"]
-    )
+    result = distance.onesided_distances(small_adata, groupby="group", selected_group="g0", groups=["g0", "g1"])
 
     assert len(result) == 2
     assert "g0" in result.index
@@ -1563,9 +1469,7 @@ def test_two_groups_only() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1589,9 +1493,7 @@ def test_many_groups() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1619,9 +1521,7 @@ def test_unequal_group_sizes() -> None:
     for i, size in enumerate(group_sizes):
         groups.extend([f"g{i}"] * size)
 
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(3)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(3)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1717,9 +1617,7 @@ def test_single_cell_per_group() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1755,9 +1653,7 @@ def test_single_cell_mixed_groups() -> None:
     for i, size in enumerate(group_sizes):
         group_labels.extend([f"g{i}"] * size)
 
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(group_labels, categories=["g0", "g1", "g2"])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(group_labels, categories=["g0", "g1", "g2"])})
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
 
@@ -1791,9 +1687,7 @@ def test_high_dimensional_features() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1807,9 +1701,7 @@ def test_high_dimensional_features() -> None:
     expected = _compute_energy_distance_cpu(X, Y)
     actual = result_df.loc["g0", "g1"]
 
-    np.testing.assert_allclose(
-        actual, expected, rtol=1e-4, atol=1e-5, err_msg="High-dimensional mismatch"
-    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5, err_msg="High-dimensional mismatch")
 
 
 def test_similar_distributions_small_distance() -> None:
@@ -1844,8 +1736,7 @@ def test_similar_distributions_small_distance() -> None:
     # Distance between samples from same distribution should be small
     # (close to 0, but not exactly due to sampling)
     assert abs(result_df.loc["g0", "g1"]) < 0.5, (
-        f"Distance between similar distributions should be small, "
-        f"got {result_df.loc['g0', 'g1']}"
+        f"Distance between similar distributions should be small, got {result_df.loc['g0', 'g1']}"
     )
 
 
@@ -1862,9 +1753,7 @@ def test_different_distributions_larger_distance() -> None:
     g2_data = rng.normal(loc=5, size=(cells_per_group, n_features))
     cpu_embedding = np.vstack([g0_data, g1_data, g2_data]).astype(np.float32)
 
-    groups = (
-        ["g0"] * cells_per_group + ["g1"] * cells_per_group + ["g2"] * cells_per_group
-    )
+    groups = ["g0"] * cells_per_group + ["g1"] * cells_per_group + ["g2"] * cells_per_group
     obs = pd.DataFrame({"group": pd.Categorical(groups, categories=["g0", "g1", "g2"])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
@@ -1904,9 +1793,7 @@ def test_multi_gpu_pairwise_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1939,9 +1826,7 @@ def test_multi_gpu_onesided_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1949,14 +1834,10 @@ def test_multi_gpu_onesided_matches_single_gpu() -> None:
     distance = Distance(metric="edistance")
 
     # Compute with forced single GPU
-    single_result = distance.onesided_distances(
-        adata, groupby="group", selected_group="g0", multi_gpu=False
-    )
+    single_result = distance.onesided_distances(adata, groupby="group", selected_group="g0", multi_gpu=False)
 
     # Compute with multi GPU
-    multi_result = distance.onesided_distances(
-        adata, groupby="group", selected_group="g0", multi_gpu=True
-    )
+    multi_result = distance.onesided_distances(adata, groupby="group", selected_group="g0", multi_gpu=True)
 
     np.testing.assert_allclose(
         single_result.values,
@@ -1982,9 +1863,7 @@ def test_multi_gpu_bootstrap_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -2039,9 +1918,7 @@ def test_multi_gpu_onesided_bootstrap_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -2122,9 +1999,7 @@ def test_small_group_count_works() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -2158,9 +2033,7 @@ def test_multi_gpu_with_more_gpus_than_pairs() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame(
-        {"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}
-    )
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)

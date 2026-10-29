@@ -26,10 +26,7 @@ DENSITY = 0.3
 def _make_matrix(n_features: int, dtype, *, seed: int = 0) -> np.ndarray:
     """Group-separated, ~``DENSITY``-dense matrix (zeros make it genuinely sparse)."""
     rng = np.random.default_rng(seed)
-    blocks = [
-        (rng.normal(size=(CELLS_PER_GROUP, n_features)) + i).astype(dtype)
-        for i in range(N_GROUPS)
-    ]
+    blocks = [(rng.normal(size=(CELLS_PER_GROUP, n_features)) + i).astype(dtype) for i in range(N_GROUPS)]
     X = np.vstack(blocks)
     X[rng.random(X.shape) > DENSITY] = 0.0
     return X
@@ -57,12 +54,8 @@ def test_pairwise_sparse_matches_dense(dtype, atol, n_features) -> None:
     sparse.layers["counts"] = csr_matrix(X.astype(dtype).copy())
 
     ref = Distance(metric="edistance", obsm_key="emb").pairwise(dense, groupby="group")
-    via_x = Distance(metric="edistance", layer_key="X").pairwise(
-        sparse, groupby="group"
-    )
-    via_layer = Distance(metric="edistance", layer_key="counts").pairwise(
-        sparse, groupby="group"
-    )
+    via_x = Distance(metric="edistance", layer_key="X").pairwise(sparse, groupby="group")
+    via_layer = Distance(metric="edistance", layer_key="counts").pairwise(sparse, groupby="group")
 
     np.testing.assert_allclose(via_x.values, ref.values, atol=atol)
     np.testing.assert_allclose(via_layer.values, ref.values, atol=atol)
@@ -84,9 +77,7 @@ def test_pairwise_sparse_matches_cdist_ground_truth() -> None:
             expected[i, j] = 2 * d_xy - d_xx - d_yy
 
     sparse = AnnData(csr_matrix(X.copy()), obs=_obs())
-    result = Distance(metric="edistance", layer_key="X").pairwise(
-        sparse, groupby="group"
-    )
+    result = Distance(metric="edistance", layer_key="X").pairwise(sparse, groupby="group")
     np.testing.assert_allclose(result.values, expected, atol=1e-9)
 
 
@@ -95,12 +86,8 @@ def test_onesided_sparse_matches_dense() -> None:
     dense = _dense_adata(X)
     sparse = AnnData(csr_matrix(X.copy()), obs=_obs())
 
-    ref = Distance(metric="edistance", obsm_key="emb").onesided_distances(
-        dense, groupby="group", selected_group="g0"
-    )
-    got = Distance(metric="edistance", layer_key="X").onesided_distances(
-        sparse, groupby="group", selected_group="g0"
-    )
+    ref = Distance(metric="edistance", obsm_key="emb").onesided_distances(dense, groupby="group", selected_group="g0")
+    got = Distance(metric="edistance", layer_key="X").onesided_distances(sparse, groupby="group", selected_group="g0")
     np.testing.assert_allclose(got.values, ref.values, atol=1e-4)
 
 
@@ -109,12 +96,8 @@ def test_subset_of_groups_sparse_matches_dense() -> None:
     dense = _dense_adata(X)
     sparse = AnnData(csr_matrix(X.copy()), obs=_obs())
 
-    ref = Distance(metric="edistance", obsm_key="emb").pairwise(
-        dense, groupby="group", groups=["g0", "g2"]
-    )
-    got = Distance(metric="edistance", layer_key="X").pairwise(
-        sparse, groupby="group", groups=["g0", "g2"]
-    )
+    ref = Distance(metric="edistance", obsm_key="emb").pairwise(dense, groupby="group", groups=["g0", "g2"])
+    got = Distance(metric="edistance", layer_key="X").pairwise(sparse, groupby="group", groups=["g0", "g2"])
     np.testing.assert_allclose(got.values, ref.values, atol=1e-4)
 
 
@@ -124,15 +107,9 @@ def test_contrast_distances_sparse_matches_dense() -> None:
     sparse = AnnData(csr_matrix(X.copy()), obs=_obs())
 
     contrasts = Distance.create_contrasts(dense, groupby="group", selected_group="g0")
-    ref = Distance(metric="edistance", obsm_key="emb").contrast_distances(
-        dense, contrasts
-    )
-    got = Distance(metric="edistance", layer_key="X").contrast_distances(
-        sparse, contrasts
-    )
-    np.testing.assert_allclose(
-        got["edistance"].values, ref["edistance"].values, atol=1e-4
-    )
+    ref = Distance(metric="edistance", obsm_key="emb").contrast_distances(dense, contrasts)
+    got = Distance(metric="edistance", layer_key="X").contrast_distances(sparse, contrasts)
+    np.testing.assert_allclose(got["edistance"].values, ref["edistance"].values, atol=1e-4)
 
 
 def test_bootstrap_sparse_matches_dense() -> None:

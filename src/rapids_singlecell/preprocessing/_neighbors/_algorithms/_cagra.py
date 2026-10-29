@@ -25,18 +25,19 @@ def _cagra_knn(
     if not _cuvs_switch():
         try:
             from pylibraft.neighbors import cagra
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "The 'cagra' module is not available in your current RAFT installation. "
                 "Please update RAFT to a version that supports 'cagra'."
-            )
+            ) from e
         from pylibraft.common import DeviceResources
 
         resources = DeviceResources()
         build_kwargs = {"handle": resources}
         search_kwargs = {"handle": resources}
         warnings.warn(
-            "Using `pylibraft` for ANN was removed in RAFT 24.12 and is deprecated in rapids-singlecell. Please update RAPIDS to use `cuvs` for ANN."
+            "Using `pylibraft` for ANN was removed in RAFT 24.12 and is deprecated in rapids-singlecell. Please update RAPIDS to use `cuvs` for ANN.",
+            stacklevel=2,
         )
     else:
         from cuvs.neighbors import cagra
@@ -49,9 +50,7 @@ def _cagra_knn(
         metric_to_use = "sqeuclidean"
     else:
         metric_to_use = metric
-    build_params = cagra.IndexParams(
-        metric=metric_to_use, graph_degree=k, build_algo="nn_descent"
-    )
+    build_params = cagra.IndexParams(metric=metric_to_use, graph_degree=k, build_algo="nn_descent")
     index = cagra.build(build_params, X, **build_kwargs)
 
     search_params = cagra.SearchParams()

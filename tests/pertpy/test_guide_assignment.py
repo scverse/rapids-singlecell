@@ -25,9 +25,7 @@ def _synthetic_counts(
     truth = np.zeros((n_cells, n_guides), dtype=bool)
     for g in range(n_guides):
         is_pos = rng.random(n_cells) < frac_pos
-        X[is_pos, g] = np.clip(
-            np.round(2 ** rng.normal(log2_mean, 0.6, is_pos.sum())), 1, None
-        )
+        X[is_pos, g] = np.clip(np.round(2 ** rng.normal(log2_mean, 0.6, is_pos.sum())), 1, None)
         X[~is_pos, g] = rng.poisson(background, (~is_pos).sum())
         truth[is_pos, g] = True
     return X, truth
@@ -44,9 +42,7 @@ def _adata(X: np.ndarray) -> AnnData:
 @pytest.fixture
 def guide_adata() -> tuple[AnnData, np.ndarray]:
     """800 cells by 12 guides with 12 % positive cells per guide."""
-    X, truth = _synthetic_counts(
-        np.random.default_rng(0), 800, 12, frac_pos=0.12, log2_mean=5.0, background=0.8
-    )
+    X, truth = _synthetic_counts(np.random.default_rng(0), 800, 12, frac_pos=0.12, log2_mean=5.0, background=0.8)
     return _adata(X), truth
 
 
@@ -82,9 +78,7 @@ def test_assign_by_threshold(tiny_adata: AnnData, storage: str) -> None:
         assert result.dtype == cp.int8
     else:
         assert result.nnz == 3
-    np.testing.assert_array_equal(
-        _dense(result), (_dense(tiny_adata.X) >= 5).astype(np.int8)
-    )
+    np.testing.assert_array_equal(_dense(result), (_dense(tiny_adata.X) >= 5).astype(np.int8))
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
@@ -137,9 +131,7 @@ def test_mixture_model_dense_matches_sparse(
 
 def test_mixture_model_high_moi_keeps_component_order() -> None:
     """With half of the cells positive, the Gaussian must stay the on-target component."""
-    X, truth = _synthetic_counts(
-        np.random.default_rng(0), 2000, 3, frac_pos=0.5, log2_mean=6.0, background=1.0
-    )
+    X, truth = _synthetic_counts(np.random.default_rng(0), 2000, 3, frac_pos=0.5, log2_mean=6.0, background=1.0)
     adata = _adata(X)
     rsc.ptg.GuideAssignment().assign_mixture_model(adata)
 
@@ -169,9 +161,7 @@ def test_mixture_model_only_return_results(
     guide_adata: tuple[AnnData, np.ndarray],
 ) -> None:
     adata, _ = guide_adata
-    result = rsc.ptg.GuideAssignment().assign_mixture_model(
-        adata, only_return_results=True
-    )
+    result = rsc.ptg.GuideAssignment().assign_mixture_model(adata, only_return_results=True)
 
     assert isinstance(result, np.ndarray)
     assert result.shape == (adata.n_obs,)
@@ -190,9 +180,7 @@ def test_mixture_model_layer_is_honored(
     ga = rsc.ptg.GuideAssignment()
     with pytest.warns(UserWarning, match="Skipping 12 guides"):
         x_result = ga.assign_mixture_model(adata, only_return_results=True)
-    layer_result = ga.assign_mixture_model(
-        adata, layer="raw_guides", only_return_results=True
-    )
+    layer_result = ga.assign_mixture_model(adata, layer="raw_guides", only_return_results=True)
 
     assert (x_result == "negative").all()
     assert np.count_nonzero(layer_result != "negative") > 0
@@ -208,9 +196,7 @@ def test_mixture_model_skips_low_count_guides() -> None:
     X[~is_pos, 3] = rng.poisson(0.8, (~is_pos).sum())
     adata = _adata(X)
 
-    with pytest.warns(
-        UserWarning, match="Skipping 3 guides .*: guide_0, guide_1, guide_2"
-    ):
+    with pytest.warns(UserWarning, match="Skipping 3 guides .*: guide_0, guide_1, guide_2"):
         rsc.ptg.GuideAssignment().assign_mixture_model(adata)
     assert adata.var["threshold"].isna().tolist() == [True, True, True, False]
 
@@ -226,9 +212,7 @@ def test_mixture_model_rejects_negative_values_and_unknown_model(
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
-def test_mixture_model_rejects_negative_values_next_to_nan(
-    tiny_adata: AnnData, storage: str
-) -> None:
+def test_mixture_model_rejects_negative_values_next_to_nan(tiny_adata: AnnData, storage: str) -> None:
     tiny_adata.X[0, 0] = -1
     tiny_adata.X[1, 1] = cp.nan
     if storage != "dense":
@@ -246,12 +230,8 @@ def _layouts(X: np.ndarray) -> dict:
         wide.indices.astype(cp.int64),
     )
     indptr = cp.asnumpy(csr.indptr)
-    reverse = np.concatenate(
-        [np.arange(start, end)[::-1] for start, end in zip(indptr[:-1], indptr[1:])]
-    )
-    unsorted = gpu_csr(
-        (csr.data[reverse], csr.indices[reverse], csr.indptr), shape=csr.shape
-    )
+    reverse = np.concatenate([np.arange(start, end)[::-1] for start, end in zip(indptr[:-1], indptr[1:], strict=True)])
+    unsorted = gpu_csr((csr.data[reverse], csr.indices[reverse], csr.indptr), shape=csr.shape)
     return {
         "dense C": cp.asarray(X),
         "dense F": cp.asfortranarray(cp.asarray(X)),
@@ -264,9 +244,7 @@ def _layouts(X: np.ndarray) -> dict:
     }
 
 
-def test_layouts_match(
-    guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pytest.MonkeyPatch) -> None:
     from rapids_singlecell.pertpy_gpu import _guide_assignment
 
     adata, _ = guide_adata
@@ -283,20 +261,14 @@ def test_layouts_match(
         ga.assign_mixture_model(a)
         ga.assign_to_max_guide(a, assignment_threshold=3, obs_key="max_guide")
         ga.assign_by_threshold(a, assignment_threshold=3, output_layer="threshold")
-        np.testing.assert_array_equal(
-            a.var["threshold"], reference.var["threshold"], err_msg=name
-        )
-        np.testing.assert_array_equal(
-            a.obs["assigned_guide"], reference.obs["assigned_guide"], err_msg=name
-        )
+        np.testing.assert_array_equal(a.var["threshold"], reference.var["threshold"], err_msg=name)
+        np.testing.assert_array_equal(a.obs["assigned_guide"], reference.obs["assigned_guide"], err_msg=name)
         np.testing.assert_array_equal(
             _dense(a.layers["assigned_guides"]),
             _dense(reference.layers["assigned_guides"]),
             err_msg=name,
         )
-        np.testing.assert_array_equal(
-            _dense(a.layers["threshold"]), X >= 3, err_msg=name
-        )
+        np.testing.assert_array_equal(_dense(a.layers["threshold"]), X >= 3, err_msg=name)
         best = np.where(X.max(axis=1) >= 3, X.argmax(axis=1), -1)
         expected = np.append(adata.var_names, "Negative")[best]
         np.testing.assert_array_equal(a.obs["max_guide"], expected, err_msg=name)

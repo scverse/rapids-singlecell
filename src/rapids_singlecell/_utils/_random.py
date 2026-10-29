@@ -48,9 +48,7 @@ class _LegacyRng(np.random.Generator):
     arg: _LegacyRandom
     state: np.random.RandomState
 
-    def __init__(
-        self, arg: _LegacyRandom, state: np.random.RandomState | None = None
-    ) -> None:
+    def __init__(self, arg: _LegacyRandom, state: np.random.RandomState | None = None) -> None:
         self.arg = arg
         self.state = check_random_state(arg) if state is None else state
 
@@ -63,9 +61,7 @@ class _LegacyRng(np.random.Generator):
         raise AttributeError(msg)
 
     @classmethod
-    def wrap_global(
-        cls, arg: _LegacyRandom = None, state: np.random.RandomState | None = None
-    ) -> Self:
+    def wrap_global(cls, arg: _LegacyRandom = None, state: np.random.RandomState | None = None) -> Self:
         """Create a generator that wraps the global `RandomState` backing the legacy `np.random` functions."""
         if arg is not None:
             if isinstance(arg, np.random.RandomState):
@@ -114,9 +110,7 @@ def _if_legacy_apply_global(rng: np.random.Generator, /) -> np.random.Generator:
     return _LegacyRng.wrap_global(rng.arg, rng.state)
 
 
-def _legacy_random_state(
-    rng: SeedLike | RNGLike | None, /, *, always_state: bool = False
-) -> _LegacyRandom:
+def _legacy_random_state(rng: SeedLike | RNGLike | None, /, *, always_state: bool = False) -> _LegacyRandom:
     """Convert a np.random.Generator into a legacy `random_state` argument.
 
     If `rng` is already a `_LegacyRng`, return its original `arg` attribute.
@@ -156,9 +150,7 @@ def _accepts_legacy_random_state[**P, R](
     return decorator
 
 
-def _seed_from_rng(
-    rng: SeedLike | RNGLike | None, /, *, allow_none: bool = True
-) -> int | None:
+def _seed_from_rng(rng: SeedLike | RNGLike | None, /, *, allow_none: bool = True) -> int | None:
     """Draw the integer seed a cuML, cuGraph or CuPy call needs.
 
     Scanpy inlines this where it calls into `leidenalg`; we need it in more

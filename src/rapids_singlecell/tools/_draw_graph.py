@@ -96,9 +96,7 @@ def draw_graph(
     if hasattr(init_coords, "dtype"):
         init_coords = _validate_init_pos(init_coords)
         if init_coords.shape[1] != 2:
-            raise ValueError(
-                f"Expected 2 columns but got {init_coords.shape[1]} columns."
-            )
+            raise ValueError(f"Expected 2 columns but got {init_coords.shape[1]} columns.")
 
     if init_coords is not None:
         x, y = np.hsplit(init_coords, init_coords.shape[1])

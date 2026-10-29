@@ -101,9 +101,7 @@ from rapids_singlecell import ptg
 
 distance = ptg.Distance(metric="edistance", obsm_key="X_pca")
 result = distance.pairwise(adata, groupby="perturbation")
-res, res_var = distance.pairwise(
-    adata, groupby="perturbation", bootstrap=True, n_bootstrap=100, multi_gpu=None
-)
+res, res_var = distance.pairwise(adata, groupby="perturbation", bootstrap=True, n_bootstrap=100, multi_gpu=None)
 ```
 
 ### Squidpy-compatible API (use `rsc.gr`)

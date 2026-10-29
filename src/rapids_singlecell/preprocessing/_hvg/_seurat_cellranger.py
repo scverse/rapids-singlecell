@@ -45,8 +45,7 @@ def _highly_variable_genes_single_batch(
     n_bins: int = 20,
     flavor: Literal["seurat", "cell_ranger"] = "seurat",
 ) -> pd.DataFrame:
-    """\
-    See `highly_variable_genes`.
+    """See `highly_variable_genes`.
 
     Returns
     -------
@@ -93,9 +92,7 @@ def _highly_variable_genes_single_batch(
     return df
 
 
-def _get_mean_bins(
-    means: pd.Series, flavor: Literal["seurat", "cell_ranger"], n_bins: int
-) -> pd.Series:
+def _get_mean_bins(means: pd.Series, flavor: Literal["seurat", "cell_ranger"], n_bins: int) -> pd.Series:
     if flavor == "seurat":
         bins = n_bins
     elif flavor == "cell_ranger":
@@ -106,9 +103,7 @@ def _get_mean_bins(
     return pd.cut(means, bins=bins)
 
 
-def _get_disp_stats(
-    df: pd.DataFrame, flavor: Literal["seurat", "cell_ranger"]
-) -> pd.DataFrame:
+def _get_disp_stats(df: pd.DataFrame, flavor: Literal["seurat", "cell_ranger"]) -> pd.DataFrame:
     disp_grouped = df.groupby("mean_bin", observed=True)["dispersions"]
     if flavor == "seurat":
         disp_bin_stats = disp_grouped.agg(avg="mean", dev="std")
@@ -120,9 +115,7 @@ def _get_disp_stats(
     return disp_bin_stats.loc[df["mean_bin"]].set_index(df.index)
 
 
-def _postprocess_dispersions_seurat(
-    disp_bin_stats: pd.DataFrame, mean_bin: pd.Series
-) -> None:
+def _postprocess_dispersions_seurat(disp_bin_stats: pd.DataFrame, mean_bin: pd.Series) -> None:
     # retrieve those genes that have nan std, these are the ones where
     # only a single gene fell in the bin and implicitly set them to have
     # a normalized disperion of 1
@@ -130,9 +123,7 @@ def _postprocess_dispersions_seurat(
     gen_indices = np.flatnonzero(one_gene_per_bin.loc[mean_bin])
     if len(gen_indices) == 0:
         return
-    disp_bin_stats.loc[one_gene_per_bin, "dev"] = disp_bin_stats.loc[
-        one_gene_per_bin, "avg"
-    ]
+    disp_bin_stats.loc[one_gene_per_bin, "dev"] = disp_bin_stats.loc[one_gene_per_bin, "avg"]
     disp_bin_stats.loc[one_gene_per_bin, "avg"] = 0
 
 
@@ -171,7 +162,7 @@ def _nth_highest(x: NDArray[np.float64], n: int) -> float:
     x = x[~np.isnan(x)]
     if n > x.size:
         msg = "`n_top_genes` > number of normalized dispersions, returning all genes with normalized dispersions."
-        warnings.warn(msg, UserWarning)
+        warnings.warn(msg, UserWarning, stacklevel=2)
         n = x.size
     # interestingly, np.argpartition is slightly slower
     x[::-1].sort()

@@ -7,11 +7,14 @@ following a 4-phase pattern:
 3. Launch - run kernel on each device
 4. Gather - aggregate results back
 
-Used by: co_occurrence, edistance, and future multi-GPU functions.
+Used by: co_occurrence, spatial_autocorr, rank_genes_groups, the pertpy
+distances and Harmony.
 """
 
 from __future__ import annotations
 
+import numbers
+import warnings
 from contextlib import contextmanager
 from functools import cache
 from typing import TYPE_CHECKING
@@ -25,12 +28,19 @@ if TYPE_CHECKING:
 # Cache for device attributes per device (lazy initialization)
 _DEVICE_ATTRS_CACHE: dict[int, dict] = {}
 
+_RELAY_BYTES = 1 << 23  # pinned chunk of copies through the host
+_D2H, _H2D = cp.cuda.runtime.memcpyDeviceToHost, cp.cuda.runtime.memcpyHostToDevice
 _CANARY = np.arange(1, 9, dtype=np.float64)
 _CANARY_POISON = -_CANARY
+# Kept as a fallback: drivers that reject peer copies of stream-ordered pool
+# memory report "invalid argument".
+_CUDA_ERROR_INVALID_VALUE = 1
 _CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217
+_CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704
 _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED = 705
 _CUDA_ERROR_TOO_MANY_PEERS = 711
 _PEER_ERRORS = {
+    _CUDA_ERROR_INVALID_VALUE,
     _CUDA_ERROR_PEER_ACCESS_UNSUPPORTED,
     _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED,
     _CUDA_ERROR_TOO_MANY_PEERS,
@@ -39,56 +49,139 @@ _PEER_ERRORS = {
 
 @cache
 def _peer_copy_works(destination: int, source: int) -> bool:
-    """Return whether a peer copy arrives intact."""
+    """Return whether a peer copy arrives intact.
+
+    Peer access is enabled in both directions first, so the canary takes the direct path that later copies (and
+    Harmony's exchanges) use. Where the canary fails, the access this call enabled is disabled again and a warning
+    names the pair, which then copies through the host.
+    """
     if destination == source:
         return True
-    if not cp.cuda.runtime.deviceCanAccessPeer(destination, source):
+    runtime = cp.cuda.runtime
+    if not (runtime.deviceCanAccessPeer(destination, source) and runtime.deviceCanAccessPeer(source, destination)):
         return False
-
+    enabled, works, why = [], False, "the copies arrive corrupted"
     try:
+        for device, peer in ((destination, source), (source, destination)):
+            with cp.cuda.Device(device):
+                try:
+                    runtime.deviceEnablePeerAccess(peer)
+                    enabled.append((device, peer))
+                except runtime.CUDARuntimeError as error:
+                    if error.status != _CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED:
+                        raise
         with cp.cuda.Device(source):
             expected = cp.asarray(_CANARY, blocking=True)
         with cp.cuda.Device(destination):
             actual = cp.asarray(_CANARY_POISON, blocking=True)
-            with cp.cuda.Stream(non_blocking=True) as stream:
-                cp.copyto(actual, expected)
-                stream.synchronize()
-            actual = cp.asnumpy(actual)
-    except cp.cuda.runtime.CUDARuntimeError as error:
-        if error.status in _PEER_ERRORS:
-            return False
-        raise
-    return bool(np.array_equal(actual, _CANARY))
+            _copy_to_device_p2p(expected, destination, out=actual)
+            works = bool(np.array_equal(cp.asnumpy(actual), _CANARY))
+    except runtime.CUDARuntimeError as error:
+        if error.status not in _PEER_ERRORS:
+            raise
+        why = f"status {error.status}"
+    if not works:
+        for device, peer in enabled:
+            with cp.cuda.Device(device):
+                try:
+                    runtime.deviceDisablePeerAccess(peer)
+                except runtime.CUDARuntimeError as error:
+                    if error.status != _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED:
+                        raise
+        warnings.warn(
+            f"Peer copies from GPU {source} to GPU {destination} do not work ({why}); copying through the host.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return works
 
 
-def _copy_to_device_p2p(array: cp.ndarray, destination: int) -> cp.ndarray:
-    """Copy an array directly to another GPU."""
-    # The copy runs on the destination stream; make it wait for the work that
-    # produced ``array`` on the source stream (cudaMemcpyAsync does not).
+def _peer_copies_work(devices: list[int]) -> bool:
+    """Whether validated peer copies work between every ordered pair of ``devices``."""
+    return all(_peer_copy_works(a, b) for a in devices for b in devices if a != b)
+
+
+def _copy_target(source: cp.ndarray, destination: int, out: cp.ndarray | None) -> cp.ndarray:
+    """``out`` checked against the contiguous ``source``, or a new array like it on ``destination`` (the current GPU)."""
+    if out is None:
+        return cp.empty_like(source)
+    if (out.shape, out.strides, out.dtype, out.device.id) != (source.shape, source.strides, source.dtype, destination):
+        raise ValueError("out must have the shape, layout and dtype of the array, on the destination GPU")
+    return out
+
+
+def _copy_to_device_p2p(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """Copy an array directly to another GPU, keeping its C or F layout (into ``out`` if given, of the same layout).
+
+    The copy runs on the destination's current stream after the work on the
+    source's current stream and has landed on return, so ``array`` may be
+    released right away: CuPy's pool reuses a freed block on the stream it was
+    allocated on, which nothing orders after the copy. cudaMemcpyPeerAsync also
+    works for stream-ordered pool memory, which CuPy's generic cross-device
+    copies reject.
+    """
     with cp.cuda.Device(array.device.id):
+        contiguous = array.flags.c_contiguous or array.flags.f_contiguous
+        source = array if contiguous else cp.ascontiguousarray(array)
         ready = cp.cuda.Event(block=False, disable_timing=True)
-        ready.record()
+        ready.record(cp.cuda.get_current_stream())
     with cp.cuda.Device(destination):
-        cp.cuda.get_current_stream().wait_event(ready)
-        return cp.asarray(array)
+        stream = cp.cuda.get_current_stream()
+        stream.wait_event(ready)
+        out = _copy_target(source, destination, out)
+        cp.cuda.runtime.memcpyPeerAsync(
+            out.data.ptr,
+            destination,
+            source.data.ptr,
+            source.device.id,
+            source.nbytes,
+            stream.ptr,
+        )
+        stream.synchronize()
+    return out
 
 
-def _copy_to_device_via_host(array: cp.ndarray, destination: int) -> cp.ndarray:
-    """Copy an array to another GPU through host memory."""
+def _copy_to_device_via_host(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """Copy an array to another GPU through two pinned host buffers, keeping its C or F layout (into ``out`` if given).
+
+    One chunk of _RELAY_BYTES leaves its GPU while the previous one arrives. The copy has landed on return.
+    """
     with cp.cuda.Device(array.device.id):
-        host = array.get(order="A")
+        if not (array.flags.c_contiguous or array.flags.f_contiguous):
+            array = cp.ascontiguousarray(array)
+        stream = cp.cuda.get_current_stream()
     with cp.cuda.Device(destination):
-        return cp.asarray(host, blocking=True)
+        out = _copy_target(array, destination, out)
+        target = cp.cuda.get_current_stream()
+    step = max(1, min(array.nbytes, _RELAY_BYTES))
+    hosts, free = [cp.cuda.alloc_pinned_memory(step) for _ in range(2)], [None, None]
+    for i, at in enumerate(range(0, array.nbytes, step)):
+        size, host = min(step, array.nbytes - at), hosts[i % 2].ptr
+        with cp.cuda.Device(array.device.id):
+            if free[i % 2] is not None:
+                stream.wait_event(free[i % 2])  # the buffer's last chunk arrived
+            cp.cuda.runtime.memcpyAsync(host, array.data.ptr + at, size, _D2H, stream.ptr)
+            ready = stream.record()
+        with cp.cuda.Device(destination):
+            target.wait_event(ready)
+            cp.cuda.runtime.memcpyAsync(out.data.ptr + at, host, size, _H2D, target.ptr)
+            free[i % 2] = target.record()
+    with cp.cuda.Device(destination):
+        target.synchronize()  # also frees the buffers
+    return out
 
 
-def _copy_to_device(array: cp.ndarray, destination: int) -> cp.ndarray:
-    """Copy an array using P2P when it works, otherwise through the host."""
+def _copy_to_device(array: cp.ndarray, destination: int, *, out: cp.ndarray | None = None) -> cp.ndarray:
+    """``array`` on ``destination``: itself (ignoring ``out``) when it is already there, else a copy that has landed.
+
+    Into ``out`` of the same layout if given, by a validated peer copy or through the host.
+    """
     source = array.device.id
     if source == destination:
         return array
     if _peer_copy_works(destination, source):
-        return _copy_to_device_p2p(array, destination)
-    return _copy_to_device_via_host(array, destination)
+        return _copy_to_device_p2p(array, destination, out=out)
+    return _copy_to_device_via_host(array, destination, out=out)
 
 
 @contextmanager
@@ -124,9 +217,7 @@ def _sum_on_device(arrays: list[cp.ndarray], device: int) -> cp.ndarray:
     return total
 
 
-def _concat_on_device(
-    arrays: list[cp.ndarray], device: int, axis: int = 0
-) -> cp.ndarray:
+def _concat_on_device(arrays: list[cp.ndarray], device: int, axis: int = 0) -> cp.ndarray:
     """Concatenate ``arrays`` on ``device``, holding one cross-device copy at a time."""
     shape = list(arrays[0].shape)
     shape[axis] = sum(array.shape[axis] for array in arrays)
@@ -175,23 +266,27 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
     elif isinstance(multi_gpu, list):
         device_ids = multi_gpu
     else:
-        raise ValueError(
-            f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}"
-        )
+        raise ValueError(f"multi_gpu must be bool, list[int], or str, got {type(multi_gpu)}")
 
     # Validate device IDs
+    if not all(isinstance(d, numbers.Integral) and not isinstance(d, bool) for d in device_ids):
+        raise ValueError(f"multi_gpu device ids must be integers, got {device_ids}.")
     invalid_ids = [d for d in device_ids if d < 0 or d >= n_available]
     if invalid_ids:
-        raise ValueError(
-            f"Invalid GPU device ID(s): {invalid_ids}. "
-            f"Available devices: {list(range(n_available))}"
-        )
+        raise ValueError(f"Invalid GPU device ID(s): {invalid_ids}. Available devices: {list(range(n_available))}")
 
     if len(device_ids) == 0:
         raise ValueError("multi_gpu must specify at least one device")
 
     # Streams are keyed by device; a duplicate would drop a sync barrier
     return list(dict.fromkeys(device_ids))
+
+
+def resolve_stream_devices(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
+    """Device ids of a run: the current device when ``multi_gpu`` is off (``None`` or ``False``)."""
+    if multi_gpu is None or multi_gpu is False:
+        return [cp.cuda.Device().id]
+    return parse_device_ids(multi_gpu=multi_gpu)
 
 
 def _get_device_attrs(device_id: int | None = None) -> dict:
@@ -254,10 +349,7 @@ def _split_pairs(
     n_pairs = len(pair_left)
 
     if n_pairs == 0:
-        return [
-            (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32))
-            for _ in range(n_devices)
-        ]
+        return [(cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)) for _ in range(n_devices)]
 
     # Simple even split if no group sizes provided or single device
     if group_sizes is None or n_devices == 1:
@@ -269,9 +361,7 @@ def _split_pairs(
             if start < n_pairs:
                 chunks.append((pair_left[start:end], pair_right[start:end]))
             else:
-                chunks.append(
-                    (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32))
-                )
+                chunks.append((cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)))
         return chunks
 
     # Load-balanced split based on work per pair
@@ -324,9 +414,7 @@ def _calculate_blocks_per_pair(num_pairs: int) -> int:
     return blocks_per_pair
 
 
-def _create_category_index_mapping(
-    cats: cp.ndarray, n_batches: int
-) -> tuple[cp.ndarray, cp.ndarray]:
+def _create_category_index_mapping(cats: cp.ndarray, n_batches: int) -> tuple[cp.ndarray, cp.ndarray]:
     """Create a CSR-like data structure mapping categories to cell indices.
 
     Uses lexicographical sort to group cells by category.

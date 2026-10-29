@@ -26,21 +26,15 @@ def normalize_variance(self: Scrublet) -> None:
     gene_stdevs = cp.sqrt(gene_stdevs)
     self._counts_obs_norm = sparse_multiply(self._counts_obs_norm.T, 1 / gene_stdevs).T
     if self._counts_sim_norm is not None:
-        self._counts_sim_norm = sparse_multiply(
-            self._counts_sim_norm.T, 1 / gene_stdevs
-        ).T
+        self._counts_sim_norm = sparse_multiply(self._counts_sim_norm.T, 1 / gene_stdevs).T
 
 
 def zscore(self: Scrublet) -> None:
     gene_means, gene_stdevs = _get_mean_var(self._counts_obs_norm, axis=0)
     gene_stdevs = cp.sqrt(gene_stdevs)
-    self._counts_obs_norm = sparse_zscore(
-        self._counts_obs_norm, gene_mean=gene_means, gene_stdev=gene_stdevs
-    )
+    self._counts_obs_norm = sparse_zscore(self._counts_obs_norm, gene_mean=gene_means, gene_stdev=gene_stdevs)
     if self._counts_sim_norm is not None:
-        self._counts_sim_norm = sparse_zscore(
-            self._counts_sim_norm, gene_mean=gene_means, gene_stdev=gene_stdevs
-        )
+        self._counts_sim_norm = sparse_zscore(self._counts_sim_norm, gene_mean=gene_means, gene_stdev=gene_stdevs)
 
 
 def truncated_svd(

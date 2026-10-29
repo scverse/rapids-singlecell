@@ -45,9 +45,7 @@ def sdata():
             index=[f"cell{i}" for i in range(24)],
         ),
     )
-    table = TableModel.parse(
-        table, region=["a", "b"], region_key="region", instance_key="instance"
-    )
+    table = TableModel.parse(table, region=["a", "b"], region_key="region", instance_key="instance")
     return sd.SpatialData(points=points, tables={"cells": table, "other": table.copy()})
 
 
@@ -65,9 +63,7 @@ def _resolve(sdata, **kwargs):
 @pytest.mark.parametrize("shuffle", [False, True])
 def test_centroids_follow_table_order(sdata, shuffle):
     if shuffle:
-        sdata.tables["cells"] = sdata.tables["cells"][
-            np.random.default_rng(0).permutation(24)
-        ].copy()
+        sdata.tables["cells"] = sdata.tables["cells"][np.random.default_rng(0).permutation(24)].copy()
     table, library = _resolve(sdata)
     assert library == "region"
     for i, row in enumerate(table.obs.itertuples()):
@@ -99,9 +95,7 @@ def test_element_centroids(kind):
             index=["a", "b"],
         ),
     )
-    table = TableModel.parse(
-        table, region="cells", region_key="region", instance_key="instance"
-    )
+    table = TableModel.parse(table, region="cells", region_key="region", instance_key="instance")
     data = sd.SpatialData(**{kind: {"cells": element}}, tables={"table": table})
     result, _ = _resolve_spatial_data(
         data,
@@ -129,9 +123,7 @@ def test_neighbors_spatialdata(sdata, name, kwargs, copy):
     reference = table.copy()
     del table.obsm["coords"]
     func = getattr(rsc.gr, name)
-    expected = func(
-        reference, spatial_key="coords", library_key="region", copy=True, **kwargs
-    )
+    expected = func(reference, spatial_key="coords", library_key="region", copy=True, **kwargs)
     actual = func(
         sdata,
         table_key="cells",
@@ -145,9 +137,7 @@ def test_neighbors_spatialdata(sdata, name, kwargs, copy):
     if not copy:
         assert actual is None
         actual = (table.obsp["test_connectivities"], table.obsp["test_distances"])
-        assert (
-            table.uns["test_neighbors"]["connectivities_key"] == "test_connectivities"
-        )
+        assert table.uns["test_neighbors"]["connectivities_key"] == "test_connectivities"
     else:
         assert not table.obsp
         assert "test_neighbors" not in table.uns
@@ -322,9 +312,7 @@ def test_invalid_input_without_spatialdata(monkeypatch):
 
     def without_spatialdata(name, *args, **kwargs):
         if name == "spatialdata":
-            raise ModuleNotFoundError(
-                "No module named 'spatialdata'", name="spatialdata"
-            )
+            raise ModuleNotFoundError("No module named 'spatialdata'", name="spatialdata")
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", without_spatialdata)

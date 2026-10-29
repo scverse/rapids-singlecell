@@ -85,9 +85,7 @@ def _column_chunks(X) -> tuple[int, int]:
     return max(-(-longest // n_chunks), 1), n_chunks
 
 
-def _distinct_values(
-    X, n_guides: int
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+def _distinct_values(X, n_guides: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Sorted distinct non-zero values and their multiplicities per guide, zero padded.
 
     Integer counts below ``_HISTOGRAM_CAP`` are counted in a per-guide histogram by the CSR, CSC or dense kernel, the few other values are sorted.
@@ -123,8 +121,7 @@ def _distinct_values(
     bins = cp.flatnonzero(hist)
     keys = cp.concatenate(
         [
-            ((bins // cap).astype(cp.uint64) << 32)
-            | (bins % cap).astype(cp.float32).view(cp.uint32),
+            ((bins // cap).astype(cp.uint64) << 32) | (bins % cap).astype(cp.float32).view(cp.uint32),
             tail,
         ]
     )
@@ -135,12 +132,8 @@ def _distinct_values(
         return empty, empty, zeros.astype(cp.int32), zeros, zeros
     order = cp.argsort(keys)
     keys, counts = keys[order], counts[order]
-    starts = cp.flatnonzero(
-        cp.concatenate([cp.ones(1, dtype=cp.bool_), keys[1:] != keys[:-1]])
-    )
-    total = cp.concatenate(
-        [cp.zeros(1, dtype=cp.int64), cp.cumsum(counts, dtype=cp.int64)]
-    )
+    starts = cp.flatnonzero(cp.concatenate([cp.ones(1, dtype=cp.bool_), keys[1:] != keys[:-1]]))
+    total = cp.concatenate([cp.zeros(1, dtype=cp.int64), cp.cumsum(counts, dtype=cp.int64)])
     multiplicity = cp.diff(total[cp.append(starts, keys.size)])
     distinct_cols = (keys[starts] >> 32).astype(cp.int64)
     distinct_values = (keys[starts] & 0xFFFFFFFF).astype(cp.uint32).view(cp.float32)
@@ -154,9 +147,7 @@ def _distinct_values(
     weights_padded[distinct_cols, rank] = multiplicity.astype(cp.float32)
     has_values = n_distinct > 0
     max_counts = cp.zeros(n_guides, dtype=cp.float32)
-    max_counts[has_values] = distinct_values[
-        (first_of_guide + n_distinct - 1)[has_values]
-    ]
+    max_counts[has_values] = distinct_values[(first_of_guide + n_distinct - 1)[has_values]]
     return (
         values_padded,
         weights_padded,
@@ -183,12 +174,7 @@ def _fit_mixture(
     n_guides = values.shape[0]
     rng = cp.random.default_rng(seed)
     draws = cp.stack(
-        [
-            rng.standard_normal(
-                (n_init_seeds, _PRIOR_INIT_SAMPLES, n_guides), dtype=cp.float32
-            )
-            for _ in range(3)
-        ]
+        [rng.standard_normal((n_init_seeds, _PRIOR_INIT_SAMPLES, n_guides), dtype=cp.float32) for _ in range(3)]
     )
     n_starts = n_init_seeds + _N_QUANTILE_STARTS
     out = cp.full((n_guides, 6), cp.nan, dtype=cp.float32)
@@ -494,9 +480,7 @@ class GuideAssignment:
         The per-cell assignments if ``only_return_results`` is ``True``, else ``None``.
         """
         if model != "poisson_gauss_mixture":
-            raise ValueError(
-                "Model not implemented. Please use 'poisson_gauss_mixture'."
-            )
+            raise ValueError("Model not implemented. Please use 'poisson_gauss_mixture'.")
         X = X_to_GPU(_get_obs_rep(adata, layer=layer))
         guide_names = np.asarray(adata.var_names, dtype=str)
         n_guides = X.shape[1]
@@ -508,9 +492,7 @@ class GuideAssignment:
                 "Data contains negative values. Please use non-negative data for guide "
                 "assignment with the Mixture Model."
             )
-        values_padded, weights_padded, n_distinct, nonzero_counts, max_counts = (
-            _distinct_values(X, n_guides)
-        )
+        values_padded, weights_padded, n_distinct, nonzero_counts, max_counts = _distinct_values(X, n_guides)
 
         fittable = cp.asnumpy((nonzero_counts >= 2) & (max_counts >= 2))
         skipped = np.flatnonzero(~fittable)
@@ -526,10 +508,7 @@ class GuideAssignment:
         estimates = np.full((n_guides, 6), np.nan)
         if fittable_idx.size > 0:
             if show_progress:
-                print(
-                    f"Fitting Poisson-Gaussian mixture for {fittable_idx.size} guides "
-                    "in parallel."
-                )
+                print(f"Fitting Poisson-Gaussian mixture for {fittable_idx.size} guides in parallel.")
             idx = cp.asarray(fittable_idx)
             estimates[fittable_idx] = _fit_mixture(
                 values_padded[idx],
