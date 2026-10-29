@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+    from cupyx.scipy.sparse import spmatrix
 
 _MIXTURE_MODEL_VAR_COLUMNS = (
     "poisson_rate",
@@ -45,12 +46,12 @@ _MIXTURE_MODEL_VAR_COLUMNS = (
 )
 
 
-def _format_guides(names: Sequence[str], limit: int = 10) -> str:
+def _format_guides(names: Sequence[str] | np.ndarray, limit: int = 10) -> str:
     shown = ", ".join(names[:limit])
     return shown if len(names) <= limit else f"{shown} and {len(names) - limit} more"
 
 
-def _layout(X):
+def _layout(X: cp.ndarray | spmatrix) -> cp.ndarray | cp_csr | cp_csc:
     """CSR or CSC ``X`` with float32 or float64 values for the sparse kernels, or dense ``X`` likewise.
 
     Other sparse formats become CSR, other dtypes float32, and matrices with mixed index dtypes or strided arrays are rebuilt.
@@ -60,11 +61,12 @@ def _layout(X):
             X = X.tocsr()
         arrays = (X.data, X.indices, X.indptr)
         if X.indices.dtype != X.indptr.dtype or not all(a.flags.c_contiguous for a in arrays):
-            X = type(X)(tuple(map(cp.ascontiguousarray, arrays)), shape=X.shape)
+            data, indices, indptr = map(cp.ascontiguousarray, arrays)
+            X = type(X)((data, indices, indptr), shape=X.shape)
     return X if X.dtype in (cp.float32, cp.float64) else X.astype(cp.float32)
 
 
-def _column_chunks(X) -> tuple[int, int]:
+def _column_chunks(X: cp.ndarray | cp_csr | cp_csc) -> tuple[int, int]:
     """Entries per block and blocks per column of CSC or dense ``X``, so long columns fill the GPU."""
     if isspmatrix_csc(X) and X.shape[1]:
         longest = int(cp.diff(X.indptr).max())
@@ -76,7 +78,9 @@ def _column_chunks(X) -> tuple[int, int]:
     return max(-(-longest // n_chunks), 1), n_chunks
 
 
-def _distinct_values(X, n_guides: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+def _distinct_values(
+    X: cp.ndarray | cp_csr | cp_csc, n_guides: int
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Sorted distinct non-zero values and their multiplicities per guide, zero padded.
 
     Integer counts below ``_HISTOGRAM_CAP`` are counted in a per-guide histogram by the CSR, CSC or dense kernel, the few other values are sorted.
@@ -176,7 +180,7 @@ def _fit_mixture(
     return cp.asnumpy(out).astype(np.float64)
 
 
-def _assigned(X, thresholds: cp.ndarray):
+def _assigned(X: cp.ndarray | cp_csr | cp_csc, thresholds: cp.ndarray) -> cp.ndarray | cp_csr | cp_csc:
     """Binary matrix in the layout of ``X`` of the entries at or above their guide's threshold.
 
     Thresholds are rounded to the precision of ``X``, as a scalar would be, and a NaN threshold assigns nothing.
@@ -297,19 +301,19 @@ def _per_cell_assignments(
         labels.append(joined)
         offset += len(joined)
     codes[n_assigned > max_assignments_per_cell] = 1
-    codes = cp.asnumpy(codes)
+    codes_cpu = cp.asnumpy(codes)
     widest = max(label.dtype.itemsize for label in labels)
     if offset * widest > _LABEL_BYTES:
         labels = [label.astype(object) for label in labels]
     names = np.concatenate(labels)
     # Sorted distinct labels, as the categories of pertpy's pd.Categorical.
     used = np.zeros(names.size, dtype=bool)
-    used[codes] = True
+    used[codes_cpu] = True
     used = np.flatnonzero(used)
-    categories, inverse = np.unique(names[used], return_inverse=True)
+    categories, category_codes = np.unique(names[used], return_inverse=True)
     remap = np.empty(names.size, dtype=np.intp)
-    remap[used] = inverse
-    return pd.Categorical.from_codes(remap[codes], categories)
+    remap[used] = category_codes
+    return pd.Categorical.from_codes(remap[codes_cpu], pd.Index(categories))
 
 
 class GuideAssignment:
