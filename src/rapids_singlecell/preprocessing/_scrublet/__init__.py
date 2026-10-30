@@ -48,8 +48,7 @@ def scrublet(
     copy: bool = False,
     rng: SeedLike | RNGLike | None = None,
 ) -> AnnData | None:
-    """\
-    Predict doublets using Scrublet :cite:p:`Wolock2019`.
+    """Predict doublets using Scrublet :cite:p:`Wolock2019`.
 
     Predict cell doublets using a nearest-neighbor classifier of observed
     transcriptomes and simulated doublets. Works best if the input is a raw
@@ -155,14 +154,13 @@ def scrublet(
     ``.uns['scrublet']['parameters']``
         Dictionary of Scrublet parameters
 
-    See also
+    See Also
     --------
     :func:`~rapids_singlecell.pp.scrublet_simulate_doublets`: Run Scrublet's doublet
         simulation separately for advanced usage.
     :func:`~scanpy.pl.scrublet_score_distribution`: Plot histogram of doublet
         scores for observed transcriptomes and simulated doublets.
     """
-
     rng = np.random.default_rng(rng)
 
     if copy:
@@ -240,9 +238,7 @@ def scrublet(
 
     if batch_key is not None:
         if batch_key not in adata.obs.keys():
-            raise ValueError(
-                "`batch_key` must be a column of .obs in the input annData object."
-            )
+            raise ValueError("`batch_key` must be a column of .obs in the input annData object.")
 
         # Run Scrublet independently on batches and return just the
         # scrublet-relevant parts of the objects to add to the input object
@@ -268,9 +264,7 @@ def scrublet(
         # Save the .uns from each batch separately
 
         adata.uns["scrublet"] = {}
-        adata.uns["scrublet"]["batches"] = dict(
-            zip(batches, [scrub["uns"] for scrub in scrubbed])
-        )
+        adata.uns["scrublet"]["batches"] = dict(zip(batches, [scrub["uns"] for scrub in scrubbed], strict=False))
 
         # Record that we've done batched analysis, so e.g. the plotting
         # function knows what to do.
@@ -308,8 +302,7 @@ def _scrublet_call_doublets(
     rng: np.random.Generator,
     verbose: bool = True,
 ) -> AnnData:
-    """\
-    Core function for predicting doublets using Scrublet.
+    """Core function for predicting doublets using Scrublet.
 
     Predict cell doublets using a nearest-neighbor classifier of observed
     transcriptomes and simulated doublets.
@@ -386,7 +379,6 @@ def _scrublet_call_doublets(
     ``.uns['scrublet']['parameters']``
         Dictionary of Scrublet parameters
     """
-
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
     # Estimate n_neighbors if not provided, and create scrublet object.
@@ -457,9 +449,7 @@ def _scrublet_call_doublets(
         "parameters": {
             "expected_doublet_rate": expected_doublet_rate,
             "sim_doublet_ratio": (
-                adata_sim.uns.get("scrublet", {})
-                .get("parameters", {})
-                .get("sim_doublet_ratio", None)
+                adata_sim.uns.get("scrublet", {}).get("parameters", {}).get("sim_doublet_ratio", None)
             ),
             "n_neighbors": n_neighbors,
             **meta_random_state,
@@ -480,9 +470,7 @@ def _scrublet_call_doublets(
         adata_obs.obs["predicted_doublet"] = False
 
     if get_doublet_neighbor_parents:
-        adata_obs.uns["scrublet"]["doublet_neighbor_parents"] = (
-            scrub.doublet_neighbor_parents_
-        )
+        adata_obs.uns["scrublet"]["doublet_neighbor_parents"] = scrub.doublet_neighbor_parents_
 
     return adata_obs
 
@@ -532,14 +520,13 @@ def scrublet_simulate_doublets(
         ``.uns['scrublet']['parameters']``
             Dictionary of Scrublet parameters
 
-    See also
+    See Also
     --------
     :func:`~rapids_singlecell.pp.scrublet`: Main way of running Scrublet, runs
         preprocessing, doublet simulation (this function) and calling.
     :func:`~scanpy.pl.scrublet_score_distribution`: Plot histogram of doublet
         scores for observed transcriptomes and simulated doublets.
     """
-
     rng = np.random.default_rng(rng)
 
     X = _get_obs_rep(adata, layer=layer)

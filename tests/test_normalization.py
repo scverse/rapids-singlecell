@@ -22,9 +22,7 @@ def test_normalize_total(dtype, sparse):
     cudata = AnnData(X)
 
     rsc.pp.normalize_total(cudata, target_sum=1)
-    cp.testing.assert_allclose(
-        cp.ravel(cudata.X.sum(axis=1)), np.ones(cudata.shape[0], dtype=dtype)
-    )
+    cp.testing.assert_allclose(cp.ravel(cudata.X.sum(axis=1)), np.ones(cudata.shape[0], dtype=dtype))
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.int64])
@@ -34,9 +32,7 @@ def test_normalize_total_promotes_dense_integers(dtype):
     rsc.pp.normalize_total(cudata, target_sum=10)
 
     assert cudata.X.dtype == cp.float32
-    cp.testing.assert_allclose(
-        cudata.X.sum(axis=1), cp.full(cudata.n_obs, 10, dtype=cp.float32)
-    )
+    cp.testing.assert_allclose(cudata.X.sum(axis=1), cp.full(cudata.n_obs, 10, dtype=cp.float32))
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -45,14 +41,10 @@ def test_normalize_total_layers(dtype):
     cudata.layers["layer"] = cudata.X.copy()
 
     rsc.pp.normalize_total(cudata, target_sum=1, layer="layer")
-    assert np.allclose(
-        cudata.layers["layer"].sum(axis=1), np.ones(cudata.shape[0], dtype=dtype)
-    )
+    assert np.allclose(cudata.layers["layer"].sum(axis=1), np.ones(cudata.shape[0], dtype=dtype))
 
 
-@pytest.mark.parametrize(
-    "sparsity_func", [cp.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__
-)
+@pytest.mark.parametrize("sparsity_func", [cp.array, csr_matrix, csc_matrix], ids=lambda x: x.__name__)
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("theta", [0.01, 1.0, 100, np.inf])
 @pytest.mark.parametrize("clip", [None, 1.0, np.inf])
@@ -73,9 +65,7 @@ def test_normalize_pearson_residuals_values(sparsity_func, dtype, theta, clip):
 
     # compute output to test
     cudata = AnnData(X=sparsity_func(X, dtype=dtype))
-    output_X = rsc.pp.normalize_pearson_residuals(
-        cudata, theta=theta, clip=clip, inplace=False
-    )
+    output_X = rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=clip, inplace=False)
 
     rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=clip, inplace=True)
     assert np.all(np.isin(["pearson_residuals_normalization"], list(cudata.uns.keys())))
@@ -102,9 +92,7 @@ def test_normalize_pearson_residuals_values(sparsity_func, dtype, theta, clip):
         assert np.min(output_X) >= -clip
 
 
-@pytest.mark.parametrize(
-    "sparsity_func", [csr_matrix, csc_matrix], ids=lambda x: x.__name__
-)
+@pytest.mark.parametrize("sparsity_func", [csr_matrix, csc_matrix], ids=lambda x: x.__name__)
 @pytest.mark.parametrize("theta", [100.0, np.inf])
 def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
     """Regression test: float64 precision of the sparse Pearson-residual kernels.
@@ -134,9 +122,7 @@ def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
         reference = (X - mu) / cp.sqrt(mu + mu**2 / theta)
 
     cudata = AnnData(X=sparsity_func(X, dtype=np.float64))
-    output = rsc.pp.normalize_pearson_residuals(
-        cudata, theta=theta, clip=np.inf, inplace=False
-    )
+    output = rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=np.inf, inplace=False)
 
     # the buggy `sqrtf` path is only ~1e-7 accurate; 1e-9 cleanly separates it
     cp.testing.assert_allclose(output, reference, rtol=1e-9, atol=1e-9)
@@ -257,9 +243,7 @@ def test_normalize_total_exclude_none_highly_expressed(sparse):
     # Normal normalize
     rsc.pp.normalize_total(adata1, target_sum=1e4)
     # With exclude_highly_expressed but max_fraction high enough that nothing is excluded
-    rsc.pp.normalize_total(
-        adata2, target_sum=1e4, exclude_highly_expressed=True, max_fraction=0.99
-    )
+    rsc.pp.normalize_total(adata2, target_sum=1e4, exclude_highly_expressed=True, max_fraction=0.99)
 
     if sparse:
         r1 = adata1.X.toarray()

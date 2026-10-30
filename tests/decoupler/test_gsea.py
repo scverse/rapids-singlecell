@@ -65,7 +65,7 @@ def _reference(mat, sets, times, seed):
             mass = np.abs(same).sum()
             scores[i, j] = es * same.size / mass if mass else 0
             if mass:
-                pvals[i, j] = np.mean(same >= es if es >= 0 else same <= es)
+                pvals[i, j] = ((same >= es if es >= 0 else same <= es).sum() + 1) / (same.size + 1)
     return scores, pvals
 
 
@@ -109,9 +109,7 @@ def test_rank_preserves_numba_ties_and_inverse_at_storage_boundaries(nvar):
     np.testing.assert_array_equal(ranks.get(), np.argsort(expected, axis=1))
 
 
-@pytest.mark.parametrize(
-    "kind", ["dense", "sparse", "signed", "large", "backed", "regression"]
-)
+@pytest.mark.parametrize("kind", ["dense", "sparse", "signed", "large", "backed", "regression"])
 def test_public_outputs_and_batching_match_decoupler(kind, tmp_path):
     rng = np.random.default_rng(825)
     nvar = 4097 if kind == "large" else 2000 if kind == "regression" else 513
@@ -153,7 +151,7 @@ def test_public_outputs_and_batching_match_decoupler(kind, tmp_path):
         times=times,
         seed=42,
     )
-    aligned = [cnct[start : start + length] for start, length in zip(starts, offsets)]
+    aligned = [cnct[start : start + length] for start, length in zip(starts, offsets, strict=False)]
     actual, pval = _run(matrix, aligned, times=times, seed=42)
     np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
     np.testing.assert_array_equal(pval, raw_p)
@@ -167,14 +165,10 @@ def test_public_outputs_and_batching_match_decoupler(kind, tmp_path):
     try:
         for bsize in [1, len(mat)]:
             result = dc.gsea(data, net, times=times, tmin=0, empty=False, bsize=bsize)
-            score, padj = (
-                result if result else (data.obsm["score_gsea"], data.obsm["padj_gsea"])
-            )
+            score, padj = result if result else (data.obsm["score_gsea"], data.obsm["padj_gsea"])
             np.testing.assert_array_equal(score.columns, sources)
             np.testing.assert_allclose(score, expected, rtol=1e-12, atol=1e-12)
-            np.testing.assert_array_equal(
-                padj, false_discovery_control(raw_p, axis=1).astype(np.float32)
-            )
+            np.testing.assert_array_equal(padj, false_discovery_control(raw_p, axis=1).astype(np.float32))
     finally:
         if isinstance(data, AnnData) and data.isbacked:
             data.file.close()
@@ -235,9 +229,7 @@ def test_integer_and_proof_boundaries_against_full_walk(case, seed):
     elif case == "fraction":
         mat[:, :66] = np.linspace(17.25, 0.125, 66)
     elif case == "overflow":
-        mat[:, :66] = np.finfo(np.float32).max * np.linspace(
-            1, 0.75, 66, dtype=np.float32
-        )
+        mat[:, :66] = np.finfo(np.float32).max * np.linspace(1, 0.75, 66, dtype=np.float32)
     elif case == "subnormal":
         mat[:, :66] = np.nextafter(np.float32(0), np.float32(1)) * np.arange(66, 0, -1)
     else:
@@ -280,9 +272,7 @@ def test_cache_chunk_handoff_budget_and_pickle(forward, fits, nvar, times):
     chunks = []
 
     def consume(inverse, permutations):
-        chunks.append(
-            (inverse.copy(), None if permutations is None else permutations.copy())
-        )
+        chunks.append((inverse.copy(), None if permutations is None else permutations.copy()))
 
     with producer:
         cache.run(nvar, times, 42, consume, forward=forward)
@@ -293,14 +283,10 @@ def test_cache_chunk_handoff_budget_and_pickle(forward, fits, nvar, times):
     with consumer:
         cache.run(nvar, times, 42, consume, forward=forward)
         for batch in [first, chunks]:
-            inverse = cp.concatenate([chunk[0] for chunk in batch], axis=1).get(
-                stream=consumer
-            )
+            inverse = cp.concatenate([chunk[0] for chunk in batch], axis=1).get(stream=consumer)
             np.testing.assert_array_equal(inverse, np.argsort(expected, axis=1).T)
             if forward:
-                permutations = cp.concatenate([chunk[1] for chunk in batch]).get(
-                    stream=consumer
-                )
+                permutations = cp.concatenate([chunk[1] for chunk in batch]).get(stream=consumer)
                 np.testing.assert_array_equal(permutations, expected)
     assert (cache.entry is not None) == fits
     with cache.lock:
@@ -311,9 +297,7 @@ def test_cache_chunk_handoff_budget_and_pickle(forward, fits, nvar, times):
 
 @pytest.mark.parametrize("dask_input", [False, True])
 @pytest.mark.parametrize("explicit_cache", [False, True])
-def test_public_cache_is_shared_by_batches_and_scoped_to_call(
-    monkeypatch, dask_input, explicit_cache
-):
+def test_public_cache_is_shared_by_batches_and_scoped_to_call(monkeypatch, dask_input, explicit_cache):
     import dask
     import dask.array as da
 
@@ -355,9 +339,7 @@ def test_public_cache_is_shared_by_batches_and_scoped_to_call(
 
 @pytest.mark.parametrize("max_bytes", [0, 256 * 1024**2])
 @pytest.mark.parametrize("seed", [0, 42])
-def test_streamed_and_cached_scoring_counts_each_permutation_once(
-    monkeypatch, max_bytes, seed
-):
+def test_streamed_and_cached_scoring_counts_each_permutation_once(monkeypatch, max_bytes, seed):
     mat = np.zeros((2, 257), dtype=np.float32)
     mat[:, :66] = np.linspace(3, 1, 66)
     sets = [np.arange(8), np.arange(257), np.arange(65)]

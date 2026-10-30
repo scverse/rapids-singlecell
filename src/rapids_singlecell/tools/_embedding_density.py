@@ -19,9 +19,7 @@ def _basis_obsm_key(adata: AnnData, basis: str) -> str | None:
     if basis in adata.obsm:
         return basis
     embedding, layout = (
-        ("draw_graph", basis.removeprefix("draw_graph_"))
-        if basis.startswith("draw_graph_")
-        else (basis, "")
+        ("draw_graph", basis.removeprefix("draw_graph_")) if basis.startswith("draw_graph_") else (basis, "")
     )
     if embedding in _EMBEDDINGS:
         keys = _existing_preset_keys(adata, embedding, layout=layout)
@@ -38,8 +36,8 @@ def embedding_density(
     key_added: str | None = None,
     components: str | Sequence[str] = None,
 ) -> None:
-    """\
-    Calculate the density of cells in an embedding (per condition).
+    """Calculate the density of cells in an embedding (per condition).
+
     Gaussian kernel density estimation is used to calculate the density of
     cells in an embedded space. This can be performed per category over a
     categorical cell annotation. The cell density can be plotted using the
@@ -154,8 +152,7 @@ def embedding_density(
 
 
 def _calc_density(x: cp.ndarray, y: cp.ndarray) -> np.ndarray:
-    """\
-    Calculates the density of points in 2 dimensions using a Gaussian KDE kernel.
+    """Calculates the density of points in 2 dimensions using a Gaussian KDE kernel.
 
     Uses a covariance-aware bandwidth (Scott's rule) matching
     :class:`scipy.stats.gaussian_kde`, and min-max scales the PDF.

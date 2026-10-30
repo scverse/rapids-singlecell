@@ -25,8 +25,7 @@ def calculate_qc_metrics(
     log1p: bool = True,
     layer: str = None,
 ) -> None:
-    """\
-    Calculate basic quality-control metrics :cite:p:`McCarthy2017`.
+    """Calculate basic quality-control metrics :cite:p:`McCarthy2017`.
 
     Calculates number of genes per cell (n_genes) and number of counts per cell (n_counts).
     Loosely based on calculate_qc_metrics from scanpy :cite:p:`Wolf2018`. Updates :attr:`~anndata.AnnData.obs` and :attr:`~anndata.AnnData.var`  with columns with qc data.
@@ -71,7 +70,6 @@ def calculate_qc_metrics(
                 E.g. 'pct_dropout_by_counts'. Percentage of cells this feature does not appear in.
 
     """
-
     X = _get_obs_rep(adata, layer=layer)
 
     _check_gpu_X(X, allow_dask=True)
@@ -82,9 +80,7 @@ def calculate_qc_metrics(
     adata.var[f"total_{expr_type}"] = cp.asnumpy(sums_genes)
     mean_array = sums_genes / adata.n_obs
     adata.var[f"mean_{expr_type}"] = cp.asnumpy(mean_array)
-    adata.var[f"pct_dropout_by_{expr_type}"] = cp.asnumpy(
-        (1 - cells_per_gene / adata.n_obs) * 100
-    )
+    adata.var[f"pct_dropout_by_{expr_type}"] = cp.asnumpy((1 - cells_per_gene / adata.n_obs) * 100)
     if log1p:
         adata.var[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_genes))
         adata.var[f"log1p_mean_{expr_type}"] = cp.asnumpy(cp.log1p(mean_array))
@@ -92,9 +88,7 @@ def calculate_qc_metrics(
     adata.obs[f"n_{var_type}_by_{expr_type}"] = cp.asnumpy(genes_per_cell)
     adata.obs[f"total_{expr_type}"] = cp.asnumpy(sums_cells)
     if log1p:
-        adata.obs[f"log1p_n_{var_type}_by_{expr_type}"] = cp.asnumpy(
-            cp.log1p(genes_per_cell)
-        )
+        adata.obs[f"log1p_n_{var_type}_by_{expr_type}"] = cp.asnumpy(cp.log1p(genes_per_cell))
         adata.obs[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_cells))
 
     if qc_vars:
@@ -105,13 +99,9 @@ def calculate_qc_metrics(
             sums_cells_sub = _geneset_qc(X, mask)
 
             adata.obs[f"total_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub)
-            adata.obs[f"pct_{expr_type}_{qc_var}"] = cp.asnumpy(
-                sums_cells_sub / sums_cells * 100
-            )
+            adata.obs[f"pct_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub / sums_cells * 100)
             if log1p:
-                adata.obs[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(
-                    cp.log1p(sums_cells_sub)
-                )
+                adata.obs[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(cp.log1p(sums_cells_sub))
 
 
 def _basic_qc(
@@ -198,9 +188,7 @@ def _basic_qc_dask(
                 nnz=X_part.nnz,
                 stream=cp.cuda.get_current_stream().ptr,
             )
-            return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[
-                None, ...
-            ]
+            return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[None, ...]
 
     elif isinstance(X._meta, cp.ndarray):
         from rapids_singlecell._cuda import _qc_dask_cuda as _qcd
@@ -233,13 +221,9 @@ def _basic_qc_dask(
                 n_genes=X_part.shape[1],
                 stream=cp.cuda.get_current_stream().ptr,
             )
-            return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[
-                None, ...
-            ]
+            return cp.vstack([sums_genes, cells_per_gene.astype(X_part.dtype)])[None, ...]
     else:
-        raise ValueError(
-            "Please use a cupy csr_matrix or cp.ndarray. csc_matrix are not supported with dask."
-        )
+        raise ValueError("Please use a cupy csr_matrix or cp.ndarray. csc_matrix are not supported with dask.")
 
     cell_results = X.map_blocks(
         __qc_calc_1,
@@ -348,7 +332,5 @@ def _geneset_qc_dask(X: DaskArray, mask: cp.ndarray) -> cp.ndarray:
             )
             return sums_cells_sub
 
-    sums_cells_sub = X.map_blocks(
-        __qc_calc, dtype=X.dtype, meta=cp.array([]), drop_axis=1
-    ).compute()
+    sums_cells_sub = X.map_blocks(__qc_calc, dtype=X.dtype, meta=cp.array([]), drop_axis=1).compute()
     return sums_cells_sub.ravel()

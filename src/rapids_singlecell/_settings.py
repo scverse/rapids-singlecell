@@ -19,9 +19,7 @@ type HVGFlavor = Literal[
     "pearson_residuals",
     "poisson_gene_selection",
 ]
-type DETest = Literal[
-    "logreg", "t-test", "t-test_overestim_var", "wilcoxon", "wilcoxon_binned"
-]
+type DETest = Literal["logreg", "t-test", "t-test_overestim_var", "wilcoxon", "wilcoxon_binned"]
 
 
 class HVGPreset(NamedTuple):
@@ -108,9 +106,7 @@ class Preset(enum.StrEnum):
 
         `key_added=None` (v1) or `key_added="graph_{layout}"` (v2).
         """
-        return BasicEmbeddingPreset(
-            key_added=None if self is Preset.ScanpyV1 else "graph_{layout}"
-        )
+        return BasicEmbeddingPreset(key_added=None if self is Preset.ScanpyV1 else "graph_{layout}")
 
     @property
     def rank_genes_groups(self) -> RankGenesGroupsPreset:
@@ -119,12 +115,8 @@ class Preset(enum.StrEnum):
         `method="t-test", mean_in_log_space=True` (v1) or `method="wilcoxon", mean_in_log_space=False` (v2).
         """
         return {
-            Preset.ScanpyV1: RankGenesGroupsPreset(
-                method="t-test", mask_var=None, mean_in_log_space=True
-            ),
-            Preset.ScanpyV2Preview: RankGenesGroupsPreset(
-                method="wilcoxon", mask_var=None, mean_in_log_space=False
-            ),
+            Preset.ScanpyV1: RankGenesGroupsPreset(method="t-test", mask_var=None, mean_in_log_space=True),
+            Preset.ScanpyV2Preview: RankGenesGroupsPreset(method="wilcoxon", mask_var=None, mean_in_log_space=False),
         }[self]
 
     @property
@@ -194,8 +186,7 @@ class Default:
         value = self.resolve()
         suffix = (
             " – changes in 2.0"
-            if settings.preset is Preset.ScanpyV1
-            and value != self._get_value(Preset.ScanpyV2Preview)
+            if settings.preset is Preset.ScanpyV1 and value != self._get_value(Preset.ScanpyV2Preview)
             else ""
         )
         return f"{value!r} (settings.preset={str(settings.preset)!r}{suffix})"

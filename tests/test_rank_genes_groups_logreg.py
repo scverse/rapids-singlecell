@@ -48,10 +48,6 @@ def test_rank_genes_groups_with_unsorted_groups():
     bdata = adata.copy()
     rsc.tl.rank_genes_groups_logreg(adata, "blobs", groups=["Zero", "One", "Three"])
     rsc.tl.rank_genes_groups_logreg(bdata, "blobs", groups=["One", "Three", "Zero"])
-    array_ad = pd.DataFrame(
-        adata.uns["rank_genes_groups"]["scores"]["Three"]
-    ).to_numpy()
-    array_bd = pd.DataFrame(
-        bdata.uns["rank_genes_groups"]["scores"]["Three"]
-    ).to_numpy()
+    array_ad = pd.DataFrame(adata.uns["rank_genes_groups"]["scores"]["Three"]).to_numpy()
+    array_bd = pd.DataFrame(bdata.uns["rank_genes_groups"]["scores"]["Three"]).to_numpy()
     np.testing.assert_equal(array_ad, array_bd)

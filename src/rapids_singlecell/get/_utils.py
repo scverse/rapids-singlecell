@@ -39,10 +39,7 @@ def _collection_of(thing: object, typ: type | tuple[type, ...]) -> bool:
 def _require_anndata_acc():
     """Return the accessor namespace or explain the optional version requirement."""
     if A is None:
-        raise ImportError(
-            "AnnData accessor references require a version of `anndata` that "
-            "provides `anndata.acc`."
-        )
+        raise ImportError("AnnData accessor references require a version of `anndata` that provides `anndata.acc`.")
     return A
 
 
@@ -150,18 +147,11 @@ def _get_arr(
         "varm": varm,
         "varp": varp,
     }
-    selected = [
-        (key, value)
-        for key, value in choices.items()
-        if value is not None and value is not False
-    ]
+    selected = [(key, value) for key, value in choices.items() if value is not None and value is not False]
 
     if acc is not None:
         if selected:
-            raise TypeError(
-                "`acc` cannot be combined with `layer`/`use_raw`/`obsm`/"
-                "`obsp`/`varm`/`varp`."
-            )
+            raise TypeError("`acc` cannot be combined with `layer`/`use_raw`/`obsm`/`obsp`/`varm`/`varp`.")
         if isinstance(acc, str):
             acc = _resolve_matrix_acc(acc)
         if not isinstance(acc, GraphAcc | LayerAcc | MultiAcc):
@@ -219,26 +209,18 @@ def _resolve_ref(
         resolved = [_resolve_ref(item) for item in refs]
         n_strings = sum(isinstance(item, str) for item in resolved)
         if n_strings not in {0, len(resolved)}:
-            raise TypeError(
-                "All references must be either AdRefs or strings, not a mix."
-            )
+            raise TypeError("All references must be either AdRefs or strings, not a mix.")
         return resolved
 
     if not isinstance(ref, AdRef | str):
         raise TypeError(f"References must be strings or AdRefs, got {ref!r}.")
-    if (
-        isinstance(ref, AdRef)
-        or settings.preset is not Preset.ScanpyV2Preview
-        or A is None
-    ):
+    if isinstance(ref, AdRef) or settings.preset is not Preset.ScanpyV2Preview or A is None:
         return ref
     resolved = _resolve_vector_acc(ref, strict=False)
     return ref if resolved is None else resolved
 
 
-def _ref_dim(
-    ref: AdRef | str, *, dim: Literal["obs", "var"] | None
-) -> Literal["obs", "var"]:
+def _ref_dim(ref: AdRef | str, *, dim: Literal["obs", "var"] | None) -> Literal["obs", "var"]:
     """Derive and validate the dimension of one vector reference."""
     ref = _resolve_ref(ref)
     if isinstance(ref, str):
@@ -252,18 +234,13 @@ def _ref_dim(
     return ref_dim
 
 
-def _refs_dim(
-    refs: Collection[AdRef | str], *, dim: Literal["obs", "var"] | None = None
-) -> Literal["obs", "var"]:
+def _refs_dim(refs: Collection[AdRef | str], *, dim: Literal["obs", "var"] | None = None) -> Literal["obs", "var"]:
     """Derive the single dimension shared by a collection of references."""
     if not refs:
         raise ValueError("At least one reference is required.")
     dims = {_ref_dim(ref, dim=dim) for ref in refs}
     if len(dims) != 1:
-        raise ValueError(
-            "All references must refer to the same single axis "
-            f"(`obs` or `var`), got {dims}."
-        )
+        raise ValueError(f"All references must refer to the same single axis (`obs` or `var`), got {dims}.")
     return next(iter(dims))
 
 
@@ -338,10 +315,7 @@ def _check_mask(
     if isinstance(mask, AdRef | str):
         mask = _resolve_ref(mask)
         if not isinstance(data, AnnData):
-            raise ValueError(
-                f"Cannot use a reference for {description} without providing "
-                "an AnnData object."
-            )
+            raise ValueError(f"Cannot use a reference for {description} without providing an AnnData object.")
         try:
             mask_array = _get_vec(data, mask, dim=dim)
         except KeyError:
@@ -365,12 +339,8 @@ def _check_mask(
     is_bool = pd.api.types.is_bool_dtype(mask_array.dtype)
     if not allow_probabilities and not is_bool:
         raise ValueError("Mask array must be boolean.")
-    if allow_probabilities and not (
-        is_bool or pd.api.types.is_float_dtype(mask_array.dtype)
-    ):
-        raise ValueError(
-            f"{description.capitalize()} array must be boolean or floating point."
-        )
+    if allow_probabilities and not (is_bool or pd.api.types.is_float_dtype(mask_array.dtype)):
+        raise ValueError(f"{description.capitalize()} array must be boolean or floating point.")
     return mask_array
 
 

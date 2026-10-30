@@ -48,8 +48,7 @@ def highly_variable_genes(
     n_samples: int = 10000,
     batch_key: str | None = None,
 ) -> None:
-    """\
-    Annotate highly variable genes :cite:p:`Satija2015,Zheng2017,Stuart2019,Lause2021,Andrews2019`.
+    """Annotate highly variable genes :cite:p:`Satija2015,Zheng2017,Stuart2019,Lause2021,Andrews2019`.
 
     Expects logarithmized data, except when `flavor='seurat_v3','seurat_v3_paper','pearson_residuals','poisson_gene_selection'`, in which count data is expected.
 
@@ -212,12 +211,8 @@ def highly_variable_genes(
         adata.var["highly_variable"] = df["highly_variable"]
         adata.var["means"] = df["means"]
         adata.var["dispersions"] = df["dispersions"]
-        adata.var["dispersions_norm"] = df["dispersions_norm"].astype(
-            np.float32, copy=False
-        )
+        adata.var["dispersions_norm"] = df["dispersions_norm"].astype(np.float32, copy=False)
 
         if batch_key is not None:
             adata.var["highly_variable_nbatches"] = df["highly_variable_nbatches"]
-            adata.var["highly_variable_intersection"] = df[
-                "highly_variable_intersection"
-            ]
+            adata.var["highly_variable_intersection"] = df["highly_variable_intersection"]

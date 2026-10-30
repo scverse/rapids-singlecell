@@ -33,14 +33,6 @@ static inline void cuda_check_runtime(cudaError_t err, const char* what) {
     }
 }
 
-static inline void cusolver_check(cusolverStatus_t status, const char* what) {
-    if (status != CUSOLVER_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string(what) +
-                                 " failed with cuSOLVER status " +
-                                 std::to_string(static_cast<int>(status)));
-    }
-}
-
 // Typed wrappers for the batched Cholesky (cuSOLVER) and triangular solve
 // (cuBLAS) used by the full-covariance precision-Cholesky.
 template <typename T>
