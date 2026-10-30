@@ -17,7 +17,6 @@ from rapids_singlecell._cuda import (
     _harmony_correction_batched_cuda as _correction_batched_cuda,
 )
 from rapids_singlecell._cuda import _harmony_correction_cuda as _correction_cuda
-from rapids_singlecell._utils import _create_category_index_mapping
 from rapids_singlecell._utils._multi_gpu import _copy_to_device
 from rapids_singlecell._utils._random import _seed_from_rng
 
@@ -364,10 +363,11 @@ def harmonize(
             _sorted_groups(offsets, lo, hi, device)
             for device, lo, hi in zip(devices, bounds[:-1], bounds[1:], strict=True)
         ]
-        # Exact int64 sums of block counts, right-hand sides and centroids.
+        # Exact int64 sums of block counts, joint counts, right-hand sides and centroids.
         capacity = n_clusters * max(
             (n_blocks if keep else 1) * n_batches,
-            _limbs(dtype.itemsize) * n_groups * n_pcs,
+            n_groups,
+            _limbs(dtype.itemsize) * n_batches * n_pcs,
             3 * n_pcs,
         )
 
@@ -378,7 +378,10 @@ def harmonize(
         # Read after the upload, whose host staging overlaps the sort.
         if not bool(cp.isfinite(theta_array).all()):
             raise ValueError(f"theta must be finite, got {theta}.")
-        rhs_bounds = _rhs_bounds(shards, offsets, bounds)
+        level_offsets = [0, *np.cumsum(n_levels).tolist()]
+        rhs_bounds = _rhs_bounds(
+            shards, offsets, bounds, joint_cats=joint.get("joint_cats"), level_offsets=level_offsets
+        )
 
         # Initialize algorithm
         shards = [
@@ -414,12 +417,12 @@ def harmonize(
             lo, hi = bounds[rank], bounds[rank + 1]
             groups, shard_groups[rank] = shard_groups[rank], None
             mine, local[rank] = local[rank], None
-            joint_args = {name: mine[name] for name in joint}
             N_b_local, sums = mine["N_b"], {"comm": comm, "rank": rank}
             seg_start, seg_group = _segments(offsets, unit, lo, hi)
             segments = (seg_start, seg_group, mine["rhs_bounds"])
             if n_covariates > 1:  # centroid sums need no group cuts
                 seg_start = _segments(offsets[[0, -1]], unit, lo, hi)[0]
+                seg_levels = _segment_levels(mine["joint_cats"], seg_group, level_offsets)
             Pr_b = (N_b_local / n_cells).astype(dtype)
             # The update blocks are drawn once per call, before the large arrays
             # exist; with several keys the assignment tiles take any cells.
@@ -455,7 +458,7 @@ def harmonize(
                 Pr_b=Pr_b,
                 theta=mine["theta"],
                 seg_start=seg_start,
-                joint_cats=joint_args.get("joint_cats"),
+                joint_cats=mine.get("joint_cats"),
                 joints=joints,
                 **workspace,
                 force_blocks=_FORCE_CLUSTER_BLOCKS,
@@ -507,9 +510,11 @@ def harmonize(
                     Z_hat = _correction_multi(
                         X,
                         R,
+                        O=O,
                         lambda_kb=lambda_kb,
-                        n_first=int(n_levels[0]),
-                        **joint_args,
+                        joint_cats=mine["joint_cats"],
+                        seg_levels=seg_levels,
+                        level_offsets=level_offsets,
                         segments=segments,
                         output=Z_norm,
                         normalize=normalize,
@@ -567,8 +572,9 @@ def _sort_by_batch(
     """
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates, n_batches = int(n_levels.size), int(n_levels.sum())
-    # Several keys solve a dense float64 system over all their levels per
-    # cluster (and factor a copy); fail before the GPU work if it cannot fit.
+    # Several keys assemble a dense float64 system over all their levels per
+    # cluster and factor a copy (float32, or float64 when the solve falls back,
+    # which the bound sizes); fail before the GPU work if it cannot fit.
     system_bytes = 16 * (n_batches + 1) ** 2
     if n_covariates > 1 and system_bytes > _CORRECTION_WORKSPACE_LIMIT_BYTES:
         raise MemoryError(
@@ -581,18 +587,9 @@ def _sort_by_batch(
     groups, counts, joint = batch_codes[:, 0], N_b, {}
     if n_covariates > 1:
         joint_cats, groups = _factorize_joint_codes(batch_codes, n_levels)
-        if joint_cats.size > 2**31 - 2**24:  # int32 (category, key) positions
-            raise ValueError(
-                f"harmonize supports at most {2**31 - 2**24} joint categories x keys, got {joint_cats.size}."
-            )
         counts = cp.zeros(joint_cats.shape[0], dtype=cp.int32)
         cp.add.at(counts, groups, 1)
-        marginal = _create_category_index_mapping(joint_cats.ravel(), n_batches)
-        joint = {
-            "joint_cats": joint_cats,
-            "marginal_joint_offsets": marginal[0],
-            "marginal_joint_indices": (marginal[1] // n_covariates).astype(cp.int32),
-        }
+        joint = {"joint_cats": joint_cats}
     # A seeded random order within each group, so the runs of neighbouring
     # cells shuffled together are random cells of a group. The counts are read
     # (waiting for the GPU) before the sort is queued.
@@ -741,36 +738,56 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
     return {"R": R}
 
 
-def _rhs_bounds(parts: list[cp.ndarray], offsets: np.ndarray, bounds: list[int]) -> cp.ndarray:
+def _rhs_bounds(
+    parts: list[cp.ndarray],
+    offsets: np.ndarray,
+    bounds: list[int],
+    *,
+    joint_cats: cp.ndarray | None = None,
+    level_offsets: list[int] | None = None,
+) -> cp.ndarray:
     """Bounds of the exact right-hand side sums (segment_gemm.cuh), on the current GPU.
 
     The exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells (sorted by group, ``offsets`` on
-    the host) and PC d, so no other group or PC coarsens a sum. ``parts`` hold the cells
-    ``bounds[r] .. bounds[r + 1]``; each GPU takes the maxima of its own groups (a group spanning GPUs from each),
-    which are exact, so every split gives the same bounds.
+    the host) and PC d, so no other group or PC coarsens a sum: the batches with one key; with several
+    (``joint_cats``: the levels of the joint categories, ``level_offsets``: the first level of each key and the
+    end), every key's levels in key order. ``parts`` hold the cells ``bounds[r] .. bounds[r + 1]``; each GPU takes
+    the maxima of its own cells, which are exact, so every split gives the same bounds.
     """
-    maxima = cp.zeros((len(offsets) - 1, parts[0].shape[1]), dtype=parts[0].dtype)
+    n_pcs, counts = parts[0].shape[1], np.diff(offsets).astype(np.int64)
+    if joint_cats is not None:  # cells per level: those of its joint categories
+        cats, n = cp.asnumpy(joint_cats), np.zeros(level_offsets[-1], dtype=np.int64)
+        for c in range(cats.shape[1]):
+            np.add.at(n, cats[:, c], counts)
+    else:
+        n = counts
+    maxima = cp.zeros((len(n), n_pcs), dtype=parts[0].dtype)
     for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
-        # the groups of the cells lo .. hi - 1
-        first, end = np.searchsorted(offsets, [lo, hi - 1], side="right") - [1, 0]
         with cp.cuda.Device(part.device.id):
             seg_start, seg_group = _segments(offsets, _SEGMENT, lo, hi)
-            seg_group -= int(first)  # rows of m
-            m = cp.empty((end - first, part.shape[1]), dtype=part.dtype)
-            _correction_batched_cuda.group_absmax(
+            absmax = functools.partial(
+                _correction_batched_cuda.group_absmax,
                 part,
                 seg_start=seg_start,
-                seg_group=seg_group,
-                out=m,
                 stream=cp.cuda.get_current_stream().ptr,
             )
+            if joint_cats is None:  # the groups of the cells lo .. hi - 1
+                first, end = np.searchsorted(offsets, [lo, hi - 1], side="right") - [1, 0]
+                m = cp.empty((end - first, n_pcs), dtype=part.dtype)
+                absmax(seg_group=seg_group - int(first), out=m)
+            else:  # every level of every key, from the segments' joint categories
+                first, end = 0, len(n)
+                m = cp.empty((len(n), n_pcs), dtype=part.dtype)
+                levels = _segment_levels(_copy_to_device(joint_cats, part.device.id), seg_group, level_offsets)
+                for c, (lo_c, hi_c) in enumerate(zip(level_offsets[:-1], level_offsets[1:], strict=True)):
+                    absmax(seg_group=levels[c], out=m[lo_c:hi_c])
         rows = maxima[first:end]
         cp.maximum(rows, _copy_to_device(m, maxima.device.id), out=rows)
     if not bool(cp.isfinite(maxima).all()):
         raise ValueError(
             "Input data contains NaN or infinite values. Please handle these before running harmony_integrate."
         )
-    n = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None]
+    n = cp.asarray(n, dtype=cp.float64)[:, None]
     rhs = n * maxima  # beyond float64 near 1e308: n < 2^a, max < 2^b
     exp = cp.frexp(cp.where(rhs > 0, rhs, 1.0))[1]
     exp = cp.where(cp.isinf(rhs), cp.frexp(n)[1] + cp.frexp(maxima)[1], exp)
@@ -792,6 +809,11 @@ def _segments(
     start = np.union1d(start, grid)
     group = np.searchsorted(offsets, start[:-1], side="right") - 1
     return cp.asarray(start - lo, dtype=cp.int32), cp.asarray(group, dtype=cp.int32)
+
+
+def _segment_levels(joint_cats: cp.ndarray, seg_group: cp.ndarray, level_offsets: list[int]) -> cp.ndarray:
+    """Each segment's level within every key (keys x segments); segments never straddle a joint category."""
+    return cp.ascontiguousarray((joint_cats[seg_group] - cp.asarray(level_offsets[:-1], dtype=cp.int32)).T)
 
 
 def _sorted_groups(offsets: np.ndarray, lo: int, hi: int, device: int) -> cp.ndarray:
@@ -1005,11 +1027,11 @@ def _correction_multi(
     X: cp.ndarray,
     R: cp.ndarray,
     *,
+    O: cp.ndarray,
     lambda_kb: cp.ndarray,
-    n_first: int,
     joint_cats: cp.ndarray,
-    marginal_joint_offsets: cp.ndarray,
-    marginal_joint_indices: cp.ndarray,
+    seg_levels: cp.ndarray,
+    level_offsets: list[int],
     segments: tuple,
     output: cp.ndarray | None = None,
     normalize: bool = False,
@@ -1018,8 +1040,11 @@ def _correction_multi(
 ) -> cp.ndarray:
     """Apply the exact general-design correction in bounded cluster chunks.
 
-    The cells are sorted by joint category (``segments`` as for _correction_batched), with the joint counts of R over
-    the ``n_total`` cells of all GPUs.
+    The cells are sorted by joint category (``segments`` as for _correction_batched, the bounds per level),
+    ``seg_levels`` (keys x segments) holds each segment's level within its key and
+    ``level_offsets`` the first level of each key; the counts and sums run over the ``n_total`` cells of all GPUs.
+    The cluster systems are solved in float32 and refined in float64 as the counts ``O`` and the ridge call for
+    (_refinement_steps; correction_batched.cu).
     """
     seg_start, seg_group, bounds = segments
     Z = _correction_output(X, output)
@@ -1028,9 +1053,8 @@ def _correction_multi(
         R=R,
         lambda_kb=lambda_kb,
         joint_cats=joint_cats,
-        marginal_joint_offsets=marginal_joint_offsets,
-        marginal_joint_indices=marginal_joint_indices,
-        n_first=n_first,
+        seg_levels=seg_levels,
+        level_offsets=level_offsets,
         seg_start=seg_start,
         seg_group=seg_group,
         bounds=bounds,
@@ -1045,12 +1069,30 @@ def _correction_multi(
         ),
         suppress=_SUPPRESS_PENALTY,
         n_total=n_total,
+        refine=_refinement_steps(O, lambda_kb, len(level_offsets) - 1, X.dtype.itemsize),
         stream=cp.cuda.get_current_stream().ptr,
         blas=cp.cuda.device.get_cublas_handle(),
         solver=cp.cuda.device.get_cusolver_handle(),
         **({} if sums is None else sums),
     )
     return Z
+
+
+def _refinement_steps(O: cp.ndarray, lambda_kb: cp.ndarray, n_covariates: int, itemsize: int) -> int:
+    """Float64 refinement steps of the float32 cluster solves of the several-keys correction, or -1 for float64.
+
+    Equilibrated, a cluster's system has a unit diagonal and a largest eigenvalue below the number of design blocks
+    (intercept and keys); in the design's null directions only the ridge acts, spread over those blocks, and the
+    intercept has none, so the smallest eigenvalue is at least ``lambda / ((O + lambda) (n_covariates + 1))`` and the
+    condition number at most ``(n_covariates + 1)**2 max (O + lambda) / lambda``. Each step gains that factor times
+    2**-24; the count reaches 2**-20 relative error for float32 data and the rounding level of a float64 solve
+    (1e-15 as the proxy) for float64, else the float64 solve (more steps would cost more than its factorization).
+    """
+    rho = (n_covariates + 1) ** 2 * float(cp.max((O + lambda_kb) / lambda_kb)) * 2.0**-24  # suppressed levels: ~1
+    if not rho < 0.1:
+        return -1
+    steps = math.ceil(math.log(2.0**-20 if itemsize == 4 else 1e-15) / math.log(rho)) - 1
+    return steps if steps <= 4 else -1
 
 
 def _multi_correction_cluster_chunk_size(
@@ -1063,17 +1105,18 @@ def _multi_correction_cluster_chunk_size(
 ) -> int:
     """Choose a cluster chunk that keeps multi-key scratch below 1 GiB (one cluster at a time above that)."""
     nb1 = n_batches + 1
-    # Double Gram and RHS with the solver's copies, joint right-hand sides
-    # (double) and coefficients, exact joint sums, and joint counts. The chunk
-    # sets the results (correction_batched.cu), so the terms of buffers that
-    # are gone stay: the solver's Gram copies, coefficients in X's dtype and a
-    # sliced lambda and mask.
+    # Double Gram and right-hand sides, the float32 systems with their scaling
+    # and residuals, the round's coefficients, the exact per-level sums (int64
+    # limbs), the joint counts (int64) and the applied coefficients in X's
+    # dtype. The chunk sets the results (correction_batched.cu), so the terms
+    # of buffers that are gone stay (the solver's Gram copies).
     per_cluster = (
         16 * (nb1 * nb1 + nb1 * n_pcs)
+        + 4 * (nb1 * nb1 + nb1 * n_pcs)
+        + 8 * nb1 * (1 + 2 * n_pcs)
+        + 8 * _limbs(itemsize) * nb1 * n_pcs
+        + 8 * n_joint_categories
         + itemsize * nb1 * n_pcs
-        + n_joint_categories * ((8 + itemsize) * n_pcs + itemsize)
-        + 8 * _limbs(itemsize) * n_joint_categories * n_pcs
-        + (itemsize + 1) * n_batches
     )
     return max(1, min(n_clusters, _CORRECTION_WORKSPACE_LIMIT_BYTES // per_cluster))
 
