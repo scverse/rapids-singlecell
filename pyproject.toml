@@ -194,7 +194,7 @@ lint.isort.required-imports = [ "from __future__ import annotations" ]
 lint.pydocstyle.convention = "numpy"
 
 [tool.codespell]
-ignore-words-list = "nd,indext,coo,alo,clen,fo,ot,numer"
+ignore-words-list = "nd,indext,coo,alo,clen,fo,ot,numer,ontrol"
 skip = "*.ipynb,*.csv"
 
 [tool.mypy]
@@ -262,6 +262,7 @@ module = [
   "rapids_singlecell.pertpy_gpu._metrics._wasserstein",
   "rapids_singlecell.pertpy_gpu._mixscale",
   "rapids_singlecell.pertpy_gpu._mixscape",
+  "rapids_singlecell.preprocessing._dsb",
   "rapids_singlecell.preprocessing._harmony",
   "rapids_singlecell.preprocessing._harmony._chunks_to_device",
   "rapids_singlecell.preprocessing._harmony._helper",

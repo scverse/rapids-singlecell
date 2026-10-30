@@ -3,6 +3,7 @@ from __future__ import annotations
 from .preprocessing import (
     bbknn,
     calculate_qc_metrics,
+    dsb,
     filter_cells,
     filter_genes,
     harmony_integrate,
@@ -28,6 +29,7 @@ from .preprocessing import (
 __all__ = [
     "bbknn",
     "calculate_qc_metrics",
+    "dsb",
     "filter_cells",
     "filter_genes",
     "harmony_integrate",

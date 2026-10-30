@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ._dsb import dsb
 from ._harmony_integrate import harmony_integrate
 from ._hvg import highly_variable_genes
 from ._neighbors import bbknn, neighbors

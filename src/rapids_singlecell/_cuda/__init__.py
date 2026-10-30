@@ -21,6 +21,7 @@ __all__ = [
     "_autocorr_cuda",
     "_bbknn_cuda",
     "_cooc_cuda",
+    "_dsb_cuda",
     "_edistance_cuda",
     "_gsea_cuda",
     "_gsva_cuda",
