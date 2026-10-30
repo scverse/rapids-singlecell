@@ -11,7 +11,7 @@ from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
-from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_host
+from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_host
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
@@ -678,7 +678,10 @@ def test_has_canonical_format_host_matches_scipy(n_rows, dtype):
     "multi_gpu",
     [False, pytest.param([0, 1], marks=pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="needs 2 GPUs"))],
 )
-def test_wilcoxon_host_csr_strided_indices(multi_gpu, reference):
+def test_wilcoxon_host_csr_strided_indices(multi_gpu, reference, monkeypatch):
+    # Several column batches, so batch boundaries search the (sorted) rows.
+    for ovr in (True, False):
+        monkeypatch.setitem(_wilcoxon._SUB_BATCH, ("csr_host", ovr), 8)
     rng = np.random.default_rng(7)
     n_cells, n_genes = 120, 30
     pairs = np.sort(np.argsort(rng.random((n_cells, n_genes)), axis=1)[:, :2], axis=1).astype(np.int32)
@@ -698,7 +701,6 @@ def test_wilcoxon_host_csr_strided_indices(multi_gpu, reference):
             method="wilcoxon",
             reference=reference,
             tie_correct=True,
-            chunk_size=8,  # several column batches: boundaries search sorted rows
             multi_gpu=multi_gpu,
             use_raw=False,
         )
@@ -708,19 +710,20 @@ def test_wilcoxon_host_csr_strided_indices(multi_gpu, reference):
             np.testing.assert_array_equal(results[1][field][group], results[0][field][group])
 
 
-# chunk_size wider than the genes, or than the host-CSR column histogram fits
-# in shared memory (one int per column), is clamped to the default result.
+# Batch widths beyond the genes, free memory or the host-CSR column histogram's
+# shared memory (one int per column) are clamped and give the default result.
 @pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "cupy_dense"])
-def test_wilcoxon_wide_chunk_size_matches_default(fmt):
+def test_wilcoxon_wide_batches_match_default(fmt, monkeypatch):
     rng = np.random.default_rng(8)
     X = _to_format(rng.poisson(0.3, (40, 13_000)).astype(np.float32), fmt)
     obs = pd.DataFrame({"g": pd.Categorical(np.repeat(list("ab"), 20))}, index=[str(i) for i in range(40)])
     results = []
-    for chunk_size in (None, 20_000):
+    for wide in (False, True):
+        if wide:
+            for key in list(_wilcoxon._SUB_BATCH):
+                monkeypatch.setitem(_wilcoxon._SUB_BATCH, key, 20_000)
         adata = sc.AnnData(X=X, obs=obs.copy())
-        rsc.tl.rank_genes_groups(
-            adata, "g", method="wilcoxon", chunk_size=chunk_size, multi_gpu=False, n_genes=100, use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", multi_gpu=False, n_genes=100, use_raw=False)
         results.append(adata.uns["rank_genes_groups"])
     for field in ("names", "scores", "pvals"):
         for group in ("a", "b"):
@@ -1616,8 +1619,9 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
     assert adata.uns["rank_genes_groups"]["names"].dtype.names == bdata.uns["rank_genes_groups"]["names"].dtype.names
 
 
-def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
+def test_wilcoxon_host_csr_signed_ovr_matches_scanpy(monkeypatch):
     """Host CSR OVR ranks signed stored values correctly."""
+    monkeypatch.setitem(_wilcoxon._SUB_BATCH, ("csr_host", True), 8)  # several batches
     rng = np.random.default_rng(0)
     n_obs, n_vars = 200, 24
     X = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
@@ -1638,7 +1642,6 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
         pts=True,
         tie_correct=True,
         n_genes=n_vars,
-        chunk_size=8,  # < n_vars -> multiple chunks
     )
     sc.tl.rank_genes_groups(
         cpu,
@@ -1952,8 +1955,6 @@ def test_rank_genes_groups_default_method_is_ttest():
     [
         ({"method": "nope"}, ValueError, "method must be one of"),
         ({"corr_method": "foo"}, ValueError, "corr_method must be either"),
-        ({"chunk_size": 0}, ValueError, "chunk_size must be a positive integer"),
-        ({"chunk_size": -4}, ValueError, "chunk_size must be a positive integer"),
         ({"groups": "0"}, ValueError, "Specify a sequence of groups"),
         ({"reference": "ZZ"}, ValueError, "needs to be one of groupby"),
     ],
@@ -1964,6 +1965,19 @@ def test_rank_genes_groups_invalid_args_raise(override, exc, match):
     kwargs = {"method": "wilcoxon", "use_raw": False, **override}
     with pytest.raises(exc, match=match):
         rsc.tl.rank_genes_groups(adata, "group", **kwargs)
+
+
+# chunk_size is deprecated: it warns and does not change the result.
+def test_rank_genes_groups_chunk_size_deprecated():
+    adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
+    expected = adata.copy()
+    rsc.tl.rank_genes_groups(expected, "group", method="wilcoxon", use_raw=False)
+    with pytest.warns(FutureWarning, match="chunk_size"):
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, chunk_size=8)
+    for group in ("0", "1"):
+        np.testing.assert_array_equal(
+            adata.uns["rank_genes_groups"]["scores"][group], expected.uns["rank_genes_groups"]["scores"][group]
+        )
 
 
 def test_rank_genes_groups_mask_var_missing_key_raises():

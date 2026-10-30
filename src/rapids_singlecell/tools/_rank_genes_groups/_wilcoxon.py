@@ -136,7 +136,6 @@ def wilcoxon(
     *,
     tie_correct: bool,
     use_continuity: bool = False,
-    chunk_size: int | None = None,
     multi_gpu: bool | list[int] | str | None = None,
     return_u_values: bool = False,
 ) -> _WilcoxonResult | None:
@@ -154,7 +153,6 @@ def wilcoxon(
         rg,
         tie_correct=tie_correct,
         use_continuity=use_continuity,
-        chunk_size=chunk_size,
         multi_gpu=multi_gpu,
         return_u_values=return_u_values,
         shard_runner=_run_wilcoxon_shard,
@@ -166,7 +164,6 @@ def _run_wilcoxon_shard(
     *,
     tie_correct: bool,
     use_continuity: bool,
-    chunk_size: int | None,
     return_u_values: bool,
     column_range: tuple[int, int] | None = None,
     sparse_row_spans: tuple[np.ndarray, np.ndarray] | None = None,
@@ -193,7 +190,7 @@ def _run_wilcoxon_shard(
         "compute_tie_corr": tie_correct,
         "compute_nnz": rg.comp_pts,
         "col_start": col_start,
-        "sub_batch_cols": _SUB_BATCH[layout, ovr] if chunk_size is None else chunk_size,
+        "sub_batch_cols": _SUB_BATCH[layout, ovr],
         # Expression-space means sum expm1 of the log1p values in the same pass.
         "expm1_scale": 0.0 if rg.mean_in_log_space else _log1p_scale(rg),
     }

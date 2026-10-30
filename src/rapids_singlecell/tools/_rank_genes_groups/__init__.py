@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import pandas as pd
-from scverse_misc import Deprecation, deprecated
+from scverse_misc import Deprecation, deprecated, deprecated_arg
 
 from rapids_singlecell._settings import Default, resolve_default, settings
 
@@ -41,6 +41,13 @@ def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
     return _matrix_to_records(values, arrays["group_names"], np.dtype(object))
 
 
+_CHUNK_SIZE_DEPRECATION = Deprecation(
+    "0.19.0",
+    "Both Wilcoxon tests size their gene batches from the data and free GPU memory. The argument is ignored.",
+)
+
+
+@deprecated_arg("chunk_size", _CHUNK_SIZE_DEPRECATION)
 def rank_genes_groups(
     adata: AnnData,
     groupby: str,
@@ -157,10 +164,7 @@ def rank_genes_groups(
         latter is more accurate in the presence of outliers. The Scanpy 1
         preset defaults to `True`; the Scanpy 2 preview defaults to `False`.
     chunk_size
-        Number of genes to process at once for `'wilcoxon'` and
-        `'wilcoxon_binned'`. For `'wilcoxon'` the default depends on the
-        input layout. For `'wilcoxon_binned'` the default is sized dynamically
-        based on ``n_groups`` and ``n_bins`` to keep histogram memory stable.
+        Deprecated and ignored.
     multi_gpu
         GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
         and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
@@ -263,10 +267,6 @@ def rank_genes_groups(
         )
         raise ValueError(msg)
 
-    if chunk_size is not None and chunk_size <= 0:
-        msg = "chunk_size must be a positive integer."
-        raise ValueError(msg)
-
     if key_added is None:
         key_added = "rank_genes_groups"
 
@@ -309,7 +309,6 @@ def rank_genes_groups(
         tie_correct=tie_correct,
         use_continuity=use_continuity,
         return_u_values=return_u_values,
-        chunk_size=chunk_size,
         multi_gpu=multi_gpu,
         n_bins=n_bins,
         bin_range=bin_range,

@@ -247,7 +247,6 @@ class _RankGenes:
         tie_correct: bool = False,
         use_continuity: bool = False,
         n_bins: int | None = None,
-        chunk_size: int | None = None,
         bin_range: Literal["log1p", "auto"] | None = None,
     ) -> list[tuple[int, NDArray, NDArray]]:
         """Histogram-based approximate Wilcoxon rank-sum test."""
@@ -258,7 +257,6 @@ class _RankGenes:
             tie_correct=tie_correct,
             use_continuity=use_continuity,
             n_bins=n_bins,
-            chunk_size=chunk_size,
             bin_range=bin_range,
         )
 
@@ -278,7 +276,6 @@ class _RankGenes:
         mean_in_log_space: bool = True,
         tie_correct: bool = False,
         use_continuity: bool = False,
-        chunk_size: int | None = None,
         multi_gpu: bool | list[int] | str | None = None,
         n_bins: int | None = None,
         bin_range: Literal["log1p", "auto"] | None = None,
@@ -322,7 +319,6 @@ class _RankGenes:
                 self,
                 tie_correct=tie_correct,
                 use_continuity=use_continuity,
-                chunk_size=chunk_size,
                 multi_gpu=multi_gpu,
                 return_u_values=return_u_values,
             )
@@ -332,7 +328,6 @@ class _RankGenes:
                 tie_correct=tie_correct,
                 use_continuity=use_continuity,
                 n_bins=n_bins,
-                chunk_size=chunk_size,
                 bin_range=bin_range,
             )
             if not mean_in_log_space:

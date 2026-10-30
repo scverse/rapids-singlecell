@@ -115,7 +115,6 @@ def wilcoxon_binned(
     tie_correct: bool = False,
     use_continuity: bool = False,
     n_bins: int | None = None,
-    chunk_size: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Histogram-based approximate Wilcoxon rank-sum test."""
@@ -286,19 +285,16 @@ def wilcoxon_binned(
     if use_multi_stream:
         from ._stream_multi_gpu import run_binned_hist_multi
 
-    if chunk_size is not None:
-        chunk_width = chunk_size
-    else:
-        chunk_width = _auto_chunk_width(
-            n_genes,
-            n_groups,
-            n_hist_groups,
-            n_bins_total,
-            device_ids=device_ids,
-            ireference=ireference,
-            tie_correct=tie_correct,
-            gathers_multi_gpu=use_multi_stream,
-        )
+    chunk_width = _auto_chunk_width(
+        n_genes,
+        n_groups,
+        n_hist_groups,
+        n_bins_total,
+        device_ids=device_ids,
+        ireference=ireference,
+        tie_correct=tie_correct,
+        gathers_multi_gpu=use_multi_stream,
+    )
 
     is_host_csr = sp.issparse(X) and X.format == "csr"
     is_host_csc = sp.issparse(X) and X.format == "csc"

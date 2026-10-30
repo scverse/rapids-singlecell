@@ -6,6 +6,7 @@ import pytest
 import scanpy as sc
 
 import rapids_singlecell as rsc
+from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_binned
 from testing.rapids_singlecell._helper import ARRAY_TYPES_MEM
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
@@ -163,32 +164,19 @@ class TestWilcoxonBinnedParameters:
                 assert np.all(pvals >= 0)
                 assert np.all(pvals <= 1)
 
-    def test_chunk_size(self, adata_blobs):
-        """Test with different chunk_size values produce same results."""
-        adata_small = adata_blobs.copy()
-        adata_large = adata_blobs.copy()
-        rsc.get.anndata_to_GPU(adata_small)
-        rsc.get.anndata_to_GPU(adata_large)
-
-        rsc.tl.rank_genes_groups(
-            adata_small,
-            "blobs",
-            method="wilcoxon_binned",
-            use_raw=False,
-            chunk_size=3,
-        )
-        rsc.tl.rank_genes_groups(
-            adata_large,
-            "blobs",
-            method="wilcoxon_binned",
-            use_raw=False,
-            chunk_size=1000,
-        )
-
-        for group in adata_small.uns["rank_genes_groups"]["scores"].dtype.names:
-            scores_small = np.asarray(adata_small.uns["rank_genes_groups"]["scores"][group], dtype=float)
-            scores_large = np.asarray(adata_large.uns["rank_genes_groups"]["scores"][group], dtype=float)
-            np.testing.assert_allclose(scores_small, scores_large, rtol=1e-10)
+    def test_chunk_widths(self, adata_blobs, monkeypatch):
+        """Narrow and wide gene chunks give the same scores."""
+        scores = []
+        for width in (3, 1000):
+            monkeypatch.setattr(_wilcoxon_binned, "_auto_chunk_width", lambda *_args, width=width, **_kw: width)
+            adata = adata_blobs.copy()
+            rsc.get.anndata_to_GPU(adata)
+            rsc.tl.rank_genes_groups(adata, "blobs", method="wilcoxon_binned", use_raw=False)
+            scores.append(adata.uns["rank_genes_groups"]["scores"])
+        for group in scores[0].dtype.names:
+            np.testing.assert_allclose(
+                np.asarray(scores[0][group], dtype=float), np.asarray(scores[1][group], dtype=float), rtol=1e-10
+            )
 
 
 class TestWilcoxonBinnedEdgeCases:
