@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Union
 
 import cupy as cp
 import numpy as np
+from cupyx.scipy.sparse import coo_matrix as coo_matrix_gpu
 from cupyx.scipy.sparse import csc_matrix as csc_matrix_gpu
 from cupyx.scipy.sparse import csr_matrix as csr_matrix_gpu
 from dask.array import Array as DaskArray
@@ -26,7 +27,7 @@ from ._utils import _get_obs_rep, _set_obs_rep
 if TYPE_CHECKING:
     from anndata import AnnData
 
-GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu]  # noqa: UP007
+GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu, coo_matrix_gpu]  # noqa: UP007
 CPU_ARRAY_TYPE = Union[np.ndarray, csr_matrix_cpu, csc_matrix_cpu]  # noqa: UP007
 
 

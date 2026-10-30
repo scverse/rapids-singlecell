@@ -731,13 +731,7 @@ def test_contrast_distances_with_split_by() -> None:
     assert np.all(np.isfinite(res["wasserstein"].values))
 
 
-requires_2_gpus = pytest.mark.skipif(
-    cp.cuda.runtime.getDeviceCount() < 2,
-    reason="multi-GPU test requires >= 2 GPUs",
-)
-
-
-@requires_2_gpus
+@pytest.mark.two_gpus
 def test_distance_wasserstein_multi_gpu_pairwise_matches_single() -> None:
     """Splitting pairs across GPUs must give the same result as one GPU.
 
@@ -751,7 +745,7 @@ def test_distance_wasserstein_multi_gpu_pairwise_matches_single() -> None:
     np.testing.assert_allclose(df2.values, df1.values, rtol=1e-5, atol=1e-5)
 
 
-@requires_2_gpus
+@pytest.mark.two_gpus
 def test_distance_wasserstein_multi_gpu_onesided_matches_single() -> None:
     adata = _make_grouped_adata(n_groups=6, cells_per_group=40, n_features=8, seed=12)
     distance = Distance(metric="wasserstein")
@@ -760,7 +754,7 @@ def test_distance_wasserstein_multi_gpu_onesided_matches_single() -> None:
     np.testing.assert_allclose(s2.values, s1.values, rtol=1e-5, atol=1e-5)
 
 
-@requires_2_gpus
+@pytest.mark.two_gpus
 def test_distance_wasserstein_multi_gpu_contrast_matches_single() -> None:
     adata = _make_grouped_adata(n_groups=6, cells_per_group=30, n_features=6, seed=13)
     distance = Distance(metric="wasserstein")
@@ -770,7 +764,7 @@ def test_distance_wasserstein_multi_gpu_contrast_matches_single() -> None:
     np.testing.assert_allclose(r2["wasserstein"].values, r1["wasserstein"].values, rtol=1e-5, atol=1e-5)
 
 
-@requires_2_gpus
+@pytest.mark.two_gpus
 def test_distance_wasserstein_multi_gpu_copies_outlive_their_consumers(
     monkeypatch,
 ) -> None:
