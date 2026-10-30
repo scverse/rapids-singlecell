@@ -175,7 +175,7 @@ def _run_wilcoxon_shard(
     """Rank one gene shard; the kernels also return per-group sums / nnz."""
     X = rg.X
     n_cells = X.shape[0]
-    col_start, col_stop = column_range or (0, X.shape[1])
+    col_start, col_stop = (0, X.shape[1]) if column_range is None else column_range
     n_cols = col_stop - col_start
     n_groups = len(rg.groups_order)
     ovr = rg.ireference is None
@@ -193,7 +193,7 @@ def _run_wilcoxon_shard(
         "compute_tie_corr": tie_correct,
         "compute_nnz": rg.comp_pts,
         "col_start": col_start,
-        "sub_batch_cols": chunk_size or _SUB_BATCH[layout, ovr],
+        "sub_batch_cols": _SUB_BATCH[layout, ovr] if chunk_size is None else chunk_size,
         # Expression-space means sum expm1 of the log1p values in the same pass.
         "expm1_scale": 0.0 if rg.mean_in_log_space else _log1p_scale(rg),
     }
@@ -202,8 +202,8 @@ def _run_wilcoxon_shard(
         args = (X,)
     else:
         kw["csc"] = X.format == "csc"
-        if sparse_row_spans is None:
-            sparse_row_spans = (np.empty(0, X.indptr.dtype),) * 2 if sp.issparse(X) else (X.indptr[:0],) * 2
+        if sparse_row_spans is None:  # whole rows; only host CSR reads them
+            sparse_row_spans = (X.indptr[:-1], X.indptr[1:])
         args = (X.data, X.indices, X.indptr, *sparse_row_spans)
     codes = cp.asarray(rg.group_codes, dtype=cp.int32)
 

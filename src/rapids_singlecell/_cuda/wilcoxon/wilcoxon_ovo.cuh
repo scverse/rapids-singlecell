@@ -338,6 +338,14 @@ struct OvoRanker {
         return sc;
     }
 
+    // Groups run on gridDim.y; fn(g0, n) covers them in chunks that fit it.
+    template <typename F>
+    void for_group_chunks(F fn) const {
+        int max_y = max_grid_dims()[1];
+        for (int g0 = 0; g0 < n_groups; g0 += max_y)
+            fn(g0, std::min(max_y, n_groups - g0));
+    }
+
     // Rank one column sub-batch: sorted ref [n_ref, sb_cols] F-order against
     // dense groups [n_all_grp, sb_cols] F-order split by d_offsets; results
     // go to [group * ld + col].
@@ -346,11 +354,13 @@ struct OvoRanker {
               double* tie_corr, int ld, int n_ref, int n_all_grp, int sb_cols,
               cudaStream_t stream) const {
         if (!tie) {
-            ovo_rank_dense_vs_ref_kernel<<<dim3(sb_cols, n_groups),
-                                           UTIL_BLOCK_SIZE, 0, stream>>>(
-                ref_sorted, grp_dense, d_offsets, rank_sums, n_ref, n_all_grp,
-                ld);
-            CUDA_CHECK_LAST_ERROR(ovo_rank_dense_vs_ref_kernel);
+            for_group_chunks([&](int g0, int n) {
+                ovo_rank_dense_vs_ref_kernel<<<dim3(sb_cols, n),
+                                               UTIL_BLOCK_SIZE, 0, stream>>>(
+                    ref_sorted, grp_dense, d_offsets + g0,
+                    rank_sums + (size_t)g0 * ld, n_ref, n_all_grp, ld);
+                CUDA_CHECK_LAST_ERROR(ovo_rank_dense_vs_ref_kernel);
+            });
             return;
         }
         ref_tie_sum_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
@@ -361,11 +371,15 @@ struct OvoRanker {
             int padded = 1;
             while (padded < band_max) padded <<= 1;
             int tpb = std::max(WARP_SIZE, std::min(padded, max_tpb));
-            ovo_rank_smem_kernel<<<dim3(sb_cols, n_groups), tpb,
-                                   (size_t)padded * sizeof(float), stream>>>(
-                ref_sorted, grp_dense, d_offsets, sc.ref_tie_sums, rank_sums,
-                tie_corr, n_ref, n_all_grp, ld, lo, hi);
-            CUDA_CHECK_LAST_ERROR(ovo_rank_smem_kernel);
+            for_group_chunks([&](int g0, int n) {
+                ovo_rank_smem_kernel<<<dim3(sb_cols, n), tpb,
+                                       (size_t)padded * sizeof(float),
+                                       stream>>>(
+                    ref_sorted, grp_dense, d_offsets + g0, sc.ref_tie_sums,
+                    rank_sums + (size_t)g0 * ld, tie_corr + (size_t)g0 * ld,
+                    n_ref, n_all_grp, ld, lo, hi);
+                CUDA_CHECK_LAST_ERROR(ovo_rank_smem_kernel);
+            });
         };
         launch_band(0, OVO_MEDIUM_MAX, medium_max, UTIL_BLOCK_SIZE);
         launch_band(OVO_MEDIUM_MAX + 1, OVO_LARGE_MAX, large_max,

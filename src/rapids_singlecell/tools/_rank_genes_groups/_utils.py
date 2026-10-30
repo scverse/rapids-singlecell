@@ -83,9 +83,15 @@ def _canonicalize_sparse(X):
     if not (sp.issparse(X) or cpsp.issparse(X)) or getattr(X, "format", None) not in {"csr", "csc"}:
         return X
     # scipy scans for the flag on one thread (seconds on large matrices) and
-    # caches it in _has_canonical_format; seed that cache from a parallel scan.
+    # caches it in _has_canonical_format; seed that cache from a parallel scan
+    # of contiguous index arrays (scipy's own check also handles strided ones).
     dtype = X.indptr.dtype if sp.issparse(X) and not hasattr(X, "_has_canonical_format") else None
-    if dtype in (np.int32, np.int64) and X.indices.dtype == dtype:
+    if (
+        dtype in (np.int32, np.int64)
+        and X.indices.dtype == dtype
+        and X.indptr.flags.c_contiguous
+        and X.indices.flags.c_contiguous
+    ):
         from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 
         X.has_canonical_format = _wc.has_canonical_format_host(X.indptr, X.indices)

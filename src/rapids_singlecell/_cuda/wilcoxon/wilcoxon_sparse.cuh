@@ -387,8 +387,9 @@ static void cast_with_stats(const InT* data, float* vals, const int* rows,
 }
 
 // CSC input: host batches stream through pinned memory (whole arrays pinned
-// when moderate, else a bounded ring); device batches are read in place.
-// Stored values are cast to f32 keys while their group stats accumulate.
+// when moderate and pinnable, else a bounded ring that also narrows row ids
+// to int32); device batches are read in place. Stored values are cast to
+// f32 keys while their group stats accumulate.
 template <typename InT, typename IndexT, typename Ranker>
 static void sparse_csc(const InT* data, const IndexT* indices,
                        const IndexT* indptr, bool on_host, int n_rows,
@@ -424,14 +425,15 @@ static void sparse_csc(const InT* data, const IndexT* indices,
     bool bounded = on_host && total_nnz * (sizeof(InT) + sizeof(IndexT)) >
                                   HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES;
     HostRegisterGuard pin_data, pin_indices;
-    std::unique_ptr<PinnedRing<InT, IndexT>> stage;
+    std::unique_ptr<PinnedRing<InT, int>> stage;
     if (bounded) {
-        stage.reset(new PinnedRing<InT, IndexT>(n_streams, max_nnz));
+        stage.reset(new PinnedRing<InT, int>(n_streams, max_nnz));
     } else if (on_host) {
-        pin_data =
-            HostRegisterGuard(const_cast<InT*>(data), total_nnz * sizeof(InT));
+        // Pinning only speeds the copies up (read-only maps cannot be pinned).
+        pin_data = HostRegisterGuard(const_cast<InT*>(data),
+                                     total_nnz * sizeof(InT), 0, true);
         pin_indices = HostRegisterGuard(const_cast<IndexT*>(indices),
-                                        total_nnz * sizeof(IndexT));
+                                        total_nnz * sizeof(IndexT), 0, true);
     }
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
     int* d_offsets = upload_batch_offsets(batches, pool);
@@ -447,9 +449,11 @@ static void sparse_csc(const InT* data, const IndexT* indices,
         bufs[s].vals = pool.alloc<float>(max_nnz);
         bufs[s].data =
             on_host ? raw_values<InT>(pool, bufs[s].vals, max_nnz) : nullptr;
-        bufs[s].indices = on_host ? pool.alloc<IndexT>(max_nnz) : nullptr;
-        bufs[s].rows =
-            sizeof(IndexT) > sizeof(int) ? pool.alloc<int>(max_nnz) : nullptr;
+        bufs[s].indices =
+            on_host && !bounded ? pool.alloc<IndexT>(max_nnz) : nullptr;
+        bufs[s].rows = bounded || sizeof(IndexT) > sizeof(int)
+                           ? pool.alloc<int>(max_nnz)
+                           : nullptr;
         bufs[s].rank = rank.alloc(pool, max_nnz, sb, streams[s]);
     }
     cudaDeviceSynchronize();
@@ -464,34 +468,42 @@ static void sparse_csc(const InT* data, const IndexT* indices,
                                    "CSC batch nnz");
         const InT* d = data + p0;
         const IndexT* ix = indices + p0;
-        if (on_host) {
-            if (bounded) {
-                stage->wait(s);
-                host_copy_slice_as<InT, IndexT>(data, indices, (size_t)p0, nnz,
-                                                stage->template get<0>(s),
-                                                stage->template get<1>(s));
-                d = stage->template get<0>(s);
-                ix = stage->template get<1>(s);
-            }
-            cudaMemcpyAsync(buf.data, d, (size_t)nnz * sizeof(InT),
-                            cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(buf.indices, ix, (size_t)nnz * sizeof(IndexT),
-                            cudaMemcpyHostToDevice, stream);
-            if (bounded) stage->record(s, stream);
+        const int* rows = buf.rows;
+        if (bounded) {
+            stage->wait(s);
+            host_copy_slice_as<InT, int>(data, indices, (size_t)p0, nnz,
+                                         stage->template get<0>(s),
+                                         stage->template get<1>(s));
+            cudaMemcpyAsync(buf.data, stage->template get<0>(s),
+                            (size_t)nnz * sizeof(InT), cudaMemcpyHostToDevice,
+                            stream);
+            cudaMemcpyAsync(buf.rows, stage->template get<1>(s),
+                            (size_t)nnz * sizeof(int), cudaMemcpyHostToDevice,
+                            stream);
+            stage->record(s, stream);
             d = buf.data;
-            ix = buf.indices;
+        } else {
+            if (on_host) {
+                cudaMemcpyAsync(buf.data, d, (size_t)nnz * sizeof(InT),
+                                cudaMemcpyHostToDevice, stream);
+                cudaMemcpyAsync(buf.indices, ix, (size_t)nnz * sizeof(IndexT),
+                                cudaMemcpyHostToDevice, stream);
+                d = buf.data;
+                ix = buf.indices;
+            }
+            if constexpr (sizeof(IndexT) > sizeof(int)) {
+                if (nnz > 0) {
+                    cast_array_kernel<IndexT, int>
+                        <<<(nnz + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE,
+                           UTIL_BLOCK_SIZE, 0, stream>>>(ix, buf.rows,
+                                                         (size_t)nnz);
+                    CUDA_CHECK_LAST_ERROR(cast_array_kernel);
+                }
+            } else {
+                rows = reinterpret_cast<const int*>(ix);
+            }
         }
         const int* offsets = d_offsets + (size_t)b * (sb + 1);
-        const int* rows = reinterpret_cast<const int*>(ix);
-        if constexpr (sizeof(IndexT) > sizeof(int)) {
-            if (nnz > 0) {
-                cast_array_kernel<IndexT, int>
-                    <<<(nnz + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE,
-                       UTIL_BLOCK_SIZE, 0, stream>>>(ix, buf.rows, (size_t)nnz);
-                CUDA_CHECK_LAST_ERROR(cast_array_kernel);
-            }
-            rows = buf.rows;
-        }
         cast_with_stats(d, buf.vals, rows, offsets, sb_cols, col, stats,
                         stream);
         rank(CscBatch{buf.vals, rows, offsets, nnz, sb_cols}, buf.rank, col,
@@ -627,6 +639,9 @@ static const T* interp_lower_bound(const T* lo, const T* hi, T v) {
     return std::lower_bound(lo + a + 1, lo + b + 1, v);
 }
 
+// Below this many stored entries one thread scans faster than the pool wakes.
+constexpr int64_t CANONICAL_SCAN_SERIAL_NNZ = 1 << 22;
+
 // scipy's has_canonical_format for CSR/CSC (indptr non-decreasing, indices
 // strictly increasing within each row), but scanned by the host workers over
 // nnz-balanced row ranges instead of on one thread.
@@ -636,7 +651,7 @@ static bool has_canonical_format_host(const IndexT* indptr,
     for (int64_t r = 0; r < n_rows; r++)
         if (indptr[r] > indptr[r + 1]) return false;
     int64_t nnz = n_rows > 0 ? (int64_t)indptr[n_rows] : 0;
-    int n_threads = nnz < (1 << 22) ? 1 : host_worker_count();
+    int n_threads = nnz < CANONICAL_SCAN_SERIAL_NNZ ? 1 : host_worker_count();
     auto first_row = [&](int t) {  // first row starting in worker t's share
         if (t == n_threads) return n_rows;
         IndexT p = (IndexT)(nnz * t / n_threads);
@@ -917,6 +932,11 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
                                          : GATHER_BYTES + RAW_BYTES<InT> +
                                                2 * sizeof(float) +
                                                2 * sizeof(int) + 12;
+    // The column histogram keeps one int per batch column in shared memory.
+    sub_batch_cols =
+        std::min({sub_batch_cols, n_cols,
+                  device_attribute(cudaDevAttrMaxSharedMemoryPerBlock) /
+                      (int)sizeof(int)});
     int slab_cols = std::min(sub_batch_cols, rank.max_cols());
     if constexpr (ovo) slab_cols = std::min(slab_cols, OVO_SLAB_COLS);
     CsrRangeBatchPlan range_batches =
@@ -993,13 +1013,10 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
         gather_consumed.emplace_back(
             std::make_unique<ScopedCudaEvent>(cudaEventDisableTiming));
     }
-    int device = 0;
-    int n_sms = 0;
-    cuda_check(cudaGetDevice(&device), "rowstream histogram get device");
-    cuda_check(
-        cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, device),
-        "rowstream histogram get SM count");
-    int range_histogram_blocks = std::max(1, 4 * n_sms);
+    int range_histogram_blocks =
+        std::max(1, 4 * device_attribute(cudaDevAttrMultiProcessorCount));
+    // Codes, sizes and the zeroed outputs come from the caller's stream.
+    cudaDeviceSynchronize();
 
     // One ascending column pass; sorted-row cursors make transfer one-shot.
     // Threaded gather counts row runs, prefix-sums, then copies disjoint
