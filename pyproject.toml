@@ -40,7 +40,12 @@ dependencies = [
   "session-info2",
   "statsmodels>=0.12",
   "tqdm",
+  # `rapids_singlecell.io` reads and writes zarr v3 (sharded arrays, codec pipelines)
+  "zarr>=3.3",
 ]
+# reading zarr straight into GPU memory (`rapids_singlecell.io`)
+optional-dependencies.io-cu12 = [ "zarr-kvikio[cuda12]" ]
+optional-dependencies.io-cu13 = [ "zarr-kvikio[cuda13]" ]
 optional-dependencies.rapids-cu12 = [
   "cudf-cu12>=25.12",
   "cugraph-cu12>=25.12",
@@ -209,7 +214,17 @@ warn_unused_configs = true
 
 # RAPIDS and friends ship without type information
 [[tool.mypy.overrides]]
-module = [ "cudf.*", "cuml.*", "cuvs.*", "numba.*", "pylibraft.*" ]
+module = [
+  "cudf.*",
+  "cuml.*",
+  "cuvs.*",
+  "dask_cuda.*",
+  "distributed.*",
+  "numba.*",
+  "pylibraft.*",
+  "pynvml",
+  "zarr_kvikio.*",
+]
 ignore_missing_imports = true
 
 # scanpy has inline annotations but no py.typed marker
