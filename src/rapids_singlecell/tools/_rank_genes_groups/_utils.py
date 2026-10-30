@@ -80,11 +80,16 @@ def _canonicalize_sparse(X):
 
     Fast Wilcoxon ranks stored nnz once, so it expects scanpy's summed view.
     """
-    if (
-        (sp.issparse(X) or cpsp.issparse(X))
-        and getattr(X, "format", None) in {"csr", "csc"}
-        and not X.has_canonical_format
-    ):
+    if not (sp.issparse(X) or cpsp.issparse(X)) or getattr(X, "format", None) not in {"csr", "csc"}:
+        return X
+    # scipy scans for the flag on one thread (seconds on large matrices) and
+    # caches it in _has_canonical_format; seed that cache from a parallel scan.
+    dtype = X.indptr.dtype if sp.issparse(X) and not hasattr(X, "_has_canonical_format") else None
+    if dtype in (np.int32, np.int64) and X.indices.dtype == dtype:
+        from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
+
+        X.has_canonical_format = _wc.has_canonical_format_host(X.indptr, X.indices)
+    if not X.has_canonical_format:
         X.sum_duplicates()  # also sorts indices and sets the canonical flag
     return X
 
@@ -148,13 +153,6 @@ def _select_groups(
         raise ValueError(msg)
 
     return groups_order, group_codes, group_sizes
-
-
-def _choose_chunk_size(requested: int | None) -> int:
-    """Choose chunk size for gene processing."""
-    if requested is not None:
-        return int(requested)
-    return 128
 
 
 def _csc_columns_to_gpu(X_csc, start: int, stop: int, n_rows: int) -> cp.ndarray:

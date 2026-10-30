@@ -196,29 +196,6 @@ static inline int checked_int_product(size_t a, size_t b, const char* context) {
     return (int)(a * b);
 }
 
-template <typename DeviceValueT, typename DeviceIndexT = int,
-          typename AccumT = double>
-struct SparseWindowDTypes {
-    using value_type = DeviceValueT;
-    using index_type = DeviceIndexT;
-    using accum_type = AccumT;
-
-    static constexpr size_t bytes_per_nnz =
-        sizeof(value_type) + sizeof(index_type);
-};
-
-using WilcoxonSparseWindowDTypes = SparseWindowDTypes<float, int, double>;
-
-template <typename DTypes>
-static inline size_t sparse_window_nnz_bytes(size_t nnz) {
-    return nnz * DTypes::bytes_per_nnz;
-}
-
-template <typename DTypes>
-static inline size_t sparse_window_accum_bytes(size_t count) {
-    return count * sizeof(typename DTypes::accum_type);
-}
-
 // Stream-count clamps: never use more streams than column batches, nor more
 // than the per-stream memory budget allows.
 static inline int clamp_streams_by_cols(
@@ -563,12 +540,6 @@ struct PinnedRing {
     PinnedRing& operator=(const PinnedRing&) = delete;
 };
 
-template <typename DTypes>
-using SparseWindowStagingRing =
-    PinnedRing<typename DTypes::value_type, typename DTypes::index_type>;
-
-using HostStagingRing = SparseWindowStagingRing<WilcoxonSparseWindowDTypes>;
-
 /** Fill linear segment offsets [0, stride, ..., n_segments*stride] on-device.
  */
 __global__ void fill_linear_offsets_kernel(int* __restrict__ out,
@@ -598,30 +569,6 @@ static void host_copy_slice_as(const InT* h_data, const IndexT* h_indices,
         for (int k = k0; k < k1; k++) {
             stage_vals[k] = (StageValT)h_data[start + k];
             stage_cols[k] = (StageIndexT)h_indices[start + k];
-        }
-    });
-}
-
-// Threaded host gather of selected dense rows and contiguous columns.
-// Output staging is always F-order [n_window_rows, n_window_cols].
-template <typename StageT, typename InT>
-static void host_materialize_dense_rows_window_as(
-    const InT* h_X, bool f_order, int n_full_rows, int n_full_cols,
-    const int* row_ids, int n_window_rows, int col_start, int n_window_cols,
-    StageT* stage) {
-    int total =
-        checked_int_product((size_t)n_window_rows, (size_t)n_window_cols,
-                            "dense host row-window items");
-    host_parallel_ranges(total, [&](int i0, int i1) {
-        for (int idx = i0; idx < i1; idx++) {
-            int local_col = idx / n_window_rows;
-            int local_row = idx - local_col * n_window_rows;
-            int row = row_ids ? row_ids[local_row] : local_row;
-            int col = col_start + local_col;
-            size_t src = f_order ? (size_t)col * n_full_rows + row
-                                 : (size_t)row * n_full_cols + col;
-            stage[(size_t)local_col * n_window_rows + local_row] =
-                (StageT)h_X[src];
         }
     });
 }

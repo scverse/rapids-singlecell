@@ -158,9 +158,9 @@ def rank_genes_groups(
         preset defaults to `True`; the Scanpy 2 preview defaults to `False`.
     chunk_size
         Number of genes to process at once for `'wilcoxon'` and
-        `'wilcoxon_binned'`. Default is 512 for `'wilcoxon'`. For
-        `'wilcoxon_binned'` the default is sized dynamically based on
-        ``n_groups`` and ``n_bins`` to keep histogram memory stable.
+        `'wilcoxon_binned'`. For `'wilcoxon'` the default depends on the
+        input layout. For `'wilcoxon_binned'` the default is sized dynamically
+        based on ``n_groups`` and ``n_bins`` to keep histogram memory stable.
     multi_gpu
         GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
         and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all

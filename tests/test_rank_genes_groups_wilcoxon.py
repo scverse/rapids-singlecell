@@ -11,7 +11,6 @@ from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
-from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_host
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
@@ -649,6 +648,26 @@ def test_wilcoxon_ovo_host_csr_unsorted_indices_match_sorted():
             )
 
 
+# The threaded canonical-format scan agrees with scipy's (serial below 4M nnz).
+@pytest.mark.parametrize("n_rows", [100, 100_000])
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_has_canonical_format_host_matches_scipy(n_rows, dtype):
+    from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
+
+    lengths = np.arange(n_rows) % 7 * 15  # includes empty rows
+    indptr = np.concatenate([[0], np.cumsum(lengths)]).astype(dtype)
+    indices = (np.arange(indptr[-1]) - np.repeat(indptr[:-1], lengths)).astype(dtype)
+    assert _wc.has_canonical_format_host(indptr, indices)
+    for row in (1, n_rows // 2, n_rows - 1):
+        p = indptr[row]
+        for a, b in ((p + 1, p), (p, p)):  # swapped pair, duplicate
+            bad = indices.copy()
+            bad[p], bad[p + 1] = indices[a], indices[b]
+            X = sp.csr_matrix((np.ones(len(bad), np.float32), bad, indptr), shape=(n_rows, 100))
+            assert not X.has_canonical_format
+            assert not _wc.has_canonical_format_host(indptr, bad)
+
+
 @pytest.mark.parametrize("reference", ["rest", "1"])
 @pytest.mark.parametrize(
     "fmt",
@@ -693,6 +712,28 @@ def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt):
                 atol=atol,
                 equal_nan=True,
             )
+
+
+# Expression-space means (Scanpy 2 preset) are expm1 sums from the test pass.
+@pytest.mark.parametrize("reference", ["rest", "b"])
+@pytest.mark.parametrize("pts", [False, True])
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_dense", "cupy_csr", "cupy_csc"])
+def test_wilcoxon_expression_space_logfoldchanges(reference, pts, fmt):
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(1.5, (300, 8)) * (rng.random((300, 8)) < 0.5)
+    groups = rng.choice(list("abc"), 300)
+    obs = pd.DataFrame({"g": pd.Categorical(groups)}, index=[str(i) for i in range(300)])
+    adata = sc.AnnData(X=_to_format(np.log2(1 + counts).astype(np.float32), fmt), obs=obs)
+    adata.uns["log1p"] = {"base": 2}
+    rsc.tl.rank_genes_groups(
+        adata, "g", method="wilcoxon", reference=reference, mean_in_log_space=False, pts=pts, use_raw=False
+    )
+    result = adata.uns["rank_genes_groups"]
+    for group in result["names"].dtype.names:
+        rest = counts[groups == "b"] if reference == "b" else counts[groups != group]
+        expected = np.log2((counts[groups == group].mean(0) + 1e-9) / (rest.mean(0) + 1e-9))
+        genes = np.asarray(result["names"][group]).astype(int)
+        np.testing.assert_allclose(result["logfoldchanges"][group], expected[genes], rtol=1e-5, atol=1e-5)
 
 
 def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
@@ -2046,19 +2087,25 @@ def _make_multi_gpu_wilcoxon_adata(fmt, *, source_device=0, all_zero=False, sign
 @pytest.mark.parametrize("empty_group", [0, 1], ids=["first", "last"])
 def test_wilcoxon_ovo_empty_group_outputs_are_initialized(empty_group):
     n_cols = 5
-    ref = cp.asfortranarray(cp.tile(cp.asarray([0, 0, 1], dtype=cp.float32)[:, None], (1, n_cols)))
-    groups = cp.asfortranarray(cp.tile(cp.asarray([0, 2, 3, 4], dtype=cp.float32)[:, None], (1, n_cols)))
+    # Rows 0-2 are the reference, rows 3-6 the (possibly empty) test groups.
+    X = cp.asfortranarray(cp.tile(cp.asarray([0, 0, 1, 0, 2, 3, 4], dtype=cp.float32)[:, None], (1, n_cols)))
     offsets = cp.asarray([0, 0, 4] if empty_group == 0 else [0, 4, 4], dtype=cp.int32)
     rank_sums = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
     tie_corr = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
+    unused = cp.zeros((1, 1), dtype=cp.float64)
 
-    _wc.ovo_rank_dense_tiered_unsorted_ref(
-        ref,
-        groups,
+    _wc.ovo_dense(
+        X,
+        cp.arange(3, dtype=cp.int32),
+        cp.arange(3, 7, dtype=cp.int32),
         offsets,
+        cp.full(7, -1, dtype=cp.int32),  # no stats rows
         rank_sums,
         tie_corr,
+        unused,
+        unused,
         compute_tie_corr=True,
+        compute_nnz=False,
         stream=cp.cuda.get_current_stream().ptr,
     )
     cp.cuda.get_current_stream().synchronize()
@@ -2075,33 +2122,38 @@ def test_wilcoxon_ovo_empty_group_outputs_are_initialized(empty_group):
 def test_wilcoxon_ovo_sparse_empty_group_outputs_are_initialized(empty_group):
     n_cols = 5
     matrix = sp.csr_matrix(np.tile(np.asarray([0, 0, 1, 0, 2, 3, 4], dtype=np.float32)[:, None], (1, n_cols)))
-    ref_rows = np.asarray([0, 1, 2], dtype=np.int32)
-    group_rows = np.asarray([3, 4, 5, 6], dtype=np.int32)
     offsets = np.asarray([0, 0, 4] if empty_group == 0 else [0, 4, 4], dtype=np.int32)
     rank_sums = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
     tie_corr = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
-    group_sums = cp.full((3, n_cols), cp.nan, dtype=cp.float64)
+    group_sums = cp.zeros((3, n_cols), dtype=cp.float64)  # stats by group code
+    valid_group = 1 - empty_group
+    codes = cp.asarray([2, 2, 2, valid_group, valid_group, valid_group, valid_group], dtype=cp.int32)
+    ref_map = cp.asarray([0, 1, 2, -1, -1, -1, -1], dtype=cp.int32)
+    grp_map = cp.asarray([-1, -1, -1, 0, 1, 2, 3], dtype=cp.int32)
 
-    _wcs.ovo_streaming_csr_host(
+    _wc.ovo_sparse(
         matrix.data,
         matrix.indices,
+        matrix.indptr,
         matrix.indptr[:-1],
         matrix.indptr[1:],
-        ref_rows,
-        group_rows,
-        offsets,
+        codes,
+        ref_map,
+        grp_map,
+        cp.arange(3, dtype=cp.int32),
+        cp.arange(3, 7, dtype=cp.int32),
+        cp.asarray(offsets),
         rank_sums,
         tie_corr,
         group_sums,
-        cp.empty(1, dtype=cp.float64),
-        n_cols=n_cols,
+        cp.zeros((1, 1), dtype=cp.float64),
+        n_ref=3,
+        csc=False,
         compute_tie_corr=True,
         compute_nnz=False,
-        analytic_zeros=True,
     )
     cp.cuda.get_current_stream().synchronize()
 
-    valid_group = 1 - empty_group
     probe = cp.sum(rank_sums + tie_corr) + cp.sum(group_sums)
     assert bool(cp.isfinite(probe).item())
     cp.testing.assert_array_equal(rank_sums[empty_group], cp.zeros(n_cols))
