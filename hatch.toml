@@ -10,6 +10,11 @@ extra_index_urls = [
 [envs.hatch-test]
 default-args = []
 dependency-groups = ["test"]
+# Build backend in the env: CI disables build isolation for rapids-singlecell (.github/uv-ci.toml),
+# so the editable rebuild hatch runs when it syncs the test group reuses the first build.
+pre-install-commands = [
+  "{env:HATCH_UV:uv} pip install hatchling hatch-vcs 'nanobind>=2' 'scikit-build-core[hatchling]>=1.0.1' cmake ninja",
+]
 
 # Select CUDA feature per matrix
 overrides.matrix.cuda.features = [
