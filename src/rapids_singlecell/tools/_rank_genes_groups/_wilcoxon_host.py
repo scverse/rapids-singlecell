@@ -11,7 +11,6 @@ import cupyx.scipy.sparse as cpsp
 import numpy as np
 
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
-from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
 from rapids_singlecell._utils import _copy_to_device, parse_device_ids
 
 if TYPE_CHECKING:
@@ -44,12 +43,14 @@ _WilcoxonResult = tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None]
 
 
 def _host_sparse_kernel_source(X):
-    """Normalize sparse values once while sharing index metadata."""
-    data = X.data if X.data.dtype == np.float64 else X.data.astype(np.float32, copy=False)
-    if data is X.data:
+    """Normalize sparse values once; index arrays stay shared unless strided."""
+    dtype = np.float64 if X.data.dtype == np.float64 else np.float32
+    data = np.ascontiguousarray(X.data, dtype=dtype)
+    indices, indptr = np.ascontiguousarray(X.indices), np.ascontiguousarray(X.indptr)
+    if data is X.data and indices is X.indices and indptr is X.indptr:
         return X
     source = copy(X)
-    source.data = data
+    source.data, source.indices, source.indptr = data, indices, indptr
     return source
 
 
@@ -62,13 +63,9 @@ def _host_dense_matrix(matrix: np.ndarray) -> np.ndarray:
 
 
 @contextmanager
-def _shared_dense_host_registration(
-    matrix: np.ndarray | None,
-    *,
-    enabled: bool,
-):
-    """Best-effort portable pin shared by concurrent dense OVR workers."""
-    if matrix is None or not enabled or matrix.nbytes == 0:
+def _shared_dense_host_registration(matrix: np.ndarray | None):
+    """Best-effort portable pin shared by concurrent dense workers."""
+    if matrix is None or matrix.nbytes == 0:
         yield
         return
 
@@ -107,8 +104,10 @@ def _build_ovo_host_context(rg: _RankGenes) -> _OvoHostContext:
     else:
         # One stable grouping pass replaces a full-cell boolean scan per group.
         # Selected codes are [0, n_groups); the unselected-cell sentinel sorts
-        # after them and is excluded by selected_total.
-        grouped_rows = np.argsort(codes, kind="stable").astype(np.int32, copy=False)
+        # after them and is excluded by selected_total. Codes narrowed to 16
+        # bits or less take NumPy's radix sort.
+        small_codes = codes.astype(np.min_scalar_type(n_groups), copy=False)
+        grouped_rows = np.argsort(small_codes, kind="stable").astype(np.int32, copy=False)
         group_starts = np.empty(n_groups + 1, dtype=np.intp)
         group_starts[0] = 0
         np.cumsum(group_sizes, dtype=np.intp, out=group_starts[1:])
@@ -150,19 +149,14 @@ def _csr_column_weights(indices, n_genes: int, xp) -> np.ndarray:
     return weights.astype(np.int64, copy=False)
 
 
-def _split_gene_ranges(
-    X,
-    *,
-    n_devices: int,
-    dense_fallback: bool,
-) -> list[tuple[int, int]]:
+def _split_gene_ranges(X, *, n_devices: int) -> list[tuple[int, int]]:
     """Split contiguous genes, balancing sparse-native work by column nnz."""
     n_genes = int(X.shape[1])
     n_shards = min(n_devices, n_genes)
     if n_shards <= 1:
         return [(0, n_genes)]
 
-    if isinstance(X, np.ndarray | cp.ndarray) or dense_fallback:
+    if isinstance(X, np.ndarray | cp.ndarray):
         weights = np.ones(n_genes, dtype=np.int64)
     elif X.format == "csc":
         if cpsp.issparse(X):
@@ -255,7 +249,7 @@ def _device_csr_column_shard(X, start: int, stop: int):
     with cp.cuda.Device(X.data.device.id):
         stream = cp.cuda.get_current_stream()
         local_indptr = cp.empty_like(X.indptr)
-        local_nnz = _wcs.csr_column_range_indptr_device(
+        local_nnz = _wc.csr_column_range_indptr_device(
             X.indices,
             X.indptr,
             local_indptr,
@@ -265,7 +259,7 @@ def _device_csr_column_shard(X, start: int, stop: int):
         )
         local_data = cp.empty(local_nnz, dtype=X.data.dtype)
         local_indices = cp.empty(local_nnz, dtype=X.indices.dtype)
-        _wcs.csr_column_range_gather_device(
+        _wc.csr_column_range_gather_device(
             X.data,
             X.indices,
             X.indptr,
@@ -346,13 +340,22 @@ def _run_sharded_wilcoxon(
     *,
     tie_correct: bool,
     use_continuity: bool,
-    chunk_size: int | None,
     multi_gpu: bool | list[int] | str | None,
     return_u_values: bool,
     shard_runner: Callable[..., _WilcoxonResult | None],
 ) -> _WilcoxonResult | None:
     """Run Wilcoxon across one or more GPU shards."""
     X = rg.X
+    # Host OVO ranks only reference and test-group rows: dense input copies
+    # just those when they are under half the cells, CSR skips the others
+    # through empty row spans (below). Stats still land on the caller's rg.
+    shard_rg = rg
+    unselected = rg.group_codes == len(rg.groups_order) if rg.ireference is not None else None
+    if isinstance(X, np.ndarray) and unselected is not None and 2 * np.count_nonzero(unselected) > X.shape[0]:
+        keep = np.flatnonzero(~unselected)
+        shard_rg = copy(rg)
+        shard_rg.X, shard_rg.group_codes = X[keep], rg.group_codes[keep]
+        X = shard_rg.X
     n_cells, n_total_genes = X.shape
     is_device_input = isinstance(X, cp.ndarray) or cpsp.issparse(X)
     source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id if cpsp.issparse(X) else None
@@ -362,13 +365,9 @@ def _run_sharded_wilcoxon(
     else:
         device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
         device_ids.sort(key=lambda device_id: device_id != source_device)
-    ranges = _split_gene_ranges(
-        X,
-        n_devices=len(device_ids),
-        dense_fallback=rg._sparse_negative_fallback,
-    )
+    ranges = _split_gene_ranges(X, n_devices=len(device_ids))
     device_ids = device_ids[: len(ranges)]
-    ovo_host_context = _build_ovo_host_context(rg) if rg.ireference is not None else None
+    ovo_host_context = _build_ovo_host_context(shard_rg) if rg.ireference is not None else None
     dense_source = _host_dense_matrix(X) if isinstance(X, np.ndarray) else None
     csr_row_spans = [None] * len(ranges)
     if is_device_input:
@@ -388,7 +387,7 @@ def _run_sharded_wilcoxon(
                     dtype=sparse_source.indptr.dtype,
                     order="C",
                 )
-                _wcs.csr_row_boundaries_host(
+                _wc.csr_row_boundaries_host(
                     sparse_source.indices,
                     sparse_source.indptr,
                     cuts,
@@ -402,25 +401,25 @@ def _run_sharded_wilcoxon(
                     )
                     for shard_index in range(len(ranges))
                 ]
+            if unselected is not None and unselected.any():
+                csr_row_spans = [(starts, np.where(unselected, starts, stops)) for starts, stops in csr_row_spans]
         else:
             kernel_inputs = [_host_csc_column_shard(sparse_source, start, stop) for start, stop in ranges]
 
     def run_shard(
         shard_index: int,
     ) -> tuple[_RankGenes, _WilcoxonResult | None]:
-        worker = copy(rg)
+        worker = copy(shard_rg)
         worker.X = kernel_inputs[shard_index]
         column_range = None if is_device_input else ranges[shard_index]
         if not is_device_input:
             host_workers = max(1, MAX_HOST_STAGING_WORKERS // len(device_ids))
             _wc._set_host_worker_limit(host_workers)
-            _wcs._set_host_worker_limit(host_workers)
         with cp.cuda.Device(device_ids[shard_index]):
             result = shard_runner(
                 worker,
                 tie_correct=tie_correct,
                 use_continuity=use_continuity,
-                chunk_size=chunk_size,
                 return_u_values=return_u_values,
                 column_range=column_range,
                 sparse_row_spans=csr_row_spans[shard_index],
@@ -430,8 +429,7 @@ def _run_sharded_wilcoxon(
             cp.cuda.runtime.deviceSynchronize()
         return worker, result
 
-    register_dense = dense_source is not None and rg.ireference is None
-    with _shared_dense_host_registration(dense_source, enabled=register_dense):
+    with _shared_dense_host_registration(dense_source):
         if len(device_ids) == 1:
             shards = [run_shard(0)]
         else:
