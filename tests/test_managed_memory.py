@@ -87,3 +87,13 @@ def test_harmony_integrate(managed_memory, dtype):
     rsc.pp.harmony_integrate(adata, key="batch", dtype=dtype)
     assert adata.obsm["X_pca_harmony"].shape == (300, 10)
     assert adata.obsm["X_pca_harmony"].dtype == dtype
+
+
+def test_wnn(managed_memory):
+    rng = np.random.default_rng(0)
+    adata = AnnData(np.zeros((300, 1), dtype=np.float32))
+    adata.obsm["A"] = rng.normal(size=(300, 8)).astype(np.float32)
+    adata.obsm["B"] = rng.normal(size=(300, 5)).astype(np.float32)
+    rsc.pp.wnn(adata, ["A", "B"], knn_range=40)
+    assert adata.obsp["snn"].nnz > 0
+    np.testing.assert_allclose(adata.obs[["A_weight", "B_weight"]].sum(axis=1), 1)
