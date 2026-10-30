@@ -187,8 +187,10 @@ struct Comm {
         barrier();
         return slot;
     }
-    // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU,
-    // in order on `stream` but copied on the rank's own stream: on a legacy
+    // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU
+    // (a slot, or memory a kernel on `stream` reads before it is freed: a peer
+    // copy in flight into freed memory faults both GPUs, see exchange), in
+    // order on `stream` but copied on the rank's own stream: on a legacy
     // default stream, a peer copy would also wait for the other GPU's work.
     void pull(int to, int from, long long* dst, const long long* src, size_t n,
               cudaStream_t stream) {

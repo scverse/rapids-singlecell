@@ -751,7 +751,7 @@ void register_bindings(nb::module_& m) {
 
     m.def(
         "solve_spd",
-        [](gpu_array_c<double, Device> gram,  // batched: overwritten
+        [](gpu_array_c<double, Device> gram,  // float64 path: overwritten
            gpu_array_c<const double, Device> rhs, gpu_array_c<double, Device> x,
            bool one_at_a_time, int refine, std::uintptr_t stream,
            std::uintptr_t blas, std::uintptr_t solver) {

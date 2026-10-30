@@ -710,6 +710,19 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, levels, n_cells
     cp.testing.assert_allclose(correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol)
 
 
+@pytest.mark.parametrize(("n_pcs", "n_clusters", "n_keys"), [(64, 64, 1), (30, 23, 1), (32, 126, 1), (30, 10, 2)])
+def test_harmony_shared_memory_boundary(n_pcs, n_clusters, n_keys):
+    # Shapes whose segment-sum or apply plan fills the 48 KB of shared memory a kernel may use without opting in:
+    # the kernels' static rows have to count towards the opt-in.
+    rng = np.random.default_rng(3)
+    n_cells = 2000
+    obs = pd.DataFrame({f"b{i}": rng.integers(0, 4, n_cells).astype(str) for i in range(n_keys)}).astype("category")
+    X = cp.asarray(rng.standard_normal((n_cells, n_pcs), dtype=np.float32))
+    key = list(obs.columns) if n_keys > 1 else "b0"
+    Z = harmony_module.harmonize(X, obs, key, n_clusters=n_clusters, max_iter_harmony=2, rng=0)
+    assert cp.isfinite(Z).all()
+
+
 def test_harmony_rhs_bounds_per_level():
     # With several keys the bound of a level is the one-key bound of its cells (those of all its joint categories),
     # also past float64's range, and the same from any split of the cells.

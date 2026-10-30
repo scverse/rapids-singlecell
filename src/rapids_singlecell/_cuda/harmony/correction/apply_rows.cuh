@@ -11,9 +11,9 @@
 // or CTAs, nor on the launch configuration. CTAs take runs of row tiles of one
 // segment; R tiles are staged in shared memory by cp.async, W[g] stays there
 // (summed as it is staged; in k chunks when it does not fit, partial sums then
-// wait in Z). Callers
-// chunk clusters the same way: a call without `finish` leaves the sums in Z,
-// and one with `resume` continues them (the same bits for the same W).
+// wait in Z). Callers chunk clusters the same way: a call without `finish`
+// leaves the sums in Z, and one with `resume` continues them (the same bits
+// for the same W).
 
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
@@ -30,6 +30,7 @@
 namespace harmony_apply {
 
 constexpr int kMaxTables = 8;
+constexpr size_t kStaticSmem = kMaxTables * sizeof(int);  // apply_rows_kernel
 
 // The coefficients W[g] of a segment s: the sum over its tables t < n of
 // w[t][seg_group[t][s]] (K x D each, common strides), added in that order as
@@ -98,14 +99,15 @@ __global__ void __launch_bounds__(NT)
     if (t0 == t1) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int K4 = (K + 3) & ~3, WS = min(D, DW);
-    // The segment's rows of every table: thread 0 resolves them with constant
+    // The segment's group in every table: thread 0 resolves them with constant
     // indices into the parameter (a runtime index would copy it to local
-    // memory); the barrier below publishes them.
-    __shared__ const T* wg[kMaxTables];
+    // memory) and the barrier below publishes them; groups rather than
+    // pointers keep the loads in their address spaces.
+    __shared__ int sgrp[kMaxTables];
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int t = 0; t < kMaxTables; ++t)
-            if (t < tb.n) wg[t] = tb.w[t] + (size_t)tb.seg_group[t][seg] * wgs;
+            if (t < tb.n) sgrp[t] = tb.seg_group[t][seg];
     }
     // shared: 2 stages of R tiles (TM x kc as RT) | CONV: the tile as T | W
     // chunk, element (k, j) at ((k / 4) * WS + j) * 4 + k % 4, + slack read by
@@ -127,10 +129,13 @@ __global__ void __launch_bounds__(NT)
                 if (k0 + k >= K)  // R pad +0: fma(+0, -0, acc) == acc, -0 too
                     *p = T(-0.0);
                 else if (tb.n == 1)
-                    __pipeline_memcpy_async(p, wg[0] + e, sizeof(T));
+                    __pipeline_memcpy_async(
+                        p, tb.w[0] + (size_t)sgrp[0] * wgs + e, sizeof(T));
                 else {
-                    T sum = wg[0][e];
-                    for (int t = 1; t < tb.n; ++t) sum += wg[t][e];
+                    T sum = tb.w[0][(size_t)sgrp[0] * wgs + e];
+#pragma unroll
+                    for (int t = 1; t < kMaxTables; ++t)
+                        if (t < tb.n) sum += tb.w[t][(size_t)sgrp[t] * wgs + e];
                     *p = sum;
                 }
             }
@@ -242,7 +247,9 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const Tables<T>& tb,
                    const int* seg_start, int n_seg, bool normalize, bool resume,
                    bool finish, T* Z, int slots, int kc, size_t budget,
                    cudaStream_t s) {
-    // shared T per cluster: 2 R stages (or 2 bfloat16 + widened), W column
+    // shared T per cluster: 2 R stages (or 2 bfloat16 + widened), W column;
+    // the kernel's static rows come out of the budget
+    budget -= kStaticSmem;
     const int k4 = (K + 3) & ~3, dw = 32 * slots, ws = std::min(D, dw);
     const int per = 16 * (slots < 8 ? 4 : 2) + ws, slack = (dw - ws) * 4;
     kc = std::min(
@@ -251,7 +258,7 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const Tables<T>& tb,
     if (n_seg <= 0) return cudaSuccess;
     const size_t smem = ((size_t)per * kc + slack) * sizeof(T);
     auto kernel = kernel_for<T, RT>(slots);
-    if (smem > 48 * 1024 &&
+    if (smem + kStaticSmem > 48 * 1024 &&
         cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem))
         return cudaGetLastError();

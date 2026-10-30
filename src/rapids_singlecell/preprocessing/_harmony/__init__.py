@@ -363,10 +363,11 @@ def harmonize(
             _sorted_groups(offsets, lo, hi, device)
             for device, lo, hi in zip(devices, bounds[:-1], bounds[1:], strict=True)
         ]
-        # Exact int64 sums of block counts, right-hand sides and centroids.
+        # Exact int64 sums of block counts, joint counts, right-hand sides and centroids.
         capacity = n_clusters * max(
             (n_blocks if keep else 1) * n_batches,
-            _limbs(dtype.itemsize) * max(n_groups, n_batches) * n_pcs,
+            n_groups,
+            _limbs(dtype.itemsize) * n_batches * n_pcs,
             3 * n_pcs,
         )
 
@@ -571,8 +572,9 @@ def _sort_by_batch(
     """
     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
     n_covariates, n_batches = int(n_levels.size), int(n_levels.sum())
-    # Several keys solve a dense float64 system over all their levels per
-    # cluster (and factor a copy); fail before the GPU work if it cannot fit.
+    # Several keys assemble a dense float64 system over all their levels per
+    # cluster and factor a copy (float32, or float64 when the solve falls back,
+    # which the bound sizes); fail before the GPU work if it cannot fit.
     system_bytes = 16 * (n_batches + 1) ** 2
     if n_covariates > 1 and system_bytes > _CORRECTION_WORKSPACE_LIMIT_BYTES:
         raise MemoryError(

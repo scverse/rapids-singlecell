@@ -46,6 +46,7 @@ struct Plan {
 };
 
 constexpr int kMaxGroupings = 8;
+constexpr int kStaticSmem = kMaxGroupings * (int)sizeof(int);  // segment_kernel
 
 // A segment's groups under several groupings j < n at once: seg_group[j][s]
 // (null: 0) + offset[j], rows of the same acc and bound_exp.
@@ -196,24 +197,6 @@ __global__ void __launch_bounds__(kThreads, 2)
         }
         __pipeline_commit();
     };
-    // The segment's rows under every grouping, this tile's columns: thread 0
-    // resolves them with constant indices into the parameter (a runtime index
-    // would copy it to local memory) and the barriers below publish them.
-    __shared__ const short* sbg[kMaxGroupings];
-    __shared__ unsigned long long* sout[kMaxGroupings];
-    const size_t ls = (size_t)K * D;
-    const int ng = gs.n;
-    if (threadIdx.x == 0) {
-#pragma unroll
-        for (int j = 0; j < kMaxGroupings; ++j)
-            if (j < ng) {
-                const int g =
-                    (gs.seg_group[j] ? gs.seg_group[j][blockIdx.x] : 0) +
-                    gs.offset[j];
-                sbg[j] = bound_exp + (size_t)g * D + d0;
-                sout[j] = acc + (size_t)g * limbs * ls + (size_t)k0 * D + d0;
-            }
-    }
     load(0);
     const int nto = p.dgt * p.kgt, sp = threadIdx.x / nto;
     const int o = threadIdx.x % nto, dg = o / p.kgt, kg = o % p.kgt;
@@ -265,14 +248,31 @@ __global__ void __launch_bounds__(kThreads, 2)
             rows(std::false_type{}, a, r, n);
     }
     __pipeline_wait_prior(0);
+    // The segment's row under every grouping: thread 0 resolves them with
+    // constant indices into the parameter (a runtime index would copy it to
+    // local memory) and the barrier publishes them; rows rather than pointers
+    // keep the loads below in their address spaces.
+    __shared__ int srow[kMaxGroupings];
+    const int ng = gs.n;
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < kMaxGroupings; ++j)
+            if (j < ng)
+                srow[j] = (gs.seg_group[j] ? gs.seg_group[j][blockIdx.x] : 0) +
+                          gs.offset[j];
+    }
     __syncthreads();
 
+    const size_t ls = (size_t)K * D;  // this tile's columns: + k0 D + d0
     auto put = [&](T v, int d, int k) {
         if (d < dv && k < kv)
 #pragma unroll 1
-            for (int j = 0; j < ng; ++j)
-                emit(v, scale_exp(sbg[j][d], limbs),
-                     sout[j] + (size_t)k * D + d, ls, limbs);
+            for (int j = 0; j < ng; ++j) {
+                const size_t g = srow[j];
+                emit(v, scale_exp(bound_exp[g * D + d0 + d], limbs),
+                     acc + g * limbs * ls + ((size_t)k0 + k) * D + d0 + d, ls,
+                     limbs);
+            }
     };
     if (p.nsplit == 1 && sp == 0)
 #pragma unroll
@@ -351,7 +351,8 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
     const int red = p.nsplit * p.dgt * p.kgt * p.td * p.tk * sizeof(T);
     p.smem = std::max(2 * p.stage, p.nsplit > 1 ? red : 0);
     auto launch = [&](auto kernel) {
-        if (p.smem > kSmemBudget)  // strided R rows only
+        if (p.smem + kStaticSmem >
+            kSmemBudget)  // strided R rows, or at the budget
             cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, p.smem);
         kernel<<<dim3(n_seg, p.n_dy * p.n_ky), kThreads, p.smem, s>>>(
