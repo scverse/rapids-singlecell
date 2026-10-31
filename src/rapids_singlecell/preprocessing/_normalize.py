@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from functools import cache, partial
+from functools import partial
 from typing import TYPE_CHECKING, Union
 
 import cupy as cp
@@ -641,44 +641,6 @@ def normalize_pearson_residuals(
     return None
 
 
-_log1p_scaled = cp.ElementwiseKernel("T x, T s", "T y", "y = log1p(x * s)", "rsc_shifted_clr_log1p_scaled")
-
-_row_sum64 = cp.ReductionKernel(
-    "T x", "float64 y", "(double)x", "a + b", "y = a", "0", "rsc_shifted_clr_row_sum64", reduce_type="double"
-)
-
-_CSR_KERNEL = r"""
-// One warp per CSR row: the dense output row is log1p(s * x) - mean_j log1p(s * x_j).
-template <typename T, typename P, typename I>
-__global__ void shifted_clr_csr(const P* __restrict__ indptr, const I* __restrict__ indices,
-                                const T* __restrict__ data, T* __restrict__ out,
-                                long long n_rows, long long n_cols, T s) {
-    long long row = ((long long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int lane = threadIdx.x & 31;
-    if (row >= n_rows) return;  // uniform per warp
-    P start = indptr[row];
-    P stop = indptr[row + 1];
-    double total = 0.0;
-    for (P k = start + lane; k < stop; k += 32) total += (double)log1p(data[k] * s);
-    for (int off = 16; off > 0; off >>= 1) total += __shfl_xor_sync(0xffffffff, total, off);
-    T offset = (T)(total / (double)n_cols);
-    T* out_row = out + row * n_cols;
-    for (long long j = lane; j < n_cols; j += 32) out_row[j] = -offset;
-    __syncwarp();
-    for (P k = start + lane; k < stop; k += 32) out_row[indices[k]] = log1p(data[k] * s) - offset;
-}
-"""
-_C_TYPES = {cp.dtype(cp.float32): "float", cp.dtype(cp.float64): "double", cp.dtype(cp.int32): "int"}
-_C_TYPES[cp.dtype(cp.int64)] = "long long"
-_BLOCK = 256
-
-
-@cache
-def _csr_kernel(*types: str) -> cp.RawKernel:
-    expr = f"shifted_clr_csr<{', '.join(types)}>"
-    return cp.RawModule(code=_CSR_KERNEL, options=("-std=c++17",), name_expressions=(expr,)).get_function(expr)
-
-
 def _estimate_nb_overdispersion(X: ArrayTypesDask) -> float:
     r"""Closed-form least squares of :math:`\mathrm{Var}_g = μ_g + α μ_g^2` across genes."""
     mu, var = _get_mean_var(X, axis=0, correction=0)
@@ -701,18 +663,32 @@ def _estimate_nb_overdispersion(X: ArrayTypesDask) -> float:
 
 def _shifted_clr(X: cp.ndarray | sparse.csr_matrix, scale: float) -> cp.ndarray:
     """Dense ``log1p(scale * X)`` centered on its per-cell mean."""
+    from rapids_singlecell._cuda import _norm_cuda as _nc
+
     n_rows, n_cols = X.shape
-    s = X.dtype.type(scale)
-    if isinstance(X, cp.ndarray):
-        out = _log1p_scaled(X, s)
-        out -= (_row_sum64(out, axis=1) / n_cols).astype(out.dtype)[:, None]
-        return out
     out = cp.empty((n_rows, n_cols), dtype=X.dtype)
-    if n_rows == 0:
+    if n_rows == 0 or n_cols == 0:
         return out
-    kernel = _csr_kernel(_C_TYPES[X.dtype], _C_TYPES[X.indptr.dtype], _C_TYPES[X.indices.dtype])
-    grid = (n_rows * 32 + _BLOCK - 1) // _BLOCK
-    kernel((grid,), (_BLOCK,), (X.indptr, X.indices, X.data, out, cp.int64(n_rows), cp.int64(n_cols), s))
+    if isinstance(X, cp.ndarray):
+        _nc.shifted_clr_dense(
+            cp.ascontiguousarray(X),
+            out=out,
+            nrows=n_rows,
+            ncols=n_cols,
+            scale=float(scale),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    else:
+        _nc.shifted_clr_csr(
+            X.indptr,
+            X.indices,
+            X.data,
+            out=out,
+            nrows=n_rows,
+            ncols=n_cols,
+            scale=float(scale),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
     return out
 
 
@@ -790,7 +766,7 @@ def normalize_shifted_clr(
             raise ValueError("Dask arrays must be chunked along the first axis only.")
         X = X.map_blocks(_shifted_clr, scale, meta=_meta_dense(X.dtype), dtype=X.dtype)
     else:
-        cell_depths = _row_sum64(X, axis=1) if isinstance(X, cp.ndarray) else X.sum(axis=1)
+        cell_depths = X.sum(axis=1)
         if not bool((cell_depths > 0).all()):
             warnings.warn("Some cells have zero counts", UserWarning, stacklevel=2)
         X = _shifted_clr(X, scale)
