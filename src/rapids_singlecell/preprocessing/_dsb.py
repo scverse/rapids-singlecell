@@ -523,16 +523,16 @@ def _fit_rows(
     if n_fits == 0:
         return params, flags
     if sub is None and not compress:
-        _dsb.mix2(cp.ascontiguousarray(f(M)), none, none, none, params, flags, subset=False, **kw)  # type: ignore[call-overload]
+        _dsb.mix2(cp.ascontiguousarray(f(M)), none, none, none, params, flags, subset=False, **kw)  # type: ignore[call-overload, unused-ignore]
         return params, flags
     start = M if sub is None else cp.take_along_axis(M, cp.asarray(sub), axis=1)  # type: ignore[attr-defined]
     init = cp.empty((n_fits, 2, 6), dtype=dtype)
-    _dsb.mix2(cp.ascontiguousarray(f(start)), none, none, init, none, flags, subset=False, **kw)  # type: ignore[call-overload]
+    _dsb.mix2(cp.ascontiguousarray(f(start)), none, none, init, none, flags, subset=False, **kw)  # type: ignore[call-overload, unused-ignore]
     if compress and (unique := _unique_counts(M)) is not None:
         x, w = f(unique[0]), unique[1].astype(dtype, copy=False)
     else:
         x, w = cp.ascontiguousarray(f(M)), none
-    _dsb.mix2(x, w, init, none, params, flags, subset=sub is not None, **kw)  # type: ignore[call-overload]
+    _dsb.mix2(x, w, init, none, params, flags, subset=sub is not None, **kw)  # type: ignore[call-overload, unused-ignore]
     return params, flags
 
 
