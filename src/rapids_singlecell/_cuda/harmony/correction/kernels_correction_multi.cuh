@@ -7,10 +7,12 @@
 
 #include "../storage.cuh"
 
-// The regression systems are assembled and solved in double from the joint
-// counts and the exact joint right-hand sides: every entry is a sum of the
-// same values, so the intercept and category rows stay consistent and a small
-// ridge lambda does not lose the solution to rounding.
+// The regression systems (solved by solve_systems, correction_batched.cu) are
+// assembled in double from exact sums:
+// the Gram matrices from the clustering's int64 joint counts (every entry,
+// the intercept and the diagonal included, from the same counts, so the rows
+// stay consistent and a small ridge lambda does not lose the solution to
+// rounding), the right-hand sides from exact per-level sums of R^T X.
 
 // The ridge penalties of a chunk's clusters (rows of stride ld, those of
 // lambda_kb): a category is active unless its penalty suppresses it (a pruned
@@ -28,167 +30,101 @@ struct Penalties {
     }
 };
 
-// Initialize the intercept, intercept/category, and within-covariate diagonal
-// entries of every regression Gram matrix.  All other entries are already
-// zero.  An inactive category is represented by an isolated unit diagonal,
-// which is algebraically equivalent to omitting that category from the solve
-// and then restoring a zero coefficient.
-template <typename T>
-__global__ void initialize_multi_gram_kernel(
-    Penalties<T> lambda, const T* __restrict__ joint_O,
-    const int* __restrict__ marginal_joint_offsets,
-    const int* __restrict__ marginal_joint_indices, double* __restrict__ gram,
-    int n_batches, int n_clusters, int n_joint_categories) {
-    int cluster = blockIdx.x;
-    if (cluster >= n_clusters) return;
+// Exact joint counts of a chunk's clusters (counts: J x k int64, the
+// clustering's fixed point) summed into the Gram matrices, as int64 in the
+// matrices' own storage: the diagonal of every level and, above it, the
+// cross-key entries of every pair of levels of a joint category. Integer
+// atomics: the same bits in any order. finish_gram_kernel converts them.
+__global__ void count_blocks_kernel(
+    const unsigned long long* __restrict__ counts,
+    const int* __restrict__ joint_cats, int n_covariates, int J, int k, int nb1,
+    unsigned long long* __restrict__ gram) {
+    long long total = (long long)J * k;
+    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         e < total; e += (long long)gridDim.x * blockDim.x) {
+        unsigned long long v = counts[e];
+        if (!v) continue;
+        const int* levels = joint_cats + (e / k) * n_covariates;
+        unsigned long long* g = gram + (e % k) * (size_t)nb1 * nb1;
+        for (int c = 0; c < n_covariates; ++c) {
+            int b = levels[c] + 1;
+            atomicAdd(g + (size_t)b * nb1 + b, v);
+            for (int d = c + 1; d < n_covariates; ++d)  // levels[d] > levels[c]
+                atomicAdd(g + (size_t)b * nb1 + levels[d] + 1, v);
+        }
+    }
+}
 
-    int nb1 = n_batches + 1;
-    double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
-    auto count = [&](int joint) {
-        return (double)joint_O[(size_t)joint * n_clusters + cluster];
-    };
-    double total = 0;
-    for (int joint = threadIdx.x; joint < n_joint_categories;
-         joint += blockDim.x)
-        total += count(joint);
+// One block per cluster: the counted Gram matrix as double (count_inv: the
+// fixed point's unit), symmetric, with the ridge on the diagonal, the
+// intercept row and column from the level counts (the first key's levels
+// hold every cell once) and an isolated unit diagonal for an inactive
+// (pruned) level, which omits it from the solve. A cluster without cells
+// gets a unit pivot (W = 0).
+template <typename T>
+__global__ void finish_gram_kernel(Penalties<T> lambda, double count_inv,
+                                   int n_first, int n_batches, int k,
+                                   double* __restrict__ gram) {
+    int nb1 = n_batches + 1, cluster = blockIdx.x;
+    if (cluster >= k) return;
+    double* g = gram + (size_t)cluster * nb1 * nb1;
+    auto u = reinterpret_cast<unsigned long long*>(g);
+    unsigned long long total = 0;
+    for (int b = 1 + threadIdx.x; b <= n_first; b += blockDim.x)
+        total += u[(size_t)b * nb1 + b];
     total = block_sum(total);
-    // A cluster without cells has zero right-hand sides: a unit pivot keeps
-    // its system positive definite (W = 0).
-    if (threadIdx.x == 0) cluster_gram[0] = total > 0 ? total : 1;
-
-    for (int batch = threadIdx.x; batch < n_batches; batch += blockDim.x) {
-        int row = batch + 1;
-        if (lambda.active(batch, cluster)) {
-            double observed = 0;
-            for (int position = marginal_joint_offsets[batch];
-                 position < marginal_joint_offsets[batch + 1]; ++position)
-                observed += count(marginal_joint_indices[position]);
-            cluster_gram[row] = observed;
-            cluster_gram[(size_t)row * nb1] = observed;
-            cluster_gram[(size_t)row * nb1 + row] =
-                observed + lambda(batch, cluster);
-        } else {
-            cluster_gram[(size_t)row * nb1 + row] = 1;
+    __syncthreads();  // every count read before any entry becomes double
+    for (size_t e = threadIdx.x; e < (size_t)nb1 * nb1; e += blockDim.x) {
+        int r = (int)(e / nb1), c = (int)(e % nb1);
+        if (r == 0 && c == 0) {
+            g[0] = total ? (double)total * count_inv : 1.0;
+        } else if (r == 0 || c == 0) {
+            continue;  // written with the diagonal
+        } else if (r == c) {
+            bool active = lambda.active(r - 1, cluster);
+            double count = (double)u[e] * count_inv;
+            g[e] = active ? count + lambda(r - 1, cluster) : 1.0;
+            g[r] = g[(size_t)r * nb1] = active ? count : 0.0;
+        } else if (r < c) {
+            double v =
+                lambda.active(r - 1, cluster) && lambda.active(c - 1, cluster)
+                    ? (double)u[e] * count_inv
+                    : 0.0;
+            g[e] = g[(size_t)c * nb1 + r] = v;
         }
     }
 }
 
-// Add the cross-covariate blocks A diag(q_k) A^T, where each row of
-// joint_cats contains the F active marginal levels for one observed joint
-// category.  Same-covariate blocks are diagonal and were initialized from O.
-template <typename T, int N_COVARIATES>
-__global__ void add_joint_cross_kernel(
-    const T* __restrict__ joint_O, const int* __restrict__ joint_cats,
-    const int* __restrict__ marginal_joint_offsets,
-    const int* __restrict__ marginal_joint_indices, Penalties<T> lambda,
-    double* __restrict__ gram, int n_covariates, int n_batches,
-    int n_clusters) {
-    size_t total = (size_t)n_batches * n_clusters;
-    int nb1 = n_batches + 1;
-
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total; idx += (size_t)blockDim.x * gridDim.x) {
-        int batch = (int)(idx / n_clusters);
-        int cluster = (int)(idx % n_clusters);
-        if (!lambda.active(batch, cluster)) continue;
-        int row = batch + 1;
-        double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
-        // The lower category owns each symmetric pair and visits its joint
-        // categories in CSR order. No other thread writes either entry.
-        for (int position = marginal_joint_offsets[batch];
-             position < marginal_joint_offsets[batch + 1]; ++position) {
-            int joint = marginal_joint_indices[position];
-            T value = joint_O[(size_t)joint * n_clusters + cluster];
-            if (value == T(0)) continue;
-            const int* levels =
-                joint_cats + (size_t)joint * (N_COVARIATES > 0 ? N_COVARIATES
-                                                               : n_covariates);
-            int count = N_COVARIATES > 0 ? N_COVARIATES : n_covariates;
-#pragma unroll
-            for (int other = 0; other < count; ++other) {
-                int other_batch = levels[other];
-                if (other_batch <= batch ||
-                    !lambda.active(other_batch, cluster))
-                    continue;
-                int col = other_batch + 1;
-                double updated = cluster_gram[(size_t)row * nb1 + col] + value;
-                cluster_gram[(size_t)row * nb1 + col] = updated;
-                cluster_gram[(size_t)col * nb1 + row] = updated;
-            }
-        }
-    }
-}
-
-// Expand joint-category cross-products R_j^T X_j into the regression
-// right-hand sides: row b + 1 sums the joints containing category b (in
-// ascending CSR order, deterministic). Row 0 and the inactive categories:
-// intercept_and_mask_kernel.
-__global__ void marginal_from_joint_rhs_kernel(
-    const double* __restrict__ joint_rhs,
-    const int* __restrict__ marginal_joint_offsets,
-    const int* __restrict__ marginal_joint_indices, double* __restrict__ rhs,
-    int n_pcs, int n_clusters, int n_batches) {
-    size_t total = (size_t)n_clusters * n_batches * n_pcs;
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total; idx += (size_t)blockDim.x * gridDim.x) {
-        int pc = (int)(idx % n_pcs);
-        int b = (int)(idx / n_pcs % n_batches);
-        int cluster = (int)(idx / ((size_t)n_pcs * n_batches));
-        double value = 0;
-        for (int position = marginal_joint_offsets[b];
-             position < marginal_joint_offsets[b + 1]; ++position)
-            value += joint_rhs[((size_t)marginal_joint_indices[position] *
-                                    n_clusters +
-                                cluster) *
-                                   n_pcs +
-                               pc];
-        rhs[((size_t)cluster * (n_batches + 1) + b + 1) * n_pcs + pc] = value;
-    }
-}
-
-// Row 0 (intercept) sums every joint: the rows of the first key's n_first
-// categories, which hold every joint once. Then the rows of inactive
-// categories are zeroed.
+// The right-hand sides' intercept row (all cells) as the sum of the first
+// key's level rows, in order; then zeros in the rows of inactive levels.
 template <typename T>
-__global__ void intercept_and_mask_kernel(Penalties<T> lambda,
-                                          double* __restrict__ rhs, int n_pcs,
-                                          int n_clusters, int n_batches,
-                                          int n_first) {
-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < (size_t)n_clusters * n_pcs;
-         idx += (size_t)blockDim.x * gridDim.x) {
-        int pc = (int)(idx % n_pcs), cluster = (int)(idx / n_pcs);
-        double* row = rhs + (size_t)cluster * (n_batches + 1) * n_pcs + pc;
-        double value = 0;
-        for (int b = 0; b < n_first; ++b) value += row[(size_t)(b + 1) * n_pcs];
-        row[0] = value;
+__global__ void finish_rhs_kernel(Penalties<T> lambda, int n_first,
+                                  int n_batches, int n_pcs, int k,
+                                  double* __restrict__ rhs) {
+    const int nb1 = n_batches + 1;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < (size_t)k * n_pcs; i += (size_t)gridDim.x * blockDim.x) {
+        const int cluster = (int)(i / n_pcs);
+        double* r = rhs + (size_t)cluster * nb1 * n_pcs + i % n_pcs;
+        double total = 0.0;
+        for (int b = 0; b < n_first; ++b) total += r[(size_t)(b + 1) * n_pcs];
+        r[0] = total;
         for (int b = 0; b < n_batches; ++b)
-            if (!lambda.active(b, cluster)) row[(size_t)(b + 1) * n_pcs] = 0;
+            if (!lambda.active(b, cluster)) r[(size_t)(b + 1) * n_pcs] = 0.0;
     }
 }
 
-// Coefficients per joint category: W_joint[j][k][:] is the sum of the
-// marginal rows W_all[k][b + 1][:] over the categories b of joint j. The
-// intercept is deliberately retained in the embedding, as in Harmony.
+// The coefficients applied per level: table[b][k][:] = W[k][b + 1][:]; the
+// intercept W[k][0][:] stays in the embedding, as in Harmony.
 template <typename T>
-__global__ void joint_coefficients_kernel(const double* __restrict__ W_all,
-                                          const int* __restrict__ joint_cats,
-                                          T* __restrict__ W_joint, int n_pcs,
-                                          int n_clusters, int n_batches,
-                                          int n_covariates,
-                                          int n_joint_categories) {
-    int nb1 = n_batches + 1;
-    size_t total = (size_t)n_joint_categories * n_clusters * n_pcs;
+__global__ void level_tables_kernel(const double* __restrict__ W, int k,
+                                    int nb1, int n_pcs, T* __restrict__ table) {
+    int n_batches = nb1 - 1;
+    size_t total = (size_t)n_batches * k * n_pcs;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += (size_t)blockDim.x * gridDim.x) {
-        int pc = (int)(idx % n_pcs);
-        int cluster = (int)(idx / n_pcs % n_clusters);
-        int joint = (int)(idx / ((size_t)n_pcs * n_clusters));
-        const int* levels = joint_cats + (size_t)joint * n_covariates;
-        T value = T(0);
-        for (int c = 0; c < n_covariates; ++c)
-            value +=
-                (T)W_all[((size_t)cluster * nb1 + levels[c] + 1) * n_pcs + pc];
-        W_joint[idx] = value;
+        int pc = (int)(idx % n_pcs), cluster = (int)(idx / n_pcs % k);
+        int b = (int)(idx / ((size_t)n_pcs * k));
+        table[idx] = (T)W[((size_t)cluster * nb1 + b + 1) * n_pcs + pc];
     }
 }
