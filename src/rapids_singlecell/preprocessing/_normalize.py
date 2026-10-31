@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from functools import partial
-from typing import TYPE_CHECKING, Literal, Union
+from functools import cache, partial
+from typing import TYPE_CHECKING, Union
 
 import cupy as cp
 from anndata import AnnData
@@ -24,11 +24,6 @@ if TYPE_CHECKING:
     from cupyx.scipy.sparse import spmatrix
 
     from rapids_singlecell._utils import ArrayTypesDask
-
-# normalize_clr writes its factored output to these fixed keys.
-CLR_LAYER = "clr"
-CLR_CELL_DEPTHS_KEY = "clr_cell_depths"
-CLR_RESIDUALS_KEY = "clr_residuals"
 
 
 def normalize_total(
@@ -132,61 +127,6 @@ def normalize_total(
     return None
 
 
-def _normalize_total(
-    X: ArrayTypesDask,
-    target_sum: float | None,
-    *,
-    exclude_highly_expressed: bool = False,
-    max_fraction: float = 0.05,
-) -> ArrayTypesDask:
-    if isinstance(X, DaskArray):
-        return _normalize_total_dask(X, target_sum)
-    elif isinstance(X, sparse.csr_matrix):
-        X = _normalize_total_csr(
-            X,
-            target_sum,
-            exclude_highly_expressed=exclude_highly_expressed,
-            max_fraction=max_fraction,
-        )
-    elif isinstance(X, cp.ndarray):
-        X = _normalize_total_dense(
-            X,
-            target_sum,
-            exclude_highly_expressed=exclude_highly_expressed,
-            max_fraction=max_fraction,
-        )
-    else:
-        raise ValueError(f"Cannot normalize {type(X)}")
-    return X
-
-
-def _sum_axis1(X: ArrayTypesDask) -> cp.ndarray | DaskArray:
-    """Per-cell counts (sum over axis=1) for a CSR matrix, dense cupy array, or Dask array."""
-    if isinstance(X, DaskArray):
-        return X.map_blocks(
-            _sum_axis1,
-            meta=cp.array((1.0,), dtype=X.dtype),
-            dtype=X.dtype,
-            chunks=(X.chunksize[0],),
-            drop_axis=1,
-        )
-    if isinstance(X, sparse.csr_matrix):
-        from rapids_singlecell._cuda import _norm_cuda as _nc
-
-        counts = cp.zeros(X.shape[0], dtype=X.dtype)
-        _nc.sum_major(
-            X.indptr,
-            X.data,
-            sums=counts,
-            major=X.shape[0],
-            stream=cp.cuda.get_current_stream().ptr,
-        )
-        return counts
-    elif isinstance(X, cp.ndarray):
-        return X.sum(axis=1)
-    raise ValueError(f"Cannot compute row sums for {type(X)}")
-
-
 def _counts_to_scales(counts_per_cell: cp.ndarray, target_sum: float | None = None) -> cp.ndarray:
     """Compute per-cell scale factors. Uses median of nonzero counts if target_sum is None."""
     nonzero = counts_per_cell > 0
@@ -250,7 +190,14 @@ def _normalize_total_csr(
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
         if gene_is_hi is None:
-            counts = _sum_axis1(X)
+            counts = cp.zeros(n_cells, dtype=X.dtype)
+            _nc.sum_major(
+                X.indptr,
+                X.data,
+                sums=counts,
+                major=n_cells,
+                stream=cp.cuda.get_current_stream().ptr,
+            )
         else:
             counts = cp.zeros(n_cells, dtype=X.dtype)
             _nc.masked_sum_major(
@@ -302,11 +249,11 @@ def _normalize_total_dense(
         # Compute per-cell counts, then prescaled multiply
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
-        counts_per_cell = _sum_axis1(X)
+        counts_per_cell = X.sum(axis=1)
         if exclude_highly_expressed:
             hi_exp = X > max_fraction * counts_per_cell.reshape(-1, 1)
             gene_subset = ~hi_exp.any(axis=0)
-            counts_per_cell = _sum_axis1(X[:, gene_subset])
+            counts_per_cell = X[:, gene_subset].sum(axis=1)
 
         scales = _counts_to_scales(counts_per_cell, target_sum)
         _nc.prescaled_mul_dense(
@@ -358,160 +305,37 @@ def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
 
 
 def _get_target_sum_dask(X: DaskArray) -> int:
-    counts_per_cell = _sum_axis1(X).compute()
+    if isinstance(X._meta, sparse.csr_matrix):
+        from rapids_singlecell._cuda import _norm_cuda as _nc
+
+        def __sum(X_part):
+            counts_per_cell = cp.zeros(X_part.shape[0], dtype=X_part.dtype)
+            _nc.sum_major(
+                X_part.indptr,
+                X_part.data,
+                sums=counts_per_cell,
+                major=X_part.shape[0],
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+            return counts_per_cell
+
+    elif isinstance(X._meta, cp.ndarray):
+
+        def __sum(X_part):
+            return X_part.sum(axis=1)
+    else:
+        raise ValueError(f"Cannot compute target sum for {type(X)}")
+    target_sum_chunk_matrices = X.map_blocks(
+        __sum,
+        meta=cp.array((1.0,), dtype=X.dtype),
+        dtype=X.dtype,
+        chunks=(X.chunksize[0],),
+        drop_axis=1,
+    )
+    counts_per_cell = target_sum_chunk_matrices.compute()
     counts_per_cell = counts_per_cell[counts_per_cell > 0]
     target_sum = cp.median(counts_per_cell)
     return target_sum
-
-
-def normalize_clr(
-    adata: AnnData,
-    *,
-    target_sum: float | None = None,
-    alpha: float | Literal["auto"] | None = None,
-    layer: str | None = None,
-    inplace: bool = True,
-    copy: bool = False,
-) -> Union[AnnData, spmatrix, cp.ndarray, None]:  # noqa: UP007
-    r"""\
-    Normalize counts with the shifted centered log-ratio (PFlog1pPF) transform.
-
-    Computes the shifted centered log-ratio (CLR) transform
-
-    .. math::
-        T(x)_i = \log(u_i + 1) - \frac{1}{D} \sum_{j=1}^D \log(u_j + 1),
-
-    where :math:`u_i = K \, x_i / \sum_j x_j` are the depth-normalized counts
-    (proportional fitting to a target depth :math:`K`) and :math:`D` is the number
-    of genes. Equivalently this is proportional fitting, then ``log1p``, then
-    per-cell mean-centering in log space (the centered-log-ratio step). The
-    transform is simultaneously variance-stabilizing, depth-invariant, and
-    rank-preserving :cite:p:`Booeshaghi2026`.
-
-    To avoid densifying the matrix, the centering term is *not* subtracted in
-    place and the source matrix is left untouched. ``adata.layers["clr"]`` holds
-    the sparse :math:`\log(u + 1)`, the per-cell centering offset
-    :math:`\frac{1}{D}\sum_j \log(u_j + 1)` is written to
-    ``adata.obsm["clr_residuals"]``, and the raw per-cell depths to
-    ``adata.obsm["clr_cell_depths"]``. The full centered CLR is recovered as
-    ``adata.layers["clr"] - adata.obsm["clr_residuals"][:, None]``;
-    :func:`~rapids_singlecell.pp.pca` consumes this factored form directly via
-    ``layer="clr"`` without ever materializing it.
-
-    .. note::
-        When the input is a Dask array, deriving the proportional-fitting target
-        :math:`K` from the data requires a global reduction and therefore triggers
-        a blocking ``.compute()`` (for the default mean-depth target, and for
-        `alpha`, including ``alpha="auto"``). Only the scalar reduction is
-        materialized, not the matrix. Passing `target_sum` explicitly keeps it lazy.
-
-    Parameters
-    ----------
-        adata
-            The annotated data matrix of shape `n_obs` × `n_vars`. Rows correspond
-            to cells and columns to genes.
-        target_sum
-            Target depth :math:`K` for the proportional-fitting step. If `None`
-            (and `alpha` is not given), the empirical mean cell depth is used. This
-            is only an *intermediate* target: the subsequent log and centering steps
-            put each cell on the zero-sum hyperplane regardless of `K`.
-        alpha
-            Negative-binomial overdispersion of the dataset (``var = μ + α·μ²``).
-            When given, it overrides `target_sum` and sets :math:`K = 4 \cdot α \cdot s`
-            by the delta method, where :math:`s` is the mean cell depth, calibrating
-            the count-scale pseudocount to the variance-stabilizing value
-            ``y0 = 1/(4·α)`` :cite:p:`Booeshaghi2026`. Pass ``"auto"`` to estimate
-            :math:`α` from the data (closed-form least squares of ``var = μ + α·μ²``
-            across genes). Raises a :class:`ValueError` if the estimated or supplied
-            :math:`α` is not positive (e.g. underdispersed data); pass `target_sum`
-            instead.
-        layer
-            Layer to read the counts from. If `None`, `X` is used. The result is
-            always written to ``adata.layers["clr"]``; the source is not modified.
-        inplace
-            Whether to update `adata` or return the result.
-        copy
-            Whether to return a copy or update `adata`. Not compatible with
-            `inplace=False`.
-
-    Returns
-    -------
-        Depending on `inplace`:
-
-        - `inplace=True` (default): writes the sparse :math:`\log(u + 1)` to
-          ``adata.layers["clr"]`` and the centering offsets / depths to
-          ``adata.obsm["clr_residuals"]`` / ``adata.obsm["clr_cell_depths"]``,
-          leaving the source matrix untouched, and returns `None`.
-        - `copy=True`: performs the update on a copy and returns it.
-        - `inplace=False`: returns the tuple ``(X, cell_depths, residuals)`` and
-          leaves `adata` untouched.
-    """
-    if copy:
-        if not inplace:
-            msg = "`copy=True` cannot be used with `inplace=False`."
-            raise ValueError(msg)
-        adata = adata.copy()
-    X = _get_obs_rep(adata, layer=layer)
-    _check_gpu_X(X, allow_dask=True)
-    # The PF step mutates the matrix in place; copy so the source (X / `layer`)
-    # is preserved (CSC `.tocsr()` already yields a fresh matrix).
-    if sparse.isspmatrix_csc(X):
-        X = X.tocsr()
-    else:
-        X = X.copy()
-    X, cell_depths, residuals = _normalize_clr(X, target_sum=target_sum, alpha=alpha)
-    if inplace:
-        adata.layers[CLR_LAYER] = X
-        adata.obsm[CLR_CELL_DEPTHS_KEY] = cell_depths
-        adata.obsm[CLR_RESIDUALS_KEY] = residuals
-    if copy:
-        return adata
-    if not inplace:
-        return X, cell_depths, residuals
-    return None
-
-
-def _estimate_overdispersion(X: ArrayTypesDask) -> tuple[float, cp.ndarray]:
-    mean, var = _get_mean_var(X, axis=0, correction=0)
-    cell_depths = _sum_axis1(X)
-    if isinstance(X, DaskArray):
-        import dask
-
-        mean, var, cell_depths = dask.compute(mean, var, cell_depths)
-    mean_sq = mean**2
-    numerator = cp.sum((var - mean) * mean_sq)
-    denominator = cp.sum(mean_sq**2)
-    if float(denominator) == 0:
-        msg = "Cannot estimate overdispersion: all gene means are zero."
-        raise ValueError(msg)
-    return numerator / denominator, cell_depths
-
-
-def _normalize_clr(
-    X: ArrayTypesDask, target_sum: float | None, alpha: float | Literal["auto"] | None
-) -> tuple[ArrayTypesDask, cp.ndarray, cp.ndarray]:
-    if alpha == "auto":
-        alpha, cell_depths = _estimate_overdispersion(X)
-    else:
-        cell_depths = _sum_axis1(X)
-        if isinstance(cell_depths, DaskArray):
-            cell_depths = cell_depths.compute()
-    if bool((cell_depths == 0).any()):
-        warnings.warn("Some cells have zero counts", UserWarning)
-    if alpha is not None:
-        if alpha <= 0:
-            raise ValueError("alpha must be positive")
-        target_sum = 4.0 * alpha * float(cell_depths.mean())
-    elif target_sum is None:
-        target_sum = float(cell_depths.mean())
-
-    X = _normalize_total(X, target_sum)
-    X = _calc_log1p(X)
-    # Centering offset = per-cell mean of log1p(PF) = row sum / n_genes.
-    # `_sum_axis1` already covers CSR/dense/Dask; avoids the unused variance pass.
-    residuals = _sum_axis1(X) / X.shape[1]
-
-    return X, cell_depths, residuals
 
 
 def _calc_log1p(X: ArrayTypesDask, base: float | None = None) -> ArrayTypesDask:
@@ -814,4 +638,168 @@ def normalize_pearson_residuals(
         _set_obs_rep(adata, residuals, layer=layer)
     else:
         return residuals
+    return None
+
+
+_log1p_scaled = cp.ElementwiseKernel("T x, T s", "T y", "y = log1p(x * s)", "rsc_shifted_clr_log1p_scaled")
+
+_row_sum64 = cp.ReductionKernel(
+    "T x", "float64 y", "(double)x", "a + b", "y = a", "0", "rsc_shifted_clr_row_sum64", reduce_type="double"
+)
+
+_CSR_KERNEL = r"""
+// One warp per CSR row: the dense output row is log1p(s * x) - mean_j log1p(s * x_j).
+template <typename T, typename P, typename I>
+__global__ void shifted_clr_csr(const P* __restrict__ indptr, const I* __restrict__ indices,
+                                const T* __restrict__ data, T* __restrict__ out,
+                                long long n_rows, long long n_cols, T s) {
+    long long row = ((long long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x & 31;
+    if (row >= n_rows) return;  // uniform per warp
+    P start = indptr[row];
+    P stop = indptr[row + 1];
+    double total = 0.0;
+    for (P k = start + lane; k < stop; k += 32) total += (double)log1p(data[k] * s);
+    for (int off = 16; off > 0; off >>= 1) total += __shfl_xor_sync(0xffffffff, total, off);
+    T offset = (T)(total / (double)n_cols);
+    T* out_row = out + row * n_cols;
+    for (long long j = lane; j < n_cols; j += 32) out_row[j] = -offset;
+    __syncwarp();
+    for (P k = start + lane; k < stop; k += 32) out_row[indices[k]] = log1p(data[k] * s) - offset;
+}
+"""
+_C_TYPES = {cp.dtype(cp.float32): "float", cp.dtype(cp.float64): "double", cp.dtype(cp.int32): "int"}
+_C_TYPES[cp.dtype(cp.int64)] = "long long"
+_BLOCK = 256
+
+
+@cache
+def _csr_kernel(*types: str) -> cp.RawKernel:
+    expr = f"shifted_clr_csr<{', '.join(types)}>"
+    return cp.RawModule(code=_CSR_KERNEL, options=("-std=c++17",), name_expressions=(expr,)).get_function(expr)
+
+
+def _estimate_nb_overdispersion(X: ArrayTypesDask) -> float:
+    r"""Closed-form least squares of :math:`\mathrm{Var}_g = μ_g + α μ_g^2` across genes."""
+    mu, var = _get_mean_var(X, axis=0, correction=0)
+    mu2 = mu**2
+    numerator = cp.sum((var - mu) * mu2)
+    denominator = cp.sum(mu2 * mu2)
+    if isinstance(X, DaskArray):
+        import dask
+
+        numerator, denominator = dask.compute(numerator, denominator)
+    if float(denominator) == 0.0:
+        msg = "Cannot estimate overdispersion: every gene has zero mean. Pass a positive `alpha` explicitly."
+        raise ValueError(msg)
+    alpha = float(numerator / denominator)
+    if not alpha > 0:
+        msg = f"Estimated overdispersion is non-positive (alpha = {alpha}); pass a positive `alpha` explicitly."
+        raise ValueError(msg)
+    return alpha
+
+
+def _shifted_clr(X: cp.ndarray | sparse.csr_matrix, scale: float) -> cp.ndarray:
+    """Dense ``log1p(scale * X)`` centered on its per-cell mean."""
+    n_rows, n_cols = X.shape
+    s = X.dtype.type(scale)
+    if isinstance(X, cp.ndarray):
+        out = _log1p_scaled(X, s)
+        out -= (_row_sum64(out, axis=1) / n_cols).astype(out.dtype)[:, None]
+        return out
+    out = cp.empty((n_rows, n_cols), dtype=X.dtype)
+    if n_rows == 0:
+        return out
+    kernel = _csr_kernel(_C_TYPES[X.dtype], _C_TYPES[X.indptr.dtype], _C_TYPES[X.indices.dtype])
+    grid = (n_rows * 32 + _BLOCK - 1) // _BLOCK
+    kernel((grid,), (_BLOCK,), (X.indptr, X.indices, X.data, out, cp.int64(n_rows), cp.int64(n_cols), s))
+    return out
+
+
+def normalize_shifted_clr(
+    adata: AnnData,
+    *,
+    alpha: float | None = None,
+    layer: str | None = None,
+    inplace: bool = True,
+    copy: bool = False,
+) -> Union[AnnData, dict[str, cp.ndarray | DaskArray], None]:  # noqa: UP007
+    r"""Normalize counts with the shifted centered log-ratio (PFlog) transform :cite:p:`Booeshaghi2022`.
+
+    If `alpha` is not provided, it is estimated from the input matrix. PFlog is
+    then computed as
+
+    .. math::
+        T(x)_i = \log(1 + 4 α x_i)
+            - \frac{1}{D} \sum_{j=1}^D \log(1 + 4 α x_j),
+
+    which is equivalent to centering :math:`\log(x_i + 1 / (4 α))` because the
+    constant :math:`\log(4 α)` cancels during CLR centering.
+
+    .. note::
+        CLR centering generally maps zeros to non-zero values, so the resulting
+        matrix is dense even when the input is sparse.
+
+    Parameters
+    ----------
+        adata
+            The annotated data matrix of shape `n_obs` × `n_vars`.
+            Rows correspond to cells and columns to genes.
+        alpha
+            Negative-binomial overdispersion of the dataset (``var = μ + α·μ²``).
+            If `None`, it is estimated from the input matrix. A positive numeric
+            value uses that value directly. PFlog applies ``log1p(4 * alpha * x)``
+            before CLR centering.
+        layer
+            Layer to normalize instead of `X`.
+        inplace
+            Whether to update `adata` or return a dictionary with the normalized
+            matrix.
+        copy
+            Whether to modify a copied input object. Not compatible with
+            `inplace=False`.
+
+    Returns
+    -------
+    Returns a dictionary with the normalized matrix or updates `adata`, depending
+    on `inplace`.
+    """
+    if copy:
+        if not inplace:
+            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
+        adata = adata.copy()
+
+    view_to_actual(adata)
+
+    X = _get_obs_rep(adata, layer=layer)
+    _check_gpu_X(X, allow_dask=True)
+    if sparse.isspmatrix_csc(X):
+        X = X.tocsr()
+    if X.dtype.kind in "iub":
+        X = X.astype(cp.float64)
+
+    if alpha is None:
+        alpha = _estimate_nb_overdispersion(X)
+    elif not alpha > 0:
+        msg = f"`alpha` must be positive to compute PFlog, got {alpha}. The data may be underdispersed."
+        raise ValueError(msg)
+    scale = 4.0 * float(alpha)
+
+    if isinstance(X, DaskArray):
+        if len(X.chunks[1]) > 1:
+            raise ValueError("Dask arrays must be chunked along the first axis only.")
+        X = X.map_blocks(_shifted_clr, scale, meta=_meta_dense(X.dtype), dtype=X.dtype)
+    else:
+        cell_depths = _row_sum64(X, axis=1) if isinstance(X, cp.ndarray) else X.sum(axis=1)
+        if not bool((cell_depths > 0).all()):
+            warnings.warn("Some cells have zero counts", UserWarning, stacklevel=2)
+        X = _shifted_clr(X, scale)
+
+    if inplace:
+        _set_obs_rep(adata, X, layer=layer)
+
+    if copy:
+        return adata
+    elif not inplace:
+        return {"X": X}
     return None

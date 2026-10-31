@@ -19,7 +19,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.filter_cells
    pp.filter_genes
    pp.normalize_total
-   pp.normalize_clr
+   pp.normalize_shifted_clr
    pp.log1p
    pp.sqrt
    pp.highly_variable_genes
