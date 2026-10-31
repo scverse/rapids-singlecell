@@ -266,10 +266,12 @@ static void check_shapes(const Out& rank_sums, const Out& tie_corr,
                "rank_sums and the cell count");
 }
 
-// OVO group offsets [n_groups + 1] to the host, checked against the rows.
+// OVO group offsets [n_groups + 1] to the host; they start at 0 and, when the
+// layout reads the group row list (dense, CSR), end at its length.
 template <typename Ints>
 static std::vector<int> ovo_offsets(const Ints& grp_offsets, size_t n_groups,
-                                    size_t n_grp_rows, cudaStream_t stream) {
+                                    size_t n_grp_rows, bool check_rows,
+                                    cudaStream_t stream) {
     nb_require(grp_offsets.shape(0) == n_groups + 1,
                "Wilcoxon OVO: grp_offsets must have n_groups + 1 entries");
     std::vector<int> h(n_groups + 1);
@@ -278,7 +280,7 @@ static std::vector<int> ovo_offsets(const Ints& grp_offsets, size_t n_groups,
                                cudaMemcpyDeviceToHost, stream),
                "OVO group offsets D2H");
     cuda_check(cudaStreamSynchronize(stream), "OVO group offsets sync");
-    nb_require(h[0] == 0 && (size_t)h[n_groups] == n_grp_rows,
+    nb_require(h[0] == 0 && (!check_rows || (size_t)h[n_groups] == n_grp_rows),
                "Wilcoxon OVO: grp_offsets must span the group rows");
     return h;
 }
@@ -354,7 +356,7 @@ static void def_ovo_dense(nb::module_& m) {
                 compute_nnz);
             std::vector<int> h_offsets =
                 ovo_offsets(grp_offsets, rank_sums.shape(0), grp_rows.shape(0),
-                            (cudaStream_t)stream);
+                            true, (cudaStream_t)stream);
             ovo_dense<T>(
                 X.data(), OnHost, FOrder, (int)X.shape(1), col_start,
                 ref_rows.data(), (int)ref_rows.shape(0), grp_rows.data(),
@@ -638,17 +640,20 @@ static void def_sparse(nb::module_& m) {
            int sub_batch_cols, double expm1_scale) {
             int n_groups = (int)rank_sums.shape(0);
             int n_cols = (int)rank_sums.shape(1);
-            size_t n_rows = ref_map.shape(0);
+            size_t n_rows = group_codes.shape(0);
             check_shapes<Out>(rank_sums, tie_corr, group_sums, group_nnz,
                               nullptr, nullptr, group_codes.shape(0), n_rows,
                               true, compute_tie_corr, compute_nnz);
             check_sparse(data, indices, indptr, row_starts, row_stops, csc,
                          OnHost, n_rows, n_cols);
-            nb_require(grp_map.shape(0) == n_rows &&
-                           ref_rows.shape(0) == (size_t)n_ref,
-                       "Wilcoxon OVO: row maps or reference rows do not match");
+            // CSC reads the row maps, CSR the row lists; the other may be
+            // empty.
+            nb_require(
+                csc ? ref_map.shape(0) == n_rows && grp_map.shape(0) == n_rows
+                    : ref_rows.shape(0) == (size_t)n_ref,
+                "Wilcoxon OVO: row maps or reference rows do not match");
             std::vector<int> h_offsets =
-                ovo_offsets(grp_offsets, n_groups, grp_rows.shape(0), 0);
+                ovo_offsets(grp_offsets, n_groups, grp_rows.shape(0), !csc, 0);
             if (n_ref == 0 || h_offsets[n_groups] == 0) return;
             OvoRanker ranker(h_offsets.data(), n_groups, compute_tie_corr);
             RmmScratchPool pool;

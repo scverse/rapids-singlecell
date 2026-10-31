@@ -37,7 +37,9 @@ def _array_result_to_records(arrays: dict[str, object], field: str, dtype: str |
 def _array_result_to_names(arrays: dict[str, object]) -> np.ndarray:
     var_names = np.asarray(arrays["var_names"], dtype=object)
     gene_indices = np.asarray(arrays["gene_indices"], dtype=np.intp)
-    values = np.take(var_names, gene_indices)
+    # Gather straight into the record layout: transposing the object array
+    # afterwards would cost as much as the gather.
+    values = np.take(var_names, gene_indices.T).T
     return _matrix_to_records(values, arrays["group_names"], np.dtype(object))
 
 

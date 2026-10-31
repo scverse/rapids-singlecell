@@ -2,13 +2,16 @@
 
 #include "wilcoxon_common.cuh"
 
-// Bitonic sort of power-of-two `n` floats in shared memory, ascending.
-// Pad the tail with +INF before calling; any blockDim works.
-
+// Bitonic sort of power-of-two `n` floats in shared memory, ascending, by the
+// whole block or (WARP) by the calling warp. Pad the tail with +INF before
+// calling; any blockDim works.
+template <bool WARP = false>
 __device__ __forceinline__ void bitonic_sort_smem(float* s, int n) {
+    int tid = WARP ? threadIdx.x & 31 : threadIdx.x;
+    int step = WARP ? 32 : blockDim.x;
     for (int k = 2; k <= n; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            for (int i = tid; i < n; i += step) {
                 int ixj = i ^ j;
                 if (ixj > i) {
                     bool asc = ((i & k) == 0);
@@ -19,7 +22,10 @@ __device__ __forceinline__ void bitonic_sort_smem(float* s, int n) {
                     }
                 }
             }
-            __syncthreads();
+            if (WARP)
+                __syncwarp();
+            else
+                __syncthreads();
         }
     }
 }
@@ -48,7 +54,7 @@ __device__ __forceinline__ void ovo_rank_nonzeros(
     for (int i = threadIdx.x; i < nnz; i += blockDim.x) {
         float v = nz[i];
         int lt_r = sorted_lower_bound(ref, sorted ? ref_lb : 0, n_ref, v);
-        int cr = sorted_upper_bound(ref, lt_r, n_ref, v) - lt_r;
+        int cr = sorted_count_from(ref, lt_r, n_ref, v);
         int lt_g = 0, cg = 0;
         bool first = true;
         if (sorted) {
@@ -95,9 +101,9 @@ __device__ __forceinline__ void compact_nonzeros(const float* src, int n,
     }
 }
 
-// No-tie path: group-internal ranks collapse to the U closed form, so each
-// unsorted group value only searches the sorted reference (zeros share one
-// search).
+// No-tie path for groups above OVO_MEDIUM_MAX cells: group-internal ranks
+// collapse to the U closed form, so each unsorted group value only searches
+// the sorted reference (zeros share one search).
 __global__ void ovo_rank_dense_vs_ref_kernel(
     const float* __restrict__ ref_sorted, const float* __restrict__ grp_dense,
     const int* __restrict__ grp_offsets, double* __restrict__ rank_sums,
@@ -107,10 +113,7 @@ __global__ void ovo_rank_dense_vs_ref_kernel(
 
     int g_start = grp_offsets[grp];
     int n_grp = grp_offsets[grp + 1] - g_start;
-    if (n_grp == 0) {
-        if (threadIdx.x == 0) rank_sums[(size_t)grp * ld + col] = 0.0;
-        return;
-    }
+    if (n_grp <= OVO_MEDIUM_MAX) return;  // ovo_rank_warp_kernel
     const float* ref_col = ref_sorted + (long long)col * n_ref;
     const float* grp_col = grp_dense + (long long)col * n_all_grp + g_start;
 
@@ -131,7 +134,7 @@ __global__ void ovo_rank_dense_vs_ref_kernel(
             continue;
         }
         int n_lt = sorted_lower_bound(ref_col, 0, n_ref, v);
-        int n_eq = sorted_upper_bound(ref_col, n_lt, n_ref, v) - n_lt;
+        int n_eq = sorted_count_from(ref_col, n_lt, n_ref, v);
         local_sum += (double)n_lt + 0.5 * (double)n_eq;
     }
     local_sum += (double)n_zero * ((double)ref_neg + 0.5 * (double)ref_zero);
@@ -139,6 +142,132 @@ __global__ void ovo_rank_dense_vs_ref_kernel(
     if (threadIdx.x == 0) {
         rank_sums[(size_t)grp * ld + col] =
             total + (double)n_grp * ((double)n_grp + 1.0) / 2.0;
+    }
+}
+
+// Groups of at most OVO_MEDIUM_MAX cells, one warp per (column, group): a block
+// takes one column (its sorted reference stays in cache) and OVO_WARP_GROUPS
+// groups. TIE compacts each group's nonzeros into a per-warp buffer (sorted
+// above 32) for group-internal ranks and ties, as ovo_rank_nonzeros does;
+// without TIE, group-internal ranks take the closed form.
+constexpr int OVO_WARP_GROUPS = 64;
+constexpr int OVO_WARP_TPB = 256;
+template <bool TIE>
+__global__ void ovo_rank_warp_kernel(const float* __restrict__ ref_sorted,
+                                     const float* __restrict__ grp_dense,
+                                     const int* __restrict__ grp_offsets,
+                                     const double* __restrict__ ref_tie_sums,
+                                     double* __restrict__ rank_sums,
+                                     double* __restrict__ tie_corr, int n_ref,
+                                     int n_all_grp, int ld, int n_groups) {
+    extern __shared__ float bufs[];  // TIE: OVO_MEDIUM_MAX floats per warp
+    __shared__ int s_neg, s_zero;
+    int col = blockIdx.x;
+    const float* ref = ref_sorted + (size_t)col * n_ref;
+    if (threadIdx.x == 0) {
+        s_neg = sorted_lower_bound(ref, 0, n_ref, 0.0f);
+        s_zero = sorted_upper_bound(ref, s_neg, n_ref, 0.0f) - s_neg;
+    }
+    __syncthreads();
+    int ref_neg = s_neg, ref_zero = s_zero;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float* buf = bufs + warp * OVO_MEDIUM_MAX;
+    int g_end = min(n_groups, (int)(blockIdx.y + 1) * OVO_WARP_GROUPS);
+    for (int g = blockIdx.y * OVO_WARP_GROUPS + warp; g < g_end;
+         g += blockDim.x >> 5) {
+        int g_start = grp_offsets[g];
+        int n_grp = grp_offsets[g + 1] - g_start;
+        if (n_grp > OVO_MEDIUM_MAX) continue;
+        const float* vals = grp_dense + (size_t)col * n_all_grp + g_start;
+        size_t out = (size_t)g * ld + col;
+        double sum = 0.0, tie = 0.0;
+        if (!TIE) {
+            int n_zero = 0;
+            for (int i = lane; i < n_grp; i += 32) {
+                float v = vals[i];
+                if (v == 0.0f) {
+                    n_zero++;
+                    continue;
+                }
+                int lt = sorted_lower_bound(ref, 0, n_ref, v);
+                int eq = sorted_count_from(ref, lt, n_ref, v);
+                sum += (double)lt + 0.5 * (double)eq;
+            }
+            sum += (double)n_zero * ((double)ref_neg + 0.5 * (double)ref_zero);
+            sum = warp_reduce_sum(sum);
+            if (lane == 0)
+                rank_sums[out] =
+                    sum + (double)n_grp * ((double)n_grp + 1.0) / 2.0;
+            continue;
+        }
+        // All loads first (one memory round trip), then compact.
+        constexpr int PER_LANE = OVO_MEDIUM_MAX / 32;
+        float v[PER_LANE];
+#pragma unroll
+        for (int k = 0; k < PER_LANE; k++) {
+            int i = k * 32 + lane;
+            v[k] = i < n_grp ? vals[i] : 0.0f;
+        }
+        int nnz = 0;
+#pragma unroll
+        for (int k = 0; k < PER_LANE; k++) {
+            if (k * 32 >= n_grp) break;
+            unsigned mask = __ballot_sync(0xffffffffu, v[k] != 0.0f);
+            if (v[k] != 0.0f)
+                buf[nnz + __popc(mask & ((1u << lane) - 1u))] = v[k];
+            nnz += __popc(mask);
+        }
+        __syncwarp();
+        // Above one value per lane, sort the nonzeros and search them; the
+        // scan below costs nnz^2.
+        bool sorted = nnz > 32;
+        if (sorted) {
+            int padded = 64;
+            while (padded < nnz) padded <<= 1;
+            for (int i = nnz + lane; i < padded; i += 32)
+                buf[i] = __int_as_float(0x7f800000);  // +INF pad
+            __syncwarp();
+            bitonic_sort_smem<true>(buf, padded);
+        }
+        int grp_zero = n_grp - nnz;
+        if (lane == 0) {
+            sum =
+                (double)grp_zero *
+                ((double)ref_neg + ((double)(ref_zero + grp_zero) + 1.0) / 2.0);
+            tie = tie3(ref_zero + grp_zero) - tie3(ref_zero);
+        }
+        for (int i = lane; i < nnz; i += 32) {
+            float v = buf[i];
+            int lt_r = sorted_lower_bound(ref, 0, n_ref, v);
+            int cr = sorted_count_from(ref, lt_r, n_ref, v);
+            int lt_g = 0, cg = 0;
+            bool first = true;
+            if (sorted) {
+                lt_g = sorted_lower_bound(buf, 0, i, v);
+                cg = sorted_upper_bound(buf, i + 1, nnz, v) - lt_g;
+                first = lt_g == i;
+            } else {
+                for (int j = 0; j < nnz; ++j) {
+                    float w = buf[j];
+                    lt_g += w < v;
+                    if (w == v) {
+                        ++cg;
+                        first &= j >= i;
+                    }
+                }
+            }
+            sum += (double)(lt_r + lt_g + grp_zero) +
+                   ((double)(cr + cg) + 1.0) / 2.0;
+            if (first) tie += tie3(cg + cr) - tie3(cr);
+        }
+        sum = warp_reduce_sum(sum);
+        tie = warp_reduce_sum(tie);
+        if (lane == 0) {
+            rank_sums[out] = sum;
+            tie_corr[out] =
+                finalize_tie_corr(n_ref + n_grp, ref_tie_sums[col] + tie);
+        }
+        __syncwarp();  // the buffer is refilled for the next group
     }
 }
 
@@ -353,7 +482,26 @@ struct OvoRanker {
               const int* d_offsets, const OvoScratch& sc, double* rank_sums,
               double* tie_corr, int ld, int n_ref, int n_all_grp, int sb_cols,
               cudaStream_t stream) const {
+        // Groups of at most OVO_MEDIUM_MAX cells rank one warp each.
+        auto launch_warps = [&](auto tie_tag) {
+            constexpr bool TIE = decltype(tie_tag)::value;
+            if (medium_max < 0) return;
+            size_t smem =
+                TIE ? OVO_WARP_TPB / WARP_SIZE * OVO_MEDIUM_MAX * sizeof(float)
+                    : 0;
+            for_group_chunks([&](int g0, int n) {
+                dim3 grid(sb_cols, (n + OVO_WARP_GROUPS - 1) / OVO_WARP_GROUPS);
+                ovo_rank_warp_kernel<TIE><<<grid, OVO_WARP_TPB, smem, stream>>>(
+                    ref_sorted, grp_dense, d_offsets + g0, sc.ref_tie_sums,
+                    rank_sums + (size_t)g0 * ld,
+                    TIE ? tie_corr + (size_t)g0 * ld : nullptr, n_ref,
+                    n_all_grp, ld, n);
+                CUDA_CHECK_LAST_ERROR(ovo_rank_warp_kernel);
+            });
+        };
         if (!tie) {
+            launch_warps(std::false_type{});
+            if (max_grp_size <= OVO_MEDIUM_MAX) return;
             for_group_chunks([&](int g0, int n) {
                 ovo_rank_dense_vs_ref_kernel<<<dim3(sb_cols, n),
                                                UTIL_BLOCK_SIZE, 0, stream>>>(
@@ -366,6 +514,7 @@ struct OvoRanker {
         ref_tie_sum_kernel<<<sb_cols, UTIL_BLOCK_SIZE, 0, stream>>>(
             ref_sorted, sc.ref_tie_sums, n_ref, sb_cols);
         CUDA_CHECK_LAST_ERROR(ref_tie_sum_kernel);
+        launch_warps(std::true_type{});
         auto launch_band = [&](int lo, int hi, int band_max, int max_tpb) {
             if (band_max < lo) return;
             int padded = 1;
@@ -381,7 +530,6 @@ struct OvoRanker {
                 CUDA_CHECK_LAST_ERROR(ovo_rank_smem_kernel);
             });
         };
-        launch_band(0, OVO_MEDIUM_MAX, medium_max, UTIL_BLOCK_SIZE);
         launch_band(OVO_MEDIUM_MAX + 1, OVO_LARGE_MAX, large_max,
                     MAX_THREADS_PER_BLOCK);
         if (huge_ids.empty()) return;

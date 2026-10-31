@@ -150,6 +150,14 @@ __device__ __forceinline__ int sorted_upper_bound(const float* arr, int lo,
     return lo;
 }
 
+// Copies of v in arr[lb, hi) from its lower bound lb; absent values (most
+// continuous ones) cost one load instead of a second search.
+__device__ __forceinline__ int sorted_count_from(const float* arr, int lb,
+                                                 int hi, float v) {
+    return lb < hi && arr[lb] == v ? sorted_upper_bound(arr, lb + 1, hi, v) - lb
+                                   : 0;
+}
+
 // One tie run's t^3 - t (zero for t <= 1).
 // Value a stored entry adds to the group sums: x itself, or expm1(scale * x)
 // for means in expression space (inverts log1p with base e^scale).

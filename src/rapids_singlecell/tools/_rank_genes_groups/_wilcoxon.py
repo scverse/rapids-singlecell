@@ -259,12 +259,16 @@ def _run_wilcoxon_shard(
         rows = (cp.asarray(ctx.ref_row_ids), cp.asarray(ctx.all_grp_row_ids), offsets)
         _wc.ovo_dense(*args, *rows, codes, rank_sums, tie_corr, group_sums, group_nnz, **kw)
     else:
-        ref_map = np.full(n_cells, -1, dtype=np.int32)
-        ref_map[ctx.ref_row_ids] = np.arange(ctx.n_ref, dtype=np.int32)
-        grp_map = np.full(n_cells, -1, dtype=np.int32)
-        grp_map[ctx.all_grp_row_ids] = np.arange(ctx.n_all_grp, dtype=np.int32)
-        rows = (cp.asarray(ctx.ref_row_ids), cp.asarray(ctx.all_grp_row_ids))
-        maps = (cp.asarray(ref_map), cp.asarray(grp_map), *rows, offsets)
+        # CSC batches map rows to slab positions; CSR batches read the row lists.
+        empty = cp.empty(0, dtype=cp.int32)
+        if kw["csc"]:
+            ref_map = np.full(n_cells, -1, dtype=np.int32)
+            ref_map[ctx.ref_row_ids] = np.arange(ctx.n_ref, dtype=np.int32)
+            grp_map = np.full(n_cells, -1, dtype=np.int32)
+            grp_map[ctx.all_grp_row_ids] = np.arange(ctx.n_all_grp, dtype=np.int32)
+            maps = (cp.asarray(ref_map), cp.asarray(grp_map), empty, empty, offsets)
+        else:
+            maps = (empty, empty, cp.asarray(ctx.ref_row_ids), cp.asarray(ctx.all_grp_row_ids), offsets)
         _wc.ovo_sparse(*args, codes, *maps, rank_sums, tie_corr, group_sums, group_nnz, n_ref=ctx.n_ref, **kw)
     means = group_sums / sizes[:, None]
     logfoldchanges = None

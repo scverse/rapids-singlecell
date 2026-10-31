@@ -23,9 +23,9 @@ constexpr int UTIL_BLOCK_SIZE = 256;
 constexpr int DEFAULT_STREAMING_STREAMS = 4;
 // Max per-batch nnz for segmented CUDA primitives that take int32 item counts.
 constexpr size_t STREAMING_SAFE_BATCH_NNZ = 2000000000;  // < INT_MAX
-// Above this host span, avoid whole-array cudaHostRegister and use bounded
-// staging. Moderate arrays keep the lower-overhead direct async-copy path.
-constexpr size_t HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES =
+// Above this host span, stream through bounded pinned staging; moderate
+// arrays copy straight from pageable memory.
+constexpr size_t HOST_STREAMING_DIRECT_COPY_LIMIT_BYTES =
     16ULL * 1024ULL * 1024ULL * 1024ULL;
 
 // Host thread count for CPU-side staging passes: hardware concurrency, capped.
@@ -474,7 +474,7 @@ struct PinnedRingArray {
     std::vector<std::unique_ptr<T, CudaHostFree<T>>> write_combined_data;
     std::vector<HostRegisterGuard> pins;
 
-    PinnedRingArray(int n_slots, size_t count, bool write_combined)
+    PinnedRingArray(int n_slots, size_t count, bool write_combined, bool pin)
         : data(n_slots), write_combined_data(n_slots), pins(n_slots) {
         size_t n = count ? count : 1;
         for (int s = 0; s < n_slots; s++) {
@@ -486,7 +486,8 @@ struct PinnedRingArray {
                 write_combined_data[s].reset(ptr);
             } else {
                 data[s].reset(new T[n]);
-                pins[s] = HostRegisterGuard(data[s].get(), n * sizeof(T));
+                if (pin)
+                    pins[s] = HostRegisterGuard(data[s].get(), n * sizeof(T));
             }
         }
     }
@@ -498,6 +499,8 @@ struct PinnedRingArray {
 
 // Per-slot pinned host staging with events for CPU/GPU overlap.
 // Arrays share item capacity; use another ring for differently-sized metadata.
+// pin = false keeps the slots pageable, for transfers too small to repay
+// pinning them.
 template <typename... Ts>
 struct PinnedRing {
     std::tuple<PinnedRingArray<Ts>...> arrays;
@@ -505,8 +508,9 @@ struct PinnedRing {
     std::vector<char> used;
     size_t capacity = 0;
 
-    PinnedRing(int n_slots_, size_t count, bool write_combined = false)
-        : arrays(PinnedRingArray<Ts>(n_slots_, count, write_combined)...),
+    PinnedRing(int n_slots_, size_t count, bool write_combined = false,
+               bool pin = true)
+        : arrays(PinnedRingArray<Ts>(n_slots_, count, write_combined, pin)...),
           evt(n_slots_, nullptr),
           used(n_slots_, 0) {
         capacity = count ? count : 1;
@@ -523,6 +527,9 @@ struct PinnedRing {
             if (s < used.size() && used[s]) cudaEventSynchronize(e);
             cudaEventDestroy(e);
         }
+    }
+    int slots() const {
+        return (int)evt.size();
     }
     void wait(int s) {
         if (used[s])

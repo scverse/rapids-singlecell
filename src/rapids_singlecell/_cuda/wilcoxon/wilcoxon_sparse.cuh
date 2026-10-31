@@ -17,9 +17,17 @@
 
 constexpr int CSR_RANGE_U16_COLUMN_CAPACITY =
     (int)std::numeric_limits<uint16_t>::max() + 1;
+// Staging slots hold about 1/256 of a call's staged items within this range:
+// each fresh slot costs page faults or pinning per call (~0.1-0.16 ms/MB), each
+// block a host round trip.
+constexpr size_t CSR_RANGE_MIN_STAGE_ITEMS = (size_t)4 * 1024 * 1024;
 constexpr size_t CSR_RANGE_STAGE_ITEMS = (size_t)32 * 1024 * 1024;
 constexpr int CSR_RANGE_STAGE_SLOTS = 3;
 constexpr int CSR_RANGE_METADATA_SLOTS = 2;
+// Host CSR calls staging less than this copy from one pageable slot: pinning a
+// ring per call (write-combined, ~0.16 ms/MB) costs more than the slower
+// pageable copies, which run at about half the pinned bandwidth.
+constexpr size_t CSR_RANGE_PAGEABLE_STAGE_BYTES = (size_t)2 << 30;
 constexpr size_t CSR_RANGE_COUNT_CACHE_LIMIT_BYTES = (size_t)384 * 1024 * 1024;
 
 // Count entries in [col_start, col_stop) for each canonical CSR row.
@@ -225,9 +233,13 @@ struct SparseStats {
     double expm1_scale;
 };
 
-// CSR rows row_ids[i] -> row i of a pre-zeroed F-order slab for the column
-// window [col_start, col_start + n_cols), one thread per slab row so the slab
-// writes coalesce; adds each row's group stats ([code * ld + col], zeroed).
+// CSR rows row_ids[i] -> row i of an F-order slab for the column window
+// [col_start, col_start + n_cols); adds each row's group stats
+// ([code * ld + col], zeroed). A block fills a tile of EXTRACT_TILE_ROWS slab
+// rows x OVO_SLAB_COLS columns (blockIdx.y) in shared memory, one warp per row
+// reading its entries coalesced, then writes the tile out column by column,
+// coalesced and zeros included.
+constexpr int EXTRACT_TILE_ROWS = 32;
 template <typename InT, typename IndexT, typename IndptrT>
 __global__ void csr_extract_rows_kernel(const InT* __restrict__ data,
                                         const IndexT* __restrict__ indices,
@@ -236,31 +248,47 @@ __global__ void csr_extract_rows_kernel(const InT* __restrict__ data,
                                         float* __restrict__ out, int n_out,
                                         int col_start, int n_cols,
                                         SparseStats st) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_out) return;
-    int row = row_ids[i];
-    int g = st.codes[row];
-    bool stats = g >= 0 && g < st.n_groups;
-    IndptrT p = indptr[row];
-    IndptrT hi = indptr[row + 1];
-    while (p < hi) {  // first entry >= col_start
-        IndptrT m = p + ((hi - p) >> 1);
-        if (indices[m] < (IndexT)col_start)
-            p = m + 1;
-        else
-            hi = m;
+    constexpr int LD = EXTRACT_TILE_ROWS + 1;  // padding spreads the banks
+    __shared__ float tile[OVO_SLAB_COLS * LD];
+    int i0 = blockIdx.x * EXTRACT_TILE_ROWS;
+    int c0 = blockIdx.y * OVO_SLAB_COLS;
+    int w = min(OVO_SLAB_COLS, n_cols - c0);
+    for (int k = threadIdx.x; k < w * LD; k += blockDim.x) tile[k] = 0.0f;
+    __syncthreads();
+    int lane = threadIdx.x & 31, n_warps = blockDim.x >> 5;
+    IndexT lo_col = (IndexT)(col_start + c0);
+    for (int r = threadIdx.x >> 5; r < EXTRACT_TILE_ROWS && i0 + r < n_out;
+         r += n_warps) {
+        int row = row_ids[i0 + r];
+        int g = st.codes[row];
+        bool stats = g >= 0 && g < st.n_groups;
+        IndptrT p = indptr[row], hi = indptr[row + 1];
+        if (lane == 0) {  // first entry >= lo_col
+            IndptrT e = hi;
+            while (p < e) {
+                IndptrT m = p + ((e - p) >> 1);
+                if (indices[m] < lo_col)
+                    p = m + 1;
+                else
+                    e = m;
+            }
+        }
+        p = __shfl_sync(0xffffffff, p, 0);
+        for (p += lane; p < hi; p += 32) {
+            int c = (int)(indices[p] - lo_col);
+            if (c >= w) break;
+            InT raw = data[p];
+            tile[c * LD + r] = (float)raw;
+            if (!stats) continue;
+            long long at = (long long)g * st.ld + c0 + c;
+            atomicAdd(&st.sums[at], stat_value((double)raw, st.expm1_scale));
+            if (st.compute_nnz && raw != 0) atomicAdd(&st.nnz[at], 1.0);
+        }
     }
-    for (IndptrT end = indptr[row + 1]; p < end; ++p) {
-        int c = (int)(indices[p] - (IndexT)col_start);
-        if (c >= n_cols) break;
-        InT raw = data[p];
-        out[(long long)c * n_out + i] = (float)raw;
-        if (!stats) continue;
-        atomicAdd(&st.sums[(long long)g * st.ld + c],
-                  stat_value((double)raw, st.expm1_scale));
-        if (st.compute_nnz && raw != 0)
-            atomicAdd(&st.nnz[(long long)g * st.ld + c], 1.0);
-    }
+    __syncthreads();
+    if (i0 + lane >= n_out) return;
+    for (int c = threadIdx.x >> 5; c < w; c += n_warps)
+        out[(long long)(c0 + c) * n_out + i0 + lane] = tile[c * LD + lane];
 }
 
 // OVO: densify the batch's reference and test-group rows (row maps give each
@@ -341,20 +369,21 @@ struct OvoBatchRanker {
         rank_slabs(s, col, b.n_cols, stream);
     }
     // CSR rows (device input or a gathered host batch): densify directly
-    // without a transpose, stats included; rank_slabs finishes the batch.
+    // without a transpose (the tiles write the zeros too), stats included;
+    // rank_slabs finishes the batch.
     template <typename InT, typename IndexT, typename IndptrT>
     void extract_csr(const InT* data, const IndexT* indices,
                      const IndptrT* indptr, int col, int n_cols,
                      const SparseStats& st, const Scratch& s,
                      cudaStream_t stream) const {
-        zero_slabs(s, n_cols, stream);
         SparseStats batch_st = st;
         batch_st.sums += col;
         batch_st.nnz += col;
         auto launch = [&](const int* rows, float* out, int n_out) {
-            csr_extract_rows_kernel<<<(n_out + UTIL_BLOCK_SIZE - 1) /
-                                          UTIL_BLOCK_SIZE,
-                                      UTIL_BLOCK_SIZE, 0, stream>>>(
+            if (n_out == 0) return;
+            dim3 grid((n_out + EXTRACT_TILE_ROWS - 1) / EXTRACT_TILE_ROWS,
+                      (n_cols + OVO_SLAB_COLS - 1) / OVO_SLAB_COLS);
+            csr_extract_rows_kernel<<<grid, UTIL_BLOCK_SIZE, 0, stream>>>(
                 data, indices, indptr, rows, out, n_out, col, n_cols, batch_st);
             CUDA_CHECK_LAST_ERROR(csr_extract_rows_kernel);
         };
@@ -386,10 +415,11 @@ static void cast_with_stats(const InT* data, float* vals, const int* rows,
         st.compute_nnz, st.totals, st.expm1_scale, stream);
 }
 
-// CSC input: host batches stream through pinned memory (whole arrays pinned
-// when moderate and pinnable, else a bounded ring that also narrows row ids
-// to int32); device batches are read in place. Stored values are cast to
-// f32 keys while their group stats accumulate.
+// CSC input: moderate host arrays copy straight from pageable memory (pinning
+// them per call costs about what the faster copies save), larger ones stream
+// through a bounded pinned ring that also narrows row ids to int32; device
+// batches are read in place. Stored values are cast to f32 keys while their
+// group stats accumulate.
 template <typename InT, typename IndexT, typename Ranker>
 static void sparse_csc(const InT* data, const IndexT* indices,
                        const IndexT* indptr, bool on_host, int n_rows,
@@ -423,18 +453,9 @@ static void sparse_csc(const InT* data, const IndexT* indices,
     RmmScratchPool pool;
     size_t total_nnz = (size_t)h_indptr[n_cols];
     bool bounded = on_host && total_nnz * (sizeof(InT) + sizeof(IndexT)) >
-                                  HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES;
-    HostRegisterGuard pin_data, pin_indices;
+                                  HOST_STREAMING_DIRECT_COPY_LIMIT_BYTES;
     std::unique_ptr<PinnedRing<InT, int>> stage;
-    if (bounded) {
-        stage.reset(new PinnedRing<InT, int>(n_streams, max_nnz));
-    } else if (on_host) {
-        // Pinning only speeds the copies up (read-only maps cannot be pinned).
-        pin_data = HostRegisterGuard(const_cast<InT*>(data),
-                                     total_nnz * sizeof(InT), 0, true);
-        pin_indices = HostRegisterGuard(const_cast<IndexT*>(indices),
-                                        total_nnz * sizeof(IndexT), 0, true);
-    }
+    if (bounded) stage.reset(new PinnedRing<InT, int>(n_streams, max_nnz));
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
     int* d_offsets = upload_batch_offsets(batches, pool);
     struct StreamBuf {
@@ -958,15 +979,23 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
                                           histogram, sub_batch_cols + 1),
             "rowstream range scan temp-size query");
     }
-    // Host gather staging is pinned; full CSR stays pageable on CPU.
-    // Only the compacted column interval crosses the bus.
+    // Host gather staging is pinned for large calls (one pageable slot for
+    // small ones); full CSR stays pageable on CPU. Only the compacted column
+    // interval crosses the bus.
+    size_t staged_nnz = 0;
+    for (size_t nnz : batches.nnz) staged_nnz += nnz;
+    bool pin = staged_nnz * (sizeof(InT) + sizeof(StageIndexT)) >
+               CSR_RANGE_PAGEABLE_STAGE_BYTES;
     size_t stage_nnz = max_batch_nnz ? max_batch_nnz : 1;
     size_t range_stage_target =
-        std::max(CSR_RANGE_STAGE_ITEMS, (size_t)sub_batch_cols);
+        std::max(std::clamp(staged_nnz / 256, CSR_RANGE_MIN_STAGE_ITEMS,
+                            CSR_RANGE_STAGE_ITEMS),
+                 (size_t)sub_batch_cols);
     size_t gather_stage_nnz = std::min(stage_nnz, range_stage_target);
-    PinnedRing<InT, StageIndexT> gather_stage(CSR_RANGE_STAGE_SLOTS,
-                                              gather_stage_nnz, true);
-    PinnedRing<int> indptr_stage(CSR_RANGE_METADATA_SLOTS, (size_t)n_rows + 1);
+    PinnedRing<InT, StageIndexT> gather_stage(pin ? CSR_RANGE_STAGE_SLOTS : 1,
+                                              gather_stage_nnz, pin, pin);
+    PinnedRing<int> indptr_stage(CSR_RANGE_METADATA_SLOTS, (size_t)n_rows + 1,
+                                 false, pin);
     std::vector<IndexT> cursor(n_rows, 0);  // offset within each (sorted) row
     host_parallel_ranges(n_rows, [&](int r0, int r1) {
         for (int r = r0; r < r1; r++) {
@@ -983,7 +1012,8 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
     InT* d_gather_vals[n_gather];
     StageIndexT* d_gather_cols[n_gather];
     int* d_gather_indptr[n_gather];
-    for (int i = 0; i < n_gather; i++) {
+    const int n_bufs = std::min(n_gather, n_batches);  // one batch: no overlap
+    for (int i = 0; i < n_bufs; i++) {
         d_gather_vals[i] = pool.alloc<InT>(max_batch_nnz);
         d_gather_cols[i] = pool.alloc<StageIndexT>(max_batch_nnz);
         d_gather_indptr[i] = pool.alloc<int>(n_rows + 1);
@@ -1032,14 +1062,13 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
         int input_col_end = input_col + sb_cols;
         int metadata_slot = b % CSR_RANGE_METADATA_SLOTS;
         int* active_col_offsets = d_col_offsets[metadata_slot];
-        InT* gather_vals = d_gather_vals[b % n_gather];
-        StageIndexT* gather_cols = d_gather_cols[b % n_gather];
-        int* gather_indptr = d_gather_indptr[b % n_gather];
-        if (b >= n_gather) {
-            cuda_check(
-                cudaStreamWaitEvent(copy_stream,
-                                    gather_consumed[b - n_gather]->get(), 0),
-                "rowstream copy wait for gather consumption");
+        InT* gather_vals = d_gather_vals[b % n_bufs];
+        StageIndexT* gather_cols = d_gather_cols[b % n_bufs];
+        int* gather_indptr = d_gather_indptr[b % n_bufs];
+        if (b >= n_bufs) {
+            cuda_check(cudaStreamWaitEvent(
+                           copy_stream, gather_consumed[b - n_bufs]->get(), 0),
+                       "rowstream copy wait for gather consumption");
         }
         indptr_stage.wait(metadata_slot);
         int* h_gather_indptr = indptr_stage.template get<0>(metadata_slot);
@@ -1080,7 +1109,7 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
             int block_nnz = h_gather_indptr[row_end] - block_nnz_begin;
             if (block_nnz > 0) {
                 int stage_slot =
-                    (int)(range_stage_sequence % CSR_RANGE_STAGE_SLOTS);
+                    (int)(range_stage_sequence % gather_stage.slots());
                 gather_stage.wait(stage_slot);
                 InT* h_gather_vals = gather_stage.template get<0>(stage_slot);
                 StageIndexT* h_gather_cols =
