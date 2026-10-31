@@ -14,7 +14,8 @@ from rapids_singlecell.preprocessing._neighbors import _wnn
 
 
 def _ref_jaccard(nn, prune=0.0):  # Seurat's ComputeSNN
-    A = np.zeros((len(nn), len(nn)))
+    # integer matmul is exact and skips BLAS (threaded float GEMMs proved flaky)
+    A = np.zeros((len(nn), len(nn)), dtype=np.int64)
     A[np.arange(len(nn))[:, None], nn] = 1
     shared = A @ A.T
     J = shared / (2 * nn.shape[1] - shared)
@@ -50,23 +51,20 @@ def _seurat_wnn_reference(reps, *, k, knn_range, cross=1e-4, smooth=False):
     exp_scores = np.zeros((n_mod, n))
     for m in range(n_mod):
         within = np.exp(-impute(m, m) / sigma[m])
-        for r in range(n_mod):
-            if r == m:
-                continue
+        for r in set(range(n_mod)) - {m}:
             score = np.clip(within / (np.exp(-impute(m, r) / sigma[m]) + cross), 0, 200)
             if smooth:
                 score = score[nn[m][:, 1:]].mean(axis=1)
             exp_scores[m] += np.exp(score)
     weights = exp_scores / exp_scores.sum(axis=0)
 
+    K = [np.exp(-np.maximum(D[m] - nearest[m][:, None], 0) / sigma[m][:, None]) for m in range(n_mod)]
     idx = np.empty((n, k), dtype=int)
     sim = np.empty((n, k))
     for i in range(n):  # MultiModalNN
         cand = np.concatenate([o[i, 1:knn_range] for o in order])
         cand = np.array(list(dict.fromkeys(cand)))
-        s = sum(
-            weights[m, i] * np.exp(-np.maximum(D[m][i, cand] - nearest[m][i], 0) / sigma[m][i]) for m in range(n_mod)
-        )
+        s = sum(weights[m, i] * K[m][i, cand] for m in range(n_mod))
         best = np.argsort(-s, kind="stable")[:k]
         idx[i], sim[i] = cand[best], s[best]
     snn = _ref_jaccard(idx, prune=1 / 15)
@@ -102,19 +100,16 @@ def test_wnn_matches_seurat_reference(smooth, n_mod):
     keys = ["X_pca", "X_apca", "X_lsi"][:n_mod]
     # NumPy integers, e.g. from a parameter sweep, are accepted
     rsc.pp.wnn(adata, keys, n_neighbors=np.int64(10), knn_range=40, smooth=smooth)
-    reps = [adata.obsm[key].astype(np.float64) for key in keys]
-    ref = _seurat_wnn_reference(reps, k=10, knn_range=40, smooth=smooth)
+    ref = _seurat_wnn_reference([adata.obsm[key].astype(np.float64) for key in keys], k=10, knn_range=40, smooth=smooth)
     _assert_matches(adata, keys, ref)
 
 
 def test_wnn_matches_seurat_fixture():
     """Seurat 5.5.1 with exact RANN search, see tests/_scripts/generate_wnn_seurat.py."""
     ref = np.load(Path(__file__).parent / "_data" / "wnn_seurat_5.5.1.npz")
-    adata = AnnData(np.zeros((200, 1), dtype=np.float32))
-    adata.obsm["X_pca"], adata.obsm["X_apca"] = ref["pca"], ref["apca"]
+    adata = AnnData(obsm={"X_pca": ref["pca"], "X_apca": ref["apca"]})
     rsc.pp.wnn(adata, {"RNA": "X_pca", "ADT": "X_apca"}, knn_range=40)
-    ref = ref["weights"].T, ref["indices"], ref["distances"], ref["snn"]
-    _assert_matches(adata, ["RNA", "ADT"], ref)
+    _assert_matches(adata, ["RNA", "ADT"], (ref["weights"].T, ref["indices"], ref["distances"], ref["snn"]))
 
 
 @pytest.mark.parametrize(("k", "max_keys"), [(30, None), (30, 1024), (70, None), (150, None)])
@@ -128,12 +123,8 @@ def test_wnn_snn_kernels(monkeypatch, k, max_keys):
     nn = np.argsort(D, axis=1, kind="stable")[:, :k]
     nearest = D[np.arange(len(D)), nn[:, 1]]
     knn, emb = cp.asarray(nn, dtype=cp.int32), cp.asarray(E, dtype=cp.float32)
-
-    def run():
-        near = cp.asarray(nearest, dtype=cp.float32)
-        sigma = _wnn._snn_bandwidth(knn, emb, near, s_nn=k).get()
-        return sigma, _wnn._snn_graph(knn, prune=1 / 15)
-
+    near = cp.asarray(nearest, dtype=cp.float32)
+    run = lambda: (_wnn._snn_bandwidth(knn, emb, near, s_nn=k).get(), _wnn._snn_graph(knn, prune=1 / 15))
     monkeypatch.setattr(_wnn, "_SNN_CHUNK_PAIRS", 1 << 14)
     if max_keys is not None:
         monkeypatch.setattr(_wnn, "_snn_max_keys", lambda s, key_bytes: max_keys)
@@ -151,22 +142,11 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
     adata = _multimodal_adata()
     adata.X = None  # the layout must use an existing reduction
     use_rep = {"RNA": "X_pca", "ADT": "X_apca"}
-    out = rsc.pp.wnn(
-        adata,
-        use_rep,
-        n_pcs=[10, None],
-        n_neighbors=15,
-        knn_range=50,
-        key_added="wnn",
-        copy=True,
-    )
+    out = rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, key_added="wnn", copy=True)
     assert "wnn" not in adata.uns
     params = out.uns["wnn"]["params"]
     assert (params["use_rep"], params["n_pcs"]) == ("X_pca", 10)
-    assert params["modalities"] == {
-        "RNA": {"use_rep": "X_pca", "n_pcs": 10},
-        "ADT": {"use_rep": "X_apca", "n_pcs": 8},
-    }
+    assert params["modalities"] == {"RNA": {"use_rep": "X_pca", "n_pcs": 10}, "ADT": {"use_rep": "X_apca", "n_pcs": 8}}
     w = out.obs[["RNA_weight", "ADT_weight"]].to_numpy()
     np.testing.assert_allclose(w.sum(axis=1), 1, rtol=1e-6)
     # the RNA-like modality separates more groups, so it should dominate
@@ -193,9 +173,13 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
 def test_wnn_connectivity_methods(method):
     adata = _multimodal_adata()
     keys = ["X_pca", "X_apca"]
-    rsc.pp.wnn(adata, keys, n_pcs=5, knn_range=50, method=method, weight_key=None)
+    # NumPy scalars broadcast; only the UMAP connectivities use the seed
+    kw = {"n_pcs": np.int64(5), "cross_constant": np.float32(1e-4), "random_state": 5}
+    with pytest.warns(UserWarning, match="ignored"):
+        rsc.pp.wnn(adata, keys, knn_range=50, method=method, weight_key=None, **kw)
     params = adata.uns["neighbors"]["params"]
     assert (params["method"], params["modalities"]["X_apca"]["n_pcs"]) == (method, 5)
+    assert "random_state" not in params
     assert adata.obs.columns.empty
     C = adata.obsp["connectivities"]
     assert C.nnz > 0
@@ -205,10 +189,7 @@ def test_wnn_connectivity_methods(method):
 def test_wnn_mudata():
     md = pytest.importorskip("mudata")
     adata = _multimodal_adata()
-    mods = {
-        name: AnnData(adata.X, obs=adata.obs, obsm={"X_pca": adata.obsm[key]})
-        for name, key in (("rna", "X_pca"), ("prot", "X_apca"))
-    }
+    mods = {name: AnnData(obsm={"X_pca": adata.obsm[key]}) for name, key in (("rna", "X_pca"), ("prot", "X_apca"))}
     mdata = md.MuData(mods)
     with pytest.raises(TypeError, match="mapping"):
         rsc.pp.wnn(mdata, ["X_pca", "X_pca"])
@@ -217,25 +198,27 @@ def test_wnn_mudata():
     np.testing.assert_allclose(mdata.obs["rna_weight"], adata.obs["X_pca_weight"], rtol=1e-6)
     assert (mdata.obsp["distances"] != adata.obsp["distances"]).nnz == 0
     params = mdata.uns["neighbors"]["params"]
-    assert params["modalities"] == {
-        "rna": {"use_rep": "X_pca", "n_pcs": 12},
-        "prot": {"use_rep": "X_pca", "n_pcs": 8},
-    }
+    assert params["modalities"] == {"rna": {"use_rep": "X_pca", "n_pcs": 12}, "prot": {"use_rep": "X_pca", "n_pcs": 8}}
     # muon's schema, read by `mu.tl.umap`
-    assert params["use_rep"] == {"rna": "X_pca", "prot": "X_pca"}
-    assert params["n_pcs"] == {"rna": 12, "prot": 8}
+    assert (params["use_rep"], params["n_pcs"]) == ({"rna": "X_pca", "prot": "X_pca"}, {"rna": 12, "prot": 8})
 
 
-def test_wnn_duplicated_cells():
+@pytest.mark.parametrize(("method", "k"), [("umap", 16), ("gauss", 20)])
+def test_wnn_duplicated_cells(method, k):
     # the cell moves to the front of its neighbors, or replaces the last one
     knn = cp.array([[0, 1, 2], [0, 1, 2], [0, 1, 3], [1, 2, 0]], dtype=cp.int32)
     expected = [[0, 1, 2], [1, 0, 2], [2, 0, 1], [3, 1, 2]]
     np.testing.assert_array_equal(_wnn._ensure_self_first(knn).get(), expected)
-    adata = _multimodal_adata(n=200)
-    for key in ("X_pca", "X_apca"):
-        adata.obsm[key][100:110] = adata.obsm[key][100]
-    rsc.pp.wnn(adata, ["X_pca", "X_apca"], knn_range=50)
-    assert np.isfinite(adata.obs[["X_pca_weight", "X_apca_weight"]]).all().all()
+    rng = np.random.default_rng(0)
+    adata = AnnData(obsm={"A": rng.normal(size=(400, 8)), "B": rng.normal(size=(400, 6))})
+    adata.obsm["A"][100:140] = [20, 20, 20, 20, 0, 0, 0, 0]  # identical in A only
+    for X in adata.obsm.values():
+        X[200:230] = X[200]
+    rsc.pp.wnn(adata, ["A", "B"], n_neighbors=k, knn_range=60, method=method)
+    # cells identical in one modality are predicted exactly there (rounding residues gave ~1e-4)
+    assert np.median(adata.obs["A_weight"][100:140]) > 0.5
+    assert np.isfinite(adata.obs[["A_weight", "B_weight"]]).all().all()
+    assert np.isfinite(adata.obsp["connectivities"].data).all()
     D = adata.obsp["distances"]
     assert np.all(D.indices.reshape(adata.n_obs, -1) != np.arange(adata.n_obs)[:, None])
 
@@ -246,13 +229,12 @@ def _no_kernel(*args, **kwargs):
 
 @pytest.mark.parametrize(
     ("bad_id", "bad_dist"),
-    [(np.iinfo(np.int64).max, 1.0), (2**32 + 5, 1.0), (5, np.inf)],
+    [(np.iinfo(np.int64).max, 1.0), (2**32 + 5, 1.0), (5, np.inf), (5, np.sqrt(np.finfo(np.float32).max))],
 )
 def test_wnn_rejects_invalid_neighbors(monkeypatch, bad_id, bad_dist):
     def incomplete_knn(X, Y, k, **kwargs):
-        idx = (cp.arange(X.shape[0])[:, None] + cp.arange(k)) % X.shape[0]
+        idx = (cp.arange(X.shape[0])[:, None] + cp.arange(k)) % X.shape[0]  # int64
         dist = cp.tile(cp.arange(k, dtype=cp.float32), (X.shape[0], 1))
-        idx = idx.astype(cp.int64)
         idx[0, -1], dist[0, -1] = bad_id, bad_dist
         return idx, dist
 
@@ -261,22 +243,23 @@ def test_wnn_rejects_invalid_neighbors(monkeypatch, bad_id, bad_dist):
     monkeypatch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
     with pytest.raises(ValueError, match="incomplete"):
         rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24)
-    assert not adata.obsp
-    assert "neighbors" not in adata.uns
+    assert not adata.obsp and "neighbors" not in adata.uns
 
 
-def test_wnn_incomplete_ivf_search_can_be_retried(monkeypatch):
+def test_wnn_approximate_searches(monkeypatch):
     adata = _multimodal_adata(n=500)
-    kwargs = {"use_rep": ["X_pca", "X_apca"], "algorithm": "ivfflat"}
+    kwargs = {"use_rep": ["X_pca", "X_apca"], "knn_range": 100}
     with monkeypatch.context() as patch:
         patch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
         with pytest.raises(ValueError, match="n_probes"):
-            rsc.pp.wnn(adata, **kwargs, algorithm_kwds={"n_lists": 64, "n_probes": 1})
-    # searching all lists repairs the candidates in the same CUDA context
-    rsc.pp.wnn(adata, **kwargs, algorithm_kwds={"n_lists": 64, "n_probes": 64})
-    D = adata.obsp["distances"]
-    assert np.all(np.diff(D.indptr) == 20)
-    assert np.isfinite(D.data).all()
+            rsc.pp.wnn(adata, **kwargs, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+    # searching all IVF lists repairs the candidates in the same CUDA context;
+    # nn_descent needs a graph degree beyond its default
+    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {})):
+        rsc.pp.wnn(adata, **kwargs, algorithm=algorithm, algorithm_kwds=kwds)
+        D = adata.obsp["distances"]
+        assert np.all(np.diff(D.indptr) == 20)
+        assert np.isfinite(D.data).all()
 
 
 @pytest.mark.parametrize(
@@ -291,11 +274,13 @@ def test_wnn_incomplete_ivf_search_can_be_retried(monkeypatch):
         ({"algorithm": "kd_tree"}, "Invalid algorithm"),
         ({"use_rep": ["X_pca", "X_pca"]}, "unique strings"),
         ({"weight_key": "weight"}, "distinct column"),
+        ({"algorithm": "cagra", "knn_range": 100}, "up to 64"),
     ],
 )
 def test_wnn_errors(kwargs, match):
-    adata = _multimodal_adata()
+    adata = _multimodal_adata()[:300]  # errors leave even a view untouched
     kwargs = {"use_rep": ["X_pca", "X_apca"], "knn_range": 50} | kwargs
     with pytest.raises((ValueError, TypeError), match=match):
         rsc.pp.wnn(adata, **kwargs)
+    assert adata.is_view
     assert not adata.obsp and "neighbors" not in adata.uns

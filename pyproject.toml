@@ -68,6 +68,7 @@ dev = [
 ]
 test = [
   "igraph",
+  "mudata",
   "spatialdata>=0.7.2",
   { include-group = "test-minimal" },
 ]
@@ -209,7 +210,7 @@ warn_unused_configs = true
 
 # RAPIDS and friends ship without type information
 [[tool.mypy.overrides]]
-module = [ "cudf.*", "cuml.*", "cuvs.*", "muon.*", "numba.*", "pylibraft.*" ]
+module = [ "cudf.*", "cuml.*", "cuvs.*", "mudata.*", "numba.*", "pylibraft.*" ]
 ignore_missing_imports = true
 
 # scanpy has inline annotations but no py.typed marker

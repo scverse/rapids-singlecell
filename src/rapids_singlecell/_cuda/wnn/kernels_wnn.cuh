@@ -21,6 +21,8 @@ __device__ __forceinline__ float warp_sum(float v) {
 // Warp per cell: distance between the cell's embedding and the mean embedding
 // of its neighbors 1..k-1 (Seurat's PredictAssay, which drops the self column),
 // minus the distance to the nearest neighbor, clipped at zero (impute_dist).
+// The differences are summed, so identical neighbors give exactly 0, and k = 2
+// gives the distance to neighbor 1 with the multimodal kernel's arithmetic.
 // `emb` is (n_obs, d); `knn` is the neighbor list of any modality.
 __global__ void wnn_impute_dist_kernel(const float* __restrict__ emb, int d,
                                        const int* __restrict__ knn, int k_max,
@@ -37,8 +39,9 @@ __global__ void wnn_impute_dist_kernel(const float* __restrict__ emb, int d,
         float acc = 0.0f;
         for (int f = lane; f < d; f += 32) {
             float s = 0.0f;
-            for (int c = 1; c < k; ++c) s += emb[(long long)nn[c] * d + f];
-            const float diff = xi[f] - s * inv;
+            for (int c = 1; c < k; ++c)
+                s += xi[f] - emb[(long long)nn[c] * d + f];
+            const float diff = s * inv;
             acc += diff * diff;
         }
         acc = warp_sum(acc);
