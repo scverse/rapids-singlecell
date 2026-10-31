@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import cupy as cp
 import numpy as np
 import pytest
+import scanpy as sc
 from anndata import AnnData
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 
@@ -13,9 +12,30 @@ from rapids_singlecell.preprocessing._normalize import _estimate_nb_overdispersi
 
 ARRAY_TYPES = [cp.asarray, csr_matrix, csc_matrix]
 
-# Output of scanpy's own `normalize_shifted_clr` (scverse/scanpy#4160), see
-# `tests/_scripts/generate_shifted_clr_scanpy.py`
-SCANPY = np.load(Path(__file__).parent / "_data/shifted_clr_scanpy.npz")
+# TODO: drop this skip once a scanpy release ships `normalize_shifted_clr` (scverse/scanpy#4160);
+# until then only the `dev` CI env, which installs scanpy main, compares against scanpy.
+needs_scanpy_shifted_clr = pytest.mark.skipif(
+    not hasattr(sc.pp, "normalize_shifted_clr"),
+    reason="installed scanpy has no `normalize_shifted_clr` (scverse/scanpy#4160)",
+)
+
+
+def _counts() -> np.ndarray:
+    """RNA-like overdispersed counts with an empty cell and an empty gene."""
+    rng = np.random.default_rng(0)
+    mu = rng.lognormal(0.5, 1.2, size=30)
+    x = rng.negative_binomial(2, 2 / (2 + mu), size=(40, 30)).astype(np.float64)
+    x[3] = 0
+    x[:, 7] = 0
+    return x
+
+
+def _scanpy_shifted_clr(x: np.ndarray, **kwargs) -> np.ndarray:
+    adata = AnnData(x.copy())
+    with pytest.warns(UserWarning, match="Some cells have zero counts"):
+        sc.pp.normalize_shifted_clr(adata, **kwargs)
+    return np.asarray(adata.X)
+
 
 # Same hand-computed cases as scanpy's tests
 X_clr = np.array([[5, 0, 3, 2], [1, 1, 0, 4], [0, 7, 2, 1], [3, 3, 3, 3]], dtype="float32")
@@ -39,24 +59,30 @@ def _clr(x, array_type=cp.asarray, **kwargs) -> np.ndarray:
     return cp.asnumpy(adata.X)
 
 
+@needs_scanpy_shifted_clr
 @pytest.mark.parametrize("array_type", ARRAY_TYPES)
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-@pytest.mark.parametrize("case", ["estimated", "alpha_0.3"])
-def test_matches_scanpy(array_type, dtype, case):
-    kwargs = {} if case == "estimated" else {"alpha": 0.3}
-    adata = AnnData(array_type(cp.asarray(SCANPY["counts"], dtype=dtype)))
+@pytest.mark.parametrize("alpha", [None, 0.3], ids=["estimated", "explicit"])
+def test_matches_scanpy(array_type, dtype, alpha):
+    x = _counts().astype(dtype)
+    expected = _scanpy_shifted_clr(x, alpha=alpha)
+    adata = AnnData(array_type(cp.asarray(x)))
     with pytest.warns(UserWarning, match="Some cells have zero counts"):
-        rsc.pp.normalize_shifted_clr(adata, **kwargs)
+        rsc.pp.normalize_shifted_clr(adata, alpha=alpha)
 
     assert isinstance(adata.X, cp.ndarray)
     assert adata.X.dtype == dtype
     tol = 1e-6 if dtype == np.float32 else 1e-12
-    cp.testing.assert_allclose(adata.X, SCANPY[case], rtol=tol, atol=tol)
+    np.testing.assert_allclose(cp.asnumpy(adata.X), expected, rtol=tol, atol=tol)
 
 
+@needs_scanpy_shifted_clr
 def test_estimate_alpha_matches_scanpy():
-    alpha = _estimate_nb_overdispersion(csr_matrix(cp.asarray(SCANPY["counts"])))
-    assert alpha == pytest.approx(float(SCANPY["alpha_estimated"]), rel=1e-12)
+    from scanpy.preprocessing._normalization import _estimate_nb_overdispersion as sc_estimate
+
+    x = _counts()
+    alpha = _estimate_nb_overdispersion(csr_matrix(cp.asarray(x)))
+    assert alpha == pytest.approx(sc_estimate(x), rel=1e-12)
 
 
 @pytest.mark.parametrize("array_type", ARRAY_TYPES)
