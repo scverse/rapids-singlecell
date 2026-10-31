@@ -33,3 +33,20 @@ r <- quiet(DSBNormalizeProtein(cells, empty, use.isotype.control = FALSE))
 w(t(r), "no_isotypes")
 r <- quiet(ModelNegativeADTnorm(cells, use.isotype.control = FALSE))
 w(t(r), "negative_no_isotypes")
+# Mclust fits of vectors longer than 2000 values, started from given subsets
+# (Mclust draws them at random otherwise)
+suppressPackageStartupMessages(library(mclust))
+set.seed(1)
+n <- 2500
+x <- cbind(log(rpois(n, 1.5) + 1), c(rnorm(1700), rnorm(n - 1700, 4, 1.5)),
+           log(rpois(n, rgamma(n, 2, 0.2)) + 10))
+idx <- sapply(seq_len(ncol(x)), function(j) sample(n, 2000))
+fits <- t(sapply(seq_len(ncol(x)), function(j) {
+  g <- Mclust(x[, j], G = 2, verbose = FALSE,
+                      initialization = list(subset = idx[, j]))
+  p <- g$parameters
+  c(p$mean, rep_len(p$variance$sigmasq, 2), p$pro)
+}))
+w(x, "subset_x")
+w(idx, "subset_idx")
+w(fits, "subset_params")

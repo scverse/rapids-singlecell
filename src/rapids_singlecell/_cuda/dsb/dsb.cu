@@ -1,8 +1,6 @@
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
-#include <stdexcept>
 
 #include "../nb_types.h"
 #include "kernels_dsb.cuh"
@@ -10,88 +8,44 @@
 using namespace nb::literals;
 
 constexpr int WARPS_PER_BLOCK = 8;
-constexpr int COOP_THREADS = 256;
-constexpr long long COOP_MIN_CHUNK = 2048;
-
-// Cooperative work split: chunks of >= COOP_MIN_CHUNK values, at most one
-// chunk per co-resident block, no more blocks than (pair, chunk) items.
-struct CoopLayout {
-    long long grid, chunk, n_chunks;
-};
-
-template <typename T>
-static CoopLayout coop_layout(long long n_fits, int n) {
-    int device = 0, n_sm = 0, per_sm = 0;
-    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
-    cuda_check(
-        cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device),
-        "cudaDeviceGetAttribute");
-    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                   &per_sm, dsb::mix2_coop_kernel<T>, COOP_THREADS, 0),
-               "cudaOccupancyMaxActiveBlocksPerMultiprocessor");
-    const long long max_grid = (long long)n_sm * (per_sm > 0 ? per_sm : 1);
-    const long long chunk =
-        std::max(COOP_MIN_CHUNK, ((long long)n + max_grid - 1) / max_grid);
-    const long long n_chunks = ((long long)n + chunk - 1) / chunk;
-    return {std::min(max_grid, 2 * n_fits * n_chunks), chunk, n_chunks};
-}
-
-template <typename T>
-static size_t coop_workspace_bytes(long long n_fits, int n) {
-    return 2 * n_fits *
-           (sizeof(dsb::FitState<T>) +
-            coop_layout<T>(n_fits, n).n_chunks * 7 * sizeof(double));
-}
 
 template <typename T, typename Device>
 static void def_mix2(nb::module_& m) {
-    // init: empty -> fit every row; (n_fits, 2, 6) -> only write start values
+    // Empty W / init_in / init_out mean "not given" (see mix2_kernel).
     m.def(
-        "mix2_warp",
-        [](gpu_array_c<const T, Device> X, gpu_array_c<T, Device> params,
-           gpu_array_c<int, Device> status, gpu_array_c<T, Device> q,
-           gpu_array_c<T, Device> init, int max_iter, std::uintptr_t stream) {
+        "mix2",
+        [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> W,
+           gpu_array_c<const T, Device> init_in,
+           gpu_array_c<T, Device> init_out, gpu_array_c<T, Device> params,
+           gpu_array_c<std::uint8_t, Device> flags, bool subset, int max_iter,
+           double margin, std::uintptr_t stream) {
+            nb_require(X.ndim() == 2, "dsb: X must be 2-D");
             const long long n_fits = X.shape(0);
+            const size_t n_vals = n_fits * X.shape(1);
+            nb_require(W.size() == 0 || W.size() == n_vals,
+                       "dsb: W must match X");
+            nb_require(init_in.size() == 0 || init_in.size() == n_fits * 12,
+                       "dsb: init_in must be (n_fits, 2, 6)");
+            nb_require(init_out.size() == 0 || init_out.size() == n_fits * 12,
+                       "dsb: init_out must be (n_fits, 2, 6)");
+            nb_require(init_out.size() > 0 || (params.size() == n_fits * 6 &&
+                                               flags.size() == n_fits),
+                       "dsb: params must be (n_fits, 6), flags (n_fits,)");
+            nb_require(flags.size() == 0 || flags.size() == n_fits,
+                       "dsb: flags must be (n_fits,)");
             if (n_fits == 0) return;
             const unsigned int grid = strided_grid(n_fits, WARPS_PER_BLOCK);
-            dsb::mix2_warp_kernel<T><<<grid, WARPS_PER_BLOCK * dsb::kWarp, 0,
-                                       (cudaStream_t)stream>>>(
-                X.data(), n_fits, (int)X.shape(1), max_iter, params.data(),
-                status.data(), q.data(), init.size() ? init.data() : nullptr);
-            CUDA_CHECK_LAST_ERROR(mix2_warp_kernel);
+            dsb::mix2_kernel<T><<<grid, WARPS_PER_BLOCK * dsb::kWarp, 0,
+                                  (cudaStream_t)stream>>>(
+                X.data(), W.size() ? W.data() : nullptr, n_fits,
+                (int)X.shape(1), init_in.size() ? init_in.data() : nullptr,
+                init_out.size() ? init_out.data() : nullptr, subset, max_iter,
+                margin, params.data(), flags.size() ? flags.data() : nullptr);
+            CUDA_CHECK_LAST_ERROR(mix2_kernel);
         },
-        "X"_a, "params"_a, "status"_a, "q"_a, "init"_a, nb::kw_only(),
-        "max_iter"_a, "stream"_a = 0);
-
-    m.def(
-        "mix2_coop",
-        [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> init,
-           gpu_array_c<T, Device> params, gpu_array_c<int, Device> status,
-           gpu_array_c<std::uint8_t, Device> work, int max_iter,
-           std::uintptr_t stream) {
-            long long n_fits = X.shape(0);
-            int n = (int)X.shape(1);
-            if (n_fits == 0) return;
-            nb_require(work.size() >= coop_workspace_bytes<T>(n_fits, n),
-                       "dsb workspace too small");
-            CoopLayout l = coop_layout<T>(n_fits, n);
-            const T* x = X.data();
-            const T* ip = init.data();
-            auto* states = reinterpret_cast<dsb::FitState<T>*>(work.data());
-            double* partials = reinterpret_cast<double*>(states + 2 * n_fits);
-            T* pp = params.data();
-            int* sp = status.data();
-            void* args[] = {&x,        &n_fits,     &n,  &max_iter,
-                            &l.chunk,  &l.n_chunks, &ip, &states,
-                            &partials, &pp,         &sp};
-            cuda_check(cudaLaunchCooperativeKernel(
-                           (void*)dsb::mix2_coop_kernel<T>, dim3(l.grid),
-                           dim3(COOP_THREADS), args, 0, (cudaStream_t)stream),
-                       "dsb: cooperative launch for vectors longer than 2000 "
-                       "values (unsupported on some MPS / virtualized GPUs)");
-        },
-        "X"_a, "init"_a, "params"_a, "status"_a, "work"_a, nb::kw_only(),
-        "max_iter"_a, "stream"_a = 0);
+        "X"_a, "W"_a, "init_in"_a, "init_out"_a.noconvert(),
+        "params"_a.noconvert(), "flags"_a.noconvert(), nb::kw_only(),
+        "subset"_a, "max_iter"_a, "margin"_a = 0.0, "stream"_a = 0);
 }
 
 template <typename Device>
@@ -102,12 +56,5 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_dsb_cuda, m) {
     m.doc() = "Batched two-component univariate Gaussian mixtures for dsb.";
-    m.def(
-        "mix2_coop_workspace",
-        [](long long n_fits, int n, bool double_precision) {
-            return double_precision ? coop_workspace_bytes<double>(n_fits, n)
-                                    : coop_workspace_bytes<float>(n_fits, n);
-        },
-        "n_fits"_a, "n"_a, "double_precision"_a);
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

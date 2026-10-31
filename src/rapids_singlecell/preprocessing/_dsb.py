@@ -1,9 +1,9 @@
 """dsb normalization of CITE-seq protein (ADT) counts :cite:p:`Mule2022`.
 
 GPU port of the dsb R package (CC0), following ``DSBNormalizeProtein`` and
-``ModelNegativeADTnorm``. The R functions dsb calls were reimplemented from
-published descriptions and calibrated by black-box runs only (no mclust, limma
-or R stats source was consulted):
+``ModelNegativeADTnorm``, with the API of ``scanpy.pp.dsb``. The R functions
+dsb calls were reimplemented from published descriptions and calibrated by
+black-box runs only (no mclust, limma or R stats source was consulted):
 
 * ``mclust::Mclust(x, G = 2)``: see ``_mixture_fits`` (Fraley & Raftery 2002;
   Scrucca et al. 2016).
@@ -17,27 +17,36 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast, get_args
 
 import cupy as cp
 import numpy as np
 from cupyx.scipy import sparse as cpsparse
+from scanpy._utils import view_to_actual
 from scipy import sparse
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 
-if TYPE_CHECKING:
-    from collections.abc import Iterable
+from ._utils import _sparse_to_dense
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+    import pandas as pd
     from anndata import AnnData
+    from numpy.typing import DTypeLike
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 _SUBSET = 2000  # Mclust starts longer vectors from a random subset this size
-# EM iteration cap (R has none); only a guard against fits that never converge
-_MAX_ITER = {np.dtype(np.float64): 100_000, np.dtype(np.float32): 10_000}
-_ISOTYPE_PATTERN = re.compile(r"sotype|Iso|iso|control|CTRL|ctrl|Ctrl|ontrol")
+_MAX_ITER = 100_000  # EM iteration cap (R has none); a guard against hangs
+# float32 fits whose decisions are this close (relative) to a threshold are
+# refit in float64; well above the float32 noise of those decisions
+_MARGIN = {np.dtype(np.float64): 0.0, np.dtype(np.float32): 2e-3}
+_CHUNK = 65_536  # rows of empty droplets densified at a time
+_ISOTYPE_PATTERN = re.compile(r"sotype|Iso|iso|control|CTRL|ctrl|Ctrl|ontrol")  # codespell:ignore ontrol
+_CSBase = sparse.csr_matrix | sparse.csc_matrix | sparse.csr_array | sparse.csc_array
 _ScaleFactor = Literal["standardize", "mean_subtract"]
 _VAR_KEYS = ("dsb_ambient_mean", "dsb_ambient_sd")
 _OBS_KEYS = ("dsb_cell_background_mean", "dsb_technical_component")
@@ -56,7 +65,7 @@ def dsb(
     quantile_clip: tuple[float, float] | None = None,
     layer: str | None = None,
     key_added: str | None = None,
-    dtype: type = np.float64,
+    dtype: DTypeLike = np.float32,
     rng: SeedLike | RNGLike | None = None,
     copy: bool = False,
 ) -> AnnData | None:
@@ -75,25 +84,21 @@ def dsb(
 
     Without `adata_empty` this mirrors ``dsb::ModelNegativeADTnorm``: step 1
     subtracts, per protein, the first-component mean of a mixture fit across
-    cells.
-
-    The mixture fits reproduce ``mclust::Mclust(x, G = 2)``. Mclust starts
-    vectors longer than 2000 values from a random subset of 2000, which affects
-    the per-protein fits of the negative model with more than 2000 cells: these
-    match R only in distribution and depend on `rng`.
+    cells. The mixture fits reproduce ``mclust::Mclust(x, G = 2)``.
 
     Parameters
     ----------
     adata
         Cells-by-proteins raw ADT counts of cell-containing droplets.
     adata_empty
-        Raw ADT counts of empty droplets with the same proteins. If `None`,
-        the background is estimated from the cells.
+        Raw ADT counts of empty droplets with the same proteins (may be backed).
+        If `None`, the background is estimated from the cells.
     isotype_controls
         Name(s) of isotype control proteins in `adata.var_names` for step 2.
     use_isotype_controls
         Use `isotype_controls` in step 2, as recommended by dsb. If `False`, only
-        the per-cell background mean is regressed out.
+        the per-cell background mean is regressed out; the covariate is centered
+        as in limma >= 3.66 (older limma versions give different results).
     denoise_counts
         Run step 2.
     pseudocount
@@ -114,18 +119,35 @@ def dsb(
         Store the result in `adata.layers[key_added]` instead of overwriting
         `layer` (or `.X`).
     dtype
-        Floating point type of all computations and the output. `float64`
-        matches R to ~1e-10. `float32` is several times faster and usually
-        agrees to ~1e-4, but for about 1 in 10,000 cells with very slowly
-        converging fits, rounding changes the EM stopping iteration and that
-        cell's background estimate.
+        Floating point type of the computations and the output (in
+        ``scanpy.pp.dsb``, `dtype` sets only the output and computations use
+        float64).
 
-        Where R would fail, rsc warns and continues: a cell whose mixture fit
-        is singular in both models (R errors) gets the lower center of a
-        two-cluster k-means as background, and EM stops after 100,000
-        (float64) or 10,000 (float32) iterations (R has no limit).
+        `float64` reproduces R (~1e-10 on dsb's example data) and
+        ``scanpy.pp.dsb`` (~1e-11).
+
+        `float32` (default) is several times faster on GPUs with low float64
+        throughput and stays within ~1e-5 of `float64`: on 1,000,000 cells,
+        with and without `adata_empty`, the outputs differed by at most
+        7.4e-6 (per-cell maximum 7.8e-7 on average), the cell backgrounds
+        by at most 2.2e-6, with the same E/V model choices for every cell.
+        The log counts are computed in float64 and rounded once. The mixture
+        fits carry the parameters, deviations and log-densities in
+        double-single (hi, lo) float arithmetic; fits or k-means splits whose
+        decision lies within float32 noise of its threshold, or whose start
+        has values merged into ties by the rounding, are redone in float64
+        (about 1.4% of cells with `adata_empty`, 5.7% without). The empty
+        droplet statistics, the per-protein backgrounds without `adata_empty`
+        and the step 2 slopes are computed in float64.
+
+        Where R would fail on a model fit, rsc warns and continues: a cell
+        whose mixture fit is singular in both models (R errors) gets the lower
+        center of a two-cluster k-means as background, and EM stops after
+        100,000 iterations (R has no limit).
     rng
-        Random number generator for the subsampled fits of long vectors.
+        Random number generator for the mixture fits of vectors longer than
+        2000 values, which start from a random subset. Without `adata_empty`
+        and with more than 2000 cells, results vary between calls unless set.
     copy
         Return a modified copy instead of updating `adata` in place.
 
@@ -181,43 +203,42 @@ def dsb(
         if layer is not None and layer not in adata_empty.layers:
             raise ValueError(f"`adata_empty` has no layer {layer!r}.")
     rng = np.random.default_rng(rng)
+
+    if copy:
+        adata = adata.copy()
+    else:
+        view_to_actual(adata)
+    # in memory after the copy / view_to_actual: DataFrames, not Dataset2D
+    adata.var = cast("pd.DataFrame", adata.var).drop(columns=[k for k in _VAR_KEYS if k in adata.var])
+    adata.obs = cast("pd.DataFrame", adata.obs).drop(columns=[k for k in _OBS_KEYS if k in adata.obs])
     X_in = _get_obs_rep(adata, layer=layer)
     on_gpu = isinstance(X_in, cp.ndarray) or cpsparse.issparse(X_in)
-    counts = _dense_gpu(X_in, dtype)
-    _check_counts(counts, "adata")
-    adt_log = cp.log(counts + dtype.type(pseudocount))
-    del counts
-
-    var_stats = {}
+    counts = _counts(X_in, "adata", dtype)
+    scale = None
     if adata_empty is not None:
-        empty = _dense_gpu(_get_obs_rep(adata_empty, layer=layer), dtype)
-        _check_counts(empty, "adata_empty")
-        empty_log = cp.log(empty + dtype.type(pseudocount))
-        mean, sd = empty_log.mean(axis=0), empty_log.std(axis=0, ddof=1)
+        mean, sd, constant = _empty_stats(_get_obs_rep(adata_empty, layer=layer), pseudocount)
         var_stats = {"dsb_ambient_mean": mean, "dsb_ambient_sd": sd}
         if scale_factor == "standardize":
-            constant = cp.asnumpy(empty.min(axis=0) == empty.max(axis=0))
             if constant.any():
                 raise ValueError(
                     "Proteins with the same count in every empty droplet cannot be "
                     f"standardized; remove them from both objects: {list(proteins[constant])}"
                 )
-            low = cp.asnumpy(sd < 0.05)
-            if low.any():
+            if (low := sd < 0.05).any():
                 warnings.warn(
                     "Proteins with low background log-count sd < 0.05, check "
-                    f"their raw and normalized distributions: {list(proteins[low])}",
+                    f"their raw and normalized distributions: {list(proteins[cp.asnumpy(low)])}",
                     UserWarning,
                     stacklevel=2,
                 )
-            norm = (adt_log - mean) / sd
-        else:
-            norm = adt_log - mean
+            scale = sd
     else:
-        fit = _mixture_fits(cp.ascontiguousarray(adt_log.T), rng)
-        mean = fit.params[:, 0].copy()
-        failed = cp.asnumpy(fit.status < 0)
-        if failed.any():
+        # per-protein background in float64 (P fits, but every cell depends on
+        # them): compressed on the counts, EM on float64 log counts
+        mean = _mixture_fits(
+            counts.T, rng, compress=True, transform=lambda v: cp.log(v.astype(np.float64) + pseudocount)
+        ).params[:, 0]
+        if (failed := cp.asnumpy(cp.isnan(mean))).any():  # type: ignore[attr-defined]
             warnings.warn(
                 f"The background could not be fit for proteins "
                 f"{list(proteins[failed])}; they are only log transformed.",
@@ -226,28 +247,48 @@ def dsb(
             )
             mean[cp.asarray(failed)] = 0
         var_stats = {"dsb_ambient_mean": mean}
-        norm = adt_log - mean
-    del adt_log
-    norm = cp.ascontiguousarray(norm)
+
+    def step1(out: cp.ndarray) -> cp.ndarray:
+        """Step 1 in place on float64 log counts."""
+        out -= mean
+        if scale is not None:
+            out /= scale  # type: ignore[operator]
+        return out
+
+    def exact_cells(rows) -> cp.ndarray:
+        """float64 step 1 of some cells, to refit marginal float32 fits."""
+        x = X_in[cp.asarray(rows) if on_gpu else rows]
+        return step1(_log_counts(x, pseudocount, "adata", np.dtype(np.float64)))
+
+    if dtype == np.float64:
+        counts += pseudocount
+        norm = step1(cp.log(counts, out=counts))
+    else:
+        # float64 log, rounded once to float32 in row chunks (in place of the
+        # counts): rounding keeps the order of the values and only merges some
+        # into ties (see _fit_rows)
+        for r in range(0, counts.shape[0], _CHUNK):
+            chunk = counts[r : r + _CHUNK].astype(np.float64)
+            chunk += pseudocount
+            counts[r : r + _CHUNK] = step1(cp.log(chunk, out=chunk))
+        norm = counts
+    del counts
 
     obs_stats = {}
     if denoise_counts:
         if fast_km:
-            background = _kmeans_low_centers(norm)
+            background = _kmeans_low_centers(norm, exact_cells)
         else:
-            fit = _mixture_fits(norm, rng)
-            failed = fit.status < 0
-            if bool(failed.any()):
+            background = _mixture_fits(norm, rng, exact=exact_cells).params[:, 0].copy()
+            if (n_failed := int((failed_cells := cp.isnan(background)).sum())) > 0:  # type: ignore[attr-defined]
                 warnings.warn(
-                    f"The mixture model could not be fit for {int(failed.sum())} "
+                    f"The mixture model could not be fit for {n_failed} "
                     "cells; using the lower k-means center of their values instead.",
                     UserWarning,
                     stacklevel=2,
                 )
-            background = fit.params[:, 0].copy()
-            if bool(failed.any()):
-                background[failed] = _kmeans_low_centers(norm[failed])
-        technical = background
+                background[failed_cells] = _kmeans_low_centers(norm[failed_cells])
+        technical = background.astype(np.float64)
         if iso_idx is not None:
             noise = cp.concatenate([norm[:, iso_idx], background[:, None]], axis=1)
             constant = cp.asnumpy(noise.min(axis=0) == noise.max(axis=0))
@@ -258,11 +299,16 @@ def dsb(
                     f"cells: {[n for n, c in zip(names, constant, strict=True) if c]}"
                 )
             technical = _first_pc_scores(noise)
-        # limma::removeBatchEffect (>= 3.66) centers the covariate: subtract the
-        # slope times the centered v; a constant covariate leaves the data unchanged
-        vc = technical - technical.mean()
-        if float(vc @ vc) > 0:
-            norm -= vc[:, None] * ((vc @ norm) / (vc @ vc))
+        # subtract the slope times the centered technical component;
+        # a constant covariate leaves the data unchanged
+        if float(technical.max()) > float(technical.min()):
+            vc = technical - technical.mean()  # type: ignore[attr-defined]
+            # slopes accumulated in float64, in row chunks
+            slopes = sum(
+                (norm[r : r + _CHUNK] * vc[r : r + _CHUNK, None].astype(dtype)).sum(axis=0, dtype=np.float64)
+                for r in range(0, norm.shape[0], _CHUNK)
+            ) / (vc @ vc)
+            norm -= vc[:, None].astype(dtype) * slopes.astype(dtype)
         else:
             warnings.warn(
                 "The technical component is constant; step 2 leaves the data unchanged.",
@@ -275,28 +321,19 @@ def dsb(
         }
 
     if quantile_clip is not None:
-        q = cp.quantile(norm, cp.asarray(quantile_clip, dtype=dtype), axis=0)
-        norm = cp.clip(norm, q[0], q[1])
+        q = cp.quantile(norm, cp.asarray(quantile_clip, dtype=dtype), axis=0)  # type: ignore[attr-defined]
+        cp.clip(norm, q[0], q[1], out=norm)  # type: ignore[attr-defined]
 
-    if copy:
-        adata = adata.copy()
-    elif adata.is_view:
-        adata._init_as_actual(adata.copy())
-    adata.var.drop(columns=[k for k in _VAR_KEYS if k in adata.var], inplace=True)
-    adata.obs.drop(columns=[k for k in _OBS_KEYS if k in adata.obs], inplace=True)
-    out = norm if on_gpu else cp.asnumpy(norm)
-    if key_added is None:
-        _set_obs_rep(adata, out, layer=layer)
-    else:
-        adata.layers[key_added] = out
+    out = norm.astype(dtype, copy=False)
+    _set_obs_rep(adata, out if on_gpu else cp.asnumpy(out), layer=layer if key_added is None else key_added)
     for key, val in var_stats.items():
-        adata.var[key] = cp.asnumpy(val)
+        adata.var[key] = cp.asnumpy(val).astype(dtype, copy=False)
     for key, val in obs_stats.items():
-        adata.obs[key] = cp.asnumpy(val)
+        adata.obs[key] = cp.asnumpy(val).astype(dtype, copy=False)
     return adata if copy else None
 
 
-def _isotype_indices(proteins, isotype_controls, *, use_isotype_controls: bool, required: bool):
+def _isotype_indices(proteins: pd.Index, isotype_controls, *, use_isotype_controls: bool, required: bool):
     if isinstance(isotype_controls, str):
         isotype_controls = [isotype_controls]
     elif isotype_controls is not None:
@@ -317,27 +354,69 @@ def _isotype_indices(proteins, isotype_controls, *, use_isotype_controls: bool, 
     return None
 
 
-def _check_counts(x: cp.ndarray, name: str) -> None:
-    if not bool(cp.isfinite(x).all() and (x >= 0).all()):
-        raise ValueError(f"`{name}` must contain raw counts: finite and non-negative values.")
+def _dense_gpu(x, dtype: np.dtype) -> cp.ndarray:
+    """New dense C-ordered device array of `x` in `dtype`.
 
-
-def _dense_gpu(X, dtype: np.dtype) -> cp.ndarray:
-    if isinstance(X, DaskArray):
+    Moves the narrower of the source and target dtype and casts on the device
+    otherwise (cupyx sparse needs floats, so other sparse dtypes cast on the host).
+    """
+    if isinstance(x, DaskArray):
         raise TypeError("dsb does not support dask arrays.")
-    # move the narrower of source and target dtype, cast on the GPU otherwise
-    # (cupyx sparse needs floats, so integer scipy matrices cast on the host)
-    narrow = X.dtype.itemsize > dtype.itemsize or X.dtype.kind != "f"
-    if sparse.issparse(X):
-        X = cpsparse.csr_matrix(X.astype(dtype) if narrow else X)
-    if cpsparse.issparse(X):
-        return X.astype(dtype).toarray()
-    if X.dtype.itemsize > dtype.itemsize:
-        return cp.array(X, dtype=dtype, order="C")
-    return cp.asarray(X).astype(dtype, order="C", copy=False)
+    if sparse.issparse(x) and not isinstance(x, _CSBase):
+        x = sparse.csr_matrix(x)  # type: ignore[call-overload]
+    if isinstance(x, _CSBase):
+        if x.dtype.kind != "f" or x.dtype.itemsize > dtype.itemsize:
+            x = x.astype(dtype)
+        x = cpsparse.csc_matrix(x) if x.format == "csc" else cpsparse.csr_matrix(x)
+    if cpsparse.issparse(x):
+        return _sparse_to_dense(x if x.format in ("csr", "csc") else x.tocsr(), order="C").astype(dtype, copy=False)  # type: ignore[attr-defined]
+    if isinstance(x, cp.ndarray):
+        return x.astype(dtype, order="C", copy=True)
+    x = np.asarray(x)
+    if x.dtype.itemsize > dtype.itemsize:
+        return cp.array(x, dtype=dtype, order="C")
+    return cp.asarray(x).astype(dtype, order="C", copy=False)
 
 
-def _match_proteins(adata_empty: AnnData, proteins) -> AnnData:
+def _counts(x, name: str, dtype: np.dtype) -> cp.ndarray:
+    """Checked raw counts as a new dense device array."""
+    if x is None:
+        raise ValueError(f"`{name}.X` is None; pass the `layer` with the counts.")
+    out = _dense_gpu(x, dtype)
+    if not bool(cp.isfinite(out).all() and (out >= 0).all()):  # type: ignore[attr-defined]
+        raise ValueError(f"`{name}` must contain raw counts: finite and non-negative values.")
+    return out
+
+
+def _log_counts(x, pseudocount: float, name: str, dtype: np.dtype) -> cp.ndarray:
+    """``log(x + pseudocount)`` as a new dense device array."""
+    out = _counts(x, name, dtype)
+    out += dtype.type(pseudocount)
+    return cp.log(out, out=out)
+
+
+def _empty_stats(x, pseudocount: float) -> tuple[cp.ndarray, cp.ndarray, np.ndarray]:
+    """Per-protein float64 mean, sd and constancy of the log counts, in row chunks."""
+    if x is None:
+        raise ValueError("`adata_empty.X` is None; pass the `layer` with the counts.")
+    n, n_vars = 0, x.shape[1]
+    mean, m2 = cp.zeros(n_vars), cp.zeros(n_vars)
+    lo, hi = cp.full(n_vars, np.inf), cp.full(n_vars, -np.inf)
+    for start in range(0, x.shape[0], _CHUNK):
+        chunk = _log_counts(x[start : start + _CHUNK], pseudocount, "adata_empty", np.dtype(np.float64))
+        n_b, mean_b = chunk.shape[0], chunk.mean(axis=0)  # type: ignore[attr-defined]
+        m2_b = ((chunk - mean_b) ** 2).sum(axis=0)
+        # merge with the previous chunks (Chan et al.)
+        delta, n_ab = mean_b - mean, n + n_b
+        mean = mean + delta * (n_b / n_ab)
+        m2 = m2 + m2_b + delta**2 * (n * n_b / n_ab)
+        n = n_ab
+        lo, hi = cp.minimum(lo, chunk.min(axis=0)), cp.maximum(hi, chunk.max(axis=0))  # type: ignore[attr-defined]
+        del chunk
+    return mean, cp.sqrt(m2 / (n - 1)), cp.asnumpy(lo == hi)  # type: ignore[attr-defined, operator]
+
+
+def _match_proteins(adata_empty: AnnData, proteins: pd.Index) -> AnnData:
     names = adata_empty.var_names
     if names.equals(proteins):
         return adata_empty
@@ -357,12 +436,19 @@ def _match_proteins(adata_empty: AnnData, proteins) -> AnnData:
 
 
 class _MixtureFit(NamedTuple):
-    params: cp.ndarray  # (n, 6): mean0, mean1, var0, var1, pro0, loglik
-    status: cp.ndarray  # 0 = E, 1 = V, -1 = no fit; +2 = hit the EM cap
-    q: cp.ndarray  # start split (of the subset for long vectors)
+    params: cp.ndarray  # (n, 6): mean0, mean1, var0, var1, pro0, pro1; NaN = no fit
+    capped: cp.ndarray  # EM of either model hit the iteration cap
 
 
-def _mixture_fits(M: cp.ndarray, rng: np.random.Generator) -> _MixtureFit:
+def _mixture_fits(
+    M: cp.ndarray,
+    rng: np.random.Generator,
+    *,
+    max_iter: int = _MAX_ITER,
+    compress: bool = False,
+    exact: Callable[[np.ndarray], cp.ndarray] | None = None,
+    transform: Callable[[cp.ndarray], cp.ndarray] | None = None,
+) -> _MixtureFit:
     """Fit ``Mclust(x, G = 2)`` to every row of `M`.
 
     Behaviour of mclust 6.1.3, established by black-box runs only:
@@ -377,54 +463,136 @@ def _mixture_fits(M: cp.ndarray, rng: np.random.Generator) -> _MixtureFit:
       ``2 loglik - npar log(n)`` of models E and V wins.
     * Vectors longer than 2000 values: split and first M-step on a random
       subset of 2000, EM on all values, extra M-step always applied.
-    """
-    from rapids_singlecell._cuda import _dsb_cuda as _dsb
 
+    With `compress`, EM runs once per distinct value of a row, weighted by its
+    multiplicity (for long rows of tied log counts). With `transform`, the
+    rows are fit after applying this increasing elementwise map, which is
+    applied to the distinct values only.
+
+    float32 rows are fit in double-single arithmetic (see kernels_dsb.cuh).
+    Rows with a decision within float32 noise of its threshold (the stopping
+    rule, the extra M-step, an E/V BIC tie) or with ties in their start (see
+    warp_threshold) are refit in float64 from ``exact(rows)`` (float64 rows;
+    the upcast rows of `M` if not given).
+    """
     n_fits, n = M.shape
-    params = cp.empty((n_fits, 6), dtype=M.dtype)
-    status = cp.empty(n_fits, dtype=cp.int32)
-    q = cp.empty(n_fits, dtype=M.dtype)
-    kw = {"max_iter": _MAX_ITER[M.dtype], "stream": cp.cuda.get_current_stream().ptr}
-    if n <= _SUBSET:
-        _dsb.mix2_warp(M, params, status, q, params[:0], **kw)
-    else:
-        idx = np.stack([rng.choice(n, _SUBSET, replace=False) for _ in range(n_fits)])
-        sub = cp.take_along_axis(M, cp.asarray(idx), axis=1)
-        init = cp.empty((n_fits, 2, 6), dtype=M.dtype)
-        _dsb.mix2_warp(sub, params, status, q, init, **kw)
-        nbytes = _dsb.mix2_coop_workspace(n_fits, n, M.dtype == np.float64)
-        work = cp.empty(nbytes, dtype=cp.uint8)
-        _dsb.mix2_coop(M, init, params, status, work, **kw)
-    if n_capped := int((status >= 2).sum()):
+    sub = None
+    if n > _SUBSET:
+        sub = np.array([rng.choice(n, _SUBSET, replace=False) for _ in range(n_fits)], dtype=np.intp).reshape(
+            n_fits, _SUBSET
+        )
+    params, flags = _fit_rows(M, sub, max_iter=max_iter, compress=compress, transform=transform)
+    if (replay := np.flatnonzero(cp.asnumpy(flags & 2))).size:
+        rows = exact(replay) if exact is not None else M[cp.asarray(replay)].astype(np.float64)
+        sub_r = None if sub is None else sub[replay]
+        params_r, flags_r = _fit_rows(rows, sub_r, max_iter=max_iter, compress=compress, transform=transform)
+        params[cp.asarray(replay)] = params_r.astype(M.dtype)
+        flags[cp.asarray(replay)] = flags_r
+    capped = (flags & 1).astype(bool)
+    if n_capped := int(capped.sum()):
         warnings.warn(
-            f"EM stopped at the iteration limit ({kw['max_iter']}) without "
+            f"EM stopped at the iteration limit ({max_iter}) without "
             f"converging for {n_capped} fits; these may differ from R.",
             UserWarning,
             stacklevel=3,
         )
-    return _MixtureFit(params, status, q)
+    return _MixtureFit(params, capped)
 
 
-def _kmeans_low_centers(M: cp.ndarray) -> cp.ndarray:
-    """Lower center of the optimal 1-D two-means split of every row."""
+def _fit_rows(
+    M: cp.ndarray,
+    sub: np.ndarray | None,
+    *,
+    max_iter: int,
+    compress: bool,
+    transform: Callable[[cp.ndarray], cp.ndarray] | None = None,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Params and flags (see mix2_kernel) of the rows of `M` (after `transform`).
+
+    Started from the rows' subsets `sub` if given.
+    """
+    from rapids_singlecell._cuda import _dsb_cuda as _dsb
+
+    f = transform if transform is not None else (lambda v: v)
+    n_fits = M.shape[0]
+    dtype = f(M[:0, :0]).dtype
+    params = cp.empty((n_fits, 6), dtype=dtype)
+    flags = cp.zeros(n_fits, dtype=cp.uint8)
+    none = cp.empty(0, dtype=dtype)
+    kw = {"max_iter": max_iter, "margin": _MARGIN[dtype], "stream": cp.cuda.get_current_stream().ptr}
+    if n_fits == 0:
+        return params, flags
+    if sub is None and not compress:
+        _dsb.mix2(cp.ascontiguousarray(f(M)), none, none, none, params, flags, subset=False, **kw)  # type: ignore[call-overload]
+        return params, flags
+    start = M if sub is None else cp.take_along_axis(M, cp.asarray(sub), axis=1)  # type: ignore[attr-defined]
+    init = cp.empty((n_fits, 2, 6), dtype=dtype)
+    _dsb.mix2(cp.ascontiguousarray(f(start)), none, none, init, none, flags, subset=False, **kw)  # type: ignore[call-overload]
+    if compress and (unique := _unique_counts(M)) is not None:
+        x, w = f(unique[0]), unique[1].astype(dtype, copy=False)
+    else:
+        x, w = cp.ascontiguousarray(f(M)), none
+    _dsb.mix2(x, w, init, none, params, flags, subset=sub is not None, **kw)  # type: ignore[call-overload]
+    return params, flags
+
+
+def _unique_counts(M: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray] | None:
+    """Distinct values of every row of `M` and their multiplicities.
+
+    Rows are padded to the same length with their maximum at multiplicity 0.
+    None if the rows have too many distinct values for this to pay off.
+    """
+    n_rows, n = M.shape
+    vals = cp.unique(M)
+    if n_rows * vals.size > M.size:
+        return None
+    # multiplicity of every (row, distinct value) pair
+    idx = cp.searchsorted(vals, M)  # type: ignore[arg-type]
+    idx += (cp.arange(n_rows) * vals.size)[:, None]  # type: ignore[index, operator]
+    counts = cp.bincount(idx.ravel(), minlength=n_rows * vals.size).reshape(n_rows, vals.size)
+    del idx
+    present = counts > 0
+    row, k = cp.nonzero(present)
+    col = (cp.cumsum(present, axis=1) - 1)[row, k]
+    values = cp.full((n_rows, int(present.sum(axis=1).max())), vals[-1], dtype=M.dtype)
+    weights = cp.zeros(values.shape, dtype=M.dtype)
+    values[row, col] = vals[k]
+    weights[row, col] = counts[row, k]
+    return values, weights
+
+
+def _kmeans_low_centers(M: cp.ndarray, exact: Callable[[np.ndarray], cp.ndarray] | None = None) -> cp.ndarray:
+    """Lower center of the optimal 1-D two-means split of every row.
+
+    float32 rows whose two best splits score within 1e-6 (relative; float32
+    rounding of the values can swap them) are redone from ``exact(rows)``.
+    """
     n = M.shape[1]
-    S = cp.sort(M, axis=1).astype(cp.float64)
+    S = cp.sort(M, axis=1).astype(cp.float64)  # type: ignore[attr-defined]
     left = cp.cumsum(S, axis=1)[:, :-1]  # sums of the s smallest, s = 1..n-1
     s = cp.arange(1, n, dtype=cp.float64)
     # minimizing the within-cluster sum of squares maximizes this; splits
     # inside runs of tied values are not real partitions
-    score = left**2 / s + (S.sum(axis=1, keepdims=True) - left) ** 2 / (n - s)
-    score = cp.where(S[:, :-1] < S[:, 1:], score, -cp.inf)
-    best = cp.argmax(score, axis=1)
-    low = cp.take_along_axis(left, best[:, None], axis=1)[:, 0] / (best + 1)
-    return cp.where(S[:, 0] == S[:, -1], S[:, 0], low).astype(M.dtype)
+    score = left**2 / s + (S.sum(axis=1, keepdims=True) - left) ** 2 / (n - s)  # type: ignore[operator]
+    score = cp.where(S[:, :-1] < S[:, 1:], score, -cp.inf)  # type: ignore[attr-defined]
+    best = cp.argmax(score, axis=1)  # type: ignore[attr-defined]
+    low = cp.take_along_axis(left, best[:, None], axis=1)[:, 0] / (best + 1)  # type: ignore[attr-defined]
+    low = cp.where(S[:, 0] == S[:, -1], S[:, 0], low).astype(M.dtype)
+    if exact is not None and M.dtype != np.float64 and n > 2:
+        top = cp.take_along_axis(score, best[:, None], axis=1)[:, 0]  # type: ignore[attr-defined]
+        cp.put_along_axis(score, best[:, None], -cp.inf, axis=1)  # type: ignore[attr-defined]
+        tie = cp.asnumpy(top - score.max(axis=1) <= 1e-6 * cp.abs(top))  # type: ignore[attr-defined]
+        if (rows := np.flatnonzero(tie)).size:
+            low[cp.asarray(rows)] = _kmeans_low_centers(exact(rows)).astype(M.dtype)
+    return low
 
 
 def _first_pc_scores(A: cp.ndarray) -> cp.ndarray:
-    """First principal component scores of the standardized columns.
+    """First principal component scores (float64) of the standardized columns.
 
     Oriented along the last column (the background mean).
     """
-    Z = (A - A.mean(axis=0)) / A.std(axis=0, ddof=1)
-    v = cp.linalg.eigh(Z.T @ Z)[1][:, -1]
+    A = A.astype(np.float64)
+    Z = (A - A.mean(axis=0)) / A.std(axis=0, ddof=1)  # type: ignore[attr-defined]
+    v = cp.linalg.eigh(Z.T @ Z)[1][:, -1]  # type: ignore[attr-defined]
     return Z @ (v if float(v[-1]) >= 0 else -v)
