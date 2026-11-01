@@ -1,10 +1,7 @@
 #pragma once
 
 // Batched univariate two-component Gaussian mixtures reproducing
-// mclust::Mclust(x, G = 2) for dsb. Clean-room: EM (Dempster et al. 1977),
-// models E/V and BIC (Fraley & Raftery 2002; Scrucca et al. 2016); start
-// values, stopping rule, singularity threshold and final update were found by
-// black-box runs of Mclust (see _mixture_fits in preprocessing/_dsb.py).
+// mclust::Mclust(x, G = 2), see _mixture_fits in preprocessing/_dsb.py.
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -15,14 +12,11 @@
 namespace dsb {
 
 constexpr int kWarp = 32;
-constexpr double kTol = 1e-5;  // relative log-likelihood change
-// One more M-step when sum((pro - colMeans(z))^2) exceeds sqrt(DBL_EPSILON).
-constexpr double kExtraMStepTol = 1.4901161193847656e-08;
+constexpr double kTol = 1e-5;
+constexpr double kExtraMStepTol = 1.4901161193847656e-08;  // sqrt(DBL_EPSILON)
 
-// float32 computes in double-single (hi, lo) where float rounding would move
-// Mclust's decisions (see _mixture_fits): the parameters, the deviations from
-// the means and the component log-densities, plus compensated sums. exp and
-// log1p stay in float. float64 computes natively.
+// float32 keeps the parameters, deviations and log-densities in double-single
+// (hi, lo) arithmetic; float64 computes natively.
 struct dsf {
     float hi, lo;
     dsf() = default;
@@ -30,7 +24,6 @@ struct dsf {
     }
 };
 
-// Error-free transforms (Knuth two-sum, FMA two-product).
 __device__ __forceinline__ dsf two_sum(float a, float b) {
     const float s = a + b, bb = s - a;
     return {s, (a - (s - bb)) + (b - bb)};
@@ -72,17 +65,46 @@ __device__ __forceinline__ dsf operator/(dsf a, dsf b) {
 __device__ __forceinline__ dsf shfl_xor(dsf v, int o) {
     return {__shfl_xor_sync(~0u, v.hi, o), __shfl_xor_sync(~0u, v.lo, o)};
 }
-__device__ __forceinline__ dsf shfl_from(dsf v, int src) {
-    return {__shfl_sync(~0u, v.hi, src), __shfl_sync(~0u, v.lo, src)};
-}
 __device__ __forceinline__ double shfl_xor(double v, int o) {
     return __shfl_xor_sync(~0u, v, o);
 }
-__device__ __forceinline__ float shfl_xor(float v, int o) {
-    return __shfl_xor_sync(~0u, v, o);
+__device__ __forceinline__ dsf shfl_from(dsf v, int src) {
+    return {__shfl_sync(~0u, v.hi, src), __shfl_sync(~0u, v.lo, src)};
+}
+__device__ __forceinline__ void acc_add(dsf& a, float x) {
+    const dsf s = two_sum(a.hi, x);
+    a.hi = s.hi;
+    a.lo += s.lo;
+}
+// without the low-order cancellation correction, enough for log-densities
+__device__ __forceinline__ dsf sloppy_add(dsf a, dsf b) {
+    const dsf s = two_sum(a.hi, b.hi);
+    return quick_two_sum(s.hi, s.lo + (a.lo + b.lo));
+}
+__device__ __forceinline__ dsf sub_from(float x, dsf m) {
+    const dsf s = two_sum(x, -m.hi);
+    return quick_two_sum(s.hi, s.lo - m.lo);
+}
+__device__ __forceinline__ dsf square(dsf d) {
+    const float p = d.hi * d.hi;
+    return quick_two_sum(p, fmaf(d.hi, d.hi, -p) + 2.f * d.hi * d.lo);
+}
+__host__ __device__ constexpr dsf dsc(double v) {
+    return dsf(float(v), float(v - double(float(v))));
+}
+// log(m 2^e), m in [sqrt(1/2), sqrt(2)): log(m) = 2 atanh((m - 1) / (m + 1))
+__device__ __forceinline__ dsf ds_log(dsf a) {
+    int e;
+    if (frexpf(a.hi, &e) < 0.70710678f) --e;
+    const dsf x(ldexpf(a.hi, -e), ldexpf(a.lo, -e));
+    const dsf r = (x - dsf(1.f)) / (x + dsf(1.f));
+    const dsf r2 = r * r;
+    dsf t = dsc(1.0 / 21);
+#pragma unroll
+    for (int k = 19; k >= 1; k -= 2) t = t * r2 + dsc(1.0 / k);
+    return r * t * 2.f + dsc(0.69314718055994530942) * float(e);
 }
 
-// Working type R of storage type T and conversions.
 template <typename T>
 using Work = std::conditional_t<std::is_same_v<T, float>, dsf, double>;
 __device__ __forceinline__ double to_d(double v) {
@@ -97,28 +119,15 @@ __device__ __forceinline__ double lead(double v) {
 __device__ __forceinline__ float lead(dsf v) {
     return v.hi;
 }
-template <typename R>
-__device__ __forceinline__ R from_d(double v) {
-    if constexpr (std::is_same_v<R, dsf>) {
-        const float h = float(v);
-        return {h, float(v - h)};
-    } else {
-        return v;
-    }
-}
 template <typename T>
 __device__ __forceinline__ Work<T> lift(T v) {
-    if constexpr (std::is_same_v<T, float>)
-        return dsf{v, 0.f};
-    else
-        return v;
+    return Work<T>(v);
 }
-template <typename T>
-__device__ __forceinline__ T lower(Work<T> v) {
-    if constexpr (std::is_same_v<T, float>)
-        return v.hi + v.lo;
-    else
-        return v;
+__device__ __forceinline__ double lower(double v) {
+    return v;
+}
+__device__ __forceinline__ float lower(dsf v) {
+    return v.hi + v.lo;
 }
 
 template <typename R>
@@ -126,7 +135,6 @@ struct Mix2 {
     R mu0, mu1, s0, s1, pro0, pro1;
 };
 
-// Variances <= DBL_EPSILON are singular, as in R, for both precisions.
 template <typename R>
 __device__ __forceinline__ bool mix2_valid(const Mix2<R>& p) {
     using L = decltype(lead(p.mu0));
@@ -137,7 +145,6 @@ __device__ __forceinline__ bool mix2_valid(const Mix2<R>& p) {
            v[4] > 0 && v[5] > 0;
 }
 
-// Xor butterfly: every lane gets the bit-identical total.
 template <typename V, int N>
 __device__ __forceinline__ void warp_sum(V (&v)[N]) {
 #pragma unroll
@@ -146,9 +153,7 @@ __device__ __forceinline__ void warp_sum(V (&v)[N]) {
         for (int k = 0; k < N; ++k) v[k] = v[k] + shfl_xor(v[k], off);
 }
 
-// M-step from moments about shifts sh_k: s = (w0, w1, a0, a1, b0, b1) with
-// w_k = sum z_k, a_k = sum z_k (x - sh_k), b_k = sum z_k (x - sh_k)^2; n is
-// the number of observations.
+// M-step from s = (sum z_k, sum z_k (x - sh_k), sum z_k (x - sh_k)^2)
 template <typename R>
 __device__ __forceinline__ Mix2<R> finish_mstep(const R (&s)[6], R n,
                                                 bool equal_var, R sh0, R sh1) {
@@ -162,116 +167,57 @@ __device__ __forceinline__ Mix2<R> finish_mstep(const R (&s)[6], R n,
                    s[1] / n};
 }
 
-// Per-lane part of the E-step at p fused with the next M-step over
-// x[lane::32] (with multiplicities w, if given): moments about the current
-// means into s, the log-likelihood (it drives the stopping rule) into ll.
-template <typename T>
-__device__ __forceinline__ void em_accumulate(const T* __restrict__ x,
-                                              const T* __restrict__ w, int n,
-                                              int lane, const Mix2<Work<T>>& p,
-                                              Work<T> (&s)[6], Work<T>& ll) {
-    using R = Work<T>;
-    // per-iteration constants in double: a few scalar operations
-    const R c0 =
-        from_d<R>(log(to_d(p.pro0)) - 0.5 * log(2 * CUDART_PI * to_d(p.s0)));
-    const R c1 =
-        from_d<R>(log(to_d(p.pro1)) - 0.5 * log(2 * CUDART_PI * to_d(p.s1)));
-    const R h0 = from_d<R>(0.5 / to_d(p.s0)), h1 = from_d<R>(0.5 / to_d(p.s1));
-    T prod = T(1);  // unweighted: product of (1 + e) <= 2, flushed every 32
+// E-step at p fused with the next M-step over x[lane::32] (weights w if
+// given): moments about the current means into s, log-likelihood into ll.
+__device__ __forceinline__ void em_accumulate(const double* __restrict__ x,
+                                              const double* __restrict__ w,
+                                              int n, int lane,
+                                              const Mix2<double>& p,
+                                              double (&s)[6], double& ll) {
+    const double c0 = log(p.pro0) - 0.5 * log(2 * CUDART_PI * p.s0);
+    const double c1 = log(p.pro1) - 0.5 * log(2 * CUDART_PI * p.s1);
+    const double h0 = 0.5 / p.s0, h1 = 0.5 / p.s1;
+    double prod = 1;  // product of (1 + e) <= 2, flushed every 32 values
     int cnt = 0;
     for (int i = lane; i < n; i += kWarp) {
-        const R xi = lift(x[i]);
-        const R d0 = xi - p.mu0, d1 = xi - p.mu1;
-        const R l0 = c0 - d0 * d0 * h0, l1 = c1 - d1 * d1 * h1;
-        const R diff = l1 - l0;
-        const bool first = lead(diff) < 0;  // l0 > l1
-        const R hi = first ? l0 : l1;
-        const T e = exp(first ? lower<T>(diff) : -lower<T>(diff));
-        T inv = T(1) / (T(1) + e);
+        const double d0 = x[i] - p.mu0, d1 = x[i] - p.mu1;
+        const double l0 = c0 - d0 * d0 * h0, l1 = c1 - d1 * d1 * h1;
+        const double diff = l1 - l0;
+        const bool first = diff < 0;
+        const double hi = first ? l0 : l1;
+        const double e = exp(first ? diff : -diff);
+        double inv = 1 / (1 + e);
         if (w != nullptr) {
             inv *= w[i];
-            ll = ll + (hi + lift(T(log1p(e)))) * lift(w[i]);
+            ll = ll + (hi + log1p(e)) * w[i];
         } else {
             ll = ll + hi;
-            prod *= T(1) + e;
+            prod *= 1 + e;
             if (++cnt == 32) {
-                ll = ll + lift(T(log(prod)));
-                prod = T(1);
+                ll = ll + log(prod);
+                prod = 1;
                 cnt = 0;
             }
         }
-        const T z0 = first ? inv : e * inv, z1 = first ? e * inv : inv;
-        const R t0 = d0 * z0, t1 = d1 * z1;
+        const double z0 = first ? inv : e * inv, z1 = first ? e * inv : inv;
+        const double t0 = d0 * z0, t1 = d1 * z1;
         s[0] = s[0] + z0;
         s[1] = s[1] + z1;
         s[2] = s[2] + t0;
         s[3] = s[3] + t1;
-        s[4] = s[4] + t0 * lead(d0);
-        s[5] = s[5] + t1 * lead(d1);
+        s[4] = s[4] + t0 * d0;
+        s[5] = s[5] + t1 * d1;
     }
-    ll = ll + lift(T(log(prod)));
+    ll = ll + log(prod);
 }
 
-// float32: double-single only where float rounding moves Mclust's decisions
-// (the deviations d = x - mu, the log-densities l = c - d^2 h; the parameters
-// are double-single state). l1 - l0 only feeds exp and is formed in float;
-// moment terms are float products, accumulated with compensation.
-__device__ __forceinline__ void acc_add(dsf& a, float x) {
-    const dsf s = two_sum(a.hi, x);  // errors collect in lo
-    a.hi = s.hi;
-    a.lo += s.lo;
-}
-// a + b without the low-order cancellation correction: absolute error
-// ~eps^2 max(|a|, |b|), enough for log-densities
-__device__ __forceinline__ dsf sloppy_add(dsf a, dsf b) {
-    const dsf s = two_sum(a.hi, b.hi);
-    return quick_two_sum(s.hi, s.lo + (a.lo + b.lo));
-}
-__device__ __forceinline__ dsf sub_from(float x, dsf m) {  // x - m
-    const dsf s = two_sum(x, -m.hi);
-    return quick_two_sum(s.hi, s.lo - m.lo);
-}
-__device__ __forceinline__ dsf square(dsf d) {
-    const float p = d.hi * d.hi;
-    return quick_two_sum(p, fmaf(d.hi, d.hi, -p) + 2.f * d.hi * d.lo);
-}
-
-// Compile-time double-single constant.
-__host__ __device__ constexpr dsf dsc(double v) {
-    return dsf(float(v), float(v - double(float(v))));
-}
-
-// Natural log of a > 0 in double-single: exact power-of-two reduction to
-// [sqrt(1/2), sqrt(2)), then log(m) = 2 atanh(r), r = (m - 1) / (m + 1),
-// |r| < 0.172, by its series to 2^-46 relative.
-__device__ __forceinline__ dsf ds_log(dsf a) {
-    int e;
-    const float m = frexpf(a.hi, &e);  // a.hi = m 2^e, m in [0.5, 1)
-    if (m < 0.70710678f) --e;
-    const dsf x(ldexpf(a.hi, -e), ldexpf(a.lo, -e));
-    const dsf r = (x - dsf(1.f)) / (x + dsf(1.f));
-    const dsf r2 = r * r;
-    dsf t = dsc(1.0 / 21);
-    t = t * r2 + dsc(1.0 / 19);
-    t = t * r2 + dsc(1.0 / 17);
-    t = t * r2 + dsc(1.0 / 15);
-    t = t * r2 + dsc(1.0 / 13);
-    t = t * r2 + dsc(1.0 / 11);
-    t = t * r2 + dsc(1.0 / 9);
-    t = t * r2 + dsc(1.0 / 7);
-    t = t * r2 + dsc(1.0 / 5);
-    t = t * r2 + dsc(1.0 / 3);
-    t = t * r2 + dsf(1.f);
-    return r * t * 2.f + dsc(0.69314718055994530942) * float(e);
-}
-
-template <>
-__device__ __forceinline__ void em_accumulate<float>(
-    const float* __restrict__ x, const float* __restrict__ w, int n, int lane,
-    const Mix2<dsf>& p, dsf (&s)[6], dsf& ll) {
-    // c = log(pro) - log(2 pi s) / 2 = log(pro^2 / (2 pi s)) / 2 and
-    // h = 1 / (2 s), without float64: even lanes take component 0, odd lanes
-    // component 1, then exchange
+__device__ __forceinline__ void em_accumulate(const float* __restrict__ x,
+                                              const float* __restrict__ w,
+                                              int n, int lane,
+                                              const Mix2<dsf>& p, dsf (&s)[6],
+                                              dsf& ll) {
+    // c = log(pro^2 / (2 pi s)) / 2 and h = 1 / (2 s): even lanes compute
+    // component 0, odd lanes component 1
     const bool odd = lane & 1;
     const dsf pro = odd ? p.pro1 : p.pro0, var = odd ? p.s1 : p.s0;
     const dsf my_c = ds_log(pro * pro / (var * dsc(2 * CUDART_PI))) * 0.5f;
@@ -282,17 +228,15 @@ __device__ __forceinline__ void em_accumulate<float>(
         const dsf d0 = sub_from(x[i], p.mu0), d1 = sub_from(x[i], p.mu1);
         const dsf l0 = sloppy_add(c0, -(square(d0) * h0));
         const dsf l1 = sloppy_add(c1, -(square(d1) * h1));
-        // l1 - l0 as (hi, lo): e = exp(-|l1 - l0|) = exp(a) (1 + b) keeps the
-        // low part, which rounding the argument to float would lose
+        // e = exp(-|l1 - l0|) = exp(a) (1 + b) with l1 - l0 = a + b
         const dsf dl = two_sum(l1.hi, -l0.hi);
         const float dlo = dl.lo + (l1.lo - l0.lo);
-        const bool first = dl.hi + dlo < 0.f;  // l0 > l1
+        const bool first = dl.hi + dlo < 0.f;
         const dsf hi = first ? l0 : l1;
         const float ea = expf(first ? dl.hi : -dl.hi);
         const float e = fmaf(ea, first ? dlo : -dlo, ea);
         const float wi = w != nullptr ? w[i] : 1.f;
         const float inv = wi / (1.f + e);
-        // log-likelihood term hi + log1p(e), compensated per value
         const dsf t = w != nullptr ? hi * wi : hi;
         acc_add(ll, t.hi);
         acc_add(ll, log1pf(e) * wi);
@@ -311,11 +255,8 @@ __device__ __forceinline__ void em_accumulate<float>(
     for (int k = 0; k < 6; ++k) s[k] = quick_two_sum(s[k].hi, s[k].lo);
 }
 
-// EM of one model from the start values p: the log-likelihood of a subset
-// start is not compared and its extra M-step is always applied. Returns the
-// EM iterations (-1 if singular or degenerate) and the parameters in p. Sets
-// `marginal` when a stopping or update decision was within `margin`
-// (relative) of its threshold.
+// EM of one model from p. Returns the iterations (-1 if singular) and sets
+// `marginal` when a stopping or extra M-step decision is within `margin`.
 template <typename T>
 __device__ int fit_model(const T* __restrict__ x, const T* __restrict__ w,
                          int n, Work<T> n_obs, int lane, bool equal_var,
@@ -333,13 +274,11 @@ __device__ int fit_model(const T* __restrict__ x, const T* __restrict__ w,
         const Mix2<R> pn = finish_mstep(s, n_obs, equal_var, p.mu0, p.mu1);
         if (!isfinite(lead(l[0]))) return -1;
         if (++it > 0) {
-            // |l_k - l_{k-1}| relative to the tolerance (in float for float32)
             const auto dl = fabs(lead(l[0] - ll_prev));
             const auto tol = decltype(dl)(kTol) * (1 + fabs(lead(l[0])));
             if (it > 1 && margin > 0 && fabs(dl / tol - 1) < margin)
                 marginal = true;
             if ((it > 1 && dl < tol) || it >= max_iter) {
-                // pn.pro* are the column means of the final responsibilities
                 const double d0 = to_d(p.pro0 - pn.pro0);
                 const double d1 = to_d(p.pro1 - pn.pro1);
                 const double dp = d0 * d0 + d1 * d1;
@@ -357,12 +296,8 @@ __device__ int fit_model(const T* __restrict__ x, const T* __restrict__ w,
     }
 }
 
-// Mclust's univariate start split: the type 7 quantile at the fraction j / k
-// with the smallest k >= 2 for which min < q < max (the median for untied
-// data); NaN when all values are equal. Order statistics by rank counting,
-// O(n^2 / 32): start vectors have at most 2000 values. Sets `tied` when
-// copies of the min, of the max or of q move the threshold or the split:
-// float32 values rounded from float64 can merge into such ties.
+// Mclust's start threshold (NaN if all values are equal), by rank counting.
+// `tied`: copies of the min, the max or q, which float32 rounding can create.
 template <typename T>
 __device__ T warp_threshold(const T* __restrict__ x, int n, int lane,
                             bool& tied) {
@@ -390,7 +325,7 @@ __device__ T warp_threshold(const T* __restrict__ x, int n, int lane,
         if (j * (n - 1) < b * k) break;
     }
     const long long lo = (n - 1) * j / k, rem = (n - 1) * j % k;
-    T x_lo = -CUDART_INF, x_hi = -CUDART_INF;  // order statistics lo, lo + 1
+    T x_lo = -CUDART_INF, x_hi = -CUDART_INF;
     for (int i = lane; i < n; i += kWarp) {
         int less = 0, leq = 0;
         for (int t = 0; t < n; ++t) {
@@ -414,15 +349,10 @@ __device__ T warp_threshold(const T* __restrict__ x, int n, int lane,
     return q;
 }
 
-// One warp per row of X. The start values of models E (0) and V (1) are
-// init_in[f, model, 6] if given, else the M-step of the hard split of the row
-// at Mclust's threshold. With init_out, only writes those start values;
-// otherwise runs EM on the row (with multiplicities W, if given) and writes
-// the model with the larger BIC to params[f] = (mu0, mu1, var0, var1, pro0,
-// pro1), NaN if both are singular, and to flags[f] bit 0 whether either model
-// hit max_iter, bit 1 whether a decision was marginal (see fit_model; also a
-// BIC tie, or with margin > 0 a tied start, see warp_threshold). With
-// init_out, flags (if given) get only the tied start.
+// One warp per row. Models E and V start from init_in, or from the hard split
+// at the threshold. With init_out, only those starts are written. Otherwise
+// params[f] gets the model with the larger BIC (NaN if both are singular) and
+// flags[f] bit 0 an iteration cap, bit 1 a marginal decision.
 template <typename T>
 __global__ void mix2_kernel(const T* __restrict__ X, const T* __restrict__ W,
                             long long n_fits, int n,
@@ -447,7 +377,7 @@ __global__ void mix2_kernel(const T* __restrict__ X, const T* __restrict__ W,
         } else {
             const T q = warp_threshold(x, n, lane, tied);
             const R rq = lift(q);
-            R s[6] = {R(0), R(0), R(0), R(0), R(0), R(0)};  // hard split x < q
+            R s[6] = {R(0), R(0), R(0), R(0), R(0), R(0)};
             for (int i = lane; i < n; i += kWarp) {
                 const int k = x[i] < q ? 0 : 1;
                 const R d = lift(x[i]) - rq;
@@ -464,9 +394,9 @@ __global__ void mix2_kernel(const T* __restrict__ X, const T* __restrict__ W,
             if (lane == 0 && tied && flags != nullptr) flags[f] |= 2;
             if (lane == 0)
                 for (int m = 0; m < 2; ++m) {
-                    const T v[6] = {lower<T>(p[m].mu0),  lower<T>(p[m].mu1),
-                                    lower<T>(p[m].s0),   lower<T>(p[m].s1),
-                                    lower<T>(p[m].pro0), lower<T>(p[m].pro1)};
+                    const T v[6] = {lower(p[m].mu0),  lower(p[m].mu1),
+                                    lower(p[m].s0),   lower(p[m].s1),
+                                    lower(p[m].pro0), lower(p[m].pro1)};
                     for (int k = 0; k < 6; ++k)
                         init_out[f * 12 + m * 6 + k] = v[k];
                 }
@@ -494,9 +424,8 @@ __global__ void mix2_kernel(const T* __restrict__ X, const T* __restrict__ W,
                 fabs(bic[1] - bic[0]) < margin * 1e-4 * (1 + fabs(bic[0])))
                 marginal = true;
             const Mix2<R>& r = p[sel < 0 ? 0 : sel];
-            const T v[6] = {lower<T>(r.mu0),  lower<T>(r.mu1),
-                            lower<T>(r.s0),   lower<T>(r.s1),
-                            lower<T>(r.pro0), lower<T>(r.pro1)};
+            const T v[6] = {lower(r.mu0), lower(r.mu1),  lower(r.s0),
+                            lower(r.s1),  lower(r.pro0), lower(r.pro1)};
             for (int k = 0; k < 6; ++k)
                 params[f * 6 + k] = sel < 0 ? T(CUDART_NAN) : v[k];
             flags[f] |=

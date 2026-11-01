@@ -1,7 +1,4 @@
-# Reference values for tests/test_dsb.py from the dsb R package (2.0.1,
-# mclust 6.1.3, limma >= 3.66, which centers the covariates of
-# removeBatchEffect). Uses a subset of the example data shipped with dsb
-# (CC0 / public domain).
+# Reference values for tests/test_dsb.py (dsb 2.0.1, mclust 6.1.3, limma >= 3.66)
 #   Rscript tests/_scripts/dsb_reference.R tests/_data/dsb
 suppressPackageStartupMessages(library(dsb))
 stopifnot(packageVersion("limma") >= "3.66.0")
@@ -28,13 +25,11 @@ r <- quiet(DSBNormalizeProtein(cells, empty, isotype.control.name.vec = iso,
 w(t(r), "meansub_clip")
 r <- quiet(ModelNegativeADTnorm(cells, isotype.control.name.vec = iso))
 w(t(r), "negative")
-# without isotype controls, step 2 depends on the covariate centering
 r <- quiet(DSBNormalizeProtein(cells, empty, use.isotype.control = FALSE))
 w(t(r), "no_isotypes")
 r <- quiet(ModelNegativeADTnorm(cells, use.isotype.control = FALSE))
 w(t(r), "negative_no_isotypes")
-# Mclust fits of vectors longer than 2000 values, started from given subsets
-# (Mclust draws them at random otherwise)
+# Mclust fits of vectors longer than 2000 values from given subsets
 suppressPackageStartupMessages(library(mclust))
 set.seed(1)
 n <- 2500

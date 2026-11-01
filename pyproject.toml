@@ -224,6 +224,11 @@ module = [ "rapids_singlecell._cuda.*" ]
 ignore_missing_imports = true
 ignore_errors = true
 
+# dsb: cupy-stubs gaps, and the nanobind overloads only exist when the stubs are built
+[[tool.mypy.overrides]]
+module = [ "rapids_singlecell.preprocessing._dsb" ]
+disable_error_code = [ "arg-type", "attr-defined", "call-overload", "index", "operator" ]
+
 # Ratchet: modules that do not type check yet. Fix one, then delete it here.
 # Most failures are CuPy APIs that cupy-stubs does not cover yet.
 [[tool.mypy.overrides]]
