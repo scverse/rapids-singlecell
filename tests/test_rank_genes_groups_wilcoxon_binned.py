@@ -622,3 +622,12 @@ def test_binned_host_multi_gpu_matches_single(adata_blobs, array_type, reference
                 atol=1e-7,
                 equal_nan=True,
             )
+
+
+def test_auto_chunk_width_budgets_densified_tile(monkeypatch):
+    """Signed sparse input densifies each gene window; its float64 tile counts against free memory."""
+    monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (8 << 30, 16 << 30))
+    kw = {"device_ids": [cp.cuda.Device().id], "ireference": None, "tie_correct": True, "gathers_multi_gpu": False}
+    assert _wilcoxon_binned._auto_chunk_width(20_000, 2, 2, 1_002, **kw) == 20_000
+    width = _wilcoxon_binned._auto_chunk_width(20_000, 2, 2, 1_002, dense_rows=100_000, **kw)
+    assert 1 <= width and width * 100_000 * 8 <= _wilcoxon_binned._AUTO_CHUNK_MEMORY_FRACTION * (8 << 30)

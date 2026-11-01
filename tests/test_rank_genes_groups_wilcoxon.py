@@ -1166,7 +1166,8 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
     adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
     adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
     adata_cpu = adata_gpu.copy()
-    # Host OVO skips unselected cells: dense copies the rest, CSR empties spans.
+    # Host OVO ranks only the selected cells: CSR passes just their spans, dense
+    # gathers them per gene batch when they are under half the cells.
     adata_gpu.X = _to_format(adata_gpu.X, fmt)
 
     rsc.tl.rank_genes_groups(
@@ -1206,6 +1207,33 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
                     atol=1e-8,
                     err_msg=f"{field} mismatch for gene {gene} group {group}",
                 )
+
+
+@pytest.mark.parametrize("fmt", ["numpy_dense", "numpy_dense_f", "scipy_csr"])
+def test_wilcoxon_ovo_host_subset_passes_only_selected_rows(fmt, monkeypatch):
+    """Host OVO keeps the matrix whole and hands the kernels only the selected rows."""
+    rng = np.random.default_rng(3)
+    dense = rng.integers(0, 6, size=(240, 12)).astype(np.float32)
+    dense[dense < 2] = 0.0
+    obs = pd.DataFrame({"group": pd.Categorical([str(i % 8) for i in range(240)])})
+    X = np.asfortranarray(dense) if fmt == "numpy_dense_f" else _to_format(dense, fmt)
+    host, device = sc.AnnData(X=X, obs=obs.copy()), sc.AnnData(X=cp.asarray(dense), obs=obs.copy())
+    name = "ovo_sparse" if fmt == "scipy_csr" else "ovo_dense"
+    binding, seen = getattr(_wc, name), []
+
+    def spy(*args, **kw):
+        seen.append((len(args[3]), len(args[4])) if name == "ovo_sparse" else (args[0].shape[0], len(kw["rows"])))
+        return binding(*args, **kw)
+
+    monkeypatch.setattr(_wc, name, spy)
+    kw = {"method": "wilcoxon", "groups": ["1", "2"], "reference": "0", "use_raw": False, "multi_gpu": False}
+    rsc.tl.rank_genes_groups(host, "group", **kw)
+    monkeypatch.undo()
+    rsc.tl.rank_genes_groups(device, "group", **kw)
+
+    # 3 of 8 groups of 30 cells: CSR spans or dense row ids for those 90 rows only.
+    assert seen == [(90, 90) if fmt == "scipy_csr" else (240, 90)]
+    _assert_multi_gpu_wilcoxon_equal(host, device)
 
 
 @pytest.mark.parametrize(

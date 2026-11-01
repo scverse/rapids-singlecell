@@ -38,8 +38,13 @@ def _auto_chunk_width(
     ireference: int | None,
     tie_correct: bool,
     gathers_multi_gpu: bool,
+    dense_rows: int = 0,
 ) -> int:
-    """Choose a histogram width from the least-free selected device."""
+    """Choose a histogram width from the least-free selected device.
+
+    ``dense_rows`` is the cell count of a densified window (signed sparse
+    input), whose float64 column tile is budgeted per gene too.
+    """
     free_bytes = []
     for device_id in device_ids:
         with cp.cuda.Device(device_id):
@@ -68,7 +73,7 @@ def _auto_chunk_width(
 
     # Account for group-wise statistic/result temporaries, then reserve the
     # remaining 40% for the input, allocator fragmentation, and other clients.
-    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES
+    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES + dense_rows * _FLOAT_BYTES
     usable_bytes = int(min(free_bytes) * _AUTO_CHUNK_MEMORY_FRACTION)
     return min(n_genes, max(1, usable_bytes // max(bytes_per_gene, 1)))
 
@@ -294,6 +299,7 @@ def wilcoxon_binned(
         ireference=ireference,
         tie_correct=tie_correct,
         gathers_multi_gpu=use_multi_stream,
+        dense_rows=n_cells if rg._sparse_negative_fallback else 0,
     )
 
     is_host_csr = sp.issparse(X) and X.format == "csr"

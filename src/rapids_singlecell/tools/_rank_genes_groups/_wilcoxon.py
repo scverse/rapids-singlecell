@@ -168,6 +168,7 @@ def _run_wilcoxon_shard(
     column_range: tuple[int, int] | None = None,
     sparse_row_spans: tuple[np.ndarray, np.ndarray] | None = None,
     ovo_host_context: _OvoHostContext | None = None,
+    dense_rows: np.ndarray | None = None,
 ) -> _WilcoxonResult | None:
     """Rank one gene shard; the kernels also return per-group sums / nnz."""
     X = rg.X
@@ -257,7 +258,7 @@ def _run_wilcoxon_shard(
     offsets = cp.asarray(ctx.offsets_np)
     if is_dense:
         rows = (cp.asarray(ctx.ref_row_ids), cp.asarray(ctx.all_grp_row_ids), offsets)
-        _wc.ovo_dense(*args, *rows, codes, rank_sums, tie_corr, group_sums, group_nnz, **kw)
+        _wc.ovo_dense(*args, *rows, codes, rank_sums, tie_corr, group_sums, group_nnz, rows=dense_rows, **kw)
     else:
         # CSC batches map rows to slab positions; CSR batches read the row lists.
         empty = cp.empty(0, dtype=cp.int32)

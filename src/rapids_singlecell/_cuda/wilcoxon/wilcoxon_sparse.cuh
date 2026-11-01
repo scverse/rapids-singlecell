@@ -705,17 +705,18 @@ struct CsrRangeBatchPlan {
 };
 
 template <typename IndexT, typename IndptrT>
-static CsrRangeBatchPlan plan_csr_range_batches(
-    const IndexT* h_indices, const IndptrT* h_indptr, const IndptrT* row_starts,
-    const IndptrT* row_stops, int n_rows, int input_col_start, int n_cols,
-    int sub_batch_cols, size_t cap, const char* what) {
+static CsrRangeBatchPlan plan_csr_range_batches(const IndexT* h_indices,
+                                                const IndptrT* row_starts,
+                                                const IndptrT* row_stops,
+                                                int n_rows, int input_col_start,
+                                                int n_cols, int sub_batch_cols,
+                                                size_t cap, const char* what) {
     if (sub_batch_cols < 1) sub_batch_cols = 1;
     if (cap < 1) cap = 1;
 
     size_t range_nnz = 0;
     for (int r = 0; r < n_rows; r++) {
-        if (row_starts[r] < h_indptr[r] || row_stops[r] < row_starts[r] ||
-            row_stops[r] > h_indptr[r + 1]) {
+        if (row_stops[r] < row_starts[r]) {
             throw std::runtime_error(std::string(what) +
                                      " has an invalid row span");
         }
@@ -823,7 +824,7 @@ static CsrRangeBatchPlan plan_csr_range_batches(
 // be copied once while values/indices are transferred in bounded row blocks.
 template <typename IndexT, typename IndptrT>
 static int prepare_csr_range_batch(const IndexT* h_indices,
-                                   const IndptrT* h_indptr,
+                                   const IndptrT* row_starts,
                                    const IndptrT* row_stops, int n_rows,
                                    int col_start, int col_end, IndptrT* cursor,
                                    int* fallback_row_counts,
@@ -833,7 +834,7 @@ static int prepare_csr_range_batch(const IndexT* h_indices,
     if (row_counts == nullptr) {
         host_parallel_ranges(n_rows, [&](int r0, int r1) {
             for (int r = r0; r < r1; r++) {
-                const IndexT* row_base = h_indices + h_indptr[r];
+                const IndexT* row_base = h_indices + row_starts[r];
                 const IndexT* lo = row_base + cursor[r];
                 const IndexT* hi = h_indices + row_stops[r];
                 if (lo < hi && *lo < (IndexT)col_start) {
@@ -860,13 +861,13 @@ static int prepare_csr_range_batch(const IndexT* h_indices,
 // rebases each item.
 template <typename StageIndexT, typename InT, typename IndexT, typename IndptrT>
 static void materialize_csr_range_row_block(
-    const InT* h_data, const IndexT* h_indices, const IndptrT* h_indptr,
+    const InT* h_data, const IndexT* h_indices, const IndptrT* row_starts,
     int row_begin, int row_end, int stage_col_offset, IndptrT* cursor,
     const int* row_counts, const int* compact_indptr, int block_nnz_begin,
     InT* stage_vals, StageIndexT* stage_cols) {
     auto materialize_rows = [&](int r0, int r1) {
         for (int r = r0; r < r1; r++) {
-            IndptrT base = h_indptr[r] + cursor[r];
+            IndptrT base = row_starts[r] + cursor[r];
             size_t dst = (size_t)(compact_indptr[r] - block_nnz_begin);
             int count = row_counts[r];
             std::memcpy(stage_vals + dst, h_data + base,
@@ -929,7 +930,6 @@ static void materialize_csr_range_row_block(
 // the host and transferred once as a mini-CSR column batch.
 template <typename StageIndexT, typename InT, typename IndexT, typename Ranker>
 static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
-                                  const IndexT* h_indptr,
                                   const IndexT* row_starts,
                                   const IndexT* row_stops, int input_col_start,
                                   int n_rows, int n_cols, int sub_batch_cols,
@@ -960,11 +960,10 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
                       (int)sizeof(int)});
     int slab_cols = std::min(sub_batch_cols, rank.max_cols());
     if constexpr (ovo) slab_cols = std::min(slab_cols, OVO_SLAB_COLS);
-    CsrRangeBatchPlan range_batches =
-        plan_csr_range_batches(h_indices, h_indptr, row_starts, row_stops,
-                               n_rows, input_col_start, n_cols, sub_batch_cols,
-                               batch_nnz_cap(rank, slab_cols, 1, BYTES_PER_NNZ),
-                               "rowstream range batch nnz");
+    CsrRangeBatchPlan range_batches = plan_csr_range_batches(
+        h_indices, row_starts, row_stops, n_rows, input_col_start, n_cols,
+        sub_batch_cols, batch_nnz_cap(rank, slab_cols, 1, BYTES_PER_NNZ),
+        "rowstream range batch nnz");
     ColumnBatchPlan batches = std::move(range_batches.columns);
 
     sub_batch_cols = batches.sub_batch_cols;
@@ -999,13 +998,12 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
     std::vector<IndexT> cursor(n_rows, 0);  // offset within each (sorted) row
     host_parallel_ranges(n_rows, [&](int r0, int r1) {
         for (int r = r0; r < r1; r++) {
-            const IndexT* row_base = h_indices + h_indptr[r];
             const IndexT* lo = h_indices + row_starts[r];
             const IndexT* hi = h_indices + row_stops[r];
             if (lo < hi && *lo < (IndexT)input_col_start) {
                 lo = std::lower_bound(lo, hi, (IndexT)input_col_start);
             }
-            cursor[r] = (IndexT)(lo - row_base);
+            cursor[r] = (IndexT)(lo - (h_indices + row_starts[r]));
         }
     });
 
@@ -1079,7 +1077,7 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
         int* fallback_row_counts = g_count.empty() ? nullptr : g_count.data();
 
         int batch_nnz = prepare_csr_range_batch(
-            h_indices, h_indptr, row_stops, n_rows, input_col, input_col_end,
+            h_indices, row_starts, row_stops, n_rows, input_col, input_col_end,
             cursor.data(), fallback_row_counts, planned_row_counts,
             h_gather_indptr, "rowstream range gather nnz");
         if ((size_t)batch_nnz != batches.nnz[b]) {
@@ -1115,7 +1113,7 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
                 StageIndexT* h_gather_cols =
                     gather_stage.template get<1>(stage_slot);
                 materialize_csr_range_row_block<StageIndexT>(
-                    h_data, h_indices, h_indptr, row_begin, row_end,
+                    h_data, h_indices, row_starts, row_begin, row_end,
                     input_col_start, cursor.data(), batch_row_counts,
                     h_gather_indptr, block_nnz_begin, h_gather_vals,
                     h_gather_cols);
@@ -1203,16 +1201,16 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
 // whenever that interval fits.
 template <typename InT, typename IndexT, typename Ranker>
 static void sparse_csr_host(const InT* h_data, const IndexT* h_indices,
-                            const IndexT* h_indptr, const IndexT* row_starts,
-                            const IndexT* row_stops, int col_start, int n_rows,
-                            int n_cols, int sub_batch_cols, const Ranker& rank,
+                            const IndexT* row_starts, const IndexT* row_stops,
+                            int col_start, int n_rows, int n_cols,
+                            int sub_batch_cols, const Ranker& rank,
                             const SparseStats& stats) {
     if (n_cols <= CSR_RANGE_U16_COLUMN_CAPACITY)
-        sparse_csr_host_typed<uint16_t>(h_data, h_indices, h_indptr, row_starts,
+        sparse_csr_host_typed<uint16_t>(h_data, h_indices, row_starts,
                                         row_stops, col_start, n_rows, n_cols,
                                         sub_batch_cols, rank, stats);
     else
-        sparse_csr_host_typed<int>(h_data, h_indices, h_indptr, row_starts,
-                                   row_stops, col_start, n_rows, n_cols,
-                                   sub_batch_cols, rank, stats);
+        sparse_csr_host_typed<int>(h_data, h_indices, row_starts, row_stops,
+                                   col_start, n_rows, n_cols, sub_batch_cols,
+                                   rank, stats);
 }

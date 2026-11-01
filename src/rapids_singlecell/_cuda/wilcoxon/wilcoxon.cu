@@ -23,11 +23,34 @@ static int fit_dense_width(int width, int n_cols, size_t col_bytes) {
 
 // Device view of dense column batch [col, col + sb_cols) of X (n_rows x ld):
 // device input is used in place; host input is copied into `stage` (F-order
-// contiguously, C-order as a 2D copy). Returns the C-order row stride.
+// contiguously, C-order as a 2D copy). Given host row ids `rows` (n_rows of
+// X's n_full_rows), only those rows are gathered into host `h_stage` in the
+// same layout and copied at once. Returns the C-order row stride.
 template <typename T>
 static int dense_batch(const T* X, bool on_host, bool f_order, int ld,
                        int n_rows, int col, int sb_cols, T* stage,
-                       const T*& src, cudaStream_t stream) {
+                       const T*& src, cudaStream_t stream,
+                       const int* rows = nullptr, int n_full_rows = 0,
+                       T* h_stage = nullptr) {
+    if (rows) {
+        host_parallel_ranges(f_order ? sb_cols : n_rows, [&](int a, int b) {
+            for (int k = a; k < b; k++) {
+                if (f_order) {
+                    const T* in = X + (size_t)(col + k) * n_full_rows;
+                    T* out = h_stage + (size_t)k * n_rows;
+                    for (int i = 0; i < n_rows; i++) out[i] = in[rows[i]];
+                } else {
+                    std::memcpy(h_stage + (size_t)k * sb_cols,
+                                X + (size_t)rows[k] * ld + col,
+                                (size_t)sb_cols * sizeof(T));
+                }
+            }
+        });
+        cudaMemcpyAsync(stage, h_stage, (size_t)n_rows * sb_cols * sizeof(T),
+                        cudaMemcpyHostToDevice, stream);
+        src = stage;
+        return sb_cols;
+    }
     src = X + (f_order ? (size_t)col * n_rows : (size_t)col);
     if (!on_host) return ld;
     if (f_order)
@@ -147,7 +170,9 @@ static void ovr_dense(const T* X, bool on_host, bool f_order, int ld,
 // Dense OVO over column batches of X (layout as in ovr_dense): gather the
 // reference and group rows of each batch into F-order float slabs, sort the
 // reference and rank the groups against it. f64 stats are per-code group
-// sums / nnz of the native values ([code * n_cols + col], zeroed).
+// sums / nnz of the native values ([code * n_cols + col], zeroed). With host
+// `rows`, the n_rows ranked rows are those of X's n_full_rows, gathered per
+// batch through a bounded pinned ring.
 template <typename T>
 static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
                       int col_start, const int* ref_rows, int n_ref,
@@ -158,7 +183,8 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
                       double* group_nnz, int n_rows, int n_cols,
                       bool compute_tie_corr, bool compute_nnz,
                       int sub_batch_cols, double expm1_scale,
-                      cudaStream_t upstream) {
+                      cudaStream_t upstream, const int* rows = nullptr,
+                      int n_full_rows = 0) {
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0 || n_groups == 0) return;
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
     OvoRanker ranker(h_offsets, n_groups, compute_tie_corr);
@@ -186,6 +212,8 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    std::unique_ptr<PinnedRing<T>> h_stage;
+    if (rows) h_stage.reset(new PinnedRing<T>(n_streams, batches.max_items));
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
     ranker.upload_huge_ids(pool);
     int* ref_offsets = pool.alloc<int>(sub_batch_cols + 1);
@@ -215,12 +243,16 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
 
     for (int col = 0, b = 0; col < n_cols; col += sub_batch_cols, ++b) {
         int sb_cols = std::min(sub_batch_cols, n_cols - col);
-        cudaStream_t stream = streams[b % n_streams];
-        auto& buf = bufs[b % n_streams];
+        int s = b % n_streams;
+        cudaStream_t stream = streams[s];
+        auto& buf = bufs[s];
+        if (h_stage) h_stage->wait(s);
         const T* src;
         int row_stride =
             dense_batch(X, on_host, f_order, ld, n_rows, col_start + col,
-                        sb_cols, buf.stage, src, stream);
+                        sb_cols, buf.stage, src, stream, rows, n_full_rows,
+                        h_stage ? h_stage->template get<0>(s) : nullptr);
+        if (h_stage) h_stage->record(s, stream);
         launch_dense_gather(src, ref_rows, buf.ref, n_ref, n_rows, sb_cols,
                             f_order, row_stride, stream);
         launch_dense_gather(src, grp_rows, buf.grp, n_all_grp, n_rows, sb_cols,
@@ -285,20 +317,26 @@ static std::vector<int> ovo_offsets(const Ints& grp_offsets, size_t n_groups,
     return h;
 }
 
-// Sparse inputs: data and indices pair up, indptr spans the compressed axis
-// and host CSR row spans cover every row.
+// Sparse inputs: data and indices pair up and indptr spans the compressed
+// axis, except host CSR, which reads only its row spans (one per ranked row,
+// possibly a subset of the matrix rows) within the stored values.
 template <typename Data, typename Index>
 static void check_sparse(const Data& data, const Index& indices,
                          const Index& indptr, const Index& row_starts,
                          const Index& row_stops, bool csc, bool on_host,
                          size_t n_rows, size_t n_cols) {
-    nb_require(
+    bool spans = !csc && on_host;
+    bool ok =
         data.shape(0) == indices.shape(0) &&
-            indptr.shape(0) == (csc ? n_cols : n_rows) + 1 &&
-            (csc || !on_host ||
-             (row_starts.shape(0) == n_rows && row_stops.shape(0) == n_rows)),
-        "Wilcoxon sparse: data, indices, indptr or row spans do not "
-        "match the matrix shape");
+        (spans ? row_starts.shape(0) == n_rows && row_stops.shape(0) == n_rows
+               : indptr.shape(0) == (csc ? n_cols : n_rows) + 1);
+    for (size_t r = 0; ok && spans && r < n_rows; r++)
+        ok = row_starts.data()[r] >= 0 &&
+             row_starts.data()[r] <= row_stops.data()[r] &&
+             (size_t)row_stops.data()[r] <= indices.shape(0);
+    nb_require(ok,
+               "Wilcoxon sparse: data, indices, indptr or row spans do not "
+               "match the matrix shape");
 }
 
 template <typename T, typename Array, bool OnHost, bool FOrder, typename Device>
@@ -349,10 +387,19 @@ static void def_ovo_dense(nb::module_& m) {
            gpu_array_c<double, Device> group_sums,
            gpu_array_c<double, Device> group_nnz, bool compute_tie_corr,
            bool compute_nnz, int col_start, int sub_batch_cols,
-           double expm1_scale, std::uintptr_t stream) {
+           double expm1_scale, std::uintptr_t stream,
+           host_vec<const int> rows) {
+            // Host input may rank a subset `rows` of X's rows; codes and row
+            // lists then index into it.
+            bool subset = OnHost && rows.is_valid();
+            size_t n_rows = subset ? rows.shape(0) : X.shape(0);
+            for (size_t i = 0; subset && i < n_rows; i++)
+                nb_require(
+                    rows.data()[i] >= 0 && (size_t)rows.data()[i] < X.shape(0),
+                    "Wilcoxon OVO: rows must index X");
             check_shapes<gpu_array_c<double, Device>>(
                 rank_sums, tie_corr, group_sums, group_nnz, nullptr, nullptr,
-                group_codes.shape(0), X.shape(0), true, compute_tie_corr,
+                group_codes.shape(0), n_rows, true, compute_tie_corr,
                 compute_nnz);
             std::vector<int> h_offsets =
                 ovo_offsets(grp_offsets, rank_sums.shape(0), grp_rows.shape(0),
@@ -363,15 +410,17 @@ static void def_ovo_dense(nb::module_& m) {
                 (int)grp_rows.shape(0), grp_offsets.data(), h_offsets.data(),
                 (int)rank_sums.shape(0), group_codes.data(),
                 (int)group_sums.shape(0), rank_sums.data(), tie_corr.data(),
-                group_sums.data(), group_nnz.data(), (int)X.shape(0),
+                group_sums.data(), group_nnz.data(), (int)n_rows,
                 (int)rank_sums.shape(1), compute_tie_corr, compute_nnz,
-                sub_batch_cols, expm1_scale, (cudaStream_t)stream);
+                sub_batch_cols, expm1_scale, (cudaStream_t)stream,
+                subset ? rows.data() : nullptr, (int)X.shape(0));
         },
         "X"_a, "ref_rows"_a, "grp_rows"_a, "grp_offsets"_a, "group_codes"_a,
         "rank_sums"_a, "tie_corr"_a, "group_sums"_a, "group_nnz"_a,
         nb::kw_only(), "compute_tie_corr"_a, "compute_nnz"_a, "col_start"_a = 0,
         "sub_batch_cols"_a = SUB_BATCH_COLS, "expm1_scale"_a = 0.0,
-        "stream"_a = 0, nb::call_guard<nb::gil_scoped_release>());
+        "stream"_a = 0, "rows"_a.none() = nb::none(),
+        nb::call_guard<nb::gil_scoped_release>());
 }
 
 template <typename IndexT, typename IndptrT, typename Device>
@@ -563,8 +612,8 @@ static void run_sparse(bool csc, const InT* data, const IndexT* indices,
         sparse_csc(data, indices, indptr, OnHost, n_rows, n_cols,
                    sub_batch_cols, rank, stats);
     else if constexpr (OnHost)
-        sparse_csr_host(data, indices, indptr, row_starts, row_stops, col_start,
-                        n_rows, n_cols, sub_batch_cols, rank, stats);
+        sparse_csr_host(data, indices, row_starts, row_stops, col_start, n_rows,
+                        n_cols, sub_batch_cols, rank, stats);
     else if constexpr (std::is_same_v<Ranker, OvoBatchRanker>)
         ovo_csr_device(data, indices, indptr, n_rows, n_cols, sub_batch_cols,
                        rank, stats);

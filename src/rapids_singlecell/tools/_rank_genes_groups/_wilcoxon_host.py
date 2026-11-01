@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
 import numpy as np
+import scipy.sparse as sp
 
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 from rapids_singlecell._utils import _copy_to_device, parse_device_ids
@@ -346,16 +347,18 @@ def _run_sharded_wilcoxon(
 ) -> _WilcoxonResult | None:
     """Run Wilcoxon across one or more GPU shards."""
     X = rg.X
-    # Host OVO ranks only reference and test-group rows: dense input copies
-    # just those when they are under half the cells, CSR skips the others
-    # through empty row spans (below). Stats still land on the caller's rg.
-    shard_rg = rg
-    unselected = rg.group_codes == len(rg.groups_order) if rg.ireference is not None else None
-    if isinstance(X, np.ndarray) and unselected is not None and 2 * np.count_nonzero(unselected) > X.shape[0]:
-        keep = np.flatnonzero(~unselected)
-        shard_rg = copy(rg)
-        shard_rg.X, shard_rg.group_codes = X[keep], rg.group_codes[keep]
-        X = shard_rg.X
+    # Host OVO ranks only the reference and test-group rows `keep` (shard_rg
+    # carries their codes; stats still land on the caller's rg): CSR passes
+    # just their row spans, dense input gathers them per gene batch when they
+    # are under half the cells.
+    shard_rg, keep = rg, None
+    if rg.ireference is not None and (sp.issparse(X) and X.format == "csr" or isinstance(X, np.ndarray)):
+        unselected = rg.group_codes == len(rg.groups_order)
+        n_unselected = np.count_nonzero(unselected)
+        if n_unselected > (X.shape[0] // 2 if isinstance(X, np.ndarray) else 0):
+            keep = np.flatnonzero(~unselected).astype(np.int32)
+            shard_rg = copy(rg)
+            shard_rg.group_codes = rg.group_codes[keep]
     n_cells, n_total_genes = X.shape
     is_device_input = isinstance(X, cp.ndarray) or cpsp.issparse(X)
     source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id if cpsp.issparse(X) else None
@@ -401,8 +404,8 @@ def _run_sharded_wilcoxon(
                     )
                     for shard_index in range(len(ranges))
                 ]
-            if unselected is not None and unselected.any():
-                csr_row_spans = [(starts, np.where(unselected, starts, stops)) for starts, stops in csr_row_spans]
+            if keep is not None:
+                csr_row_spans = [(starts[keep], stops[keep]) for starts, stops in csr_row_spans]
         else:
             kernel_inputs = [_host_csc_column_shard(sparse_source, start, stop) for start, stop in ranges]
 
@@ -424,12 +427,14 @@ def _run_sharded_wilcoxon(
                 column_range=column_range,
                 sparse_row_spans=csr_row_spans[shard_index],
                 ovo_host_context=ovo_host_context,
+                dense_rows=keep if dense_source is not None else None,
             )
             # Synchronize ranker streams before gathering or releasing inputs.
             cp.cuda.runtime.deviceSynchronize()
         return worker, result
 
-    with _shared_dense_host_registration(dense_source):
+    # Gathered dense rows are read on the host; only streamed rows need pins.
+    with _shared_dense_host_registration(dense_source if keep is None else None):
         if len(device_ids) == 1:
             shards = [run_shard(0)]
         else:
