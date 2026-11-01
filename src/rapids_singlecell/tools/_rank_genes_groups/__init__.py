@@ -170,8 +170,8 @@ def rank_genes_groups(
     multi_gpu
         GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
         and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
-        visible GPUs for host input and device OVO, while device OVR stays on
-        its input-owning GPU. For the streaming t-test/binned paths, ``None``
+        visible GPUs for host input, while device input stays on its owning
+        GPU. For the streaming t-test/binned paths, ``None``
         and ``False`` use the current GPU. ``True`` uses all visible GPUs, and a
         list or comma-separated string selects device IDs. Streaming multi-GPU
         is host-only: CSR/dense input is sharded by cell rows, CSC by gene

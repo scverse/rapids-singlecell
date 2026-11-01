@@ -362,8 +362,9 @@ def _run_sharded_wilcoxon(
     n_cells, n_total_genes = X.shape
     is_device_input = isinstance(X, cp.ndarray) or cpsp.issparse(X)
     source_device = X.device.id if isinstance(X, cp.ndarray) else X.data.device.id if cpsp.issparse(X) else None
-    auto_single_device = multi_gpu is None and is_device_input and rg.ireference is None
-    if multi_gpu is False or auto_single_device:
+    # Device input stays on its GPU unless asked: copying half of it to a peer
+    # costs more than the second GPU's ranking saves.
+    if multi_gpu is False or (multi_gpu is None and is_device_input):
         device_ids = [source_device if source_device is not None else cp.cuda.Device().id]
     else:
         device_ids = list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))

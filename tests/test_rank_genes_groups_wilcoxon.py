@@ -2427,7 +2427,7 @@ def _assert_multi_gpu_wilcoxon_equal(actual, expected):
         pytest.param(("numpy_dense", "rest", False, None, [None]), id="host_ovr_default"),
         pytest.param(("numpy_dense", "1", False, None, [None]), id="host_ovo_default"),
         pytest.param(("cupy_dense", "rest", False, None, []), id="device_ovr_default"),
-        pytest.param(("cupy_dense", "1", False, None, [None]), id="device_ovo_default"),
+        pytest.param(("cupy_dense", "1", False, None, []), id="device_ovo_default"),
         pytest.param(("cupy_dense", "rest", True, False, []), id="device_force_one"),
         pytest.param(("cupy_dense", "rest", True, True, [True]), id="device_force_all"),
         pytest.param(("cupy_dense", "rest", True, "current", ["current"]), id="device_ids"),
