@@ -503,11 +503,11 @@ def _kmeans_low_centers(M: cp.ndarray, exact: Callable[[np.ndarray], cp.ndarray]
 
 def _first_pc_scores(A: cp.ndarray) -> cp.ndarray:
     """float64 first principal component scores of the standardized columns, oriented along the last."""
-    from ._pca import pca
-    from ._scale import scale
+    from ._pca import _run_cuml_pca
+    from ._utils import _get_mean_var
 
-    Z = scale(A.astype(np.float64), zero_center=True)
-    info = pca(Z, n_comps=1, svd_solver="covariance_eigh", dtype="float64", return_info=True)
-    scores, components, *_ = cast("tuple", info)
+    A = A.astype(np.float64)
+    mean, var = _get_mean_var(A)
+    pca_func, scores = _run_cuml_pca((A - mean) / cp.sqrt(var), 1, svd_solver="covariance_eigh")
     scores = cp.asarray(scores[:, 0])
-    return scores if float(components[0, -1]) >= 0 else -scores
+    return scores if float(pca_func.components_[0, -1]) >= 0 else -scores
