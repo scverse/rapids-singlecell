@@ -59,9 +59,9 @@ overrides.matrix.deps.extra-dependencies = [
     "dev",
     "rapids_prerelease",
   ], value = "numba>=0.64,<0.65" },
+  # the RAPIDS nightlies need cuda-core>=1, which only numba-cuda>=0.30 allows
   { if = [
     "dev",
-    "rapids_prerelease",
   ], value = "numba-cuda<0.30" },
 ]
 # RAPIDS pins depend on both `deps` and `cuda`, so they key off the env name
