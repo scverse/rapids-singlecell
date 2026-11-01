@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import anndata as ad
@@ -141,18 +142,34 @@ def test_input_types(counts, convert):
     np.testing.assert_allclose(cp.asnumpy(a.X), expected, rtol=0, atol=1e-12)
 
 
+@pytest.mark.parametrize("reordered", [False, True], ids=["same_order", "reordered"])
 @pytest.mark.parametrize("fmt", ["dense", "csr", "csc"])
-def test_backed_empty(counts, tmp_path, monkeypatch, fmt):
+def test_backed_empty(counts, tmp_path, monkeypatch, fmt, reordered):
     import rapids_singlecell.preprocessing._dsb as dsb_mod
 
     cells, empty = counts
     expected = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, copy=True).X
+    if reordered:
+        empty = empty[:, empty.var_names[::-1]].copy()
     x = empty.X if fmt == "dense" else getattr(sparse, f"{fmt}_matrix")(empty.X)
     AnnData(x, obs=empty.obs, var=empty.var).write_h5ad(tmp_path / "empty.h5ad")
     backed = ad.read_h5ad(tmp_path / "empty.h5ad", backed="r")
     monkeypatch.setattr(dsb_mod, "_CHUNK", 64)  # several chunks
-    res = rsc.pp.dsb(cells, backed, isotype_controls=ISOTYPES, copy=True)
-    np.testing.assert_allclose(res.X, expected, rtol=0, atol=1e-10)
+    # the backed matrix reaches the chunked statistics, not loaded in full
+    # (as `.X` of a view reordering its columns would)
+    inputs = []
+    empty_stats = dsb_mod._empty_stats
+
+    def spy(x, *args):
+        inputs.append(x)
+        return empty_stats(x, *args)
+
+    monkeypatch.setattr(dsb_mod, "_empty_stats", spy)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Reordered", UserWarning)
+        res = rsc.pp.dsb(cells, backed, isotype_controls=ISOTYPES, copy=True)
+    assert not isinstance(inputs[0], np.ndarray | sparse.spmatrix | sparse.sparray)
+    np.testing.assert_array_equal(res.X, expected)
 
 
 def test_layer_and_key_added(counts):

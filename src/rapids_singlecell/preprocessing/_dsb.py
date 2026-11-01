@@ -196,8 +196,9 @@ def dsb(
     )
     if adata.n_obs < 2 or (denoise_counts and adata.n_vars < 2):
         raise ValueError("dsb needs at least 2 cells, and 2 proteins with `denoise_counts`.")
+    empty_order = None
     if adata_empty is not None:
-        adata_empty = _match_proteins(adata_empty, proteins)
+        empty_order = _match_proteins(adata_empty.var_names, proteins)
         if adata_empty.n_obs < 2:
             raise ValueError("`adata_empty` needs at least 2 empty droplets.")
         if layer is not None and layer not in adata_empty.layers:
@@ -216,7 +217,11 @@ def dsb(
     counts = _counts(X_in, "adata", dtype)
     scale = None
     if adata_empty is not None:
+        # in the protein order of `adata_empty`: a view reordering its
+        # columns would load all of a backed matrix at once
         mean, sd, constant = _empty_stats(_get_obs_rep(adata_empty, layer=layer), pseudocount)
+        if empty_order is not None:
+            mean, sd, constant = mean[cp.asarray(empty_order)], sd[cp.asarray(empty_order)], constant[empty_order]
         var_stats = {"dsb_ambient_mean": mean, "dsb_ambient_sd": sd}
         if scale_factor == "standardize":
             if constant.any():
@@ -416,10 +421,13 @@ def _empty_stats(x, pseudocount: float) -> tuple[cp.ndarray, cp.ndarray, np.ndar
     return mean, cp.sqrt(m2 / (n - 1)), cp.asnumpy(lo == hi)  # type: ignore[attr-defined, operator]
 
 
-def _match_proteins(adata_empty: AnnData, proteins: pd.Index) -> AnnData:
-    names = adata_empty.var_names
+def _match_proteins(names: pd.Index, proteins: pd.Index) -> np.ndarray | None:
+    """Positions of `proteins` in the protein `names` of `adata_empty`.
+
+    None if they are in the same order.
+    """
     if names.equals(proteins):
-        return adata_empty
+        return None
     if not names.is_unique or len(names) != len(proteins) or set(names) != set(proteins):
         diff = sorted(set(names).symmetric_difference(proteins))
         dup = list(names[names.duplicated()])
@@ -432,7 +440,7 @@ def _match_proteins(adata_empty: AnnData, proteins: pd.Index) -> AnnData:
         UserWarning,
         stacklevel=3,
     )
-    return adata_empty[:, proteins]
+    return names.get_indexer(proteins)
 
 
 class _MixtureFit(NamedTuple):
