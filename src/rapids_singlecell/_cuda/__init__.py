@@ -55,6 +55,7 @@ __all__ = [
     "_wilcoxon_binned_cuda",
     "_wilcoxon_cuda",
     "_wilcoxon_sparse_cuda",
+    "_wnn_cuda",
 ]
 
 

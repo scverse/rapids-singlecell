@@ -17,6 +17,7 @@ from .preprocessing import (
     scrublet,
     scrublet_simulate_doublets,
     sqrt,
+    wnn,
 )
 from .preprocessing import (
     filter_highly_variable as filter_highly_variable,
@@ -42,6 +43,7 @@ __all__ = [
     "scrublet",
     "scrublet_simulate_doublets",
     "sqrt",
+    "wnn",
 ]
 
 __deprecated_exports__ = {
