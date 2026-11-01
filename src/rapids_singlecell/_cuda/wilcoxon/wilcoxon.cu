@@ -212,8 +212,15 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    // Gathered rows stage like host CSR: pinned slots only past
+    // CSR_RANGE_PAGEABLE_STAGE_BYTES, else one pageable slot.
     std::unique_ptr<PinnedRing<T>> h_stage;
-    if (rows) h_stage.reset(new PinnedRing<T>(n_streams, batches.max_items));
+    if (rows) {
+        bool pin = (size_t)n_rows * n_cols * sizeof(T) >
+                   CSR_RANGE_PAGEABLE_STAGE_BYTES;
+        h_stage.reset(new PinnedRing<T>(pin ? n_streams : 1, batches.max_items,
+                                        false, pin));
+    }
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
     ranker.upload_huge_ids(pool);
     int* ref_offsets = pool.alloc<int>(sub_batch_cols + 1);
@@ -246,13 +253,14 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
         int s = b % n_streams;
         cudaStream_t stream = streams[s];
         auto& buf = bufs[s];
-        if (h_stage) h_stage->wait(s);
+        int slot = h_stage ? s % h_stage->slots() : 0;
+        if (h_stage) h_stage->wait(slot);
         const T* src;
         int row_stride =
             dense_batch(X, on_host, f_order, ld, n_rows, col_start + col,
                         sb_cols, buf.stage, src, stream, rows, n_full_rows,
-                        h_stage ? h_stage->template get<0>(s) : nullptr);
-        if (h_stage) h_stage->record(s, stream);
+                        h_stage ? h_stage->template get<0>(slot) : nullptr);
+        if (h_stage) h_stage->record(slot, stream);
         launch_dense_gather(src, ref_rows, buf.ref, n_ref, n_rows, sb_cols,
                             f_order, row_stride, stream);
         launch_dense_gather(src, grp_rows, buf.grp, n_all_grp, n_rows, sb_cols,
