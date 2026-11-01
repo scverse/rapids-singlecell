@@ -68,6 +68,7 @@ dev = [
 ]
 test = [
   "igraph",
+  "mudata",
   "spatialdata>=0.7.2",
   { include-group = "test-minimal" },
 ]
@@ -209,7 +210,7 @@ warn_unused_configs = true
 
 # RAPIDS and friends ship without type information
 [[tool.mypy.overrides]]
-module = [ "cudf.*", "cuml.*", "cuvs.*", "numba.*", "pylibraft.*" ]
+module = [ "cudf.*", "cuml.*", "cuvs.*", "mudata.*", "numba.*", "pylibraft.*" ]
 ignore_missing_imports = true
 
 # scanpy has inline annotations but no py.typed marker
@@ -285,6 +286,7 @@ module = [
   "rapids_singlecell.preprocessing._neighbors._algorithms._nn_descent",
   "rapids_singlecell.preprocessing._neighbors._helper",
   "rapids_singlecell.preprocessing._neighbors._neighbors",
+  "rapids_singlecell.preprocessing._neighbors._wnn",
   "rapids_singlecell.preprocessing._normalize",
   "rapids_singlecell.preprocessing._pca",
   "rapids_singlecell.preprocessing._qc",
