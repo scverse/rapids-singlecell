@@ -503,7 +503,8 @@ def _kmeans_low_centers(M: cp.ndarray, exact: Callable[[np.ndarray], cp.ndarray]
 
 def _first_pc_scores(A: cp.ndarray) -> cp.ndarray:
     """float64 first principal component scores of the standardized columns, oriented along the last."""
-    A = A.astype(np.float64)
-    Z = (A - A.mean(axis=0)) / A.std(axis=0, ddof=1)
-    v = cp.linalg.eigh(Z.T @ Z)[1][:, -1]
-    return Z @ (v if float(v[-1]) >= 0 else -v)
+    C = A - A.mean(axis=0, dtype=np.float64)
+    G = cp.asnumpy(C.T @ C)
+    sd = np.sqrt(np.diag(G))
+    v = np.linalg.eigh(G / np.outer(sd, sd))[1][:, -1]
+    return C @ cp.asarray((v if v[-1] >= 0 else -v) * np.sqrt(A.shape[0] - 1) / sd)
