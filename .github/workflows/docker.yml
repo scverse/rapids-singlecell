@@ -8,17 +8,17 @@ on:
   push:
     branches: [main]
     paths:
-      - 'docker/**'
-      - '.github/workflows/docker.yml'
-      - 'conda/*.yml'
-      - 'pyproject.toml'
+      - "docker/**"
+      - ".github/workflows/docker.yml"
+      - "conda/*.yml"
+      - "pyproject.toml"
   pull_request:
     branches: [main]
     paths:
-      - 'docker/**'
-      - '.github/workflows/docker.yml'
-      - 'conda/*.yml'
-      - 'pyproject.toml'
+      - "docker/**"
+      - ".github/workflows/docker.yml"
+      - "conda/*.yml"
+      - "pyproject.toml"
   release:
     types: [published]
 
