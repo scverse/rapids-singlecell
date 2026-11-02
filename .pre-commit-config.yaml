@@ -59,7 +59,7 @@ repos:
       - id: end-of-file-fixer
         groups: [format]
       - id: mixed-line-ending
-        exclude: ^\.cruft\.json$  # inconsistent file endings on windows - file never to be modified manually.
+        exclude: ^\.cruft\.json$ # inconsistent file endings on windows - file never to be modified manually.
         args: [--fix=lf]
         groups: [format]
       - id: trailing-whitespace
