@@ -100,8 +100,9 @@ static void ovr_dense(const T* X, bool on_host, bool f_order, int ld,
     DenseColumnBatchPlan batches;
     size_t sub_items = 0, cub_temp_bytes = 0, per_stream = 0;
     int n_streams = 1;
-    // Plans batches of w columns; returns the scratch they take.
-    auto plan = [&](int w) {
+    // Plans batches of w columns (and streams, clamped to the free memory if
+    // fit); returns the scratch they take.
+    auto plan = [&](int w, bool fit) {
         batches = plan_dense_column_batches(n_rows, n_cols, w, SAFE_BATCH_NNZ,
                                             "Dense OVR sub-batch");
         sub_items = batches.max_items;
@@ -112,25 +113,29 @@ static void ovr_dense(const T* X, bool on_host, bool f_order, int ld,
                                   (direct_keys ? 0 : sizeof(float)) +
                                   sizeof(float) + sizeof(int)) +
                      cub_temp_bytes;
-        n_streams = clamp_streams_by_budget(
-            clamp_streams_by_cols(n_cols, batches.sub_batch_cols), per_stream,
-            rmm_available_device_bytes(0.8));
+        n_streams = clamp_streams_by_cols(n_cols, batches.sub_batch_cols);
+        if (fit)
+            n_streams = clamp_streams_by_budget(
+                n_streams, per_stream, rmm_available_device_bytes(0.8));
         return (sub_items + batches.sub_batch_cols + 1) * sizeof(int) +
                n_streams * per_stream;
     };
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
-    // Keep the requested width if its scratch can be allocated: a warmed pool
-    // holds reusable memory that cudaMemGetInfo does not count. Otherwise fit
-    // the free memory (per item: host stage, keys in/out, rows in/out and
-    // CUB's pair buffers).
-    if (!pool.try_reserve(plan(std::min(sub_batch_cols, n_cols))))
-        pool.reserve(plan(fit_dense_width(
-            sub_batch_cols, n_cols,
-            (size_t)n_rows *
-                ((on_host ? sizeof(T) : 0) + (direct_keys ? 0 : sizeof(float)) +
-                 sizeof(float) + 2 * sizeof(int) + 2 * sizeof(float)))));
+    // Keep the requested width and streams if their scratch can be allocated:
+    // a warmed pool holds reusable memory that cudaMemGetInfo does not count.
+    // Otherwise fit both to the free memory (per item: host stage, keys
+    // in/out, rows in/out and CUB's pair buffers).
+    if (!pool.try_reserve(plan(std::min(sub_batch_cols, n_cols), false)))
+        pool.reserve(
+            plan(fit_dense_width(
+                     sub_batch_cols, n_cols,
+                     (size_t)n_rows *
+                         ((on_host ? sizeof(T) : 0) +
+                          (direct_keys ? 0 : sizeof(float)) + sizeof(float) +
+                          2 * sizeof(int) + 2 * sizeof(float))),
+                 true));
     sub_batch_cols = batches.sub_batch_cols;
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
     // CUB only reads the iota rows and linear offsets: fill once, share.
@@ -216,8 +221,8 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
     DenseColumnBatchPlan batches;
     size_t ref_items = 0, grp_items = 0, ref_cub_bytes = 0, per_stream = 0;
     int n_streams = 1;
-    // Plans batches of w columns; returns the scratch they take.
-    auto plan = [&](int w) {
+    // Plans batches of w columns and their streams, as in ovr_dense.
+    auto plan = [&](int w, bool fit) {
         batches = plan_dense_column_batches(n_rows, n_cols, w, SAFE_BATCH_NNZ,
                                             "Dense OVO sub-batch");
         int cols = batches.sub_batch_cols;
@@ -229,21 +234,24 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
         per_stream = (on_host ? batches.max_items * sizeof(T) : 0) +
                      (2 * ref_items + grp_items) * sizeof(float) +
                      ref_cub_bytes + ranker.scratch_bytes(grp_items, cols);
-        n_streams = clamp_streams_by_budget(clamp_streams_by_cols(n_cols, cols),
-                                            per_stream,
-                                            rmm_available_device_bytes(0.8));
+        n_streams = clamp_streams_by_cols(n_cols, cols);
+        if (fit)
+            n_streams = clamp_streams_by_budget(
+                n_streams, per_stream, rmm_available_device_bytes(0.8));
         return (cols + 1) * sizeof(int) + n_streams * per_stream;
     };
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
-    // The requested width if its scratch can be allocated, as in ovr_dense.
-    if (!pool.try_reserve(plan(std::min(sub_batch_cols, n_cols))))
-        pool.reserve(plan(fit_dense_width(
-            sub_batch_cols, n_cols,
-            (on_host ? (size_t)n_rows * sizeof(T) : 0) +
-                (3 * (size_t)n_ref + n_all_grp) * sizeof(float) +
-                ranker.scratch_bytes(n_all_grp, 1))));
+    // The requested width and streams if they fit, as in ovr_dense.
+    if (!pool.try_reserve(plan(std::min(sub_batch_cols, n_cols), false)))
+        pool.reserve(
+            plan(fit_dense_width(
+                     sub_batch_cols, n_cols,
+                     (on_host ? (size_t)n_rows * sizeof(T) : 0) +
+                         (3 * (size_t)n_ref + n_all_grp) * sizeof(float) +
+                         ranker.scratch_bytes(n_all_grp, 1)),
+                 true));
     sub_batch_cols = batches.sub_batch_cols;
     // Gathered rows stage like host CSR: pinned slots only past
     // pageable_stage_bytes, else one pageable slot.

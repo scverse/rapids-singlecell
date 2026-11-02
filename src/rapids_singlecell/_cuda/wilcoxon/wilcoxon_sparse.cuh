@@ -327,10 +327,13 @@ struct OvoBatchRanker {
                (sb_cols + 1) * sizeof(int) + cub_temp(sb_cols) +
                ranker->scratch_bytes(grp_items, sb_cols);
     }
-    // Dense slabs bound the batch width: int32 items and half the free memory.
-    int max_cols() const {
+    // Dense slabs bound the batch width: int32 items and, if fit, half the
+    // free memory.
+    int max_cols(bool fit = true) const {
         size_t cols = SAFE_BATCH_NNZ / (size_t)std::max(n_ref, n_all_grp);
-        cols = std::min(cols, rmm_available_device_bytes(0.5) / bytes(0, 1));
+        if (fit)
+            cols =
+                std::min(cols, rmm_available_device_bytes(0.5) / bytes(0, 1));
         return (int)std::max<size_t>(1, std::min<size_t>(cols, INT_MAX));
     }
     Scratch alloc(RmmScratchPool& pool, size_t, int sb_cols,
@@ -553,13 +556,20 @@ static void ovo_csr_device(const InT* data, const IndexT* indices,
                            int sub_batch_cols, const OvoBatchRanker& rank,
                            const SparseStats& stats) {
     if (n_rows == 0 || n_cols == 0) return;
-    int sb = std::min(sub_batch_cols, rank.max_cols());
-    int n_streams = clamp_streams_by_budget(clamp_streams_by_cols(n_cols, sb),
+    // pool first: streams drain before it frees their scratch (see guard doc).
+    RmmScratchPool pool;
+    // As in ovr_dense: the requested width and streams if their scratch can be
+    // allocated, else both fitted to the free memory.
+    int sb = std::min({sub_batch_cols, n_cols, rank.max_cols(false)});
+    int n_streams = clamp_streams_by_cols(n_cols, sb);
+    if (!pool.try_reserve(n_streams * rank.bytes(0, sb))) {
+        sb = std::min(sub_batch_cols, rank.max_cols());
+        n_streams = clamp_streams_by_budget(clamp_streams_by_cols(n_cols, sb),
                                             rank.bytes(0, sb),
                                             rmm_available_device_bytes(0.8));
-    RmmScratchPool pool;
+        pool.reserve(n_streams * rank.bytes(0, sb));
+    }
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
-    pool.reserve(n_streams * rank.bytes(0, sb));
     std::vector<OvoBatchRanker::Scratch> scratch;
     for (int s = 0; s < n_streams; s++)
         scratch.push_back(rank.alloc(pool, 0, sb, streams[s]));
@@ -601,9 +611,16 @@ static void sparse_csr_device(const InT* data, const IndexT* indices,
     constexpr size_t BYTES_PER_NNZ =
         RAW_BYTES<InT> + 3 * sizeof(float) + 2 * sizeof(int) + 8;
     int sb = std::min(sub_batch_cols, rank.max_cols());
-    ColumnBatchPlan batches = plan_column_batches_from_counts(
-        n_cols, sb, batch_nnz_cap(rank, sb, N_STREAMS, BYTES_PER_NNZ),
-        [&](int c) { return (size_t)col_counts[c]; }, "CSR column batch nnz");
+    auto plan = [&](int streams) {
+        return plan_column_batches_from_counts(
+            n_cols, sb, batch_nnz_cap(rank, sb, streams, BYTES_PER_NNZ),
+            [&](int c) { return (size_t)col_counts[c]; },
+            "CSR column batch nnz");
+    };
+    ColumnBatchPlan batches = plan(N_STREAMS);
+    // Every batch scans all rows: when memory rather than the width splits
+    // the columns, one stream's larger batches beat overlapping small ones.
+    if (batches.n_batches > (n_cols + sb - 1) / sb) batches = plan(1);
     sb = batches.sub_batch_cols;
     size_t max_nnz = batches.max_nnz;
     size_t per_stream = max_nnz * BYTES_PER_NNZ + rank.bytes(max_nnz, sb);
