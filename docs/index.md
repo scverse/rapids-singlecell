@@ -2,42 +2,44 @@
 ```
 
 ```{toctree}
-:caption: 'General'
+:caption: Getting started
 :hidden: true
 :maxdepth: 1
 
 installation.md
-usage_principles.md
-agent_skill.md
-api/index.md
-tutorials.md
-release-notes/index.md
-references.md
+Quickstart <notebooks/01_basic_workflow>
 ```
 
 ```{toctree}
-:caption: 'Advanced Usage'
+:caption: Guides
 :hidden: true
 :maxdepth: 1
 
+tutorials.md
 memory_management.md
 gpu_configuration.md
 out_of_core.md
+agent_skill.md
 ```
 
 ```{toctree}
-:caption: 'Development'
+:caption: Reference
 :hidden: true
 :maxdepth: 1
 
+api/index.md
+usage_principles.md
+```
+
+```{toctree}
+:caption: Project
+:hidden: true
+:maxdepth: 1
+
+release-notes/index.md
 contributing.md
-```
-
-```{toctree}
-:caption: 'About'
-:hidden: true
-:maxdepth: 1
-
+citation.md
+references.md
 acknowledgements.md
 GitHub <https://github.com/scverse/rapids-singlecell>
 Discourse <https://discourse.scverse.org/c/help/rsc/48>
