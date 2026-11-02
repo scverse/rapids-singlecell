@@ -39,6 +39,15 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.harmony_integrate
 ```
 
+### Protein (ADT) normalization
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+
+   pp.dsb
+```
+
 ### Doublet detection
 
 ```{eval-rst}
