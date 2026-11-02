@@ -53,6 +53,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 
    pp.neighbors
    pp.bbknn
+   pp.wnn
 ```
 
 ## Tools: `tl`
