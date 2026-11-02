@@ -17,7 +17,8 @@ from ..test_score_genes import _create_sparse_nan_matrix  # noqa: TID252
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-def test_mean_var(client, data_kind, axis, dtype):
+@pytest.mark.parametrize("correction", [0, 1])
+def test_mean_var(client, data_kind, axis, dtype, correction):
     if data_kind == "dense":
         adata = pbmc68k_reduced()
         adata.X = adata.X.astype(dtype)
@@ -31,8 +32,8 @@ def test_mean_var(client, data_kind, axis, dtype):
         dask_data.X = as_sparse_cupy_dask_array(dask_data.X).persist()
         rsc.get.anndata_to_GPU(adata)
 
-    mean, var = _get_mean_var(adata.X, axis=axis)
-    dask_mean, dask_var = _get_mean_var(dask_data.X, axis=axis)
+    mean, var = _get_mean_var(adata.X, axis=axis, correction=correction)
+    dask_mean, dask_var = _get_mean_var(dask_data.X, axis=axis, correction=correction)
     dask_mean, dask_var = dask_mean.compute(), dask_var.compute()
 
     cp.testing.assert_allclose(mean, dask_mean)

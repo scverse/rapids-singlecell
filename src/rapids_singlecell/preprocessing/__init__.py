@@ -4,7 +4,7 @@ from ._dsb import dsb
 from ._harmony_integrate import harmony_integrate
 from ._hvg import highly_variable_genes
 from ._neighbors import bbknn, neighbors, wnn
-from ._normalize import log1p, normalize_pearson_residuals, normalize_total, sqrt
+from ._normalize import log1p, normalize_pearson_residuals, normalize_shifted_clr, normalize_total, sqrt
 from ._pca import pca
 from ._qc import calculate_qc_metrics
 from ._regress_out import regress_out

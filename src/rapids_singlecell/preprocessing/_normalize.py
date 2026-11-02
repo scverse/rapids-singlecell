@@ -18,7 +18,7 @@ from rapids_singlecell._compat import (
 )
 from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
 
-from ._utils import _check_gpu_X, _check_nonnegative_integers
+from ._utils import _check_gpu_X, _check_nonnegative_integers, _get_mean_var
 
 if TYPE_CHECKING:
     from cupyx.scipy.sparse import spmatrix
@@ -638,4 +638,144 @@ def normalize_pearson_residuals(
         _set_obs_rep(adata, residuals, layer=layer)
     else:
         return residuals
+    return None
+
+
+def _estimate_nb_overdispersion(X: ArrayTypesDask) -> float:
+    r"""Closed-form least squares of :math:`\mathrm{Var}_g = μ_g + α μ_g^2` across genes."""
+    mu, var = _get_mean_var(X, axis=0, correction=0)
+    mu2 = mu**2
+    numerator = cp.sum((var - mu) * mu2)
+    denominator = cp.sum(mu2 * mu2)
+    if isinstance(X, DaskArray):
+        import dask
+
+        numerator, denominator = dask.compute(numerator, denominator)
+    if float(denominator) == 0.0:
+        msg = "Cannot estimate overdispersion: every gene has zero mean. Pass a positive `alpha` explicitly."
+        raise ValueError(msg)
+    alpha = float(numerator / denominator)
+    if not alpha > 0:
+        msg = f"Estimated overdispersion is non-positive (alpha = {alpha}); pass a positive `alpha` explicitly."
+        raise ValueError(msg)
+    return alpha
+
+
+def _shifted_clr(X: cp.ndarray | sparse.csr_matrix, scale: float) -> cp.ndarray:
+    """Dense ``log1p(scale * X)`` centered on its per-cell mean."""
+    from rapids_singlecell._cuda import _norm_cuda as _nc
+
+    n_rows, n_cols = X.shape
+    out = cp.empty((n_rows, n_cols), dtype=X.dtype)
+    if n_rows == 0 or n_cols == 0:
+        return out
+    if isinstance(X, cp.ndarray):
+        _nc.shifted_clr_dense(
+            cp.ascontiguousarray(X),
+            out=out,
+            nrows=n_rows,
+            ncols=n_cols,
+            scale=float(scale),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    else:
+        _nc.shifted_clr_csr(
+            X.indptr,
+            X.indices,
+            X.data,
+            out=out,
+            nrows=n_rows,
+            ncols=n_cols,
+            scale=float(scale),
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+    return out
+
+
+def normalize_shifted_clr(
+    adata: AnnData,
+    *,
+    alpha: float | None = None,
+    layer: str | None = None,
+    inplace: bool = True,
+    copy: bool = False,
+) -> Union[AnnData, dict[str, cp.ndarray | DaskArray], None]:  # noqa: UP007
+    r"""Normalize counts with the shifted centered log-ratio (PFlog) transform :cite:p:`Booeshaghi2022`.
+
+    If `alpha` is not provided, it is estimated from the input matrix. PFlog is
+    then computed as
+
+    .. math::
+        T(x)_i = \log(1 + 4 α x_i)
+            - \frac{1}{D} \sum_{j=1}^D \log(1 + 4 α x_j),
+
+    which is equivalent to centering :math:`\log(x_i + 1 / (4 α))` because the
+    constant :math:`\log(4 α)` cancels during CLR centering.
+
+    .. note::
+        CLR centering generally maps zeros to non-zero values, so the resulting
+        matrix is dense even when the input is sparse.
+
+    Parameters
+    ----------
+        adata
+            The annotated data matrix of shape `n_obs` × `n_vars`.
+            Rows correspond to cells and columns to genes.
+        alpha
+            Negative-binomial overdispersion of the dataset (``var = μ + α·μ²``).
+            If `None`, it is estimated from the input matrix. A positive numeric
+            value uses that value directly. PFlog applies ``log1p(4 * alpha * x)``
+            before CLR centering.
+        layer
+            Layer to normalize instead of `X`.
+        inplace
+            Whether to update `adata` or return a dictionary with the normalized
+            matrix.
+        copy
+            Whether to modify a copied input object. Not compatible with
+            `inplace=False`.
+
+    Returns
+    -------
+    Returns a dictionary with the normalized matrix or updates `adata`, depending
+    on `inplace`.
+    """
+    if copy:
+        if not inplace:
+            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
+        adata = adata.copy()
+
+    view_to_actual(adata)
+
+    X = _get_obs_rep(adata, layer=layer)
+    _check_gpu_X(X, allow_dask=True)
+    if sparse.isspmatrix_csc(X):
+        X = X.tocsr()
+    if X.dtype.kind in "iub":
+        X = X.astype(cp.float64)
+
+    if alpha is None:
+        alpha = _estimate_nb_overdispersion(X)
+    elif not alpha > 0:
+        msg = f"`alpha` must be positive to compute PFlog, got {alpha}. The data may be underdispersed."
+        raise ValueError(msg)
+    scale = 4.0 * float(alpha)
+
+    if isinstance(X, DaskArray):
+        if len(X.chunks[1]) > 1:
+            raise ValueError("Dask arrays must be chunked along the first axis only.")
+        X = X.map_blocks(_shifted_clr, scale, meta=_meta_dense(X.dtype), dtype=X.dtype)
+    else:
+        cell_depths = X.sum(axis=1)
+        if not bool((cell_depths > 0).all()):
+            warnings.warn("Some cells have zero counts", UserWarning, stacklevel=2)
+        X = _shifted_clr(X, scale)
+
+    if inplace:
+        _set_obs_rep(adata, X, layer=layer)
+
+    if copy:
+        return adata
+    elif not inplace:
+        return {"X": X}
     return None
