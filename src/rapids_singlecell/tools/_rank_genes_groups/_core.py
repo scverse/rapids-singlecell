@@ -247,7 +247,6 @@ class _RankGenes:
         tie_correct: bool = False,
         use_continuity: bool = False,
         n_bins: int | None = None,
-        chunk_size: int | None = None,
         bin_range: Literal["log1p", "auto"] | None = None,
     ) -> list[tuple[int, NDArray, NDArray]]:
         """Histogram-based approximate Wilcoxon rank-sum test."""
@@ -258,7 +257,6 @@ class _RankGenes:
             tie_correct=tie_correct,
             use_continuity=use_continuity,
             n_bins=n_bins,
-            chunk_size=chunk_size,
             bin_range=bin_range,
         )
 
@@ -278,7 +276,6 @@ class _RankGenes:
         mean_in_log_space: bool = True,
         tie_correct: bool = False,
         use_continuity: bool = False,
-        chunk_size: int | None = None,
         multi_gpu: bool | list[int] | str | None = None,
         n_bins: int | None = None,
         bin_range: Literal["log1p", "auto"] | None = None,
@@ -289,19 +286,15 @@ class _RankGenes:
         self.mean_in_log_space = mean_in_log_space
         # Devices for the host-streaming t-test / binned shards.
         self._multi_gpu = multi_gpu
-        # Exact OVR inserts implicit zeros between negative and positive stored
-        # values analytically. Binned and host OVO sparse paths still need the
-        # sign check; device OVO does not use its result.
+        # Exact Wilcoxon ranks zeros as one tie block between negative and
+        # positive values, so only the binned histograms need the sign check.
         self._sparse_negative_fallback = False
         if method in {"wilcoxon", "wilcoxon_binned"}:
             # Fast paths rank each stored coordinate once, so they must see
             # scanpy's summed duplicate view even when no sign scan is needed.
             with _data_device(self.X):
                 self.X = _canonicalize_sparse(self.X)
-                needs_signed_fallback = method == "wilcoxon_binned" or (
-                    self.ireference is not None and sp.issparse(self.X)
-                )
-                if needs_signed_fallback:
+                if method == "wilcoxon_binned":
                     self._sparse_negative_fallback = _sparse_has_negative(self.X)
         if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
             # Host input streams (no full copy); device / Dask move to the GPU.
@@ -326,20 +319,15 @@ class _RankGenes:
                 self,
                 tie_correct=tie_correct,
                 use_continuity=use_continuity,
-                chunk_size=chunk_size,
                 multi_gpu=multi_gpu,
                 return_u_values=return_u_values,
             )
-            if wilcoxon_result is not None and not mean_in_log_space:
-                self._basic_stats()
-                wilcoxon_result = (*wilcoxon_result[:3], None)
             test_results = []
         elif method == "wilcoxon_binned":
             test_results = self.wilcoxon_binned(
                 tie_correct=tie_correct,
                 use_continuity=use_continuity,
                 n_bins=n_bins,
-                chunk_size=chunk_size,
                 bin_range=bin_range,
             )
             if not mean_in_log_space:

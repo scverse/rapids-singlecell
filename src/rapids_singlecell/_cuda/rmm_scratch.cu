@@ -47,6 +47,16 @@ void* rmm_allocate(size_t bytes) {
     return reinterpret_cast<void*>(nb::cast<std::uintptr_t>(alloc(bytes)));
 }
 
+void* rmm_try_allocate(size_t bytes) {
+    try {
+        return rmm_allocate(bytes);
+    } catch (nb::python_error& e) {
+        nb::gil_scoped_acquire gil;
+        if (!e.matches(PyExc_MemoryError)) throw;
+    }
+    return nullptr;
+}
+
 // Frees run in destructors and must not throw: a dealloc's error (e.g. a
 // signal handler's KeyboardInterrupt at its first bytecode) is reported as
 // unraisable. The default dealloc runs no bytecode.

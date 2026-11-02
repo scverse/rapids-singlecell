@@ -23,9 +23,9 @@ constexpr int UTIL_BLOCK_SIZE = 256;
 constexpr int DEFAULT_STREAMING_STREAMS = 4;
 // Max per-batch nnz for segmented CUDA primitives that take int32 item counts.
 constexpr size_t STREAMING_SAFE_BATCH_NNZ = 2000000000;  // < INT_MAX
-// Above this host span, avoid whole-array cudaHostRegister and use bounded
-// staging. Moderate arrays keep the lower-overhead direct async-copy path.
-constexpr size_t HOST_STREAMING_DIRECT_PIN_LIMIT_BYTES =
+// Above this host span, stream through bounded pinned staging; moderate
+// arrays copy straight from pageable memory.
+constexpr size_t HOST_STREAMING_DIRECT_COPY_LIMIT_BYTES =
     16ULL * 1024ULL * 1024ULL * 1024ULL;
 
 // Host thread count for CPU-side staging passes: hardware concurrency, capped.
@@ -196,29 +196,6 @@ static inline int checked_int_product(size_t a, size_t b, const char* context) {
     return (int)(a * b);
 }
 
-template <typename DeviceValueT, typename DeviceIndexT = int,
-          typename AccumT = double>
-struct SparseWindowDTypes {
-    using value_type = DeviceValueT;
-    using index_type = DeviceIndexT;
-    using accum_type = AccumT;
-
-    static constexpr size_t bytes_per_nnz =
-        sizeof(value_type) + sizeof(index_type);
-};
-
-using WilcoxonSparseWindowDTypes = SparseWindowDTypes<float, int, double>;
-
-template <typename DTypes>
-static inline size_t sparse_window_nnz_bytes(size_t nnz) {
-    return nnz * DTypes::bytes_per_nnz;
-}
-
-template <typename DTypes>
-static inline size_t sparse_window_accum_bytes(size_t count) {
-    return count * sizeof(typename DTypes::accum_type);
-}
-
 // Stream-count clamps: never use more streams than column batches, nor more
 // than the per-stream memory budget allows.
 static inline int clamp_streams_by_cols(
@@ -338,6 +315,9 @@ static inline ColumnBatchPlan plan_csc_column_batches(const IndptrT* h_indptr,
 static inline int* upload_batch_offsets(const ColumnBatchPlan& plan,
                                         RmmScratchPool& pool) {
     int* d_all_offsets = pool.alloc<int>(plan.offsets.size());
+    // Stream-ordered pools (CuPy/RMM async) allocate on the caller's stream,
+    // which may not order with this copy: finish the allocation first.
+    cudaDeviceSynchronize();
     cudaMemcpy(d_all_offsets, plan.offsets.data(),
                plan.offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
     return d_all_offsets;
@@ -497,7 +477,7 @@ struct PinnedRingArray {
     std::vector<std::unique_ptr<T, CudaHostFree<T>>> write_combined_data;
     std::vector<HostRegisterGuard> pins;
 
-    PinnedRingArray(int n_slots, size_t count, bool write_combined)
+    PinnedRingArray(int n_slots, size_t count, bool write_combined, bool pin)
         : data(n_slots), write_combined_data(n_slots), pins(n_slots) {
         size_t n = count ? count : 1;
         for (int s = 0; s < n_slots; s++) {
@@ -509,7 +489,8 @@ struct PinnedRingArray {
                 write_combined_data[s].reset(ptr);
             } else {
                 data[s].reset(new T[n]);
-                pins[s] = HostRegisterGuard(data[s].get(), n * sizeof(T));
+                if (pin)
+                    pins[s] = HostRegisterGuard(data[s].get(), n * sizeof(T));
             }
         }
     }
@@ -521,6 +502,8 @@ struct PinnedRingArray {
 
 // Per-slot pinned host staging with events for CPU/GPU overlap.
 // Arrays share item capacity; use another ring for differently-sized metadata.
+// pin = false keeps the slots pageable, for transfers too small to repay
+// pinning them.
 template <typename... Ts>
 struct PinnedRing {
     std::tuple<PinnedRingArray<Ts>...> arrays;
@@ -528,8 +511,9 @@ struct PinnedRing {
     std::vector<char> used;
     size_t capacity = 0;
 
-    PinnedRing(int n_slots_, size_t count, bool write_combined = false)
-        : arrays(PinnedRingArray<Ts>(n_slots_, count, write_combined)...),
+    PinnedRing(int n_slots_, size_t count, bool write_combined = false,
+               bool pin = true)
+        : arrays(PinnedRingArray<Ts>(n_slots_, count, write_combined, pin)...),
           evt(n_slots_, nullptr),
           used(n_slots_, 0) {
         capacity = count ? count : 1;
@@ -547,6 +531,9 @@ struct PinnedRing {
             cudaEventDestroy(e);
         }
     }
+    int slots() const {
+        return (int)evt.size();
+    }
     void wait(int s) {
         if (used[s])
             cuda_check(cudaEventSynchronize(evt[s]), "PinnedRing reuse");
@@ -562,12 +549,6 @@ struct PinnedRing {
     PinnedRing(const PinnedRing&) = delete;
     PinnedRing& operator=(const PinnedRing&) = delete;
 };
-
-template <typename DTypes>
-using SparseWindowStagingRing =
-    PinnedRing<typename DTypes::value_type, typename DTypes::index_type>;
-
-using HostStagingRing = SparseWindowStagingRing<WilcoxonSparseWindowDTypes>;
 
 /** Fill linear segment offsets [0, stride, ..., n_segments*stride] on-device.
  */
@@ -598,30 +579,6 @@ static void host_copy_slice_as(const InT* h_data, const IndexT* h_indices,
         for (int k = k0; k < k1; k++) {
             stage_vals[k] = (StageValT)h_data[start + k];
             stage_cols[k] = (StageIndexT)h_indices[start + k];
-        }
-    });
-}
-
-// Threaded host gather of selected dense rows and contiguous columns.
-// Output staging is always F-order [n_window_rows, n_window_cols].
-template <typename StageT, typename InT>
-static void host_materialize_dense_rows_window_as(
-    const InT* h_X, bool f_order, int n_full_rows, int n_full_cols,
-    const int* row_ids, int n_window_rows, int col_start, int n_window_cols,
-    StageT* stage) {
-    int total =
-        checked_int_product((size_t)n_window_rows, (size_t)n_window_cols,
-                            "dense host row-window items");
-    host_parallel_ranges(total, [&](int i0, int i1) {
-        for (int idx = i0; idx < i1; idx++) {
-            int local_col = idx / n_window_rows;
-            int local_row = idx - local_col * n_window_rows;
-            int row = row_ids ? row_ids[local_row] : local_row;
-            int col = col_start + local_col;
-            size_t src = f_order ? (size_t)col * n_full_rows + row
-                                 : (size_t)row * n_full_cols + col;
-            stage[(size_t)local_col * n_window_rows + local_row] =
-                (StageT)h_X[src];
         }
     });
 }
