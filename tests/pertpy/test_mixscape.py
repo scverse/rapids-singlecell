@@ -58,6 +58,31 @@ def test_mixscape_classification(mixscape_adata):
     assert "mixscape" in adata.uns
 
 
+def test_mixscape_min_cells_is_independent_of_min_de_genes():
+    rng = np.random.default_rng(7)
+    n_cells, n_genes = 6, 20
+    adata = anndata.AnnData(
+        X=np.vstack([rng.normal(1.0, 0.1, (n_cells, n_genes)), rng.normal(5.0, 0.1, (n_cells, n_genes))]),
+        obs=pd.DataFrame(
+            {"gene_target": ["NT"] * n_cells + ["target_gene"] * n_cells},
+            index=[f"cell_{i}" for i in range(2 * n_cells)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)]),
+    )
+    adata.layers["X_pert"] = adata.X.copy()
+    target = (adata.obs["gene_target"] == "target_gene").to_numpy()
+
+    result = rsc.ptg.Mixscape().mixscape(
+        adata, pert_key="gene_target", control="NT", test_method="t-test", min_de_genes=10, min_cells=3, copy=True
+    )
+    assert (result.obs.loc[target, "mixscape_class_global"] == "KO").all()
+
+    result = rsc.ptg.Mixscape().mixscape(
+        adata, pert_key="gene_target", control="NT", test_method="t-test", min_de_genes=1, min_cells=7, copy=True
+    )
+    assert (result.obs.loc[target, "mixscape_class_global"] == "NP").all()
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_mixscape_matches_pertpy(mixscape_adata, dtype):
     """Classification matches pertpy at both float32 and float64."""
