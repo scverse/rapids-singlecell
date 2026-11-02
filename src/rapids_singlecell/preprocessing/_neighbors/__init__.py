@@ -27,6 +27,7 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _large_coo_to_host_csr,
     _Metrics,
 )
+from rapids_singlecell.preprocessing._neighbors._wnn import wnn
 from rapids_singlecell.tools._utils import _choose_representation
 
 if TYPE_CHECKING:

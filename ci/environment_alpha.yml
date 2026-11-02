@@ -1,11 +1,11 @@
 name: rapids_singlecell_nightly
 channels:
- - rapidsai-nightly
- - nvidia
- - conda-forge
+  - rapidsai-nightly
+  - nvidia
+  - conda-forge
 dependencies:
- - rapids=26.12
- - python=3.14
- - cuda-version=12.9
- - zarr=3.0.6
- - cudnn
+  - rapids=26.12
+  - python=3.14
+  - cuda-version=12.9
+  - zarr=3.0.6
+  - cudnn

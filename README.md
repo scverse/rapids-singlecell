@@ -43,7 +43,7 @@ If you use this tool, please cite: [![arXiv](https://img.shields.io/badge/arXiv-
 
 Please cite the relevant tools if used: [decoupler](https://doi.org/10.1093/bioadv/vbac016) for decoupler functions, [squidpy](https://doi.org/10.1038/s41592-021-01358-2) for spatial analysis, and [pertpy](https://doi.org/10.1038/s41592-025-02909-7) for perturbation analysis.
 
-[//]: # (numfocus-fiscal-sponsor-attribution)
+[//]: # "numfocus-fiscal-sponsor-attribution"
 
 rapids-singlecell is part of the scverse® project ([website](https://scverse.org), [governance](https://scverse.org/about/roles)) and is fiscally sponsored by [NumFOCUS](https://numfocus.org/).
 If you like scverse® and want to support our mission, please consider making a tax-deductible [donation](https://numfocus.org/donate-to-scverse) to help the project pay for developer time, professional services, travel, workshops, and a variety of other needs.

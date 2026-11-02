@@ -5,14 +5,14 @@ On systems with several GPUs, you can assign different GPUs to independent analy
 
 ## Quick guide
 
-| What you want to do | Recommended setup |
-| --- | --- |
-| Run one analysis on one GPU | Start Python with `CUDA_VISIBLE_DEVICES=0`. |
-| Run two independent scripts on two GPUs | Start one with `CUDA_VISIBLE_DEVICES=0` and the other with `CUDA_VISIBLE_DEVICES=1`. |
-| Run two notebooks on two GPUs | Set a different `CUDA_VISIBLE_DEVICES` value in the first cell of each fresh kernel. |
-| Keep a small display GPU out of an analysis | Exclude it from `CUDA_VISIBLE_DEVICES`, for example by starting with `CUDA_VISIBLE_DEVICES=1`. |
-| Use several GPUs for one supported RSC operation | Make only the intended GPUs visible and pass `multi_gpu=True` or an explicit device list. |
-| Process an out-of-core or distributed dataset | Use Dask-CUDA; see {doc}`out_of_core`. |
+| What you want to do                              | Recommended setup                                                                              |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Run one analysis on one GPU                      | Start Python with `CUDA_VISIBLE_DEVICES=0`.                                                    |
+| Run two independent scripts on two GPUs          | Start one with `CUDA_VISIBLE_DEVICES=0` and the other with `CUDA_VISIBLE_DEVICES=1`.           |
+| Run two notebooks on two GPUs                    | Set a different `CUDA_VISIBLE_DEVICES` value in the first cell of each fresh kernel.           |
+| Keep a small display GPU out of an analysis      | Exclude it from `CUDA_VISIBLE_DEVICES`, for example by starting with `CUDA_VISIBLE_DEVICES=1`. |
+| Use several GPUs for one supported RSC operation | Make only the intended GPUs visible and pass `multi_gpu=True` or an explicit device list.      |
+| Process an out-of-core or distributed dataset    | Use Dask-CUDA; see {doc}`out_of_core`.                                                         |
 
 > Assign GPUs before CUDA is initialized in the Python process or notebook kernel.
 > Use an RSC function's `multi_gpu` argument to control work inside that process.
@@ -215,13 +215,13 @@ For independent jobs, give each process or kernel only its assigned GPU.
 
 The controls involved in GPU execution have different purposes:
 
-| Control | Scope | Purpose |
-| --- | --- | --- |
-| Scheduler or container assignment | Job or container | Enforces the platform's GPU allocation. |
-| `CUDA_VISIBLE_DEVICES` | Python process or Jupyter kernel | Determines which GPUs CUDA libraries can see. |
-| A function's `multi_gpu` argument | One RSC operation | Selects visible GPUs for that operation. |
-| {class}`cupy.cuda.Device` | Current host thread | Selects the default logical device for new CUDA work. |
-| `rmm.reinitialize(devices=...)` | RMM memory resources | Configures allocators but does not hide or select GPUs for algorithms. |
+| Control                           | Scope                            | Purpose                                                                |
+| --------------------------------- | -------------------------------- | ---------------------------------------------------------------------- |
+| Scheduler or container assignment | Job or container                 | Enforces the platform's GPU allocation.                                |
+| `CUDA_VISIBLE_DEVICES`            | Python process or Jupyter kernel | Determines which GPUs CUDA libraries can see.                          |
+| A function's `multi_gpu` argument | One RSC operation                | Selects visible GPUs for that operation.                               |
+| {class}`cupy.cuda.Device`         | Current host thread              | Selects the default logical device for new CUDA work.                  |
+| `rmm.reinitialize(devices=...)`   | RMM memory resources             | Configures allocators but does not hide or select GPUs for algorithms. |
 
 CuPy creates new arrays on the current device:
 

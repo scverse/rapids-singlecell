@@ -1,11 +1,12 @@
 # Installation
 
-*rapids-singlecell* requires Python 3.12–3.14 and an NVIDIA GPU.
+_rapids-singlecell_ requires Python 3.12–3.14 and an NVIDIA GPU.
 
 (conda-installation)=
 ## Conda
-The easiest way to install *rapids-singlecell* is to use one of the *yaml* files provided in the [conda](https://github.com/scverse/rapids-singlecell/tree/main/conda) folder.
-These *yaml* files install everything needed to run the example notebooks and get you started.
+
+The easiest way to install _rapids-singlecell_ is to use one of the _yaml_ files provided in the [conda](https://github.com/scverse/rapids-singlecell/tree/main/conda) folder.
+These _yaml_ files install everything needed to run the example notebooks and get you started.
 Download the matching file or run the commands below from a repository checkout.
 
 `````{tab-set}
@@ -40,18 +41,18 @@ See the [NVIDIA installation guide](https://docs.nvidia.com/datascience/install/
 
 ## PyPI
 
-Starting with version 0.15.0, *rapids-singlecell* ships precompiled CUDA kernels via nanobind.
+Starting with version 0.15.0, _rapids-singlecell_ ships precompiled CUDA kernels via nanobind.
 Prebuilt wheels are available for **x86_64** and **aarch64** Linux for both CUDA 12 and CUDA 13.
 
 ### CUDA version compatibility
 
 The prebuilt wheels support the following CUDA runtime versions:
 
-| Wheel | Compiled with | Runtime support | GPU architectures |
-|---|---|---|---|
-| `rapids-singlecell` | Source distribution | Any supported CUDA | Compiles for your local GPU architecture |
-| `rapids-singlecell-cu12` | CUDA 12.2 | CUDA 12.2–12.9+ | Turing through Hopper (native), Blackwell (via PTX JIT) |
-| `rapids-singlecell-cu13` | CUDA 13.0 | CUDA 13.0+ | Turing through Blackwell (precompiled cubins) |
+| Wheel                    | Compiled with       | Runtime support    | GPU architectures                                       |
+| ------------------------ | ------------------- | ------------------ | ------------------------------------------------------- |
+| `rapids-singlecell`      | Source distribution | Any supported CUDA | Compiles for your local GPU architecture                |
+| `rapids-singlecell-cu12` | CUDA 12.2           | CUDA 12.2–12.9+    | Turing through Hopper (native), Blackwell (via PTX JIT) |
+| `rapids-singlecell-cu13` | CUDA 13.0           | CUDA 13.0+         | Turing through Blackwell (precompiled cubins)           |
 
 The CUDA 12 wheels are compiled with CUDA 12.2.
 Check the [CUDA-X Data Science support matrix](https://docs.nvidia.com/datascience/platform-support/) for the CUDA runtime and driver requirements of your dependency versions.
@@ -158,16 +159,16 @@ CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80-real;86-real;89-real;90-real" [uv] pip
 
 Common architecture codes:
 
-| Code | GPU Generation | Examples |
-|---|---|---|
-| `75` | Turing | T4, RTX 2080 |
-| `80` | Ampere | A100, A30 |
-| `86` | Ampere | A10, RTX 3090 |
-| `89` | Ada Lovelace | L4, L40, RTX 4090 |
-| `90` | Hopper | H100, H200 |
-| `100` | Blackwell | B200, GB200 |
-| `103` | Blackwell | B300, GB300 |
-| `120` | Blackwell | RTX PRO 6000 |
+| Code  | GPU Generation | Examples          |
+| ----- | -------------- | ----------------- |
+| `75`  | Turing         | T4, RTX 2080      |
+| `80`  | Ampere         | A100, A30         |
+| `86`  | Ampere         | A10, RTX 3090     |
+| `89`  | Ada Lovelace   | L4, L40, RTX 4090 |
+| `90`  | Hopper         | H100, H200        |
+| `100` | Blackwell      | B200, GB200       |
+| `103` | Blackwell      | B300, GB300       |
+| `120` | Blackwell      | RTX PRO 6000      |
 
 ```{tip}
 Use `native` (the default) for the fastest compilation when you only need to run on your local GPU.
@@ -177,13 +178,13 @@ The `-real` suffix generates device code only (no PTX fallback), which reduces b
 
 ## Agent skill
 
-````{card} Use rapids-singlecell with coding agents
+```{card} Use rapids-singlecell with coding agents
 :link: agent-skill
 :link-type: ref
 
 Install the version-matched analysis skill for Claude Code, Codex, and other agents,
 and check the GPU environment before starting.
-````
+```
 
 See the {ref}`agent skill guide <agent-skill>` for installation, kernel checks, and usage.
 

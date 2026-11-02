@@ -207,7 +207,8 @@ def _get_connectivities_gauss(
 
     # Per-cell bandwidth from median of squared distances (exclude self at col 0)
     d_sq = knn_dist**2
-    sigmas_sq = cp.median(d_sq[:, 1:], axis=1)
+    # floor a zero bandwidth (duplicated cells) to keep the limits of 0/0: weight 1 at distance 0, else 0
+    sigmas_sq = cp.maximum(cp.median(d_sq[:, 1:], axis=1), cp.finfo(d_sq.dtype).tiny)
     sigmas = cp.sqrt(sigmas_sq)
 
     # Build sparse CSR from KNN edges (exclude self)
