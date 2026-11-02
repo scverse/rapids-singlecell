@@ -42,11 +42,11 @@ rapids-singlecell-install-skills --dest /other/skills/rapids-singlecell
 ````
 `````
 
-| Option | Effect |
-|---|---|
-| `--check` | Compare the installed copy with the bundle in the active package |
-| `--force` | Replace a differing copy, e.g. after upgrading rapids-singlecell |
-| `--print-path` | Print the location of the bundled skill |
+| Option         | Effect                                                           |
+| -------------- | ---------------------------------------------------------------- |
+| `--check`      | Compare the installed copy with the bundle in the active package |
+| `--force`      | Replace a differing copy, e.g. after upgrading rapids-singlecell |
+| `--print-path` | Print the location of the bundled skill                          |
 
 The agent looks up the installed API with `python -m rapids_singlecell_skills.api`, so run it in the same environment as rapids-singlecell.
 

@@ -74,11 +74,12 @@ cp.cuda.set_allocator(rmm_cupy_allocator)
 ```
 
 ## Best Practices
+
 To achieve optimal memory management in rapids-singlecell, consider the following guidelines:
 
-* **Large-scale Data Analysis:** Utilize `managed_memory` for datasets exceeding your VRAM's capacity, keeping in mind the potential performance penalties.
-* **Performance-Critical Operations:** Choose `pool_allocator` when speed is critical and sufficient VRAM is available.
-* **Advanced managed-memory pool:** Combining `managed_memory=True` and `pool_allocator=True` is supported, but size the pool explicitly and benchmark it for the workload.
+- **Large-scale Data Analysis:** Utilize `managed_memory` for datasets exceeding your VRAM's capacity, keeping in mind the potential performance penalties.
+- **Performance-Critical Operations:** Choose `pool_allocator` when speed is critical and sufficient VRAM is available.
+- **Advanced managed-memory pool:** Combining `managed_memory=True` and `pool_allocator=True` is supported, but size the pool explicitly and benchmark it for the workload.
 
 ### Troubleshooting
 
@@ -86,6 +87,7 @@ To achieve optimal memory management in rapids-singlecell, consider the followin
 - Very slow runtime with managed memory → reduce oversubscription or switch back to [Pool Allocator](#pool-allocator) if VRAM allows.
 
 ## Further Reading
+
 For a more in-depth understanding of rmm and its functionalities, refer to the [NVIDIA RMM documentation](https://docs.rapids.ai/api/rmm/stable/python/).
 
 

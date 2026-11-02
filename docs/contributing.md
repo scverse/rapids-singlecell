@@ -137,16 +137,19 @@ Template the binding registration function on `Device` and use `REGISTER_GPU_BIN
 2. Write the kernel header (`kernels_your_module.cuh`) and bindings (`your_module.cu`)
 3. Include `"../nb_types.h"` for the shared type aliases
 4. Register the module in `CMakeLists.txt`:
+
    ```cmake
    add_nb_cuda_module(_your_module_cuda src/rapids_singlecell/_cuda/your_module/your_module.cu)
    ```
 5. Add the module name to the `__all__` list in `src/rapids_singlecell/_cuda/__init__.py`:
+
    ```python
    __all__ = [
        ...,
        "_your_module_cuda",
    ]
    ```
+
    This registers the module for lazy loading — imports return `None` when the compiled extension is absent (e.g., docs builds without a GPU). Errors loading an installed extension are propagated.
 6. Rebuild: `[uv] pip install -e .`
 
@@ -185,11 +188,11 @@ The project uses [hatch](https://hatch.pypa.io/) to manage test environments. Th
 - **`cuda`**: `12` or `13` — selects the matching CUDA-X Data Science and CuPy packages
 - **`deps`**: `stable`, `dev`, or `rapids_prerelease` — controls Python version and dependency sources
 
-| `deps` | Python | Description |
-|---|---|---|
-| `stable` | 3.12 | Released versions of all dependencies |
-| `dev` | 3.14 | Upstream `main` branches of anndata and scanpy |
-| `rapids_prerelease` | 3.14 | CUDA-X Data Science nightly wheels |
+| `deps`              | Python | Description                                    |
+| ------------------- | ------ | ---------------------------------------------- |
+| `stable`            | 3.12   | Released versions of all dependencies          |
+| `dev`               | 3.14   | Upstream `main` branches of anndata and scanpy |
+| `rapids_prerelease` | 3.14   | CUDA-X Data Science nightly wheels             |
 
 To run the test suite against a specific matrix combination:
 
@@ -254,11 +257,11 @@ The built docs are in `docs/_build/html/`.
 
 The project publishes three separate packages:
 
-| Package | Contents | For whom |
-|---|---|---|
-| `rapids-singlecell-cu12` | Prebuilt wheels (CUDA 12) | Most users |
-| `rapids-singlecell-cu13` | Prebuilt wheels (CUDA 13) | Most users |
-| `rapids-singlecell` | Source distribution | Self-compilation |
+| Package                  | Contents                  | For whom         |
+| ------------------------ | ------------------------- | ---------------- |
+| `rapids-singlecell-cu12` | Prebuilt wheels (CUDA 12) | Most users       |
+| `rapids-singlecell-cu13` | Prebuilt wheels (CUDA 13) | Most users       |
+| `rapids-singlecell`      | Source distribution       | Self-compilation |
 
 ### Wheel builds
 
@@ -288,10 +291,10 @@ See {ref}`container-deprecation` for migration options.
 
 The `docker/` directory contains the following recipes:
 
-| File | Purpose |
-|---|---|
-| `Dockerfile.deps` | Base image with conda CUDA-X Data Science environment + pip dependencies. Uses `nvidia/cuda:*-devel` for CUDA toolkit access. |
-| `Dockerfile` | Final image that builds on `rapids-singlecell-deps` and compiles rapids-singlecell from source for all supported GPU architectures. |
+| File              | Purpose                                                                                                                             |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `Dockerfile.deps` | Base image with conda CUDA-X Data Science environment + pip dependencies. Uses `nvidia/cuda:*-devel` for CUDA toolkit access.       |
+| `Dockerfile`      | Final image that builds on `rapids-singlecell-deps` and compiles rapids-singlecell from source for all supported GPU architectures. |
 
 The `.github/workflows/docker.yml` workflow builds these images using the repository as the `source` build context and passes the package version through `RSC_VERSION`.
 It removes the `rapids-singlecell` pip entry from the conda environment file before building the dependency image and publishes images on releases.

@@ -10,7 +10,7 @@ import scanpy as sc
 
 ## Workflow
 
-The workflow of *rapids-singlecell* is broadly the same as *scanpy's*.
+The workflow of _rapids-singlecell_ is broadly the same as _scanpy's_.
 For more information, see the tutorials and API documentation.
 
 ### Settings

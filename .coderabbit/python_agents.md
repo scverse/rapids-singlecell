@@ -18,6 +18,7 @@
 ## CRITICAL Issues (Always Comment)
 
 ### Algorithm Correctness
+
 - Logic errors in single-cell analysis implementations
 - Incorrect statistical computations (mean, variance, rank tests, p-values)
 - Numerical instability causing wrong results (overflow, underflow, precision loss)
@@ -26,17 +27,20 @@
 - **Data layout bugs**: incorrect sparse format assumptions (CSR vs CSC vs COO)
 
 ### GPU Memory Safety
+
 - Device memory leaks (CuPy arrays not freed, circular references)
 - Out-of-memory on large datasets (2M+ cells) due to unnecessary copies or intermediates
 - Silent data corruption from dtype mismatches between Python and CUDA kernels
 - **Passing float64 arrays to kernels templated on float32** (silent misinterpretation, not crashes)
 
 ### API Compatibility
+
 - Breaking changes to public function signatures
 - Behavior diverging from scanpy/squidpy/pertpy without justification
 - Removing or renaming public functions without deprecation
 
 ### Sparse Matrix Handling
+
 - Incorrect sparse format conversions (CSR↔CSC↔COO) causing wrong results
 - Unnecessary format conversions that waste GPU memory and time
 - Not handling sparse input when dense is expected (or vice versa)
@@ -44,6 +48,7 @@
 ## HIGH Issues (Comment if Substantial)
 
 ### Scalability
+
 **This library must handle datasets with millions of cells and thousands of groups.** Every review should consider: "What happens when this runs on 2M cells with 10,000 categories?" Code that works on 5,000 cells can silently produce wrong results, run out of memory, or take hours at real scale.
 
 - Unnecessary GPU↔CPU transfers (`.get()` calls in hot paths)
@@ -57,6 +62,7 @@
 - **Dense matrices where sparse would suffice** — a 2M x 30,000 dense float32 matrix is ~224GB
 
 ### Numerical Stability at Scale
+
 At millions of cells, numerical edge cases that "never happen" on small data become routine:
 
 - **Extreme z-scores**: Wilcoxon/t-test z-scores of |z| > 50 are common with 2M cells. Standard normal CDF (`ndtr`, `norm.sf`) underflows to 0.0 around z=37. Use `erfc(|z| / sqrt(2))` which is accurate to ~1e-300.
@@ -71,11 +77,13 @@ At millions of cells, numerical edge cases that "never happen" on small data bec
 **The general principle**: if a function computes statistics, distances, or p-values, assume it will see extreme values at scale. Choose numerically robust formulations (erfc over ndtr, log-space over linear, float64 over float32 for accumulators) even if the simpler version "works" on test data.
 
 ### Input Validation
+
 - Missing checks for required `.obs`/`.var` columns in AnnData
 - Not handling edge cases (zero cells in a group, single gene, empty selections)
 - Using truthiness checks (`if layer_key:`) instead of `is None` / `is not None` for optional parameters
 
 ### Test Quality
+
 - Missing validation of numerical correctness (only checking "runs without error")
 - Missing comparison with scanpy/squidpy/pertpy reference implementations
 - Missing edge case coverage (empty groups, single cell, all-zero genes)
@@ -85,20 +93,24 @@ At millions of cells, numerical edge cases that "never happen" on small data bec
 - **Never change test tolerances without justification** (state current, proposed, actual error, and reason)
 
 ### Documentation
+
 - Missing or incorrect docstrings for public functions
 - Parameters not documented
 - Missing notes about GPU-specific behavior differences
 
 ### Security
+
 - Unsafe deserialization of data files
 - Missing bounds checking allowing resource exhaustion
 
 ### Magic Numbers
+
 - Hard-coded numeric literals (128, 256, 512, 1024, etc.) in kernel configurations, thresholds, or tile sizes without named constants
 - Use descriptive constants: `BLOCK_SIZE = 256`, `SHARED_MEM_THRESHOLD = 48 * 1024`
 - Tile sizes, block dimensions, and heuristic thresholds must all be named
 
 ### Missing Kernel Error Checking
+
 - After calling nanobind CUDA kernel wrappers from Python, the next CuPy operation may silently consume a pending CUDA error
 - After RawKernel launches, call `cp.cuda.runtime.getLastError()` to surface launch failures immediately (e.g., shared memory overflow, invalid grid dimensions)
 - This is especially important in development and testing — a kernel that silently fails produces garbage results that look like algorithm bugs
@@ -293,6 +305,7 @@ Consider: Document the actual error and why the increase is acceptable
 ## Common Bug Patterns
 
 ### 1. dtype Promotion Issues
+
 **Pattern**: Mixing Python float scalars with float32 CuPy arrays
 
 **Red flags**:
@@ -301,6 +314,7 @@ Consider: Document the actual error and why the increase is acceptable
 - Not casting scalars to `array.dtype.type(value)`
 
 ### 2. Group Computation Waste
+
 **Pattern**: Computing over all groups then filtering results
 
 **Red flags**:
@@ -309,6 +323,7 @@ Consider: Document the actual error and why the increase is acceptable
 - Missing early subsetting of AnnData to requested groups
 
 ### 3. Sparse Format Mismatch
+
 **Pattern**: Incorrect assumptions about sparse matrix format
 
 **Red flags**:
@@ -317,6 +332,7 @@ Consider: Document the actual error and why the increase is acceptable
 - Format conversion in hot paths (inside loops)
 
 ### 4. GPU Sync Overhead
+
 **Pattern**: Individual element access on GPU arrays from Python
 
 **Red flags**:
@@ -325,6 +341,7 @@ Consider: Document the actual error and why the increase is acceptable
 - `.get()` calls inside loops instead of bulk transfer
 
 ### 5. Numerical Approaches That Break at Scale
+
 **Pattern**: Using formulations that work on small data but fail with millions of cells
 
 **Red flags**:
@@ -338,6 +355,7 @@ Consider: Document the actual error and why the increase is acceptable
 **The principle**: At 2M cells with 10K categories, every "rare" edge case becomes routine — extreme z-scores (|z| > 50), near-zero variances, massive tie counts, near-singular matrices. Choose formulations that are robust across the full range, not just correct on textbook examples. If a simpler formulation breaks at scale, the robust one is the correct one.
 
 ### 6. None Check Errors
+
 **Pattern**: Using truthiness instead of identity checks for optional parameters
 
 **Red flags**:
@@ -350,6 +368,7 @@ Consider: Document the actual error and why the increase is acceptable
 ## Code Review Checklists
 
 ### When Reviewing Preprocessing Functions
+
 - [ ] Does the function handle both sparse and dense input?
 - [ ] Are results stored in the correct AnnData slot?
 - [ ] Is the computation in-place when `copy=False`?
@@ -357,24 +376,28 @@ Consider: Document the actual error and why the increase is acceptable
 - [ ] Does behavior match scanpy for the same parameters?
 
 ### When Reviewing Kernel Wrappers
+
 - [ ] Is the array dtype checked before passing to the kernel?
 - [ ] Are launch configurations (grid, block) computed correctly?
 - [ ] Is shared memory usage within device limits?
 - [ ] Are results transferred back correctly?
 
 ### When Reviewing Statistical Tests
+
 - [ ] Are p-values computed correctly (two-sided vs one-sided)?
 - [ ] Are ties handled properly in rank tests?
 - [ ] Is multiple testing correction applied where expected?
 - [ ] Do results match scanpy/scipy for the same inputs?
 
 ### When Reviewing Multi-GPU Code
+
 - [ ] Is work split without interleaving across devices?
 - [ ] Are streams properly managed per device?
 - [ ] Does single-GPU case work (early return)?
 - [ ] Are results gathered and combined correctly?
 
 ### When Reviewing Tests
+
 - [ ] Are numerical results compared with reference implementations?
 - [ ] Are edge cases tested (empty, single cell, all-zero)?
 - [ ] Are both sparse and dense inputs tested?
