@@ -864,6 +864,47 @@ def test_wilcoxon_expression_space_logfoldchanges(groups, reference, pts, fmt):
                 np.testing.assert_allclose(result["pts_rest"][group].to_numpy(), (rest > 0).mean(0))
 
 
+# Expression-space means invert the native values: integers float32 cannot hold
+# exactly (here with a log base near 1, where they stay finite) are not rounded.
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_dense"])
+def test_wilcoxon_expression_space_wide_integers(fmt):
+    X = np.array([[2**24], [2**24], [2**24 + 1], [2**24 + 1]], dtype=np.int64)
+    obs = pd.DataFrame({"g": pd.Categorical(["r", "r", "t", "t"])})
+    lfc = {}
+    for dtype in (np.int64, np.float64):
+        adata = sc.AnnData(X=_to_format(X.astype(dtype), fmt), obs=obs.copy())
+        adata.uns["log1p"] = {"base": np.exp(4e-5)}
+        kw = {"groups": ["t"], "reference": "r", "mean_in_log_space": False, "use_raw": False}
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", **kw)
+        lfc[dtype] = adata.uns["rank_genes_groups"]["logfoldchanges"]["t"]
+    np.testing.assert_allclose(lfc[np.int64], 4e-5 / np.log(2), rtol=1e-6)
+    np.testing.assert_array_equal(lfc[np.int64], lfc[np.float64])
+
+
+# Stream-ordered pools (CuPy MemoryAsyncPool, RMM async) allocate the kernels'
+# scratch on the caller's stream; the workers must wait for it.
+@pytest.mark.parametrize("reference", ["rest", "1"])
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "numpy_dense_f", "scipy_csr", "scipy_csc", "cupy_dense", "cupy_csr", "cupy_csc"]
+)
+def test_wilcoxon_async_allocator_matches_default(fmt, reference):
+    rng = np.random.default_rng(11)
+    dense = (rng.poisson(1.0, (600, 70)) * (rng.random((600, 70)) < 0.6)).astype(np.float32)
+    obs = pd.DataFrame({"g": pd.Categorical(rng.choice(list("0123"), 600))})
+    X = np.asfortranarray(dense) if fmt == "numpy_dense_f" else _to_format(dense, fmt)
+    expected, actual = sc.AnnData(X=X, obs=obs.copy()), sc.AnnData(X=X, obs=obs.copy())
+    kw = {"method": "wilcoxon", "reference": reference, "use_raw": False, "multi_gpu": False}
+    rsc.tl.rank_genes_groups(expected, "g", **kw)
+    allocator = cp.cuda.get_allocator()
+    cp.cuda.set_allocator(cp.cuda.MemoryAsyncPool().malloc)
+    try:
+        with cp.cuda.Stream(non_blocking=True):
+            rsc.tl.rank_genes_groups(actual, "g", **kw)
+    finally:
+        cp.cuda.set_allocator(allocator)
+    _assert_multi_gpu_wilcoxon_equal(actual, expected)
+
+
 # pts count nonzero values: explicitly stored zeros are not expressed (scanpy
 # calls eliminate_zeros() before counting).
 @pytest.mark.parametrize("mean_in_log_space", [True, False])
@@ -1209,11 +1250,13 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
                 )
 
 
+@pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("fmt", ["numpy_dense", "numpy_dense_f", "scipy_csr"])
-def test_wilcoxon_ovo_host_subset_passes_only_selected_rows(fmt, monkeypatch):
-    """Host OVO keeps the matrix whole and hands the kernels only the selected rows."""
+def test_wilcoxon_ovo_host_subset_passes_only_selected_rows(fmt, pinned, monkeypatch):
+    """Host OVO keeps the matrix whole and hands the kernels only the selected rows, staged through reused pageable
+    or pinned slots over ten 4-gene batches (the last one gene wide)."""
     rng = np.random.default_rng(3)
-    dense = rng.integers(0, 6, size=(240, 12)).astype(np.float32)
+    dense = rng.integers(0, 6, size=(240, 37)).astype(np.float32)
     dense[dense < 2] = 0.0
     obs = pd.DataFrame({"group": pd.Categorical([str(i % 8) for i in range(240)])})
     X = np.asfortranarray(dense) if fmt == "numpy_dense_f" else _to_format(dense, fmt)
@@ -1226,8 +1269,14 @@ def test_wilcoxon_ovo_host_subset_passes_only_selected_rows(fmt, monkeypatch):
         return binding(*args, **kw)
 
     monkeypatch.setattr(_wc, name, spy)
+    monkeypatch.setitem(_wilcoxon._SUB_BATCH, ("csr_host" if fmt == "scipy_csr" else "dense", False), 4)
     kw = {"method": "wilcoxon", "groups": ["1", "2"], "reference": "0", "use_raw": False, "multi_gpu": False}
-    rsc.tl.rank_genes_groups(host, "group", **kw)
+    stage_bytes = _wc._set_pageable_stage_bytes(0) if pinned else None
+    try:
+        rsc.tl.rank_genes_groups(host, "group", **kw)
+    finally:
+        if pinned:
+            _wc._set_pageable_stage_bytes(stage_bytes)
     monkeypatch.undo()
     rsc.tl.rank_genes_groups(device, "group", **kw)
 
@@ -2385,6 +2434,7 @@ def test_wilcoxon_ovo_more_groups_than_grid_y(tie_correct):
     ref = rng.integers(0, 5, (n_ref, n_cols)).astype(np.float32)
     grp = rng.integers(0, 5, (n_groups, n_cols)).astype(np.float32)
     rank_sums = cp.empty((n_groups, n_cols), dtype=cp.float64)
+    tie_corr = cp.ones((n_groups, n_cols) if tie_correct else (1,), dtype=cp.float64)
     _wc.ovo_dense(
         cp.asfortranarray(cp.asarray(np.vstack([ref, grp]))),
         cp.arange(n_ref, dtype=cp.int32),
@@ -2392,7 +2442,7 @@ def test_wilcoxon_ovo_more_groups_than_grid_y(tie_correct):
         cp.arange(n_groups + 1, dtype=cp.int32),
         cp.full(n_ref + n_groups, -1, dtype=cp.int32),  # no stats rows
         rank_sums,
-        cp.ones((n_groups, n_cols) if tie_correct else (1,), dtype=cp.float64),
+        tie_corr,
         cp.zeros((n_groups + 1, n_cols), dtype=cp.float64),
         cp.zeros((1, 1), dtype=cp.float64),
         compute_tie_corr=tie_correct,
@@ -2401,6 +2451,11 @@ def test_wilcoxon_ovo_more_groups_than_grid_y(tie_correct):
     )
     expected = 1 + (ref[None] < grp[:, None]).sum(1) + 0.5 * (ref[None] == grp[:, None]).sum(1)
     cp.testing.assert_allclose(rank_sums, cp.asarray(expected))
+    if tie_correct:  # 1 - sum(t^3 - t) / (n^3 - n) over the tie blocks of the reference plus the group's cell
+        counts = np.stack([(ref == v).sum(0) for v in range(5)])
+        joined = counts[grp.astype(int), np.arange(n_cols)]  # reference cells tied with the group's cell
+        blocks = (counts**3 - counts).sum(0) + 3 * joined * (joined + 1)
+        cp.testing.assert_allclose(tie_corr, cp.asarray(1 - blocks / ((n_ref + 1) ** 3 - (n_ref + 1))))
 
 
 def _assert_multi_gpu_wilcoxon_equal(actual, expected):

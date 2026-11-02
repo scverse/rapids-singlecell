@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "wilcoxon_sparse.cuh"
@@ -21,6 +22,17 @@ static int fit_dense_width(int width, int n_cols, size_t col_bytes) {
         1, std::min({(size_t)width, (size_t)n_cols, cols}));
 }
 
+// Start the workers after everything queued on `upstream` so far: the inputs
+// and the scratch, which stream-ordered allocators (CuPy/RMM async pools)
+// allocate on the caller's stream.
+static void wait_upstream(const ScopedCudaStreams& streams,
+                          cudaStream_t upstream, const char* context) {
+    ScopedCudaEvent ready(cudaEventDisableTiming);
+    ready.record(upstream);
+    for (cudaStream_t s : streams.streams)
+        cuda_check(cudaStreamWaitEvent(s, ready.get(), 0), context);
+}
+
 // Device view of dense column batch [col, col + sb_cols) of X (n_rows x ld):
 // device input is used in place; host input is copied into `stage` (F-order
 // contiguously, C-order as a 2D copy). Given host row ids `rows` (n_rows of
@@ -33,17 +45,21 @@ static int dense_batch(const T* X, bool on_host, bool f_order, int ld,
                        const int* rows = nullptr, int n_full_rows = 0,
                        T* h_stage = nullptr) {
     if (rows) {
-        host_parallel_ranges(f_order ? sb_cols : n_rows, [&](int a, int b) {
-            for (int k = a; k < b; k++) {
+        // Threads split the staged elements, which run along a column (F)
+        // or a row (C), so a narrow batch still gathers in parallel.
+        int run = f_order ? n_rows : sb_cols;
+        host_parallel_ranges(n_rows * sb_cols, [&](int e0, int e1) {
+            for (int e = e0; e < e1;) {
+                int o = e / run, i = e - o * run, n = std::min(e1 - e, run - i);
                 if (f_order) {
-                    const T* in = X + (size_t)(col + k) * n_full_rows;
-                    T* out = h_stage + (size_t)k * n_rows;
-                    for (int i = 0; i < n_rows; i++) out[i] = in[rows[i]];
+                    const T* in = X + (size_t)(col + o) * n_full_rows;
+                    for (int j = 0; j < n; j++)
+                        h_stage[e + j] = in[rows[i + j]];
                 } else {
-                    std::memcpy(h_stage + (size_t)k * sb_cols,
-                                X + (size_t)rows[k] * ld + col,
-                                (size_t)sb_cols * sizeof(T));
+                    std::memcpy(h_stage + e, X + (size_t)rows[o] * ld + col + i,
+                                (size_t)n * sizeof(T));
                 }
+                e += n;
             }
         });
         cudaMemcpyAsync(stage, h_stage, (size_t)n_rows * sb_cols * sizeof(T),
@@ -81,29 +97,41 @@ static void ovr_dense(const T* X, bool on_host, bool f_order, int ld,
     if (n_rows == 0 || n_cols == 0 || n_groups == 0) return;
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
     const bool direct_keys = f_order && std::is_same<T, float>::value;
-    // Per item: host stage, keys in/out, rows in/out and CUB's pair buffers.
-    sub_batch_cols = fit_dense_width(
-        sub_batch_cols, n_cols,
-        (size_t)n_rows *
-            ((on_host ? sizeof(T) : 0) + (direct_keys ? 0 : sizeof(float)) +
-             sizeof(float) + 2 * sizeof(int) + 2 * sizeof(float)));
-
-    DenseColumnBatchPlan batches = plan_dense_column_batches(
-        n_rows, n_cols, sub_batch_cols, SAFE_BATCH_NNZ, "Dense OVR sub-batch");
-    sub_batch_cols = batches.sub_batch_cols;
-    size_t sub_items = batches.max_items;
-    size_t cub_temp_bytes = cub_segmented_sortpairs_temp_bytes(
-        checked_cub_items(sub_items, "Dense OVR sub-batch"), sub_batch_cols);
-    size_t per_stream = sub_items * ((on_host ? sizeof(T) : 0) +
-                                     (direct_keys ? 0 : sizeof(float)) +
-                                     sizeof(float) + sizeof(int)) +
-                        cub_temp_bytes;
-    int n_streams =
-        clamp_streams_by_budget(clamp_streams_by_cols(n_cols, sub_batch_cols),
-                                per_stream, rmm_available_device_bytes(0.8));
+    DenseColumnBatchPlan batches;
+    size_t sub_items = 0, cub_temp_bytes = 0, per_stream = 0;
+    int n_streams = 1;
+    // Plans batches of w columns; returns the scratch they take.
+    auto plan = [&](int w) {
+        batches = plan_dense_column_batches(n_rows, n_cols, w, SAFE_BATCH_NNZ,
+                                            "Dense OVR sub-batch");
+        sub_items = batches.max_items;
+        cub_temp_bytes = cub_segmented_sortpairs_temp_bytes(
+            checked_cub_items(sub_items, "Dense OVR sub-batch"),
+            batches.sub_batch_cols);
+        per_stream = sub_items * ((on_host ? sizeof(T) : 0) +
+                                  (direct_keys ? 0 : sizeof(float)) +
+                                  sizeof(float) + sizeof(int)) +
+                     cub_temp_bytes;
+        n_streams = clamp_streams_by_budget(
+            clamp_streams_by_cols(n_cols, batches.sub_batch_cols), per_stream,
+            rmm_available_device_bytes(0.8));
+        return (sub_items + batches.sub_batch_cols + 1) * sizeof(int) +
+               n_streams * per_stream;
+    };
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    // Keep the requested width if its scratch can be allocated: a warmed pool
+    // holds reusable memory that cudaMemGetInfo does not count. Otherwise fit
+    // the free memory (per item: host stage, keys in/out, rows in/out and
+    // CUB's pair buffers).
+    if (!pool.try_reserve(plan(std::min(sub_batch_cols, n_cols))))
+        pool.reserve(plan(fit_dense_width(
+            sub_batch_cols, n_cols,
+            (size_t)n_rows *
+                ((on_host ? sizeof(T) : 0) + (direct_keys ? 0 : sizeof(float)) +
+                 sizeof(float) + 2 * sizeof(int) + 2 * sizeof(float)))));
+    sub_batch_cols = batches.sub_batch_cols;
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
     // CUB only reads the iota rows and linear offsets: fill once, share.
     int* rows_in = pool.alloc<int>(sub_items);
@@ -112,8 +140,6 @@ static void ovr_dense(const T* X, bool on_host, bool f_order, int ld,
         rows_in, n_rows, sub_batch_cols);
     CUDA_CHECK_LAST_ERROR(fill_row_indices_kernel);
     upload_linear_offsets(offsets, sub_batch_cols, n_rows, upstream);
-    ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
-    inputs_ready.record(upstream);
 
     struct StreamBuf {
         T* stage;
@@ -123,15 +149,14 @@ static void ovr_dense(const T* X, bool on_host, bool f_order, int ld,
         uint8_t* cub_temp;
     };
     std::vector<StreamBuf> bufs(n_streams);
-    for (int s = 0; s < n_streams; ++s) {
-        cuda_check(cudaStreamWaitEvent(streams[s], inputs_ready.get(), 0),
-                   "dense OVR wait for inputs");
-        bufs[s].stage = on_host ? pool.alloc<T>(sub_items) : nullptr;
-        bufs[s].keys_in = direct_keys ? nullptr : pool.alloc<float>(sub_items);
-        bufs[s].keys_out = pool.alloc<float>(sub_items);
-        bufs[s].rows_out = pool.alloc<int>(sub_items);
-        bufs[s].cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
+    for (auto& buf : bufs) {
+        buf.stage = on_host ? pool.alloc<T>(sub_items) : nullptr;
+        buf.keys_in = direct_keys ? nullptr : pool.alloc<float>(sub_items);
+        buf.keys_out = pool.alloc<float>(sub_items);
+        buf.rows_out = pool.alloc<int>(sub_items);
+        buf.cub_temp = pool.alloc<uint8_t>(cub_temp_bytes);
     }
+    wait_upstream(streams, upstream, "dense OVR wait for inputs");
 
     for (int col = 0, b = 0; col < n_cols; col += sub_batch_cols, ++b) {
         int sb_cols = std::min(sub_batch_cols, n_cols - col);
@@ -188,45 +213,50 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
     if (n_cols == 0 || n_ref == 0 || n_all_grp == 0 || n_groups == 0) return;
     if (sub_batch_cols <= 0) sub_batch_cols = SUB_BATCH_COLS;
     OvoRanker ranker(h_offsets, n_groups, compute_tie_corr);
-    sub_batch_cols =
-        fit_dense_width(sub_batch_cols, n_cols,
-                        (on_host ? (size_t)n_rows * sizeof(T) : 0) +
-                            (3 * (size_t)n_ref + n_all_grp) * sizeof(float) +
-                            ranker.scratch_bytes(n_all_grp, 1));
-
-    DenseColumnBatchPlan batches = plan_dense_column_batches(
-        n_rows, n_cols, sub_batch_cols, SAFE_BATCH_NNZ, "Dense OVO sub-batch");
-    sub_batch_cols = batches.sub_batch_cols;
-    size_t ref_items = (size_t)n_ref * sub_batch_cols;
-    size_t grp_items = (size_t)n_all_grp * sub_batch_cols;
-    size_t ref_cub_bytes = cub_segmented_sortkeys_temp_bytes(
-        checked_cub_items(ref_items, "Dense OVO reference sub-batch"),
-        sub_batch_cols);
-    size_t per_stream = (on_host ? batches.max_items * sizeof(T) : 0) +
-                        (2 * ref_items + grp_items) * sizeof(float) +
-                        ref_cub_bytes +
-                        ranker.scratch_bytes(grp_items, sub_batch_cols);
-    int n_streams =
-        clamp_streams_by_budget(clamp_streams_by_cols(n_cols, sub_batch_cols),
-                                per_stream, rmm_available_device_bytes(0.8));
+    DenseColumnBatchPlan batches;
+    size_t ref_items = 0, grp_items = 0, ref_cub_bytes = 0, per_stream = 0;
+    int n_streams = 1;
+    // Plans batches of w columns; returns the scratch they take.
+    auto plan = [&](int w) {
+        batches = plan_dense_column_batches(n_rows, n_cols, w, SAFE_BATCH_NNZ,
+                                            "Dense OVO sub-batch");
+        int cols = batches.sub_batch_cols;
+        ref_items = (size_t)n_ref * cols;
+        grp_items = (size_t)n_all_grp * cols;
+        ref_cub_bytes = cub_segmented_sortkeys_temp_bytes(
+            checked_cub_items(ref_items, "Dense OVO reference sub-batch"),
+            cols);
+        per_stream = (on_host ? batches.max_items * sizeof(T) : 0) +
+                     (2 * ref_items + grp_items) * sizeof(float) +
+                     ref_cub_bytes + ranker.scratch_bytes(grp_items, cols);
+        n_streams = clamp_streams_by_budget(clamp_streams_by_cols(n_cols, cols),
+                                            per_stream,
+                                            rmm_available_device_bytes(0.8));
+        return (cols + 1) * sizeof(int) + n_streams * per_stream;
+    };
 
     // pool first: streams drain before it frees their scratch (see guard doc).
     RmmScratchPool pool;
+    // The requested width if its scratch can be allocated, as in ovr_dense.
+    if (!pool.try_reserve(plan(std::min(sub_batch_cols, n_cols))))
+        pool.reserve(plan(fit_dense_width(
+            sub_batch_cols, n_cols,
+            (on_host ? (size_t)n_rows * sizeof(T) : 0) +
+                (3 * (size_t)n_ref + n_all_grp) * sizeof(float) +
+                ranker.scratch_bytes(n_all_grp, 1))));
+    sub_batch_cols = batches.sub_batch_cols;
     // Gathered rows stage like host CSR: pinned slots only past
-    // CSR_RANGE_PAGEABLE_STAGE_BYTES, else one pageable slot.
+    // pageable_stage_bytes, else one pageable slot.
     std::unique_ptr<PinnedRing<T>> h_stage;
     if (rows) {
-        bool pin = (size_t)n_rows * n_cols * sizeof(T) >
-                   CSR_RANGE_PAGEABLE_STAGE_BYTES;
+        bool pin = (size_t)n_rows * n_cols * sizeof(T) > pageable_stage_bytes;
         h_stage.reset(new PinnedRing<T>(pin ? n_streams : 1, batches.max_items,
                                         false, pin));
     }
     ScopedCudaStreams streams(n_streams, cudaStreamNonBlocking);
-    ranker.upload_huge_ids(pool);
+    ranker.upload_huge_ids(pool, upstream);
     int* ref_offsets = pool.alloc<int>(sub_batch_cols + 1);
     upload_linear_offsets(ref_offsets, sub_batch_cols, n_ref, upstream);
-    ScopedCudaEvent inputs_ready(cudaEventDisableTiming);
-    inputs_ready.record(upstream);
 
     struct StreamBuf {
         T* stage;
@@ -237,16 +267,15 @@ static void ovo_dense(const T* X, bool on_host, bool f_order, int ld,
         OvoScratch ovo;
     };
     std::vector<StreamBuf> bufs(n_streams);
-    for (int s = 0; s < n_streams; ++s) {
-        cuda_check(cudaStreamWaitEvent(streams[s], inputs_ready.get(), 0),
-                   "dense OVO wait for inputs");
-        bufs[s].stage = on_host ? pool.alloc<T>(batches.max_items) : nullptr;
-        bufs[s].ref = pool.alloc<float>(ref_items);
-        bufs[s].ref_sorted = pool.alloc<float>(ref_items);
-        bufs[s].grp = pool.alloc<float>(grp_items);
-        bufs[s].ref_cub = pool.alloc<uint8_t>(ref_cub_bytes);
-        bufs[s].ovo = ranker.alloc(pool, grp_items, sub_batch_cols);
+    for (auto& buf : bufs) {
+        buf.stage = on_host ? pool.alloc<T>(batches.max_items) : nullptr;
+        buf.ref = pool.alloc<float>(ref_items);
+        buf.ref_sorted = pool.alloc<float>(ref_items);
+        buf.grp = pool.alloc<float>(grp_items);
+        buf.ref_cub = pool.alloc<uint8_t>(ref_cub_bytes);
+        buf.ovo = ranker.alloc(pool, grp_items, sub_batch_cols);
     }
+    wait_upstream(streams, upstream, "dense OVO wait for inputs");
 
     for (int col = 0, b = 0; col < n_cols; col += sub_batch_cols, ++b) {
         int sb_cols = std::min(sub_batch_cols, n_cols - col);
@@ -714,7 +743,7 @@ static void def_sparse(nb::module_& m) {
             if (n_ref == 0 || h_offsets[n_groups] == 0) return;
             OvoRanker ranker(h_offsets.data(), n_groups, compute_tie_corr);
             RmmScratchPool pool;
-            ranker.upload_huge_ids(pool);
+            ranker.upload_huge_ids(pool, 0);  // the drivers sync the device
             OvoBatchRanker rank{
                 ref_map.data(),     grp_map.data(), ref_rows.data(),
                 grp_rows.data(),    n_ref,          h_offsets[n_groups],
@@ -800,6 +829,10 @@ void register_bindings(nb::module_& m) {
 
 NB_MODULE(_wilcoxon_cuda, m) {
     m.def("_set_host_worker_limit", &set_host_worker_limit, "limit"_a);
+    m.def(
+        "_set_pageable_stage_bytes",
+        [](size_t bytes) { return std::exchange(pageable_stage_bytes, bytes); },
+        "bytes"_a);
     register_scratch_allocator(m);
     def_csr_row_boundaries_host<int, int>(m);
     def_csr_row_boundaries_host<int64_t, int64_t>(m);

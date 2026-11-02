@@ -43,9 +43,19 @@ class _OvoHostContext:
 _WilcoxonResult = tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None]
 
 
-def _host_sparse_kernel_source(X):
+def _kernel_dtype(dtype, *, exact: bool):
+    """Float dtype the kernels read.
+
+    float64 stays float64; with ``exact`` (expression-space means invert the native values), so do integers float32
+    cannot hold exactly. Everything else becomes float32.
+    """
+    dtype = np.dtype(dtype)
+    return np.float64 if dtype == np.float64 or (exact and dtype.kind in "iu" and dtype.itemsize >= 4) else np.float32
+
+
+def _host_sparse_kernel_source(X, *, exact: bool = False):
     """Normalize sparse values once; index arrays stay shared unless strided."""
-    dtype = np.float64 if X.data.dtype == np.float64 else np.float32
+    dtype = _kernel_dtype(X.data.dtype, exact=exact)
     data = np.ascontiguousarray(X.data, dtype=dtype)
     indices, indptr = np.ascontiguousarray(X.indices), np.ascontiguousarray(X.indptr)
     if data is X.data and indices is X.indices and indptr is X.indptr:
@@ -55,9 +65,9 @@ def _host_sparse_kernel_source(X):
     return source
 
 
-def _host_dense_matrix(matrix: np.ndarray) -> np.ndarray:
+def _host_dense_matrix(matrix: np.ndarray, *, exact: bool = False) -> np.ndarray:
     if matrix.dtype.kind != "f" or matrix.dtype.itemsize < 4:
-        return np.asarray(matrix, dtype=np.float32, order="F")
+        return np.asarray(matrix, dtype=_kernel_dtype(matrix.dtype, exact=exact), order="F")
     if matrix.flags.c_contiguous or matrix.flags.f_contiguous:
         return matrix
     return np.asfortranarray(matrix)
@@ -372,14 +382,15 @@ def _run_sharded_wilcoxon(
     ranges = _split_gene_ranges(X, n_devices=len(device_ids))
     device_ids = device_ids[: len(ranges)]
     ovo_host_context = _build_ovo_host_context(shard_rg) if rg.ireference is not None else None
-    dense_source = _host_dense_matrix(X) if isinstance(X, np.ndarray) else None
+    exact = not rg.mean_in_log_space
+    dense_source = _host_dense_matrix(X, exact=exact) if isinstance(X, np.ndarray) else None
     csr_row_spans = [None] * len(ranges)
     if is_device_input:
         kernel_inputs = _prepare_device_column_shards(X, ranges, device_ids)
     elif dense_source is not None:
         kernel_inputs = [dense_source] * len(ranges)
     else:
-        sparse_source = _host_sparse_kernel_source(X)
+        sparse_source = _host_sparse_kernel_source(X, exact=exact)
         if sparse_source.format == "csr":
             kernel_inputs = [sparse_source] * len(ranges)
             if len(ranges) == 1:

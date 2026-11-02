@@ -443,12 +443,16 @@ struct OvoRanker {
         return bytes;
     }
 
-    void upload_huge_ids(RmmScratchPool& pool) {
+    // Queued on `stream`, which the workers must wait for: a pageable
+    // cudaMemcpy may return before its DMA lands.
+    void upload_huge_ids(RmmScratchPool& pool, cudaStream_t stream) {
         if (huge_ids.empty()) return;
         int* d = pool.alloc<int>(huge_ids.size());
-        cuda_check(cudaMemcpy(d, huge_ids.data(), huge_ids.size() * sizeof(int),
-                              cudaMemcpyHostToDevice),
-                   "OVO HUGE group ids H2D");
+        cudaDeviceSynchronize();  // as in upload_batch_offsets
+        cuda_check(
+            cudaMemcpyAsync(d, huge_ids.data(), huge_ids.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, stream),
+            "OVO HUGE group ids H2D");
         d_huge_ids = d;
     }
 

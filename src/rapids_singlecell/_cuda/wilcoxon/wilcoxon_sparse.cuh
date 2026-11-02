@@ -26,8 +26,9 @@ constexpr int CSR_RANGE_STAGE_SLOTS = 3;
 constexpr int CSR_RANGE_METADATA_SLOTS = 2;
 // Host CSR calls staging less than this copy from one pageable slot: pinning a
 // ring per call (write-combined, ~0.16 ms/MB) costs more than the slower
-// pageable copies, which run at about half the pinned bandwidth.
-constexpr size_t CSR_RANGE_PAGEABLE_STAGE_BYTES = (size_t)2 << 30;
+// pageable copies, which run at about half the pinned bandwidth. Tests lower
+// it (_set_pageable_stage_bytes) to cover the pinned ring.
+inline size_t pageable_stage_bytes = (size_t)2 << 30;
 constexpr size_t CSR_RANGE_COUNT_CACHE_LIMIT_BYTES = (size_t)384 * 1024 * 1024;
 
 // Count entries in [col_start, col_stop) for each canonical CSR row.
@@ -323,7 +324,8 @@ struct OvoBatchRanker {
     size_t bytes(size_t, int sb_cols) const {
         size_t grp_items = (size_t)n_all_grp * sb_cols;
         return ((size_t)2 * n_ref * sb_cols + grp_items) * sizeof(float) +
-               cub_temp(sb_cols) + ranker->scratch_bytes(grp_items, sb_cols);
+               (sb_cols + 1) * sizeof(int) + cub_temp(sb_cols) +
+               ranker->scratch_bytes(grp_items, sb_cols);
     }
     // Dense slabs bound the batch width: int32 items and half the free memory.
     int max_cols() const {
@@ -338,10 +340,11 @@ struct OvoBatchRanker {
         s.ref_sorted = pool.alloc<float>((size_t)n_ref * sb_cols);
         s.grp = pool.alloc<float>((size_t)n_all_grp * sb_cols);
         s.ref_offsets = pool.alloc<int>(sb_cols + 1);
-        upload_linear_offsets(s.ref_offsets, sb_cols, n_ref, stream);
         s.cub_bytes = cub_temp(sb_cols);
         s.cub = pool.alloc<uint8_t>(s.cub_bytes);
         s.ovo = ranker->alloc(pool, (size_t)n_all_grp * sb_cols, sb_cols);
+        cudaDeviceSynchronize();  // as in upload_batch_offsets
+        upload_linear_offsets(s.ref_offsets, sb_cols, n_ref, stream);
         return s;
     }
     void zero_slabs(const Scratch& s, int n_cols, cudaStream_t stream) const {
@@ -457,6 +460,15 @@ static void sparse_csc(const InT* data, const IndexT* indices,
     std::unique_ptr<PinnedRing<InT, int>> stage;
     if (bounded) stage.reset(new PinnedRing<InT, int>(n_streams, max_nnz));
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+    // What the stream buffers below take (per_stream budgets the host case).
+    size_t stream_bytes =
+        max_nnz *
+            (sizeof(float) + (on_host ? RAW_BYTES<InT> : 0) +
+             (on_host && !bounded ? sizeof(IndexT) : 0) +
+             (bounded || sizeof(IndexT) > sizeof(int) ? sizeof(int) : 0)) +
+        rank.bytes(max_nnz, sb);
+    pool.reserve(batches.offsets.size() * sizeof(int) +
+                 n_streams * stream_bytes);
     int* d_offsets = upload_batch_offsets(batches, pool);
     struct StreamBuf {
         InT* data;
@@ -547,6 +559,7 @@ static void ovo_csr_device(const InT* data, const IndexT* indices,
                                             rmm_available_device_bytes(0.8));
     RmmScratchPool pool;
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+    pool.reserve(n_streams * rank.bytes(0, sb));
     std::vector<OvoBatchRanker::Scratch> scratch;
     for (int s = 0; s < n_streams; s++)
         scratch.push_back(rank.alloc(pool, 0, sb, streams[s]));
@@ -573,6 +586,7 @@ static void sparse_csr_device(const InT* data, const IndexT* indices,
     std::vector<unsigned int> col_counts(n_cols);
     {
         unsigned int* d_counts = pool.alloc<unsigned int>(n_cols);
+        cudaDeviceSynchronize();  // as in upload_batch_offsets
         cudaMemset(d_counts, 0, n_cols * sizeof(unsigned int));
         csr_col_histogram_kernel<<<(n_rows + UTIL_BLOCK_SIZE - 1) /
                                        UTIL_BLOCK_SIZE,
@@ -597,6 +611,10 @@ static void sparse_csr_device(const InT* data, const IndexT* indices,
         clamp_streams_by_budget(clamp_streams_by_cols(n_cols, sb), per_stream,
                                 rmm_available_device_bytes(0.8));
     ScopedCudaStreams streams(n_streams, cudaStreamDefault);
+    pool.reserve(
+        batches.offsets.size() * sizeof(int) +
+        n_streams * (sb * sizeof(int) + rank.bytes(max_nnz, sb) +
+                     max_nnz * (sizeof(float) + RAW_BYTES<InT> + sizeof(int))));
     int* d_offsets = upload_batch_offsets(batches, pool);
     struct StreamBuf {
         int* write_pos;
@@ -983,8 +1001,8 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
     // interval crosses the bus.
     size_t staged_nnz = 0;
     for (size_t nnz : batches.nnz) staged_nnz += nnz;
-    bool pin = staged_nnz * (sizeof(InT) + sizeof(StageIndexT)) >
-               CSR_RANGE_PAGEABLE_STAGE_BYTES;
+    bool pin =
+        staged_nnz * (sizeof(InT) + sizeof(StageIndexT)) > pageable_stage_bytes;
     size_t stage_nnz = max_batch_nnz ? max_batch_nnz : 1;
     size_t range_stage_target =
         std::max(std::clamp(staged_nnz / 256, CSR_RANGE_MIN_STAGE_ITEMS,
@@ -1011,13 +1029,18 @@ static void sparse_csr_host_typed(const InT* h_data, const IndexT* h_indices,
     StageIndexT* d_gather_cols[n_gather];
     int* d_gather_indptr[n_gather];
     const int n_bufs = std::min(n_gather, n_batches);  // one batch: no overlap
+    slab_cols = std::min(slab_cols, sub_batch_cols);
+    size_t csc_nnz = ovo ? 0 : max_batch_nnz;
+    pool.reserve(n_bufs * (max_batch_nnz * (sizeof(InT) + sizeof(StageIndexT)) +
+                           ((size_t)n_rows + 1) * sizeof(int)) +
+                 (3 * (size_t)sub_batch_cols + 2) * sizeof(int) +
+                 csc_nnz * (sizeof(float) + RAW_BYTES<InT> + sizeof(int)) +
+                 scan_temp_bytes + rank.bytes(max_batch_nnz, slab_cols));
     for (int i = 0; i < n_bufs; i++) {
         d_gather_vals[i] = pool.alloc<InT>(max_batch_nnz);
         d_gather_cols[i] = pool.alloc<StageIndexT>(max_batch_nnz);
         d_gather_indptr[i] = pool.alloc<int>(n_rows + 1);
     }
-    slab_cols = std::min(slab_cols, sub_batch_cols);
-    size_t csc_nnz = ovo ? 0 : max_batch_nnz;
     int* d_col_offsets[CSR_RANGE_METADATA_SLOTS] = {
         pool.alloc<int>(sub_batch_cols + 1),
         pool.alloc<int>(sub_batch_cols + 1)};

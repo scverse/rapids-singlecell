@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import cupy as cp
+import cupyx.scipy.sparse as cpsp
 import numpy as np
+import pandas as pd
 import pytest
 import scanpy as sc
+import scipy.sparse as sp
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_binned
@@ -625,9 +628,35 @@ def test_binned_host_multi_gpu_matches_single(adata_blobs, array_type, reference
 
 
 def test_auto_chunk_width_budgets_densified_tile(monkeypatch):
-    """Signed sparse input densifies each gene window; its float64 tile counts against free memory."""
+    """Signed sparse input densifies each gene window; its float64 tile and, for host input, the uploaded values
+    and indices count against free memory."""
     monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (8 << 30, 16 << 30))
     kw = {"device_ids": [cp.cuda.Device().id], "ireference": None, "tie_correct": True, "gathers_multi_gpu": False}
     assert _wilcoxon_binned._auto_chunk_width(20_000, 2, 2, 1_002, **kw) == 20_000
-    width = _wilcoxon_binned._auto_chunk_width(20_000, 2, 2, 1_002, dense_rows=100_000, **kw)
-    assert 1 <= width and width * 100_000 * 8 <= _wilcoxon_binned._AUTO_CHUNK_MEMORY_FRACTION * (8 << 30)
+    X = sp.random(100_000, 3, density=0.5, format="csc", dtype=np.float64)
+    gene_bytes = _wilcoxon_binned._densified_gene_bytes(X, 100_000)
+    assert gene_bytes == 100_000 * (8 + 8 + 4)
+    assert _wilcoxon_binned._densified_gene_bytes(cpsp.csc_matrix(X), 100_000) == 100_000 * 8
+    width = _wilcoxon_binned._auto_chunk_width(20_000, 2, 2, 1_002, dense_bytes=gene_bytes, **kw)
+    assert 1 <= width and width * gene_bytes <= _wilcoxon_binned._AUTO_CHUNK_MEMORY_FRACTION * (8 << 30)
+
+
+def test_binned_signed_host_sparse_fits_free_memory(monkeypatch):
+    """Densifying signed host CSR windows (a GPU CSC window plus its float64 tile) stays within the reported free
+    memory, enforced here as a CuPy pool limit. (Host CSC means stream through kernels sized from the real free
+    memory, which the limit cannot model.)"""
+    rng = np.random.default_rng(0)
+    dense = rng.standard_normal((20_000, 400))
+    dense[rng.random(dense.shape) < 0.4] = 0
+    adata = sc.AnnData(X=sp.csr_matrix(dense))
+    adata.obs["g"] = pd.Categorical(rng.choice(list("ab"), 20_000))
+    pool = cp.cuda.MemoryPool()
+    pool.set_limit(size=64 << 20)
+    monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (64 << 20, 16 << 30))
+    allocator = cp.cuda.get_allocator()
+    cp.cuda.set_allocator(pool.malloc)
+    try:
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon_binned", use_raw=False, multi_gpu=False)
+    finally:
+        cp.cuda.set_allocator(allocator)
+    assert adata.uns["rank_genes_groups"]["scores"].shape == (400,)

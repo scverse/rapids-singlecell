@@ -38,12 +38,12 @@ def _auto_chunk_width(
     ireference: int | None,
     tie_correct: bool,
     gathers_multi_gpu: bool,
-    dense_rows: int = 0,
+    dense_bytes: int = 0,
 ) -> int:
     """Choose a histogram width from the least-free selected device.
 
-    ``dense_rows`` is the cell count of a densified window (signed sparse
-    input), whose float64 column tile is budgeted per gene too.
+    ``dense_bytes`` is what densifying one gene of a window (signed sparse
+    input) holds on the GPU, budgeted per gene too.
     """
     free_bytes = []
     for device_id in device_ids:
@@ -73,9 +73,18 @@ def _auto_chunk_width(
 
     # Account for group-wise statistic/result temporaries, then reserve the
     # remaining 40% for the input, allocator fragmentation, and other clients.
-    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES + dense_rows * _FLOAT_BYTES
+    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES + dense_bytes
     usable_bytes = int(min(free_bytes) * _AUTO_CHUNK_MEMORY_FRACTION)
     return min(n_genes, max(1, usable_bytes // max(bytes_per_gene, 1)))
+
+
+def _densified_gene_bytes(X, n_cells: int) -> int:
+    """GPU bytes one gene of a densified window holds.
+
+    Its float64 column plus, for host input, the uploaded window values and indices, budgeted as if full.
+    """
+    upload = X.data.itemsize + X.indices.itemsize if sp.issparse(X) else 0
+    return n_cells * (_FLOAT_BYTES + upload)
 
 
 def _fill_sparse_zero_bin(hist: cp.ndarray, group_counts: cp.ndarray) -> None:
@@ -299,7 +308,7 @@ def wilcoxon_binned(
         ireference=ireference,
         tie_correct=tie_correct,
         gathers_multi_gpu=use_multi_stream,
-        dense_rows=n_cells if rg._sparse_negative_fallback else 0,
+        dense_bytes=_densified_gene_bytes(X, n_cells) if rg._sparse_negative_fallback else 0,
     )
 
     is_host_csr = sp.issparse(X) and X.format == "csr"

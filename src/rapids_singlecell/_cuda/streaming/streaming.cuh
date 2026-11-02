@@ -315,6 +315,9 @@ static inline ColumnBatchPlan plan_csc_column_batches(const IndptrT* h_indptr,
 static inline int* upload_batch_offsets(const ColumnBatchPlan& plan,
                                         RmmScratchPool& pool) {
     int* d_all_offsets = pool.alloc<int>(plan.offsets.size());
+    // Stream-ordered pools (CuPy/RMM async) allocate on the caller's stream,
+    // which may not order with this copy: finish the allocation first.
+    cudaDeviceSynchronize();
     cudaMemcpy(d_all_offsets, plan.offsets.data(),
                plan.offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
     return d_all_offsets;

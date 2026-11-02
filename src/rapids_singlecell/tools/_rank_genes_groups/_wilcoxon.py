@@ -12,7 +12,7 @@ import scipy.sparse as sp
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 
 from ._utils import EPS, MIN_GROUP_SIZE_WARNING
-from ._wilcoxon_host import _build_ovo_host_context, _OvoHostContext, _run_sharded_wilcoxon
+from ._wilcoxon_host import _build_ovo_host_context, _kernel_dtype, _OvoHostContext, _run_sharded_wilcoxon
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -124,10 +124,10 @@ def _validate_wilcoxon_sparse_dtype(X) -> None:
             raise TypeError(msg)
 
 
-def _device_dense(X: cp.ndarray) -> cp.ndarray:
+def _device_dense(X: cp.ndarray, *, exact: bool = False) -> cp.ndarray:
     """Float32/64 C- or F-contiguous array the dense kernels read in place."""
     if X.dtype not in (cp.float32, cp.float64):
-        X = X.astype(cp.float32)
+        X = X.astype(_kernel_dtype(X.dtype, exact=exact))
     return X if X.flags.c_contiguous or X.flags.f_contiguous else cp.ascontiguousarray(X)
 
 
@@ -184,7 +184,7 @@ def _run_wilcoxon_shard(
     is_dense = isinstance(X, np.ndarray | cp.ndarray)
     if is_dense:
         layout = "dense"
-        X = _device_dense(X) if isinstance(X, cp.ndarray) else X
+        X = _device_dense(X, exact=not rg.mean_in_log_space) if isinstance(X, cp.ndarray) else X
     else:
         layout = f"{X.format}_host" if sp.issparse(X) else "sparse_device"
     kw = {
