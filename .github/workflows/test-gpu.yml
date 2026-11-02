@@ -175,7 +175,7 @@ jobs:
     needs: get-envs
     runs-on: ${{ matrix.env.runner }}
     timeout-minutes: 45
-    continue-on-error: true  # Prerelease failures don't fail the workflow
+    continue-on-error: true # Prerelease failures don't fail the workflow
     strategy:
       fail-fast: false
       max-parallel: 2

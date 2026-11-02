@@ -3,12 +3,14 @@
 These functions offer accelerated near drop-in replacements for common tools provided by {doc}`scanpy <scanpy:api/index>` {cite}`Wolf2018`.
 
 ## Preprocessing `pp`
+
 Filtering of highly-variable genes, batch-effect correction, per-cell normalization.
 
 Any transformation of the data matrix that is not a tool.
 Other than `tools`, preprocessing steps usually don’t return an easily interpretable annotation, but perform a basic transformation on the data matrix.
 
 ### Basic Preprocessing
+
 ```{eval-rst}
 .. module:: rapids_singlecell.pp
 .. currentmodule:: rapids_singlecell
@@ -38,6 +40,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 ```
 
 ### Doublet detection
+
 ```{eval-rst}
 .. autosummary::
    :toctree: generated/
@@ -47,6 +50,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 ```
 
 ### Neighbors
+
 ```{eval-rst}
 .. autosummary::
    :toctree: generated/
@@ -69,6 +73,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 ```
 
 ### Embedding
+
 ```{eval-rst}
 .. autosummary::
    :toctree: generated/
