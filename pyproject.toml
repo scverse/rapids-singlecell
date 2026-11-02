@@ -76,7 +76,7 @@ docs = [
   "dask",
   "nbsphinx>=0.8.12",
   "pytest",
-  "scverse-doc[full]>=0.3",
+  "scverse-doc[full]>=0.4",
   "scverse-misc[sphinx]>=0.1.3",
   "spatialdata>=0.7.2",
   "sphinx>=8.1",

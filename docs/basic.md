@@ -2,20 +2,6 @@
 :end-before: "## Documentation"
 ```
 
-[//]: # "numfocus-fiscal-sponsor-attribution"
-
-rapids-singlecell is part of the scverse® project ([website](https://scverse.org), [governance](https://scverse.org/about/roles)) and is fiscally sponsored by [NumFOCUS](https://numfocus.org/).
-If you like scverse® and want to support our mission, please consider making a tax-deductible [donation](https://numfocus.org/donate-to-scverse) to help the project pay for developer time, professional services, travel, workshops, and a variety of other needs.
-
-<div align="center">
-<a href="https://numfocus.org/project/scverse">
-  <img
-    src="https://raw.githubusercontent.com/numfocus/templates/master/images/numfocus-logo.png"
-    width="200"
-  >
-</a>
-</div>
-
 ```{div}
 :style: height: 0.5rem
 ```
@@ -68,3 +54,19 @@ If you use rapids-singlecell, please cite:
 - 07.08.23 _rapids-singlecell_ is now part of scverse® ecosystem.
 - 04.08.23 Thanks to the great team at [scverse](https://www.scverse.org)® _rapids-singlecell_ is now automatically tested with CI
 - 27.06.23 I'm very honored to announce that I was invited to co-author a [technical blog post](https://developer.nvidia.com/blog/gpu-accelerated-single-cell-rna-analysis-with-rapids-singlecell/) that demonstrates the capabilities and performance of _rapids-singlecell_ for NVIDIA.
+
+## NumFOCUS
+
+[//]: # "numfocus-fiscal-sponsor-attribution"
+
+rapids-singlecell is part of the scverse® project ([website](https://scverse.org), [governance](https://scverse.org/about/roles)) and is fiscally sponsored by [NumFOCUS](https://numfocus.org/).
+If you like scverse® and want to support our mission, please consider making a tax-deductible [donation](https://numfocus.org/donate-to-scverse) to help the project pay for developer time, professional services, travel, workshops, and a variety of other needs.
+
+<div align="center">
+<a href="https://numfocus.org/project/scverse">
+  <img
+    src="https://raw.githubusercontent.com/numfocus/templates/master/images/numfocus-logo.png"
+    width="200"
+  >
+</a>
+</div>
