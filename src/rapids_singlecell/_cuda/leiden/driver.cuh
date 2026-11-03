@@ -9,6 +9,8 @@
 //     CC-piece last resort), AGGREGATE stage 2; projection to level 0 with
 //     V-cycle UP sweeps, the CC split and, with replicas, the best slice
 //   exact Q, size-ordered labels
+// With several partitions (multi_gpu), level 0 is split by rows
+// (partition.cuh); levels >= 1 run on partition 0.
 
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -88,6 +90,36 @@ struct DriverParams {
     TreeClasses trees{};
 };
 
+// The level loop's next step after local moving at level lvl (n vertices) gave
+// C communities; n_next: communities after refinement and pieces: CC pieces of
+// the move partition (-1 while unknown). One rule for every driver.
+enum class LevelStep {
+    kVerifyTop,     // C == n after DOWN: certify with all-active TOP sweeps
+    kCertified,     // C == n after TOP: the level loop ends at this level
+    kRefine,        // refine (n_next unknown)
+    kReenterTop,    // refinement merged nothing: TOP sweeps again
+    kPieces,        // ... and the re-entries are used up: the CC pieces of P
+    kOutputPieces,  // the pieces are singletons: output them, the loop ends
+    kAggregate,     // aggregate to level lvl + 1
+    kAggregateStop  // aggregate; level lvl + 1 is the last (max_levels)
+};
+
+inline LevelStep level_step(u32 phase, i64 C, i64 n, i64 n_next, i64 pieces,
+                            int reentry, int lvl, const DriverParams& dp) {
+    if (level_done(C, n))
+        return phase == kPhaseTop ? LevelStep::kCertified
+                                  : LevelStep::kVerifyTop;
+    if (n_next < 0) return LevelStep::kRefine;
+    if (n_next == n) {  // refinement merged nothing (C < n)
+        if (reentry < dp.max_reentry) return LevelStep::kReenterTop;
+        // last resort (never expected): the connected pieces of P
+        if (pieces < 0) return LevelStep::kPieces;
+        if (pieces == n) return LevelStep::kOutputPieces;
+    }
+    return lvl + 1 == dp.max_levels ? LevelStep::kAggregateStop
+                                    : LevelStep::kAggregate;
+}
+
 inline int n_replicas(i64 nnz_counted, int max_replicas, i64 budget) {
     if (nnz_counted <= 0) return 1;
     const i64 r = budget / nnz_counted;
@@ -150,6 +182,18 @@ __global__ void drv_slice_relabel_kernel(const int* __restrict__ P_in, i64 n,
         P_out[v] = (c >= 0 && c < C) ? rank[c] : 0;
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) ctl->n_components = rank[C];
+}
+
+// The device invariant checks of a Control readback.
+inline void check_device_flags(u32 flags) {
+    if (flags & kFlagForestInvariant)
+        throw std::runtime_error(
+            "leiden: refinement forest invariant violated");
+    if (flags & kFlagGatherInvariant)
+        throw std::runtime_error("leiden: multi-pass gather failed");
+    if (flags & kFlagBadLabel)
+        throw std::runtime_error(
+            "leiden: internal error: community id out of range");
 }
 
 // One iteration: a vertex moved (stop rule), and the dev module's counters.
@@ -218,6 +262,14 @@ class LeidenDriver {
         for (int c = 0; c < kNumClasses; ++c) g0_.cls[c] = q.class_count[c];
     }
 
+    // lam_hat = gamma / 2m_hat (one IEEE division) and the seed.
+    void set_resolution(double gamma, u32 seed) {
+        lam_ = gamma / static_cast<double>(q_.two_m_hat);
+        gamma_ = gamma;
+        seed_ = seed;
+        s64_ = seed64(seed);
+    }
+
     // One resolution; false if the arena overflowed.
     bool run_resolution(double gamma, u32 seed, const int* init, int R,
                         int* labels_out, ResolutionResult& out) {
@@ -229,10 +281,7 @@ class LeidenDriver {
             CUDA_CHECK_LAST_ERROR(drv_iota_kernel);
             return true;
         }
-        lam_ = gamma / static_cast<double>(two_m);  // one IEEE division
-        gamma_ = gamma;
-        seed_ = seed;
-        s64_ = seed64(seed);
+        set_resolution(gamma, seed);
         int* P0 = L_.persist.P0;
         if (init) {
             cuda_check(cudaMemcpyAsync(P0, init, n * sizeof(int),
@@ -317,14 +366,7 @@ class LeidenDriver {
     // Control readback (one sync) with the device invariant checks.
     Control readback() {
         const Control c = read_control(L_.ctl, s_, L_.pinned);
-        if (c.flags & kFlagForestInvariant)
-            throw std::runtime_error(
-                "leiden: refinement forest invariant violated");
-        if (c.flags & kFlagGatherInvariant)
-            throw std::runtime_error("leiden: multi-pass gather failed");
-        if (c.flags & kFlagBadLabel)
-            throw std::runtime_error(
-                "leiden: internal error: community id out of range");
+        check_device_flags(c.flags);
         return c;
     }
 
@@ -399,7 +441,7 @@ class LeidenDriver {
     // PLEIDEN_R + AGGREGATE stage 1 of level l (C on the device; SL2 next).
     void launch_refine_begin(const LevelGraph& g, const int* P, int l, u32 it,
                              int* cmap, const AggregateOptions& opt,
-                             AggregatePlan& plan,
+                             AggregatePlan<>& plan,
                              std::vector<KernelCall> pre = {}) {
         RefineParams rp;
         rp.lam = lam_;
@@ -462,18 +504,51 @@ class LeidenDriver {
     // False on arena overflow; C_out: communities before the CC split.
     bool leiden_iteration(const LevelGraph& g0, int* P0, i64 id_bound, int it,
                           bool vcycle, IterationStat& stat, i64& C_out) {
-        LevelArena& arena = L_.arena;
-        arena.reset();
+        L_.arena.reset();
         std::vector<LevelGraph> G;
         G.reserve(static_cast<std::size_t>(dp_.max_levels) + 1);
         G.push_back(g0);
         const u32 uit = static_cast<u32>(it);
         bool moved = false;
         int lvl = 0;
+        i64 idb = id_bound;
+        if (!level_loop(G, lvl, idb, uit, moved, stat)) return false;
+        i64 Ccur = idb;
+        project(G, lvl, 0, vcycle, uit, Ccur, moved);
+        stat.moved = moved;
+        C_out = Ccur;
+        return true;
+    }
+
+   public:
+    // Levels >= 1 of an iteration whose level 0 ran partitioned: the level
+    // loop from level 1 (G = {g0, g1}, g0.cmap = its cmap, P_1 in
+    // level_partition(1), the arena holding both) and the projection down to
+    // level 1. False on arena overflow.
+    bool upper_levels(const LevelGraph& g0, const LevelGraph& g1, i64 idb,
+                      int it, bool vcycle, IterationStat& stat, i64& Ccur,
+                      bool& moved) {
+        std::vector<LevelGraph> G;
+        G.reserve(static_cast<std::size_t>(dp_.max_levels) + 1);
+        G.push_back(g0);
+        G.push_back(g1);
+        const u32 uit = static_cast<u32>(it);
+        int lvl = 1;
+        if (!level_loop(G, lvl, idb, uit, moved, stat)) return false;
+        Ccur = idb;
+        project(G, lvl, 1, vcycle, uit, Ccur, moved);
+        return true;
+    }
+
+   private:
+    // The levels from G[lvl] up (lvl, idb: the last level and its id bound);
+    // false on arena overflow.
+    bool level_loop(std::vector<LevelGraph>& G, int& lvl, i64& idb, u32 uit,
+                    bool& moved, IterationStat& stat) {
+        LevelArena& arena = L_.arena;
         u32 phase = kPhaseDown;
         int reentry = 0;
         u32 top_done = 0;  // TOP sweeps run at this level (cumulative)
-        i64 idb = id_bound;
         AggregateOptions opt;
         opt.gather = dp_.gather;
         opt.move = dp_.th;
@@ -495,7 +570,7 @@ class LeidenDriver {
                 speculate
                     ? arena.push_bottom<int>(static_cast<std::size_t>(g.n))
                     : nullptr;
-            AggregatePlan plan;
+            AggregatePlan<> plan;
             if (cmap) {  // COMPACT runs in refinement's graph
                 launch_refine_begin(g, P, lvl, uit, cmap, opt, plan,
                                     std::move(compact));
@@ -522,34 +597,38 @@ class LeidenDriver {
             }
             moved = moved || st.moves > 0;
             idb = C;
-            if (level_done(C, g.n)) {
+            LevelStep step = level_step(phase, C, g.n, cmap ? c.n_next : -1, -1,
+                                        reentry, lvl, dp_);
+            if (step == LevelStep::kVerifyTop ||
+                step == LevelStep::kCertified) {
                 if (cmap) {  // drop the speculative refinement / level
                     arena.release_top();
                     arena.bottom = mark;
                 }
-                if (!top) {  // all-active verification
+                if (step == LevelStep::kVerifyTop) {  // all-active verification
                     phase = kPhaseTop;
                     continue;
                 }
                 ++stat.levels;  // certified gamma-separated top
                 break;
             }
-            if (!cmap) {  // refinement was not launched: launch it now
+            if (step == LevelStep::kRefine) {  // not launched: launch it now
                 cmap = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
                 if (!cmap) return false;  // the arena cannot hold this level
                 launch_refine_begin(g, P, lvl, uit, cmap, opt, plan);
                 c = readback();  // SL2
+                step =
+                    level_step(phase, C, g.n, c.n_next, -1, reentry, lvl, dp_);
             }
-            if (c.n_next == g.n) {  // refinement merged nothing (C < n)
+            if (step == LevelStep::kReenterTop || step == LevelStep::kPieces) {
                 arena.release_top();
-                arena.bottom = mark;              // drop the speculative level
-                if (reentry < dp_.max_reentry) {  // re-enter TOP sweeps
+                arena.bottom = mark;  // drop the speculative level
+                if (step == LevelStep::kReenterTop) {
                     ++reentry;
                     stat.reentries += 1;
                     phase = kPhaseTop;
                     continue;
                 }
-                // last resort (never expected): the connected pieces of P
                 stat.fallbacks += 1;
                 stat.uncertified = true;
                 cmap = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
@@ -558,7 +637,9 @@ class LeidenDriver {
                                            cudaMemcpyDeviceToDevice, s_),
                            "leiden: fallback pieces");
                 const i64 pieces = cc_split(g, cmap);
-                if (pieces == g.n) {  // output the pieces (uncertified)
+                step = level_step(phase, C, g.n, c.n_next, pieces, reentry, lvl,
+                                  dp_);
+                if (step == LevelStep::kOutputPieces) {  // uncertified
                     cuda_check(cudaMemcpyAsync(P, cmap, g.n * sizeof(int),
                                                cudaMemcpyDeviceToDevice, s_),
                                "leiden: fallback partition");
@@ -596,14 +677,19 @@ class LeidenDriver {
             phase = kPhaseDown;
             reentry = 0;
             top_done = 0;
-            if (lvl == dp_.max_levels) {  // guard; kNN graphs need 5-12
+            if (step == LevelStep::kAggregateStop) {  // kNN graphs need 5-12
                 ++stat.levels;
                 break;
             }
         }
-        // projection to level 0, with the V-cycle's UP sweeps
-        i64 Ccur = idb;
-        for (int lp = lvl - 1; lp >= 0; --lp) {
+        return true;
+    }
+
+    // Projection from level lvl down to level lp_end, with the V-cycle's UP
+    // sweeps (Ccur: the id bound of the current level's partition).
+    void project(std::vector<LevelGraph>& G, int lvl, int lp_end, bool vcycle,
+                 u32 uit, i64& Ccur, bool& moved) {
+        for (int lp = lvl - 1; lp >= lp_end; --lp) {
             const LevelGraph& g = G[lp];
             int* P = level_partition(lp);
             run_project(level_partition(lp + 1), g.cmap, g.n, P, s_);
@@ -620,9 +706,6 @@ class LeidenDriver {
                 moved = moved || mr.st.moves > 0;
             }
         }
-        stat.moved = moved;
-        C_out = Ccur;
-        return true;
     }
 };
 
@@ -697,6 +780,12 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
 
 template <typename T, typename Device>
 using optional_array = std::optional<gpu_array_c<T, Device>>;
+
+inline int check_max_replicas(int r) {
+    if (r < 1 || r > kMaxReplicas)
+        throw std::invalid_argument("max_replicas must be in [1, 4]");
+    return r;
+}
 
 // One `leiden` call with driver parameters `dp` (also the dev knob binding).
 template <typename IP, typename IX, typename WI, typename InDevice,
@@ -805,10 +894,11 @@ void register_driver_typed(nb::module_& m) {
            std::vector<double> resolutions, std::vector<std::uint32_t> seeds,
            int n_iterations,
            optional_array<const int, Device> initial_membership,
-           double arena_factor, std::uintptr_t stream) {
+           double arena_factor, int max_replicas, std::uintptr_t stream) {
             DriverParams dp;
             dp.n_iterations = n_iterations;
             dp.arena_factor = arena_factor;
+            dp.max_replicas = check_max_replicas(max_replicas);
             return result_dict(call_leiden<IP, IX, WI, InDevice, Device>(
                 indptr, indices, data, use_weights, check, workspace, pinned,
                 labels_out, resolutions, seeds, initial_membership, dp,
@@ -820,7 +910,8 @@ void register_driver_typed(nb::module_& m) {
         "labels_out"_a.noconvert().none() = nb::none(), "resolutions"_a,
         "seeds"_a, "n_iterations"_a,
         "initial_membership"_a.noconvert().none() = nb::none(),
-        "arena_factor"_a = 1.9, "stream"_a = 0);
+        "arena_factor"_a = 1.9, "max_replicas"_a = kMaxReplicas,
+        "stream"_a = 0);
 }
 
 template <typename InDevice, typename Device>
@@ -846,6 +937,14 @@ inline void register_api(nb::module_& m) {
     register_ingest(m);
 
     m.attr("PINNED_BYTES") = kPinnedBytes;
+    // Replica copies of the first iteration for nnz_counted counted entries.
+    m.def(
+        "n_replicas",
+        [](long long nnz_counted, int max_replicas) {
+            return n_replicas(nnz_counted, check_max_replicas(max_replicas),
+                              DriverParams{}.replica_nnz_budget);
+        },
+        "nnz_counted"_a, "max_replicas"_a = kMaxReplicas);
 
     REGISTER_GPU_BINDINGS(register_driver_bindings, m);
 }

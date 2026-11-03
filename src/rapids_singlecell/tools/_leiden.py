@@ -18,6 +18,11 @@ from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
 from scipy import sparse
 
 from rapids_singlecell._cuda import _leiden_cuda as _ld
+from rapids_singlecell._utils._multi_gpu import _copy_to_device as _copy_to_gpu
+from rapids_singlecell._utils._multi_gpu import (
+    _peer_copies_work,
+    resolve_stream_devices,
+)
 from rapids_singlecell._utils._random import (
     _accepts_legacy_random_state,
     _LegacyRng,
@@ -46,6 +51,18 @@ _HOST_ZERO_COPY = True
 _H2D_CHUNK_BYTES = 1 << 23
 _WORKSPACE_CACHE_BYTES = 1 << 31  # see `_WORKSPACE_CACHE`; 0 disables it
 _N_ITER_WARN = 20  # above this: warn and run the -1 rule
+# multi_gpu: partition 0 also holds levels >= 1, so its arena is sized by the
+# whole graph's entries (`_ARENA_FACTOR`; it needs what one GPU needs, 1.54 on
+# brain500k, 1.67 on brain1m3), each other partition's by its own entries, but
+# at least 1/P of all as it merges 1/P of the coarse rows (`_ARENA_FACTOR_PART`;
+# the int64 partial rows of the contraction need 2.1-2.3); a rerun grows the
+# partitions that overflowed. Test knobs: `_N_PARTITIONS` forces the number of
+# partitions (round-robin over the devices, several per device);
+# `_MAX_REPLICAS` caps the replicas of small graphs (1: none, which
+# partitioned runs require).
+_ARENA_FACTOR_PART = 2.7
+_N_PARTITIONS: int | None = None
+_MAX_REPLICAS: int | None = None
 _MAX_RESOLUTION = 2.0**20  # bound of the integer no-overflow proof
 # cuGraph returns the refined partition when it hits `max_iter` levels, so
 # `n_iterations` is not forwarded and the cap stays well above what it needs.
@@ -80,6 +97,7 @@ def leiden(
     theta: float | None = None,
     dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
+    multi_gpu: bool | list[int] | str | None = None,
     **clustering_args,
 ) -> AnnData | None:
     """Cluster cells into subgroups using the Leiden algorithm :cite:p:`Traag2019`.
@@ -151,6 +169,26 @@ def leiden(
     use_dask
         Deprecated. If ``True``, run cuGraph's Dask implementation on all GPUs
         (this implies ``flavor='cugraph'``).
+    multi_gpu
+        GPUs of ``flavor='rapids'`` (not supported by ``flavor='cugraph'``):
+
+        - ``None`` or ``False`` (default): the current GPU.
+        - ``True``: all GPUs, but only for a graph whose single-GPU workspace
+          (sized from the checked, fixed-up graph before the run) does not
+          fit in the free memory of the current GPU; others run there.
+        - ``list[int]`` or comma-separated ``str`` (e.g. ``"0,2"``): these
+          GPUs, always split (one GPU: run on it).
+
+        A split run gives each GPU one contiguous range of the cells,
+        balanced by stored entries: it stores the rows of its cells and
+        about 150 bytes of state per cell of the graph. The first GPU also
+        runs the coarser levels and needs about as much workspace as one
+        GPU would, so on k-NN graphs (about 28 bytes per stored entry on one
+        GPU) 2 GPUs fit graphs only about 1.15x as large and 4 GPUs about
+        1.3x. A split run synchronises the GPUs many times per level, so
+        it is slower than one GPU; labels and modularity are bitwise
+        identical. Graphs of at most ``2**18`` counted entries, which one
+        GPU clusters as several replicas, warn and run on one GPU.
     **clustering_args
         Further arguments for the clustering. ``flavor='rapids'`` accepts
         ``beta`` (randomness of the refinement, theta in :cite:t:`Traag2019`;
@@ -186,6 +224,9 @@ def leiden(
         theta=theta,
         clustering_args=clustering_args,
     )
+    if flavor == "cugraph" and multi_gpu is not None and multi_gpu is not False:
+        msg = "multi_gpu is supported by flavor='rapids'; flavor='cugraph' runs on all GPUs with use_dask=True."
+        raise ValueError(msg)
     dtype = _check_dtype(dtype)
     _validate_n_iterations(n_iterations, flavor=flavor)
     resolutions = _validate_resolutions(resolution)
@@ -212,6 +253,7 @@ def leiden(
             rng=rng,
             n_iterations=n_iterations,
             use_weights=use_weights,
+            multi_gpu=multi_gpu,
             **clustering_args,
         )
     else:
@@ -345,11 +387,12 @@ def _leiden_rapids(
     rng: np.random.Generator,
     n_iterations: int,
     use_weights: bool,
+    multi_gpu: bool | list[int] | str | None = None,
     beta: float = 0.0,
     initial_membership=None,
     objective_function: str = "modularity",
 ) -> list[SimpleNamespace]:
-    """Run every resolution in one native call (`_leiden_cuda.leiden`)."""
+    """Run every resolution in one native call (`_leiden_cuda.leiden`, or `leiden_mg` split over GPUs)."""
     if objective_function.lower() != "modularity":
         msg = "flavor='rapids' supports objective_function='modularity' (CPM: planned)."
         raise NotImplementedError(msg)
@@ -361,32 +404,71 @@ def _leiden_rapids(
         raise NotImplementedError(msg)
     if n_iterations > _N_ITER_WARN:  # warned about in `leiden`
         n_iterations = -1
-    csr = _as_csr(adjacency)
-    n = csr.shape[0]
-    membership = _compact_initial_membership(initial_membership, n)
-    host_input = _HOST_ZERO_COPY and not cpx_sparse.issparse(csr) and _reads_host_memory(cp.cuda.Device().id)
-    graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input)
-    if info["nnz_counted"] == 0:  # no edge: every cell is its own cluster
-        codes = np.arange(n, dtype=np.int32)
-        return [SimpleNamespace(membership=codes, modularity=0.0, n_clusters=n) for _ in resolutions]
-    args = {
-        "indices": graph.indices,
-        "data": graph.data,
-        "use_weights": use_weights,
-        "check": info,
-        "resolutions": [float(res) for res in resolutions],
-        # the native kernels are seeded: one seed per resolution
-        "seeds": [_seed_from_rng(rng, allow_none=False) & 0xFFFFFFFF for _ in resolutions],
-        "n_iterations": n_iterations,
-        "initial_membership": membership,
-        "stream": cp.cuda.get_current_stream().ptr,
-    }
+    devices = resolve_stream_devices(multi_gpu=multi_gpu)
+    # a device list is always split (one device: run there); True splits
+    # graphs that do not fit on the current GPU
+    explicit = isinstance(multi_gpu, list | str)
+    split = "always" if explicit else "auto" if multi_gpu is True else "no"
+    home = devices[0] if explicit else cp.cuda.Device().id
+    source = _input_device(adjacency)
+    with cp.cuda.Device(home if source is None else source):
+        csr = _as_csr(adjacency)
+    with cp.cuda.Device(home):
+        if source not in (None, home):  # device input on another GPU
+            arrays = (_copy_to_gpu(a, home) for a in (csr.data, csr.indices, csr.indptr))
+            csr = cpx_sparse.csr_matrix(tuple(arrays), shape=csr.shape)
+        n = csr.shape[0]
+        membership = _compact_initial_membership(initial_membership, n)
+        host_input = _HOST_ZERO_COPY and not cpx_sparse.issparse(csr) and _reads_host_memory(cp.cuda.Device().id)
+        graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input)
+        if info["nnz_counted"] == 0:  # no edge: every cell is its own cluster
+            codes = np.arange(n, dtype=np.int32)
+            return [SimpleNamespace(membership=codes, modularity=0.0, n_clusters=n) for _ in resolutions]
+        # the native kernels are seeded: one seed per resolution, whatever the GPUs
+        seeds = [_seed_from_rng(rng, allow_none=False) & 0xFFFFFFFF for _ in resolutions]
+        max_replicas = 4 if _MAX_REPLICAS is None else _MAX_REPLICAS
+        args = {
+            "indices": graph.indices,
+            "data": graph.data,
+            "use_weights": use_weights,
+            "check": info,
+            "resolutions": [float(res) for res in resolutions],
+            "seeds": seeds,
+            "n_iterations": n_iterations,
+            "initial_membership": membership,
+            "max_replicas": max_replicas,
+            "stream": cp.cuda.get_current_stream().ptr,
+        }
+        n_parts = _n_partitions(graph, args, devices, split=split)
+        if n_parts > 1 and _ld.n_replicas(info["nnz_counted"], max_replicas) > 1:
+            msg = "multi_gpu: graphs this small run as replicas, which split runs do not have; running on one GPU."
+            warnings.warn(msg, UserWarning, stacklevel=4)
+            n_parts = 1
+        if n_parts == 1:
+            return _leiden_single(graph, args, n)
+        owned = cpx_sparse.issparse(adjacency) and graph.indices is adjacency.indices
+        parts = _split_rows(graph, n_parts, devices, owned=owned)
+        del graph, csr, args  # the partitions hold copies of a fixed-up graph
+        return _leiden_partitioned(
+            parts,
+            info,
+            n=n,
+            use_weights=use_weights,
+            resolutions=resolutions,
+            seeds=seeds,
+            n_iterations=n_iterations,
+            membership=membership,
+        )
+
+
+def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNamespace]:
+    """One GPU: size the workspace, run, rerun with a larger arena if a level did not fit."""
     pinned = cp.cuda.alloc_pinned_memory(_ld.PINNED_BYTES)  # readback buffer
     factor = _ARENA_FACTOR
     for _ in range(_MAX_RERUNS + 1):
         # a call without a workspace sizes it
         nbytes = _ld.leiden(graph.indptr, **args, arena_factor=factor)
-        buffer, workspace, labels = _allocate_workspace(nbytes["required_bytes"], (len(resolutions), n))
+        buffer, workspace, labels = _allocate_workspace(nbytes["required_bytes"], (len(args["resolutions"]), n))
         out = _ld.leiden(
             graph.indptr,
             **args,
@@ -409,6 +491,149 @@ def _leiden_rapids(
         SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
         for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)
     ]
+
+
+def _n_partitions(graph, args: dict, devices: list[int], *, split: str) -> int:
+    """Partitions of a run: the knob, one per device of a split, else 1.
+
+    ``"auto"`` (``multi_gpu=True``) splits only a graph whose single-GPU
+    workspace and labels do not fit in the current GPU's free memory.
+    """
+    if _N_PARTITIONS is not None:
+        return _N_PARTITIONS
+    if split == "always":
+        return len(devices)
+    if split == "no" or len(devices) == 1:
+        return 1
+    nbytes = _ld.leiden(graph.indptr, **args, arena_factor=_ARENA_FACTOR)["required_bytes"]
+    labels = 4 * len(args["resolutions"]) * (graph.indptr.shape[0] - 1)
+    return 1 if nbytes + labels <= cp.cuda.Device().mem_info[0] else len(devices)
+
+
+def _row_bounds(indptr: np.ndarray, n_parts: int) -> list[int]:
+    """Row bounds of the partitions, balanced by stored entries.
+
+    Every bound but n is a multiple of 32, so each word of an activity bitmap
+    has one owner; a 32-row block of hubs can leave partitions empty.
+    """
+    n, nnz = indptr.shape[0] - 1, int(indptr[-1])
+    targets = np.arange(1, n_parts, dtype=np.float64) * nnz / n_parts
+    inner = -(-np.searchsorted(indptr, targets, side="left") // 32) * 32
+    return [0, *np.maximum.accumulate(np.minimum(inner, n)).tolist(), n]
+
+
+def _split_rows(graph: SimpleNamespace, n_parts: int, devices: list[int], *, owned: bool) -> SimpleNamespace:
+    """The rows of each partition (`_row_bounds`) on its device (`leiden_mg`'s level 0).
+
+    Partition p holds a full-length int64 indptr (other rows empty), int32
+    indices and the data of its rows; it views user-owned device input on its
+    device, else holds copies, so the caller can free the fixed-up graph.
+    Partitions go round-robin over ``devices``; the first (which also runs
+    levels >= 1) avoids the device of user-owned input.
+    """
+    host = isinstance(graph.indptr, np.ndarray)
+    indptr = np.asarray(graph.indptr if host else cp.asnumpy(graph.indptr), dtype=np.int64)
+    bounds = _row_bounds(indptr, n_parts)
+    source = None if host else graph.indices.device.id
+    if owned and len(devices) > 1 and devices[0] == source:
+        devices = devices[1:] + devices[:1]
+    devs = [devices[p % len(devices)] for p in range(n_parts)]
+    indptrs, indices, data = [], [], []
+    for p, device in enumerate(devs):
+        e0, e1 = int(indptr[bounds[p]]), int(indptr[bounds[p + 1]])
+        with cp.cuda.Device(device):
+            indptrs.append(cp.asarray(np.clip(indptr, e0, e1) - e0))
+        indices.append(_rows_on(graph.indices[e0:e1], device, view=owned, dtype=np.int32))
+        data.append(_rows_on(graph.data[e0:e1], device, view=owned))
+    return SimpleNamespace(bounds=bounds, devices=devs, indptrs=indptrs, indices=indices, data=data)
+
+
+def _rows_on(array, device: int, *, view: bool, dtype=None) -> cp.ndarray:
+    """A partition's entries on its device: a view of user-owned device input there, else a copy."""
+    if isinstance(array, np.ndarray):
+        with cp.cuda.Device(device):
+            return cp.asarray(np.ascontiguousarray(array, dtype=dtype))
+    with cp.cuda.Device(array.device.id):
+        if dtype is not None and array.dtype != dtype:
+            array, view = array.astype(dtype), True  # a fresh copy
+        if array.device.id == device:
+            return array if view else array.copy()
+    return _copy_to_gpu(array, device)
+
+
+def _leiden_partitioned(
+    parts: SimpleNamespace,
+    info: dict,
+    *,
+    n: int,
+    use_weights: bool,
+    resolutions: list[float],
+    seeds: list[int],
+    n_iterations: int,
+    membership: cp.ndarray | None,
+) -> list[SimpleNamespace]:
+    """Every resolution in one `_leiden_cuda.leiden_mg` call over the partitions of `_split_rows`."""
+    root = parts.devices[0]
+    if membership is not None and membership.device.id != root:
+        membership = _copy_to_gpu(membership, root)
+    peer = _peer_copies_work(sorted(set(parts.devices)))
+    for device in {*parts.devices, cp.cuda.Device().id}:  # the inputs are ready
+        with cp.cuda.Device(device):
+            cp.cuda.get_current_stream().synchronize()
+    args = {
+        "indices": parts.indices,
+        "data": parts.data,
+        "devices": parts.devices,
+        "bounds": parts.bounds,
+        "use_weights": use_weights,
+        "check": info,
+        "peer": peer,
+        "resolutions": [float(res) for res in resolutions],
+        "seeds": seeds,
+        "n_iterations": n_iterations,
+        "initial_membership": membership,
+    }
+    factors = [_ARENA_FACTOR] + [_ARENA_FACTOR_PART] * (len(parts.devices) - 1)  # one per partition
+    for _ in range(_MAX_RERUNS + 1):
+        sizes = _ld.leiden_mg(parts.indptrs, **args, workspaces=[], arena_factors=factors)["required_bytes"]
+        workspaces = []
+        for device, nbytes in zip(parts.devices, sizes, strict=True):
+            with cp.cuda.Device(device):
+                workspaces.append(cp.empty(nbytes, dtype=cp.uint8))
+        with cp.cuda.Device(root):
+            labels = cp.empty((len(resolutions), n), dtype=cp.int32)
+        out = _ld.leiden_mg(
+            parts.indptrs,
+            **args,
+            workspaces=workspaces,
+            labels_out=labels,
+            arena_factors=factors,
+        )
+        if out["status"] == "ok":
+            with cp.cuda.Device(root):
+                codes = _labels_to_host(labels)
+            break
+        # rare: a level did not fit; grow the arena of each partition that overflowed
+        del workspaces, labels
+        for p, need in enumerate(out["required_arena_factor"]):
+            if need > 0:
+                factors[p] = max(_WORKSPACE_GROWTH * factors[p], _REQUIRED_SLACK * need)
+    else:
+        msg = f"Native Leiden reported workspace_too_small {_MAX_RERUNS + 1} times in a row."
+        raise RuntimeError(msg)
+    return [
+        SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
+        for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)
+    ]
+
+
+def _input_device(adjacency) -> int | None:
+    """The GPU that device input (CuPy / cupyx) lives on; None for host input."""
+    if isinstance(adjacency, cp.ndarray):
+        return adjacency.device.id
+    if cpx_sparse.issparse(adjacency):
+        return adjacency.data.device.id
+    return None
 
 
 def _as_csr(adjacency):

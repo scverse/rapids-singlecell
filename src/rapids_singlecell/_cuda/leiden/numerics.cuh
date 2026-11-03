@@ -329,10 +329,14 @@ struct DeviceInfo {
     bool pageable_access = false;
 };
 
+// Cached per device (a partitioned run alternates between devices).
 inline const DeviceInfo& device_info() {
-    static thread_local DeviceInfo cached;
+    constexpr int kCachedDevices = 64;
+    static thread_local DeviceInfo cache[kCachedDevices];
+    static thread_local DeviceInfo other;
     int dev = 0;
     cuda_check(cudaGetDevice(&dev), "leiden: cudaGetDevice");
+    DeviceInfo& cached = dev < kCachedDevices ? cache[dev] : other;
     if (dev != cached.device) {
         DeviceInfo d;
         d.device = dev;

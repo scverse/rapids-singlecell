@@ -80,6 +80,13 @@ def _graph(name):
         cols = list(range(1, n)) + list(range(2, n))
         a = sparse.coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
         a = a + a.T
+    elif name == "hubs":  # 32 hubs (rows 0-31) linked to all other cells, plus a random 10-neighbour chain
+        n, rng = 2000, np.random.default_rng(0)
+        order = rng.permutation(n)
+        rows = np.concatenate([*(order[:-d] for d in range(1, 11)), np.repeat(np.arange(32), n - 32)])
+        cols = np.concatenate([*(order[d:] for d in range(1, 11)), np.tile(np.arange(32, n), 32)])
+        a = sparse.coo_matrix((rng.uniform(0.5, 1.0, rows.size), (rows, cols)), shape=(n, n))
+        a = a + a.T
     elif name == "components":  # blocks plus isolated vertices
         rng = np.random.default_rng(2)
         mats = [sparse.random(40 + 9 * i, 40 + 9 * i, density=0.15, random_state=rng) for i in range(5)]
@@ -792,6 +799,167 @@ def test_streams_and_allocators():
         assert_same(native(a, [0.5, 1.0]), expected)
     finally:
         cp.cuda.set_allocator(allocator)
+
+
+# ---------- multi-GPU: level 0 split into row partitions ----------
+
+
+@pytest.fixture
+def partitions(monkeypatch):
+    """Sets the number of row partitions (round-robin over the GPUs, so several share
+    one; None: one); no replicas, so the small fixtures split."""
+    monkeypatch.setattr(_leiden, "_MAX_REPLICAS", 1)
+
+    def use(n_parts):
+        monkeypatch.setattr(_leiden, "_N_PARTITIONS", n_parts)
+
+    return use
+
+
+class _SpyLd:
+    """The native module, recording the status and arena factors of every `leiden_mg` run."""
+
+    def __init__(self, module):
+        self.module, self.runs = module, []
+
+    def __getattr__(self, name):
+        return getattr(self.module, name)
+
+    def leiden_mg(self, *args, **kwargs):
+        out = self.module.leiden_mg(*args, **kwargs)
+        if kwargs["workspaces"]:  # a run, not a sizing call
+            self.runs.append((out["status"], list(kwargs["arena_factors"])))
+        return out
+
+
+@needs_native
+@pytest.mark.parametrize("name", ["pbmc3k", "pairs", "star", "components"])
+def test_partitions_bitwise(partitions, name):
+    """2, 3 and 4 partitions (pairs: some empty; star: a hub; components:
+    isolated cells) give the bits of one, also with n_iterations=-1."""
+    a = _graph(name)
+    for n_iterations in (2, -1):
+        partitions(None)
+        expected = native(a, [0.5, 1.0, 2.0], n_iterations=n_iterations)
+        for n_parts in (2, 3, 4):
+            partitions(n_parts)
+            assert_same(native(a, [0.5, 1.0, 2.0], n_iterations=n_iterations), expected)
+
+
+@needs_native
+def test_partitions_options(partitions, monkeypatch):
+    """2, 3 and 4 partitions with use_weights=False (n_iterations=-1),
+    initial_membership (n_iterations=1), a re-quantisation (gamma = 20),
+    device input, and the exchange through the host (no peer copies, also
+    between partitions on one GPU)."""
+    a = _graph("pbmc68k")
+    start = native(a, 1.0, seed=1)[0].membership
+    cases = [
+        ({"use_weights": False, "n_iterations": -1}, a),
+        ({"initial_membership": start, "n_iterations": 1}, a),
+        ({}, cpx_sparse.csr_matrix(a)),
+    ]
+    for kwargs, adjacency in cases:
+        partitions(None)
+        expected = native(adjacency, [0.5, 20.0], **kwargs)
+        for n_parts in (2, 3, 4):
+            partitions(n_parts)
+            assert_same(native(adjacency, [0.5, 20.0], **kwargs), expected)
+    monkeypatch.setattr(_leiden, "_peer_copies_work", lambda devices: False)
+    assert_same(native(a, [0.5, 20.0]), expected)
+
+
+@needs_native
+def test_partitions_empty(partitions, monkeypatch):
+    """Empty and small partitions merge their share of the coarse rows: a
+    32-row block of hubs (the default split leaves partition 1 empty) and
+    forced bounds (also the first partition empty) run once, with the bits of
+    one partition."""
+    spy = _SpyLd(_leiden._ld)
+    monkeypatch.setattr(_leiden, "_ld", spy)
+    a = _graph("hubs")
+    assert _leiden._row_bounds(a.indptr.astype(np.int64), 6)[:3] == [0, 32, 32]
+    b = _graph("pbmc3k")
+    n = b.shape[0]
+    forced = ([0, 64, 64, 1024, n], [0, 1312, 1344, n], [0, 1312, n, n, n], [0, 0, 0, 32, n])
+    for adjacency, splits in ((a, [None]), (b, forced)):
+        partitions(None)
+        expected = native(adjacency, [0.5, 1.0])
+        for bounds in splits:
+            if bounds is None:
+                partitions(6)
+            else:
+                monkeypatch.setattr(_leiden, "_row_bounds", lambda indptr, n_parts, bounds=bounds: bounds)
+                partitions(len(bounds) - 1)
+            spy.runs.clear()
+            assert_same(native(adjacency, [0.5, 1.0]), expected)
+            assert [status for status, _ in spy.runs] == ["ok"]
+
+
+@needs_native
+def test_partitions_rerun_and_workspace(partitions, monkeypatch):
+    """Arenas too small stop every partition and the rerun gives the same
+    bits; so do workspaces filled with garbage."""
+    a = _graph("pbmc3k")
+    partitions(None)
+    expected = native(a, [0.5, 1.0, 2.0])
+    partitions(3)
+    spy = _SpyLd(_leiden._ld)
+    monkeypatch.setattr(_leiden, "_ld", spy)
+    for factor in ("_ARENA_FACTOR", "_ARENA_FACTOR_PART"):  # partition 0, the others
+        with monkeypatch.context() as m:
+            m.setattr(_leiden, factor, 0.05)
+            spy.runs.clear()
+            assert_same(native(a, [0.5, 1.0, 2.0]), expected)
+            (status, first), (last_status, last) = spy.runs[0], spy.runs[-1]
+            assert (status, last_status) == ("workspace_too_small", "ok")
+            # only the partitions that overflowed grow
+            kept = slice(1, None) if factor == "_ARENA_FACTOR" else slice(0, 1)
+            assert last[kept] == first[kept]
+    empty = cp.empty
+
+    def dirty(*args, **kwargs):
+        out = empty(*args, **kwargs)
+        out.view(cp.uint8)[...] = 0xA5
+        return out
+
+    monkeypatch.setattr(cp, "empty", dirty)
+    assert_same(native(a, [0.5, 1.0, 2.0]), expected)
+
+
+@needs_native
+def test_multi_gpu_argument(adata_neighbors, monkeypatch):
+    n_gpus = cp.cuda.runtime.getDeviceCount()
+    for bad in ("x", [n_gpus], [], 1.5, [0.5], 0):
+        with pytest.raises(ValueError, match=r"multi_gpu|GPU|literal"):
+            rsc.tl.leiden(adata_neighbors, multi_gpu=bad)
+    for kwargs in ({"flavor": "cugraph"}, {"use_dask": True}):
+        for multi_gpu in (True, 0, [0]):
+            with pytest.raises(ValueError, match=r"multi_gpu is supported by flavor='rapids'"):
+                rsc.tl.leiden(adata_neighbors, multi_gpu=multi_gpu, **kwargs)
+    assert "leiden" not in adata_neighbors.obs
+    # a graph that fits runs on the current GPU; a device list is split
+    rsc.tl.leiden(adata_neighbors, key_added="one")
+    for key, multi_gpu in (("all", True), ("list", [0]), ("str", "0")):
+        rsc.tl.leiden(adata_neighbors, multi_gpu=multi_gpu, key_added=key)
+        pd.testing.assert_series_equal(adata_neighbors.obs[key], adata_neighbors.obs["one"], check_names=False)
+    # graphs small enough for replicas are not split
+    monkeypatch.setattr(_leiden, "_N_PARTITIONS", 2)
+    with pytest.warns(UserWarning, match="replicas"):
+        rsc.tl.leiden(adata_neighbors, key_added="replicas")
+    pd.testing.assert_series_equal(adata_neighbors.obs["replicas"], adata_neighbors.obs["one"], check_names=False)
+
+
+@needs_native
+@pytest.mark.two_gpus
+def test_multi_gpu_devices(partitions, peer):
+    """Partitions on two GPUs (peer copies or through the host; host and device input) give the bits of one."""
+    a = _graph("pbmc3k")
+    partitions(None)
+    expected = native(a, [0.5, 1.0, 2.0])
+    assert_same(native(a, [0.5, 1.0, 2.0], multi_gpu=[0, 1]), expected)
+    partitions(3)
+    assert_same(native(cpx_sparse.csr_matrix(a), [0.5, 1.0, 2.0], multi_gpu=[1, 0]), expected)
 
 
 # ---------- quality ----------
