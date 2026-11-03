@@ -6,6 +6,8 @@ from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import rapids_singlecell as rsc
 
+pytestmark = pytest.mark.filterwarnings("ignore:The function louvain is deprecated:FutureWarning")
+
 
 @pytest.mark.parametrize("clustering_function", [rsc.tl.leiden, rsc.tl.louvain])
 def test_dask_clustering(dist_client, clustering_function):
