@@ -246,14 +246,12 @@ def neighbors(
         method=method,
         metric=metric,
     )
-    if connectivities.nnz >= np.iinfo(np.int32).max:
-        connectivities = (
-            _large_coo_to_host_csr(connectivities)
-            if connectivities.format == "coo"  # gauss and jaccard return CSR
-            else connectivities.get().tocsr()
-        )
-    else:
-        connectivities = connectivities.tocsr().get()
+    # a GPU tocsr sorts all entries and runs out of memory well below 2**31 of them
+    connectivities = (
+        _large_coo_to_host_csr(connectivities)
+        if connectivities.format == "coo"  # gauss and jaccard return CSR
+        else connectivities.get().tocsr()
+    )
 
     # Store results
     neighbors_key = key_added if key_added is not None else "neighbors"

@@ -132,7 +132,7 @@ def _build_sparse_distances(
 
 
 def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
-    """Host CSR of a GPU COO matrix with too many entries for CuPy's 32-bit CSR.
+    """Host CSR of a GPU COO matrix, without a GPU tocsr (memory, 32-bit limits).
 
     The graphs cuML builds are sorted by row and column, so only the row pointers
     have to be computed (on the GPU), instead of converting billions of entries on the host.
