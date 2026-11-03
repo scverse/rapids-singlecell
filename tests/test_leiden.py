@@ -857,6 +857,33 @@ def test_cugraph_arguments(adata_neighbors, monkeypatch):
     assert [s["random_state"] for s in seen[2:]] == [int(rng.integers(0, 2**32)) for _ in range(2)]
 
 
+@pytest.mark.parametrize("error", [MemoryError("std::bad_alloc"), RuntimeError("... out_of_memory ...")])
+def test_cugraph_out_of_memory_retry(adata_neighbors, monkeypatch, error):
+    import rmm
+
+    expected = rsc.tl.leiden(adata_neighbors, flavor="cugraph", copy=True)
+    original, calls = _leiden._cugraph_groups, []
+
+    def fail_once(*args, **kwargs):
+        calls.append(type(rmm.mr.get_current_device_resource()))
+        if len(calls) == 1:
+            raise error
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_leiden, "_cugraph_groups", fail_once)
+    with pytest.warns(ResourceWarning, match="managed memory"):
+        rsc.tl.leiden(adata_neighbors, flavor="cugraph")
+    # the retry runs in managed memory with the same seed, then the resource is restored
+    assert calls[1] is rmm.mr.ManagedMemoryResource
+    assert type(rmm.mr.get_current_device_resource()) is calls[0]
+    assert (adata_neighbors.obs["leiden"] == expected.obs["leiden"]).all()
+    # other errors are not retried
+    calls.clear()
+    monkeypatch.setattr(_leiden, "_cugraph_groups", lambda *a, **k: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        rsc.tl.leiden(adata_neighbors, flavor="cugraph")
+
+
 def test_cugraph_helpers():
     groups = np.array([5, 5, 3, 3, 9, 7, 7, 7])
     codes, n_clusters = _leiden._size_ordered_codes(groups)

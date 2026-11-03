@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from contextlib import contextmanager
 from numbers import Integral, Real
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
@@ -49,6 +50,7 @@ _MAX_RESOLUTION = 2.0**20  # bound of the integer no-overflow proof
 # cuGraph returns the refined partition when it hits `max_iter` levels, so
 # `n_iterations` is not forwarded and the cap stays well above what it needs.
 _CUGRAPH_MAX_ITER = 100
+_MODULARITY_CHUNK = 1 << 27  # entries per chunk of `_exact_modularity`
 # The native implementation is the default; this also starts the deprecation
 # of flavor="cugraph" and use_dask (FutureWarning).
 _DEFAULT_FLAVOR: Literal["rapids", "cugraph"] = "rapids"
@@ -676,14 +678,23 @@ def _leiden_cugraph(
     if objective_function.lower() != "modularity":
         msg = "flavor='cugraph' only supports objective_function='modularity'."
         raise NotImplementedError(msg)
-    if use_dask:
-        from cugraph.dask import leiden as culeiden
-
-        g = _create_graph_dask(adjacency, dtype, use_weights=use_weights)
+    # cuGraph's leiden is seeded: one seed per resolution, kept for a retry
+    seeds = [_seed_from_rng(rng) for _ in resolutions]
+    kw = {"seeds": seeds, "theta": theta, "dtype": dtype, "use_weights": use_weights, "max_iter": max_iter}
+    if use_dask:  # an out-of-memory worker leaves the others hanging: no retry
+        groups = _cugraph_groups(adjacency, resolutions, **kw, use_dask=True)
     else:
-        from cugraph import leiden as culeiden
-
-        g = _create_graph(adjacency, dtype, use_weights=use_weights)
+        try:
+            groups = _cugraph_groups(adjacency, resolutions, **kw, use_dask=False)
+        except (MemoryError, RuntimeError) as err:
+            if not isinstance(err, MemoryError) and "out_of_memory" not in str(err):
+                raise
+            groups = None  # the retry starts after the failed call has been freed
+        if groups is None:
+            msg = "cuGraph ran out of GPU memory; retrying in CUDA managed memory (slower)."
+            warnings.warn(msg, ResourceWarning, stacklevel=4)
+            with _managed_memory():
+                groups = _cugraph_groups(adjacency, resolutions, **kw, use_dask=False)
     if not hasattr(_ld, "ingest_check"):  # no native extension: float64 sums
         graph, info, weighted = _as_csr(adjacency), None, use_weights
     else:
@@ -694,13 +705,38 @@ def _leiden_cugraph(
             graph, info, weighted = _ingest(_as_csr(adjacency), use_weights=use_weights, host_input=False)
     modularity = _exact_modularity(graph, info, use_weights=weighted)
     parts = []
+    for resolution, group in zip(resolutions, groups, strict=True):
+        membership, n_clusters = _size_ordered_codes(group)
+        parts.append(
+            SimpleNamespace(
+                membership=membership,
+                # cuGraph's modularity is not that of the returned partition
+                modularity=modularity(membership, n_clusters, resolution),
+                n_clusters=n_clusters,
+            )
+        )
+    return parts
+
+
+def _cugraph_groups(
+    adjacency, resolutions, *, seeds, theta, dtype, use_weights, max_iter, use_dask
+) -> list[np.ndarray]:
+    """Communities of every resolution; cuGraph's graph is freed on return."""
+    if use_dask:
+        from cugraph.dask import leiden as culeiden
+
+        g = _create_graph_dask(adjacency, dtype, use_weights=use_weights)
+    else:
+        from cugraph import leiden as culeiden
+
+        g = _create_graph(adjacency, dtype, use_weights=use_weights)
+    groups = []
     try:
-        for resolution in resolutions:
+        for resolution, seed in zip(resolutions, seeds, strict=True):
             leiden_parts, _ = culeiden(
                 g,
                 resolution=resolution,
-                # cuGraph's leiden is seeded, so draw the seed right here
-                random_state=_seed_from_rng(rng),
+                random_state=seed,
                 theta=1.0 if theta is None else theta,
                 max_iter=max_iter,
             )
@@ -708,22 +744,27 @@ def _leiden_cugraph(
                 leiden_parts = leiden_parts.to_backend("pandas").compute()
             else:
                 leiden_parts = leiden_parts.to_pandas()
-            membership, n_clusters = _size_ordered_codes(_vertex_groups(leiden_parts, adjacency.shape[0]))
-            parts.append(
-                SimpleNamespace(
-                    membership=membership,
-                    # cuGraph's modularity is not that of the returned partition
-                    modularity=modularity(membership, n_clusters, resolution),
-                    n_clusters=n_clusters,
-                )
-            )
+            groups.append(_vertex_groups(leiden_parts, adjacency.shape[0]))
     finally:
         # tear down the comms even on failure: later Dask calls would fail
         if use_dask:
             import cugraph.dask.comms.comms as Comms
 
             Comms.destroy()
-    return parts
+    return groups
+
+
+@contextmanager
+def _managed_memory():
+    """Route RMM allocations (cuGraph's, CuPy's) to CUDA managed memory, which can exceed the GPU."""
+    import rmm
+
+    previous = rmm.mr.get_current_device_resource()
+    rmm.mr.set_current_device_resource(rmm.mr.ManagedMemoryResource())
+    try:
+        yield
+    finally:
+        rmm.mr.set_current_device_resource(previous)
 
 
 def _vertex_groups(leiden_parts: pd.DataFrame, n: int) -> np.ndarray:
@@ -754,29 +795,41 @@ def _exact_modularity(graph, info: dict | None, *, use_weights: bool):
     ``info=None`` (no native extension) the weights are summed in float64.
     """
     indptr = cp.asarray(graph.indptr, dtype=cp.int64)
-    indices = cp.asarray(graph.indices, dtype=cp.int64)
-    data = cp.asarray(graph.data, dtype=cp.float64)
+    indices = cp.asarray(graph.indices)
+    data = cp.asarray(graph.data)
     n = indptr.shape[0] - 1
-    rows = cp.searchsorted(indptr[1:], cp.arange(indices.shape[0]), side="right")
-    counted = (rows != indices) & ((data > 0) if use_weights else (data != 0))
-    value = data if use_weights else cp.ones_like(data)
+    s = None
+
+    def weights(lo: int, hi: int) -> tuple[cp.ndarray, cp.ndarray]:
+        """Rows and (quantised) weights of the entries lo:hi; 0 if not counted."""
+        rows = cp.searchsorted(indptr[1:], cp.arange(lo, hi), side="right")
+        w = data[lo:hi].astype(cp.float64)
+        counted = (rows != indices[lo:hi]) & ((w > 0) if use_weights else (w != 0))
+        value = w if use_weights else cp.ones_like(w)
+        if s is None:
+            return rows, cp.where(counted, value, 0.0)
+        q = cp.where(counted, cp.maximum(cp.rint(cp.ldexp(value, s)), 1), 0)
+        return rows, q.astype(cp.int64)
 
     def modularity(membership: np.ndarray, n_clusters: int, resolution: float):
-        if info is None:
-            q = cp.where(counted, value, 0.0)
-        else:
+        nonlocal s
+        if info is not None:
             s = _scale_exponent(info["nnz_counted"], info["wmax"], resolution)
-            q = cp.where(counted, cp.maximum(cp.rint(cp.ldexp(value, s)), 1), 0)
-            q = q.astype(cp.int64)
-        khat = cp.zeros(n, q.dtype)
-        cp.add.at(khat, rows, q)
         labels = cp.asarray(membership, dtype=cp.int64)
-        volumes = cp.zeros(n_clusters, q.dtype)
+        khat = cp.zeros(n, cp.float64 if s is None else cp.int64)
+        inner = 0
+        # in edge chunks: the full-length temporaries would not fit next to large graphs
+        for lo in range(0, indices.shape[0], _MODULARITY_CHUNK):
+            hi = min(lo + _MODULARITY_CHUNK, indices.shape[0])
+            rows, q = weights(lo, hi)
+            cp.add.at(khat, rows, q)
+            inner += q[labels[rows] == labels[indices[lo:hi]]].sum().item()
+        volumes = cp.zeros(n_clusters, khat.dtype)
         cp.add.at(volumes, labels, khat)
         two_m = float(khat.sum().item())
         if two_m == 0:  # no counted entry
             return 0.0
-        inner = float(q[labels[rows] == labels[indices]].sum().item())
+        inner = float(inner)
         x = volumes.get().astype(np.float64) / two_m
         return float(inner / two_m - float(resolution) * _tree1024(x * x))
 
