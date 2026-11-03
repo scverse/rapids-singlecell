@@ -290,3 +290,6 @@ date,project,total,last_30_days
 2026-11-01,rapids-singlecell,306093,11752
 2026-11-01,rapids-singlecell-cu12,17413,2533
 2026-11-01,rapids-singlecell-cu13,15381,1928
+2026-11-02,rapids-singlecell,306639,12033
+2026-11-02,rapids-singlecell-cu12,17664,2734
+2026-11-02,rapids-singlecell-cu13,15579,2081
