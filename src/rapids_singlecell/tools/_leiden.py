@@ -127,7 +127,7 @@ def leiden(
         ``adata.obs`` key under which to add the cluster labels.
     adjacency
         Sparse adjacency matrix of the graph, defaults to neighbors
-        connectivities.
+        connectivities. ``flavor='rapids'`` ignores its diagonal (self-loops).
     directed
         Must not be ``True``: the graph is treated as undirected.
     use_weights
@@ -164,8 +164,9 @@ def leiden(
         see ``beta``.
     dtype
         Weight dtype of the cuGraph graph (``'float32'`` or ``'float64'``).
-        Only used by ``flavor='cugraph'``; the native implementation reads the
-        weights in their own precision.
+        Only used by ``flavor='cugraph'``; the native implementation reads
+        float32 or float64 weights and rounds them to one 64-bit fixed-point
+        grid.
     use_dask
         Deprecated. If ``True``, run cuGraph's Dask implementation on all GPUs
         (this implies ``flavor='cugraph'``).
@@ -213,9 +214,12 @@ def leiden(
         ``n_iterations``, and ``random_state`` (if applicable).
     ``adata.uns['leiden' | key_added]['modularity']`` : :class:`float`
         The modularity of the returned clustering with the resolution as
-        gamma, computed in float64 from the graph (a list for several
-        resolutions). Use :func:`scanpy.metrics.modularity` for the score
-        with gamma = 1.
+        gamma (a list for several resolutions), computed exactly without
+        self-loops and with the weights rounded to one 64-bit fixed-point
+        grid, which differs from float64 sums only for weights spanning many
+        orders of magnitude or a resolution near ``2**20``. Use
+        :func:`scanpy.metrics.modularity` for the score with gamma = 1 (it
+        counts self-loops).
     """
     flavor = _validate_flavor(
         flavor,
@@ -228,6 +232,7 @@ def leiden(
         msg = "multi_gpu is supported by flavor='rapids'; flavor='cugraph' runs on all GPUs with use_dask=True."
         raise ValueError(msg)
     dtype = _check_dtype(dtype)
+    use_weights = bool(use_weights)  # the bindings take a Python bool
     _validate_n_iterations(n_iterations, flavor=flavor)
     resolutions = _validate_resolutions(resolution)
     rng = np.random.default_rng(rng)
@@ -410,17 +415,22 @@ def _leiden_rapids(
     explicit = isinstance(multi_gpu, list | str)
     split = "always" if explicit else "auto" if multi_gpu is True else "no"
     home = devices[0] if explicit else cp.cuda.Device().id
+    if split == "auto":  # partition 0 goes to the GPU whose free memory decides
+        devices = [home, *(d for d in devices if d != home)]
     source = _input_device(adjacency)
     with cp.cuda.Device(home if source is None else source):
         csr = _as_csr(adjacency)
     with cp.cuda.Device(home):
         if source not in (None, home):  # device input on another GPU
-            arrays = (_copy_to_gpu(a, home) for a in (csr.data, csr.indices, csr.indptr))
-            csr = cpx_sparse.csr_matrix(tuple(arrays), shape=csr.shape)
+            from rapids_singlecell.tools._rank_genes_groups._wilcoxon_host import _copy_device_sparse_to_device
+
+            csr = _copy_device_sparse_to_device(csr, home)
         n = csr.shape[0]
         membership = _compact_initial_membership(initial_membership, n)
         host_input = _HOST_ZERO_COPY and not cpx_sparse.issparse(csr) and _reads_host_memory(cp.cuda.Device().id)
-        graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input)
+        graph, info = None, {"nnz_counted": 0}
+        if csr.nnz:  # an empty graph needs no check (its size-0 arrays can report another memory kind)
+            graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input)
         if info["nnz_counted"] == 0:  # no edge: every cell is its own cluster
             codes = np.arange(n, dtype=np.int32)
             return [SimpleNamespace(membership=codes, modularity=0.0, n_clusters=n) for _ in resolutions]
@@ -440,13 +450,15 @@ def _leiden_rapids(
             "stream": cp.cuda.get_current_stream().ptr,
         }
         n_parts = _n_partitions(graph, args, devices, split=split)
-        if n_parts > 1 and _ld.n_replicas(info["nnz_counted"], max_replicas) > 1:
+        if n_parts > 1 and _ld.n_replicas(info["nnz_counted"], n, max_replicas) > 1:
             msg = "multi_gpu: graphs this small run as replicas, which split runs do not have; running on one GPU."
             warnings.warn(msg, UserWarning, stacklevel=4)
             n_parts = 1
         if n_parts == 1:
             return _leiden_single(graph, args, n)
-        owned = cpx_sparse.issparse(adjacency) and graph.indices is adjacency.indices
+        for device in devices:  # a split run does not use the cached single-GPU workspaces
+            _WORKSPACE_CACHE.pop(device, None)
+        owned = cpx_sparse.issparse(adjacency) and graph.indices is getattr(adjacency, "indices", None)
         parts = _split_rows(graph, n_parts, devices, owned=owned)
         del graph, csr, args  # the partitions hold copies of a fixed-up graph
         return _leiden_partitioned(
@@ -464,11 +476,14 @@ def _leiden_rapids(
 def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNamespace]:
     """One GPU: size the workspace, run, rerun with a larger arena if a level did not fit."""
     pinned = cp.cuda.alloc_pinned_memory(_ld.PINNED_BYTES)  # readback buffer
+    # the memory kind of the call's other device arrays, which the workspace must share
+    arrays = (graph.indptr, args["initial_membership"])
+    kind = next((_memory_kind(a) for a in arrays if isinstance(a, cp.ndarray)), None)
     factor = _ARENA_FACTOR
     for _ in range(_MAX_RERUNS + 1):
         # a call without a workspace sizes it
         nbytes = _ld.leiden(graph.indptr, **args, arena_factor=factor)
-        buffer, workspace, labels = _allocate_workspace(nbytes["required_bytes"], (len(args["resolutions"]), n))
+        buffer, workspace, labels = _allocate_workspace(nbytes["required_bytes"], (len(args["resolutions"]), n), kind)
         out = _ld.leiden(
             graph.indptr,
             **args,
@@ -497,7 +512,8 @@ def _n_partitions(graph, args: dict, devices: list[int], *, split: str) -> int:
     """Partitions of a run: the knob, one per device of a split, else 1.
 
     ``"auto"`` (``multi_gpu=True``) splits only a graph whose single-GPU
-    workspace and labels do not fit in the current GPU's free memory.
+    workspace and labels do not fit in the current GPU's free memory (with
+    its cached workspace, which a single-GPU run reuses or frees).
     """
     if _N_PARTITIONS is not None:
         return _N_PARTITIONS
@@ -507,7 +523,10 @@ def _n_partitions(graph, args: dict, devices: list[int], *, split: str) -> int:
         return 1
     nbytes = _ld.leiden(graph.indptr, **args, arena_factor=_ARENA_FACTOR)["required_bytes"]
     labels = 4 * len(args["resolutions"]) * (graph.indptr.shape[0] - 1)
-    return 1 if nbytes + labels <= cp.cuda.Device().mem_info[0] else len(devices)
+    device = cp.cuda.Device()
+    cached = _WORKSPACE_CACHE.get(device.id)
+    free = device.mem_info[0] + (0 if cached is None else cached.nbytes)
+    return 1 if nbytes + labels <= free else len(devices)
 
 
 def _row_bounds(indptr: np.ndarray, n_parts: int) -> list[int]:
@@ -550,6 +569,9 @@ def _split_rows(graph: SimpleNamespace, n_parts: int, devices: list[int], *, own
 
 def _rows_on(array, device: int, *, view: bool, dtype=None) -> cp.ndarray:
     """A partition's entries on its device: a view of user-owned device input there, else a copy."""
+    if array.shape[0] == 0:  # a slice: new empty arrays report CUDA memory also under a managed allocator
+        with cp.cuda.Device(device):
+            return cp.empty(1, dtype=dtype or array.dtype)[:0]
     if isinstance(array, np.ndarray):
         with cp.cuda.Device(device):
             return cp.asarray(np.ascontiguousarray(array, dtype=dtype))
@@ -577,9 +599,6 @@ def _leiden_partitioned(
     if membership is not None and membership.device.id != root:
         membership = _copy_to_gpu(membership, root)
     peer = _peer_copies_work(sorted(set(parts.devices)))
-    for device in {*parts.devices, cp.cuda.Device().id}:  # the inputs are ready
-        with cp.cuda.Device(device):
-            cp.cuda.get_current_stream().synchronize()
     args = {
         "indices": parts.indices,
         "data": parts.data,
@@ -602,6 +621,10 @@ def _leiden_partitioned(
                 workspaces.append(cp.empty(nbytes, dtype=cp.uint8))
         with cp.cuda.Device(root):
             labels = cp.empty((len(resolutions), n), dtype=cp.int32)
+        # leiden_mg runs on its own streams: the inputs and buffers must be ready
+        for device in {*parts.devices, cp.cuda.Device().id}:
+            with cp.cuda.Device(device):
+                cp.cuda.get_current_stream().synchronize()
         out = _ld.leiden_mg(
             parts.indptrs,
             **args,
@@ -666,7 +689,11 @@ def _ingest(csr, *, use_weights: bool, host_input: bool):
     """
     n = csr.shape[0]
     if cpx_sparse.issparse(csr):
-        graph = SimpleNamespace(indptr=csr.indptr, indices=csr.indices, data=csr.data, host=False)
+        arrays = (csr.indptr, csr.indices, csr.data)
+        # the bindings take one memory kind per call: copy input of another allocator
+        if _memory_kind(csr.indptr) != _memory_kind(cp.empty(1, dtype=cp.uint8)):
+            arrays = tuple(a.copy() for a in arrays)
+        graph = SimpleNamespace(indptr=arrays[0], indices=arrays[1], data=arrays[2], host=False)
     elif host_input:
         graph = SimpleNamespace(
             indptr=np.ascontiguousarray(csr.indptr),
@@ -786,8 +813,8 @@ def _symmetrize(graph: SimpleNamespace, n: int) -> SimpleNamespace:
         a = sparse.csr_matrix((graph.data, graph.indices, graph.indptr), shape=(n, n))
         xp = np
     else:
-        if graph.nnz >= 2**31:
-            msg = "Symmetrizing an asymmetric adjacency with >= 2**31 entries is not supported."
+        if 2 * graph.nnz >= 2**31:  # A + A.T has up to 2 nnz entries, int32-indexed on the device
+            msg = "Symmetrizing an asymmetric adjacency with >= 2**30 entries on the GPU is not supported."
             raise ValueError(msg)
         a = cpx_sparse.csr_matrix(
             (graph.data, graph.indices.astype(cp.int32), graph.indptr.astype(cp.int32)),
@@ -828,12 +855,18 @@ def _workspace_cache_applies() -> bool:
     )
 
 
-def _allocate_workspace(nbytes: int, labels_shape: tuple[int, int]) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
-    """One buffer holding the workspace (``nbytes``) and the int32 labels."""
+def _allocate_workspace(
+    nbytes: int, labels_shape: tuple[int, int], kind: int | None = None
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """One buffer holding the workspace (``nbytes``) and the int32 labels.
+
+    A cached buffer is reused only in memory of ``kind`` (`_memory_kind`; None: any).
+    """
     offset = -(-nbytes // 256) * 256
     total = offset + 4 * labels_shape[0] * labels_shape[1]
     buffer = _WORKSPACE_CACHE.pop(cp.cuda.Device().id, None)
-    if buffer is None or buffer.nbytes < total or not _workspace_cache_applies():
+    reuse = buffer is not None and buffer.nbytes >= total and kind in (None, _memory_kind(buffer))
+    if not (reuse and _workspace_cache_applies()):
         buffer = None  # free the cached buffer first
         buffer = cp.empty(total, dtype=cp.uint8)
     labels = buffer[offset:total].view(cp.int32).reshape(labels_shape)
@@ -845,6 +878,11 @@ def _cache_workspace(buffer: cp.ndarray) -> None:
     limit = min(_WORKSPACE_CACHE_BYTES, device.mem_info[1] // 16)
     if buffer.nbytes <= limit and _workspace_cache_applies():
         _WORKSPACE_CACHE[device.id] = buffer
+
+
+def _memory_kind(array: cp.ndarray) -> int:
+    """DLPack device type of a device array: CUDA or CUDA managed memory."""
+    return array.__dlpack_device__()[0]
 
 
 def _reads_host_memory(device: int) -> bool:

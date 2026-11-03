@@ -167,8 +167,8 @@ template <typename IP, typename IX, typename WI>
 IngestInfo run_ingest_check(const IP* indptr, const IX* indices, const WI* data,
                             i64 n, i64 nnz, bool use_weights, Control* ctl,
                             void* pinned, cudaStream_t s) {
-    if (n < 0 || n >= kMaxVertices)
-        throw std::invalid_argument("leiden: n must be in [0, 2^30)");
+    if (n < 0 || n >= kMaxVertices - 1)  // and its CUB scans fit
+        throw std::invalid_argument("leiden: n must be in [0, 2^30 - 1)");
     if (n == 0 && nnz != 0)
         throw std::invalid_argument("leiden: indptr must end at nnz");
     const EntryValue<WI> val{data, use_weights};

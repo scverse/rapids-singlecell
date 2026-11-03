@@ -120,9 +120,11 @@ inline LevelStep level_step(u32 phase, i64 C, i64 n, i64 n_next, i64 pieces,
                                     : LevelStep::kAggregate;
 }
 
-inline int n_replicas(i64 nnz_counted, int max_replicas, i64 budget) {
+// The replicas fit the vertex ids and CUB item counts: R * n <= 2^30 - 2.
+inline int n_replicas(i64 nnz_counted, i64 n, int max_replicas, i64 budget) {
     if (nnz_counted <= 0) return 1;
-    const i64 r = budget / nnz_counted;
+    const i64 r = std::min(budget / nnz_counted,
+                           (kMaxVertices - 2) / std::max<i64>(n, 1));
     return static_cast<int>(std::min<i64>(max_replicas, std::max<i64>(1, r)));
 }
 
@@ -735,8 +737,8 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
     p.wkind = call_wkind(in.info, in.use_weights, data_f32, in.gammas);
     p.idx64_input = idx64_input;
     p.host_input = host_input;
-    const int R =
-        n_replicas(in.info.n_counted, dp.max_replicas, dp.replica_nnz_budget);
+    const int R = n_replicas(in.info.n_counted, in.n, dp.max_replicas,
+                             dp.replica_nnz_budget);
     p.replicas = R;
     p.arena_factor = dp.arena_factor;
     p.subrounds = dp.subrounds;
@@ -807,8 +809,8 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
     const i64 nnz = static_cast<i64>(indices.size());
     if (static_cast<i64>(data.size()) != nnz)
         throw std::invalid_argument("data and indices must have equal length");
-    if (n >= kMaxVertices)
-        throw std::invalid_argument("leiden: n must be < 2^30");
+    if (n >= kMaxVertices - 1)
+        throw std::invalid_argument("leiden: n must be < 2^30 - 1");
     if constexpr (host_input_v<InDevice>) require_pageable_access();
     const std::size_t n_res = resolutions.size();
     if (n_res == 0 || seeds.size() != n_res)
@@ -937,14 +939,15 @@ inline void register_api(nb::module_& m) {
     register_ingest(m);
 
     m.attr("PINNED_BYTES") = kPinnedBytes;
-    // Replica copies of the first iteration for nnz_counted counted entries.
+    // Replica copies of the first iteration for nnz_counted counted entries
+    // among n vertices.
     m.def(
         "n_replicas",
-        [](long long nnz_counted, int max_replicas) {
-            return n_replicas(nnz_counted, check_max_replicas(max_replicas),
+        [](long long nnz_counted, long long n, int max_replicas) {
+            return n_replicas(nnz_counted, n, check_max_replicas(max_replicas),
                               DriverParams{}.replica_nnz_budget);
         },
-        "nnz_counted"_a, "max_replicas"_a = kMaxReplicas);
+        "nnz_counted"_a, "n"_a, "max_replicas"_a = kMaxReplicas);
 
     REGISTER_GPU_BINDINGS(register_driver_bindings, m);
 }

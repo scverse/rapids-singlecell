@@ -16,23 +16,23 @@ class PeerExchange final : public Exchange {
                  bool peer)
         : dev_(std::move(devices)), s_(std::move(streams)), peer_(peer) {
         ev_.assign(dev_.size(), nullptr);
-        for (std::size_t i = 0; i < dev_.size(); ++i) {
-            set(static_cast<int>(i));
-            cuda_check(
-                cudaEventCreateWithFlags(&ev_[i], cudaEventDisableTiming),
-                "leiden: exchange event");
+        try {
+            for (std::size_t i = 0; i < dev_.size(); ++i) {
+                set(static_cast<int>(i));
+                cuda_check(
+                    cudaEventCreateWithFlags(&ev_[i], cudaEventDisableTiming),
+                    "leiden: exchange event");
+            }
+            if (!peer_)
+                cuda_check(cudaMallocHost(&stage_, kStageBytes),
+                           "leiden: exchange staging buffer");
+        } catch (...) {  // no destructor runs for a failed constructor
+            release();
+            throw;
         }
-        if (!peer_)
-            cuda_check(cudaMallocHost(&stage_, kStageBytes),
-                       "leiden: exchange staging buffer");
     }
     ~PeerExchange() override {
-        for (std::size_t i = 0; i < dev_.size(); ++i) {
-            if (!ev_[i]) continue;
-            cudaSetDevice(dev_[i]);
-            cudaEventDestroy(ev_[i]);
-        }
-        if (stage_) cudaFreeHost(stage_);
+        release();
     }
     PeerExchange(const PeerExchange&) = delete;
     PeerExchange& operator=(const PeerExchange&) = delete;
@@ -123,6 +123,16 @@ class PeerExchange final : public Exchange {
     void set(int i) {
         cuda_check(cudaSetDevice(dev_[i]), "leiden: cudaSetDevice");
     }
+    void release() {
+        for (std::size_t i = 0; i < dev_.size(); ++i) {
+            if (!ev_[i]) continue;
+            cudaSetDevice(dev_[i]);
+            cudaEventDestroy(ev_[i]);
+            ev_[i] = nullptr;
+        }
+        if (stage_) cudaFreeHost(stage_);
+        stage_ = nullptr;
+    }
     // Every stream waits for the work queued so far on every other one.
     void barrier() {
         for (int i = 0; i < parts(); ++i) {
@@ -180,13 +190,19 @@ struct PartResources {
     explicit PartResources(const std::vector<int>& devices) : dev(devices) {
         cuda_check(cudaGetDevice(&previous), "leiden: cudaGetDevice");
         s.assign(dev.size(), nullptr);
-        for (std::size_t i = 0; i < dev.size(); ++i) {
-            cuda_check(cudaSetDevice(dev[i]), "leiden: cudaSetDevice");
-            cuda_check(cudaStreamCreateWithFlags(&s[i], cudaStreamNonBlocking),
-                       "leiden: partition stream");
+        try {
+            for (std::size_t i = 0; i < dev.size(); ++i) {
+                cuda_check(cudaSetDevice(dev[i]), "leiden: cudaSetDevice");
+                cuda_check(
+                    cudaStreamCreateWithFlags(&s[i], cudaStreamNonBlocking),
+                    "leiden: partition stream");
+            }
+            cuda_check(cudaMallocHost(&pinned, dev.size() * kPinnedBytes),
+                       "leiden: pinned readback buffer");
+        } catch (...) {  // no destructor runs for a failed constructor
+            release();
+            throw;
         }
-        cuda_check(cudaMallocHost(&pinned, dev.size() * kPinnedBytes),
-                   "leiden: pinned readback buffer");
     }
     void synchronize() {
         for (std::size_t i = 0; i < dev.size(); ++i) {
@@ -196,13 +212,18 @@ struct PartResources {
         }
     }
     ~PartResources() {
+        release();
+    }
+    void release() {
         synchronize();
         for (std::size_t i = 0; i < dev.size(); ++i) {
             if (!s[i]) continue;
             cudaSetDevice(dev[i]);
             cudaStreamDestroy(s[i]);
+            s[i] = nullptr;
         }
         if (pinned) cudaFreeHost(pinned);
+        pinned = nullptr;
         cudaSetDevice(previous);
         cudaGetLastError();
     }
@@ -233,8 +254,8 @@ nb::dict call_leiden_mg(
     if (indptrs[0].ndim() != 1 || indptrs[0].size() < 1)
         throw std::invalid_argument("indptr must be 1-D with n + 1 entries");
     const i64 n = static_cast<i64>(indptrs[0].size()) - 1;
-    if (n >= kMaxVertices)
-        throw std::invalid_argument("leiden: n must be < 2^30");
+    if (n >= kMaxVertices - 1)
+        throw std::invalid_argument("leiden: n must be < 2^30 - 1");
     if (bounds[0] != 0 || bounds[P] != n)
         throw std::invalid_argument("leiden_mg: bounds must run from 0 to n");
     std::vector<i64> nnz(P);

@@ -539,8 +539,8 @@ def test_invalid_weights(adata_neighbors, bad):
     with pytest.raises(ValueError, match="finite and non-negative"):
         rsc.tl.leiden(adata_neighbors, adjacency=adjacency)
     assert "leiden" not in adata_neighbors.obs
-    # without weights only the pattern counts
-    rsc.tl.leiden(adata_neighbors, adjacency=adjacency, use_weights=False)
+    # without weights only the pattern counts (also for a NumPy bool)
+    rsc.tl.leiden(adata_neighbors, adjacency=adjacency, use_weights=np.False_)
 
 
 @needs_native
@@ -850,14 +850,15 @@ def test_partitions_bitwise(partitions, name):
 def test_partitions_options(partitions, monkeypatch):
     """2, 3 and 4 partitions with use_weights=False (n_iterations=-1),
     initial_membership (n_iterations=1), a re-quantisation (gamma = 20),
-    device input, and the exchange through the host (no peer copies, also
-    between partitions on one GPU)."""
+    device input (CSR and COO), and the exchange through the host (no peer
+    copies, also between partitions on one GPU)."""
     a = _graph("pbmc68k")
     start = native(a, 1.0, seed=1)[0].membership
     cases = [
         ({"use_weights": False, "n_iterations": -1}, a),
         ({"initial_membership": start, "n_iterations": 1}, a),
         ({}, cpx_sparse.csr_matrix(a)),
+        ({}, cpx_sparse.coo_matrix(a)),
     ]
     for kwargs, adjacency in cases:
         partitions(None)
@@ -899,7 +900,8 @@ def test_partitions_empty(partitions, monkeypatch):
 @needs_native
 def test_partitions_rerun_and_workspace(partitions, monkeypatch):
     """Arenas too small stop every partition and the rerun gives the same
-    bits; so do workspaces filled with garbage."""
+    bits; so do workspaces filled with garbage (by work still queued on the
+    caller's stream, which the partitions' streams must wait for)."""
     a = _graph("pbmc3k")
     partitions(None)
     expected = native(a, [0.5, 1.0, 2.0])
@@ -920,7 +922,8 @@ def test_partitions_rerun_and_workspace(partitions, monkeypatch):
 
     def dirty(*args, **kwargs):
         out = empty(*args, **kwargs)
-        out.view(cp.uint8)[...] = 0xA5
+        for _ in range(100):  # long enough to race unordered streams
+            out.view(cp.uint8)[...] = 0xA5
         return out
 
     monkeypatch.setattr(cp, "empty", dirty)
