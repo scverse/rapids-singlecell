@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from scanpy.datasets import pbmc68k_reduced
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._clustering import _create_graph
 
+# `tl.louvain` is deprecated; only `test_louvain_deprecated` expects the warning
+pytestmark = pytest.mark.filterwarnings("ignore:The function louvain is deprecated:FutureWarning")
+
 
 @pytest.fixture
 def adata_neighbors():
     return pbmc68k_reduced()
+
+
+def test_louvain_deprecated(adata_neighbors):
+    with pytest.warns(FutureWarning, match=r"louvain is deprecated.*tl\.leiden") as record:
+        rsc.tl.louvain(adata_neighbors)
+    (warning,) = (w for w in record if "louvain is deprecated" in str(w.message))
+    # attributed to the caller, so a decorator stacked above `@deprecated` shows up here
+    assert Path(warning.filename).samefile(__file__)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64", "int32"])

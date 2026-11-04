@@ -141,7 +141,7 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.pp.pca`
 - {func}`~.tl.score_genes`
 - {func}`~.tl.score_genes_cell_cycle`
-- {func}`~.tl.louvain` (set `use_dask=True` to distribute graph clustering)
+- `tl.louvain` (deprecated; set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.leiden` (set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`

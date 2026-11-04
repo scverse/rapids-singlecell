@@ -110,7 +110,6 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 .. autosummary::
    :toctree: generated/
 
-    tl.louvain
     tl.leiden
 ```
 
