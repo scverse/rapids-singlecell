@@ -11,6 +11,7 @@ import pandas as pd
 from natsort import natsorted
 from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
+from scverse_misc import Deprecation, deprecated
 
 from rapids_singlecell._keys import _resolve_obsm_key
 from rapids_singlecell._utils._random import (
@@ -308,6 +309,7 @@ def leiden(
     return adata if copy else None
 
 
+@deprecated(Deprecation("0.19.0", "Use `rapids_singlecell.tl.leiden` instead."))
 def louvain(
     adata: AnnData,
     resolution: float | list[float] = 1.0,
