@@ -190,6 +190,55 @@ def test_indices_approx_nn(algo):
     assert counter / b_stop > 0.9
 
 
+# cuVS nn_descent itself loses recall beyond a graph degree of 64 (about 0.8 here)
+@pytest.mark.parametrize(("algo", "min_recall"), [("nn_descent", 0.7), ("cagra", 0.9)])
+def test_approx_nn_beyond_default_degree(algo, min_recall):
+    # beyond cuVS's default intermediate graph degree (96) and CAGRA search width (64)
+    adata = pbmc68k_reduced()
+    brute_data = adata.copy()
+    neighbors(adata, n_neighbors=100, algorithm=algo)
+    neighbors(brute_data, n_neighbors=100, algorithm="brute")
+    D, ref = adata.obsp["distances"], brute_data.obsp["distances"]
+    assert np.all(np.diff(D.indptr) == 100)
+    assert np.isfinite(D.data).all()
+    shared = sum(
+        len(np.intersect1d(D.indices[D.indptr[i] : D.indptr[i + 1]], ref.indices[ref.indptr[i] : ref.indptr[i + 1]]))
+        for i in range(adata.n_obs)
+    )
+    assert shared / ref.nnz > min_recall
+
+
+def test_ivf_incomplete_neighbors_raise():
+    # probing one of 64 lists cannot fill 100 neighbor slots
+    X = np.random.default_rng(0).normal(size=(500, 20)).astype(np.float32)
+    adata = AnnData(X)
+    with pytest.raises(ValueError, match="n_probes"):
+        neighbors(adata, n_neighbors=100, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+    assert not adata.obsp
+
+
+@pytest.mark.parametrize(("bad_id", "bad_dist"), [(10**6, 1.0), (5, np.inf), (5, np.nan)])
+@pytest.mark.parametrize("batch_balanced", [False, True])
+def test_invalid_neighbors_raise(monkeypatch, bad_id, bad_dist, batch_balanced):
+    from rapids_singlecell.preprocessing._neighbors._neighbors import KNN_ALGORITHMS
+
+    def padded_knn(X, Y, k, **kwargs):
+        idx = (cp.arange(Y.shape[0])[:, None] + cp.arange(k)) % X.shape[0]
+        dist = cp.tile(cp.arange(k, dtype=cp.float32), (Y.shape[0], 1))
+        idx[0, -1], dist[0, -1] = bad_id, bad_dist
+        return idx, dist
+
+    monkeypatch.setitem(KNN_ALGORITHMS, "ivfflat", padded_knn)
+    adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        if batch_balanced:
+            adata.obs["batch"] = np.arange(adata.n_obs) % 2
+            bbknn(adata, batch_key="batch", neighbors_within_batch=3, algorithm="ivfflat")
+        else:
+            neighbors(adata, n_neighbors=5, algorithm="ivfflat")
+    assert not adata.obsp
+
+
 KEY = "test"
 
 

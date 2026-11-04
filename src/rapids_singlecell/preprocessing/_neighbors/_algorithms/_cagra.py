@@ -53,7 +53,8 @@ def _cagra_knn(
     build_params = cagra.IndexParams(metric=metric_to_use, graph_degree=k, build_algo="nn_descent")
     index = cagra.build(build_params, X, **build_kwargs)
 
-    search_params = cagra.SearchParams()
+    # the search keeps `itopk_size` candidates (default 64), which must be at least k
+    search_params = cagra.SearchParams(itopk_size=max(algorithm_kwds.get("itopk_size", 64), k))
     distances, neighbors = cagra.search(search_params, index, Y, k, **search_kwargs)
 
     if resources is not None:

@@ -19,6 +19,7 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
+    _check_knn_complete,
     _connectivities_to_host_csr,
 )
 from rapids_singlecell.tools._utils import _choose_representation
@@ -32,8 +33,6 @@ _DEFAULT_SEED = 0
 # shared memory; they are sorted globally.
 _SNN_CHUNK_PAIRS = 1 << 25
 _SPREAD3 = ((16, 0x030000FF), (8, 0x0300F00F), (4, 0x030C30C3), (2, 0x09249249))
-# all_neighbors pads unfilled neighbor slots with sqrt(FLT_MAX) distances
-_PAD_DIST = 1e18
 
 
 def _stream() -> int:
@@ -233,7 +232,6 @@ def _check_params(
     n_mod: int,
     n_neighbors: int,
     knn_range: int,
-    algorithm: str,
     cross_constant: float | Sequence[float],
 ) -> tuple[int, int, list[float]]:
     n_neighbors, knn_range = operator.index(n_neighbors), operator.index(knn_range)
@@ -245,8 +243,6 @@ def _check_params(
         raise ValueError(f"`knn_range` must be at most the number of cells ({n_obs}).")
     if n_mod * (knn_range - 1) > 4096:
         raise ValueError("`knn_range * n_modalities` must be at most 4096.")
-    if algorithm == "cagra" and knn_range > 64:
-        raise ValueError("`algorithm='cagra'` supports `knn_range` up to 64; use e.g. 'ivfflat'.")
     if np.ndim(cross_constant) == 0:
         return n_neighbors, knn_range, [float(cross_constant)] * n_mod
     if len(cross_constant) != n_mod:
@@ -269,9 +265,6 @@ def _modality_knns(
 ) -> cp.ndarray:
     """The ``knn_range`` nearest neighbors within each modality, shape ``(n_mod, n_obs, knn_range)``."""
     n_obs = reps[0].shape[0]
-    algorithm_kwds = dict(algorithm_kwds)
-    if algorithm == "nn_descent":  # cuVS fails if this is below the graph degree
-        algorithm_kwds.setdefault("intermediate_graph_degree", max(128, int(1.5 * knn_range)))
     knns = cp.empty((len(reps), n_obs, knn_range), dtype=cp.int32)
     for m, X in enumerate(reps):
         X = _check_neighbors_X(X, algorithm)
@@ -279,14 +272,12 @@ def _modality_knns(
             X, X, k=knn_range, metric="euclidean", metric_kwds={}, algorithm_kwds=algorithm_kwds
         )
         knn, dist = cp.asarray(knn), cp.asarray(dist)
-        # IVF can pad incomplete lists with sentinel IDs (or repeated IDs with infinite distances),
-        # all_neighbors with huge distances; check before narrowing IDs or indexing kernels.
-        if not bool(((knn >= 0) & (knn < n_obs) & (dist < _PAD_DIST)).all()):
-            raise ValueError(
-                f"The {algorithm!r} search returned incomplete or invalid neighbors for modality {names[m]!r}. "
-                "Increase `n_probes` in `algorithm_kwds` for IVF searches (lower `n_lists` for 'all_neighbors'), "
-                "reduce `knn_range`, or use `algorithm='brute'`."
-            )
+        # before narrowing the IDs or indexing kernels with them
+        try:
+            _check_knn_complete(knn, dist, n_index=n_obs, algorithm=algorithm)
+        except ValueError as e:
+            e.add_note(f"in modality {names[m]!r}")
+            raise
         knns[m] = _ensure_self_first(knn.astype(cp.int32, copy=False))
         del knn, dist  # free them before the next search
     return knns
@@ -419,12 +410,10 @@ def wnn(
     algorithm
         The kNN search within each modality, see :func:`~rapids_singlecell.pp.neighbors`. ``'brute'`` (default) is
         exact and bit-identical across runs up to ``knn_range=256`` (beyond, cuVS orders exactly tied neighbors
-        arbitrarily). ``'ivfflat'`` is much faster, yet closer to exact than Seurat's Annoy search; ``'cagra'``
-        needs ``knn_range <= 64``.
+        arbitrarily). ``'ivfflat'`` is much faster, yet closer to exact than Seurat's Annoy search.
     algorithm_kwds
         Options for the kNN search, see :func:`~rapids_singlecell.pp.neighbors`. Incomplete results raise a
-        :class:`ValueError` (for IVF, increase ``n_probes``). For ``'nn_descent'``, ``intermediate_graph_degree``
-        defaults to ``max(128, 1.5 * knn_range)``.
+        :class:`ValueError` (for IVF, increase ``n_probes``).
     method
         Method for the `connectivities`, see :func:`~rapids_singlecell.pp.neighbors`.
     rng
@@ -481,12 +470,7 @@ def wnn(
         raise ValueError(f"`weight_key` {weight_key!r} must give a distinct column per modality, e.g. '{{}}_weight'.")
     n_obs = adata.n_obs
     n_neighbors, knn_range, cross_constant = _check_params(
-        n_obs=n_obs,
-        n_mod=len(reps),
-        n_neighbors=n_neighbors,
-        knn_range=knn_range,
-        algorithm=algorithm,
-        cross_constant=cross_constant,
+        n_obs=n_obs, n_mod=len(reps), n_neighbors=n_neighbors, knn_range=knn_range, cross_constant=cross_constant
     )
 
     if l2_norm:
