@@ -413,12 +413,6 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
         ({"block_proportion": 0}, "block_proportion"),
         ({"block_proportion": 1.5}, "block_proportion"),
         ({"block_proportion": float("nan")}, "block_proportion"),
-        ({"shuffle_chunk_size": 0}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": -2}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": 1.5}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": "8"}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": float("inf")}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": float("nan")}, "shuffle_chunk_size"),
         ({"colsum_algo": "bogus"}, "colsum_algo"),
         ({"max_iter_harmony": 0}, "max_iter_harmony"),
         ({"n_clusters": 0}, "n_clusters"),
@@ -1234,11 +1228,16 @@ def test_harmony_tau_discounts_theta():
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_shuffle_chunk_size():
-    exact = _integrate(shuffle_chunk_size=1)
-    assert exact.tobytes() == _integrate(shuffle_chunk_size=1).tobytes()
-    assert exact.tobytes() != _integrate(shuffle_chunk_size=8).tobytes()
-    assert _integrate(shuffle_chunk_size=8.0).tobytes() == _integrate(shuffle_chunk_size=8).tobytes()
+def test_harmony_block_runs(monkeypatch):
+    # Cells join the update blocks in runs of up to _SHUFFLE_CHUNK sorted
+    # cells, at most a block's share; runs of one deal single cells.
+    assert harmony_module._block_layout(480, 20)[0] == 8
+    assert harmony_module._block_layout(100, 20)[0] == 5
+    runs = _integrate()
+    monkeypatch.setattr(harmony_module, "_SHUFFLE_CHUNK", 1)
+    single = _integrate()
+    assert single.tobytes() == _integrate().tobytes()
+    assert single.tobytes() != runs.tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")

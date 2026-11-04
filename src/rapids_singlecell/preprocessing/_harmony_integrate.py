@@ -42,7 +42,6 @@ def harmony_integrate(
     correction_method: Literal["fast", "batched"] | None = None,
     colsum_algo: COLSUM_ALGO | None = None,
     block_proportion: float = 0.05,
-    shuffle_chunk_size: int = 8,
     rng: SeedLike | RNGLike | None = None,
     multi_gpu: bool | list[int] | str | None = False,
     verbose: bool = False,
@@ -183,14 +182,9 @@ def harmony_integrate(
         Larger values are faster but may converge to different solutions.
         The blocks are drawn once per call and visited in a rotating order
         (the reference implementations redraw random blocks every iteration).
-    shuffle_chunk_size
-        Cells move between the update blocks in runs of this many neighbouring
-        cells of the same batch (joint category with several keys), in random
-        order within the batch, so the GPU writes contiguous rows. Every block
-        takes an equal share of each stretch of about ``n_cells / 384``
-        batch-sorted cells, so batches spanning several stretches are spread
-        evenly; smaller batches are dealt in runs and can be spread less evenly
-        than by independent random blocks (``1`` moves cells one at a time).
+        Cells join them in runs of up to 8 cells of the same batch, in random
+        order within the batch, so a batch of fewer than
+        ``8 / block_proportion`` cells is spread over fewer blocks.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -317,7 +311,6 @@ def harmony_integrate(
             ridge_lambda=ridge_lambda,
             sigma=sigma,
             block_proportion=block_proportion,
-            shuffle_chunk_size=shuffle_chunk_size,
             theta=theta,
             tau=tau,
             correction_method=correction_method,

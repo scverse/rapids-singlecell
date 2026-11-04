@@ -50,6 +50,7 @@ _FORCE_CLUSTER_BLOCKS = False
 _KEEP_BLOCK_COUNTS = None
 _COMM_VALUES = 1 << 22  # int64 values per exchange; larger sums take several
 _BLOCK_UNITS = 384  # units of the block draw (see _draw_blocks)
+_SHUFFLE_CHUNK = 8  # sorted cells per run of the block draw (see _block_layout)
 _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
 
 # Each flavor inherits the stopping rules of the implementation it reproduces:
@@ -99,7 +100,6 @@ def harmonize(
     ridge_lambda: float = 1.0,
     sigma: float = 0.1,
     block_proportion: float = 0.05,
-    shuffle_chunk_size: int = 8,
     theta: float | int | list[float] | np.ndarray | cp.ndarray = 2.0,
     tau: int = 0,
     correction_method: Literal["fast", "batched"] | None = None,
@@ -158,12 +158,6 @@ def harmonize(
 
     block_proportion
         Proportion of block size in one update operation of clustering step.
-
-    shuffle_chunk_size
-        Cells per run of neighbouring cells of the same batch (joint category
-        with several keys) that move between update blocks together. Every
-        block takes an equal share of each stretch of about n_cells / 384
-        batch-sorted cells (see _block_layout). ``1`` moves cells one at a time.
 
     theta
         Weight of the diversity penalty term. A scalar is broadcast to every
@@ -255,13 +249,6 @@ def harmonize(
             raise ValueError(f"out must be a NumPy array of shape {Z.shape} and dtype {dtype}.")
         if not out.flags.writeable:
             raise ValueError("out must be writeable.")
-    try:
-        valid = int(shuffle_chunk_size) == shuffle_chunk_size >= 1
-    except (TypeError, ValueError, OverflowError):
-        valid = False
-    if not valid:
-        raise ValueError(f"shuffle_chunk_size must be a positive integer, got {shuffle_chunk_size!r}.")
-    shuffle_chunk_size = int(shuffle_chunk_size)
     if not np.isfinite(sigma) or sigma <= 0:
         raise ValueError(f"sigma must be a finite positive number, got {sigma}.")
     if not 0 < block_proportion <= 1:
@@ -345,7 +332,7 @@ def harmonize(
         # Shards: contiguous runs of the sorted cells, one per GPU, cut at
         # multiples of the block draw's units (which also cut the segments), so
         # that every GPU draws the blocks and sums the segments of a single-GPU run.
-        chunk, unit = _block_layout(n_cells, n_blocks, shuffle_chunk_size)
+        chunk, unit = _block_layout(n_cells, n_blocks)
         if len(devices) > n_cells // unit:
             warnings.warn(
                 f"Using {n_cells // unit} of {len(devices)} GPUs: {n_cells} cells split into at most that many shards.",
@@ -831,12 +818,13 @@ def _sorted_groups(offsets: np.ndarray, lo: int, hi: int, device: int) -> cp.nda
         return groups
 
 
-def _block_layout(n_total: int, n_blocks: int, shuffle_chunk: int) -> tuple[int, int]:
+def _block_layout(n_total: int, n_blocks: int) -> tuple[int, int]:
     """Shuffle runs and units of the block draw (see _draw_blocks).
 
-    About _BLOCK_UNITS units, each dealing every block the same share.
+    Runs of up to _SHUFFLE_CHUNK neighbouring sorted cells (random within their group) join a block together, so the
+    GPU reads and writes contiguous rows; about _BLOCK_UNITS units, each dealing every block the same share.
     """
-    chunk = max(1, min(shuffle_chunk, n_total // n_blocks))
+    chunk = max(1, min(_SHUFFLE_CHUNK, n_total // n_blocks))
     step = n_blocks * chunk
     return chunk, step * -(-n_total // (step * _BLOCK_UNITS))
 
