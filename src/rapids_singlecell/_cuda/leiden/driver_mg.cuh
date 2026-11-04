@@ -430,8 +430,9 @@ void register_mg_typed(nb::module_& m) {
                 check, workspaces, peer, labels_out, resolutions, seeds,
                 n_iterations, initial_membership, arena_factors);
         },
-        "indptrs"_a, nb::kw_only(), "indices"_a, "data"_a, "devices"_a,
-        "bounds"_a, "use_weights"_a, "check"_a, "workspaces"_a, "peer"_a,
+        "indptrs"_a.noconvert(), nb::kw_only(), "indices"_a.noconvert(),
+        "data"_a.noconvert(), "devices"_a, "bounds"_a, "use_weights"_a,
+        "check"_a, "workspaces"_a.noconvert(), "peer"_a,
         "labels_out"_a.noconvert().none() = nb::none(), "resolutions"_a,
         "seeds"_a, "n_iterations"_a,
         "initial_membership"_a.noconvert().none() = nb::none(),

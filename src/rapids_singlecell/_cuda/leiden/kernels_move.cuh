@@ -16,16 +16,21 @@ namespace leiden {
 
 using namespace nb::literals;
 
-constexpr int kMoveLightBlocksPerSm = 5;  // light kernel __launch_bounds__
-constexpr int kMoveMidSlots = 256;        // per warp: 3 KB
-constexpr int kMoveMidBlock = 128;        // mid kernel: 4-warp blocks (13 KB)
-constexpr int kMoveBlockSlots = 2048;     // per block: 24 KB
-constexpr int kMoveXlCap = 1536;          // distinct keys per pass (load 0.75)
-constexpr int kMoveSmemIds = 4096;        // M0 block-privatised histogram
-constexpr i64 kNoScore = LLONG_MIN;       // "no candidate" (scores > -2^63)
-constexpr int kDeferIdle = -1;            // deferred-activation slot: unused
-constexpr int kDeferMulti = -2;           //   two movers with different targets
-constexpr int kEmptySlot = -1;            // free hash-table slot
+// light kernel __launch_bounds__ (Turing: 1024 threads per SM)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+constexpr int kMoveLightBlocksPerSm = 4;
+#else
+constexpr int kMoveLightBlocksPerSm = 5;
+#endif
+constexpr int kMoveMidSlots = 256;     // per warp: 3 KB
+constexpr int kMoveMidBlock = 128;     // mid kernel: 4-warp blocks (13 KB)
+constexpr int kMoveBlockSlots = 2048;  // per block: 24 KB
+constexpr int kMoveXlCap = 1536;       // distinct keys per pass (load 0.75)
+constexpr int kMoveSmemIds = 4096;     // M0 block-privatised histogram
+constexpr i64 kNoScore = LLONG_MIN;    // "no candidate" (scores > -2^63)
+constexpr int kDeferIdle = -1;         // deferred-activation slot: unused
+constexpr int kDeferMulti = -2;        //   two movers with different targets
+constexpr int kEmptySlot = -1;         // free hash-table slot
 
 enum : int { kMoveErrLabel = 1, kMoveErrBucket = 2 };
 
@@ -806,7 +811,8 @@ __device__ __forceinline__ bool move_block_table_add(int* keys, i64* vals,
 }
 
 // block: block per vertex, shared-memory table in hash-range passes; npass
-// starts at ceil(deg / pass_cap) and doubles when a pass overflows. The argmax
+// starts at 1, and a pass that overflows stops and is redone split: into
+// ceil(deg / pass_cap) passes the first time, else twice as many. The argmax
 // and W(v, d) carry across passes, so npass never changes the result.
 template <WKind K, bool kPrune>
 __global__ void __launch_bounds__(kBlock, 3)
@@ -842,9 +848,8 @@ __global__ void __launch_bounds__(kBlock, 3)
         const int tsize = move_table_size(
             deg < pass_cap ? deg : static_cast<i64>(pass_cap), kMoveBlockSlots);
         const u32 mask = static_cast<u32>(tsize - 1);
-        u64 npass = deg > pass_cap
-                        ? static_cast<u64>((deg + pass_cap - 1) / pass_cap)
-                        : 1ull;
+        u64 npass = 1;  // a hub's neighbours often sit in few communities
+        const u64 deg_pass = static_cast<u64>((deg + pass_cap - 1) / pass_cap);
         if constexpr (kPrune) {  // first pass: own / oth only
             i64 own = 0, oth = 0;
             for (i64 j = b + tid; j < e; j += blockDim.x) {
@@ -894,6 +899,11 @@ __global__ void __launch_bounds__(kBlock, 3)
             __syncthreads();
             for (i64 j0 = b + static_cast<i64>(wib) * kWarp; j0 < e;
                  j0 += blockDim.x) {
+                // an overflowed first pass is redone split: stop early (a
+                // full table probes long)
+                if (npass < deg_pass &&
+                    __any_sync(kFullMask, *static_cast<volatile int*>(&s_ovf)))
+                    break;
                 const i64 j = j0 + lane;
                 int c = -1;
                 i64 x = 0;
@@ -931,7 +941,7 @@ __global__ void __launch_bounds__(kBlock, 3)
                     s_key[s] = kEmptySlot;
                     s_val[s] = 0;
                 }
-                npass *= 2;
+                npass = npass < deg_pass ? deg_pass : 2 * npass;
                 p *= 2;
                 continue;  // the loop head synchronises before the next pass
             }
@@ -1240,8 +1250,8 @@ void move_eval_calls_t(KernelCall* c, const MoveEval<K>& a,
                        const i64 (&cc)[kNumClasses], int xl_cap,
                        const MoveAct& t) {
     c[0].set(cc[kClassLight] > 0, move_eval_light_kernel<K, kPrune>,
-             dim3(grid_resident(cc[kClassLight], kWarpsPerBlock,
-                                kMoveLightBlocksPerSm)),
+             dim3(grid_occ(move_eval_light_kernel<K, kPrune>, cc[kClassLight],
+                           kWarpsPerBlock)),
              dim3(kBlock), 0, a, B.list(r, kClassLight),
              B.count(r, kClassLight), B.cap[kClassLight], t);
     c[1].set(cc[kClassMid] > 0, move_eval_mid_kernel<K, kPrune>,

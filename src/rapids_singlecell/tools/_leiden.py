@@ -38,11 +38,11 @@ if TYPE_CHECKING:
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
-# Workspace arena in units of 8 * nnz bytes. A level that does not fit ends
-# the call; the (rare, bitwise identical) rerun grows the factor by
-# `_WORKSPACE_GROWTH`, or to the driver's request plus slack.
-_ARENA_FACTOR = 1.9
-_WORKSPACE_GROWTH = 2.0
+# Workspace arena in units of 8 * nnz bytes; k-NN graphs need 1.5-2.6, more
+# with more cells. A level that does not fit ends the call, which reruns
+# (bitwise identical) with the driver's request plus slack; an arena that
+# cannot be allocated shrinks to the largest that fits.
+_ARENA_FACTOR = 2.7
 _REQUIRED_SLACK = 1.25
 _MAX_RERUNS = 6
 # Host input is read in place on GPUs with ATS (e.g. GB10); elsewhere it is
@@ -52,14 +52,13 @@ _H2D_CHUNK_BYTES = 1 << 23
 _WORKSPACE_CACHE_BYTES = 1 << 31  # see `_WORKSPACE_CACHE`; 0 disables it
 _N_ITER_WARN = 20  # above this: warn and run the -1 rule
 # multi_gpu: partition 0 also holds levels >= 1, so its arena is sized by the
-# whole graph's entries (`_ARENA_FACTOR`; it needs what one GPU needs, 1.54 on
-# brain500k, 1.67 on brain1m3), each other partition's by its own entries, but
-# at least 1/P of all as it merges 1/P of the coarse rows (`_ARENA_FACTOR_PART`;
-# the int64 partial rows of the contraction need 2.1-2.3); a rerun grows the
-# partitions that overflowed. Test knobs: `_N_PARTITIONS` forces the number of
-# partitions (round-robin over the devices, several per device);
-# `_MAX_REPLICAS` caps the replicas of small graphs (1: none, which
-# partitioned runs require).
+# whole graph's entries (`_ARENA_FACTOR`; it needs what one GPU needs), each
+# other partition's by its own entries, but at least 1/P of all as it merges
+# 1/P of the coarse rows (`_ARENA_FACTOR_PART`; the int64 partial rows of the
+# contraction need 2.1-2.6); a rerun grows the partitions that overflowed.
+# Test knobs: `_N_PARTITIONS` forces the number of partitions (round-robin
+# over the devices, several per device); `_MAX_REPLICAS` caps the replicas of
+# small graphs (1: none, which partitioned runs require).
 _ARENA_FACTOR_PART = 2.7
 _N_PARTITIONS: int | None = None
 _MAX_REPLICAS: int | None = None
@@ -67,7 +66,6 @@ _MAX_RESOLUTION = 2.0**20  # bound of the integer no-overflow proof
 # cuGraph returns the refined partition when it hits `max_iter` levels, so
 # `n_iterations` is not forwarded and the cap stays well above what it needs.
 _CUGRAPH_MAX_ITER = 100
-_MODULARITY_CHUNK = 1 << 27  # entries per chunk of `_exact_modularity`
 # The native implementation is the default; this also starts the deprecation
 # of flavor="cugraph" and use_dask (FutureWarning).
 _DEFAULT_FLAVOR: Literal["rapids", "cugraph"] = "rapids"
@@ -127,7 +125,10 @@ def leiden(
         ``adata.obs`` key under which to add the cluster labels.
     adjacency
         Sparse adjacency matrix of the graph, defaults to neighbors
-        connectivities. ``flavor='rapids'`` ignores its diagonal (self-loops).
+        connectivities. ``flavor='rapids'`` sums duplicate entries, clusters
+        an asymmetric matrix as A + A.T (with a warning) and ignores the
+        diagonal (self-loops); every stored weight must be finite and
+        non-negative.
     directed
         Must not be ``True``: the graph is treated as undirected.
     use_weights
@@ -137,8 +138,9 @@ def leiden(
         How many iterations of the Leiden algorithm to perform, as in
         ``scanpy.tl.leiden``; each iteration restarts from the partition of the
         previous one :cite:p:`Traag2019`. ``-1`` iterates until an iteration
-        moves no cell or improves the modularity by less than 1e-6 (at most 20
-        iterations). Values above 20 behave like ``-1``, with a warning.
+        moves no cell or improves the modularity by less than 1e-6, then runs
+        a last one (at most 20 in all). Values above 20 behave like ``-1``,
+        with a warning.
         ``flavor='cugraph'`` ignores it and runs up to 100 levels.
     neighbors_key
         If not specified, ``leiden`` looks at ``.obsp['connectivities']`` for
@@ -152,21 +154,25 @@ def leiden(
         Which implementation to use. ``'rapids'`` (default) is the native CUDA
         implementation of rapids-singlecell, bitwise reproducible for a given
         seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden`.
-        ``'rapids'`` needs a device workspace of about 4x the graph (float32
-        CSR) and raises if it cannot be allocated. Under an allocator that does
-        not pool (the default of rapids-singlecell), it keeps the workspace for
-        the next call if it is at most 2 GiB and 1/16 of the GPU memory.
+        ``'rapids'`` needs a device workspace of about 22 bytes per stored
+        entry and 160 bytes per cell (on k-NN graphs about 3.5x the float32
+        CSR, which is also copied to the GPU if it is on the host). If that
+        does not fit, it runs with a smaller one where the graph allows and
+        else raises :class:`MemoryError` (RMM managed memory can exceed the
+        GPU). Under an allocator that does not pool (the default of
+        rapids-singlecell), it keeps the workspace for the next call if it is
+        at most 2 GiB and 1/16 of the GPU memory.
     copy
         Whether to copy ``adata`` or modify it in place.
     theta
-        cuGraph's refinement randomness, only used by ``flavor='cugraph'``
-        (``None`` means 1.0). ``flavor='rapids'`` ignores it with a warning;
-        see ``beta``.
+        Deprecated. cuGraph's refinement randomness, only used by
+        ``flavor='cugraph'`` (``None`` means 1.0). ``flavor='rapids'`` ignores
+        it with a warning; see ``beta``.
     dtype
         Weight dtype of the cuGraph graph (``'float32'`` or ``'float64'``).
-        Only used by ``flavor='cugraph'``; the native implementation reads
-        float32 or float64 weights and rounds them to one 64-bit fixed-point
-        grid.
+        Only used by the deprecated ``flavor='cugraph'``; the native
+        implementation reads float32 or float64 weights and rounds them to one
+        64-bit fixed-point grid.
     use_dask
         Deprecated. If ``True``, run cuGraph's Dask implementation on all GPUs
         (this implies ``flavor='cugraph'``).
@@ -174,29 +180,29 @@ def leiden(
         GPUs of ``flavor='rapids'`` (not supported by ``flavor='cugraph'``):
 
         - ``None`` or ``False`` (default): the current GPU.
-        - ``True``: all GPUs, but only for a graph whose single-GPU workspace
-          (sized from the checked, fixed-up graph before the run) does not
-          fit in the free memory of the current GPU; others run there.
+        - ``True``: all GPUs, but only for a graph that runs out of memory
+          on the current GPU; others run there.
         - ``list[int]`` or comma-separated ``str`` (e.g. ``"0,2"``): these
           GPUs, always split (one GPU: run on it).
 
         A split run gives each GPU one contiguous range of the cells,
-        balanced by stored entries: it stores the rows of its cells and
-        about 150 bytes of state per cell of the graph. The first GPU also
-        runs the coarser levels and needs about as much workspace as one
-        GPU would, so on k-NN graphs (about 28 bytes per stored entry on one
-        GPU) 2 GPUs fit graphs only about 1.15x as large and 4 GPUs about
-        1.3x. A split run synchronises the GPUs many times per level, so
-        it is slower than one GPU; labels and modularity are bitwise
-        identical. Graphs of at most ``2**18`` counted entries, which one
-        GPU clusters as several replicas, warn and run on one GPU.
+        balanced by stored entries: it stores the rows of its cells, an
+        arena of about 2.7x their size and about 160 bytes of state per cell
+        of the graph. One GPU (the first listed one, or the next if the
+        first holds a CuPy adjacency; with ``True``, the one with the most
+        free memory) also runs the coarser levels and needs about as much
+        workspace as one GPU would, so 2 GPUs fit graphs only about 1.1x as
+        large and 4 GPUs about 1.2x. A split run synchronises the GPUs many
+        times per level, so it is slower than one GPU; labels and modularity
+        are bitwise identical. Graphs of at most ``2**18`` counted entries,
+        which one GPU clusters as several replicas, warn and run on one GPU.
     **clustering_args
         Further arguments for the clustering. ``flavor='rapids'`` accepts
         ``beta`` (randomness of the refinement, theta in :cite:t:`Traag2019`;
-        the default 0 merges along the best edge), ``initial_membership`` and
-        ``objective_function='modularity'``. ``flavor='cugraph'`` accepts
-        ``max_iter`` (maximum number of levels, default 100) and
-        ``objective_function='modularity'``.
+        only the default 0, which merges along the best edge, is supported),
+        ``initial_membership`` and ``objective_function='modularity'``.
+        ``flavor='cugraph'`` accepts ``max_iter`` (maximum number of levels,
+        default 100) and ``objective_function='modularity'``.
 
     Returns
     -------
@@ -217,7 +223,8 @@ def leiden(
         gamma (a list for several resolutions), computed exactly without
         self-loops and with the weights rounded to one 64-bit fixed-point
         grid, which differs from float64 sums only for weights spanning many
-        orders of magnitude or a resolution near ``2**20``. Use
+        orders of magnitude or a resolution near ``2**20``
+        (``flavor='cugraph'``: cuGraph's value). Use
         :func:`scanpy.metrics.modularity` for the score with gamma = 1 (it
         counts self-loops).
     """
@@ -328,7 +335,7 @@ def _validate_flavor(
     match flavor:
         case "rapids" | "cugraph" if use_dask:
             if deprecate_cugraph or flavor == "rapids":
-                msg = "use_dask is deprecated and runs the legacy cuGraph implementation; use flavor='rapids' instead."
+                msg = "use_dask is deprecated and runs the legacy cuGraph implementation, which will be removed in 0.20; use flavor='rapids' instead."
                 warnings.warn(msg, FutureWarning, stacklevel=4)
             flavor = "cugraph"
         case "cugraph":
@@ -337,9 +344,7 @@ def _validate_flavor(
                 warnings.warn(msg, FutureWarning, stacklevel=4)
         case "rapids":
             if theta is not None:
-                msg = (
-                    "theta is a cuGraph parameter (it had no effect there) and is ignored by flavor='rapids'; see beta."
-                )
+                msg = "theta is a deprecated cuGraph parameter (it had no effect there) and is ignored by flavor='rapids'; see beta."
                 warnings.warn(msg, FutureWarning, stacklevel=4)
         case _:
             msg = f"flavor must be either 'rapids' or 'cugraph', but {flavor!r} was passed."
@@ -379,8 +384,14 @@ def _validate_resolutions(resolution: float | Sequence[float]) -> list[float]:
     if not resolutions:
         msg = "resolution must be a number or a non-empty sequence of numbers."
         raise ValueError(msg)
-    if not all(isinstance(res, Real) and math.isfinite(res) and 0 <= res <= _MAX_RESOLUTION for res in resolutions):
+    if not all(
+        isinstance(res, Real) and not isinstance(res, bool) and math.isfinite(res) and 0 <= res <= _MAX_RESOLUTION
+        for res in resolutions
+    ):
         msg = f"resolution must be finite and in [0, 2**20], but {resolution!r} was passed."
+        raise ValueError(msg)
+    if len(set(resolutions)) < len(resolutions):  # each writes one obs column
+        msg = f"resolution must not repeat a value, but {resolution!r} was passed."
         raise ValueError(msg)
     return resolutions
 
@@ -410,13 +421,10 @@ def _leiden_rapids(
     if n_iterations > _N_ITER_WARN:  # warned about in `leiden`
         n_iterations = -1
     devices = resolve_stream_devices(multi_gpu=multi_gpu)
-    # a device list is always split (one device: run there); True splits
-    # graphs that do not fit on the current GPU
+    # a device list is always split (one device: run there); True splits a
+    # graph that runs out of memory on the current GPU
     explicit = isinstance(multi_gpu, list | str)
-    split = "always" if explicit else "auto" if multi_gpu is True else "no"
     home = devices[0] if explicit else cp.cuda.Device().id
-    if split == "auto":  # partition 0 goes to the GPU whose free memory decides
-        devices = [home, *(d for d in devices if d != home)]
     source = _input_device(adjacency)
     with cp.cuda.Device(home if source is None else source):
         csr = _as_csr(adjacency)
@@ -444,20 +452,27 @@ def _leiden_rapids(
             "check": info,
             "resolutions": [float(res) for res in resolutions],
             "seeds": seeds,
-            "n_iterations": n_iterations,
+            "n_iterations": int(n_iterations),
             "initial_membership": membership,
             "max_replicas": max_replicas,
             "stream": cp.cuda.get_current_stream().ptr,
         }
-        n_parts = _n_partitions(graph, args, devices, split=split)
+        n_parts = _N_PARTITIONS if _N_PARTITIONS is not None else len(devices) if explicit else 1
         if n_parts > 1 and _ld.n_replicas(info["nnz_counted"], n, max_replicas) > 1:
             msg = "multi_gpu: graphs this small run as replicas, which split runs do not have; running on one GPU."
             warnings.warn(msg, UserWarning, stacklevel=4)
             n_parts = 1
         if n_parts == 1:
-            return _leiden_single(graph, args, n)
+            try:
+                return _leiden_single(graph, args, n)
+            except MemoryError:
+                if multi_gpu is not True or len(devices) == 1:
+                    raise
+            n_parts = len(devices)
         for device in devices:  # a split run does not use the cached single-GPU workspaces
             _WORKSPACE_CACHE.pop(device, None)
+        if multi_gpu is True:  # partition 0 (levels >= 1: about one GPU's workspace) where most is free
+            devices = sorted(devices, key=_free_bytes, reverse=True)
         owned = cpx_sparse.issparse(adjacency) and graph.indices is getattr(adjacency, "indices", None)
         parts = _split_rows(graph, n_parts, devices, owned=owned)
         del graph, csr, args  # the partitions hold copies of a fixed-up graph
@@ -474,16 +489,32 @@ def _leiden_rapids(
 
 
 def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNamespace]:
-    """One GPU: size the workspace, run, rerun with a larger arena if a level did not fit."""
+    """One GPU: size the workspace, run, rerun with a larger arena if a level did not fit.
+
+    An arena that cannot be allocated shrinks to the largest that fits in free
+    memory, if that is more than an overflowed level asked for.
+    """
     pinned = cp.cuda.alloc_pinned_memory(_ld.PINNED_BYTES)  # readback buffer
     # the memory kind of the call's other device arrays, which the workspace must share
     arrays = (graph.indptr, args["initial_membership"])
     kind = next((_memory_kind(a) for a in arrays if isinstance(a, cp.ndarray)), None)
-    factor = _ARENA_FACTOR
+    shape = (len(args["resolutions"]), n)
+    factor, need = _ARENA_FACTOR, 0.0
     for _ in range(_MAX_RERUNS + 1):
         # a call without a workspace sizes it
-        nbytes = _ld.leiden(graph.indptr, **args, arena_factor=factor)
-        buffer, workspace, labels = _allocate_workspace(nbytes["required_bytes"], (len(args["resolutions"]), n), kind)
+        nbytes = _ld.leiden(graph.indptr, **args, arena_factor=factor)["required_bytes"]
+        try:
+            buffer, workspace, labels = _allocate_workspace(nbytes, shape, kind)
+        except MemoryError as err:
+            # the workspace is affine in the factor: solve for what fits
+            base = _ld.leiden(graph.indptr, **args, arena_factor=factor / 2)["required_bytes"]
+            per_factor = 2 * (nbytes - base) / factor
+            fit = factor - (nbytes + 4 * shape[0] * shape[1] + 1024 - _free_bytes()) / per_factor
+            if not need < fit < factor:
+                msg = f"Out of GPU memory for the {nbytes / 2**30:.1f} GiB workspace of flavor='rapids'; RMM managed memory can exceed the GPU."
+                raise MemoryError(msg) from err
+            factor = fit
+            continue
         out = _ld.leiden(
             graph.indptr,
             **args,
@@ -496,9 +527,10 @@ def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNam
             codes = _labels_to_host(labels)
             _cache_workspace(buffer)
             break
-        # rare: a level did not fit; free the buffer before allocating anew
+        # a level did not fit; free the buffer before allocating anew
         del buffer, workspace, labels
-        factor = max(_WORKSPACE_GROWTH * factor, _REQUIRED_SLACK * out["required_arena_factor"])
+        need = out["required_arena_factor"]
+        factor = _REQUIRED_SLACK * need
     else:
         msg = f"Native Leiden reported workspace_too_small {_MAX_RERUNS + 1} times in a row."
         raise RuntimeError(msg)
@@ -508,25 +540,10 @@ def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNam
     ]
 
 
-def _n_partitions(graph, args: dict, devices: list[int], *, split: str) -> int:
-    """Partitions of a run: the knob, one per device of a split, else 1.
-
-    ``"auto"`` (``multi_gpu=True``) splits only a graph whose single-GPU
-    workspace and labels do not fit in the current GPU's free memory (with
-    its cached workspace, which a single-GPU run reuses or frees).
-    """
-    if _N_PARTITIONS is not None:
-        return _N_PARTITIONS
-    if split == "always":
-        return len(devices)
-    if split == "no" or len(devices) == 1:
-        return 1
-    nbytes = _ld.leiden(graph.indptr, **args, arena_factor=_ARENA_FACTOR)["required_bytes"]
-    labels = 4 * len(args["resolutions"]) * (graph.indptr.shape[0] - 1)
-    device = cp.cuda.Device()
-    cached = _WORKSPACE_CACHE.get(device.id)
-    free = device.mem_info[0] + (0 if cached is None else cached.nbytes)
-    return 1 if nbytes + labels <= free else len(devices)
+def _free_bytes(device: int | None = None) -> int:
+    """Free memory of a GPU (None: the current one), less some headroom."""
+    free = cp.cuda.Device(device).mem_info[0]
+    return free - free // 64 - (1 << 28)
 
 
 def _row_bounds(indptr: np.ndarray, n_parts: int) -> list[int]:
@@ -595,6 +612,9 @@ def _leiden_partitioned(
     membership: cp.ndarray | None,
 ) -> list[SimpleNamespace]:
     """Every resolution in one `_leiden_cuda.leiden_mg` call over the partitions of `_split_rows`."""
+    if len({_memory_kind(a) for a in (*parts.indptrs, *parts.indices, *parts.data)}) > 1:
+        msg = "multi_gpu needs one kind of memory on all its GPUs, e.g. RMM managed memory on each: rmm.reinitialize(managed_memory=True, devices=[0, 1])."
+        raise ValueError(msg)
     root = parts.devices[0]
     if membership is not None and membership.device.id != root:
         membership = _copy_to_gpu(membership, root)
@@ -609,7 +629,7 @@ def _leiden_partitioned(
         "peer": peer,
         "resolutions": [float(res) for res in resolutions],
         "seeds": seeds,
-        "n_iterations": n_iterations,
+        "n_iterations": int(n_iterations),
         "initial_membership": membership,
     }
     factors = [_ARENA_FACTOR] + [_ARENA_FACTOR_PART] * (len(parts.devices) - 1)  # one per partition
@@ -636,11 +656,11 @@ def _leiden_partitioned(
             with cp.cuda.Device(root):
                 codes = _labels_to_host(labels)
             break
-        # rare: a level did not fit; grow the arena of each partition that overflowed
+        # a level did not fit; grow the arena of each partition that overflowed
         del workspaces, labels
         for p, need in enumerate(out["required_arena_factor"]):
             if need > 0:
-                factors[p] = max(_WORKSPACE_GROWTH * factors[p], _REQUIRED_SLACK * need)
+                factors[p] = _REQUIRED_SLACK * need
     else:
         msg = f"Native Leiden reported workspace_too_small {_MAX_RERUNS + 1} times in a row."
         raise RuntimeError(msg)
@@ -661,10 +681,16 @@ def _input_device(adjacency) -> int | None:
 
 def _as_csr(adjacency):
     """CSR with float weights, kept on the host or device it lives on."""
-    if cpx_sparse.issparse(adjacency) or sparse.issparse(adjacency):
+    if isinstance(adjacency, cpx_sparse.coo_matrix):
+        # cupyx's tocsr sums duplicates with float atomics (in any order): keep them for `_canonicalize`
+        order = cp.argsort(adjacency.row, kind="stable")
+        indptr = cp.zeros(adjacency.shape[0] + 1, dtype=cp.int64)
+        cp.cumsum(cp.bincount(adjacency.row, minlength=adjacency.shape[0]), out=indptr[1:])
+        csr = cpx_sparse.csr_matrix((adjacency.data[order], adjacency.col[order], indptr), shape=adjacency.shape)
+    elif cpx_sparse.issparse(adjacency) or sparse.issparse(adjacency):
         csr = adjacency.tocsr()
     elif isinstance(adjacency, cp.ndarray):
-        csr = cpx_sparse.csr_matrix(adjacency)
+        csr = cpx_sparse.csr_matrix(adjacency if adjacency.dtype.kind in "fc" else adjacency.astype(cp.float32))
     else:
         csr = sparse.csr_matrix(np.asarray(adjacency))
     if csr.shape[0] != csr.shape[1]:
@@ -804,24 +830,26 @@ def _canonicalize(graph: SimpleNamespace, n: int) -> SimpleNamespace:
         scratch=scratch,
         stream=cp.cuda.get_current_stream().ptr,
     )
-    return SimpleNamespace(indptr=indptr, indices=indices[:nnz], data=data[:nnz], host=False)
+    data = data[:nnz]
+    if graph.data.dtype == np.float32 and nnz == graph.nnz:  # nothing summed: the same fp32 values
+        data = data.astype(cp.float32)
+    return SimpleNamespace(indptr=indptr, indices=indices[:nnz], data=data, host=False)
 
 
 def _symmetrize(graph: SimpleNamespace, n: int) -> SimpleNamespace:
-    """A + A.T on the side the arrays live on (two-operand sums: deterministic)."""
-    if graph.host:
-        a = sparse.csr_matrix((graph.data, graph.indices, graph.indptr), shape=(n, n))
+    """A + A.T (two-operand sums: deterministic) on the device, or on the host for host input and graphs too large for cupyx."""
+    if graph.host or 2 * graph.nnz >= 2**31:  # cupyx indexes A + A.T (up to 2 nnz entries) with int32
+        arrays = (cp.asnumpy(graph.data), cp.asnumpy(graph.indices), cp.asnumpy(graph.indptr))
+        a = sparse.csr_matrix(arrays, shape=(n, n))
+        a = (a + a.T).tocsr()
+        if not graph.host:
+            return _to_device(a)
         xp = np
     else:
-        if 2 * graph.nnz >= 2**31:  # A + A.T has up to 2 nnz entries, int32-indexed on the device
-            msg = "Symmetrizing an asymmetric adjacency with >= 2**30 entries on the GPU is not supported."
-            raise ValueError(msg)
-        a = cpx_sparse.csr_matrix(
-            (graph.data, graph.indices.astype(cp.int32), graph.indptr.astype(cp.int32)),
-            shape=(n, n),
-        )
+        indices, indptr = (x.astype(cp.int32, copy=False) for x in (graph.indices, graph.indptr))
+        a = cpx_sparse.csr_matrix((graph.data, indices, indptr), shape=(n, n))
+        a = (a + a.T).tocsr()
         xp = cp
-    a = (a + a.T).tocsr()
     return SimpleNamespace(
         indptr=xp.ascontiguousarray(a.indptr),
         indices=xp.ascontiguousarray(a.indices),
@@ -958,33 +986,18 @@ def _leiden_cugraph(
             warnings.warn(msg, ResourceWarning, stacklevel=4)
             with _managed_memory():
                 groups = _cugraph_groups(adjacency, resolutions, **kw, use_dask=False)
-    if not hasattr(_ld, "ingest_check"):  # no native extension: float64 sums
-        graph, info, weighted = _as_csr(adjacency), None, use_weights
-    else:
-        # cuGraph clusters an asymmetric adjacency as an undirected graph:
-        # score A + A.T without the warning of flavor='rapids'
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            graph, info, weighted = _ingest(_as_csr(adjacency), use_weights=use_weights, host_input=False)
-    modularity = _exact_modularity(graph, info, use_weights=weighted)
     parts = []
-    for resolution, group in zip(resolutions, groups, strict=True):
+    for group, modularity in groups:
         membership, n_clusters = _size_ordered_codes(group)
-        parts.append(
-            SimpleNamespace(
-                membership=membership,
-                # cuGraph's modularity is not that of the returned partition
-                modularity=modularity(membership, n_clusters, resolution),
-                n_clusters=n_clusters,
-            )
-        )
+        # cuGraph's modularity (not always that of the returned partition)
+        parts.append(SimpleNamespace(membership=membership, modularity=float(modularity), n_clusters=n_clusters))
     return parts
 
 
 def _cugraph_groups(
     adjacency, resolutions, *, seeds, theta, dtype, use_weights, max_iter, use_dask
-) -> list[np.ndarray]:
-    """Communities of every resolution; cuGraph's graph is freed on return."""
+) -> list[tuple[np.ndarray, float]]:
+    """Communities and cuGraph's modularity of every resolution; cuGraph's graph is freed on return."""
     if use_dask:
         from cugraph.dask import leiden as culeiden
 
@@ -996,7 +1009,7 @@ def _cugraph_groups(
     groups = []
     try:
         for resolution, seed in zip(resolutions, seeds, strict=True):
-            leiden_parts, _ = culeiden(
+            leiden_parts, modularity = culeiden(
                 g,
                 resolution=resolution,
                 random_state=seed,
@@ -1007,7 +1020,7 @@ def _cugraph_groups(
                 leiden_parts = leiden_parts.to_backend("pandas").compute()
             else:
                 leiden_parts = leiden_parts.to_pandas()
-            groups.append(_vertex_groups(leiden_parts, adjacency.shape[0]))
+            groups.append((_vertex_groups(leiden_parts, adjacency.shape[0]), modularity))
     finally:
         # tear down the comms even on failure: later Dask calls would fail
         if use_dask:
@@ -1047,80 +1060,3 @@ def _size_ordered_codes(groups: np.ndarray) -> tuple[np.ndarray, int]:
     rank = np.empty_like(order)
     rank[order] = np.arange(order.size)
     return rank[inverse].astype(np.int32), int(order.size)
-
-
-def _exact_modularity(graph, info: dict | None, *, use_weights: bool):
-    """Modularity of compact labels with the native driver's arithmetic.
-
-    Takes `_ingest`'s results: weights quantised at the resolution's scale,
-    exact integer sums and a TREE1024 sum of the volume terms, as in
-    ``flavor='rapids'`` (up to the label order of that sum). With
-    ``info=None`` (no native extension) the weights are summed in float64.
-    """
-    indptr = cp.asarray(graph.indptr, dtype=cp.int64)
-    indices = cp.asarray(graph.indices)
-    data = cp.asarray(graph.data)
-    n = indptr.shape[0] - 1
-    s = None
-
-    def weights(lo: int, hi: int) -> tuple[cp.ndarray, cp.ndarray]:
-        """Rows and (quantised) weights of the entries lo:hi; 0 if not counted."""
-        rows = cp.searchsorted(indptr[1:], cp.arange(lo, hi), side="right")
-        w = data[lo:hi].astype(cp.float64)
-        counted = (rows != indices[lo:hi]) & ((w > 0) if use_weights else (w != 0))
-        value = w if use_weights else cp.ones_like(w)
-        if s is None:
-            return rows, cp.where(counted, value, 0.0)
-        q = cp.where(counted, cp.maximum(cp.rint(cp.ldexp(value, s)), 1), 0)
-        return rows, q.astype(cp.int64)
-
-    def modularity(membership: np.ndarray, n_clusters: int, resolution: float):
-        nonlocal s
-        if info is not None:
-            s = _scale_exponent(info["nnz_counted"], info["wmax"], resolution)
-        labels = cp.asarray(membership, dtype=cp.int64)
-        khat = cp.zeros(n, cp.float64 if s is None else cp.int64)
-        inner = 0
-        # in edge chunks: the full-length temporaries would not fit next to large graphs
-        for lo in range(0, indices.shape[0], _MODULARITY_CHUNK):
-            hi = min(lo + _MODULARITY_CHUNK, indices.shape[0])
-            rows, q = weights(lo, hi)
-            cp.add.at(khat, rows, q)
-            inner += q[labels[rows] == labels[indices[lo:hi]]].sum().item()
-        volumes = cp.zeros(n_clusters, khat.dtype)
-        cp.add.at(volumes, labels, khat)
-        two_m = float(khat.sum().item())
-        if two_m == 0:  # no counted entry
-            return 0.0
-        inner = float(inner)
-        x = volumes.get().astype(np.float64) / two_m
-        return float(inner / two_m - float(resolution) * _tree1024(x * x))
-
-    return modularity
-
-
-def _scale_exponent(nnz_counted: int, wmax: float, resolution: float) -> int:
-    """Fixed-point scale exponent, as the native `scale_for_gamma`."""
-    if not (nnz_counted > 0 and wmax > 0):
-        return 0
-    f_m, e_m = math.frexp(float(wmax))
-    f_w, e_w = math.frexp(float(nnz_counted) * f_m)
-    e_q = math.frexp(1.0 / f_w)[1]
-    s = 58 - (e_w + e_m) + (e_q - 1)
-    if resolution > 16.0:
-        f, e = math.frexp(resolution / 16.0)
-        s -= e - 1 if f == 0.5 else e
-    return s
-
-
-def _tree1024(t: np.ndarray) -> float:
-    """Fixed-order float64 sum: 1024 strided partials, then a tree."""
-    acc = np.zeros(1024)
-    for start in range(0, t.shape[0], 1024):
-        chunk = t[start : start + 1024]
-        acc[: chunk.shape[0]] += chunk
-    width = 512
-    while width:
-        acc[:width] += acc[width : 2 * width]
-        width //= 2
-    return float(acc[0])

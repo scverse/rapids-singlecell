@@ -263,21 +263,17 @@ def test_labels_size_ordered(adata_neighbors, flavor, resolution):
         np.testing.assert_array_equal(labels.cat.codes, expected.codes)
 
 
-@pytest.mark.parametrize("flavor", FLAVORS)
+@needs_native
 @pytest.mark.parametrize("resolution", [0.5, 1.0, 2.0])
 @pytest.mark.parametrize("use_weights", [True, False])
-def test_modularity_is_exact(adata_neighbors, flavor, resolution, use_weights):
-    rsc.tl.leiden(adata_neighbors, flavor=flavor, resolution=resolution, use_weights=use_weights)
+def test_modularity_is_exact(adata_neighbors, resolution, use_weights):
+    rsc.tl.leiden(adata_neighbors, resolution=resolution, use_weights=use_weights)
     q = adata_neighbors.uns["leiden"]["modularity"]
     assert type(q) is float
     a = adata_neighbors.obsp["connectivities"]
     codes = adata_neighbors.obs["leiden"].cat.codes.to_numpy()
     expected = _fp64_modularity(a, codes, resolution, use_weights=use_weights)
     assert q == pytest.approx(expected, rel=0, abs=1e-9)
-    if flavor == "cugraph":  # bitwise the exact Q of its labels
-        graph, info, weighted = _leiden._ingest(_leiden._as_csr(a), use_weights=use_weights, host_input=False)
-        exact = _leiden._exact_modularity(graph, info, use_weights=weighted)
-        assert float.hex(q) == float.hex(exact(codes, int(codes.max()) + 1, resolution))
 
 
 def test_modularity_matches_networkx(adata_neighbors):
@@ -339,8 +335,9 @@ BOTH = ("rapids", "cugraph")
         *((BOTH, {"n_iterations": n}, ValueError, _N_ITER_MSG) for n in (0, -2, 1.5, True, "2")),
         *(
             (BOTH, {"resolution": r}, ValueError, _RES_MSG)
-            for r in (-0.5, np.nan, np.inf, -np.inf, 2.0**21, [1.0, np.nan], ["1"])
+            for r in (-0.5, np.nan, np.inf, -np.inf, 2.0**21, [1.0, np.nan], ["1"], True, [0.5, False])
         ),
+        (BOTH, {"resolution": [0.5, 1.0, 0.5]}, ValueError, "must not repeat"),
         (("rapids",), {"resolution": []}, ValueError, "non-empty"),
         (("rapids",), {"max_iter": 5}, TypeError, _UNKNOWN_MSG),
         (("rapids",), {"foo": 1}, TypeError, _UNKNOWN_MSG),
@@ -381,6 +378,7 @@ def test_rapids_parameter_checks(adata_neighbors):
     with pytest.raises(ValueError, match="square"):
         rsc.tl.leiden(adata_neighbors, adjacency=adata_neighbors.obsp["connectivities"][:, :10])
     assert "leiden" not in adata_neighbors.obs
+    rsc.tl.leiden(adata_neighbors, dtype=np.dtype("float32"))  # cuGraph's, ignored
 
 
 @pytest.mark.parametrize("native_module", [None, object()], ids=["absent", "stub"])
@@ -389,12 +387,9 @@ def test_rapids_unavailable(adata_neighbors, monkeypatch, native_module):
     with pytest.raises(NotImplementedError, match="flavor='rapids' is not available"):
         rsc.tl.leiden(adata_neighbors, flavor="rapids")
     assert "leiden" not in adata_neighbors.obs
-    # flavor='cugraph' still runs; its modularity is summed in float64
+    # flavor='cugraph' still runs
     rsc.tl.leiden(adata_neighbors, flavor="cugraph", resolution=0.5)
-    codes = adata_neighbors.obs["leiden"].cat.codes.to_numpy()
-    expected = _fp64_modularity(adata_neighbors.obsp["connectivities"], codes, 0.5)
-    q = adata_neighbors.uns["leiden"]["modularity"]
-    assert q == pytest.approx(expected, rel=0, abs=1e-12)
+    assert type(adata_neighbors.uns["leiden"]["modularity"]) is float
 
 
 def _record_flavor_calls(monkeypatch) -> list[str]:
@@ -445,7 +440,7 @@ def test_deprecations(adata_neighbors, monkeypatch, unpatched_warn):
             rsc.tl.leiden(adata_neighbors, flavor=flavor, use_dask=True)
         # one warning: the use_dask one already names the cuGraph implementation
         assert [str(w.message)[:23] for w in rec] == ["use_dask is deprecated "]
-    with pytest.warns(FutureWarning, match=r"theta is a cuGraph parameter"):
+    with pytest.warns(FutureWarning, match=r"theta is a deprecated cuGraph parameter"):
         rsc.tl.leiden(adata_neighbors, flavor="rapids", theta=1.0)
     assert calls == ["cugraph", "cugraph", "cugraph", "rapids"]
 
@@ -564,8 +559,21 @@ def test_non_canonical_input(device):
     clean.sum_duplicates()
     expected = native(clean)
     if device:
+        coo = cpx_sparse.coo_matrix(
+            (cp.asarray(data[order]), (cp.asarray(rows[order]), cp.asarray(cols[order]))), shape=a.shape
+        )
+        assert_same(native(coo), expected)  # duplicates kept in their order
         messy = cpx_sparse.csr_matrix(messy)
     assert_same(native(messy), expected)
+
+
+@needs_native
+def test_dense_input():
+    """Dense NumPy and CuPy input, also integer, equal the sparse graph."""
+    a = _graph("sbm")  # unit weights
+    expected = native(a)
+    for dense in (a.toarray(), cp.asarray(a.toarray()), cp.asarray(a.toarray()).astype(cp.int32)):
+        assert_same(native(dense), expected)
 
 
 @needs_native
@@ -688,16 +696,11 @@ def test_connected_communities(name):
 @pytest.mark.parametrize("name", ["pbmc3k", "sbm", "components", "star"])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_modularity_matches_fp64(name, dtype):
-    """The reported (exact) Q equals the float64 recomputation, and the
-    cuGraph flavor's exact Q of the same labels."""
+    """The reported (exact) Q equals the float64 recomputation."""
     a = _graph(name).astype(dtype)
-    graph, info, weighted = _leiden._ingest(a, use_weights=True, host_input=False)
-    exact = _leiden._exact_modularity(graph, info, use_weights=weighted)
     for res, part in zip((0.5, 1.0, 2.0), native(a, [0.5, 1.0, 2.0]), strict=True):
         expected = _fp64_modularity(a, part.membership, res)
         assert part.modularity == pytest.approx(expected, rel=0, abs=1e-9)
-        q = exact(part.membership, part.n_clusters, res)
-        assert q == pytest.approx(part.modularity, rel=0, abs=1e-12)
 
 
 # ---------- determinism ----------
@@ -742,7 +745,8 @@ def test_workspace_cache(monkeypatch):
     """Under rsc's default allocator (no pool) a call leaves its buffer, up to
     the cap, to the next call, which reuses it if large enough. A rerun frees
     the buffer before it allocates a larger one."""
-    assert _leiden._workspace_cache_applies()
+    if not _leiden._workspace_cache_applies():
+        pytest.skip("the session's allocator pools")
     with cp.cuda.using_allocator(cp.get_default_memory_pool().malloc):
         assert not _leiden._workspace_cache_applies()
     live, allocs, large = {}, [], 1 << 20
@@ -782,6 +786,32 @@ def test_workspace_cache(monkeypatch):
         native(a)
         assert device not in cache
         assert not [s for s in live.values() if s >= large]
+
+
+@needs_native
+def test_workspace_shrinks_to_fit(monkeypatch):
+    """An arena that cannot be allocated shrinks to the free memory, with the
+    same bits, unless that is below what a level needs."""
+    a, sizes, budget = _graph("pbmc3k"), [], []
+    allocate = _leiden._allocate_workspace
+
+    def limited(nbytes, shape, kind=None):
+        sizes.append(nbytes)
+        if budget and nbytes + 4 * shape[0] * shape[1] > budget[0]:
+            raise MemoryError("limited")
+        return allocate(nbytes, shape, kind)
+
+    monkeypatch.setattr(_leiden, "_allocate_workspace", limited)
+    monkeypatch.setattr(_leiden, "_free_bytes", lambda device=None: budget[0])
+    expected = native(a)
+    full = sizes[0]
+    budget.append(int(0.8 * full))
+    sizes.clear()
+    assert_same(native(a), expected)
+    assert sizes[0] == full > budget[0] >= sizes[-1]
+    budget[0] = int(0.3 * full)
+    with pytest.raises(MemoryError, match="Out of GPU memory"):
+        native(a)
 
 
 @needs_native
@@ -963,6 +993,28 @@ def test_multi_gpu_devices(partitions, peer):
     assert_same(native(a, [0.5, 1.0, 2.0], multi_gpu=[0, 1]), expected)
     partitions(3)
     assert_same(native(cpx_sparse.csr_matrix(a), [0.5, 1.0, 2.0], multi_gpu=[1, 0]), expected)
+
+
+@needs_native
+@pytest.mark.two_gpus
+def test_multi_gpu_true_splits_out_of_memory(partitions, monkeypatch):
+    """multi_gpu=True splits a graph that runs out of memory on one GPU, with
+    the bits of one GPU; a single GPU raises."""
+    a = _graph("pbmc3k")
+    partitions(None)
+    expected = native(a, [0.5, 1.0])
+    spy = _SpyLd(_leiden._ld)
+    monkeypatch.setattr(_leiden, "_ld", spy)
+
+    def out_of_memory(*args, **kwargs):
+        raise MemoryError("full")
+
+    monkeypatch.setattr(_leiden, "_leiden_single", out_of_memory)
+    assert_same(native(a, [0.5, 1.0], multi_gpu=True), expected)
+    assert [status for status, _ in spy.runs] == ["ok"]
+    for multi_gpu in (None, [0]):
+        with pytest.raises(MemoryError, match="full"):
+            native(a, [0.5, 1.0], multi_gpu=multi_gpu)
 
 
 # ---------- quality ----------

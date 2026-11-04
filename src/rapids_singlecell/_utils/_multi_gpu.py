@@ -279,7 +279,7 @@ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
         raise ValueError("multi_gpu must specify at least one device")
 
     # Streams are keyed by device; a duplicate would drop a sync barrier
-    return list(dict.fromkeys(device_ids))
+    return [int(d) for d in dict.fromkeys(device_ids)]
 
 
 def resolve_stream_devices(*, multi_gpu: bool | list[int] | str | None) -> list[int]:

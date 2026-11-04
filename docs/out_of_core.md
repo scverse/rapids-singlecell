@@ -142,7 +142,7 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.tl.score_genes`
 - {func}`~.tl.score_genes_cell_cycle`
 - {func}`~.tl.louvain` (set `use_dask=True` to distribute graph clustering)
-- {func}`~.tl.leiden` (`use_dask=True` is deprecated; `multi_gpu` splits a graph over GPUs without Dask)
+- {func}`~.tl.leiden` (`use_dask=True` is deprecated; graphs larger than one GPU's memory can run in RMM managed memory)
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`
 - {func}`~rapids_singlecell.dcg.aucell`, {func}`~rapids_singlecell.dcg.gsea`, {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ora`, {func}`~rapids_singlecell.dcg.ulm`, {func}`~rapids_singlecell.dcg.waggr` and {func}`~rapids_singlecell.dcg.zscore`

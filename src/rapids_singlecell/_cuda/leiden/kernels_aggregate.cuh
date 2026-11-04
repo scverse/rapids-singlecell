@@ -550,19 +550,13 @@ struct CoarseLevel {
     bool ok = true;  // false: workspace_too_small (see arena)
 };
 
+// at every use: a device reset drops the opt-in (CUDA 12)
 template <WKind K, typename OW>
 inline void agg_block_smem_optin() {
-    static thread_local u64 done = 0;  // bit d: set on device d (< 64)
-    const int dev = device_info().device;
-    const u64 bit = dev < 64 ? 1ull << dev : 0;
-    if (!(done & bit)) {
-        cuda_check(
-            cudaFuncSetAttribute(agg_gather_block_kernel<K, OW>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kAggBlockSmem)),
-            "leiden: gather block shared memory");
-        done |= bit;
-    }
+    cuda_check(cudaFuncSetAttribute(agg_gather_block_kernel<K, OW>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(kAggBlockSmem)),
+               "leiden: gather block shared memory");
 }
 
 // The gather classes over device-resident counts; the block class runs on 1024
