@@ -142,13 +142,14 @@ def leiden(
         implementation of rapids-singlecell, bitwise reproducible for a given
         seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden`.
         ``'rapids'`` needs about 140 bytes of device memory per cell plus
-        what its coarser levels hold, allocated as they need it (14-18 bytes
-        per stored entry at the peak on k-NN graphs: about 2.5-3x the float32
-        CSR, which is also copied to the GPU if it is on the host); if that
-        does not fit, it raises :class:`MemoryError` (RMM managed memory can
-        exceed the GPU). Under an allocator that does not pool (the default
-        of rapids-singlecell), it keeps the per-cell workspace for the next
-        call if it is at most 2 GiB and 1/16 of the GPU memory.
+        what its coarser levels hold, allocated as they need it: on k-NN
+        graphs 14-18 bytes per stored entry at the peak (about 22 at 100M
+        cells), in all 2.5-3.5x the float32 CSR, which is also copied to the
+        GPU if it is on the host. If that does not fit, it raises
+        :class:`MemoryError` (RMM managed memory can exceed the GPU). Under an
+        allocator that does not pool (the default of rapids-singlecell), it
+        keeps the per-cell workspace for the next call if it is at most 2 GiB
+        and 1/16 of the GPU memory.
     copy
         Whether to copy ``adata`` or modify it in place.
     theta
@@ -168,7 +169,8 @@ def leiden(
 
         - ``None`` or ``False`` (default): the current GPU.
         - ``True``: all GPUs, but only for a graph that runs out of memory
-          on the current GPU; others run there.
+          on the current GPU (it reruns split, from the start); others run
+          there.
         - ``list[int]`` or comma-separated ``str`` (e.g. ``"0,2"``): these
           GPUs, always split (one GPU: run on it).
 
@@ -178,10 +180,11 @@ def leiden(
         the graph. One GPU (the first listed one, or the next if the first
         holds a CuPy adjacency; with ``True``, the one with the most free
         memory) also holds the coarser levels, so 2 GPUs fit graphs only
-        about 1.1x as large and 4 GPUs about 1.2x. A split run synchronises the GPUs many
-        times per level, so it is slower than one GPU; labels and modularity
-        are bitwise identical. Graphs of at most ``2**18`` counted entries,
-        which one GPU clusters as several replicas, warn and run on one GPU.
+        about 1.1x as large and 4 GPUs about 1.2x. A split run synchronises
+        the GPUs many times per level, so it is slower than one GPU; labels
+        and modularity are bitwise identical. Graphs of at most ``2**18``
+        counted entries, which one GPU clusters as several replicas, warn and
+        run on one GPU.
     **clustering_args
         Further arguments for the clustering. ``flavor='rapids'`` accepts
         ``beta`` (randomness of the refinement, theta in :cite:t:`Traag2019`;
@@ -457,8 +460,8 @@ def _leiden_rapids(
             n_parts = len(devices)
         for device in devices:  # a split run does not use the cached single-GPU workspaces
             _WORKSPACE_CACHE.pop(device, None)
-        if multi_gpu is True:  # partition 0 (levels >= 1: about one GPU's workspace) where most is free
-            devices = sorted(devices, key=_free_bytes, reverse=True)
+        if multi_gpu is True:  # partition 0 (levels >= 1: most of one GPU's need) where most is free
+            devices = sorted(devices, key=lambda d: cp.cuda.Device(d).mem_info[0], reverse=True)
         owned = cpx_sparse.issparse(adjacency) and graph.indices is getattr(adjacency, "indices", None)
         parts = _split_rows(graph, n_parts, devices, owned=owned)
         del graph, csr, args  # the partitions hold copies of a fixed-up graph
@@ -507,27 +510,27 @@ def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNam
     nbytes = _ld.leiden(graph.indptr, **args)["required_bytes"]  # a call without a workspace sizes it
     buffer, workspace, labels = _allocate_workspace(nbytes, shape, kind)
     blocks = _ArenaBlocks()
-    out = _ld.leiden(
-        graph.indptr,
-        **args,
-        workspace=workspace,
-        pinned=pinned.ptr,
-        labels_out=labels,
-        arena_alloc=blocks.alloc,
-        arena_free=blocks.free,
-    )
+    try:
+        out = _ld.leiden(
+            graph.indptr,
+            **args,
+            workspace=workspace,
+            pinned=pinned.ptr,
+            labels_out=labels,
+            arena_alloc=blocks.alloc,
+            arena_free=blocks.free,
+        )
+    except BaseException:  # a kept traceback (e.g. IPython's) must not hold the memory
+        del buffer, workspace, labels
+        raise
+    finally:
+        blocks.live.clear()
     codes = _labels_to_host(labels)
     _cache_workspace(buffer)
     return [
         SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
         for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)
     ]
-
-
-def _free_bytes(device: int | None = None) -> int:
-    """Free memory of a GPU (None: the current one), less some headroom."""
-    free = cp.cuda.Device(device).mem_info[0]
-    return free - free // 64 - (1 << 28)
 
 
 def _row_bounds(indptr: np.ndarray, n_parts: int) -> list[int]:
@@ -628,14 +631,20 @@ def _leiden_partitioned(
         with cp.cuda.Device(device):
             cp.cuda.get_current_stream().synchronize()
     blocks = _ArenaBlocks(ready=True)
-    out = _ld.leiden_mg(
-        parts.indptrs,
-        **args,
-        workspaces=workspaces,
-        labels_out=labels,
-        arena_alloc=blocks.alloc,
-        arena_free=blocks.free,
-    )
+    try:
+        out = _ld.leiden_mg(
+            parts.indptrs,
+            **args,
+            workspaces=workspaces,
+            labels_out=labels,
+            arena_alloc=blocks.alloc,
+            arena_free=blocks.free,
+        )
+    except BaseException:  # a kept traceback (e.g. IPython's) must not hold the memory
+        del workspaces, labels
+        raise
+    finally:
+        blocks.live.clear()
     with cp.cuda.Device(root):
         codes = _labels_to_host(labels)
     return [

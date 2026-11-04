@@ -733,7 +733,10 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
     Layout L = make_layout(p, in.workspace);
     out.required_bytes = L.total;
     if (L.total > in.workspace_bytes) {
-        out.status = "workspace_too_small";
+        if (in.workspace)
+            throw std::invalid_argument(
+                "leiden: workspace too small for its layout");
+        out.status = "size";
         return out;
     }
     L.pinned = in.pinned;
@@ -767,34 +770,29 @@ template <typename T, typename Device>
 using optional_array = std::optional<gpu_array_c<T, Device>>;
 
 // Arena blocks from Python: alloc(nbytes, device) -> pointer, free(pointer),
-// called with the GIL. `sync`: a stream to finish before a block goes back
-// (the multi-GPU driver's own streams; null: the caller's stream, which the
-// allocator orders).
-inline ArenaGrower python_grower(const nb::object& alloc,
-                                 const nb::object& free, int device,
+// called with the GIL; their exceptions (MemoryError, KeyboardInterrupt)
+// propagate unchanged. `sync`: a stream of `device` to finish before a block
+// goes back (the multi-GPU driver's own streams; null: the caller's stream,
+// which the allocator orders). The caller keeps both alive for the call.
+inline ArenaGrower python_grower(nb::handle alloc, nb::handle free, int device,
                                  cudaStream_t sync = nullptr) {
     ArenaGrower g;
-    g.alloc = [&alloc, device](std::size_t bytes) -> void* {
+    g.alloc = [alloc, device](std::size_t bytes) -> void* {
         nb::gil_scoped_acquire gil;
-        try {
-            return reinterpret_cast<void*>(
-                nb::cast<std::uintptr_t>(alloc(bytes, device)));
-        } catch (nb::python_error& e) {
-            if (e.matches(PyExc_MemoryError)) throw std::bad_alloc();
-            throw std::runtime_error(std::string("leiden: arena_alloc: ") +
-                                     e.what());
-        }
+        return reinterpret_cast<void*>(
+            nb::cast<std::uintptr_t>(alloc(bytes, device)));
     };
-    g.free = [&free, sync](void* p) {
-        if (sync)
-            cuda_check(cudaStreamSynchronize(sync), "leiden: arena release");
-        nb::gil_scoped_acquire gil;
-        try {
-            free(reinterpret_cast<std::uintptr_t>(p));
-        } catch (nb::python_error& e) {
-            throw std::runtime_error(std::string("leiden: arena_free: ") +
-                                     e.what());
+    g.free = [free, device, sync](void* p) {
+        if (sync) {  // on its own device, which compute-sanitizer requires
+            int prev = 0;
+            cuda_check(cudaGetDevice(&prev), "leiden: cudaGetDevice");
+            cuda_check(cudaSetDevice(device), "leiden: cudaSetDevice");
+            const cudaError_t err = cudaStreamSynchronize(sync);
+            cudaSetDevice(prev);
+            cuda_check(err, "leiden: arena release");
         }
+        nb::gil_scoped_acquire gil;
+        free(reinterpret_cast<std::uintptr_t>(p));
     };
     return g;
 }
@@ -903,8 +901,9 @@ inline nb::dict result_dict(const DriverResult& r) {
 
 // Every resolution of the call. `check`: ingest_check's result for exactly
 // these arrays; `labels_out`: (len(resolutions), n) int32. Without `workspace`
-// the call only sizes it (status "workspace_too_small", required_bytes); a
-// run takes arena_alloc(nbytes, device) -> pointer and arena_free(pointer).
+// the call only sizes it (status "size", required_bytes); a run takes
+// arena_alloc(nbytes, device) -> pointer and arena_free(pointer), whose
+// allocator must order the blocks on `stream` (CuPy's: its current stream).
 template <typename IP, typename IX, typename WI, typename InDevice,
           typename Device>
 void register_driver_typed(nb::module_& m) {

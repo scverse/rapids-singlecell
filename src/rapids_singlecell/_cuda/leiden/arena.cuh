@@ -391,8 +391,9 @@ struct ArenaGrower {
 // host. A bottom carve takes the region while it fits, else a block (at
 // offsets >= cap, so marks stay comparable); the top lives in blocks of its
 // own. restore / release_top / reset free the blocks above; a reserve_* hint
-// sizes the next block for a group of carves (at least kAlign bytes: a block
-// is never empty). Every level gets exactly what it needs, whatever the graph.
+// sizes the next block for a group of carves (at least kAlign bytes); an empty
+// carve takes no space. Every level gets exactly what it needs, whatever the
+// graph.
 struct LevelArena {
     char* base = nullptr;
     std::size_t cap = 0;
@@ -427,6 +428,7 @@ struct LevelArena {
     template <typename T>
     T* push_bottom(std::size_t count) {
         const std::size_t b = align_up(bottom), nb = count * sizeof(T);
+        if (nb == 0) return reinterpret_cast<T*>(base);
         if (b + nb <= cap) {
             bottom = b + nb;
             return reinterpret_cast<T*>(base + b);
@@ -451,6 +453,7 @@ struct LevelArena {
     template <typename T>
     T* push_top(std::size_t count) {
         const std::size_t nt = align_up(count * sizeof(T));
+        if (nt == 0) return reinterpret_cast<T*>(base);
         if (tblocks.empty() || tblocks.back().at + nt > tblocks.back().size) {
             const std::size_t size = std::max({nt, tnext, kAlign});
             tnext = 0;

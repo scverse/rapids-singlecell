@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import _warnings
+import contextlib
 import warnings
 from types import SimpleNamespace
 
@@ -778,38 +779,43 @@ def test_workspace_cache(monkeypatch):
 
 
 @needs_native
-def test_arena_blocks(monkeypatch):
+@pytest.mark.parametrize("n_parts", [None, 3])
+def test_arena_blocks(partitions, monkeypatch, n_parts):
     """The coarser levels live in blocks of the current allocator, freed as
-    they end; a block that cannot be allocated raises MemoryError and leaves
-    no block behind."""
-    a, live, sizes = _graph("pbmc68k"), {}, []
+    they end; an error in an allocation (MemoryError, Ctrl-C) reaches the
+    caller unchanged and leaves no block behind."""
+    a, sizes, made, freed = _graph("pbmc68k"), [], [], []
+    partitions(None)
+    expected = native(a, [0.5, 1.0])
+    partitions(n_parts)
     alloc, free = _leiden._ArenaBlocks.alloc, _leiden._ArenaBlocks.free
 
     def tracked(self, nbytes, device):
-        ptr = alloc(self, nbytes, device)
-        live[ptr] = nbytes
+        made.append(self)
         sizes.append(nbytes)
-        return ptr
+        return alloc(self, nbytes, device)
 
-    def untracked(self, ptr):
-        live.pop(ptr)
+    def counted(self, ptr):
+        freed.append(ptr)
         free(self, ptr)
 
-    expected = native(a, [0.5, 1.0])
     monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", tracked)
-    monkeypatch.setattr(_leiden._ArenaBlocks, "free", untracked)
+    monkeypatch.setattr(_leiden._ArenaBlocks, "free", counted)
     assert_same(native(a, [0.5, 1.0]), expected)
     assert len(sizes) > 2  # at least a level and its contraction's rows
+    assert freed
+    for error in (MemoryError("test"), KeyboardInterrupt("test")):
 
-    def failing(self, nbytes, device):
-        if len(sizes) >= 3:
-            raise MemoryError("test")
-        return tracked(self, nbytes, device)
+        def failing(self, nbytes, device, error=error):
+            if len(sizes) >= 3:
+                raise error
+            return tracked(self, nbytes, device)
 
-    sizes.clear()
-    monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", failing)
-    with pytest.raises(MemoryError):
-        native(a, [0.5, 1.0])
+        sizes.clear()
+        monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", failing)
+        with pytest.raises(type(error), match="test"):
+            native(a, [0.5, 1.0])
+        assert not made[-1].live
     monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", tracked)
     assert_same(native(a, [0.5, 1.0]), expected)
 
@@ -928,14 +934,18 @@ def test_partitions_empty(partitions, monkeypatch):
 
 
 @needs_native
-def test_partitions_workspace(partitions, monkeypatch):
+@pytest.mark.parametrize("pooled", [False, True])
+def test_partitions_workspace(partitions, monkeypatch, request, pooled):
     """Workspaces and arena blocks filled with garbage by work still queued on
     the caller's stream (which the partitions' streams must wait for) give the
-    bits of one partition."""
+    bits of one partition, also from a pool on a non-blocking stream (a freed
+    block goes straight to the next partition)."""
     a = _graph("pbmc3k")
     partitions(None)
     expected = native(a, [0.5, 1.0, 2.0])
     partitions(3)
+    if pooled:
+        request.getfixturevalue("cupy_pool")
     empty = cp.empty
 
     def dirty(*args, **kwargs):
@@ -945,7 +955,8 @@ def test_partitions_workspace(partitions, monkeypatch):
         return out
 
     monkeypatch.setattr(cp, "empty", dirty)
-    assert_same(native(a, [0.5, 1.0, 2.0]), expected)
+    with cp.cuda.Stream(non_blocking=True) if pooled else contextlib.nullcontext():
+        assert_same(native(a, [0.5, 1.0, 2.0]), expected)
 
 
 @needs_native

@@ -624,6 +624,7 @@ AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
                       align_up(sizeof(OW) * ne));  // one block
     plan.h_idx = arena.push_top<int>(ne);
     plan.h_w = arena.push_top<OW>(ne);
+    arena.reserve_top(0);
     std::vector<KernelCall> c = std::move(pre);
     std::size_t k = c.size();
     c.resize(k + 18);
