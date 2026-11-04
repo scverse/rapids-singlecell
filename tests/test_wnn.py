@@ -254,8 +254,8 @@ def test_wnn_approximate_searches(monkeypatch):
         with pytest.raises(ValueError, match="n_probes"):
             rsc.pp.wnn(adata, **kwargs, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
     # searching all IVF lists repairs the candidates in the same CUDA context;
-    # nn_descent needs a graph degree beyond its default
-    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {})):
+    # nn_descent and cagra need a graph degree and search width beyond cuVS's defaults
+    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {}), ("cagra", {})):
         rsc.pp.wnn(adata, **kwargs, algorithm=algorithm, algorithm_kwds=kwds)
         D = adata.obsp["distances"]
         assert np.all(np.diff(D.indptr) == 20)
@@ -274,7 +274,6 @@ def test_wnn_approximate_searches(monkeypatch):
         ({"algorithm": "kd_tree"}, "Invalid algorithm"),
         ({"use_rep": ["X_pca", "X_pca"]}, "unique strings"),
         ({"weight_key": "weight"}, "distinct column"),
-        ({"algorithm": "cagra", "knn_range": 100}, "up to 64"),
     ],
 )
 def test_wnn_errors(kwargs, match):
