@@ -38,28 +38,15 @@ if TYPE_CHECKING:
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
-# Workspace arena in units of 8 * nnz bytes; k-NN graphs need 1.5-2.6, more
-# with more cells. A level that does not fit ends the call, which reruns
-# (bitwise identical) with the driver's request plus slack; an arena that
-# cannot be allocated shrinks to the largest that fits.
-_ARENA_FACTOR = 2.7
-_REQUIRED_SLACK = 1.25
-_MAX_RERUNS = 6
 # Host input is read in place on GPUs with ATS (e.g. GB10); elsewhere it is
 # copied to the device in chunks through pinned buffers.
 _HOST_ZERO_COPY = True
 _H2D_CHUNK_BYTES = 1 << 23
 _WORKSPACE_CACHE_BYTES = 1 << 31  # see `_WORKSPACE_CACHE`; 0 disables it
 _N_ITER_WARN = 20  # above this: warn and run the -1 rule
-# multi_gpu: partition 0 also holds levels >= 1, so its arena is sized by the
-# whole graph's entries (`_ARENA_FACTOR`; it needs what one GPU needs), each
-# other partition's by its own entries, but at least 1/P of all as it merges
-# 1/P of the coarse rows (`_ARENA_FACTOR_PART`; the int64 partial rows of the
-# contraction need 2.1-2.6); a rerun grows the partitions that overflowed.
 # Test knobs: `_N_PARTITIONS` forces the number of partitions (round-robin
 # over the devices, several per device); `_MAX_REPLICAS` caps the replicas of
 # small graphs (1: none, which partitioned runs require).
-_ARENA_FACTOR_PART = 2.7
 _N_PARTITIONS: int | None = None
 _MAX_REPLICAS: int | None = None
 _MAX_RESOLUTION = 2.0**20  # bound of the integer no-overflow proof
@@ -154,14 +141,14 @@ def leiden(
         Which implementation to use. ``'rapids'`` (default) is the native CUDA
         implementation of rapids-singlecell, bitwise reproducible for a given
         seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden`.
-        ``'rapids'`` needs a device workspace of about 22 bytes per stored
-        entry and 160 bytes per cell (on k-NN graphs about 3.5x the float32
-        CSR, which is also copied to the GPU if it is on the host). If that
-        does not fit, it runs with a smaller one where the graph allows and
-        else raises :class:`MemoryError` (RMM managed memory can exceed the
-        GPU). Under an allocator that does not pool (the default of
-        rapids-singlecell), it keeps the workspace for the next call if it is
-        at most 2 GiB and 1/16 of the GPU memory.
+        ``'rapids'`` needs about 140 bytes of device memory per cell plus
+        what its coarser levels hold, allocated as they need it (14-18 bytes
+        per stored entry at the peak on k-NN graphs: about 2.5-3x the float32
+        CSR, which is also copied to the GPU if it is on the host); if that
+        does not fit, it raises :class:`MemoryError` (RMM managed memory can
+        exceed the GPU). Under an allocator that does not pool (the default
+        of rapids-singlecell), it keeps the per-cell workspace for the next
+        call if it is at most 2 GiB and 1/16 of the GPU memory.
     copy
         Whether to copy ``adata`` or modify it in place.
     theta
@@ -186,13 +173,12 @@ def leiden(
           GPUs, always split (one GPU: run on it).
 
         A split run gives each GPU one contiguous range of the cells,
-        balanced by stored entries: it stores the rows of its cells, an
-        arena of about 2.7x their size and about 160 bytes of state per cell
-        of the graph. One GPU (the first listed one, or the next if the
-        first holds a CuPy adjacency; with ``True``, the one with the most
-        free memory) also runs the coarser levels and needs about as much
-        workspace as one GPU would, so 2 GPUs fit graphs only about 1.1x as
-        large and 4 GPUs about 1.2x. A split run synchronises the GPUs many
+        balanced by stored entries: it stores the rows of its cells, their
+        contraction as it needs it and about 140 bytes of state per cell of
+        the graph. One GPU (the first listed one, or the next if the first
+        holds a CuPy adjacency; with ``True``, the one with the most free
+        memory) also holds the coarser levels, so 2 GPUs fit graphs only
+        about 1.1x as large and 4 GPUs about 1.2x. A split run synchronises the GPUs many
         times per level, so it is slower than one GPU; labels and modularity
         are bitwise identical. Graphs of at most ``2**18`` counted entries,
         which one GPU clusters as several replicas, warn and run on one GPU.
@@ -488,52 +474,50 @@ def _leiden_rapids(
         )
 
 
-def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNamespace]:
-    """One GPU: size the workspace, run, rerun with a larger arena if a level did not fit.
+class _ArenaBlocks:
+    """Device blocks of the native engine's level arena, allocated as levels need them and freed as they end.
 
-    An arena that cannot be allocated shrinks to the largest that fits in free
-    memory, if that is more than an overflowed level asked for.
+    With ``ready``, a block is usable from any stream when returned (`leiden_mg`
+    runs on its own streams, unordered with the allocator's).
     """
+
+    def __init__(self, *, ready: bool = False) -> None:
+        self.live: dict[int, cp.ndarray] = {}
+        self.ready = ready
+
+    def alloc(self, nbytes: int, device: int) -> int:
+        with cp.cuda.Device(device):
+            block = cp.empty(nbytes, dtype=cp.uint8)
+            if self.ready:
+                cp.cuda.get_current_stream().synchronize()
+        self.live[block.data.ptr] = block
+        return block.data.ptr
+
+    def free(self, ptr: int) -> None:
+        del self.live[ptr]
+
+
+def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNamespace]:
+    """One GPU: size the workspace and run; the level arena grows by blocks of exactly what a level needs."""
     pinned = cp.cuda.alloc_pinned_memory(_ld.PINNED_BYTES)  # readback buffer
     # the memory kind of the call's other device arrays, which the workspace must share
     arrays = (graph.indptr, args["initial_membership"])
     kind = next((_memory_kind(a) for a in arrays if isinstance(a, cp.ndarray)), None)
     shape = (len(args["resolutions"]), n)
-    factor, need = _ARENA_FACTOR, 0.0
-    for _ in range(_MAX_RERUNS + 1):
-        # a call without a workspace sizes it
-        nbytes = _ld.leiden(graph.indptr, **args, arena_factor=factor)["required_bytes"]
-        try:
-            buffer, workspace, labels = _allocate_workspace(nbytes, shape, kind)
-        except MemoryError as err:
-            # the workspace is affine in the factor: solve for what fits
-            base = _ld.leiden(graph.indptr, **args, arena_factor=factor / 2)["required_bytes"]
-            per_factor = 2 * (nbytes - base) / factor
-            fit = factor - (nbytes + 4 * shape[0] * shape[1] + 1024 - _free_bytes()) / per_factor
-            if not need < fit < factor:
-                msg = f"Out of GPU memory for the {nbytes / 2**30:.1f} GiB workspace of flavor='rapids'; RMM managed memory can exceed the GPU."
-                raise MemoryError(msg) from err
-            factor = fit
-            continue
-        out = _ld.leiden(
-            graph.indptr,
-            **args,
-            workspace=workspace,
-            pinned=pinned.ptr,
-            labels_out=labels,
-            arena_factor=factor,
-        )
-        if out["status"] == "ok":
-            codes = _labels_to_host(labels)
-            _cache_workspace(buffer)
-            break
-        # a level did not fit; free the buffer before allocating anew
-        del buffer, workspace, labels
-        need = out["required_arena_factor"]
-        factor = _REQUIRED_SLACK * need
-    else:
-        msg = f"Native Leiden reported workspace_too_small {_MAX_RERUNS + 1} times in a row."
-        raise RuntimeError(msg)
+    nbytes = _ld.leiden(graph.indptr, **args)["required_bytes"]  # a call without a workspace sizes it
+    buffer, workspace, labels = _allocate_workspace(nbytes, shape, kind)
+    blocks = _ArenaBlocks()
+    out = _ld.leiden(
+        graph.indptr,
+        **args,
+        workspace=workspace,
+        pinned=pinned.ptr,
+        labels_out=labels,
+        arena_alloc=blocks.alloc,
+        arena_free=blocks.free,
+    )
+    codes = _labels_to_host(labels)
+    _cache_workspace(buffer)
     return [
         SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
         for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)
@@ -632,38 +616,28 @@ def _leiden_partitioned(
         "n_iterations": int(n_iterations),
         "initial_membership": membership,
     }
-    factors = [_ARENA_FACTOR] + [_ARENA_FACTOR_PART] * (len(parts.devices) - 1)  # one per partition
-    for _ in range(_MAX_RERUNS + 1):
-        sizes = _ld.leiden_mg(parts.indptrs, **args, workspaces=[], arena_factors=factors)["required_bytes"]
-        workspaces = []
-        for device, nbytes in zip(parts.devices, sizes, strict=True):
-            with cp.cuda.Device(device):
-                workspaces.append(cp.empty(nbytes, dtype=cp.uint8))
-        with cp.cuda.Device(root):
-            labels = cp.empty((len(resolutions), n), dtype=cp.int32)
-        # leiden_mg runs on its own streams: the inputs and buffers must be ready
-        for device in {*parts.devices, cp.cuda.Device().id}:
-            with cp.cuda.Device(device):
-                cp.cuda.get_current_stream().synchronize()
-        out = _ld.leiden_mg(
-            parts.indptrs,
-            **args,
-            workspaces=workspaces,
-            labels_out=labels,
-            arena_factors=factors,
-        )
-        if out["status"] == "ok":
-            with cp.cuda.Device(root):
-                codes = _labels_to_host(labels)
-            break
-        # a level did not fit; grow the arena of each partition that overflowed
-        del workspaces, labels
-        for p, need in enumerate(out["required_arena_factor"]):
-            if need > 0:
-                factors[p] = _REQUIRED_SLACK * need
-    else:
-        msg = f"Native Leiden reported workspace_too_small {_MAX_RERUNS + 1} times in a row."
-        raise RuntimeError(msg)
+    sizes = _ld.leiden_mg(parts.indptrs, **args, workspaces=[])["required_bytes"]
+    workspaces = []
+    for device, nbytes in zip(parts.devices, sizes, strict=True):
+        with cp.cuda.Device(device):
+            workspaces.append(cp.empty(nbytes, dtype=cp.uint8))
+    with cp.cuda.Device(root):
+        labels = cp.empty((len(resolutions), n), dtype=cp.int32)
+    # leiden_mg runs on its own streams: the inputs and buffers must be ready
+    for device in {*parts.devices, cp.cuda.Device().id}:
+        with cp.cuda.Device(device):
+            cp.cuda.get_current_stream().synchronize()
+    blocks = _ArenaBlocks(ready=True)
+    out = _ld.leiden_mg(
+        parts.indptrs,
+        **args,
+        workspaces=workspaces,
+        labels_out=labels,
+        arena_alloc=blocks.alloc,
+        arena_free=blocks.free,
+    )
+    with cp.cuda.Device(root):
+        codes = _labels_to_host(labels)
     return [
         SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
         for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)

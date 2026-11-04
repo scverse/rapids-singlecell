@@ -243,7 +243,7 @@ nb::dict call_leiden_mg(
     const std::vector<double>& resolutions,
     const std::vector<std::uint32_t>& seeds, int n_iterations,
     const optional_array<const int, Device>& init,
-    const std::vector<double>& arena_factors) {
+    const nb::object& arena_alloc, const nb::object& arena_free) {
     const std::size_t P = indptrs.size();
     if (P < 1 || P > static_cast<std::size_t>(kMaxParts))
         throw std::invalid_argument("leiden_mg: 1 to 32 partitions");
@@ -283,13 +283,9 @@ nb::dict call_leiden_mg(
           (n_iterations >= 1 && n_iterations < (1 << 16))))
         throw std::invalid_argument(
             "n_iterations must be a positive integer or -1");
-    if (arena_factors.size() != P)
-        throw std::invalid_argument(
-            "leiden_mg: one arena factor per partition");
-    for (double f : arena_factors)
-        if (!(f > 0.0))
-            throw std::invalid_argument("arena factors must be > 0");
     const bool run = !workspaces.empty();
+    if (run && (arena_alloc.is_none() || arena_free.is_none()))
+        throw std::invalid_argument("a run needs arena_alloc and arena_free");
     if (run && workspaces.size() != P)
         throw std::invalid_argument("leiden_mg: one workspace per partition");
     if (run != labels_out.has_value())
@@ -319,9 +315,6 @@ nb::dict call_leiden_mg(
         lp[p].nnz = nnz[p];
         lp[p].wkind = call_wkind(in.info, use_weights,
                                  std::is_same_v<WI, float>, resolutions);
-        lp[p].arena_factor = arena_factors[p];
-        lp[p].arena_entries = part_arena_entries(
-            static_cast<int>(p), static_cast<int>(P), nnz[p], nnz_total);
         lp[p].subrounds = dp.subrounds;
     }
     nb::dict d;
@@ -342,8 +335,8 @@ nb::dict call_leiden_mg(
         wd[p] = data[p].data();
     }
     std::vector<Part> parts(P);
+    std::vector<ArenaGrower> growers(P);
     DriverResult out;
-    bool ok = false;
     {
         nb::gil_scoped_release release;
         PartResources res(devices);
@@ -362,6 +355,11 @@ nb::dict call_leiden_mg(
                     throw std::invalid_argument(
                         "leiden_mg: workspace too small for its layout");
                 part.L.pinned = part.pinned;
+                // blocks on the partition's device, released once its own
+                // (non-blocking) stream has finished with them
+                growers[p] = python_grower(arena_alloc, arena_free, devices[p],
+                                           res.s[p]);
+                part.L.arena.grow = &growers[p];
             }
             PeerExchange ex(devices, res.s, peer);
             const PartitionedDriver::Quantize quantize = [&](Part& part,
@@ -372,23 +370,12 @@ nb::dict call_leiden_mg(
                     in.info, part.L, dp.th, part.s);
             };
             PartitionedDriver drv(parts, ex, dp, n, bounds);
-            ok = drv.run(in, quantize, out);
+            drv.run(in, quantize, out);
             res.synchronize();
         } catch (...) {
             res.synchronize();  // no kernel may touch a returned workspace
             throw;
         }
-    }
-    if (!ok) {  // the factor each overflowed arena needs (0: no overflow)
-        nb::list f;
-        for (const Part& part : parts)
-            f.append(
-                part.L.arena.required > 0
-                    ? arena_required_factor(part.L.p, part.L.arena.required)
-                    : 0.0);
-        d["status"] = "workspace_too_small";
-        d["required_arena_factor"] = f;
-        return d;
     }
     d["status"] = "ok";
     nb::list q, k;
@@ -405,10 +392,9 @@ nb::dict call_leiden_mg(
 // partition p on devices[p] (several may share one): indptrs[p] the
 // full-length int64 offsets of its rows (other rows empty), indices[p] /
 // data[p] its entries. `check`: ingest_check of the whole graph. Without
-// workspaces the call only sizes them (one per partition); labels_out lives
-// on devices[0]; arena_factors: one per partition (see part_arena_entries).
-// Status "ok" or "workspace_too_small" with the arena factor a rerun needs
-// for each partition (0: no overflow).
+// workspaces the call only sizes them (one per partition, status "size");
+// labels_out lives on devices[0]; a run takes arena_alloc(nbytes, device) ->
+// pointer and arena_free(pointer) for the partitions' arena blocks.
 template <typename WI, typename Device>
 void register_mg_typed(nb::module_& m) {
     m.def(
@@ -423,12 +409,12 @@ void register_mg_typed(nb::module_& m) {
            std::vector<double> resolutions, std::vector<std::uint32_t> seeds,
            int n_iterations,
            optional_array<const int, Device> initial_membership,
-           std::vector<double> arena_factors) {
+           nb::object arena_alloc, nb::object arena_free) {
             return call_leiden_mg<WI, Device>(
                 indptrs, indices, data, devices,
                 std::vector<i64>(bounds.begin(), bounds.end()), use_weights,
                 check, workspaces, peer, labels_out, resolutions, seeds,
-                n_iterations, initial_membership, arena_factors);
+                n_iterations, initial_membership, arena_alloc, arena_free);
         },
         "indptrs"_a.noconvert(), nb::kw_only(), "indices"_a.noconvert(),
         "data"_a.noconvert(), "devices"_a, "bounds"_a, "use_weights"_a,
@@ -436,7 +422,7 @@ void register_mg_typed(nb::module_& m) {
         "labels_out"_a.noconvert().none() = nb::none(), "resolutions"_a,
         "seeds"_a, "n_iterations"_a,
         "initial_membership"_a.noconvert().none() = nb::none(),
-        "arena_factors"_a);
+        "arena_alloc"_a = nb::none(), "arena_free"_a = nb::none());
 }
 
 template <typename Device>

@@ -3,8 +3,8 @@
 // Workspace layout, carved from one device buffer per call: control, cub,
 // phase (Move / Refine / Aggregate / Final buffers, aliased: disjoint
 // lifetimes), persist (partitions, K_S), level0 (offsets, index / weight
-// copies, W0q, k_hat), union (replicas) and the arena (levels from the bottom,
-// the holey contraction output from the top; an overflow ends the call).
+// copies, W0q, k_hat), union (replicas) and the arena's region (cmap_0); the
+// arena grows by device blocks of the caller's allocator (LevelArena).
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <vector>
 
 #include "numerics.cuh"
 
@@ -128,8 +130,6 @@ struct LayoutParams {
     bool host_input = false;   // host arrays: level-0 device copies
     bool idx64_input = false;  // int64 indices: int32 level-0 copy
     int replicas = 1;
-    double arena_factor = 1.9;
-    i64 arena_entries = -1;  // entries the arena is sized for (-1: nnz_union)
     int subrounds = kNumSubrounds;
 
     i64 n_union() const {
@@ -137,9 +137,6 @@ struct LayoutParams {
     }
     i64 nnz_union() const {
         return static_cast<i64>(replicas) * nnz;
-    }
-    i64 arena_nnz() const {
-        return arena_entries < 0 ? nnz_union() : arena_entries;
     }
 
     void validate() const {
@@ -150,8 +147,6 @@ struct LayoutParams {
         if (n_union() >= kMaxVertices)
             throw std::invalid_argument(
                 "graph too large: replicas * n must be < 2^30");
-        if (!(arena_factor > 0.0))
-            throw std::invalid_argument("arena_factor must be > 0");
         if (subrounds < 1 || subrounds > 64)
             throw std::invalid_argument("subrounds must be in [1, 64]");
     }
@@ -379,81 +374,102 @@ struct UnionBufs {
     }
 };
 
-// Level stack + edge arena: 8 B per entry (index, weight) times arena_factor *
-// nnz_0, 24 B per vertex (offsets, k_hat, cmaps) and alignment slack.
-constexpr std::size_t kArenaEntryBytes = 8;
-constexpr std::size_t kArenaVertexBytes = 24;
-constexpr std::size_t kArenaSlack = kMaxLevels * 8 * kAlign;
-
-inline std::size_t arena_vertex_bytes(const LayoutParams& p) {
-    return kArenaVertexBytes * static_cast<std::size_t>(p.n_union()) +
-           kArenaSlack;
-}
-
+// The arena's region in the workspace: cmap_0 (written before any block).
 inline std::size_t arena_bytes(const LayoutParams& p) {
-    const double rows =
-        std::ceil(p.arena_factor * static_cast<double>(kArenaEntryBytes) *
-                  static_cast<double>(p.arena_nnz()));
-    return align_up(static_cast<std::size_t>(rows) + arena_vertex_bytes(p));
+    return align_up(sizeof(int) * static_cast<std::size_t>(p.n_union())) +
+           kAlign;
 }
 
-// The arena factor under which `needed` arena bytes fit (for the rerun).
-inline double arena_required_factor(const LayoutParams& p, std::size_t needed) {
-    const double per = static_cast<double>(kArenaEntryBytes) *
-                       static_cast<double>(p.arena_nnz());
-    if (per <= 0.0) return p.arena_factor;
-    const double f = (static_cast<double>(needed) -
-                      static_cast<double>(arena_vertex_bytes(p))) /
-                     per;
-    return std::max(f, p.arena_factor);
-}
+// Device blocks of the caller's allocator (both called with the stream's work
+// that used a freed block ordered or finished).
+struct ArenaGrower {
+    std::function<void*(std::size_t)> alloc;
+    std::function<void(void*)> free;
+};
 
-// Host bookkeeping of the arena: bump pointers from the bottom (levels, reset
-// per iteration) and the top (holey rows); a carve that does not fit returns
-// nullptr and records the demand.
+// The level stack and the holey contraction output, bump-allocated on the
+// host. A bottom carve takes the region while it fits, else a block (at
+// offsets >= cap, so marks stay comparable); the top lives in blocks of its
+// own. restore / release_top / reset free the blocks above; a reserve_* hint
+// sizes the next block for a group of carves (at least kAlign bytes: a block
+// is never empty). Every level gets exactly what it needs, whatever the graph.
 struct LevelArena {
     char* base = nullptr;
     std::size_t cap = 0;
     std::size_t bottom = 0;
-    std::size_t top = 0;
-    std::size_t required = 0;
+    const ArenaGrower* grow = nullptr;
+
+    struct Block {
+        std::size_t at, size;  // offsets [at, at + size) (top: bytes used)
+        char* p;
+    };
+    std::vector<Block> bblocks, tblocks;
+    std::size_t bnext = 0, tnext = 0;
 
     void reset() {
-        bottom = 0;
-        top = 0;
+        restore(0);
+        release_top();
     }
-    bool fits(std::size_t extra_bottom, std::size_t extra_top) const {
-        return align_up(bottom) + extra_bottom + align_up(top) + extra_top <=
-               cap;
+    void restore(std::size_t mark) {
+        bottom = mark;
+        while (!bblocks.empty() && bblocks.back().at >= mark) {
+            grow->free(bblocks.back().p);
+            bblocks.pop_back();
+        }
+    }
+    void reserve_bottom(std::size_t bytes) {
+        bnext = bytes;
+    }
+    void reserve_top(std::size_t bytes) {
+        tnext = bytes;
     }
 
     template <typename T>
     T* push_bottom(std::size_t count) {
         const std::size_t b = align_up(bottom), nb = count * sizeof(T);
-        if (b + nb + top > cap) {
-            note_overflow(b + nb + top);
-            return nullptr;
+        if (b + nb <= cap) {
+            bottom = b + nb;
+            return reinterpret_cast<T*>(base + b);
         }
-        bottom = b + nb;
-        return reinterpret_cast<T*>(base + b);
+        if (!bblocks.empty() && b >= bblocks.back().at &&
+            b + nb <= bblocks.back().at + bblocks.back().size) {
+            bottom = b + nb;
+            return reinterpret_cast<T*>(bblocks.back().p +
+                                        (b - bblocks.back().at));
+        }
+        std::size_t at = std::max(b, cap);
+        if (!bblocks.empty())
+            at =
+                std::max(at, align_up(bblocks.back().at + bblocks.back().size));
+        const std::size_t size = std::max({nb, bnext, kAlign});
+        bnext = 0;
+        bblocks.push_back({at, size, block(size)});
+        bottom = at + nb;
+        return reinterpret_cast<T*>(bblocks.back().p);
     }
 
     template <typename T>
     T* push_top(std::size_t count) {
-        const std::size_t nt = align_up(top + count * sizeof(T));
-        if (align_up(bottom) + nt > cap) {
-            note_overflow(align_up(bottom) + nt);
-            return nullptr;
+        const std::size_t nt = align_up(count * sizeof(T));
+        if (tblocks.empty() || tblocks.back().at + nt > tblocks.back().size) {
+            const std::size_t size = std::max({nt, tnext, kAlign});
+            tnext = 0;
+            tblocks.push_back({0, size, block(size)});
         }
-        top = nt;
-        return reinterpret_cast<T*>(base + cap - nt);
+        Block& t = tblocks.back();
+        t.at += nt;
+        return reinterpret_cast<T*>(t.p + t.at - nt);
     }
     void release_top() {
-        top = 0;
+        for (const Block& t : tblocks) grow->free(t.p);
+        tblocks.clear();
     }
 
-    void note_overflow(std::size_t need) {
-        required = std::max(required, need);
+   private:
+    char* block(std::size_t size) {
+        if (!grow)
+            throw std::logic_error("leiden: the arena needs an allocator");
+        return static_cast<char*>(grow->alloc(size));
     }
 };
 

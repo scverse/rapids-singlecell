@@ -250,14 +250,6 @@ __global__ void drv_set_i64_kernel(i64* p, i64 v) {
     *p = v;
 }
 
-// Entries the arena of partition p (nnz_p of all nnz entries) is sized for,
-// times its arena factor. The root also holds levels >= 1: all of them. Any
-// other partition contracts its rows (A1) and merges the partial rows of its
-// 1/P of the coarse rows (A2 - A4), whatever its own share: at least nnz / P.
-inline i64 part_arena_entries(int p, int P, i64 nnz_p, i64 nnz) {
-    return p == 0 ? nnz : std::max(nnz_p, (nnz + P - 1) / P);
-}
-
 // One partition: its rows, workspace, stream and level-0 state.
 struct Part {
     int global = 0;  // partition index (0: root)
@@ -304,8 +296,8 @@ class PartitionedDriver {
         }
     }
 
-    // Every resolution; false if an arena overflowed (status in the parts).
-    bool run(const DriverInput& in, const Quantize& quantize,
+    // Every resolution.
+    void run(const DriverInput& in, const Quantize& quantize,
              DriverResult& out) {
         int s_prev = INT_MIN;
         for (std::size_t i = 0; i < in.gammas.size(); ++i) {
@@ -328,13 +320,11 @@ class PartitionedDriver {
                         labels, n_);
                     CUDA_CHECK_LAST_ERROR(drv_iota_kernel);
                 }
-            } else if (!run_resolution(gamma, in.seeds[i], in.init, labels,
-                                       r)) {
-                return false;
+            } else {
+                run_resolution(gamma, in.seeds[i], in.init, labels, r);
             }
             out.res.push_back(std::move(r));
         }
-        return true;
     }
 
    private:
@@ -391,12 +381,6 @@ class PartitionedDriver {
         i64 t = 0;
         for (i64 x : all_values(f)) t += x;
         return t;
-    }
-    // true on every partition iff ok holds on every partition
-    template <typename F>
-    bool all_ok(F&& ok) {
-        return sum_values([&](Part& p) { return ok(p) ? i64{0} : i64{1}; }) ==
-               0;
     }
     // the root's host value on every partition
     i64 from_root(i64 v) {
@@ -456,7 +440,7 @@ class PartitionedDriver {
         if (root_) root_drv_->set_level0(root_->q, n_, root_->nnz);
     }
 
-    bool run_resolution(double gamma, u32 seed, const int* init,
+    void run_resolution(double gamma, u32 seed, const int* init,
                         int* labels_out, ResolutionResult& out) {
         lam_ = gamma / static_cast<double>(parts_[0].q.two_m_hat);
         gamma_ = gamma;
@@ -495,7 +479,7 @@ class PartitionedDriver {
             const bool vcycle = V > 0 && (!final || T == 1 || dp_.vcycle_last);
             IterationStat stat;
             i64 Cb = 0;
-            if (!iteration(C, it, vcycle, stat, Cb)) return false;
+            iteration(C, it, vcycle, stat, Cb);
             C = cc_split([](Part& p) { return p.L.persist.P0; });
             stat.cc_pieces = C - Cb;
             ++it;
@@ -517,12 +501,11 @@ class PartitionedDriver {
             read(*root_);
         }
         out.n_clusters = C;
-        return true;
     }
 
-    // One iteration (its level 0 partitioned, levels >= 1 on the root); false
-    // on arena overflow. C_out: communities before the CC split.
-    bool iteration(i64 id_bound, int it, bool vcycle, IterationStat& stat,
+    // One iteration (its level 0 partitioned, levels >= 1 on the root);
+    // C_out: communities before the CC split.
+    void iteration(i64 id_bound, int it, bool vcycle, IterationStat& stat,
                    i64& C_out) {
         each([](Part& p) { p.L.arena.reset(); });
         const u32 uit = static_cast<u32>(it);
@@ -552,12 +535,12 @@ class PartitionedDriver {
                 ++stat.levels;
                 break;
             }
-            if (!push_cmap0()) return false;  // refinement (C is known)
+            push_cmap0();  // refinement (C is known)
             const i64 n_next = refine(C, uit);
             i64 n1 = n_next;
             step = level_step(phase, C, n_, n_next, -1, reentry, 0, dp_);
             if (step == LevelStep::kReenterTop || step == LevelStep::kPieces) {
-                each([](Part& p) { p.L.arena.bottom = p.mark; });
+                each([](Part& p) { p.L.arena.restore(p.mark); });
                 if (step == LevelStep::kReenterTop) {
                     ++reentry;
                     stat.reentries += 1;
@@ -566,7 +549,7 @@ class PartitionedDriver {
                 }
                 stat.fallbacks += 1;
                 stat.uncertified = true;
-                if (!push_cmap0()) return false;
+                push_cmap0();
                 each([&](Part& p) {
                     cuda_check(cudaMemcpyAsync(p.cmap0, p.L.persist.P0,
                                                n_ * sizeof(int),
@@ -583,7 +566,7 @@ class PartitionedDriver {
                                             n_ * sizeof(int),
                                             cudaMemcpyDeviceToDevice, p.s),
                             "leiden: fallback partition");
-                        p.L.arena.bottom = p.mark;
+                        p.L.arena.restore(p.mark);
                     });
                     idb = n_;
                     ++stat.levels;
@@ -596,23 +579,19 @@ class PartitionedDriver {
                 n1 = pieces;
             }
             LevelGraph g1;
-            if (!aggregate(n1, g1)) return false;
+            aggregate(n1, g1);
             ++stat.levels;
             i64 Ccur = idb;
             bool up_moved = false;
-            int ok = 1;
             if (step == LevelStep::kAggregateStop) {
                 ++stat.levels;
             } else if (root_) {  // levels >= 1, projected down to level 1
                 use(*root_);
                 LevelGraph g0 = root_->g0;
                 g0.cmap = root_->cmap0;
-                ok = root_drv_->upper_levels(g0, g1, idb, it, vcycle, stat,
-                                             Ccur, up_moved)
-                         ? 1
-                         : 0;
+                root_drv_->upper_levels(g0, g1, idb, it, vcycle, stat, Ccur,
+                                        up_moved);
             }
-            if (!from_root(ok)) return false;
             Ccur = from_root(Ccur);
             moved = from_root(up_moved ? 1 : 0) != 0 || moved;
             // projection to level 0 and its V-cycle UP sweeps
@@ -630,19 +609,17 @@ class PartitionedDriver {
             }
             stat.moved = moved;
             C_out = Ccur;
-            return true;
+            return;
         }
         stat.moved = moved;  // the level loop ended at level 0
         C_out = idb;
-        return true;
     }
 
-    bool push_cmap0() {
+    void push_cmap0() {
         each([&](Part& p) {
             p.mark = p.L.arena.bottom;
             p.cmap0 = p.L.arena.push_bottom<int>(static_cast<std::size_t>(n_));
         });
-        return all_ok([](Part& p) { return p.cmap0 != nullptr; });
     }
 
     // LOCAL_MOVE + COMPACT of level 0: one host loop over the sweeps and
@@ -861,9 +838,8 @@ class PartitionedDriver {
     // A1 partial rows (exact int64 sums) of every partition's rows, A2 coarse
     // row ranges, A3 the partials of each range to its owner, A4 the owner's
     // merge (the contraction of the interleaved partials by the identity: one
-    // fp32 rounding of each exact sum), A5 the merged rows to the root. False
-    // on arena overflow (every partition).
-    bool aggregate(i64 n1, LevelGraph& g1) {
+    // fp32 rounding of each exact sum), A5 the merged rows to the root.
+    void aggregate(i64 n1, LevelGraph& g1) {
         const int P = ex_.parts();
         const std::size_t P1 = static_cast<std::size_t>(P) + 1;
         AggregateOptions opt;
@@ -877,8 +853,8 @@ class PartitionedDriver {
                 AggregatePlan<i64> plan = aggregate_begin<KW, i64>(
                     p.g0.indptr, p.g0.indices, w, p.g0.khat, n_, p.nnz, p.cmap0,
                     opt, ab, p.L.arena, p.L.cub, p.L.cub_bytes, p.L.ctl, p.s);
-                p.pw = plan.holey ? plan.h_w : nullptr;
-                p.pidx = plan.holey ? plan.h_idx : nullptr;
+                p.pw = plan.h_w;
+                p.pidx = plan.h_idx;
             });
             part_ranges_kernel<<<1, 1, 0, p.s>>>(ab.member_start, p.L.ctl, n_,
                                                  P, ab.indptr_next,
@@ -893,15 +869,16 @@ class PartitionedDriver {
             p.e = read(p).nnz_next;
             std::copy(rv[i].begin(), rv[i].end(), p.ranges);
         }
-        if (!all_ok([](Part& p) { return p.pidx != nullptr; })) return false;
         std::vector<i64> C(parts_[0].ranges, parts_[0].ranges + P1);
         // the holey partial rows, dense at the arena bottom
         each([&](Part& p) {
             const int* h_idx = p.pidx;
             const i64* h_w = p.pw;
-            p.pidx = p.L.arena.push_bottom<int>(static_cast<std::size_t>(p.e));
-            p.pw = p.L.arena.push_bottom<i64>(static_cast<std::size_t>(p.e));
-            if (!p.pidx || !p.pw) return;
+            const std::size_t e = static_cast<std::size_t>(p.e);
+            p.L.arena.reserve_bottom(align_up(4 * e) + align_up(8 * e));
+            p.pidx = p.L.arena.push_bottom<int>(e);
+            p.pw = p.L.arena.push_bottom<i64>(e);
+            p.L.arena.reserve_bottom(0);
             const AggregateBufs& ab = p.L.aggregate;
             if (n1 > 0) {
                 agg_compact_kernel<i64><<<grid_rows(n1), kBlock, 0, p.s>>>(
@@ -911,7 +888,6 @@ class PartitionedDriver {
             }
             p.L.arena.release_top();
         });
-        if (!all_ok([](Part& p) { return p.pidx && p.pw; })) return false;
         // A3: E[p P + q] = entries of partition p's rows in range q
         std::vector<i64> mine, E(static_cast<std::size_t>(P) * P);
         for (Part& p : parts_)
@@ -927,13 +903,15 @@ class PartitionedDriver {
         each([&](Part& p) {
             const int q = p.global;
             const i64 len = C[q + 1] - C[q], tot = got(q);
-            p.roff = p.L.arena.push_top<i64>(static_cast<std::size_t>(P) *
-                                             (len + 1));
-            p.ridx = p.L.arena.push_top<int>(static_cast<std::size_t>(tot));
-            p.rw = p.L.arena.push_top<i64>(static_cast<std::size_t>(tot));
+            const std::size_t no = static_cast<std::size_t>(P) * (len + 1),
+                              nt = static_cast<std::size_t>(tot);
+            p.L.arena.reserve_top(align_up(8 * no) + align_up(4 * nt) +
+                                  align_up(8 * nt));
+            p.roff = p.L.arena.push_top<i64>(no);
+            p.ridx = p.L.arena.push_top<int>(nt);
+            p.rw = p.L.arena.push_top<i64>(nt);
+            p.L.arena.reserve_top(0);
         });
-        if (!all_ok([](Part& p) { return p.roff && p.ridx && p.rw; }))
-            return false;
         for (int q = 0; q < P; ++q) {
             const i64 len = C[q + 1] - C[q];
             std::vector<i64> n_off(static_cast<std::size_t>(P), len + 1), n_e;
@@ -962,19 +940,19 @@ class PartitionedDriver {
         for (std::size_t i = 0; i < parts_.size(); ++i) {
             Part& p = parts_[i];
             const std::size_t tot = static_cast<std::size_t>(got(p.global));
+            const std::size_t m = static_cast<std::size_t>(n1);
             LevelArena& a = p.L.arena;
-            a.bottom = p.base;
-            aux_ip[i] = a.push_bottom<i64>(static_cast<std::size_t>(n1) + 1);
+            a.restore(p.base);
+            a.reserve_bottom(align_up(8 * (m + 1)) + align_up(4 * tot) +
+                             align_up(8 * tot) + align_up(4 * m) +
+                             align_up(8 * m));
+            aux_ip[i] = a.push_bottom<i64>(m + 1);
             aux_idx[i] = a.push_bottom<int>(tot);
             aux_w[i] = a.push_bottom<i64>(tot);
-            iota[i] = a.push_bottom<int>(static_cast<std::size_t>(n1));
-            aux_kh[i] = a.push_bottom<i64>(static_cast<std::size_t>(n1));
-            p.fidx =
-                (aux_ip[i] && aux_idx[i] && aux_w[i] && iota[i] && aux_kh[i])
-                    ? aux_idx[i]
-                    : nullptr;
+            iota[i] = a.push_bottom<int>(m);
+            aux_kh[i] = a.push_bottom<i64>(m);
+            a.reserve_bottom(0);
         }
-        if (!all_ok([](Part& p) { return p.fidx != nullptr; })) return false;
         std::vector<AggregatePlan<float>> plans(parts_.size());
         for (std::size_t i = 0; i < parts_.size(); ++i) {
             Part& p = parts_[i];
@@ -1010,8 +988,7 @@ class PartitionedDriver {
                 p.L.cub_bytes, p.L.ctl, p.s);
         }
         for (std::size_t i = 0; i < parts_.size(); ++i)
-            parts_[i].f = plans[i].holey ? read(parts_[i]).nnz_next : -1;
-        if (!all_ok([](Part& p) { return p.f >= 0; })) return false;
+            parts_[i].f = read(parts_[i]).nnz_next;
         // A5: the merged rows to the root, straight into level 1 there
         const std::vector<i64> F = all_values([](Part& p) { return p.f; });
         i64 nnz1 = 0;
@@ -1022,24 +999,27 @@ class PartitionedDriver {
         for (std::size_t i = 0; i < parts_.size(); ++i) {
             Part& p = parts_[i];
             LevelArena& a = p.L.arena;
-            a.bottom = p.base;  // the aux rows are merged
-            if (p.global == 0) {
-                lv.indptr =
-                    a.push_bottom<i64>(static_cast<std::size_t>(n1) + 1);
-                lv.khat = a.push_bottom<i64>(static_cast<std::size_t>(n1));
-                lv.indices = a.push_bottom<int>(static_cast<std::size_t>(nnz1));
-                lv.weights =
-                    a.push_bottom<float>(static_cast<std::size_t>(nnz1));
-                const bool ok =
-                    lv.indptr && lv.khat && lv.indices && lv.weights;
-                p.fidx = ok ? lv.indices : nullptr;
-                p.fw = ok ? lv.weights : nullptr;
+            a.restore(p.base);  // the aux rows are merged
+            const std::size_t m = static_cast<std::size_t>(n1);
+            if (p.global == 0) {  // level 1, with room for its cmap
+                const std::size_t e = static_cast<std::size_t>(nnz1);
+                a.reserve_bottom(align_up(8 * (m + 1)) + align_up(8 * m) +
+                                 2 * align_up(4 * e) + align_up(4 * m) +
+                                 kAlign);
+                lv.indptr = a.push_bottom<i64>(m + 1);
+                lv.khat = a.push_bottom<i64>(m);
+                lv.indices = a.push_bottom<int>(e);
+                lv.weights = a.push_bottom<float>(e);
+                p.fidx = lv.indices;
+                p.fw = lv.weights;
             } else {
-                p.fidx = a.push_bottom<int>(static_cast<std::size_t>(p.f));
-                p.fw = a.push_bottom<float>(static_cast<std::size_t>(p.f));
+                const std::size_t f = static_cast<std::size_t>(p.f);
+                a.reserve_bottom(2 * align_up(4 * f));
+                p.fidx = a.push_bottom<int>(f);
+                p.fw = a.push_bottom<float>(f);
             }
+            a.reserve_bottom(0);
         }
-        if (!all_ok([](Part& p) { return p.fidx && p.fw; })) return false;
         for (std::size_t i = 0; i < parts_.size(); ++i) {
             Part& p = parts_[i];
             use(p);
@@ -1065,8 +1045,8 @@ class PartitionedDriver {
         ex_.gatherv(0, s_idx.data(), sizeof(int), F.data(), lv.indices);
         ex_.gatherv(0, s_w.data(), sizeof(float), F.data(), lv.weights);
         for (Part& p : parts_)
-            if (p.global != 0) p.L.arena.bottom = p.base;
-        if (!root_) return true;
+            if (p.global != 0) p.L.arena.restore(p.base);
+        if (!root_) return;
         // root: indptr_1, k_hat_1 (A1's khat_next), the classes, P_1
         Part& r = *root_;
         use(r);
@@ -1098,7 +1078,6 @@ class PartitionedDriver {
         g1.nnz = nnz1;
         for (int k = 0; k < kNumClasses; ++k)
             g1.cls[k] = c.coarse_class_count[k];
-        return true;
     }
 
     // CC_SPLIT of the partition arr(p) (replicated): each partition's forest of

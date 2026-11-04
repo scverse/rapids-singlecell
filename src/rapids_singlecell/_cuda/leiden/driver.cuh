@@ -70,7 +70,7 @@ inline bool until_stable_done(bool moved, double q, double q_prev, int it,
     return !moved || q - q_prev < kDeltaQStop || it + 1 >= max_it;
 }
 
-// Knobs of one call (the shipped binding sets n_iterations and arena_factor).
+// Knobs of one call (the shipped binding sets n_iterations).
 struct DriverParams {
     int n_iterations = 2;  // >= 1, or -1 (Python maps > 20 to -1)
     int move_sweeps = 4;   // DOWN cap
@@ -83,7 +83,6 @@ struct DriverParams {
     int max_iter_until_stable = 20;
     int max_replicas = kMaxReplicas;
     i64 replica_nnz_budget = 1ll << 19;
-    double arena_factor = 1.9;
     int graph_mode = 2;  // 0: launches, 1: sweep graph replays, 2: WHILE node
     ClassThresholds th{};
     GatherClasses gather{};
@@ -217,7 +216,6 @@ struct ResolutionResult {
 
 struct DriverResult {
     std::string status = "ok";
-    double required_arena_factor = 0.0;
     std::size_t required_bytes = 0;
     std::vector<ResolutionResult> res;
 };
@@ -272,8 +270,8 @@ class LeidenDriver {
         s64_ = seed64(seed);
     }
 
-    // One resolution; false if the arena overflowed.
-    bool run_resolution(double gamma, u32 seed, const int* init, int R,
+    // One resolution.
+    void run_resolution(double gamma, u32 seed, const int* init, int R,
                         int* labels_out, ResolutionResult& out) {
         const i64 n = n_;
         const i64 two_m = q_.two_m_hat;
@@ -281,7 +279,7 @@ class LeidenDriver {
             out.n_clusters = n;
             drv_iota_kernel<<<grid_items(n), kBlock, 0, s_>>>(labels_out, n);
             CUDA_CHECK_LAST_ERROR(drv_iota_kernel);
-            return true;
+            return;
         }
         set_resolution(gamma, seed);
         int* P0 = L_.persist.P0;
@@ -309,8 +307,7 @@ class LeidenDriver {
                 CUDA_CHECK_LAST_ERROR(drv_replicate_partition_kernel);
                 const LevelGraph gu = union_level(R);
                 i64 Cb = 0;
-                if (!leiden_iteration(gu, P0, gu.n, it, vcycle, stat, Cb))
-                    return false;
+                leiden_iteration(gu, P0, gu.n, it, vcycle, stat, Cb);
                 const i64 Cu = cc_split(gu, P0);  // union ranks [0, Cu)
                 stat.cc_pieces = Cu - Cb;
                 // Q_r of each replica with one copy's 2m_hat
@@ -325,8 +322,7 @@ class LeidenDriver {
                 C = compact_slice(P0 + static_cast<i64>(best) * n, n, Cu, P0);
             } else {
                 i64 Cb = 0;
-                if (!leiden_iteration(g0_, P0, C, it, vcycle, stat, Cb))
-                    return false;
+                leiden_iteration(g0_, P0, C, it, vcycle, stat, Cb);
                 C = cc_split(g0_, P0);
                 stat.cc_pieces = C - Cb;
             }
@@ -346,7 +342,6 @@ class LeidenDriver {
         const Control c = readback();
         out.modularity = c.q[0];
         out.n_clusters = C;
-        return true;
     }
 
    private:
@@ -502,9 +497,9 @@ class LeidenDriver {
         return readback().n_components;
     }
 
-    // One iteration on the level-0 graph g0 with partition P0 (ids < id_bound).
-    // False on arena overflow; C_out: communities before the CC split.
-    bool leiden_iteration(const LevelGraph& g0, int* P0, i64 id_bound, int it,
+    // One iteration on the level-0 graph g0 with partition P0 (ids < id_bound);
+    // C_out: communities before the CC split.
+    void leiden_iteration(const LevelGraph& g0, int* P0, i64 id_bound, int it,
                           bool vcycle, IterationStat& stat, i64& C_out) {
         L_.arena.reset();
         std::vector<LevelGraph> G;
@@ -514,20 +509,19 @@ class LeidenDriver {
         bool moved = false;
         int lvl = 0;
         i64 idb = id_bound;
-        if (!level_loop(G, lvl, idb, uit, moved, stat)) return false;
+        level_loop(G, lvl, idb, uit, moved, stat);
         i64 Ccur = idb;
         project(G, lvl, 0, vcycle, uit, Ccur, moved);
         stat.moved = moved;
         C_out = Ccur;
-        return true;
     }
 
    public:
     // Levels >= 1 of an iteration whose level 0 ran partitioned: the level
     // loop from level 1 (G = {g0, g1}, g0.cmap = its cmap, P_1 in
     // level_partition(1), the arena holding both) and the projection down to
-    // level 1. False on arena overflow.
-    bool upper_levels(const LevelGraph& g0, const LevelGraph& g1, i64 idb,
+    // level 1.
+    void upper_levels(const LevelGraph& g0, const LevelGraph& g1, i64 idb,
                       int it, bool vcycle, IterationStat& stat, i64& Ccur,
                       bool& moved) {
         std::vector<LevelGraph> G;
@@ -536,16 +530,14 @@ class LeidenDriver {
         G.push_back(g1);
         const u32 uit = static_cast<u32>(it);
         int lvl = 1;
-        if (!level_loop(G, lvl, idb, uit, moved, stat)) return false;
+        level_loop(G, lvl, idb, uit, moved, stat);
         Ccur = idb;
         project(G, lvl, 1, vcycle, uit, Ccur, moved);
-        return true;
     }
 
    private:
-    // The levels from G[lvl] up (lvl, idb: the last level and its id bound);
-    // false on arena overflow.
-    bool level_loop(std::vector<LevelGraph>& G, int& lvl, i64& idb, u32 uit,
+    // The levels from G[lvl] up (lvl, idb: the last level and its id bound).
+    void level_loop(std::vector<LevelGraph>& G, int& lvl, i64& idb, u32 uit,
                     bool& moved, IterationStat& stat) {
         LevelArena& arena = L_.arena;
         u32 phase = kPhaseDown;
@@ -605,7 +597,7 @@ class LeidenDriver {
                 step == LevelStep::kCertified) {
                 if (cmap) {  // drop the speculative refinement / level
                     arena.release_top();
-                    arena.bottom = mark;
+                    arena.restore(mark);
                 }
                 if (step == LevelStep::kVerifyTop) {  // all-active verification
                     phase = kPhaseTop;
@@ -616,7 +608,6 @@ class LeidenDriver {
             }
             if (step == LevelStep::kRefine) {  // not launched: launch it now
                 cmap = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
-                if (!cmap) return false;  // the arena cannot hold this level
                 launch_refine_begin(g, P, lvl, uit, cmap, opt, plan);
                 c = readback();  // SL2
                 step =
@@ -624,7 +615,7 @@ class LeidenDriver {
             }
             if (step == LevelStep::kReenterTop || step == LevelStep::kPieces) {
                 arena.release_top();
-                arena.bottom = mark;  // drop the speculative level
+                arena.restore(mark);  // drop the speculative level
                 if (step == LevelStep::kReenterTop) {
                     ++reentry;
                     stat.reentries += 1;
@@ -634,7 +625,6 @@ class LeidenDriver {
                 stat.fallbacks += 1;
                 stat.uncertified = true;
                 cmap = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
-                if (!cmap) return false;
                 cuda_check(cudaMemcpyAsync(cmap, P, g.n * sizeof(int),
                                            cudaMemcpyDeviceToDevice, s_),
                            "leiden: fallback pieces");
@@ -645,7 +635,7 @@ class LeidenDriver {
                     cuda_check(cudaMemcpyAsync(P, cmap, g.n * sizeof(int),
                                                cudaMemcpyDeviceToDevice, s_),
                                "leiden: fallback partition");
-                    arena.bottom = mark;
+                    arena.restore(mark);
                     idb = g.n;
                     ++stat.levels;
                     break;
@@ -662,7 +652,6 @@ class LeidenDriver {
             const CoarseLevel lv = aggregate_finish(
                 g.n, cmap, plan, c.n_next, c.nnz_next, L_.aggregate, arena, P,
                 level_partition(lvl + 1), s_);
-            if (!lv.ok) return false;
             g.cmap = cmap;
             ++stat.levels;
             LevelGraph ng;
@@ -684,7 +673,6 @@ class LeidenDriver {
                 break;
             }
         }
-        return true;
     }
 
     // Projection from level lvl down to level lp_end, with the V-cycle's UP
@@ -722,6 +710,7 @@ struct DriverInput {
     void* workspace = nullptr;  // null: size the workspace only
     std::size_t workspace_bytes = 0;
     void* pinned = nullptr;
+    const ArenaGrower* grow = nullptr;  // arena blocks (a run needs them)
 };
 
 // The layout follows from the input; a call without a workspace sizes it.
@@ -740,16 +729,15 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
     const int R = n_replicas(in.info.n_counted, in.n, dp.max_replicas,
                              dp.replica_nnz_budget);
     p.replicas = R;
-    p.arena_factor = dp.arena_factor;
     p.subrounds = dp.subrounds;
     Layout L = make_layout(p, in.workspace);
     out.required_bytes = L.total;
-    out.required_arena_factor = dp.arena_factor;
     if (L.total > in.workspace_bytes) {
         out.status = "workspace_too_small";
         return out;
     }
     L.pinned = in.pinned;
+    L.arena.grow = in.grow;
     LeidenDriver drv(L, dp, s);
     int s_prev = INT_MIN;
     for (std::size_t i = 0; i < in.gammas.size(); ++i) {
@@ -769,12 +757,7 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
             drv.set_level0(quantize(gamma, L), in.n, in.nnz);
             s_prev = sg;
         }
-        if (!drv.run_resolution(gamma, in.seeds[i], in.init, R, labels, r)) {
-            out.status = "workspace_too_small";
-            out.required_arena_factor =
-                arena_required_factor(p, L.arena.required);
-            return out;
-        }
+        drv.run_resolution(gamma, in.seeds[i], in.init, R, labels, r);
         out.res.push_back(std::move(r));
     }
     return out;
@@ -782,6 +765,39 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
 
 template <typename T, typename Device>
 using optional_array = std::optional<gpu_array_c<T, Device>>;
+
+// Arena blocks from Python: alloc(nbytes, device) -> pointer, free(pointer),
+// called with the GIL. `sync`: a stream to finish before a block goes back
+// (the multi-GPU driver's own streams; null: the caller's stream, which the
+// allocator orders).
+inline ArenaGrower python_grower(const nb::object& alloc,
+                                 const nb::object& free, int device,
+                                 cudaStream_t sync = nullptr) {
+    ArenaGrower g;
+    g.alloc = [&alloc, device](std::size_t bytes) -> void* {
+        nb::gil_scoped_acquire gil;
+        try {
+            return reinterpret_cast<void*>(
+                nb::cast<std::uintptr_t>(alloc(bytes, device)));
+        } catch (nb::python_error& e) {
+            if (e.matches(PyExc_MemoryError)) throw std::bad_alloc();
+            throw std::runtime_error(std::string("leiden: arena_alloc: ") +
+                                     e.what());
+        }
+    };
+    g.free = [&free, sync](void* p) {
+        if (sync)
+            cuda_check(cudaStreamSynchronize(sync), "leiden: arena release");
+        nb::gil_scoped_acquire gil;
+        try {
+            free(reinterpret_cast<std::uintptr_t>(p));
+        } catch (nb::python_error& e) {
+            throw std::runtime_error(std::string("leiden: arena_free: ") +
+                                     e.what());
+        }
+    };
+    return g;
+}
 
 inline int check_max_replicas(int r) {
     if (r < 1 || r > kMaxReplicas)
@@ -802,7 +818,9 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
                          const std::vector<double>& resolutions,
                          const std::vector<std::uint32_t>& seeds,
                          const optional_array<const int, Device>& init,
-                         const DriverParams& dp, std::uintptr_t stream) {
+                         const DriverParams& dp, std::uintptr_t stream,
+                         const nb::object& arena_alloc,
+                         const nb::object& arena_free) {
     if (indptr.ndim() != 1 || indptr.size() < 1)
         throw std::invalid_argument("indptr must be 1-D with n + 1 entries");
     const i64 n = static_cast<i64>(indptr.size()) - 1;
@@ -830,8 +848,6 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
           (dp.n_iterations >= 1 && dp.n_iterations < (1 << 16))))
         throw std::invalid_argument(
             "n_iterations must be a positive integer or -1");
-    if (!(dp.arena_factor > 0.0))
-        throw std::invalid_argument("arena_factor must be > 0");
     DriverInput in;
     in.n = n;
     in.nnz = nnz;
@@ -844,6 +860,12 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
     in.workspace = workspace ? workspace->data() : nullptr;
     in.workspace_bytes = workspace ? workspace->size() : 0;
     in.pinned = reinterpret_cast<void*>(pinned);
+    if (workspace && (arena_alloc.is_none() || arena_free.is_none()))
+        throw std::invalid_argument("a run needs arena_alloc and arena_free");
+    int device = 0;
+    cuda_check(cudaGetDevice(&device), "leiden: cudaGetDevice");
+    const ArenaGrower grower = python_grower(arena_alloc, arena_free, device);
+    in.grow = &grower;
     const IP* ip = indptr.data();
     const IX* ix = indices.data();
     const WI* wd = data.data();
@@ -867,7 +889,6 @@ inline nb::dict result_dict(const DriverResult& r) {
     d["status"] = r.status;
     if (r.status != "ok") {
         d["required_bytes"] = r.required_bytes;
-        d["required_arena_factor"] = r.required_arena_factor;
         return d;
     }
     nb::list q, k;
@@ -882,7 +903,8 @@ inline nb::dict result_dict(const DriverResult& r) {
 
 // Every resolution of the call. `check`: ingest_check's result for exactly
 // these arrays; `labels_out`: (len(resolutions), n) int32. Without `workspace`
-// the call only sizes it. Status "ok" or "workspace_too_small" (arena).
+// the call only sizes it (status "workspace_too_small", required_bytes); a
+// run takes arena_alloc(nbytes, device) -> pointer and arena_free(pointer).
 template <typename IP, typename IX, typename WI, typename InDevice,
           typename Device>
 void register_driver_typed(nb::module_& m) {
@@ -896,15 +918,15 @@ void register_driver_typed(nb::module_& m) {
            std::vector<double> resolutions, std::vector<std::uint32_t> seeds,
            int n_iterations,
            optional_array<const int, Device> initial_membership,
-           double arena_factor, int max_replicas, std::uintptr_t stream) {
+           int max_replicas, std::uintptr_t stream, nb::object arena_alloc,
+           nb::object arena_free) {
             DriverParams dp;
             dp.n_iterations = n_iterations;
-            dp.arena_factor = arena_factor;
             dp.max_replicas = check_max_replicas(max_replicas);
             return result_dict(call_leiden<IP, IX, WI, InDevice, Device>(
                 indptr, indices, data, use_weights, check, workspace, pinned,
-                labels_out, resolutions, seeds, initial_membership, dp,
-                stream));
+                labels_out, resolutions, seeds, initial_membership, dp, stream,
+                arena_alloc, arena_free));
         },
         "indptr"_a.noconvert(), nb::kw_only(), "indices"_a.noconvert(),
         "data"_a.noconvert(), "use_weights"_a, "check"_a,
@@ -912,8 +934,8 @@ void register_driver_typed(nb::module_& m) {
         "labels_out"_a.noconvert().none() = nb::none(), "resolutions"_a,
         "seeds"_a, "n_iterations"_a,
         "initial_membership"_a.noconvert().none() = nb::none(),
-        "arena_factor"_a = 1.9, "max_replicas"_a = kMaxReplicas,
-        "stream"_a = 0);
+        "max_replicas"_a = kMaxReplicas, "stream"_a = 0,
+        "arena_alloc"_a = nb::none(), "arena_free"_a = nb::none());
 }
 
 template <typename InDevice, typename Device>

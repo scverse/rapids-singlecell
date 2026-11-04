@@ -718,9 +718,9 @@ def test_resolution_list_equals_single_calls():
 
 @needs_native
 def test_cross_call_workspace(monkeypatch):
-    """Results never depend on workspace contents: a fresh workspace filled
-    with garbage, and the workspace of another graph's call, give the bits of
-    a fresh call; so does a workspace too small for the levels (rerun)."""
+    """Results never depend on memory contents: a fresh workspace and arena
+    blocks filled with garbage, and the workspace of another graph's call,
+    give the bits of a fresh call."""
     a, b = _graph("pbmc3k"), _graph("sbm")
     expected = native(a, [0.5, 1.0, 2.0])
     native(b, [0.5, 1.0])
@@ -735,16 +735,13 @@ def test_cross_call_workspace(monkeypatch):
     _leiden._WORKSPACE_CACHE.clear()
     monkeypatch.setattr(cp, "empty", dirty)
     assert_same(native(a, [0.5, 1.0, 2.0]), expected)
-    monkeypatch.setattr(cp, "empty", empty)
-    monkeypatch.setattr(_leiden, "_ARENA_FACTOR", 0.05)
-    assert_same(native(a, [0.5, 1.0, 2.0]), expected)
 
 
 @needs_native
 def test_workspace_cache(monkeypatch):
-    """Under rsc's default allocator (no pool) a call leaves its buffer, up to
-    the cap, to the next call, which reuses it if large enough. A rerun frees
-    the buffer before it allocates a larger one."""
+    """Under rsc's default allocator (no pool) a call leaves its workspace, up
+    to the cap, to the next call, which reuses it if large enough; no arena
+    block outlives its call."""
     if not _leiden._workspace_cache_applies():
         pytest.skip("the session's allocator pools")
     with cp.cuda.using_allocator(cp.get_default_memory_pool().malloc):
@@ -770,18 +767,10 @@ def test_workspace_cache(monkeypatch):
     cache.clear()
     with cp.cuda.using_allocator(malloc):
         expected = native(a)
-        cached = cache[device].nbytes
-        allocs.clear()
+        cached = cache[device].data.ptr
         assert_same(native(a), expected)
         native(_graph("sbm"))
-        assert not [s for s, _ in allocs if s >= large]  # no new workspace
-        assert cache[device].nbytes == cached
-        monkeypatch.setattr(_leiden, "_ARENA_FACTOR", 0.05)
-        allocs.clear()
-        assert_same(native(a), expected)  # reruns
-        reruns = [(s, total) for s, total in allocs if s >= large]
-        assert len(reruns) >= 2
-        assert all(s == total for s, total in reruns)  # one workspace at a time
+        assert cache[device].data.ptr == cached  # reused, not reallocated
         monkeypatch.setattr(_leiden, "_WORKSPACE_CACHE_BYTES", 1 << 16)
         native(a)
         assert device not in cache
@@ -789,29 +778,40 @@ def test_workspace_cache(monkeypatch):
 
 
 @needs_native
-def test_workspace_shrinks_to_fit(monkeypatch):
-    """An arena that cannot be allocated shrinks to the free memory, with the
-    same bits, unless that is below what a level needs."""
-    a, sizes, budget = _graph("pbmc3k"), [], []
-    allocate = _leiden._allocate_workspace
+def test_arena_blocks(monkeypatch):
+    """The coarser levels live in blocks of the current allocator, freed as
+    they end; a block that cannot be allocated raises MemoryError and leaves
+    no block behind."""
+    a, live, sizes = _graph("pbmc68k"), {}, []
+    alloc, free = _leiden._ArenaBlocks.alloc, _leiden._ArenaBlocks.free
 
-    def limited(nbytes, shape, kind=None):
+    def tracked(self, nbytes, device):
+        ptr = alloc(self, nbytes, device)
+        live[ptr] = nbytes
         sizes.append(nbytes)
-        if budget and nbytes + 4 * shape[0] * shape[1] > budget[0]:
-            raise MemoryError("limited")
-        return allocate(nbytes, shape, kind)
+        return ptr
 
-    monkeypatch.setattr(_leiden, "_allocate_workspace", limited)
-    monkeypatch.setattr(_leiden, "_free_bytes", lambda device=None: budget[0])
-    expected = native(a)
-    full = sizes[0]
-    budget.append(int(0.8 * full))
+    def untracked(self, ptr):
+        live.pop(ptr)
+        free(self, ptr)
+
+    expected = native(a, [0.5, 1.0])
+    monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", tracked)
+    monkeypatch.setattr(_leiden._ArenaBlocks, "free", untracked)
+    assert_same(native(a, [0.5, 1.0]), expected)
+    assert len(sizes) > 2  # at least a level and its contraction's rows
+
+    def failing(self, nbytes, device):
+        if len(sizes) >= 3:
+            raise MemoryError("test")
+        return tracked(self, nbytes, device)
+
     sizes.clear()
-    assert_same(native(a), expected)
-    assert sizes[0] == full > budget[0] >= sizes[-1]
-    budget[0] = int(0.3 * full)
-    with pytest.raises(MemoryError, match="Out of GPU memory"):
-        native(a)
+    monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", failing)
+    with pytest.raises(MemoryError):
+        native(a, [0.5, 1.0])
+    monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", tracked)
+    assert_same(native(a, [0.5, 1.0]), expected)
 
 
 @needs_native
@@ -847,7 +847,7 @@ def partitions(monkeypatch):
 
 
 class _SpyLd:
-    """The native module, recording the status and arena factors of every `leiden_mg` run."""
+    """The native module, recording the status of every `leiden_mg` run."""
 
     def __init__(self, module):
         self.module, self.runs = module, []
@@ -858,7 +858,7 @@ class _SpyLd:
     def leiden_mg(self, *args, **kwargs):
         out = self.module.leiden_mg(*args, **kwargs)
         if kwargs["workspaces"]:  # a run, not a sizing call
-            self.runs.append((out["status"], list(kwargs["arena_factors"])))
+            self.runs.append(out["status"])
         return out
 
 
@@ -924,30 +924,18 @@ def test_partitions_empty(partitions, monkeypatch):
                 partitions(len(bounds) - 1)
             spy.runs.clear()
             assert_same(native(adjacency, [0.5, 1.0]), expected)
-            assert [status for status, _ in spy.runs] == ["ok"]
+            assert spy.runs == ["ok"]
 
 
 @needs_native
-def test_partitions_rerun_and_workspace(partitions, monkeypatch):
-    """Arenas too small stop every partition and the rerun gives the same
-    bits; so do workspaces filled with garbage (by work still queued on the
-    caller's stream, which the partitions' streams must wait for)."""
+def test_partitions_workspace(partitions, monkeypatch):
+    """Workspaces and arena blocks filled with garbage by work still queued on
+    the caller's stream (which the partitions' streams must wait for) give the
+    bits of one partition."""
     a = _graph("pbmc3k")
     partitions(None)
     expected = native(a, [0.5, 1.0, 2.0])
     partitions(3)
-    spy = _SpyLd(_leiden._ld)
-    monkeypatch.setattr(_leiden, "_ld", spy)
-    for factor in ("_ARENA_FACTOR", "_ARENA_FACTOR_PART"):  # partition 0, the others
-        with monkeypatch.context() as m:
-            m.setattr(_leiden, factor, 0.05)
-            spy.runs.clear()
-            assert_same(native(a, [0.5, 1.0, 2.0]), expected)
-            (status, first), (last_status, last) = spy.runs[0], spy.runs[-1]
-            assert (status, last_status) == ("workspace_too_small", "ok")
-            # only the partitions that overflowed grow
-            kept = slice(1, None) if factor == "_ARENA_FACTOR" else slice(0, 1)
-            assert last[kept] == first[kept]
     empty = cp.empty
 
     def dirty(*args, **kwargs):
@@ -1011,7 +999,7 @@ def test_multi_gpu_true_splits_out_of_memory(partitions, monkeypatch):
 
     monkeypatch.setattr(_leiden, "_leiden_single", out_of_memory)
     assert_same(native(a, [0.5, 1.0], multi_gpu=True), expected)
-    assert [status for status, _ in spy.runs] == ["ok"]
+    assert spy.runs == ["ok"]
     for multi_gpu in (None, [0]):
         with pytest.raises(MemoryError, match="full"):
             native(a, [0.5, 1.0], multi_gpu=multi_gpu)

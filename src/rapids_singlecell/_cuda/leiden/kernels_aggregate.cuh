@@ -535,8 +535,7 @@ inline std::size_t agg_bottom_end(std::size_t bottom,
 
 template <typename OW = float>
 struct AggregatePlan {
-    bool holey = false;    // holey gather into the arena top
-    int* h_idx = nullptr;  // holey region (nnz_l entries)
+    int* h_idx = nullptr;  // holey rows at the arena top (nnz_l entries)
     OW* h_w = nullptr;
 };
 
@@ -547,7 +546,6 @@ struct CoarseLevel {
     float* weights = nullptr;
     i64 n = 0;
     i64 nnz = 0;
-    bool ok = true;  // false: workspace_too_small (see arena)
 };
 
 // at every use: a device reset drops the opt-in (CUDA 12)
@@ -610,9 +608,8 @@ void gather_calls(KernelCall* c, bool on, const i64* indptr, const int* indices,
              kAggBlockSlots, small_hi + 1, i64{LLONG_MAX});
 }
 
-// Stage 1 (A1-A4a): level l is gathered into the arena top if it fits, else
-// the gathers are disabled and the overflow recorded. One call list after
-// `pre` (R9); the caller reads n_next, nnz_next and the classes at SL2.
+// Stage 1 (A1-A4a): level l is gathered into the arena top. One call list
+// after `pre` (R9); the caller reads n_next, nnz_next and the classes at SL2.
 template <WKind K, typename OW = float>
 AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
                                   EdgeW<K> w, const i64* khat, i64 n, i64 nnz,
@@ -622,19 +619,11 @@ AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
                                   Control* ctl, cudaStream_t s,
                                   std::vector<KernelCall> pre = {}) {
     AggregatePlan<OW> plan;
-    const std::size_t nu = static_cast<std::size_t>(n);
-    const std::size_t meta = align_up(8 * (nu + 1)) + align_up(8 * nu);
-    const std::size_t holey =
-        align_up(4 * static_cast<std::size_t>(nnz)) +
-        align_up(sizeof(OW) * static_cast<std::size_t>(nnz));
-    plan.holey = arena.fits(meta, holey);
-    if (plan.holey) {
-        plan.h_idx = arena.push_top<int>(static_cast<std::size_t>(nnz));
-        plan.h_w = arena.push_top<OW>(static_cast<std::size_t>(nnz));
-    } else {
-        arena.note_overflow(align_up(arena.bottom) + meta +
-                            align_up(arena.top) + holey);
-    }
+    const std::size_t ne = static_cast<std::size_t>(nnz);
+    arena.reserve_top(align_up(4 * ne) +
+                      align_up(sizeof(OW) * ne));  // one block
+    plan.h_idx = arena.push_top<int>(ne);
+    plan.h_w = arena.push_top<OW>(ne);
     std::vector<KernelCall> c = std::move(pre);
     std::size_t k = c.size();
     c.resize(k + 18);
@@ -652,9 +641,9 @@ AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
     c[k++].set(on, agg_scatter_kernel, dim3(grid_items(n)), dim3(kBlock), 0,
                cmap, n, ab.member_start, ab.member_count, ab.members,
                ab.window_offset, opt.gather, ab.clist, ab.clist_wide, ctl);
-    gather_calls<K, OW>(&c[k], on && plan.holey, indptr, indices, w, khat, n,
-                        cmap, ab, opt.gather, ab.window_offset, plan.h_idx,
-                        plan.h_w, ctl);
+    gather_calls<K, OW>(&c[k], on, indptr, indices, w, khat, n, cmap, ab,
+                        opt.gather, ab.window_offset, plan.h_idx, plan.h_w,
+                        ctl);
     k += 4;
     scan_calls(&c[k], ScanArray<i64, i64>{ab.cdeg}, ab.indptr_next, n + 1, cub,
                cub_bytes);
@@ -666,8 +655,8 @@ AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
     return plan;
 }
 
-// Stage 2, after SL2: exact metadata and compacted rows (arena bottom), then
-// P_{l+1} if P is given; !ok (arena.required set) if the level does not fit.
+// Stage 2, after SL2: exact metadata and compacted rows (arena bottom, one
+// block with room for the next level's cmap), then P_{l+1} if P is given.
 inline CoarseLevel aggregate_finish(i64 n, const int* cmap,
                                     const AggregatePlan<>& plan, i64 n_next,
                                     i64 nnz_next, const AggregateBufs& ab,
@@ -680,15 +669,13 @@ inline CoarseLevel aggregate_finish(i64 n, const int* cmap,
     const std::size_t ne = static_cast<std::size_t>(nnz_next);
     const std::size_t end =
         agg_bottom_end(arena.bottom, {8 * (nn + 1), 8 * nn, 4 * ne, 4 * ne});
-    if (!plan.holey || end + arena.top > arena.cap) {
-        arena.note_overflow(end + arena.top);
-        lv.ok = false;
-        return lv;
-    }
+    arena.reserve_bottom(end - align_up(arena.bottom) + align_up(4 * nn) +
+                         kAlign);
     lv.indptr = arena.push_bottom<i64>(nn + 1);
     lv.khat = arena.push_bottom<i64>(nn);
     lv.indices = arena.push_bottom<int>(ne);
     lv.weights = arena.push_bottom<float>(ne);
+    arena.reserve_bottom(0);
     if (n_next > 0) {
         agg_compact_kernel<<<grid_rows(n_next), kBlock, 0, s>>>(
             ab.window_offset, ab.cdeg, ab.indptr_next, n_next, plan.h_idx,
