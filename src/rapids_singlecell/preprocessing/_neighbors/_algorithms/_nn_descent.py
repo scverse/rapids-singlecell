@@ -30,8 +30,9 @@ def _nn_descent_knn(
             "The 'nn_descent' algorithm is only available in cuvs >= 25.02. Please update your cuvs installation."
         )
 
-    # Extract intermediate_graph_degree from algorithm_kwds, with default
-    intermediate_graph_degree = algorithm_kwds.get("intermediate_graph_degree", None)
+    # cuVS's default (96) is below the recommended 1.5 * k for k > 64, and fails for k > 96
+    default = max(nn_descent.IndexParams().intermediate_graph_degree, int(1.5 * k))
+    intermediate_graph_degree = max(algorithm_kwds.get("intermediate_graph_degree", default), k)
 
     idxparams = nn_descent.IndexParams(
         graph_degree=k,
