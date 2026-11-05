@@ -136,7 +136,7 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
             Comms.destroy()
         raise
     return g
-  
+
 
 @deprecated(Deprecation("0.19.0", "Use `rapids_singlecell.tl.leiden` instead."))
 def louvain(
