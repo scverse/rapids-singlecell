@@ -305,8 +305,8 @@ def wnn(
         :func:`~rapids_singlecell.tl.leiden`.
     **snn** : sparse matrix of dtype `float32`.
         Seurat's ``wsnn`` graph, the Jaccard index of the multimodal neighbor sets, with unit diagonal. Seurat
-        clusters on it, e.g. ``rsc.tl.leiden(adata, obsp='snn')``; Leiden counts the diagonal as self-loops,
-        Seurat's default Louvain ignores it.
+        clusters on it, e.g. ``rsc.tl.leiden(adata, obsp='snn')``; Leiden (``flavor='rapids'``) and Seurat's
+        default Louvain ignore the diagonal.
     **weights** : `.obs[weight_key.format(name)]`
         The weight of each modality per cell.
 
