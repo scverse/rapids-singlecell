@@ -190,7 +190,7 @@ The project uses [hatch](https://hatch.pypa.io/) to manage test environments. Th
 
 | `deps`              | Python | Description                                    |
 | ------------------- | ------ | ---------------------------------------------- |
-| `stable`            | 3.12   | Released versions of all dependencies          |
+| `stable`            | 3.13   | Released versions of all dependencies          |
 | `dev`               | 3.14   | Upstream `main` branches of anndata and scanpy |
 | `rapids_prerelease` | 3.14   | CUDA-X Data Science nightly wheels             |
 
