@@ -231,6 +231,32 @@ struct PartResources {
     PartResources& operator=(const PartResources&) = delete;
 };
 
+// Partition p stores exactly its rows: offsets 0 through bounds[p] and nnz[p]
+// from bounds[p + 1] on (the driver reads its rows' entries only).
+inline void check_partition_rows(const std::vector<const i64*>& ip,
+                                 const std::vector<int>& devices,
+                                 const std::vector<i64>& bounds,
+                                 const std::vector<i64>& nnz, i64 n) {
+    int previous = 0;
+    cuda_check(cudaGetDevice(&previous), "leiden: cudaGetDevice");
+    bool ok = true;
+    for (std::size_t p = 0; p < ip.size() && ok; ++p) {
+        const i64 at[4] = {0, bounds[p], bounds[p + 1], n};
+        i64 v[4];
+        cuda_check(cudaSetDevice(devices[p]), "leiden: cudaSetDevice");
+        for (int k = 0; k < 4; ++k)
+            cuda_check(cudaMemcpy(&v[k], ip[p] + at[k], sizeof(i64),
+                                  cudaMemcpyDeviceToHost),
+                       "leiden_mg: partition offsets");
+        ok = v[0] == 0 && v[1] == 0 && v[2] == nnz[p] && v[3] == nnz[p];
+    }
+    cuda_check(cudaSetDevice(previous), "leiden: cudaSetDevice");
+    if (!ok)
+        throw std::invalid_argument(
+            "leiden_mg: indptrs[p] must hold the rows [bounds[p], "
+            "bounds[p + 1]) only");
+}
+
 template <typename WI, typename Device>
 nb::dict call_leiden_mg(
     const std::vector<gpu_array_c<const i64, Device>>& indptrs,
@@ -239,8 +265,7 @@ nb::dict call_leiden_mg(
     const std::vector<int>& devices, const std::vector<i64>& bounds,
     bool use_weights, const nb::dict& check,
     std::vector<gpu_array_c<std::uint8_t, Device>>& workspaces, bool peer,
-    optional_array<int, Device>& labels_out,
-    const std::vector<double>& resolutions,
+    host_labels& labels_out, const std::vector<double>& resolutions,
     const std::vector<std::uint32_t>& seeds, int n_iterations,
     const optional_array<const int, Device>& init,
     const nb::object& arena_alloc, const nb::object& arena_free) {
@@ -334,6 +359,7 @@ nb::dict call_leiden_mg(
         ix[p] = indices[p].data();
         wd[p] = data[p].data();
     }
+    check_partition_rows(ip, devices, bounds, nnz, n);
     std::vector<Part> parts(P);
     std::vector<ArenaGrower> growers(P);
     DriverResult out;
@@ -393,8 +419,8 @@ nb::dict call_leiden_mg(
 // full-length int64 offsets of its rows (other rows empty), indices[p] /
 // data[p] its entries. `check`: ingest_check of the whole graph. Without
 // workspaces the call only sizes them (one per partition, status "size");
-// labels_out lives on devices[0]; a run takes arena_alloc(nbytes, device) ->
-// pointer and arena_free(pointer) for the partitions' arena blocks.
+// labels_out: host int32 (len(resolutions), n); a run takes arena_alloc(nbytes,
+// device) -> pointer and arena_free(pointer) for the partitions' arena blocks.
 template <typename WI, typename Device>
 void register_mg_typed(nb::module_& m) {
     m.def(
@@ -405,9 +431,8 @@ void register_mg_typed(nb::module_& m) {
            std::vector<int> devices, std::vector<long long> bounds,
            bool use_weights, nb::dict check,
            std::vector<gpu_array_c<std::uint8_t, Device>> workspaces, bool peer,
-           optional_array<int, Device> labels_out,
-           std::vector<double> resolutions, std::vector<std::uint32_t> seeds,
-           int n_iterations,
+           host_labels labels_out, std::vector<double> resolutions,
+           std::vector<std::uint32_t> seeds, int n_iterations,
            optional_array<const int, Device> initial_membership,
            nb::object arena_alloc, nb::object arena_free) {
             return call_leiden_mg<WI, Device>(

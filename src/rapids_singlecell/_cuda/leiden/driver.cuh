@@ -17,6 +17,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <utility>
 
@@ -185,6 +186,28 @@ __global__ void drv_slice_relabel_kernel(const int* P_in, i64 n, i64 C,
     if (blockIdx.x == 0 && threadIdx.x == 0) ctl->n_components = rank[C];
 }
 
+// initial_membership ids (compacted by the caller) must lie in [0, n): level
+// 0 indexes community arrays by them before any flag is read back.
+__global__ void drv_check_ids_kernel(const int* __restrict__ ids, i64 n,
+                                     Control* ctl) {
+    const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
+    for (i64 v = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; v < n;
+         v += stride) {
+        const int c = ids[v];
+        if (c < 0 || c >= n) atomicOr(&ctl->flags, kFlagBadLabel);
+    }
+}
+
+inline void check_initial_membership(const int* init, i64 n, Control* ctl,
+                                     void* pinned, cudaStream_t s) {
+    clear_control(ctl, s);
+    drv_check_ids_kernel<<<grid_items(n), kBlock, 0, s>>>(init, n, ctl);
+    CUDA_CHECK_LAST_ERROR(drv_check_ids_kernel);
+    if (read_control(ctl, s, pinned).flags & kFlagBadLabel)
+        throw std::invalid_argument(
+            "initial_membership ids must lie in [0, n)");
+}
+
 // The device invariant checks of a Control readback.
 inline void check_device_flags(u32 flags) {
     if (flags & kFlagForestInvariant)
@@ -224,7 +247,8 @@ struct LevelGraph {
     const i64* indptr = nullptr;
     const int* indices = nullptr;
     const float* wf = nullptr;  // fp32: level 0 scaled by 2^s on the fly,
-                                // coarse levels exact integers (scale 1)
+                                // coarse levels integer sums rounded once to
+                                // fp32 (scale 1)
     const i64* wq = nullptr;    // int64 W0q (level 0)
     i64 unit = 1;               // UNIT kind: the quantised unit weight
     double scale = 1.0;
@@ -232,6 +256,8 @@ struct LevelGraph {
     i64 n = 0, nnz = 0;
     i64 cls[kNumClasses] = {};  // vertices per degree class
     int* cmap = nullptr;        // to level l + 1 (arena bottom)
+    HubScratch hub;             // of its hub rows (numerics.cuh)
+    i64 hub_ints = 0;           // level 0: hub's size, pushed per iteration
 
     template <typename Fn>
     void with_w(Fn&& fn) const {
@@ -260,6 +286,7 @@ class LeidenDriver {
         g0_.n = n;
         g0_.nnz = nnz;
         for (int c = 0; c < kNumClasses; ++c) g0_.cls[c] = q.class_count[c];
+        g0_.hub_ints = q.hub_ints;
     }
 
     // lam_hat = gamma / 2m_hat (one IEEE division) and the seed.
@@ -270,15 +297,14 @@ class LeidenDriver {
         s64_ = seed64(seed);
     }
 
-    // One resolution.
+    // One resolution; its labels go to the host array `labels_out` [n].
     void run_resolution(double gamma, u32 seed, const int* init, int R,
                         int* labels_out, ResolutionResult& out) {
         const i64 n = n_;
         const i64 two_m = q_.two_m_hat;
         if (two_m <= 0) {  // no counted entry: every vertex its own cluster
             out.n_clusters = n;
-            drv_iota_kernel<<<grid_items(n), kBlock, 0, s_>>>(labels_out, n);
-            CUDA_CHECK_LAST_ERROR(drv_iota_kernel);
+            std::iota(labels_out, labels_out + n, 0);
             return;
         }
         set_resolution(gamma, seed);
@@ -337,8 +363,13 @@ class LeidenDriver {
             if (final) break;
         }
         launch_quality(P0, C);
-        run_rank_labels(P0, n, C, labels_out, L_.final_, L_.cub, L_.cub_bytes,
-                        L_.ctl, s_);
+        // ranked in place: P0 is rewritten by the next resolution (stream
+        // order)
+        run_rank_labels(P0, n, C, P0, L_.final_, L_.cub, L_.cub_bytes, L_.ctl,
+                        s_);
+        cuda_check(cudaMemcpyAsync(labels_out, P0, n * sizeof(int),
+                                   cudaMemcpyDeviceToHost, s_),
+                   "leiden: labels to the host");
         const Control c = readback();
         out.modularity = c.q[0];
         out.n_clusters = C;
@@ -403,6 +434,7 @@ class LeidenDriver {
         prm.S = dp_.subrounds;
         prm.th = dp_.th;
         prm.id_bound = id_bound;
+        prm.hub = g.hub;
         MoveRun mr;
         g.with_w([&](auto w) {
             constexpr WKind KW = MoveWKindOf<decltype(w)>::value;
@@ -453,9 +485,10 @@ class LeidenDriver {
             run_refine(g.indptr, g.indices, w, g.khat, P, L_.persist.KS, g.n,
                        g.n, rp, L_.refine, cmap, L_.cub, L_.cub_bytes, L_.ctl,
                        s_, &L_.ctl->move_C, rg, &r9, std::move(pre));
-            plan = aggregate_begin(g.indptr, g.indices, w, g.khat, g.n, g.nnz,
-                                   cmap, opt, L_.aggregate, L_.arena, L_.cub,
-                                   L_.cub_bytes, L_.ctl, s_, std::move(r9));
+            plan =
+                aggregate_begin(g.indptr, g.indices, w, g.khat, g.n, g.nnz,
+                                cmap, opt, L_.aggregate, L_.arena, L_.cub,
+                                L_.cub_bytes, L_.ctl, s_, g.hub, std::move(r9));
         });
     }
 
@@ -505,6 +538,10 @@ class LeidenDriver {
         std::vector<LevelGraph> G;
         G.reserve(static_cast<std::size_t>(dp_.max_levels) + 1);
         G.push_back(g0);
+        if (g0.hub_ints > 0)  // level 0's hub scratch, for the iteration
+            G[0].hub = HubScratch{L_.arena.push_bottom<int>(
+                                      static_cast<std::size_t>(g0.hub_ints)),
+                                  g0.hub_ints};
         const u32 uit = static_cast<u32>(it);
         bool moved = false;
         int lvl = 0;
@@ -643,15 +680,16 @@ class LeidenDriver {
                 agg_set_n_next_kernel<<<1, 1, 0, s_>>>(L_.ctl, pieces);
                 CUDA_CHECK_LAST_ERROR(agg_set_n_next_kernel);
                 g.with_w([&](auto w) {
-                    plan = aggregate_begin(
-                        g.indptr, g.indices, w, g.khat, g.n, g.nnz, cmap, opt,
-                        L_.aggregate, arena, L_.cub, L_.cub_bytes, L_.ctl, s_);
+                    plan = aggregate_begin(g.indptr, g.indices, w, g.khat, g.n,
+                                           g.nnz, cmap, opt, L_.aggregate,
+                                           arena, L_.cub, L_.cub_bytes, L_.ctl,
+                                           s_, g.hub);
                 });
                 c = readback();
             }
             const CoarseLevel lv = aggregate_finish(
-                g.n, cmap, plan, c.n_next, c.nnz_next, L_.aggregate, arena, P,
-                level_partition(lvl + 1), s_);
+                g.n, cmap, plan, c.n_next, c.nnz_next, c.coarse_hub_ints,
+                L_.aggregate, arena, P, level_partition(lvl + 1), s_);
             g.cmap = cmap;
             ++stat.levels;
             LevelGraph ng;
@@ -659,6 +697,7 @@ class LeidenDriver {
             ng.indices = lv.indices;
             ng.wf = lv.weights;
             ng.khat = lv.khat;
+            ng.hub = lv.hub;
             ng.n = lv.n;
             ng.nnz = lv.nnz;
             for (int k = 0; k < kNumClasses; ++k)
@@ -706,7 +745,7 @@ struct DriverInput {
     std::vector<double> gammas;
     std::vector<u32> seeds;
     const int* init = nullptr;  // compacted initial membership or null
-    int* labels_out = nullptr;  // [n_res][n]
+    int* labels_out = nullptr;  // host [n_res][n]
     void* workspace = nullptr;  // null: size the workspace only
     std::size_t workspace_bytes = 0;
     void* pinned = nullptr;
@@ -741,6 +780,8 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
     }
     L.pinned = in.pinned;
     L.arena.grow = in.grow;
+    if (in.init && in.n > 0)
+        check_initial_membership(in.init, in.n, L.ctl, L.pinned, s);
     LeidenDriver drv(L, dp, s);
     int s_prev = INT_MIN;
     for (std::size_t i = 0; i < in.gammas.size(); ++i) {
@@ -749,8 +790,7 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
         ResolutionResult r;
         if (in.info.n_counted == 0) {  // no counted entry: trivial result
             r.n_clusters = in.n;
-            drv_iota_kernel<<<grid_items(in.n), kBlock, 0, s>>>(labels, in.n);
-            CUDA_CHECK_LAST_ERROR(drv_iota_kernel);
+            std::iota(labels, labels + in.n, 0);
             out.res.push_back(std::move(r));
             continue;
         }
@@ -768,6 +808,9 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
 
 template <typename T, typename Device>
 using optional_array = std::optional<gpu_array_c<T, Device>>;
+// The labels: host int32 [n_res][n], each row copied as its resolution ends.
+using host_labels = std::optional<
+    nb::ndarray<int, nb::numpy, nb::ndim<2>, nb::c_contig, nb::device::cpu>>;
 
 // Arena blocks from Python: alloc(nbytes, device) -> pointer, free(pointer),
 // called with the GIL; their exceptions (MemoryError, KeyboardInterrupt)
@@ -811,8 +854,7 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
                          const input_array<const WI, InDevice>& data,
                          bool use_weights, const nb::dict& check,
                          optional_array<std::uint8_t, Device>& workspace,
-                         std::uintptr_t pinned,
-                         optional_array<int, Device>& labels_out,
+                         std::uintptr_t pinned, host_labels& labels_out,
                          const std::vector<double>& resolutions,
                          const std::vector<std::uint32_t>& seeds,
                          const optional_array<const int, Device>& init,
@@ -900,9 +942,9 @@ inline nb::dict result_dict(const DriverResult& r) {
 }
 
 // Every resolution of the call. `check`: ingest_check's result for exactly
-// these arrays; `labels_out`: (len(resolutions), n) int32. Without `workspace`
-// the call only sizes it (status "size", required_bytes); a run takes
-// arena_alloc(nbytes, device) -> pointer and arena_free(pointer), whose
+// these arrays; `labels_out`: host (len(resolutions), n) int32. Without
+// `workspace` the call only sizes it (status "size", required_bytes); a run
+// takes arena_alloc(nbytes, device) -> pointer and arena_free(pointer), whose
 // allocator must order the blocks on `stream` (CuPy's: its current stream).
 template <typename IP, typename IX, typename WI, typename InDevice,
           typename Device>
@@ -913,7 +955,7 @@ void register_driver_typed(nb::module_& m) {
            input_array<const IX, InDevice> indices,
            input_array<const WI, InDevice> data, bool use_weights,
            nb::dict check, optional_array<std::uint8_t, Device> workspace,
-           std::uintptr_t pinned, optional_array<int, Device> labels_out,
+           std::uintptr_t pinned, host_labels labels_out,
            std::vector<double> resolutions, std::vector<std::uint32_t> seeds,
            int n_iterations,
            optional_array<const int, Device> initial_membership,

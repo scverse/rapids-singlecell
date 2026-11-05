@@ -478,11 +478,12 @@ __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
                                         int* __restrict__ idx32,
                                         i64* __restrict__ khat, Control* ctl) {
     __shared__ i64 s_two_m[kWarpsPerBlock];
+    __shared__ i64 s_hub[kWarpsPerBlock];
     __shared__ i64 s_cls[kWarpsPerBlock][kNumClasses];
     const int lane = threadIdx.x & (kWarp - 1), wib = threadIdx.x / kWarp;
     const i64 warp0 = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + wib;
     const i64 nwarps = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-    i64 two_m = 0;
+    i64 two_m = 0, hub = 0;
     i64 cls[kNumClasses] = {};
     for (i64 v = warp0; v < n; v += nwarps) {
         const i64 b = static_cast<i64>(indptr[v]);
@@ -500,21 +501,27 @@ __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
             if (v == n - 1) indptr64[n] = e;
             khat[v] = k;
             two_m += k;
+            hub += hub_ints(e - b);
             ++cls[c];
         }
     }
     if (lane == 0) {
         s_two_m[wib] = two_m;
+        s_hub[wib] = hub;
         for (int c = 0; c < kNumClasses; ++c) s_cls[wib][c] = cls[c];
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        i64 t = 0, cc[kNumClasses] = {};
+        i64 t = 0, h = 0, cc[kNumClasses] = {};
         for (int i = 0; i < kWarpsPerBlock; ++i) {
             t += s_two_m[i];
+            h += s_hub[i];
             for (int c = 0; c < kNumClasses; ++c) cc[c] += s_cls[i][c];
         }
         atomicAdd(reinterpret_cast<u64*>(&ctl->two_m_hat), static_cast<u64>(t));
+        if (h)
+            atomicAdd(reinterpret_cast<u64*>(&ctl->hub_ints),
+                      static_cast<u64>(h));
         for (int c = 0; c < kNumClasses; ++c)
             if (cc[c])
                 atomicAdd(reinterpret_cast<u64*>(&ctl->class_count[c]),
@@ -562,6 +569,7 @@ struct QuantizeResult {
     i64 unit_q = 0;
     i64 two_m_hat = 0;
     i64 class_count[kNumClasses] = {};
+    i64 hub_ints = 0;  // scratch of the hub rows (numerics.cuh)
     WKind wkind = WKind::F32;
     const i64* indptr = nullptr;
     const int* indices = nullptr;
@@ -661,6 +669,7 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
     const Control h = read_control(ctl, stream, L.pinned);  // sync S2
     res.two_m_hat = h.two_m_hat;
     for (int c = 0; c < kNumClasses; ++c) res.class_count[c] = h.class_count[c];
+    res.hub_ints = h.hub_ints;
     return res;
 }
 

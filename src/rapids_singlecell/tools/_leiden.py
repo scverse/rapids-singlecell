@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import traceback
 import warnings
 from contextlib import contextmanager
 from numbers import Integral, Real
@@ -100,7 +101,7 @@ def leiden(
         gamma in the modularity formula). Higher values lead to more clusters.
         If a list of values is given, the clustering runs for each of them and
         writes one column per value. Each value must be finite and in
-        ``[0, 2**20]``.
+        ``[0, 2**20]``, and no two values may name the same column.
     restrict_to
         Restrict the clustering to the categories within the key for sample
         annotation, tuple needs to contain ``(obs_key, list_of_categories)``.
@@ -140,16 +141,17 @@ def leiden(
     flavor
         Which implementation to use. ``'rapids'`` (default) is the native CUDA
         implementation of rapids-singlecell, bitwise reproducible for a given
-        seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden`.
-        ``'rapids'`` needs about 140 bytes of device memory per cell plus
-        what its coarser levels hold, allocated as they need it: on k-NN
-        graphs 14-18 bytes per stored entry at the peak (about 22 at 100M
-        cells), in all 2.5-3.5x the float32 CSR, which is also copied to the
-        GPU if it is on the host. If that does not fit, it raises
-        :class:`MemoryError` (RMM managed memory can exceed the GPU). Under an
-        allocator that does not pool (the default of rapids-singlecell), it
-        keeps the per-cell workspace for the next call if it is at most 2 GiB
-        and 1/16 of the GPU memory.
+        seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden` and,
+        if it runs out of memory on one GPU, reruns in CUDA managed memory
+        (slower, with a warning). ``'rapids'`` needs about 140 bytes of
+        device memory per cell plus what its coarser levels hold, allocated
+        as they need it: on k-NN graphs 14-18 bytes per stored entry at the
+        peak (about 22 at 100M cells), in all 2.5-3.5x the float32 CSR, which
+        is also copied to the GPU if it is on the host. If that does not fit,
+        it raises :class:`MemoryError` (RMM managed memory can exceed the
+        GPU). Under an allocator that does not pool (the default of
+        rapids-singlecell), it keeps the per-cell workspace for the next call
+        if it is at most 2 GiB and 1/16 of the GPU memory.
     copy
         Whether to copy ``adata`` or modify it in place.
     theta
@@ -247,27 +249,32 @@ def leiden(
             restrict_categories=restrict_categories,
             adjacency=adjacency,
         )
-    if flavor == "rapids":
-        parts = _leiden_rapids(
-            adjacency,
-            resolutions,
-            rng=rng,
-            n_iterations=n_iterations,
-            use_weights=use_weights,
-            multi_gpu=multi_gpu,
-            **clustering_args,
-        )
-    else:
-        parts = _leiden_cugraph(
-            adjacency,
-            resolutions,
-            rng=rng,
-            theta=theta,
-            dtype=dtype,
-            use_dask=use_dask,
-            use_weights=use_weights,
-            **clustering_args,
-        )
+    try:
+        if flavor == "rapids":
+            parts = _leiden_rapids(
+                adjacency,
+                resolutions,
+                rng=rng,
+                n_iterations=n_iterations,
+                use_weights=use_weights,
+                multi_gpu=multi_gpu,
+                **clustering_args,
+            )
+        else:
+            parts = _leiden_cugraph(
+                adjacency,
+                resolutions,
+                rng=rng,
+                theta=theta,
+                dtype=dtype,
+                use_dask=use_dask,
+                use_weights=use_weights,
+                **clustering_args,
+            )
+    except BaseException as err:  # a kept traceback (e.g. IPython's) must not hold the graph copies
+        traceback.clear_frames(err.__traceback__)
+        del adjacency
+        raise
     # store output into adata.obs
     if restrict_to is not None and key_added == "leiden":
         key_added += "_R"
@@ -299,6 +306,8 @@ def leiden(
         "n_iterations": n_iterations,
         **meta_random_state,
     }
+    if flavor == "cugraph":  # what cuGraph ran instead of n_iterations
+        adata.uns[key_added]["params"]["max_iter"] = clustering_args.get("max_iter", _CUGRAPH_MAX_ITER)
     adata.uns[key_added]["modularity"] = parts[0].modularity if len(parts) == 1 else [p.modularity for p in parts]
     logg.info(
         "    finished",
@@ -379,7 +388,7 @@ def _validate_resolutions(resolution: float | Sequence[float]) -> list[float]:
     ):
         msg = f"resolution must be finite and in [0, 2**20], but {resolution!r} was passed."
         raise ValueError(msg)
-    if len(set(resolutions)) < len(resolutions):  # each writes one obs column
+    if len({str(res) for res in resolutions}) < len(resolutions):  # each writes the obs column f"{key}_{res}"
         msg = f"resolution must not repeat a value, but {resolution!r} was passed."
         raise ValueError(msg)
     return resolutions
@@ -428,6 +437,7 @@ def _leiden_rapids(
         graph, info = None, {"nnz_counted": 0}
         if csr.nnz:  # an empty graph needs no check (its size-0 arrays can report another memory kind)
             graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input)
+        del csr  # a converted copy that `_ingest` fixed up is dead: `graph` holds what the driver reads
         if info["nnz_counted"] == 0:  # no edge: every cell is its own cluster
             codes = np.arange(n, dtype=np.int32)
             return [SimpleNamespace(membership=codes, modularity=0.0, n_clusters=n) for _ in resolutions]
@@ -447,7 +457,8 @@ def _leiden_rapids(
             "stream": cp.cuda.get_current_stream().ptr,
         }
         n_parts = _N_PARTITIONS if _N_PARTITIONS is not None else len(devices) if explicit else 1
-        if n_parts > 1 and _ld.n_replicas(info["nnz_counted"], n, max_replicas) > 1:
+        replicated = _ld.n_replicas(info["nnz_counted"], n, max_replicas) > 1  # split runs have no replicas
+        if n_parts > 1 and replicated:
             msg = "multi_gpu: graphs this small run as replicas, which split runs do not have; running on one GPU."
             warnings.warn(msg, UserWarning, stacklevel=4)
             n_parts = 1
@@ -455,16 +466,18 @@ def _leiden_rapids(
             try:
                 return _leiden_single(graph, args, n)
             except MemoryError:
-                if multi_gpu is not True or len(devices) == 1:
+                if multi_gpu is not True or len(devices) == 1 or replicated:
                     raise
             n_parts = len(devices)
         for device in devices:  # a split run does not use the cached single-GPU workspaces
             _WORKSPACE_CACHE.pop(device, None)
         if multi_gpu is True:  # partition 0 (levels >= 1: most of one GPU's need) where most is free
             devices = sorted(devices, key=lambda d: cp.cuda.Device(d).mem_info[0], reverse=True)
+        elif len(devices) > 1 and devices[0] == source:  # not next to the CuPy adjacency, which stays there
+            devices = devices[1:] + devices[:1]
         owned = cpx_sparse.issparse(adjacency) and graph.indices is getattr(adjacency, "indices", None)
         parts = _split_rows(graph, n_parts, devices, owned=owned)
-        del graph, csr, args  # the partitions hold copies of a fixed-up graph
+        del graph, args  # the partitions hold copies of a fixed-up graph
         return _leiden_partitioned(
             parts,
             info,
@@ -481,12 +494,22 @@ class _ArenaBlocks:
     """Device blocks of the native engine's level arena, allocated as levels need them and freed as they end.
 
     With ``ready``, a block is usable from any stream when returned (`leiden_mg`
-    runs on its own streams, unordered with the allocator's).
+    runs on its own streams, unordered with the allocator's). Leaving the
+    context frees what a failed call left and raises the engine's own CUDA
+    out-of-memory errors (RuntimeError) as MemoryError, as the allocators do.
     """
 
     def __init__(self, *, ready: bool = False) -> None:
         self.live: dict[int, cp.ndarray] = {}
         self.ready = ready
+
+    def __enter__(self) -> _ArenaBlocks:
+        return self
+
+    def __exit__(self, kind, err, tb) -> None:
+        self.live.clear()  # the call is done with them: it synchronises before it raises
+        if isinstance(err, RuntimeError) and "out of memory" in str(err):
+            raise MemoryError(str(err)) from err
 
     def alloc(self, nbytes: int, device: int) -> int:
         with cp.cuda.Device(device):
@@ -506,27 +529,20 @@ def _leiden_single(graph: SimpleNamespace, args: dict, n: int) -> list[SimpleNam
     # the memory kind of the call's other device arrays, which the workspace must share
     arrays = (graph.indptr, args["initial_membership"])
     kind = next((_memory_kind(a) for a in arrays if isinstance(a, cp.ndarray)), None)
-    shape = (len(args["resolutions"]), n)
     nbytes = _ld.leiden(graph.indptr, **args)["required_bytes"]  # a call without a workspace sizes it
-    buffer, workspace, labels = _allocate_workspace(nbytes, shape, kind)
-    blocks = _ArenaBlocks()
-    try:
+    workspace = _allocate_workspace(nbytes, kind)
+    codes = _host_labels((len(args["resolutions"]), n))
+    with _ArenaBlocks() as blocks:
         out = _ld.leiden(
             graph.indptr,
             **args,
             workspace=workspace,
             pinned=pinned.ptr,
-            labels_out=labels,
+            labels_out=codes,
             arena_alloc=blocks.alloc,
             arena_free=blocks.free,
         )
-    except BaseException:  # a kept traceback (e.g. IPython's) must not hold the memory
-        del buffer, workspace, labels
-        raise
-    finally:
-        blocks.live.clear()
-    codes = _labels_to_host(labels)
-    _cache_workspace(buffer)
+    _cache_workspace(workspace)
     return [
         SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
         for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)
@@ -551,15 +567,11 @@ def _split_rows(graph: SimpleNamespace, n_parts: int, devices: list[int], *, own
     Partition p holds a full-length int64 indptr (other rows empty), int32
     indices and the data of its rows; it views user-owned device input on its
     device, else holds copies, so the caller can free the fixed-up graph.
-    Partitions go round-robin over ``devices``; the first (which also runs
-    levels >= 1) avoids the device of user-owned input.
+    Partitions go round-robin over ``devices``.
     """
     host = isinstance(graph.indptr, np.ndarray)
     indptr = np.asarray(graph.indptr if host else cp.asnumpy(graph.indptr), dtype=np.int64)
     bounds = _row_bounds(indptr, n_parts)
-    source = None if host else graph.indices.device.id
-    if owned and len(devices) > 1 and devices[0] == source:
-        devices = devices[1:] + devices[:1]
     devs = [devices[p % len(devices)] for p in range(n_parts)]
     indptrs, indices, data = [], [], []
     for p, device in enumerate(devs):
@@ -624,29 +636,20 @@ def _leiden_partitioned(
     for device, nbytes in zip(parts.devices, sizes, strict=True):
         with cp.cuda.Device(device):
             workspaces.append(cp.empty(nbytes, dtype=cp.uint8))
-    with cp.cuda.Device(root):
-        labels = cp.empty((len(resolutions), n), dtype=cp.int32)
+    codes = _host_labels((len(resolutions), n))
     # leiden_mg runs on its own streams: the inputs and buffers must be ready
     for device in {*parts.devices, cp.cuda.Device().id}:
         with cp.cuda.Device(device):
             cp.cuda.get_current_stream().synchronize()
-    blocks = _ArenaBlocks(ready=True)
-    try:
+    with _ArenaBlocks(ready=True) as blocks:
         out = _ld.leiden_mg(
             parts.indptrs,
             **args,
             workspaces=workspaces,
-            labels_out=labels,
+            labels_out=codes,
             arena_alloc=blocks.alloc,
             arena_free=blocks.free,
         )
-    except BaseException:  # a kept traceback (e.g. IPython's) must not hold the memory
-        del workspaces, labels
-        raise
-    finally:
-        blocks.live.clear()
-    with cp.cuda.Device(root):
-        codes = _labels_to_host(labels)
     return [
         SimpleNamespace(membership=c, modularity=float(q), n_clusters=int(k))
         for c, q, k in zip(codes, out["modularity"], out["n_clusters"], strict=True)
@@ -664,13 +667,16 @@ def _input_device(adjacency) -> int | None:
 
 def _as_csr(adjacency):
     """CSR with float weights, kept on the host or device it lives on."""
-    if isinstance(adjacency, cpx_sparse.coo_matrix):
-        # cupyx's tocsr sums duplicates with float atomics (in any order): keep them for `_canonicalize`
-        order = cp.argsort(adjacency.row, kind="stable")
-        indptr = cp.zeros(adjacency.shape[0] + 1, dtype=cp.int64)
-        cp.cumsum(cp.bincount(adjacency.row, minlength=adjacency.shape[0]), out=indptr[1:])
-        csr = cpx_sparse.csr_matrix((adjacency.data[order], adjacency.col[order], indptr), shape=adjacency.shape)
-    elif cpx_sparse.issparse(adjacency) or sparse.issparse(adjacency):
+    device = cpx_sparse.issparse(adjacency)
+    if (device or sparse.issparse(adjacency)) and adjacency.format == "coo":
+        # tocsr sums duplicates in the data dtype (cupyx: with float atomics, in
+        # any order): keep them for `_canonicalize`
+        xp, sp = (cp, cpx_sparse) if device else (np, sparse)
+        order = xp.argsort(adjacency.row, kind="stable")
+        indptr = xp.zeros(adjacency.shape[0] + 1, dtype=xp.int64)
+        xp.cumsum(xp.bincount(adjacency.row, minlength=adjacency.shape[0]), out=indptr[1:])
+        csr = sp.csr_matrix((adjacency.data[order], adjacency.col[order], indptr), shape=adjacency.shape)
+    elif device or sparse.issparse(adjacency):
         csr = adjacency.tocsr()
     elif isinstance(adjacency, cp.ndarray):
         csr = cpx_sparse.csr_matrix(adjacency if adjacency.dtype.kind in "fc" else adjacency.astype(cp.float32))
@@ -866,22 +872,14 @@ def _workspace_cache_applies() -> bool:
     )
 
 
-def _allocate_workspace(
-    nbytes: int, labels_shape: tuple[int, int], kind: int | None = None
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
-    """One buffer holding the workspace (``nbytes``) and the int32 labels.
-
-    A cached buffer is reused only in memory of ``kind`` (`_memory_kind`; None: any).
-    """
-    offset = -(-nbytes // 256) * 256
-    total = offset + 4 * labels_shape[0] * labels_shape[1]
+def _allocate_workspace(nbytes: int, kind: int | None = None) -> cp.ndarray:
+    """A workspace of at least ``nbytes``: the cached one if large enough and in memory of ``kind`` (`_memory_kind`; None: any)."""
     buffer = _WORKSPACE_CACHE.pop(cp.cuda.Device().id, None)
-    reuse = buffer is not None and buffer.nbytes >= total and kind in (None, _memory_kind(buffer))
+    reuse = buffer is not None and buffer.nbytes >= nbytes and kind in (None, _memory_kind(buffer))
     if not (reuse and _workspace_cache_applies()):
         buffer = None  # free the cached buffer first
-        buffer = cp.empty(total, dtype=cp.uint8)
-    labels = buffer[offset:total].view(cp.int32).reshape(labels_shape)
-    return buffer, buffer[:nbytes], labels
+        buffer = cp.empty(nbytes, dtype=cp.uint8)
+    return buffer
 
 
 def _cache_workspace(buffer: cp.ndarray) -> None:
@@ -911,11 +909,10 @@ def _reads_host_memory(device: int) -> bool:
     )
 
 
-def _labels_to_host(labels: cp.ndarray) -> np.ndarray:
-    """D2H copy into pages touched first (on the GB10 up to 50x faster)."""
-    codes = np.empty(labels.shape, dtype=labels.dtype)
-    codes.fill(0)
-    labels.get(out=codes)
+def _host_labels(shape: tuple[int, int]) -> np.ndarray:
+    """int32 labels the native call copies each resolution into, in pages touched first (on the GB10 up to 50x faster)."""
+    codes = np.empty(shape, dtype=np.int32)
+    codes.reshape(-1).view(np.uint8)[::4096] = 0
     return codes
 
 
@@ -966,7 +963,7 @@ def _leiden_cugraph(
             groups = None  # the retry starts after the failed call has been freed
         if groups is None:
             msg = "cuGraph ran out of GPU memory; retrying in CUDA managed memory (slower)."
-            warnings.warn(msg, ResourceWarning, stacklevel=4)
+            warnings.warn(msg, UserWarning, stacklevel=4)
             with _managed_memory():
                 groups = _cugraph_groups(adjacency, resolutions, **kw, use_dask=False)
     parts = []
@@ -1015,13 +1012,15 @@ def _cugraph_groups(
 
 @contextmanager
 def _managed_memory():
-    """Route RMM allocations (cuGraph's, CuPy's) to CUDA managed memory, which can exceed the GPU."""
+    """Route cuGraph's and CuPy's allocations through RMM to CUDA managed memory, which can exceed the GPU."""
     import rmm
+    from rmm.allocators.cupy import rmm_cupy_allocator
 
     previous = rmm.mr.get_current_device_resource()
     rmm.mr.set_current_device_resource(rmm.mr.ManagedMemoryResource())
     try:
-        yield
+        with cp.cuda.using_allocator(rmm_cupy_allocator):
+            yield
     finally:
         rmm.mr.set_current_device_resource(previous)
 

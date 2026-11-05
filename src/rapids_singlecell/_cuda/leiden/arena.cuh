@@ -51,6 +51,7 @@ struct alignas(16) Control {
     i64 n_counted;  // nnz_c
     i64 two_m_hat;
     i64 class_count[kNumClasses];
+    i64 hub_ints;      // level 0: scratch of its hub rows (hub_ints, I2)
     i64 n_components;  // C after a CC split / compaction
     i64 l_hat[kMaxReplicas];
     double sum_t[kMaxReplicas];
@@ -61,10 +62,12 @@ struct alignas(16) Control {
     int gather_list_count[3];  // A2: warp / block / wide-warp gathers
     i64 nnz_next;
     i64 coarse_class_count[kNumClasses];
+    i64 coarse_hub_ints;  // the next level's hub scratch
     // LOCAL_MOVE results of the caller's next readback (no per-sweep sync)
     i64 move_C;    // C after COMPACT
     int move_err;  // kMoveErr* bits
     int pad1;
+    unsigned long long hub_next;  // HubScratch::next of this Control's level
     // movers per (sweep of the current chunk, sub-round)
     int sweep_movers[kSweepChunk][kMaxSubrounds];
 };

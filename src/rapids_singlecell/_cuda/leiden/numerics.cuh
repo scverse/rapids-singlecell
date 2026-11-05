@@ -1,7 +1,8 @@
 #pragma once
 
 // Shared numerics. Everything that feeds a decision or an output is an exact
-// integer or an explicitly rounded (`_rn`) binary64 operation, so results do
+// integer or an explicitly rounded (`_rn`) operation: binary64, or the one fp32
+// rounding of each coarse edge weight (kernels_aggregate.cuh), so results do
 // not depend on thread order, launch geometry or contraction choices.
 
 #include <cuda_runtime.h>
@@ -317,9 +318,48 @@ __device__ __forceinline__ void warp_table_add(int* keys, i64* vals, u32 mask,
     }
 }
 
-// Hash-range pass of a key among npass passes (passes nest under doubling).
+// Hash-range pass of a key among npass passes (passes nest under doubling and
+// under any multiple: pass p of m * nb lies in pass p / m of nb).
 __device__ __forceinline__ u64 table_pass(int key, u64 npass) {
     return (static_cast<u64>(fmix32(static_cast<u32>(key))) * npass) >> 32;
+}
+
+// Hub rows hold more distinct keys than one shared-memory hash pass (the
+// block class of LOCAL_MOVE, multi-pass gathers of AGGREGATE). A row (gather
+// window) of more than kHubMinRow entries whose first pass overflows is
+// bucketed once by its keys' passes into scratch of its level, so every later
+// pass reads its own bucket instead of the whole row. Shorter rows, and rows
+// without room, re-read the row per pass (the same result): scratch for the
+// many such rows of coarse levels would raise the peak.
+constexpr int kHubRowCap = 1536;   // distinct keys per pass of a block row
+constexpr int kHubBuckets = 2048;  // most buckets of a row (shared counters)
+constexpr i64 kHubMinRow = 32 * kHubRowCap;  // ~32 passes
+
+struct HubScratch {
+    int* base = nullptr;                 // null: none
+    i64 cap = 0;                         // ints
+    unsigned long long* next = nullptr;  // bump counter, zeroed per sweep and
+                                         // per AGGREGATE (Control::hub_next)
+};
+
+__host__ __device__ __forceinline__ i64 hub_buckets(i64 entries, i64 per) {
+    const i64 b = (entries + per - 1) / per;
+    return b < kHubBuckets ? b : kHubBuckets;
+}
+
+// Scratch ints of a level for a row of `deg` entries: a bucketed move takes
+// deg + buckets + 1, a bucketed gather (int64 positions) twice its window,
+// which the other members' rows widen.
+__host__ __device__ __forceinline__ i64 hub_ints(i64 deg) {
+    return deg > kHubMinRow ? 3 * deg + hub_buckets(deg, kHubRowCap) + 1 : 0;
+}
+
+// `need` ints of scratch for one row (thread-wise); -1: none left.
+__device__ __forceinline__ i64 hub_reserve(const HubScratch& hs, i64 need) {
+    if (!hs.base) return -1;
+    const i64 at = static_cast<i64>(
+        atomicAdd(hs.next, static_cast<unsigned long long>(need)));
+    return at + need <= hs.cap ? at : -1;
 }
 
 struct DeviceInfo {

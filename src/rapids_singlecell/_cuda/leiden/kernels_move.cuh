@@ -22,15 +22,15 @@ constexpr int kMoveLightBlocksPerSm = 4;
 #else
 constexpr int kMoveLightBlocksPerSm = 5;
 #endif
-constexpr int kMoveMidSlots = 256;     // per warp: 3 KB
-constexpr int kMoveMidBlock = 128;     // mid kernel: 4-warp blocks (13 KB)
-constexpr int kMoveBlockSlots = 2048;  // per block: 24 KB
-constexpr int kMoveXlCap = 1536;       // distinct keys per pass (load 0.75)
-constexpr int kMoveSmemIds = 4096;     // M0 block-privatised histogram
-constexpr i64 kNoScore = LLONG_MIN;    // "no candidate" (scores > -2^63)
-constexpr int kDeferIdle = -1;         // deferred-activation slot: unused
-constexpr int kDeferMulti = -2;        //   two movers with different targets
-constexpr int kEmptySlot = -1;         // free hash-table slot
+constexpr int kMoveMidSlots = 256;      // per warp: 3 KB
+constexpr int kMoveMidBlock = 128;      // mid kernel: 4-warp blocks (13 KB)
+constexpr int kMoveBlockSlots = 2048;   // per block: 24 KB
+constexpr int kMoveXlCap = kHubRowCap;  // distinct keys per pass (load 0.75)
+constexpr int kMoveSmemIds = 4096;      // M0 block-privatised histogram
+constexpr i64 kNoScore = LLONG_MIN;     // "no candidate" (scores > -2^63)
+constexpr int kDeferIdle = -1;          // deferred-activation slot: unused
+constexpr int kDeferMulti = -2;         //   two movers with different targets
+constexpr int kEmptySlot = -1;          // free hash-table slot
 
 enum : int { kMoveErrLabel = 1, kMoveErrBucket = 2 };
 
@@ -82,10 +82,11 @@ __device__ __forceinline__ int move_table_size(i64 keys, int slots) {
 constexpr u32 kMoveFreshBit = 0x80000000u;
 constexpr u32 kMoveIdMask = 0x7fffffffu;
 
-// Fixed point (numerics.cuh): edge weights and node weights k_hat are exact
-// int64 counts; with Mult mu = make_mult(k_hat_v, lambda_hat), pen(K, mu) is
-// lambda_hat * k_hat_v * K in the same units, exactly. Every decision compares
-// int64 values only.
+// Fixed point (numerics.cuh): node weights k_hat are exact int64 counts, and
+// so are the edge weights of level 0 (coarse levels read each edge weight as
+// one fp32 rounding of its exact sum); with Mult mu = make_mult(k_hat_v,
+// lambda_hat), pen(K, mu) is lambda_hat * k_hat_v * K in the same units,
+// exactly. Every decision compares int64 values only.
 
 // move_score: the local-moving score of moving v into a community c != d (v's
 // current community), from w_vc = W(v, c) (the summed weight between v and the
@@ -810,24 +811,73 @@ __device__ __forceinline__ bool move_block_table_add(int* keys, i64* vals,
     return false;
 }
 
+using MoveHubScan = cub::BlockScan<int, kBlock, cub::BLOCK_SCAN_WARP_SCANS>;
+
+// Buckets v's row by its keys' passes among nb (numerics.cuh: hub rows): a
+// counting sort of the row positions of its counted entries into the level's
+// scratch, after the offsets [nb + 1]; `cnt` (>= nb ints of the empty table)
+// counts, and is emptied again. Every thread calls it; null without room.
+template <WKind K>
+__device__ const int* move_hub_buckets(const MoveEval<K>& a, int v, i64 b,
+                                       i64 e, u64 nb, const HubScratch& hs,
+                                       int* cnt, i64* s_at,
+                                       MoveHubScan::TempStorage& tmp) {
+    if (threadIdx.x == 0)
+        *s_at = hub_reserve(hs, e - b + static_cast<i64>(nb) + 1);
+    for (u64 k = threadIdx.x; k < nb; k += blockDim.x) cnt[k] = 0;
+    __syncthreads();
+    const i64 at = *s_at;
+    if (at < 0) return nullptr;  // block-uniform
+    int* off = hs.base + at;
+    int* pos = off + nb + 1;
+    for (i64 j = b + threadIdx.x; j < e; j += blockDim.x) {
+        const int u = a.indices[j];
+        if (u != v && a.w(j) > 0) atomicAdd(&cnt[table_pass(a.P[u], nb)], 1);
+    }
+    __syncthreads();
+    int carry = 0;  // exclusive scan of the counts, kBlock at a time
+    for (u64 k0 = 0; k0 < nb; k0 += blockDim.x) {
+        const u64 k = k0 + threadIdx.x;
+        int x = k < nb ? cnt[k] : 0, total = 0;
+        MoveHubScan(tmp).ExclusiveSum(x, x, total);
+        if (k < nb) off[k] = cnt[k] = carry + x;  // cnt: the bucket's cursor
+        carry += total;
+        __syncthreads();  // tmp is reused
+    }
+    if (threadIdx.x == 0) off[nb] = carry;
+    for (i64 j = b + threadIdx.x; j < e; j += blockDim.x) {
+        const int u = a.indices[j];
+        if (u != v && a.w(j) > 0)
+            pos[atomicAdd(&cnt[table_pass(a.P[u], nb)], 1)] =
+                static_cast<int>(j - b);
+    }
+    __syncthreads();
+    for (u64 k = threadIdx.x; k < nb; k += blockDim.x) cnt[k] = kEmptySlot;
+    return off;
+}
+
 // block: block per vertex, shared-memory table in hash-range passes; npass
 // starts at 1, and a pass that overflows stops and is redone split: into
-// ceil(deg / pass_cap) passes the first time, else twice as many. The argmax
-// and W(v, d) carry across passes, so npass never changes the result.
+// ceil(deg / pass_cap) passes the first time, else twice as many. A hub row
+// (numerics.cuh) is bucketed instead at its first overflow, its passes then
+// reading their bucket only. The argmax and W(v, d) carry across passes, so
+// npass and the buckets never change the result.
 template <WKind K, bool kPrune>
 __global__ void __launch_bounds__(kBlock, 3)
     move_eval_block_kernel(MoveEval<K> a, const int* __restrict__ list,
                            const int* __restrict__ count, int cap, int pass_cap,
-                           MoveAct t) {
+                           MoveAct t, HubScratch hs) {
     __shared__ int s_key[kMoveBlockSlots];
     __shared__ i64 s_val[kMoveBlockSlots];
     __shared__ i64 s_w[kWarpsPerBlock][kWarp];
     __shared__ i64 s_g[kWarpsPerBlock];
     __shared__ int s_c[kWarpsPerBlock];
     __shared__ i64 s_own;
+    __shared__ i64 s_hub;
     __shared__ int s_claimed;
     __shared__ int s_ovf;
     __shared__ u32 s_res;
+    __shared__ MoveHubScan::TempStorage s_scan;
     const int tid = threadIdx.x;
     const int lane = tid & (kWarp - 1), wib = tid / kWarp;
     for (int s = tid; s < kMoveBlockSlots; s += blockDim.x) {
@@ -890,6 +940,8 @@ __global__ void __launch_bounds__(kBlock, 3)
         u64 p = 0;
         i64 rg = kNoScore;  // running argmax (thread 0)
         int rc = INT_MAX;
+        u64 nb = 0;                // buckets of a bucketed hub row, and
+        const int* off = nullptr;  // their offsets into its positions
         if (tid == 0) s_own = 0;
         while (p < npass) {
             if (tid == 0) {
@@ -897,17 +949,24 @@ __global__ void __launch_bounds__(kBlock, 3)
                 s_ovf = 0;
             }
             __syncthreads();
-            for (i64 j0 = b + static_cast<i64>(wib) * kWarp; j0 < e;
+            i64 lo = b, hi = e;  // the pass reads the row, or its bucket
+            if (nb) {
+                const u64 bk = p / (npass / nb);
+                lo = off[bk];
+                hi = off[bk + 1];
+            }
+            for (i64 j0 = lo + static_cast<i64>(wib) * kWarp; j0 < hi;
                  j0 += blockDim.x) {
                 // an overflowed first pass is redone split: stop early (a
                 // full table probes long)
                 if (npass < deg_pass &&
                     __any_sync(kFullMask, *static_cast<volatile int*>(&s_ovf)))
                     break;
-                const i64 j = j0 + lane;
+                const i64 jj = j0 + lane;
                 int c = -1;
                 i64 x = 0;
-                if (j < e) {
+                if (jj < hi) {
+                    const i64 j = nb ? b + off[nb + 1 + jj] : jj;
                     const int u = __ldcs(&a.indices[j]);
                     if (u != v) {
                         const i64 q = a.w.cs(j);
@@ -941,7 +1000,15 @@ __global__ void __launch_bounds__(kBlock, 3)
                     s_key[s] = kEmptySlot;
                     s_val[s] = 0;
                 }
-                npass = npass < deg_pass ? deg_pass : 2 * npass;
+                if (npass == 1 && hs.base && deg > kHubMinRow) {  // a hub row
+                    __syncthreads();
+                    nb = static_cast<u64>(hub_buckets(deg, pass_cap));
+                    off = move_hub_buckets(a, v, b, e, nb, hs, s_key, &s_hub,
+                                           s_scan);
+                    if (!off) nb = 0;
+                }
+                npass = nb ? (npass == 1 ? nb : 2 * npass)
+                           : (npass < deg_pass ? deg_pass : 2 * npass);
                 p *= 2;
                 continue;  // the loop head synchronises before the next pass
             }
@@ -1088,8 +1155,10 @@ __global__ void move_compact_kernel(const int* __restrict__ rank,
     if (blockIdx.x == 0 && threadIdx.x == 0) ctl->move_C = rank[2 * n];
 }
 
-__global__ void move_clear_kernel(int* __restrict__ p, int count) {
+__global__ void move_clear_kernel(int* __restrict__ p, int count,
+                                  unsigned long long* hub_next) {
     for (int i = threadIdx.x; i < count; i += blockDim.x) p[i] = 0;
+    if (threadIdx.x == 0) *hub_next = 0;  // the sweep's hub rows reserve anew
 }
 
 // Starts a launch chunk of sweeps [k0, k_end): sweep counter, cleared movers.
@@ -1144,6 +1213,7 @@ struct MoveParams {
     int S = kNumSubrounds;
     ClassThresholds th{};
     int xl_cap = kMoveXlCap;  // distinct keys per hash-range pass
+    HubScratch hub{};         // the level's hub scratch (base, cap)
     i64 id_bound = -1;        // P ids in [0, id_bound) on entry; -1: n
     // sweeps of the first chunk (replayed TOP phases: 1, they mostly certify)
     int first_chunk = kSweepChunk;
@@ -1248,7 +1318,7 @@ template <WKind K, bool kPrune>
 void move_eval_calls_t(KernelCall* c, const MoveEval<K>& a,
                        const MoveBuckets& B, int r,
                        const i64 (&cc)[kNumClasses], int xl_cap,
-                       const MoveAct& t) {
+                       const MoveAct& t, const HubScratch& hs) {
     c[0].set(cc[kClassLight] > 0, move_eval_light_kernel<K, kPrune>,
              dim3(grid_occ(move_eval_light_kernel<K, kPrune>, cc[kClassLight],
                            kWarpsPerBlock)),
@@ -1263,17 +1333,17 @@ void move_eval_calls_t(KernelCall* c, const MoveEval<K>& a,
         cc[kClassBlock] > 0, move_eval_block_kernel<K, kPrune>,
         dim3(grid_occ(move_eval_block_kernel<K, kPrune>, cc[kClassBlock], 1)),
         dim3(kBlock), 0, a, B.list(r, kClassBlock), B.count(r, kClassBlock),
-        B.cap[kClassBlock], xl_cap, t);
+        B.cap[kClassBlock], xl_cap, t, hs);
 }
 
 template <WKind K>
 void move_eval_calls(KernelCall* c, const MoveEval<K>& a, const MoveBuckets& B,
                      int r, const i64 (&cc)[kNumClasses], int xl_cap,
-                     bool prune, const MoveAct& t = MoveAct{}) {
+                     bool prune, const MoveAct& t, const HubScratch& hs) {
     if (prune) {
-        move_eval_calls_t<K, true>(c, a, B, r, cc, xl_cap, t);
+        move_eval_calls_t<K, true>(c, a, B, r, cc, xl_cap, t, hs);
     } else {
-        move_eval_calls_t<K, false>(c, a, B, r, cc, xl_cap, t);
+        move_eval_calls_t<K, false>(c, a, B, r, cc, xl_cap, t, hs);
     }
 }
 
@@ -1395,13 +1465,14 @@ MoveRun prepare_local_move(const i64* indptr, const int* indices, EdgeW<K> w,
     ml.calls.resize(static_cast<std::size_t>(ncalls));
     KernelCall* c = ml.calls.data();
     c[0].set(true, move_clear_kernel, dim3(1), dim3(kBlock), 0, ctr.buckets(),
-             S * kNumClasses);
+             S * kNumClasses, &ctl->hub_next);
+    const HubScratch hs{prm.hub.base, prm.hub.cap, &ctl->hub_next};
     c[1].set(true, move_bucket_kernel, dim3(grid_items(v1 - v0)), dim3(kBlock),
              0, indptr, v0, v1, t, P);
     for (int r = 0; r < S; ++r) {
         KernelCall* cr = c + kSweepHead + kSweepPerRound * r;
         t.r = r;
-        move_eval_calls<K>(cr, a, B, r, class_count, prm.xl_cap, prune, t);
+        move_eval_calls<K>(cr, a, B, r, class_count, prm.xl_cap, prune, t, hs);
         cr[3].set(true, move_apply_kernel, dim3(g_items), dim3(kBlock), 0, khat,
                   P, mb.K, mb.csize, mb.dest, mb.movers, t,
                   static_cast<int>(n));

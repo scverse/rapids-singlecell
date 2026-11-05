@@ -299,10 +299,15 @@ class PartitionedDriver {
     // Every resolution.
     void run(const DriverInput& in, const Quantize& quantize,
              DriverResult& out) {
+        if (in.init && root_ && n_ > 0) {  // on the root's device
+            use(*root_);
+            check_initial_membership(in.init, n_, root_->L.ctl, root_->L.pinned,
+                                     root_->s);
+        }
         int s_prev = INT_MIN;
         for (std::size_t i = 0; i < in.gammas.size(); ++i) {
             const double gamma = in.gammas[i];
-            int* labels = in.labels_out
+            int* labels = in.labels_out  // host
                               ? in.labels_out + static_cast<i64>(i) * n_
                               : nullptr;
             ResolutionResult r;
@@ -314,12 +319,7 @@ class PartitionedDriver {
             }
             if (in.info.n_counted == 0 || parts_[0].q.two_m_hat <= 0) {
                 r.n_clusters = n_;  // no counted entry: singletons
-                if (root_ && labels) {
-                    use(*root_);
-                    drv_iota_kernel<<<grid_items(n_), kBlock, 0, root_->s>>>(
-                        labels, n_);
-                    CUDA_CHECK_LAST_ERROR(drv_iota_kernel);
-                }
+                if (root_ && labels) std::iota(labels, labels + n_, 0);
             } else {
                 run_resolution(gamma, in.seeds[i], in.init, labels, r);
             }
@@ -436,6 +436,7 @@ class PartitionedDriver {
             g.n = n_;
             g.nnz = p.nnz;
             for (int c = 0; c < kNumClasses; ++c) g.cls[c] = p.q.class_count[c];
+            g.hub_ints = p.q.hub_ints;
         }
         if (root_) root_drv_->set_level0(root_->q, n_, root_->nnz);
     }
@@ -493,11 +494,15 @@ class PartitionedDriver {
             if (final) break;
         }
         out.modularity = quality(C);
-        if (root_ && labels_out) {
+        if (root_ && labels_out) {  // ranked in place, then to the host
             use(*root_);
             const Layout& L = root_->L;
-            run_rank_labels(L.persist.P0, n_, C, labels_out, L.final_, L.cub,
+            run_rank_labels(L.persist.P0, n_, C, L.persist.P0, L.final_, L.cub,
                             L.cub_bytes, L.ctl, root_->s);
+            cuda_check(
+                cudaMemcpyAsync(labels_out, L.persist.P0, n_ * sizeof(int),
+                                cudaMemcpyDeviceToHost, root_->s),
+                "leiden: labels to the host");
             read(*root_);
         }
         out.n_clusters = C;
@@ -507,7 +512,15 @@ class PartitionedDriver {
     // C_out: communities before the CC split.
     void iteration(i64 id_bound, int it, bool vcycle, IterationStat& stat,
                    i64& C_out) {
-        each([](Part& p) { p.L.arena.reset(); });
+        each([](Part& p) {
+            p.L.arena.reset();
+            p.g0.hub = {};  // level 0's hub scratch, for the iteration
+            if (p.g0.hub_ints > 0)
+                p.g0.hub =
+                    HubScratch{p.L.arena.push_bottom<int>(
+                                   static_cast<std::size_t>(p.g0.hub_ints)),
+                               p.g0.hub_ints};
+        });
         const u32 uit = static_cast<u32>(it);
         bool moved = false;
         u32 phase = kPhaseDown;
@@ -642,10 +655,12 @@ class PartitionedDriver {
         each([&](Part& p) {
             p.ml.graph = nullptr;
             p.ml.loop = false;
+            MoveParams pp = prm;
+            pp.hub = p.g0.hub;
             p.g0.with_w([&](auto w) {
                 p.mr = prepare_local_move(
                     p.g0.indptr, p.g0.indices, w, p.g0.khat, p.L.persist.P0, n_,
-                    p.g0.cls, prm, p.L.move, p.L.ctl, p.ml, p.s, p.v0, p.v1);
+                    p.g0.cls, pp, p.L.move, p.L.ctl, p.ml, p.s, p.v0, p.v1);
             });
         });
         const i64 words = (n_ + 31) / 32;
@@ -852,7 +867,8 @@ class PartitionedDriver {
                 constexpr WKind KW = MoveWKindOf<decltype(w)>::value;
                 AggregatePlan<i64> plan = aggregate_begin<KW, i64>(
                     p.g0.indptr, p.g0.indices, w, p.g0.khat, n_, p.nnz, p.cmap0,
-                    opt, ab, p.L.arena, p.L.cub, p.L.cub_bytes, p.L.ctl, p.s);
+                    opt, ab, p.L.arena, p.L.cub, p.L.cub_bytes, p.L.ctl, p.s,
+                    p.g0.hub);
                 p.pw = plan.h_w;
                 p.pidx = plan.h_idx;
             });
@@ -985,7 +1001,7 @@ class PartitionedDriver {
             plans[i] = aggregate_begin<WKind::I64, float>(
                 aux_ip[i], aux_idx[i], EdgeW<WKind::I64>{aux_w[i]},
                 ab.khat_next, n1, tot, iota[i], opt, ib, p.L.arena, p.L.cub,
-                p.L.cub_bytes, p.L.ctl, p.s);
+                p.L.cub_bytes, p.L.ctl, p.s, p.g0.hub);  // level 0's, now idle
         }
         for (std::size_t i = 0; i < parts_.size(); ++i)
             parts_[i].f = read(parts_[i]).nnz_next;
@@ -1058,6 +1074,9 @@ class PartitionedDriver {
         cuda_check(cudaMemsetAsync(r.L.ctl->coarse_class_count, 0,
                                    sizeof(r.L.ctl->coarse_class_count), r.s),
                    "leiden: clear coarse classes");
+        cuda_check(
+            cudaMemsetAsync(&r.L.ctl->coarse_hub_ints, 0, sizeof(i64), r.s),
+            "leiden: clear coarse hub scratch");
         agg_stats_kernel<<<grid_items(n1), kBlock, 0, r.s>>>(
             ab.cdeg, ab.indptr_next, dp_.th, r.L.ctl);
         CUDA_CHECK_LAST_ERROR(agg_stats_kernel);
@@ -1078,6 +1097,11 @@ class PartitionedDriver {
         g1.nnz = nnz1;
         for (int k = 0; k < kNumClasses; ++k)
             g1.cls[k] = c.coarse_class_count[k];
+        if (c.coarse_hub_ints > 0)  // with level 1, on the root
+            g1.hub =
+                HubScratch{r.L.arena.push_bottom<int>(
+                               static_cast<std::size_t>(c.coarse_hub_ints)),
+                           c.coarse_hub_ints};
     }
 
     // CC_SPLIT of the partition arr(p) (replicated): each partition's forest of

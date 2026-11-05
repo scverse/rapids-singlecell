@@ -460,9 +460,9 @@ __global__ void label_rank_kernel(i64 C, const int* __restrict__ sorted_vals,
         label_of[sorted_vals[i]] = static_cast<int>(i);
 }
 
-__global__ void label_gather_kernel(const int* __restrict__ P, i64 n, i64 C,
+__global__ void label_gather_kernel(const int* P, i64 n, i64 C,
                                     const int* __restrict__ label_of,
-                                    int* __restrict__ labels_out) {
+                                    int* labels_out) {  // may be P (in place)
     const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
     for (i64 v = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; v < n;
          v += stride) {
