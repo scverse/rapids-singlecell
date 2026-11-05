@@ -24,7 +24,7 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
-    _large_coo_to_host_csr,
+    _connectivities_to_host_csr,
     _Metrics,
 )
 from rapids_singlecell.preprocessing._neighbors._wnn import wnn
@@ -246,14 +246,7 @@ def neighbors(
         method=method,
         metric=metric,
     )
-    if connectivities.nnz >= np.iinfo(np.int32).max:
-        connectivities = (
-            _large_coo_to_host_csr(connectivities)
-            if connectivities.format == "coo"  # gauss and jaccard return CSR
-            else connectivities.get().tocsr()
-        )
-    else:
-        connectivities = connectivities.tocsr().get()
+    connectivities = _connectivities_to_host_csr(connectivities)
 
     # Store results
     neighbors_key = key_added if key_added is not None else "neighbors"

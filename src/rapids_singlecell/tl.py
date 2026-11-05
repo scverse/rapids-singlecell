@@ -6,7 +6,6 @@ from .tools import (
     embedding_density,
     ingest,
     leiden,
-    louvain,
     pca,
     rank_genes_groups,
     score_genes,
@@ -18,6 +17,9 @@ from .tools import (
     kmeans as kmeans,
 )
 from .tools import (
+    louvain as louvain,
+)
+from .tools import (
     rank_genes_groups_logreg as rank_genes_groups_logreg,
 )
 
@@ -27,7 +29,6 @@ __all__ = [
     "embedding_density",
     "ingest",
     "leiden",
-    "louvain",
     "pca",
     "rank_genes_groups",
     "score_genes",
@@ -38,5 +39,6 @@ __all__ = [
 
 __deprecated_exports__ = {
     "kmeans": "Deprecated; do not use in new analyses.",
+    "louvain": louvain.__deprecated__,
     "rank_genes_groups_logreg": rank_genes_groups_logreg.__deprecated__,
 }

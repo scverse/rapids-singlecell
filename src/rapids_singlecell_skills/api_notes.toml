@@ -82,7 +82,7 @@ related = ["pp.normalize_pearson_residuals", "pp.pca"]
 
 [entries."pp.neighbors".index]
 keywords = ["connectivities", "graph", "knn", "nearest neighbor", "neighbors"]
-related = ["pp.bbknn", "pp.harmony_integrate", "tl.leiden", "tl.louvain", "tl.umap"]
+related = ["pp.bbknn", "pp.harmony_integrate", "tl.leiden", "tl.umap"]
 
 [entries."pp.log1p".index]
 keywords = ["log transform", "log1p", "logarithmize"]
@@ -117,7 +117,7 @@ keywords = [
   "neighbor graph",
   "reproducible leiden",
 ]
-related = ["tl.louvain", "pp.neighbors"]
+related = ["pp.neighbors"]
 
 [[entries."tl.leiden".notes]]
 kind = "snapshot"
@@ -129,10 +129,6 @@ as_of = { rsc = "0.16.1.dev7+g2ec3ef061.d20260722" }
 kind = "durable"
 claim = "Leiden partitions change with the random seed. Sweep resolutions over several rng values and keep resolutions whose labels agree across seeds."
 source = "https://doi.org/10.1038/s41467-025-60702-8"
-
-[entries."tl.louvain".index]
-keywords = ["cluster", "clustering", "community detection", "louvain", "neighbor graph"]
-related = ["tl.leiden", "pp.neighbors"]
 
 [entries."tl.rank_genes_groups".index]
 keywords = ["differential expression", "marker genes", "markers", "rank genes"]

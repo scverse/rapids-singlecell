@@ -19,7 +19,7 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
-    _large_coo_to_host_csr,
+    _connectivities_to_host_csr,
 )
 from rapids_singlecell.tools._utils import _choose_representation
 
@@ -429,12 +429,7 @@ def wnn(
     connectivities = _calc_connectivities(
         knn_indices, knn_dist, n_obs=n_obs, n_neighbors=n_neighbors + 1, rng=rng, method=method
     )
-    if connectivities.nnz < np.iinfo(np.int32).max:
-        connectivities = connectivities.tocsr().get()
-    elif connectivities.format == "coo":
-        connectivities = _large_coo_to_host_csr(connectivities)
-    else:  # gauss and jaccard return CSR
-        connectivities = connectivities.get().tocsr()
+    connectivities = _connectivities_to_host_csr(connectivities)
 
     if adata.is_view:  # only now, so that errors leave a view untouched
         adata._init_as_actual(adata.copy())
