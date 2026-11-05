@@ -139,7 +139,7 @@ class Preset(enum.StrEnum):
         return BasicEmbeddingPreset(key_added=None if self is Preset.ScanpyV1 else name)
 
     @contextmanager
-    def override(self, preset: Preset) -> Generator[Preset, None, None]:
+    def override(self, preset: Preset) -> Generator[Preset]:
         """Temporarily override :attr:`rapids_singlecell.settings.preset`."""
         with settings.override(preset=preset):
             yield self
