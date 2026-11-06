@@ -83,6 +83,7 @@ def calculate_qc_metrics(
     Returns
     -------
         A :class:`~rapids_singlecell.pp.QcMetricsResult` if `out=True`, else `None`.
+
         With `out=False`, adds the following columns in :attr:`~anndata.AnnData.obs` :
             `total_{var_type}_by_{expr_type}`
                 E.g. 'total_genes_by_counts'. Number of genes with positive counts in a cell.
