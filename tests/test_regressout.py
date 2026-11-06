@@ -24,11 +24,11 @@ def test_regress_out_ordinal(dtype):
     adata.obs["n_counts"] = adata.X.sum(axis=1).get()
 
     # results using only one processor
-    rapids = rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=100, inplace=False)
+    rapids = rsc.pp.regress_out(adata, ["n_counts", "percent_mito"], batchsize=100, out=True)
     assert adata.X.shape == rapids.shape
 
     # results using 8 processors
-    cupy = rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize="all", inplace=False)
+    cupy = rsc.pp.regress_out(adata, ["n_counts", "percent_mito"], batchsize="all", out=True)
     if dtype == "float32":
         cp.testing.assert_allclose(cupy, rapids, atol=1e-5)
     else:
@@ -47,18 +47,25 @@ def test_regress_out_layer(dtype, batchsize):
     adata.obs["n_counts"] = adata.X.sum(axis=1).get()
     adata.layers["counts"] = adata.X.copy()
 
-    single = rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=batchsize, inplace=False)
+    single = rsc.pp.regress_out(adata, ["n_counts", "percent_mito"], batchsize=batchsize, out=True)
     assert adata.X.shape == single.shape
 
-    layer = rsc.pp.regress_out(
-        adata,
-        layer="counts",
-        keys=["n_counts", "percent_mito"],
-        batchsize=batchsize,
-        inplace=False,
-    )
-
+    with pytest.warns(FutureWarning, match="keys"):
+        layer = rsc.pp.regress_out(
+            adata,
+            layer="counts",
+            keys=["n_counts", "percent_mito"],
+            batchsize=batchsize,
+            inplace=False,
+        )
     cp.testing.assert_array_equal(single, layer)
+
+    from anndata.acc import A
+
+    rsc.pp.regress_out(
+        adata, [A.obs["n_counts"], "percent_mito"], use="layers.counts", out=A.layers["r"], batchsize=batchsize
+    )
+    cp.testing.assert_array_equal(single, adata.layers["r"])
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
@@ -80,7 +87,7 @@ def test_regress_out_categorical(dtype, sparse_format):
 
     # rapids
     rsc.get.anndata_to_GPU(adata)
-    rsc.pp.regress_out(adata, keys=["batch"])
+    rsc.pp.regress_out(adata, ["batch"])
 
     if dtype == "float32":
         cp.testing.assert_allclose(adata.X, cp.array(adata_sc.X), atol=1e-5)
@@ -96,7 +103,7 @@ def test_regress_out_covariate_scale(dtype, batchsize):
     adata.obs["n_counts"] = adata.obs["n_counts"].to_numpy() * 100
     rsc.get.anndata_to_GPU(adata)
     adata.X = adata.X.astype(dtype)
-    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=batchsize)
+    rsc.pp.regress_out(adata, ["n_counts", "percent_mito"], batchsize=batchsize)
     # Same reference as test_regress_out_reproducible: scaling changes nothing.
     tester = np.load(HERE / "_data/regress_test_small.npy")
     if dtype == "float32":
@@ -112,7 +119,7 @@ def test_regress_out_reproducible(dtype, batchsize):
     adata = adata.raw.to_adata()[:200, :200].copy()
     rsc.get.anndata_to_GPU(adata)
     adata.X = adata.X.astype(dtype)
-    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=batchsize)
+    rsc.pp.regress_out(adata, ["n_counts", "percent_mito"], batchsize=batchsize)
     # This file was generated for scanpy version 1.10.3
     tester = np.load(HERE / "_data/regress_test_small.npy")
     if dtype == "float32":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import scanpy as sc
+from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 
 from rapids_singlecell.tools._diffmap import (
@@ -32,11 +33,13 @@ class TestLoadConnectivities:
         adata.obsp["custom_conn"] = adata.obsp["connectivities"].copy()
         adata.obsp["custom_dist"] = adata.obsp["distances"].copy()
 
+        conn = _load_connectivities(adata, A.obsp["custom_conn"])
+        assert conn.shape == (700, 700)
         conn = _load_connectivities(adata, neighbors_key="custom_neighbors")
         assert conn.shape == (700, 700)
 
     def test_missing_neighbors_raises(self, adata):
-        with pytest.raises(ValueError, match="No neighbors found"):
+        with pytest.raises(ValueError, match="Did not find"):
             _load_connectivities(adata, neighbors_key="no_such_key")
 
     def test_missing_connectivities_raises(self, adata):
@@ -45,7 +48,7 @@ class TestLoadConnectivities:
             "distances_key": "missing_dist",
             "params": {"n_neighbors": 10},
         }
-        with pytest.raises(ValueError, match="No connectivities found"):
+        with pytest.raises(ValueError, match="Did not find .obsp"):
             _load_connectivities(adata, neighbors_key="bad")
 
 
@@ -125,8 +128,16 @@ class TestDiffmap:
         adata.obsp["custom_conn"] = adata.obsp["connectivities"].copy()
         adata.obsp["custom_dist"] = adata.obsp["distances"].copy()
 
-        diffmap(adata, n_comps=10, neighbors_key="custom_neighbors")
+        with pytest.warns(FutureWarning, match="neighbors_key"):
+            diffmap(adata, n_comps=10, neighbors_key="custom_neighbors")
         assert adata.obsm["X_diffmap"].shape == (700, 10)
+
+    def test_use_out(self, adata):
+        adata.obsp["g"] = adata.obsp["connectivities"].copy()
+        emb = diffmap(adata, n_comps=10, use=A.obsp["g"], out=True, rng=0)
+        diffmap(adata, n_comps=10, use="obsp.g", out=A.obsm["dm"], rng=0)
+        np.testing.assert_allclose(np.abs(adata.obsm["dm"]), np.abs(emb), atol=1e-5)
+        assert adata.uns["dm"]["evals"].shape == (10,)
 
     def test_output_on_cpu(self, adata):
         diffmap(adata, n_comps=10)

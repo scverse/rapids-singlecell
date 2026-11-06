@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import cupy as cp
+import pandas as pd
 from cupyx.scipy import sparse
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.get import _get_obs_rep
+from rapids_singlecell.get import _get_arr
+from rapids_singlecell.get._out import DEPR_USE, _out_dests, _use_args, _write_dests
+from rapids_singlecell.get._utils import LayerAcc
 
 from ._utils import _check_gpu_X
 
@@ -14,8 +18,26 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
     from rapids_singlecell._utils import ArrayTypesDask
+    from rapids_singlecell.get._utils import MultiAcc
 
 
+class QcMetricsResult(NamedTuple):
+    """Outputs of :func:`~rapids_singlecell.pp.calculate_qc_metrics`."""
+
+    obs: pd.DataFrame
+    """Per-observation metrics."""
+    var: pd.DataFrame
+    """Per-variable metrics."""
+
+
+class QcMetricsOut(TypedDict, total=False):
+    """Where a mapping `out` of :func:`~rapids_singlecell.pp.calculate_qc_metrics` writes each output."""
+
+    obs: MultiAcc | str
+    var: MultiAcc | str
+
+
+@deprecated_arg("layer", DEPR_USE)
 def calculate_qc_metrics(
     adata: AnnData,
     *,
@@ -23,8 +45,11 @@ def calculate_qc_metrics(
     var_type: str = "genes",
     qc_vars: str | list = None,
     log1p: bool = True,
+    use: LayerAcc | str | None = None,
+    out: MultiAcc | str | QcMetricsOut | bool = False,
+    # deprecated
     layer: str = None,
-) -> None:
+) -> QcMetricsResult | None:
     """Calculate basic quality-control metrics :cite:p:`McCarthy2017`.
 
     Calculates number of genes per cell (n_genes) and number of counts per cell (n_counts).
@@ -43,12 +68,22 @@ def calculate_qc_metrics(
             Create these boolean columns before calculating QC metrics.
         log1p
             Set to `False` to skip computing `log1p` transformed annotations.
-        layer
-            If provided, use :attr:`~anndata.AnnData.layers` for expression values instead of :attr:`~anndata.AnnData.X`.
+        use
+            Which matrix to use for expression values, e.g. `A.X` or `A.layers['counts']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
+        out
+            Where to write the metrics.
+            If `False`, they are written as columns of `.obs` and `.var` (see below).
+            An accessor like `A.obsm['qc']` writes the metrics tables as whole DataFrames
+            to `.obsm['qc']` and `.varm['qc']` instead.
+            A mapping (:class:`~rapids_singlecell.pp.QcMetricsOut`) writes only the tables it names,
+            e.g. `{'obs': A.obsm['qc']}`.
+            If `True`, they are returned as a :class:`~rapids_singlecell.pp.QcMetricsResult`.
 
     Returns
     -------
-        adds the following columns in :attr:`~anndata.AnnData.obs` :
+        A :class:`~rapids_singlecell.pp.QcMetricsResult` if `out=True`, else `None`.
+        With `out=False`, adds the following columns in :attr:`~anndata.AnnData.obs` :
             `total_{var_type}_by_{expr_type}`
                 E.g. 'total_genes_by_counts'. Number of genes with positive counts in a cell.
             `total_{expr_type}`
@@ -70,26 +105,26 @@ def calculate_qc_metrics(
                 E.g. 'pct_dropout_by_counts'. Percentage of cells this feature does not appear in.
 
     """
-    X = _get_obs_rep(adata, layer=layer)
+    X = _get_arr(adata, dim="obs", **_use_args(use, kinds=(LayerAcc,), layer=layer))
 
     _check_gpu_X(X, allow_dask=True)
 
     sums_cells, sums_genes, genes_per_cell, cells_per_gene = _basic_qc(X)
-    # .var
-    adata.var[f"n_cells_by_{expr_type}"] = cp.asnumpy(cells_per_gene)
-    adata.var[f"total_{expr_type}"] = cp.asnumpy(sums_genes)
+    var = pd.DataFrame(index=adata.var_names)
+    obs = pd.DataFrame(index=adata.obs_names)
+    var[f"n_cells_by_{expr_type}"] = cp.asnumpy(cells_per_gene)
+    var[f"total_{expr_type}"] = cp.asnumpy(sums_genes)
     mean_array = sums_genes / adata.n_obs
-    adata.var[f"mean_{expr_type}"] = cp.asnumpy(mean_array)
-    adata.var[f"pct_dropout_by_{expr_type}"] = cp.asnumpy((1 - cells_per_gene / adata.n_obs) * 100)
+    var[f"mean_{expr_type}"] = cp.asnumpy(mean_array)
+    var[f"pct_dropout_by_{expr_type}"] = cp.asnumpy((1 - cells_per_gene / adata.n_obs) * 100)
     if log1p:
-        adata.var[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_genes))
-        adata.var[f"log1p_mean_{expr_type}"] = cp.asnumpy(cp.log1p(mean_array))
-    # .obs
-    adata.obs[f"n_{var_type}_by_{expr_type}"] = cp.asnumpy(genes_per_cell)
-    adata.obs[f"total_{expr_type}"] = cp.asnumpy(sums_cells)
+        var[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_genes))
+        var[f"log1p_mean_{expr_type}"] = cp.asnumpy(cp.log1p(mean_array))
+    obs[f"n_{var_type}_by_{expr_type}"] = cp.asnumpy(genes_per_cell)
+    obs[f"total_{expr_type}"] = cp.asnumpy(sums_cells)
     if log1p:
-        adata.obs[f"log1p_n_{var_type}_by_{expr_type}"] = cp.asnumpy(cp.log1p(genes_per_cell))
-        adata.obs[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_cells))
+        obs[f"log1p_n_{var_type}_by_{expr_type}"] = cp.asnumpy(cp.log1p(genes_per_cell))
+        obs[f"log1p_total_{expr_type}"] = cp.asnumpy(cp.log1p(sums_cells))
 
     if qc_vars:
         if isinstance(qc_vars, str):
@@ -98,10 +133,26 @@ def calculate_qc_metrics(
             mask = cp.array(adata.var[qc_var], dtype=cp.bool_)
             sums_cells_sub = _geneset_qc(X, mask)
 
-            adata.obs[f"total_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub)
-            adata.obs[f"pct_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub / sums_cells * 100)
+            obs[f"total_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub)
+            obs[f"pct_{expr_type}_{qc_var}"] = cp.asnumpy(sums_cells_sub / sums_cells * 100)
             if log1p:
-                adata.obs[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(cp.log1p(sums_cells_sub))
+                obs[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(cp.log1p(sums_cells_sub))
+
+    vals = QcMetricsResult(obs, var)
+    if out is True:
+        return vals
+    if out is False:
+        adata.obs[obs.columns] = obs
+        adata.var[var.columns] = var
+        return None
+    _, dests = _out_dests(
+        out,
+        None,
+        dests=lambda _: QcMetricsResult({"obsm": "qc"}, {"varm": "qc"}),
+        kinds=QcMetricsResult({"obsm"}, {"varm"}),
+    )
+    _write_dests(adata, vals, dests)
+    return None
 
 
 def _basic_qc(

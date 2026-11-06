@@ -9,9 +9,8 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 from natsort import natsorted
-from scanpy.tools._utils import _choose_graph
 from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
-from scverse_misc import Deprecation, deprecated
+from scverse_misc import Deprecation, deprecated, deprecated_arg
 
 from rapids_singlecell._keys import _resolve_obsm_key
 from rapids_singlecell._utils._random import (
@@ -21,14 +20,40 @@ from rapids_singlecell._utils._random import (
     _LegacyRng,
     _seed_from_rng,
 )
+from rapids_singlecell.get._out import (
+    DEPR_KEY_ADDED,
+    DEPR_NEIGHBORS_KEY,
+    DEPR_OBSP,
+    _out_key,
+    _resolve_obs,
+    deprecated_copy,
+)
 
-from ._utils import _choose_representation
+from ._utils import _choose_representation, _use_graph
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
     from scipy import sparse
+
+    from rapids_singlecell.get._utils import AdRef, GraphAcc, LayerAcc, MultiAcc
+
+_DEPR_ADJACENCY = Deprecation("0.19.0", "Store the graph in `.obsp` and pass `use=A.obsp[...]` instead.")
+
+
+def _cluster_labels(key, resolutions, labels: dict, *, out, adata: AnnData, params: dict, modularities: list):
+    """Return the labels for `out=True`, or write them and the `.uns` entry."""
+    single = len(resolutions) == 1
+    if out is True:
+        return labels[resolutions[0]] if single else labels
+    for resolution, cat in labels.items():
+        adata.obs[key[0] if single else f"{key[0]}_{resolution}"] = cat
+    adata.uns[key[1]] = {
+        "params": {"resolution": resolutions[0] if single else resolutions, **params},
+        "modularity": modularities[0] if single else modularities,
+    }
+    return None
 
 
 def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
@@ -136,6 +161,11 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
 
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_arg("adjacency", _DEPR_ADJACENCY)
+@deprecated_arg("neighbors_key", DEPR_NEIGHBORS_KEY)
+@deprecated_arg("obsp", DEPR_OBSP)
+@deprecated_copy
 def leiden(
     adata: AnnData,
     resolution: float | list[float] = 1.0,
@@ -143,16 +173,19 @@ def leiden(
     rng: SeedLike | RNGLike | None = None,
     theta: float = 1.0,
     restrict_to: tuple[str, Sequence[str]] | None = None,
-    key_added: str = "leiden",
-    adjacency: sparse.spmatrix | None = None,
     n_iterations: int = 100,
     use_weights: bool = True,
-    neighbors_key: str | None = None,
-    obsp: str | None = None,
     dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
+    use: GraphAcc | str | None = None,
+    out: AdRef | str | bool = False,
+    # deprecated
+    key_added: str | None = None,
+    adjacency: sparse.spmatrix | None = None,
+    neighbors_key: str | None = None,
+    obsp: str | None = None,
     copy: bool = False,
-) -> AnnData | None:
+) -> AnnData | pd.Categorical | dict[float, pd.Categorical] | None:
     """
     Cluster cells into subgroups using the Leiden algorithm :cite:p:`Traag2019`.
 
@@ -184,12 +217,6 @@ def leiden(
             sample annotation, tuple needs to contain
             `(obs_key, list_of_categories)`.
 
-        key_added
-            `adata.obs` key under which to add the cluster labels.
-
-        adjacency
-            Sparse adjacency matrix of the graph, defaults to neighbors
-            connectivities.
 
         n_iterations
             This controls the maximum number of levels/iterations of the
@@ -201,36 +228,33 @@ def leiden(
             If `True`, edge weights from the graph are used in the
             computation (placing more emphasis on stronger edges).
 
-        neighbors_key
-            If not specified, `leiden` looks at `.obsp['connectivities']`
-            for neighbors connectivities. If specified, `leiden` looks at
-            `.obsp[.uns[neighbors_key]['connectivities_key']]` for neighbors
-            connectivities.
-
-        obsp
-            Use .obsp[obsp] as adjacency. You can't specify both
-            `obsp` and `neighbors_key` at the same time.
-
         dtype
             Data type to use for the adjacency matrix.
 
         use_dask
             If `True`, use Dask to create the graph and cluster. This will use all GPUs available. This feature is experimental. For datasets with less than 10 Million cells, it is recommended to use `use_dask=False`.
 
-        copy
-            Whether to copy `adata` or modify it in place.
+        use
+            The neighborhood graph (connectivities) to cluster, e.g. `A.obsp['k']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
+            If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
+
+        out
+            Where to write the cluster labels, e.g. `A.obs['clusters']`; the parameters go to `.uns` under the same key.
+            If `True`, the labels are returned instead (a dict by resolution for several resolutions).
+            If `False`, they are written to `.obs['leiden']` and `.uns['leiden']` (`'leiden_R'` with `restrict_to`).
+            Several resolutions are written to `.obs[f'{key}_{resolution}']`.
     """
     # Adjacency graph
 
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
-    adata = adata.copy() if copy else adata
-
     dtype = _check_dtype(dtype)
-
-    if adjacency is None:
-        adjacency = _choose_graph(adata, obsp, neighbors_key)
+    key = _out_key(out, key_added, kind="obs", default="leiden")
+    # like `key_added`, the default key gets a suffix, keys from `out` are literal
+    col = f"{key}_R" if restrict_to is not None and key == "leiden" and out is False else key
+    adjacency = _use_graph(adata, use, adjacency=adjacency, obsp=obsp, neighbors_key=neighbors_key)
     if restrict_to is not None:
         restrict_key, restrict_categories = restrict_to
         adjacency, restrict_indices = restrict_adjacency(
@@ -252,7 +276,7 @@ def leiden(
         resolutions = [resolution]
     else:
         resolutions = resolution
-    modularities = []
+    modularities, labels = [], {}
     try:
         for resolution in resolutions:
             leiden_parts, modularity = culeiden(
@@ -271,22 +295,16 @@ def leiden(
 
             # Format output
             groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-            key_added_to_use = key_added
             if restrict_to is not None:
-                if key_added == "leiden":
-                    key_added_to_use += "_R"
                 groups = rename_groups(
                     adata,
-                    key_added=key_added_to_use,
+                    key_added=col,
                     restrict_key=restrict_key,
                     restrict_categories=restrict_categories,
                     restrict_indices=restrict_indices,
                     groups=groups,
                 )
-            if len(resolutions) > 1:
-                key_added_to_use += f"_{resolution}"
-
-            adata.obs[key_added_to_use] = pd.Categorical(
+            labels[resolution] = pd.Categorical(
                 values=groups.astype("U"),
                 categories=natsorted(map(str, np.unique(groups))),
             )
@@ -298,34 +316,37 @@ def leiden(
             import cugraph.dask.comms.comms as Comms
 
             Comms.destroy()
-    # store information on the clustering parameters
-    adata.uns[key_added] = {}
-    adata.uns[key_added]["params"] = {
-        "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
-        **meta_random_state,
-        "n_iterations": n_iterations,
-    }
-    adata.uns[key_added]["modularity"] = modularities if len(modularities) > 1 else modularities[0]
-    return adata if copy else None
+    params = {**meta_random_state, "n_iterations": n_iterations}
+    return _cluster_labels(
+        (col, key), resolutions, labels, out=out, adata=adata, params=params, modularities=modularities
+    )
 
 
 @deprecated(Deprecation("0.19.0", "Use `rapids_singlecell.tl.leiden` instead."))
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_arg("adjacency", _DEPR_ADJACENCY)
+@deprecated_arg("neighbors_key", DEPR_NEIGHBORS_KEY)
+@deprecated_arg("obsp", DEPR_OBSP)
+@deprecated_copy
 def louvain(
     adata: AnnData,
     resolution: float | list[float] = 1.0,
     *,
     restrict_to: tuple[str, Sequence[str]] | None = None,
-    key_added: str = "louvain",
-    adjacency: sparse.spmatrix | None = None,
     n_iterations: int = 100,
     threshold: float = 1e-7,
     use_weights: bool = True,
-    neighbors_key: int | None = None,
-    obsp: str | None = None,
     dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
+    use: GraphAcc | str | None = None,
+    out: AdRef | str | bool = False,
+    # deprecated
+    key_added: str | None = None,
+    adjacency: sparse.spmatrix | None = None,
+    neighbors_key: str | None = None,
+    obsp: str | None = None,
     copy: bool = False,
-) -> AnnData | None:
+) -> AnnData | pd.Categorical | dict[float, pd.Categorical] | None:
     """
     Cluster cells into subgroups using the Louvain algorithm :cite:p:`Blondel2008`.
 
@@ -344,12 +365,6 @@ def louvain(
             sample annotation, tuple needs to contain
             `(obs_key, list_of_categories)`.
 
-        key_added
-            `adata.obs` key under which to add the cluster labels.
-
-        adjacency
-            Sparse adjacency matrix of the graph, defaults to neighbors
-            connectivities.
 
         n_iterations
             This controls the maximum number of levels/iterations of the
@@ -368,32 +383,29 @@ def louvain(
             If `True`, edge weights from the graph are used in the
             computation (placing more emphasis on stronger edges).
 
-        neighbors_key
-            If not specified, `louvain` looks at `.obsp['connectivities']`
-            for neighbors connectivities. If specified, `louvain` looks at
-            `.obsp[.uns[neighbors_key]['connectivities_key']]` for neighbors
-            connectivities.
-
-        obsp
-            Use `.obsp[obsp]` as adjacency. You can't specify both `obsp`
-            and `neighbors_key` at the same time.
-
         dtype
             Data type to use for the adjacency matrix.
 
         use_dask
             If `True`, use Dask to create the graph and cluster. This will use all GPUs available. This feature is experimental. For datasets with less than 10 Million cells, it is recommended to use `use_dask=False`.
 
-        copy
-            Whether to copy `adata` or modify it in place.
+        use
+            The neighborhood graph (connectivities) to cluster, e.g. `A.obsp['k']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
+            If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
+
+        out
+            Where to write the cluster labels, e.g. `A.obs['clusters']`; the parameters go to `.uns` under the same key.
+            If `True`, the labels are returned instead (a dict by resolution for several resolutions).
+            If `False`, they are written to `.obs['louvain']` and `.uns['louvain']` (`'louvain_R'` with `restrict_to`).
+            Several resolutions are written to `.obs[f'{key}_{resolution}']`.
 
     """
     # Adjacency graph
     dtype = _check_dtype(dtype)
-
-    adata = adata.copy() if copy else adata
-    if adjacency is None:
-        adjacency = _choose_graph(adata, obsp, neighbors_key)
+    key = _out_key(out, key_added, kind="obs", default="louvain")
+    col = f"{key}_R" if restrict_to is not None and key == "louvain" and out is False else key
+    adjacency = _use_graph(adata, use, adjacency=adjacency, obsp=obsp, neighbors_key=neighbors_key)
     if restrict_to is not None:
         restrict_key, restrict_categories = restrict_to
         adjacency, restrict_indices = restrict_adjacency(
@@ -416,7 +428,7 @@ def louvain(
         resolutions = [resolution]
     else:
         resolutions = resolution
-    modularities = []
+    modularities, labels = [], {}
     try:
         for resolution in resolutions:
             louvain_parts, modularity = culouvain(
@@ -433,22 +445,16 @@ def louvain(
 
             # Format output
             groups = louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-            key_added_to_use = key_added
             if restrict_to is not None:
-                if key_added == "louvain":
-                    key_added_to_use += "_R"
                 groups = rename_groups(
                     adata,
-                    key_added=key_added_to_use,
+                    key_added=col,
                     restrict_key=restrict_key,
                     restrict_categories=restrict_categories,
                     restrict_indices=restrict_indices,
                     groups=groups,
                 )
-            if len(resolutions) > 1:
-                key_added_to_use += f"_{resolution}"
-
-            adata.obs[key_added_to_use] = pd.Categorical(
+            labels[resolution] = pd.Categorical(
                 values=groups.astype("U"),
                 categories=natsorted(map(str, np.unique(groups))),
             )
@@ -460,29 +466,31 @@ def louvain(
             import cugraph.dask.comms.comms as Comms
 
             Comms.destroy()
-    adata.uns[key_added] = {}
-    adata.uns[key_added]["params"] = {
-        "resolution": resolutions if len(resolutions) > 1 else resolutions[0],
-        "n_iterations": n_iterations,
-        "threshold": threshold,
-    }
-    adata.uns[key_added]["modularity"] = modularities if len(modularities) > 1 else modularities[0]
-    return adata if copy else None
+    params = {"n_iterations": n_iterations, "threshold": threshold}
+    return _cluster_labels(
+        (col, key), resolutions, labels, out=out, adata=adata, params=params, modularities=modularities
+    )
 
 
 @_accepts_legacy_random_state(42)
+@deprecated_arg("use_rep", Deprecation("0.19.0", "Use `use` instead."))
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_copy
 def kmeans(
     adata: AnnData,
     n_clusters: int = 8,
     n_pcs: int = 50,
     *,
-    use_rep: str = "X_pca",
     n_init: int = 1,
     rng: SeedLike | RNGLike | None = None,
-    key_added: str = "kmeans",
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: AdRef | str | bool = False,
+    # deprecated
+    use_rep: str | None = None,
+    key_added: str | None = None,
     copy: bool = False,
     **kwargs,
-) -> None:
+) -> AnnData | pd.Categorical | None:
     """
     KMeans is a basic but powerful clustering method which is optimized via Expectation Maximization. It randomly selects K data points in X, and computes which samples are close to these points. For every cluster of points, a mean is computed (hence the name), and this becomes the new centroid.
 
@@ -493,22 +501,20 @@ def kmeans(
         n_clusters
             Number of clusters to compute
         n_pcs
-            Use this many PCs. If `n_pcs==0` use `.X` if `use_rep is None`.
-        use_rep
-            Use the indicated representation. `'X'` or any key for `.obsm` is valid.
-            Either spelling of the PCA key resolves to whichever one the data
-            actually uses, so the default works under any
-            ``rapids_singlecell.settings.preset``.
+            Use this many PCs. If `n_pcs==0` use `.X`.
         n_init
             Number of initializations to run the KMeans algorithm
         rng
             Random seed or :class:`~numpy.random.Generator`; fix it if you want
             results to be the same when you restart Python. Default is 42.
             The superseded `random_state` argument is still accepted.
-        key_added
-            `adata.obs` key under which to add the cluster labels.
-        copy
-            Whether to copy `adata` or modify it in place.
+        use
+            The representation to cluster, e.g. `A.obsm['pca']` or `A.X`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsm.pca'`.
+            If `None`, the PCA embedding, under whichever key the data uses.
+        out
+            Where to write the cluster labels, e.g. `A.obs['clusters']`.
+            If `True`, the labels are returned instead. If `False`, they are written to `.obs['kmeans']`.
         **kwargs
             Additional keyword arguments for KMeans.
 
@@ -517,9 +523,11 @@ def kmeans(
 
     from cuml.cluster import KMeans
 
-    adata = adata.copy() if copy else adata
-    use_rep = _resolve_obsm_key(adata, use_rep)
-    X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+    key = _out_key(out, key_added, kind="obs", default="kmeans")
+    use = _resolve_obs(use)
+    if use is None:
+        use_rep = _resolve_obsm_key(adata, "X_pca" if use_rep is None else use_rep)
+    X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs, use=use)
 
     kmeans_out = KMeans(
         # cuML's KMeans is seeded, so draw the seed right here
@@ -530,9 +538,8 @@ def kmeans(
     ).fit(X)
     groups = kmeans_out.labels_
 
-    adata.obs[key_added] = pd.Categorical(
-        values=groups.astype("U"),
-        categories=natsorted(map(str, np.unique(groups))),
-    )
-
-    return adata if copy else None
+    labels = pd.Categorical(values=groups.astype("U"), categories=natsorted(map(str, np.unique(groups))))
+    if key is True:
+        return labels
+    adata.obs[key] = labels
+    return None

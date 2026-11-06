@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData
+from anndata.acc import A
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 
 import rapids_singlecell as rsc
@@ -40,7 +41,7 @@ def test_normalize_total_layers(dtype):
     cudata = AnnData(csr_matrix(X_total, dtype=dtype))
     cudata.layers["layer"] = cudata.X.copy()
 
-    rsc.pp.normalize_total(cudata, target_sum=1, layer="layer")
+    rsc.pp.normalize_total(cudata, target_sum=1, use=A.layers["layer"])
     assert np.allclose(cudata.layers["layer"].sum(axis=1), np.ones(cudata.shape[0], dtype=dtype))
 
 
@@ -65,9 +66,9 @@ def test_normalize_pearson_residuals_values(sparsity_func, dtype, theta, clip):
 
     # compute output to test
     cudata = AnnData(X=sparsity_func(X, dtype=dtype))
-    output_X = rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=clip, inplace=False)
+    output_X = rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=clip, out=True)
 
-    rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=clip, inplace=True)
+    rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=clip)
     assert np.all(np.isin(["pearson_residuals_normalization"], list(cudata.uns.keys())))
     assert np.all(
         np.isin(
@@ -122,7 +123,7 @@ def test_normalize_pearson_residuals_float64_precision(sparsity_func, theta):
         reference = (X - mu) / cp.sqrt(mu + mu**2 / theta)
 
     cudata = AnnData(X=sparsity_func(X, dtype=np.float64))
-    output = rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=np.inf, inplace=False)
+    output = rsc.pp.normalize_pearson_residuals(cudata, theta=theta, clip=np.inf, out=True)
 
     # the buggy `sqrtf` path is only ~1e-7 accurate; 1e-9 cleanly separates it
     cp.testing.assert_allclose(output, reference, rtol=1e-9, atol=1e-9)
@@ -156,15 +157,33 @@ def test_log1p_base(use_array, dtype, sparse, base):
         assert cudata.uns["log1p"]["base"] == base
 
 
-def test_log1p_inplace_false_does_not_write_metadata():
+def test_log1p_out_does_not_write_metadata():
     X = cp.array([[1.0, 2.0], [3.0, 4.0]], dtype=cp.float32)
     adata = AnnData(X.copy())
 
-    result = rsc.pp.log1p(adata, inplace=False)
-
+    result = rsc.pp.log1p(adata, out=True)
     cp.testing.assert_array_equal(adata.X, X)
     cp.testing.assert_allclose(result, cp.log1p(X))
+    rsc.pp.log1p(adata, out="layers.log")
+    cp.testing.assert_array_equal(adata.X, X)
+    cp.testing.assert_allclose(adata.layers["log"], cp.log1p(X))
     assert "log1p" not in adata.uns
+    with pytest.warns(FutureWarning, match="inplace"):
+        rsc.pp.log1p(adata, inplace=False)
+
+
+def test_normalize_total_out():
+    X = cp.array([[1.0, 3.0], [2.0, 6.0], [0.0, 0.0]], dtype=cp.float32)
+    adata = AnnData(X.copy(), layers={"counts": X.copy()})
+    res = rsc.pp.normalize_total(adata, target_sum=2, use="layers.counts", out=True)
+    cp.testing.assert_allclose(res.normalized, cp.array([[0.5, 1.5], [0.5, 1.5], [0, 0]]))
+    cp.testing.assert_allclose(res.norm_factor, cp.array([2.0, 4.0, 0.0]))
+    rsc.pp.normalize_total(adata, target_sum=2, out={"normalized": A.layers["n"], "norm_factor": A.obs["nf"]})
+    cp.testing.assert_array_equal(adata.X, X)
+    np.testing.assert_allclose(adata.obs["nf"], [2.0, 4.0, 0.0])
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.pp.normalize_total(adata, target_sum=2, key_added="k")
+    np.testing.assert_allclose(adata.obs["k"], [2.0, 4.0, 0.0])
 
 
 @pytest.mark.parametrize("use_array", [False, True])

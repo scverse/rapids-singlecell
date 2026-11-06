@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
 from scverse_misc import Deprecation, deprecated, deprecated_arg
 
 from rapids_singlecell._settings import Default, resolve_default, settings
+from rapids_singlecell.get import _check_mask
+from rapids_singlecell.get._out import (
+    DEPR_RAW,
+    DEPR_USE,
+    _obs_col,
+    _out_key,
+    _resolve,
+    _use_args,
+    deprecated_copy,
+)
+from rapids_singlecell.get._utils import LayerAcc
 
 from ._core import _RankGenes
 
@@ -15,6 +26,8 @@ if TYPE_CHECKING:
 
     from anndata import AnnData
     from numpy.typing import NDArray
+
+    from rapids_singlecell.get._utils import AdRef
 
 type _CorrMethod = Literal["benjamini-hochberg", "bonferroni"]
 type _Method = Literal["logreg", "t-test", "t-test_overestim_var", "wilcoxon", "wilcoxon_binned"]
@@ -50,11 +63,15 @@ _CHUNK_SIZE_DEPRECATION = Deprecation(
 
 
 @deprecated_arg("chunk_size", _CHUNK_SIZE_DEPRECATION)
+@deprecated_arg("mask_var", Deprecation("0.19.0", "Use `mask` instead."))
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("use_raw", DEPR_RAW)
+@deprecated_copy
 def rank_genes_groups(
     adata: AnnData,
-    groupby: str,
+    groupby: AdRef | str,
     *,
-    mask_var: NDArray[np.bool_] | str | None = None,
+    mask: NDArray[np.bool_] | AdRef | str | None = None,
     use_raw: bool | None = None,
     groups: Literal["all"] | Iterable[str] = "all",
     reference: str = "rest",
@@ -67,15 +84,20 @@ def rank_genes_groups(
     tie_correct: bool = False,
     use_continuity: bool = False,
     return_u_values: bool = False,
-    layer: str | None = None,
+    use: LayerAcc | str | None = None,
     mean_in_log_space: bool | Default = Default(("rank_genes_groups", "mean_in_log_space")),
     chunk_size: int | None = None,
     multi_gpu: bool | list[int] | str | None = None,
     n_bins: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
     skip_empty_groups: bool = False,
+    out: bool = False,
+    # deprecated
+    layer: str | None = None,
+    mask_var: NDArray[np.bool_] | str | None = None,
+    copy: bool = False,
     **kwds,
-) -> None:
+) -> AnnData | dict[str, Any] | None:
     """
     Rank genes for characterizing groups using GPU acceleration.
 
@@ -112,10 +134,11 @@ def rank_genes_groups(
     adata
         Annotated data matrix.
     groupby
-        The key of the observations grouping to consider.
-    mask_var
+        The observations grouping to consider, e.g. `A.obs['leiden']` or its column name.
+    mask
         Select subset of genes to use in statistical tests.
-        Can be a boolean array of shape `(n_vars,)` or a key in `adata.var`.
+        Can be a boolean array of shape `(n_vars,)` or a reference like `A.var['hvg']`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'var.hvg'`.
     use_raw
         Use `raw` attribute of `adata` if present.
     groups
@@ -158,8 +181,9 @@ def rank_genes_groups(
         For `'wilcoxon'`, store Mann-Whitney U statistics in `scores` instead
         of z-scores. P-values are still computed from the z-score normal
         approximation using the selected tie and continuity settings.
-    layer
-        Key from `adata.layers` whose value will be used to perform tests on.
+    use
+        Which matrix to test, e.g. `A.X` or `A.layers['log1p']`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.log1p'`.
     mean_in_log_space
         Whether to calculate statistics from mean-log values (`True`) or from
         the mean after applying the inverse log1p transform (`False`). The
@@ -193,6 +217,9 @@ def rank_genes_groups(
         Skip selected groups with fewer than two observations after filtering.
         This is useful for perturbation workflows where a per-cell-type slice
         keeps categories that are empty or singleton in that slice.
+    out
+        If `True`, the results are returned as a :class:`dict` instead of written to
+        `adata.uns['rank_genes_groups' | key_added]`.
     **kwds
         Additional arguments passed to the method. For `'logreg'`, these are
         passed to :class:`cuml.linear_model.LogisticRegression`.
@@ -269,11 +296,18 @@ def rank_genes_groups(
         )
         raise ValueError(msg)
 
-    if key_added is None:
-        key_added = "rank_genes_groups"
+    key_added = _out_key(out, key_added, kind="uns", default="rank_genes_groups")
+    groupby = _obs_col(groupby, param="groupby")
+    layer = _use_args(use, kinds=(LayerAcc,), layer=layer).get("layer")
+    if use is not None and use_raw is None:
+        use_raw = False
 
     mask_var_array: NDArray[np.bool_] | None = None
-    if mask_var is not None:
+    if mask is not None:
+        if mask_var is not None:
+            raise TypeError("Pass either `mask` or `mask_var`, not both.")
+        mask_var_array = np.asarray(_check_mask(adata, _resolve(mask, vec=True), "var"), dtype=bool)
+    elif mask_var is not None:
         if isinstance(mask_var, str):
             if mask_var not in adata.var.columns:
                 msg = f"mask_var key {mask_var!r} not found in adata.var."
@@ -331,48 +365,46 @@ def rank_genes_groups(
         params["return_u_values"] = return_u_values
 
     arrays = test_obj.stats_arrays or {}
-    adata.uns[key_added] = {"params": params}
+    res: dict[str, Any] = {"params": params}
     if arrays and len(arrays.get("group_names", ())) > 0:
-        adata.uns[key_added]["names"] = _array_result_to_names(arrays)
+        res["names"] = _array_result_to_names(arrays)
         for col in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
             if col in arrays:
                 values = arrays[col]
                 dtype = values.dtype
-                adata.uns[key_added][col] = _array_result_to_records(arrays, col, dtype)
+                res[col] = _array_result_to_records(arrays, col, dtype)
 
     groups_names = [str(name) for name in test_obj.groups_order]
     if test_obj.pts is not None:
-        adata.uns[key_added]["pts"] = pd.DataFrame(test_obj.pts.T, index=test_obj.var_names, columns=groups_names)
+        res["pts"] = pd.DataFrame(test_obj.pts.T, index=test_obj.var_names, columns=groups_names)
     if test_obj.pts_rest is not None:
-        adata.uns[key_added]["pts_rest"] = pd.DataFrame(
-            test_obj.pts_rest.T, index=test_obj.var_names, columns=groups_names
-        )
-
+        res["pts_rest"] = pd.DataFrame(test_obj.pts_rest.T, index=test_obj.var_names, columns=groups_names)
+    if key_added is True:
+        return res
+    adata.uns[key_added] = res
     return None
 
 
 @deprecated(Deprecation("0.14.1", "Use `rank_genes_groups(method='logreg')` instead."))
 def rank_genes_groups_logreg(
     adata: AnnData,
-    groupby: str,
+    groupby: AdRef | str,
     *,
     groups: Literal["all"] | Iterable[str] = "all",
-    use_raw: bool | None = None,
     reference: str = "rest",
     n_genes: int | None = None,
     key_added: str | None = None,
-    layer: str | None = None,
+    use: LayerAcc | str | None = None,
     **kwds,
-) -> None:
+) -> dict[str, Any] | None:
     return rank_genes_groups(
         adata,
         groupby,
         groups=groups,
-        use_raw=use_raw,
         reference=reference,
         n_genes=n_genes,
         key_added=key_added,
         method="logreg",
-        layer=layer,
+        use=use,
         **kwds,
     )

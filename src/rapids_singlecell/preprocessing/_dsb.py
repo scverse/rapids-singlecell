@@ -16,9 +16,19 @@ import numpy as np
 from cupyx.scipy import sparse as cpsparse
 from scanpy._utils import view_to_actual
 from scipy import sparse
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
-from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
+from rapids_singlecell.get import _get_arr
+from rapids_singlecell.get._out import (
+    DEPR_KEY_ADDED,
+    DEPR_USE,
+    _legacy_out,
+    _use_args,
+    _write_out,
+    deprecated_copy,
+)
+from rapids_singlecell.get._utils import LayerAcc
 
 from ._utils import _sparse_to_dense
 
@@ -42,6 +52,9 @@ _VAR_KEYS = ("dsb_ambient_mean", "dsb_ambient_sd")
 _OBS_KEYS = ("dsb_cell_background_mean", "dsb_technical_component")
 
 
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_copy
 def dsb(
     adata: AnnData,
     adata_empty: AnnData | None = None,
@@ -53,12 +66,15 @@ def dsb(
     scale_factor: _ScaleFactor = "standardize",
     fast_km: bool = False,
     quantile_clip: tuple[float, float] | None = None,
-    layer: str | None = None,
-    key_added: str | None = None,
+    use: LayerAcc | str | None = None,
+    out: LayerAcc | str | bool = False,
     dtype: DTypeLike = np.float32,
     rng: SeedLike | RNGLike | None = None,
+    # deprecated
+    layer: str | None = None,
+    key_added: str | None = None,
     copy: bool = False,
-) -> AnnData | None:
+) -> AnnData | cp.ndarray | np.ndarray | None:
     """Normalize and denoise protein (ADT) counts with dsb :cite:p:`Mule2022`.
 
     With empty droplets (`adata_empty`) this mirrors ``dsb::DSBNormalizeProtein``:
@@ -101,11 +117,13 @@ def dsb(
     quantile_clip
         Clip every protein to these lower and upper quantiles (type 7) of its
         normalized values; dsb's `quantile.clipping` uses `(0.001, 0.9995)`.
-    layer
-        Layer with the counts in `adata` and `adata_empty`; `.X` if `None`.
-    key_added
-        Store the result in `adata.layers[key_added]` instead of overwriting
-        `layer` (or `.X`).
+    use
+        Which matrix of `adata` and `adata_empty` holds the counts, e.g. `A.X` or `A.layers['counts']`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
+    out
+        Where to write the normalized values, e.g. `A.layers['dsb']` (or `'layers.dsb'`).
+        If `True`, they are returned instead, and the statistics below aren't written.
+        If `False`, they are written to the place `use` reads from.
     dtype
         Floating point type of the computations and the output (unlike
         ``scanpy.pp.dsb``, where it only sets the output). `float64` reproduces
@@ -118,14 +136,12 @@ def dsb(
     rng
         Random number generator for the mixture fits of vectors longer than
         2000 values, which start from a random subset.
-    copy
-        Return a modified copy instead of updating `adata` in place.
 
     Returns
     -------
-    Returns `adata` if `copy=True`, else updates it and sets the following.
+    The normalized values if `out=True`, else `None`. Otherwise sets the following.
 
-    `.X` or `.layers[layer | key_added]`
+    `.X`, the place `use` reads from, or `out`
         dsb normalized values (dense, `dtype`, on the device of the input).
     `.var['dsb_ambient_mean']`
         Per-protein background mean of ``log(counts + pseudocount)`` (0 for
@@ -160,28 +176,25 @@ def dsb(
     )
     if adata.n_obs < 2 or (denoise_counts and adata.n_vars < 2):
         raise ValueError("dsb needs at least 2 cells, and 2 proteins with `denoise_counts`.")
+    out = _legacy_out(out, "key_added", None if key_added is None else f"layers.{key_added}")
+    src = _use_args(use, kinds=(LayerAcc,), layer=layer)
     empty_order = None
     if adata_empty is not None:
         empty_order = _match_proteins(adata_empty.var_names, proteins)
         if adata_empty.n_obs < 2:
             raise ValueError("`adata_empty` needs at least 2 empty droplets.")
-        if layer is not None and layer not in adata_empty.layers:
-            raise ValueError(f"`adata_empty` has no layer {layer!r}.")
+        if "layer" in src and src["layer"] not in adata_empty.layers:
+            raise ValueError(f"`adata_empty` has no layer {src['layer']!r}.")
     rng = np.random.default_rng(rng)
 
-    if copy:
-        adata = adata.copy()
-    else:
-        view_to_actual(adata)
-    adata.var = cast("pd.DataFrame", adata.var).drop(columns=[k for k in _VAR_KEYS if k in adata.var])
-    adata.obs = cast("pd.DataFrame", adata.obs).drop(columns=[k for k in _OBS_KEYS if k in adata.obs])
-    X_in = _get_obs_rep(adata, layer=layer)
+    view_to_actual(adata)
+    X_in = _get_arr(adata, dim="obs", **src)
     on_gpu = isinstance(X_in, cp.ndarray) or cpsparse.issparse(X_in)
     counts = _counts(X_in, "adata", dtype)
     scale = None
     if adata_empty is not None:
         # statistics in the order of `adata_empty`: reordering a backed matrix would load it
-        mean, sd, constant = _empty_stats(_get_obs_rep(adata_empty, layer=layer), pseudocount)
+        mean, sd, constant = _empty_stats(_get_arr(adata_empty, dim="obs", **src), pseudocount)
         if empty_order is not None:
             mean, sd, constant = mean[cp.asarray(empty_order)], sd[cp.asarray(empty_order)], constant[empty_order]
         var_stats = {"dsb_ambient_mean": mean, "dsb_ambient_sd": sd}
@@ -276,12 +289,15 @@ def dsb(
         q = cp.quantile(norm, cp.asarray(quantile_clip, dtype=dtype), axis=0)
         cp.clip(norm, q[0], q[1], out=norm)
 
-    _set_obs_rep(adata, norm if on_gpu else cp.asnumpy(norm), layer=layer if key_added is None else key_added)
+    if (res := _write_out(adata, norm if on_gpu else cp.asnumpy(norm), out=out, dest=src)) is not None:
+        return res
+    adata.var = cast("pd.DataFrame", adata.var).drop(columns=[k for k in _VAR_KEYS if k in adata.var])
+    adata.obs = cast("pd.DataFrame", adata.obs).drop(columns=[k for k in _OBS_KEYS if k in adata.obs])
     for key, val in var_stats.items():
         adata.var[key] = cp.asnumpy(val).astype(dtype, copy=False)
     for key, val in obs_stats.items():
         adata.obs[key] = cp.asnumpy(val).astype(dtype, copy=False)
-    return adata if copy else None
+    return None
 
 
 def _isotype_indices(proteins: pd.Index, isotype_controls, *, use_isotype_controls: bool, required: bool):
@@ -308,7 +324,7 @@ def _isotype_indices(proteins: pd.Index, isotype_controls, *, use_isotype_contro
 def _counts(x, name: str, dtype: np.dtype) -> cp.ndarray:
     """Checked raw counts as a new dense C-ordered device array of `dtype`."""
     if x is None:
-        raise ValueError(f"`{name}.X` is None; pass the `layer` with the counts.")
+        raise ValueError(f"`{name}.X` is None; pass `use` with the counts.")
     if isinstance(x, DaskArray):
         raise TypeError("dsb does not support dask arrays.")
     if sparse.issparse(x):
@@ -331,7 +347,7 @@ def _log_counts(x, pseudocount: float, name: str, dtype: np.dtype) -> cp.ndarray
 def _empty_stats(x, pseudocount: float) -> tuple[cp.ndarray, cp.ndarray, np.ndarray]:
     """Per-protein float64 mean, sd and constancy of the log counts, in row chunks."""
     if x is None:
-        raise ValueError("`adata_empty.X` is None; pass the `layer` with the counts.")
+        raise ValueError("`adata_empty.X` is None; pass `use` with the counts.")
     n, n_vars = 0, x.shape[1]
     mean, m2 = cp.zeros(n_vars), cp.zeros(n_vars)
     lo, hi = cp.full(n_vars, np.inf), cp.full(n_vars, -np.inf)

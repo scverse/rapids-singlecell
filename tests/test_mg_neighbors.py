@@ -5,6 +5,7 @@ import itertools
 import cuvs
 import numpy as np
 import pytest
+from anndata.acc import A
 from packaging.version import parse as parse_version
 from scanpy.datasets import pbmc68k_reduced
 
@@ -202,11 +203,11 @@ def test_mg_bbknn(algo):
 
     adata = pbmc68k_reduced()
     n_rows = adata.shape[0]
-    rsc.pp.bbknn(adata, algorithm=algo, batch_key="phase")
+    rsc.pp.bbknn(adata, algorithm=algo, batches=A.obs["phase"])
 
     assert adata.obsp["distances"].shape == (n_rows, n_rows)
     assert adata.obsp["connectivities"].shape == (n_rows, n_rows)
     distances = adata.obsp["distances"].copy()
-    rsc.pp.bbknn(adata, batch_key="phase", algorithm=other_algo)
+    rsc.pp.bbknn(adata, batches=A.obs["phase"], algorithm=other_algo)
     np.testing.assert_array_equal(adata.obsp["distances"].indptr, distances.indptr)
     _calc_recall(distances, adata.obsp["distances"])

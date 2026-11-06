@@ -71,3 +71,22 @@ def test_qc_metrics_format(cls, dtype):
     assert np.allclose(cudata.obs, cudata_dense.obs)
     for col in cudata.var:  # np.allclose doesn't like mix of types
         assert np.allclose(cudata.var[col], cudata_dense.var[col])
+
+
+def test_qc_metrics_use_out():
+    from anndata.acc import A
+
+    adata = adata_mito(np.float32)
+    adata.layers["counts"] = adata.X.copy()
+    adata.X = cp.zeros_like(adata.X)
+    res = rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"], use=A.layers["counts"], out=True)
+    assert "total_counts" not in adata.obs
+    rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"], use="layers.counts", out=A.obsm["qc"])
+    pd.testing.assert_frame_equal(adata.obsm["qc"], res.obs)
+    pd.testing.assert_frame_equal(adata.varm["qc"], res.var)
+    rsc.pp.calculate_qc_metrics(adata, use="layers.counts", out={"var": A.varm["v"]})
+    assert "v" in adata.varm
+    assert "qc_obs" not in adata.obsm
+    with pytest.warns(FutureWarning, match="layer"):
+        rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"], layer="counts")
+    np.testing.assert_allclose(adata.obs["total_counts"], res.obs["total_counts"])

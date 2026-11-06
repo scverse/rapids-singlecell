@@ -37,6 +37,7 @@ from rmm.allocators.cupy import rmm_cupy_allocator
 cp.cuda.set_allocator(rmm_cupy_allocator)
 import rapids_singlecell as rsc
 import scanpy as sc
+from anndata.acc import A
 ```
 
 - The pool is the fast route when data fit in VRAM.
@@ -87,15 +88,15 @@ rsc.get.anndata_to_GPU(adata)
 adata.var["mt"] = adata.var_names.str.startswith(("MT-", "mt-"))
 rsc.pp.calculate_qc_metrics(adata, qc_vars=["mt"])
 adata = adata[~qc_outliers(adata.obs, by="sample").to_numpy()].copy()
-rsc.pp.scrublet(adata, batch_key="sample", verbose=False)  # raw counts, per sample
+rsc.pp.scrublet(adata, batch=A.obs["sample"], verbose=False)  # raw counts
 adata = adata[~adata.obs["predicted_doublet"].to_numpy()].copy()
 rsc.pp.filter_genes(adata, min_cells=20)
 rsc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3")
 rsc.pp.normalize_total(adata)  # median depth
 rsc.pp.log1p(adata)
-rsc.pp.pca(adata, n_comps=50, mask_var="highly_variable")
-rsc.pp.harmony_integrate(adata, key="sample")  # only if batches share biology
-rsc.pp.neighbors(adata, use_rep="X_pca_harmony")  # "X_pca" without integration
+rsc.pp.pca(adata, n_comps=50)
+rsc.pp.harmony_integrate(adata, A.obs["sample"])  # only if batches share biology
+rsc.pp.neighbors(adata, use=A.obsm["X_pca_harmony"])  # A.obsm["X_pca"] without integration
 rsc.tl.leiden(adata, resolution=[0.25, 0.5, 1.0, 2.0])  # one graph, keys leiden_<res>
 rsc.tl.umap(adata)
 rsc.tl.rank_genes_groups(adata, "leiden_1.0", method="wilcoxon", pts=True)

@@ -3,20 +3,34 @@ from __future__ import annotations
 import math
 import warnings
 from functools import partial
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, Union
 
 import cupy as cp
 from anndata import AnnData
 from cupyx.scipy import sparse
 from cupyx.scipy.sparse import csr_matrix
 from scanpy._utils import view_to_actual
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import (
     DaskArray,
     _meta_dense,
     _meta_sparse,
 )
-from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
+from rapids_singlecell.get import _get_arr
+from rapids_singlecell.get._out import (
+    DEPR_INPLACE,
+    DEPR_KEY_ADDED,
+    DEPR_USE,
+    _dest,
+    _key,
+    _legacy_out,
+    _out_dests,
+    _use_args,
+    _write_dests,
+    _write_out,
+    deprecated_copy,
+)
 
 from ._utils import _check_gpu_X, _check_nonnegative_integers, _get_mean_var
 
@@ -24,18 +38,43 @@ if TYPE_CHECKING:
     from cupyx.scipy.sparse import spmatrix
 
     from rapids_singlecell._utils import ArrayTypesDask
+    from rapids_singlecell.get._utils import AdRef, LayerAcc, MultiAcc
 
 
+class NormalizeTotalResult(NamedTuple):
+    """Outputs of :func:`~rapids_singlecell.pp.normalize_total`."""
+
+    normalized: Any
+    """The normalized matrix."""
+    norm_factor: Any
+    """Counts per cell before normalization divided by `target_sum`."""
+
+
+class NormalizeTotalOut(TypedDict, total=False):
+    """Where a mapping `out` of :func:`~rapids_singlecell.pp.normalize_total` writes each output."""
+
+    normalized: LayerAcc | MultiAcc | str
+    norm_factor: AdRef | str
+
+
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_copy
 def normalize_total(
     adata: AnnData,
     *,
     target_sum: float | None = None,
     exclude_highly_expressed: bool = False,
     max_fraction: float = 0.05,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | NormalizeTotalOut | bool = False,
+    # deprecated
+    key_added: str | None = None,
     layer: str | None = None,
     inplace: bool = True,
     copy: bool = False,
-) -> Union[AnnData, csr_matrix, cp.ndarray, None]:  # noqa: UP007
+) -> Union[AnnData, NormalizeTotalResult, None]:  # noqa: UP007
     """Normalizes rows in matrix so they sum to `target_sum`.
 
     Parameters
@@ -59,35 +98,42 @@ def normalize_total(
             that have more counts than `max_fraction` of the original total counts
             in at least one cell.
 
-        layer
-            Layer to normalize instead of `X`. If `None`, `X` is normalized.
+        use
+            Which matrix to normalize, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
 
-        inplace
-            Whether to update `adata` or return the matrix.
-
-        copy
-            Whether to return a copy or update `adata`. Not compatible with inplace=False.
+        out
+            Where to write the outputs. A single accessor writes `normalized` to it,
+            a mapping (:class:`~rapids_singlecell.pp.NormalizeTotalOut`) writes only the outputs it names,
+            e.g. `{'normalized': A.layers['norm'], 'norm_factor': A.obs['nf']}`.
+            If `True`, they are returned as a :class:`~rapids_singlecell.pp.NormalizeTotalResult`.
+            If `False`, `normalized` is written to the place `use` reads from and `norm_factor` isn't written.
 
     Returns
     -------
-        Returns a normalized copy or  updates `adata` with a normalized version of
-        the original `adata.X` and `adata.layers['layer']`, depending on `inplace`.
+        `None`, or a :class:`~rapids_singlecell.pp.NormalizeTotalResult` if `out=True`.
     """
-    if copy:
-        if not inplace:
-            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
-        adata = adata.copy()
-
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, layer=layer)
+    dests = _out_dests(
+        out,
+        key_added,
+        dests=lambda key: NormalizeTotalResult(src, None if key is None else {"obs": key}),
+        kinds=NormalizeTotalResult({"layer", "obsm"}, {"obs"}),
+    )
     view_to_actual(adata)
 
-    X = _get_obs_rep(adata, layer=layer)
+    X = _get_arr(adata, dim="obs", **src)
 
     _check_gpu_X(X, allow_dask=True)
 
     if X.dtype.kind in "iu":
         X = X.astype(cp.float32)
-    elif not inplace:
+    elif dests is True or dests[1].normalized != src:
         X = X.copy()
+    need_factor = dests is True or dests[1].norm_factor is not None
+    if need_factor:
+        before = X.sum(axis=1).ravel()
 
     if sparse.isspmatrix_csc(X):
         X = X.tocsr()
@@ -117,13 +163,14 @@ def normalize_total(
     else:
         raise ValueError(f"Cannot normalize {type(X)}")
 
-    if inplace:
-        _set_obs_rep(adata, X, layer=layer)
-
-    if copy:
-        return adata
-    elif not inplace:
-        return X
+    norm_factor = None
+    if need_factor:  # each row was scaled uniformly, so the ratio of row sums is the factor
+        after = X.sum(axis=1).ravel()
+        norm_factor = before / (after + (after == 0)) * (after != 0)
+    vals = NormalizeTotalResult(X, norm_factor)
+    if dests is True:
+        return vals if inplace else {"X": X, "norm_factor": norm_factor}
+    _write_dests(adata, vals, dests[1])
     return None
 
 
@@ -355,10 +402,17 @@ def _calc_log1p(X: ArrayTypesDask, base: float | None = None) -> ArrayTypesDask:
     return X
 
 
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("obsm", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_copy
 def log1p(
     data: AnnData | ArrayTypesDask,
     *,
     base: float | None = None,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | bool = False,
+    # deprecated
     layer: str | None = None,
     obsm: str | None = None,
     inplace: bool = True,
@@ -377,50 +431,39 @@ def log1p(
             :class:`~anndata.AnnData` object, the transformed matrix is returned.
         base
             Base of the logarithm. Natural logarithm is used by default.
-        layer
-            Layer to normalize instead of `X`. If `None`, `X` is normalized.
-        obsm
-            Entry of `.obsm` to transform.
-        inplace
-            Whether to update `data` or return the matrix. Only applies to
-            :class:`~anndata.AnnData` input.
-        copy
-            Whether to return a copy or update `data`. Not compatible with `inplace=False`.
-            Only applies to :class:`~anndata.AnnData` input.
+        use
+            Which matrix to transform, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
+        out
+            Where to write the result, e.g. `A.layers['k']` (or `'layers.k'`).
+            If `True`, the result is returned instead of written.
+            If `False`, it is written to the place `use` reads from.
 
     Returns
     -------
-    The resulting matrix after applying the logarithm of one plus the input matrix. If a matrix is passed, the transformed matrix is returned. If an AnnData object is passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the `data` object in-place and returns None.
+    The transformed matrix if a matrix is passed or `out=True`, else `None`.
 
     """
     if not isinstance(data, AnnData):
-        if layer is not None or obsm is not None:
-            raise ValueError("`layer` and `obsm` can only be used with an AnnData object.")
+        if layer is not None or obsm is not None or use is not None or out is not False:
+            raise ValueError("`use` and `out` can only be used with an AnnData object.")
         X = data
         _check_gpu_X(X, allow_dask=True)
         return _calc_log1p(X, base=base)
 
     adata = data
-    if copy:
-        if not inplace:
-            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
-        adata = adata.copy()
-    X = _get_obs_rep(adata, layer=layer, obsm=obsm)
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, layer=layer, obsm=obsm)
+    X = _get_arr(adata, dim="obs", **src)
 
     _check_gpu_X(X, allow_dask=True)
 
-    if not inplace:
-        X = X.copy()
-
     X = _calc_log1p(X, base=base)
-    if inplace:
-        _set_obs_rep(adata, X, layer=layer, obsm=obsm)
-        adata.uns["log1p"] = {"base": base}
-
-    if copy:
-        return adata
-    elif not inplace:
+    if out is True:
         return X
+    _write_out(adata, X, out=out, dest=src)
+    if (src if out is False else _dest(out)) == {}:
+        adata.uns["log1p"] = {"base": base}
     return None
 
 
@@ -437,9 +480,16 @@ def _calc_sqrt(X: ArrayTypesDask) -> ArrayTypesDask:
     return X
 
 
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("obsm", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_copy
 def sqrt(
     data: AnnData | ArrayTypesDask,
     *,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | bool = False,
+    # deprecated
     layer: str | None = None,
     obsm: str | None = None,
     inplace: bool = True,
@@ -455,61 +505,52 @@ def sqrt(
             The (annotated) data matrix of shape `n_obs` × `n_vars`. Rows correspond
             to cells and columns to genes. If a matrix is passed instead of an
             :class:`~anndata.AnnData` object, the transformed matrix is returned.
-        layer
-            Layer to transform instead of `X`. If `None`, `X` is transformed.
-        obsm
-            Entry of `.obsm` to transform.
-        inplace
-            Whether to update `data` or return the matrix. Only applies to
-            :class:`~anndata.AnnData` input.
-        copy
-            Whether to return a copy or update `data`. Not compatible with `inplace=False`.
-            Only applies to :class:`~anndata.AnnData` input.
+        use
+            Which matrix to transform, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
+        out
+            Where to write the result, e.g. `A.layers['k']` (or `'layers.k'`).
+            If `True`, the result is returned instead of written.
+            If `False`, it is written to the place `use` reads from.
 
     Returns
     -------
-    The resulting matrix after applying the square root to the input matrix. If a matrix is passed, the transformed matrix is returned. If an AnnData object is passed and `copy` is `True`, returns the modified AnnData. Otherwise, updates the `data` object in-place and returns None.
+    The transformed matrix if a matrix is passed or `out=True`, else `None`.
 
     """
     if not isinstance(data, AnnData):
-        if layer is not None or obsm is not None:
-            raise ValueError("`layer` and `obsm` can only be used with an AnnData object.")
+        if layer is not None or obsm is not None or use is not None or out is not False:
+            raise ValueError("`use` and `out` can only be used with an AnnData object.")
         X = data
         _check_gpu_X(X, allow_dask=True)
         return _calc_sqrt(X)
 
     adata = data
-    if copy:
-        if not inplace:
-            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
-        adata = adata.copy()
-    X = _get_obs_rep(adata, layer=layer, obsm=obsm)
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, layer=layer, obsm=obsm)
+    X = _get_arr(adata, dim="obs", **src)
 
     _check_gpu_X(X, allow_dask=True)
 
-    if not inplace:
-        X = X.copy()
-
-    X = _calc_sqrt(X)
-    if inplace:
-        _set_obs_rep(adata, X, layer=layer, obsm=obsm)
-
-    if copy:
-        return adata
-    elif not inplace:
-        return X
-    return None
+    return _write_out(adata, _calc_sqrt(X), out=out, dest=src)
 
 
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_copy
 def normalize_pearson_residuals(
     adata: AnnData,
     *,
     theta: float = 100,
     clip: float | None = None,
     check_values: bool = True,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | bool = False,
+    # deprecated
     layer: str | None = None,
     inplace: bool = True,
-) -> Union[cp.ndarray, None]:  # noqa: UP007
+    copy: bool = False,
+) -> Union[AnnData, cp.ndarray, None]:  # noqa: UP007
     """Applies analytic Pearson residual normalization :cite:p:`Lause2021`.
 
     The residuals are based on a negative binomial offset model with overdispersion
@@ -530,18 +571,23 @@ def normalize_pearson_residuals(
         check_values
             If True, checks if counts in selected layer are integers as expected by this function,
             and return a warning if non-integers are found. Otherwise, proceed without checking. Setting this to False can speed up code for large datasets.
-        layer
-            Layer to use as input instead of :attr:`~anndata.AnnData.X`. If None, :attr:`~anndata.AnnData.X` is used.
-        inplace
-            If True, update AnnData with results. Otherwise, return results. See below for details of what is returned.
+        use
+            Which matrix to normalize, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
+        out
+            Where to write the result, e.g. `A.layers['k']` (or `'layers.k'`).
+            If `True`, the result is returned instead of written.
+            If `False`, it is written to the place `use` reads from.
 
     Returns
     -------
-        If `inplace=True`, :attr:`~anndata.AnnData.X` or the selected layer in :attr:`~anndata.AnnData.layers` is updated with the normalized values. \
-        If `inplace=False` the normalized matrix is returned.
+        The normalized matrix if `out=True`. Otherwise writes it to `out` and the settings to
+        `.uns['pearson_residuals_normalization']` (or `.uns[k]` for `out=A.layers[k]`).
 
     """
-    X = _get_obs_rep(adata, layer=layer)
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, layer=layer)
+    X = _get_arr(adata, dim="obs", **src)
 
     _check_gpu_X(X, require_cf=True)
 
@@ -551,7 +597,7 @@ def normalize_pearson_residuals(
             UserWarning,
             stacklevel=2,
         )
-    computed_on = layer if layer else "adata.X"
+    computed_on = layer or (repr(use) if use is not None else "adata.X")
     settings_dict = {"theta": theta, "clip": clip, "computed_on": computed_on}
     if theta <= 0:
         raise ValueError("Pearson residuals require theta > 0")
@@ -633,11 +679,10 @@ def normalize_pearson_residuals(
             stream=stream,
         )
 
-    if inplace is True:
-        adata.uns["pearson_residuals_normalization"] = settings_dict
-        _set_obs_rep(adata, residuals, layer=layer)
-    else:
+    if out is True:
         return residuals
+    _write_out(adata, residuals, out=out, dest=src)
+    adata.uns[(out is not False and _key(_dest(out))) or "pearson_residuals_normalization"] = settings_dict
     return None
 
 
@@ -692,14 +737,20 @@ def _shifted_clr(X: cp.ndarray | sparse.csr_matrix, scale: float) -> cp.ndarray:
     return out
 
 
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_copy
 def normalize_shifted_clr(
     adata: AnnData,
     *,
     alpha: float | None = None,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | bool = False,
+    # deprecated
     layer: str | None = None,
     inplace: bool = True,
     copy: bool = False,
-) -> Union[AnnData, dict[str, cp.ndarray | DaskArray], None]:  # noqa: UP007
+) -> Union[AnnData, cp.ndarray, DaskArray, dict[str, cp.ndarray | DaskArray], None]:  # noqa: UP007
     r"""Normalize counts with the shifted centered log-ratio (PFlog) transform :cite:p:`Booeshaghi2022`.
 
     If `alpha` is not provided, it is estimated from the input matrix. PFlog is
@@ -726,28 +777,22 @@ def normalize_shifted_clr(
             If `None`, it is estimated from the input matrix. A positive numeric
             value uses that value directly. PFlog applies ``log1p(4 * alpha * x)``
             before CLR centering.
-        layer
-            Layer to normalize instead of `X`.
-        inplace
-            Whether to update `adata` or return a dictionary with the normalized
-            matrix.
-        copy
-            Whether to modify a copied input object. Not compatible with
-            `inplace=False`.
+        use
+            Which matrix to normalize, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
+        out
+            Where to write the result, e.g. `A.layers['k']` (or `'layers.k'`).
+            If `True`, the result is returned instead of written.
+            If `False`, it is written to the place `use` reads from.
 
     Returns
     -------
-    Returns a dictionary with the normalized matrix or updates `adata`, depending
-    on `inplace`.
+    The normalized matrix if `out=True`, else `None`.
     """
-    if copy:
-        if not inplace:
-            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
-        adata = adata.copy()
-
+    src = _use_args(use, layer=layer)
     view_to_actual(adata)
 
-    X = _get_obs_rep(adata, layer=layer)
+    X = _get_arr(adata, dim="obs", **src)
     _check_gpu_X(X, allow_dask=True)
     if sparse.isspmatrix_csc(X):
         X = X.tocsr()
@@ -771,11 +816,6 @@ def normalize_shifted_clr(
             warnings.warn("Some cells have zero counts", UserWarning, stacklevel=2)
         X = _shifted_clr(X, scale)
 
-    if inplace:
-        _set_obs_rep(adata, X, layer=layer)
-
-    if copy:
-        return adata
-    elif not inplace:
+    if not inplace:  # deprecated, returns what it did before `out`
         return {"X": X}
-    return None
+    return _write_out(adata, X, out=out, dest=src)

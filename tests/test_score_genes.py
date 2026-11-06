@@ -67,7 +67,7 @@ def test_score_with_reference(array_type):
     sc.pp.normalize_total(adata, target_sum=10000)
 
     sc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_cpu")
-    rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_gpu")
+    rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], out="obs.Test_gpu")
     np.testing.assert_allclose(adata.obs["Test_cpu"].to_numpy(), adata.obs["Test_gpu"].to_numpy())
 
 
@@ -85,7 +85,7 @@ def test_add_score():
     # create some non-estinsting names with 7 letters:
     non_existing_genes = _create_random_gene_names(n_genes=3, name_length=7)
     some_genes = np.r_[np.unique(np.random.choice(adata.var_names, 10)), np.unique(non_existing_genes)]
-    rsc.tl.score_genes(adata, some_genes, score_name="Test")
+    rsc.tl.score_genes(adata, some_genes, out="obs.Test")
     assert adata.obs["Test"].dtype == "float64"
 
 
@@ -129,8 +129,8 @@ def test_score_genes_sparse_vs_dense():
 
     gene_set = adata_dense.var_names[:10]
 
-    rsc.tl.score_genes(adata_sparse, gene_list=gene_set, score_name="Test")
-    rsc.tl.score_genes(adata_dense, gene_list=gene_set, score_name="Test")
+    rsc.tl.score_genes(adata_sparse, gene_list=gene_set, out="obs.Test")
+    rsc.tl.score_genes(adata_dense, gene_list=gene_set, out="obs.Test")
 
     np.testing.assert_allclose(adata_sparse.obs["Test"].values, adata_dense.obs["Test"].values)
 
@@ -157,7 +157,7 @@ def test_score_genes_deplete():
         ix_obs = np.random.choice(adata.shape[0], 50)
         adata.X[np.ix_(ix_obs, gene_idx)] = 0
 
-        rsc.tl.score_genes(adata, gene_list=gene_set, score_name="Test")
+        rsc.tl.score_genes(adata, gene_list=gene_set, out="obs.Test")
         scores = adata.obs["Test"].values
 
         np.testing.assert_array_less(scores[ix_obs], 0)
@@ -184,7 +184,7 @@ def test_use_raw_None():
     adata_raw.var_names = [str(i) for i in range(adata_raw.n_vars)]
     adata.raw = adata_raw
 
-    rsc.tl.score_genes(adata, adata_raw.var_names[:3], use_raw=None)
+    rsc.tl.score_genes(adata, adata_raw.var_names[:3])
 
 
 def test_layer():
@@ -195,15 +195,31 @@ def test_layer():
 
     # score X
     gene_set = adata.var_names[:10]
-    rsc.tl.score_genes(adata, gene_set, score_name="X_score")
+    rsc.tl.score_genes(adata, gene_set, out="obs.X_score")
     # score layer (`del` makes sure it actually uses the layer)
     adata.layers["test"] = adata.X.copy()
     adata.raw = adata
 
     del adata.X
-    rsc.tl.score_genes(adata, gene_set, score_name="test_score", layer="test")
-
+    rsc.tl.score_genes(adata, gene_set, out="obs.test_score", use="layers.test")
     np.testing.assert_array_equal(adata.obs["X_score"], adata.obs["test_score"])
+    with pytest.warns(FutureWarning, match="score_name"), pytest.warns(FutureWarning, match="layer"):
+        rsc.tl.score_genes(adata, gene_set, score_name="old_score", layer="test")
+    np.testing.assert_array_equal(adata.obs["X_score"], adata.obs["old_score"])
+    res = rsc.tl.score_genes(adata, gene_set, use="layers.test", out=True)
+    np.testing.assert_array_equal(adata.obs["X_score"], res)
+
+
+def test_cell_cycle_out():
+    adata = _create_adata(100, 1000, p_zero=0, p_nan=0)
+    s_genes, g2m_genes = adata.var_names[:20], adata.var_names[20:40]
+    res = rsc.tl.score_genes_cell_cycle(adata, s_genes=s_genes, g2m_genes=g2m_genes, out=True, rng=0)
+    assert "phase" not in adata.obs
+    rsc.tl.score_genes_cell_cycle(adata, s_genes=s_genes, g2m_genes=g2m_genes, out={"phase": "obs.cc"}, rng=0)
+    assert list(adata.obs.columns) == ["cc"]
+    np.testing.assert_array_equal(adata.obs["cc"], res.phase)
+    with pytest.raises(TypeError, match="mapping"):
+        rsc.tl.score_genes_cell_cycle(adata, s_genes=s_genes, g2m_genes=g2m_genes, out="obs.cc")
 
 
 @pytest.mark.parametrize("gene_pool", [[], ["foo", "bar"]])
