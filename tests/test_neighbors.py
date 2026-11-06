@@ -230,7 +230,7 @@ def test_neighbors_out():
     assert adata.uns["c"].keys() == {"connectivities_key", "params"}
 
     # consumers take the graph
-    rsc.tl.umap(adata, use=A.obsp["nn"], out=A.obsm["u"], maxiter=10)
+    rsc.tl.umap(adata, use=A.obsp["nn"], rep=A.obsm["X_pca"], out=A.obsm["u"], maxiter=10)
     rsc.tl.leiden(adata, use="obsp.c", out=A.obs["cl"])
     assert adata.obsm["u"].shape == (adata.n_obs, 2)
     assert "u" in adata.uns and "cl" in adata.uns

@@ -141,7 +141,7 @@ nitpick_ignore = [
     ("py:class", "rapids_singlecell.pertpy_gpu._distance.MeanVar"),
     *[
         ("py:class", f"rapids_singlecell._settings.{cls}Preset")
-        for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes"]
+        for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes", "QcMetrics"]
     ],
     ("py:data", "typing.Union"),
     ("py:class", "cuml.linear_model.LogisticRegression"),

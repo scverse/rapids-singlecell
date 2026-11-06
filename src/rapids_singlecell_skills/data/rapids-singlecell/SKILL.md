@@ -86,7 +86,7 @@ def qc_outliers(obs: pd.DataFrame, by: str) -> pd.Series:
 adata.layers["counts"] = adata.X.copy()  # host copy of raw counts
 rsc.get.anndata_to_GPU(adata)
 adata.var["mt"] = adata.var_names.str.startswith(("MT-", "mt-"))
-rsc.pp.calculate_qc_metrics(adata, qc_vars=["mt"])
+rsc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], out=False)
 adata = adata[~qc_outliers(adata.obs, by="sample").to_numpy()].copy()
 rsc.pp.scrublet(adata, batch=A.obs["sample"], verbose=False)  # raw counts
 adata = adata[~adata.obs["predicted_doublet"].to_numpy()].copy()

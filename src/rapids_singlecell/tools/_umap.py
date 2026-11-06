@@ -72,6 +72,7 @@ def umap(
     a: float | None = None,
     b: float | None = None,
     use: GraphAcc | str | None = None,
+    rep: MultiAcc | str | None = None,
     out: MultiAcc | str | bool = False,
     # deprecated
     key_added: str | None = None,
@@ -144,6 +145,9 @@ def umap(
         `rsc.pp.neighbors(adata, out=A.obsp['k'])`.
         Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
         If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
+    rep
+        Accepted for compatibility with :func:`scanpy.tl.umap`, which lays out the graph's
+        connected components with it. cuML lays them out from the graph alone, so it is not read.
     out
         Where to write the embedding, e.g. `A.obsm['umap2']`; the parameters go to `.uns` under the same key.
         If `True`, the embedding is returned instead.

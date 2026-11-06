@@ -8,6 +8,7 @@ from cupyx.scipy import sparse
 from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
+from rapids_singlecell._settings import Default, resolve_default
 from rapids_singlecell.get import _get_arr
 from rapids_singlecell.get._out import DEPR_USE, _out_dests, _use_args, _write_dests
 from rapids_singlecell.get._utils import LayerAcc
@@ -46,7 +47,7 @@ def calculate_qc_metrics(
     qc_vars: str | list = None,
     log1p: bool = True,
     use: LayerAcc | str | None = None,
-    out: MultiAcc | str | QcMetricsOut | bool = False,
+    out: MultiAcc | str | QcMetricsOut | bool | Default = Default(("calculate_qc_metrics", "out")),
     # deprecated
     layer: str = None,
 ) -> QcMetricsResult | None:
@@ -79,6 +80,7 @@ def calculate_qc_metrics(
             A mapping (:class:`~rapids_singlecell.pp.QcMetricsOut`) writes only the tables it names,
             e.g. `{'obs': A.obsm['qc']}`.
             If `True`, they are returned as a :class:`~rapids_singlecell.pp.QcMetricsResult`.
+            Defaults to `True` if :attr:`rapids_singlecell.settings.preset` is `ScanpyV1`, else `False`.
 
     Returns
     -------
@@ -140,6 +142,7 @@ def calculate_qc_metrics(
                 obs[f"log1p_total_{expr_type}_{qc_var}"] = cp.asnumpy(cp.log1p(sums_cells_sub))
 
     vals = QcMetricsResult(obs, var)
+    out = resolve_default(out)
     if out is True:
         return vals
     if out is False:
