@@ -187,7 +187,7 @@ def umap(
             init_coords = get_init_pos_from_paga(
                 adata,
                 **_rng_kwargs(get_init_pos_from_paga, rng),
-                neighbors_key=neighbors_key,
+                adjacency=neighbors["connectivities"],
             )
         case str() if init_pos == "auto":
             init_coords = "spectral" if n_obs < 1000000 else "random"

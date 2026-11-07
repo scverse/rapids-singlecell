@@ -139,8 +139,9 @@ def score_genes(
         raise RuntimeError(msg)
     gene_array = cp.array(var_names.isin(gene_list), dtype=cp.bool_)
     control_array = cp.array(var_names.isin(control_genes), dtype=cp.bool_)
-    means_list = _nan_mean(X, axis=1, mask=gene_array, n_features=len(gene_list))
-    means_control = _nan_mean(X, axis=1, mask=control_array, n_features=len(control_genes))
+    # count masked columns, not names: duplicated var_names select several columns
+    means_list = _nan_mean(X, axis=1, mask=gene_array, n_features=int(gene_array.sum()))
+    means_control = _nan_mean(X, axis=1, mask=control_array, n_features=int(control_array.sum()))
     if isinstance(X, DaskArray):
         means_list, means_control = dask.compute(means_list, means_control)
 

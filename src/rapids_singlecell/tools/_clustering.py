@@ -9,7 +9,7 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 from natsort import natsorted
-from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
+from scanpy.tools._utils_clustering import restrict_adjacency
 from scverse_misc import Deprecation, deprecated, deprecated_arg
 
 from rapids_singlecell._keys import _resolve_obsm_key
@@ -296,9 +296,8 @@ def leiden(
             # Format output
             groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
             if restrict_to is not None:
-                groups = rename_groups(
+                groups = _rename_groups(
                     adata,
-                    key_added=col,
                     restrict_key=restrict_key,
                     restrict_categories=restrict_categories,
                     restrict_indices=restrict_indices,
@@ -446,9 +445,8 @@ def louvain(
             # Format output
             groups = louvain_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
             if restrict_to is not None:
-                groups = rename_groups(
+                groups = _rename_groups(
                     adata,
-                    key_added=col,
                     restrict_key=restrict_key,
                     restrict_categories=restrict_categories,
                     restrict_indices=restrict_indices,
@@ -543,3 +541,10 @@ def kmeans(
         return labels
     adata.obs[key] = labels
     return None
+
+
+def _rename_groups(adata, *, restrict_key, restrict_categories, restrict_indices, groups):
+    """Prefix the subclusters of `restrict_categories` with their parents, keeping the other labels."""
+    all_groups = adata.obs[restrict_key].astype("U")
+    all_groups.iloc[restrict_indices] = [f"{'-'.join(restrict_categories)},{g}" for g in groups.astype("U")]
+    return all_groups

@@ -123,6 +123,8 @@ def test_score_genes_sparse_vs_dense():
     score_genes() should give the same result for dense and sparse matrices
     """
     adata_sparse = _create_adata(100, 1000, p_zero=0.3, p_nan=0.3)
+    # a duplicated gene name selects two columns
+    adata_sparse.var_names = adata_sparse.var_names[:-1].append(adata_sparse.var_names[:1])
 
     adata_dense = adata_sparse.copy()
     adata_dense.X = adata_dense.X.toarray()

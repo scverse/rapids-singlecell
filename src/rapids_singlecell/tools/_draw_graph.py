@@ -104,6 +104,7 @@ def draw_graph(
             init_coords = get_init_pos_from_paga(
                 adata,
                 **_rng_kwargs(get_init_pos_from_paga, rng),
+                adjacency=adjacency,
             )
         case False:
             init_coords = None
