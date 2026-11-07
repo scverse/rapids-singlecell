@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 import scanpy as sc
 
 import rapids_singlecell as rsc
+
+pytestmark = pytest.mark.filterwarnings("ignore:The function rank_genes_groups_logreg is deprecated:FutureWarning")
 
 
 def test_rank_genes_groups_with_renamed_categories():

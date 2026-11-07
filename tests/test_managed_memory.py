@@ -84,7 +84,7 @@ def test_harmony_integrate(managed_memory, dtype):
     adata = AnnData(rng.standard_normal((300, 5)).astype(dtype))
     adata.obs["batch"] = pd.Categorical(rng.choice(["a", "b"], 300))
     adata.obsm["X_pca"] = rng.standard_normal((300, 10)).astype(dtype)
-    rsc.pp.harmony_integrate(adata, key="batch", dtype=dtype)
+    rsc.pp.harmony_integrate(adata, "batch", dtype=dtype)
     assert adata.obsm["X_pca_harmony"].shape == (300, 10)
     assert adata.obsm["X_pca_harmony"].dtype == dtype
 

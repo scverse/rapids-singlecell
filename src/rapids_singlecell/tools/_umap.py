@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Literal
 
 import cuml.internals.logger as logger
 import cupy as cp
-import cupyx
 import numpy as np
 from cuml.manifold.umap import find_ab_params, simplicial_set_embedding
 from cupyx.scipy import sparse
@@ -43,7 +42,7 @@ def _device_coo(graph) -> sparse.coo_matrix:
         return sparse.coo_matrix(graph)
     row = cp.zeros(graph.nnz, dtype=cp.int32)
     starts = cp.asarray(graph.indptr[1:-1])
-    cupyx.scatter_add(row, starts[starts < graph.nnz], 1)
+    cp.add.at(row, starts[starts < graph.nnz], 1)
     cp.cumsum(row, out=row)
     col = cp.empty(graph.nnz, dtype=cp.int32)
     for start in range(0, graph.nnz, _H2D_CHUNK):

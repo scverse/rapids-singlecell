@@ -169,6 +169,7 @@ def test_rank_genes_groups_ttest_subset_and_bonferroni(reference, method):
     ],
 )
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
 def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
@@ -624,7 +625,7 @@ def test_ttest_host_multi_gpu_matches_single(layout, reference):
     multi = base.copy()
     kwargs = {
         "method": "t-test",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "n_genes": 12,
     }
@@ -644,6 +645,7 @@ def test_ttest_host_multi_gpu_matches_single(layout, reference):
             )
 
 
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
 def test_rank_genes_groups_use_out():
     A = pytest.importorskip("anndata.acc").A
 
@@ -658,5 +660,5 @@ def test_rank_genes_groups_use_out():
     with pytest.warns(FutureWarning, match="layer"):
         rsc.tl.rank_genes_groups(adata, "blobs", method="t-test", layer="x", key_added="old")
     np.testing.assert_array_equal(res["scores"], adata.uns["old"]["scores"])
-    with pytest.raises(TypeError, match="not both"):
+    with pytest.raises(TypeError, match="not both"), pytest.warns(FutureWarning, match="layer"):
         rsc.tl.rank_genes_groups(adata, "blobs", use="X", layer="x")

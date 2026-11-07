@@ -20,7 +20,7 @@ def small_adata() -> AnnData:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding, obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -49,7 +49,7 @@ def test_unused_categories_dropped() -> None:
     cpg, nf = 15, 5
     X = np.vstack([(rng.normal(size=(cpg, nf)) + i).astype(np.float32) for i in range(3)])
     labels = [c for c in ["g0", "g1", "g2"] for _ in range(cpg)]
-    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])})
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X, dtype=cp.float32)
     df = Distance(metric="edistance").pairwise(adata, groupby="group")
@@ -292,7 +292,7 @@ def test_edistance_correctness_larger_dataset() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -362,7 +362,7 @@ def contrast_adata() -> AnnData:
             "treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n),
             "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2),
         }
-    )
+    ).rename(str)
     adata = AnnData(cpu_emb.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
     return adata
@@ -476,7 +476,7 @@ def test_contrast_distances_multiple_references() -> None:
             ),
             "celltype": pd.Categorical(["T"] * n * 4 + ["B"] * n * 2),
         }
-    )
+    ).rename(str)
     adata = AnnData(cpu_emb.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
 
@@ -530,7 +530,7 @@ def test_contrast_distances_multiple_references_no_split() -> None:
         {
             "treatment": pd.Categorical(["ref1"] * n + ["ref2"] * n + ["drugA"] * n + ["drugB"] * n),
         }
-    )
+    ).rename(str)
     adata = AnnData(cpu_emb.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
 
@@ -609,7 +609,7 @@ def test_contrast_distances_two_split_by() -> None:
             "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2 + ["T"] * n * 2),
             "batch": pd.Categorical(["b1"] * n * 4 + ["b2"] * n * 2),
         }
-    )
+    ).rename(str)
     adata = AnnData(cpu_emb.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_emb, dtype=cp.float32)
 
@@ -695,7 +695,7 @@ def test_bootstrap_mean_close_to_point_estimate() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -936,7 +936,7 @@ def test_distance_layer_key_basic() -> None:
     # Create expression data with proper shape for both X and layer
     cpu_data = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     # Create AnnData with n_features as n_vars (required for layer to match)
     adata = AnnData(np.zeros((total_cells, n_features), dtype=np.float32), obs=obs)
@@ -1001,7 +1001,7 @@ def test_float64_matches_float32_results() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata_f32 = AnnData(cpu_embedding, obs=obs)
     adata_f32.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1033,7 +1033,7 @@ def test_bootstrap_different_feature_counts(n_features: int) -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1069,7 +1069,7 @@ def test_pairwise_correctness_parametrized(dtype) -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(dtype)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=dtype)
@@ -1105,7 +1105,7 @@ def test_correctness_float32_features(n_features) -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=np.float32)
@@ -1137,7 +1137,7 @@ def test_correctness_float64_small() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float64)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=np.float64)
@@ -1186,7 +1186,7 @@ def test_block_size_consistency() -> None:
     # Use float64 since block size difference only matters for float64 on pre-Ampere
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float64)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float64)
@@ -1259,7 +1259,7 @@ def test_distance_axioms(
         cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
 
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1469,7 +1469,7 @@ def test_two_groups_only() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1493,7 +1493,7 @@ def test_many_groups() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1521,7 +1521,7 @@ def test_unequal_group_sizes() -> None:
     for i, size in enumerate(group_sizes):
         groups.extend([f"g{i}"] * size)
 
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(3)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(3)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1617,7 +1617,7 @@ def test_single_cell_per_group() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1653,7 +1653,7 @@ def test_single_cell_mixed_groups() -> None:
     for i, size in enumerate(group_sizes):
         group_labels.extend([f"g{i}"] * size)
 
-    obs = pd.DataFrame({"group": pd.Categorical(group_labels, categories=["g0", "g1", "g2"])})
+    obs = pd.DataFrame({"group": pd.Categorical(group_labels, categories=["g0", "g1", "g2"])}).rename(str)
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
 
@@ -1687,7 +1687,7 @@ def test_high_dimensional_features() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1725,7 +1725,7 @@ def test_similar_distributions_small_distance() -> None:
     cpu_embedding = np.vstack([g0_data, g1_data])
 
     groups = ["g0"] * cells_per_group + ["g1"] * cells_per_group
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=["g0", "g1"])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=["g0", "g1"])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1754,7 +1754,7 @@ def test_different_distributions_larger_distance() -> None:
     cpu_embedding = np.vstack([g0_data, g1_data, g2_data]).astype(np.float32)
 
     groups = ["g0"] * cells_per_group + ["g1"] * cells_per_group + ["g2"] * cells_per_group
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=["g0", "g1", "g2"])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=["g0", "g1", "g2"])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1793,7 +1793,7 @@ def test_multi_gpu_pairwise_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1826,7 +1826,7 @@ def test_multi_gpu_onesided_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1863,7 +1863,7 @@ def test_multi_gpu_bootstrap_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1918,7 +1918,7 @@ def test_multi_gpu_onesided_bootstrap_matches_single_gpu() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -1999,7 +1999,7 @@ def test_small_group_count_works() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
@@ -2033,7 +2033,7 @@ def test_multi_gpu_with_more_gpus_than_pairs() -> None:
 
     cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float32)
     groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
 
     adata = AnnData(cpu_embedding.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float32)
