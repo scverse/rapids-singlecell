@@ -40,7 +40,7 @@ import scanpy as sc
 from anndata.acc import A
 ```
 
-- The pool is the fast route when data fit in VRAM.
+- The pool is fastest when data fit in VRAM.
   Importing rsc alone installs RMM without a pool.
 - If data do not fit, use `rmm.reinitialize(managed_memory=True)` instead.
   For Dask, multi-GPU or data far beyond VRAM, read [references/dask.md](references/dask.md).
@@ -50,20 +50,23 @@ from anndata.acc import A
 - Only `X`, and layers you move yourself, live on the GPU.
   rsc writes `obs`, `var`, `obsm`, `obsp` and `uns` results to the host.
 - `rsc.pp` QC, filter, normalization and HVG functions raise `_check_gpu_X` on host input.
-  `rsc.get.anndata_to_GPU(adata)` moves `X` only, and `layer=` or `convert_all=True` also moves layers.
+  `rsc.get.anndata_to_GPU(adata)` moves only `X`; `layer=` or `convert_all=True` adds layers.
 - Keep raw counts as a host layer, not `.raw` or a GPU copy.
   `rsc.get.aggregate` and `rsc.tl.rank_genes_groups` read host data directly.
 - `sc.pl` works with a GPU `X` when coloring by `obs` or `obsm`.
   Call `rsc.get.anndata_to_CPU(adata)` once before plotting gene expression.
 - Check `type(adata.X)` instead of converting defensively or hand-rolling converters.
+- Like scanpy 1.13, read with `use=A.layers["counts"]` and write with `out=` (an accessor, or `True` to return).
+  `layer`, `obsm`, `use_rep`, `key_added`, `inplace` and `copy` are deprecated.
+  `calculate_qc_metrics` returns its metrics unless `out=False`.
 
 ## Standard workflow
 
 Inspect first: shape, whether `X` holds integer counts, and which `obs` columns hold the biological sample, batch and condition.
-The code's `sample` and `condition` stand for the dataset's own columns.
+`sample` and `condition` stand for the dataset's own columns.
 Convert dense counts to CSR (`scipy.sparse.csr_matrix`) before moving them to the GPU.
 Cross-tabulate sample against condition, because a batch nested in condition cannot be corrected without erasing the condition.
-For spatial data, read [references/spatial.md](references/spatial.md) first, because its QC and normalization replace QC, doublet scoring and normalization below.
+For spatial data, read [references/spatial.md](references/spatial.md) first; its QC and normalization replace those below.
 
 ```python
 import pandas as pd
@@ -110,28 +113,28 @@ rsc.tl.rank_genes_groups(adata, "leiden_1.0", method="wilcoxon", pts=True)
 - Score doublets per sample and remove them before clustering.
 - Normalize to median depth, not `target_sum=1e4` or `1e6`.
   Do not `scale` (it densifies `X`) or `regress_out` before PCA.
-- Select about 2000 `seurat_v3` HVGs on raw counts, where `batch_key` is optional.
-- Integrate only when the uncorrected embedding separates a technical batch that shares biology across batches.
+- Select about 2000 `seurat_v3` HVGs on raw counts, where `batch=A.obs["sample"]` is optional.
+- Integrate only when the uncorrected embedding separates technical batches that share biology.
   Start with Harmony and move to scVI/scANVI for complex or cross-system batches.
 - Verify integration kept biology with known markers or scib-metrics, not UMAP inspection.
 - Leiden partitions change with the seed.
-  Sweep resolutions with 3 to 5 `rng` values and keep resolutions whose labels agree across seeds (ARI) and whose clusters have distinct markers.
+  Sweep resolutions with 3 to 5 `rng` values; keep those whose labels agree across seeds (ARI) and whose clusters have distinct markers.
 - GPU PCA on sparse input is not bitwise reproducible across reruns and can shift cluster boundaries.
-  Save final labels in the AnnData rather than expecting a rerun to reproduce them.
+  Save final labels in the AnnData instead of rerunning.
 - Marker p-values after clustering are only for ranking because the same data defined the clusters.
   Filter markers by `pts` detection fractions and effect size.
 - Annotate clusters from positive and negative markers (score marker sets with `rsc.dcg.ulm` and compare cluster means) or reference transfer (CellTypist, scANVI).
   Use `unknown` for weak or tied evidence and treat LLM-proposed labels as hypotheses.
 - UMAP is display only, so never infer distances, relatedness or trajectories from it.
 - Comparing conditions needs biological replicates and pseudobulk, so read [references/conditions.md](references/conditions.md) first.
-- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they do not beat in most cases.
+- Use foundation-model embeddings only on request and next to a PCA, Harmony or scVI baseline, which they usually do not beat.
 
 ## Fast paths
 
 - `rsc.pp.neighbors` defaults to exact `brute`, which is fine up to about 500k cells.
   Above that use `algorithm="nn_descent"` (5x faster at 2M cells, recall 0.99), not `ivfflat` (recall 0.72 by default).
 - Use `rank_genes_groups(method="wilcoxon_binned")` for Dask input or tens of millions of cells.
-- Do not rerun steps on CPU to validate them or benchmark rsc against the CPU implementation unless asked.
+- Do not rerun steps on CPU to validate or benchmark them unless asked.
 
 ## Outside rsc
 
@@ -153,12 +156,12 @@ For CRISPR screens and perturbation distances, read [references/perturbation.md]
 ## Deliverables
 
 Use a notebook for multi-step workflows or when asked.
-Otherwise a small script artifact is fine.
+Otherwise a script is fine.
 
 - Check outputs against data scale.
   Hundreds of clusters, clusters near cell count, or figures of hundreds of megapixels mean stop and fix.
 - Follow requested choices unless the data or design make them invalid.
-  In that case, show the evidence and propose an alternative.
+  Then show the evidence and propose an alternative.
 
 In a notebook:
 
@@ -166,6 +169,6 @@ In a notebook:
   Plot right after the computation it shows, then interpret in a short markdown cell.
 - Never paste standalone scripts into notebook cells.
 - Record package versions at the end of the notebook with `session_info2`.
-- While developing, test new stages against a checkpoint AnnData saved after preprocessing instead of re-executing the whole notebook.
+- While developing, test new stages on an AnnData checkpoint saved after preprocessing, not by re-executing the notebook.
 - Execute top to bottom in a fresh kernel with `jupyter nbconvert --to notebook --execute --inplace` and read every output.
 - Deliver the executed notebook, the final AnnData, and a short markdown report of findings, evidence and limitations.
