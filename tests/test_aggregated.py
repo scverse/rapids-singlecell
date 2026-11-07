@@ -107,7 +107,8 @@ def test_masked_mean_var(array_type):
         {
             "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
             "mask": [True, True, False, True, True, False],
-        }
+        },
+        index=[str(i) for i in range(6)],
     )
     adata = ad.AnnData(X=array_type(X), obs=obs)
     rsc.get.anndata_to_GPU(adata)
@@ -336,7 +337,7 @@ def test_aggregate_axis_specification(axis_name):
 def test_aggregate_examples(matrix, df, keys, metrics, expected):
     adata = ad.AnnData(
         X=matrix,
-        obs=df,
+        obs=df.set_axis(df.index.astype(str)),
         var=pd.DataFrame(index=[f"gene_{i}" for i in range(matrix.shape[1])]),
     )
     rsc.get.anndata_to_GPU(adata)
@@ -446,7 +447,8 @@ def test_aggregate_host_masked(array_type):
         {
             "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
             "mask": [True, True, False, True, True, False],
-        }
+        },
+        index=[str(i) for i in range(6)],
     )
     adata = ad.AnnData(X=array_type(X), obs=obs)  # host, not transferred
 

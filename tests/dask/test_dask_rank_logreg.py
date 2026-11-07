@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cupy as cp
 import pytest
+from anndata.acc import A
 from scanpy.datasets import pbmc3k_processed, pbmc68k_reduced
 
 import rapids_singlecell as rsc
@@ -67,7 +68,7 @@ def test_rank_genes_groups_logreg(dist_client, data_kind, dtype):
         rsc.get.anndata_to_GPU(adata)
         groupby = "louvain"
 
-    rsc.tl.rank_genes_groups_logreg(adata, groupby=groupby, use_raw=False)
-    rsc.tl.rank_genes_groups_logreg(dask_data, groupby=groupby, use_raw=False)
+    rsc.tl.rank_genes_groups(adata, groupby=groupby, method="logreg", use=A.X)
+    rsc.tl.rank_genes_groups(dask_data, groupby=groupby, method="logreg", use=A.X)
 
     assert _compare_top_genes(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])

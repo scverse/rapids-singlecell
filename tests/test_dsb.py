@@ -148,6 +148,7 @@ def test_view_is_made_actual(counts):
     assert "dsb_technical_component" in view.obs
 
 
+@pytest.mark.filterwarnings("ignore:Variable names are not unique:UserWarning")
 def test_invalid_inputs(counts):
     c, e = counts
     iso = {"isotype_controls": ISOTYPES}
@@ -220,7 +221,8 @@ def _ref_mclust2(x, eps=np.finfo(np.float64).eps):
 
     def mstep(z, equal):
         nk = z.sum(0)
-        mu = (z * x[:, None]).sum(0) / nk
+        with np.errstate(invalid="ignore"):
+            mu = (z * x[:, None]).sum(0) / nk
         ss = (z * (x[:, None] - mu) ** 2).sum(0)
         return mu, np.full(2, ss.sum() / len(x)) if equal else ss / nk, nk / len(x)
 

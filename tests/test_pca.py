@@ -566,6 +566,9 @@ def test_pca_out():
     assert adata.uns["pp"]["params"]["obsm"] == "p"
 
 
+@pytest.mark.filterwarnings("ignore:Some cells have zero counts:UserWarning")
+@pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in divide:RuntimeWarning")
 def test_pca_layer_mask():
     """Test error when layer has zero-expression genes."""
     adata = sc.datasets.pbmc3k()[:, 1000].copy()
