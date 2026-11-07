@@ -151,7 +151,8 @@ def test_n_pcs_setting_controls_pca_and_representation_selection():
 
     with rsc.settings.override(N_PCS=3):
         rsc.pp.pca(adata)
-        representation = rsc.pp.neighbors(adata, n_neighbors=3, copy=True)
+        representation = adata.copy()
+        rsc.pp.neighbors(representation, n_neighbors=3)
 
     assert adata.obsm["X_pca"].shape == (10, 3)
     assert representation.uns["neighbors"]["params"].get("n_pcs") is None

@@ -85,7 +85,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
     assert np.all(cudata.var.highly_variable_intersection == cudata.var.highly_variable)
 
     cudata.obs["batch"] = "a"
-    cudata.obs.batch.loc[::2] = "b"
+    cudata.obs.loc[::2, "batch"] = "b"
     rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert cudata.var["highly_variable"].any()
 
@@ -177,14 +177,14 @@ def test_compare_to_seurat_v3():
         pbmc_paper,
         n_top_genes=2000,
         flavor="seurat_v3_paper",
-        batch_key="dummy_tech",
+        batch="obs.dummy_tech",
     )
 
     rsc.pp.highly_variable_genes(
         pbmc,
         n_top_genes=2000,
         flavor="seurat_v3",
-        batch_key="dummy_tech",
+        batch="obs.dummy_tech",
     )
 
     seurat_v3_paper = pbmc_paper.var
@@ -259,7 +259,7 @@ def _check_pearson_hvg_columns(output_df, n_top_genes):
 @pytest.mark.parametrize("sparse", [True, False])
 def test_highly_variable_genes_pearson_residuals_general(clip, theta, n_top_genes, dtype, sparse):
     cudata = sc.datasets.pbmc3k().copy()
-    cudata = cudata[:1000, :500]
+    cudata = cudata[:1000, :500].copy()
     np.random.seed(42)
     cudata.obs["batch"] = np.random.randint(0, 3, size=cudata.shape[0])
     sc.pp.filter_genes(cudata, min_cells=1)
@@ -334,7 +334,7 @@ def test_highly_variable_genes_pearson_residuals_batch(n_top_genes, dtype):
         cudata,
         flavor="pearson_residuals",
         n_top_genes=n_top_genes,
-        batch_key="batch",
+        batch="obs.batch",
     )
 
     # check output is complete
@@ -384,7 +384,7 @@ def test_pearson_residuals_batch_order_invariant():
         a1,
         flavor="pearson_residuals",
         n_top_genes=100,
-        batch_key="batch",
+        batch="obs.batch",
         check_values=False,
     )
 
@@ -395,7 +395,7 @@ def test_pearson_residuals_batch_order_invariant():
         a2,
         flavor="pearson_residuals",
         n_top_genes=100,
-        batch_key="batch",
+        batch="obs.batch",
         check_values=False,
     )
 

@@ -50,7 +50,11 @@ def test_regress_out_layer(dtype, batchsize):
     single = rsc.pp.regress_out(adata, ["n_counts", "percent_mito"], batchsize=batchsize, out=True)
     assert adata.X.shape == single.shape
 
-    with pytest.warns(FutureWarning, match="keys"):
+    with (
+        pytest.warns(FutureWarning, match="argument layer"),
+        pytest.warns(FutureWarning, match="argument keys"),
+        pytest.warns(FutureWarning, match="argument inplace"),
+    ):
         layer = rsc.pp.regress_out(
             adata,
             layer="counts",

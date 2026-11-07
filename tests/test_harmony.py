@@ -704,6 +704,7 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, levels, n_cells
     cp.testing.assert_allclose(correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol)
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge:UserWarning")
 @pytest.mark.parametrize(("n_pcs", "n_clusters", "n_keys"), [(64, 64, 1), (30, 23, 1), (32, 126, 1), (30, 10, 2)])
 def test_harmony_shared_memory_boundary(n_pcs, n_clusters, n_keys):
     # Shapes whose segment-sum or apply plan fills the 48 KB of shared memory a kernel may use without opting in:
@@ -820,7 +821,7 @@ def adata_reference():
     meta = pd.read_csv(meta_file, delimiter="\t")
     return ad.AnnData(
         X=None,
-        obs=meta,
+        obs=meta.rename(index=str),
         obsm={"X_pca": X_pca.values, "harmony_org": X_pca_harmony.values},
     )
 
@@ -913,7 +914,7 @@ def test_harmony_integrate_use_out():
     np.testing.assert_array_equal(adata.obsm["h"], res)
     with pytest.warns(FutureWarning, match="key"):
         rsc.pp.harmony_integrate(adata, key="bulk_labels", **kw)
-    with pytest.warns(FutureWarning, match="adjusted_basis"):
+    with pytest.warns(FutureWarning, match="adjusted_basis"), pytest.warns(FutureWarning, match="argument basis"):
         rsc.pp.harmony_integrate(adata, "bulk_labels", basis="X_pca", adjusted_basis="old", **kw)
     np.testing.assert_array_equal(adata.obsm["old"], res)
     np.testing.assert_array_equal(adata.obsm["X_pca_harmony"], res)
@@ -1080,6 +1081,7 @@ def test_harmony2_ircolitis_reference(adata_ircolitis_harmonypy2, correction_met
     assert _get_measure(ref, result, "L2").max() < 0.1
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge:UserWarning")
 def test_harmony_unseeded_random_state():
     """``random_state=None`` means unseeded, not a crash."""
     rng = np.random.default_rng(734)

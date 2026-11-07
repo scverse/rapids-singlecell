@@ -100,7 +100,7 @@ def _get_anndata():
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 def test_scale_simple(dtype):
     adata = sc.datasets.pbmc68k_reduced()
-    adata.X = adata.raw.X.todense()
+    adata.X = adata.raw.X.toarray()
 
     adata[:, 0 : adata.shape[1] // 2]
     adata.X = cp.array(adata.X, dtype=dtype)

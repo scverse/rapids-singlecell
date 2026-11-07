@@ -24,7 +24,7 @@ import rapids_singlecell as rsc
 )
 def test_filter_genes(array_type, max_cells, max_counts, min_cells, min_counts):
     adata = pbmc68k_reduced()
-    adata.X = adata.raw.X.todense()
+    adata.X = adata.raw.X.toarray()
     rsc.get.anndata_to_GPU(adata)
     adata_casted = adata.copy()
     if array_type is not cp.ndarray:
@@ -62,7 +62,7 @@ def test_filter_genes(array_type, max_cells, max_counts, min_cells, min_counts):
 )
 def test_filter_cells(array_type, max_genes, max_counts, min_genes, min_counts):
     adata = pbmc68k_reduced()
-    adata.X = adata.raw.X.todense()
+    adata.X = adata.raw.X.toarray()
     rsc.get.anndata_to_GPU(adata)
     adata_casted = adata.copy()
     if array_type is not cp.ndarray:
