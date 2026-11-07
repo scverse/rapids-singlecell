@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData, read_h5ad
+from anndata.acc import A
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wnn_cuda
@@ -142,8 +143,10 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
     adata = _multimodal_adata()
     adata.X = None  # the layout must use an existing reduction
     use_rep = {"RNA": "X_pca", "ADT": "X_apca"}
-    out = rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, key_added="wnn", copy=True)
+    out = adata.copy()
+    rsc.pp.wnn(out, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, out=A.obsp["wnn"])
     assert "wnn" not in adata.uns
+    assert out.uns["wnn"].keys() >= {"connectivities_key", "distances_key", "snn_key"}
     params = out.uns["wnn"]["params"]
     assert (params["use_rep"], params["n_pcs"]) == ("X_pca", 10)
     assert params["modalities"] == {"RNA": {"use_rep": "X_pca", "n_pcs": 10}, "ADT": {"use_rep": "X_apca", "n_pcs": 8}}
@@ -151,17 +154,22 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
     np.testing.assert_allclose(w.sum(axis=1), 1, rtol=1e-6)
     # the RNA-like modality separates more groups, so it should dominate
     assert w[:, 0].mean() > w[:, 1].mean()
-    C = out.obsp["wnn_connectivities"]
+    C = out.obsp["wnn"]
     assert abs(C - C.T).max() < 1e-6
     assert C.diagonal().max() == 0
     out.write_h5ad(tmp_path / "wnn.h5ad")
     loaded = read_h5ad(tmp_path / "wnn.h5ad")
     assert loaded.uns["wnn"]["params"]["modalities"] == params["modalities"]
-    for key in ("wnn_distances", "wnn_connectivities", "wnn_snn"):
+    for key in ("wnn_distances", "wnn", "wnn_snn"):
         assert (loaded.obsp[key] != out.obsp[key]).nnz == 0
-    rsc.tl.leiden(out, neighbors_key="wnn")
-    rsc.tl.leiden(out, obsp="wnn_snn", key_added="leiden_snn")
-    rsc.tl.umap(out, neighbors_key="wnn")
+    rsc.tl.leiden(out, use=A.obsp["wnn"])
+    rsc.tl.leiden(out, use=A.obsp["wnn_snn"], out=A.obs["leiden_snn"])
+    rsc.tl.umap(out, use=A.obsp["wnn"])
+    res = rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, out=True)
+    assert (res.connectivities != C).nnz == 0
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, key_added="k")
+    assert {"k_connectivities", "k_distances", "k_snn"} <= adata.obsp.keys()
     sc.tl.umap(loaded, neighbors_key="wnn", maxiter=10, random_state=0)
     assert np.isfinite(loaded.obsm["X_umap"]).all()
     # ingest would silently map through the first modality only

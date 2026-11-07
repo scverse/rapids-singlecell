@@ -33,7 +33,7 @@ def test_rank_genes_groups_with_renamed_categories_use_rep():
     adata.layers["to_test"] = adata.X.copy()
     adata.X = adata.X[::-1, :]
 
-    rsc.tl.rank_genes_groups_logreg(adata, "blobs", layer="to_test", use_raw=False)
+    rsc.tl.rank_genes_groups_logreg(adata, "blobs", use="layers.to_test")
     assert adata.uns["rank_genes_groups"]["names"].dtype.names == ("0", "1", "2")
     assert adata.uns["rank_genes_groups"]["names"][0].tolist() == ("1", "3", "0")
 

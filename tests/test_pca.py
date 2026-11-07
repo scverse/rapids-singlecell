@@ -465,18 +465,21 @@ def test_mask_defaults(float_dtype):
     A = cp.array(A_list).astype("float32")
     adata = AnnData(A)
 
-    without_var = rsc.pp.pca(adata, copy=True, dtype=float_dtype)
+    without_var = adata.copy()
+    rsc.pp.pca(without_var, dtype=float_dtype)
 
     mask = np.array([True, True, False, True, False])
     adata.var["highly_variable"] = mask
 
-    with_var = rsc.pp.pca(adata, copy=True, dtype=float_dtype)
+    with_var = adata.copy()
+    rsc.pp.pca(with_var, dtype=float_dtype)
 
     assert without_var.uns["pca"]["params"]["mask_var"] is None
     assert with_var.uns["pca"]["params"]["mask_var"] == "highly_variable"
     assert not np.array_equal(without_var.obsm["X_pca"], with_var.obsm["X_pca"])
 
-    with_no_mask = rsc.pp.pca(adata, mask_var=None, copy=True, dtype=float_dtype)
+    with_no_mask = adata.copy()
+    rsc.pp.pca(with_no_mask, mask_var=None, dtype=float_dtype)
     assert np.array_equal(without_var.obsm["X_pca"], with_no_mask.obsm["X_pca"])
 
 
@@ -517,7 +520,7 @@ def test_pca_layer():
     del layer_adata.X
 
     rsc.pp.pca(X_adata)
-    rsc.pp.pca(layer_adata, layer="counts")
+    rsc.pp.pca(layer_adata, use="layers.counts")
 
     assert layer_adata.uns["pca"]["params"]["layer"] == "counts"
     assert "layer" not in X_adata.uns["pca"]["params"]
@@ -526,6 +529,41 @@ def test_pca_layer():
     np.testing.assert_almost_equal(X_adata.uns["pca"]["variance_ratio"], layer_adata.uns["pca"]["variance_ratio"])
     np.testing.assert_almost_equal(X_adata.obsm["X_pca"], layer_adata.obsm["X_pca"])
     np.testing.assert_almost_equal(X_adata.varm["PCs"], layer_adata.varm["PCs"])
+
+
+def test_pca_deprecated_params():
+    adata = _mask_var_adata()
+    adata.layers["counts"] = adata.X.copy()
+    with pytest.warns(FutureWarning, match="layer"):
+        rsc.pp.pca(adata, n_comps=2, layer="counts")
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.pp.pca(adata, n_comps=2, key_added="k")
+    assert {"k"} <= set(adata.obsm) & set(adata.varm) & set(adata.uns)
+    with pytest.warns(FutureWarning, match="copy"):
+        copied = rsc.pp.pca(adata, n_comps=2, copy=True)
+    assert "X_pca" in copied.obsm
+
+
+def test_pca_out():
+    from anndata.acc import A
+
+    adata = _mask_var_adata()
+    res = rsc.pp.pca(adata, n_comps=2, out=True)
+    assert res.embedding.shape == (20, 2)
+    assert res.loadings.shape == (5, 2)
+    assert not ({"X_pca"} & set(adata.obsm) or "pca" in adata.uns)
+
+    rsc.pp.pca(adata, n_comps=2, out=A.obsm["p"])
+    assert "p" in adata.obsm and "p" in adata.varm and "p" in adata.uns
+    np.testing.assert_allclose(np.abs(cp.asnumpy(adata.obsm["p"])), np.abs(cp.asnumpy(res.embedding)), atol=1e-5)
+
+    rsc.pp.pca(adata, n_comps=2, out={"embedding": "obsm.e"})
+    assert "e" in adata.obsm and "e" not in adata.varm and "e" in adata.uns
+
+    rsc.pp.pca(adata, n_comps=2, use=A.obsm["p"], out=A.obsm["pp"])
+    assert "pp" not in adata.varm
+    assert adata.uns["pp"]["components"].shape == (2, 2)
+    assert adata.uns["pp"]["params"]["obsm"] == "p"
 
 
 def test_pca_layer_mask():

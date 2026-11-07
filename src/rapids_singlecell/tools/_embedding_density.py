@@ -4,14 +4,20 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._keys import _EMBEDDINGS, _existing_preset_keys
+from rapids_singlecell._settings import Default, Preset, settings
+from rapids_singlecell.get._out import DEPR_KEY_ADDED, DEPR_USE, _obs_col, _out_key, _resolve_obs
+from rapids_singlecell.get._utils import MultiAcc, _resolve_matrix_acc
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+
+    from rapids_singlecell.get._utils import AdRef
 
 
 def _basis_obsm_key(adata: AnnData, basis: str) -> str | None:
@@ -28,14 +34,19 @@ def _basis_obsm_key(adata: AnnData, basis: str) -> str | None:
     return next((key for key in (basis, f"X_{basis}") if key in adata.obsm), None)
 
 
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_arg("basis", DEPR_USE)
 def embedding_density(
     adata: AnnData,
-    basis: str = "umap",
+    use: MultiAcc | str | Default = Default(repr="'umap'"),
     *,
-    groupby: str | None = None,
-    key_added: str | None = None,
+    groupby: AdRef | str | None = None,
     components: str | Sequence[str] = None,
-) -> None:
+    out: AdRef | str | bool = False,
+    # deprecated
+    basis: str | None = None,
+    key_added: str | None = None,
+) -> np.ndarray | None:
     """Calculate the density of cells in an embedding (per condition).
 
     Gaussian kernel density estimation is used to calculate the density of
@@ -52,40 +63,51 @@ def embedding_density(
     ----------
     adata
         The annotated data matrix.
-    basis
-        The embedding over which the density will be calculated. This embedded
-        representation should be found in ``adata.obsm[basis]`` or
-        ``adata.obsm[f"X_{basis}"]``.
+    use
+        The embedding over which the density will be calculated, e.g. `A.obsm['X_umap']`,
+        or the name of a basis found in ``adata.obsm[basis]`` or ``adata.obsm[f"X_{basis}"]``.
+        Strings are basis names, unless the scanpy v2 preset is active,
+        where they are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsm.X_umap'`.
     groupby
-        Key for categorical observation/cell annotation for which densities
-        are calculated per category.
-    key_added
-        Name of the `.obs` covariate that will be added with the density
-        estimates.
+        Categorical `.obs` column for which densities are calculated per category,
+        e.g. `A.obs['batch']` or its name.
     components
         The embedding dimensions over which the density should be calculated.
         This is limited to two components.
+    out
+        Where to write the densities, e.g. `A.obs['k']` (or `'obs.k'`);
+        the parameters then go to `.uns['k_params']`.
+        If `True`, the densities are returned instead of written.
+        If `False`, they are written to `.obs['[basis]_density_[groupby]']`.
 
     Returns
     -------
-    Updates `adata.obs` with an additional field specified by the `key_added` \
-    parameter. This parameter defaults to `[basis]_density_[groupby]`, where \
-    `[basis]` is one of `umap`, `diffmap`, `pca`, `tsne`, or `draw_graph_fa` \
-    and `[groupby]` denotes the parameter input.
-
-    Updates `adata.uns` with an additional field `[key_added]_params`.
+    The densities if `out=True`, else `None`.
+    Sets `adata.obs[key]` and `adata.uns[f'{key}_params']`, where `key` defaults to
+    `[basis]_density_[groupby]`, `[basis]` being one of `umap`, `diffmap`, `pca`, `tsne`,
+    or `draw_graph_fa`.
     """
-    # to ensure that newly created covariates are categorical
-    # to test for category numbers
-    if groupby is not None:
+    if basis is not None:
+        if not isinstance(use, Default):
+            raise TypeError("Pass either `use` or `basis`, not both.")
+        use = basis
+    elif isinstance(use, str) and settings.preset is Preset.ScanpyV2Preview:
+        use = _resolve_matrix_acc(use)
+    basis = "umap" if isinstance(use, Default) else use
+    groupby = _obs_col(groupby, param="groupby")
+    if isinstance(basis, MultiAcc):
+        basis = _resolve_obs(basis, kinds=(MultiAcc,))
+        basis_key = basis.k if basis.k in adata.obsm else None
+        basis = basis.k.removeprefix("X_")
+    else:
+        basis = basis.lower()
+        if basis == "fa":
+            basis = "draw_graph_fa"
+        basis_key = _basis_obsm_key(adata, basis)
+    key = _out_key(out, key_added, kind="obs", default=f"{basis}_density" + ("" if groupby is None else f"_{groupby}"))
+    # ensure that newly created covariates are categorical
+    if groupby is not None and key is not True:
         _sanitize_column(adata, groupby)
-    # Test user inputs
-    basis = basis.lower()
-
-    if basis == "fa":
-        basis = "draw_graph_fa"
-
-    basis_key = _basis_obsm_key(adata, basis)
     if basis_key is None:
         raise ValueError(
             "Cannot find the embedded representation "
@@ -106,38 +128,32 @@ def embedding_density(
         components += 1
 
     if groupby is not None:
-        if adata.obs[groupby].dtype.name != "category":
+        groups = adata.obs[groupby]
+        if key is True and groups.dtype.name != "category":
+            groups = groups.astype("category")  # like `_sanitize_column`, but local
+        if groups.dtype.name != "category":
             raise ValueError(f"{groupby!r} column does not contain categorical data")
-
-    # Define new covariate name
-    if key_added is not None:
-        density_covariate = key_added
-    elif groupby is not None:
-        density_covariate = f"{basis}_density_{groupby}"
-    else:
-        density_covariate = f"{basis}_density"
 
     # Calculate the densities over each category in the groupby column
     if groupby is not None:
-        categories = adata.obs[groupby].cat.categories
-
         density_values = np.zeros(adata.n_obs)
 
-        for cat in categories:
-            cat_mask = adata.obs[groupby] == cat
+        for cat in groups.cat.categories:
+            cat_mask = (groups == cat).to_numpy()
             embed_x = adata.obsm[basis_key][cat_mask, components[0]]
             embed_y = adata.obsm[basis_key][cat_mask, components[1]]
 
             dens_embed = _calc_density(cp.array(embed_x), cp.array(embed_y))
             density_values[cat_mask] = dens_embed
-
-        adata.obs[density_covariate] = density_values
     else:  # if groupby is None
         # Calculate the density over the whole embedding without subsetting
         embed_x = cp.asarray(adata.obsm[basis_key][:, components[0]])
         embed_y = cp.asarray(adata.obsm[basis_key][:, components[1]])
+        density_values = _calc_density(embed_x, embed_y)
 
-        adata.obs[density_covariate] = _calc_density(embed_x, embed_y)
+    if key is True:
+        return density_values
+    adata.obs[key] = density_values
 
     # Reduce diffmap components for labeling
     # Note: plot_scatter takes care of correcting diffmap components
@@ -145,7 +161,7 @@ def embedding_density(
     if basis != "diffmap":
         components += 1
 
-    adata.uns[f"{density_covariate}_params"] = {
+    adata.uns[f"{key}_params"] = {
         "covariate": groupby,
         "components": components.tolist(),
     }

@@ -4,6 +4,7 @@ import cupy as cp
 import numpy as np
 import pytest
 import scanpy as sc
+from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 from scipy import sparse
 
@@ -71,3 +72,21 @@ def test_umap_init_pos(init_pos, func):
 def test_draw_graph():
     pbmc = pbmc68k_reduced()[:100, :].copy()
     draw_graph(pbmc)
+
+
+@pytest.mark.parametrize("func", [umap, draw_graph])
+def test_embedding_use_out(func):
+    pbmc = pbmc68k_reduced()[:100, :].copy()
+    pbmc.obsp["g"] = pbmc.obsp["connectivities"]
+    emb = func(pbmc, use=A.obsp["g"], out=True)
+    assert emb.shape == (100, 2)
+    func(pbmc, use="obsp.g", out=A.obsm["emb"])
+    assert pbmc.obsm["emb"].shape == (100, 2)
+    assert "params" in pbmc.uns["emb"]
+
+
+def test_umap_deprecated_params():
+    pbmc = pbmc68k_reduced()[:100, :].copy()
+    with pytest.warns(FutureWarning, match="key_added"), pytest.warns(FutureWarning, match="neighbors_key"):
+        umap(pbmc, neighbors_key="neighbors", key_added="old")
+    assert "old" in pbmc.obsm

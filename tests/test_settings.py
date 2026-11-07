@@ -179,7 +179,7 @@ def test_scanpy_v2_aggregate_legacy_selection_warning():
     adata.layers["counts"] = adata.X.copy()
 
     with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
-        with pytest.warns(FutureWarning, match="`acc` will replace"):
+        with pytest.warns(FutureWarning, match="argument layer is deprecated"):
             rsc.get.aggregate(adata, by="group", func="sum", layer="counts")
 
 
@@ -298,7 +298,7 @@ def test_scverse_misc_deprecation_metadata():
 
 
 def test_changing_default_repr_mentions_scanpy_2():
-    default = inspect.signature(rsc.pp.pca).parameters["key_added"].default
+    default = inspect.signature(rsc.pp.scale).parameters["zero_center"].default
 
     with rsc.settings.override(preset=rsc.Preset.ScanpyV1):
         assert "changes in 2.0" in repr(default)

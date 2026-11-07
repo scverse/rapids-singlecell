@@ -33,7 +33,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
     cp.random.seed(0)
     cudata.obs["batch"] = np.random.binomial(3, 0.5, size=(cudata.n_obs))
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch")
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert "highly_variable_nbatches" in cudata.var.columns
     assert "highly_variable_intersection" in cudata.var.columns
 
@@ -47,7 +47,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
     batch = np.random.binomial(4, 0.5, size=(cudata.n_obs))
     cudata.obs["batch"] = batch
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch", n_top_genes=3)
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch", n_top_genes=3)
     assert "highly_variable_nbatches" in cudata.var.columns
     assert cudata.var["highly_variable"].sum() == 3
     highly_var_first_layer = cudata.var["highly_variable"].copy()
@@ -70,7 +70,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
         cudata.layers["test_layer"] = new_layer
     cudata.obs["batch"] = batch
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch", n_top_genes=3, layer="test_layer")
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch", n_top_genes=3, use="layers.test_layer")
     assert "highly_variable_nbatches" in cudata.var.columns
     assert cudata.var["highly_variable"].sum() == 3
     assert (highly_var_first_layer != cudata.var["highly_variable"]).any()
@@ -80,13 +80,13 @@ def test_highly_variable_genes_basic(dtype, sparse):
     assert no_batch_hvg.any()
     cudata.obs["batch"] = "batch"
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch")
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert np.all(no_batch_hvg == cudata.var.highly_variable)
     assert np.all(cudata.var.highly_variable_intersection == cudata.var.highly_variable)
 
     cudata.obs["batch"] = "a"
     cudata.obs.batch.loc[::2] = "b"
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch")
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert cudata.var["highly_variable"].any()
 
     colnames = [
@@ -224,7 +224,7 @@ def test_seurat_v3_mean_var_output_with_batchkey(dtype, sparse):
     true_mean = cp.mean(X, axis=0)
     true_var = cp.var(X, axis=0, dtype=np.float64, ddof=1)
 
-    rsc.pp.highly_variable_genes(pbmc, batch_key="batch", flavor="seurat_v3", n_top_genes=4000)
+    rsc.pp.highly_variable_genes(pbmc, batch="obs.batch", flavor="seurat_v3", n_top_genes=4000)
     cp.testing.assert_allclose(true_mean, pbmc.var["means"], rtol=2e-05, atol=2e-05)
     cp.testing.assert_allclose(true_var, pbmc.var["variances"], rtol=2e-05, atol=2e-05)
 
@@ -270,7 +270,7 @@ def test_highly_variable_genes_pearson_residuals_general(clip, theta, n_top_gene
     else:
         cudata.X = cp.array(cudata.X.toarray(), dtype=dtype)
     # compute reference output
-    residuals_reference = rsc.pp.normalize_pearson_residuals(cudata, clip=clip, theta=theta, inplace=False)
+    residuals_reference = rsc.pp.normalize_pearson_residuals(cudata, clip=clip, theta=theta, out=True)
     residual_variances_reference = cp.var(residuals_reference, axis=0)
 
     # compute output to be tested
@@ -482,3 +482,24 @@ def test_poisson_gene_selection_compare_to_scvi(dtype, sparse):
 
     # Check uns is set correctly
     assert pbmc.uns["hvg"]["flavor"] == "poisson_zeros"
+
+
+@pytest.mark.parametrize("flavor", ["seurat", "seurat_v3", "pearson_residuals", "poisson_gene_selection"])
+def test_hvg_out_true(flavor):
+    from anndata.acc import A
+
+    adata = sc.datasets.pbmc3k()[:500].copy()
+    sc.pp.filter_genes(adata, min_cells=10)
+    adata.layers["counts"] = cpx.scipy.sparse.csr_matrix(adata.X.astype(np.float32))
+    adata.X = adata.layers["counts"].copy()
+    if flavor == "seurat":
+        adata.X = adata.X.log1p()
+    adata.obs["b"] = np.arange(adata.n_obs) % 2
+    use = A.X if flavor == "seurat" else A.layers["counts"]
+    df = rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=50, use=use, batch=A.obs["b"], out=True)
+    assert "highly_variable" not in adata.var
+    assert df.index.equals(adata.var_names)
+    assert df["highly_variable"].sum() == 50
+    with pytest.warns(FutureWarning, match="batch_key"):
+        rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=50, use=use, batch_key="b")
+    pd.testing.assert_frame_equal(adata.var[df.columns], df)

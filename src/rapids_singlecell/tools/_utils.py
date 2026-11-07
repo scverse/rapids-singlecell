@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import cupy as cp
 import scipy.sparse as cpu_sparse
 from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
@@ -7,6 +9,8 @@ from cupyx.scipy.sparse import issparse, isspmatrix_csc, isspmatrix_csr
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
 from rapids_singlecell._settings import settings
+from rapids_singlecell.get._out import _resolve_obs
+from rapids_singlecell.get._utils import GraphAcc, LayerAcc, _get_arr
 
 from . import pca
 
@@ -25,7 +29,15 @@ def _validate_init_pos(init_coords):
     return arr
 
 
-def _choose_representation(adata, use_rep=None, n_pcs=None):
+def _choose_representation(adata, use_rep=None, n_pcs=None, *, use=None):
+    """Get the representation `use` (an accessor) or the deprecated `use_rep` (`'X'` or an `.obsm` key) points to."""
+    if use is not None:
+        if use_rep is not None:
+            raise TypeError("Pass either `use` or `use_rep`, not both.")
+        use = _resolve_obs(use)
+        if isinstance(use, LayerAcc):
+            return _get_arr(adata, use)
+        use_rep = use.k
     if use_rep is None and n_pcs == 0:  # backwards compat for specifying `.X`
         use_rep = "X"
     if use_rep is None:
@@ -61,6 +73,54 @@ def _choose_representation(adata, use_rep=None, n_pcs=None):
         else:
             raise ValueError(f"Did not find {use_rep} in `.obsm.keys()`. You need to compute it first.")
     return X
+
+
+def _neighbors(adata, use=None, neighbors_key=None) -> dict:
+    """The `.uns` entry of the neighbors around the graph `use` (or of the deprecated `neighbors_key`).
+
+    Adds the matrices as `connectivities` and `distances` (`None` if missing).
+    For `use=A.obsp[g]`, the entry is the one whose `connectivities_key` is `g`, else the distances
+    are where `pp.neighbors(out=A.obsp[g])` puts them.
+    """
+    if use is not None:
+        if neighbors_key is not None:
+            raise TypeError("Pass either `use` or `neighbors_key`, not both.")
+        graph = _resolve_obs(use, kinds=(GraphAcc,)).k
+        for key in dict.fromkeys([graph, "neighbors", *adata.uns]):
+            entry = adata.uns.get(key)
+            if (
+                isinstance(entry, Mapping)
+                and entry.get("connectivities_key", key == "neighbors" and "connectivities") == graph
+            ):
+                break
+        else:
+            entry = {"distances_key": "distances" if graph == "connectivities" else f"{graph}_distances"}
+        entry = {**entry, "connectivities_key": graph}
+    else:
+        key = neighbors_key or "neighbors"
+        if key not in adata.uns:
+            raise ValueError(f"Did not find .uns[{key!r}]. Run `pp.neighbors` first.")
+        entry = {"connectivities_key": "connectivities", "distances_key": "distances", **adata.uns[key]}
+    if (conns_key := entry["connectivities_key"]) not in adata.obsp:
+        raise ValueError(f"Did not find .obsp[{conns_key!r}]. Run `pp.neighbors` first.")
+    dists_key = entry.get("distances_key")
+    return entry | {
+        "connectivities": adata.obsp[conns_key],
+        "distances": adata.obsp[dists_key] if dists_key in adata.obsp else None,
+    }
+
+
+def _use_graph(adata, use=None, *, adjacency=None, obsp=None, neighbors_key=None):
+    """Choose the connectivities from `use`, or the deprecated `adjacency`/`obsp`/`neighbors_key`."""
+    if (adjacency is not None) + (obsp is not None) + (use is not None) > 1:
+        raise TypeError("Pass only one of `use`, `obsp`, or `adjacency`.")
+    if adjacency is not None:
+        return adjacency
+    if obsp is not None:
+        if neighbors_key is not None:
+            raise TypeError("Pass either `obsp` or `neighbors_key`, not both.")
+        return adata.obsp[obsp]
+    return _neighbors(adata, use, neighbors_key)["connectivities"]
 
 
 def _nan_mean_minor_dask_sparse(X, major, minor, *, mask=None, n_features=None):

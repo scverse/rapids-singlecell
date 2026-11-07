@@ -26,6 +26,14 @@ ISOTYPES = [
     "Mouse IgG2bkIsotype_PROT",
     "RatIgG2bkIsotype_PROT",
 ]
+
+
+def _dsb(adata, *args, **kwargs):
+    adata = adata.copy()
+    rsc.pp.dsb(adata, *args, **kwargs)
+    return adata
+
+
 PRECISIONS = {np.float64: 1e-10, np.float32: 1e-5}
 CONFIGS = {
     "default": ({"isotype_controls": ISOTYPES}, True),
@@ -67,7 +75,7 @@ def _step1(cells, empty):
 def test_matches_r(counts, config, dtype):
     cells, empty = counts
     kwargs, with_empty = CONFIGS[config]
-    res = rsc.pp.dsb(cells, empty if with_empty else None, dtype=dtype, copy=True, **kwargs)
+    res = _dsb(cells, empty if with_empty else None, dtype=dtype, **kwargs)
     assert res.X.dtype == dtype
     np.testing.assert_allclose(res.X, _read(config).to_numpy(), rtol=0, atol=PRECISIONS[dtype])
     if config == "default":
@@ -88,7 +96,7 @@ def test_matches_r(counts, config, dtype):
 )
 def test_input_types(counts, convert):
     cells, empty = counts
-    expected = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, copy=True).X
+    expected = _dsb(cells, empty, isotype_controls=ISOTYPES).X
     a = AnnData(convert(cells.X), obs=cells.obs, var=cells.var)
     e = AnnData(convert(empty.X), obs=empty.obs, var=empty.var)
     on_gpu = isinstance(a.X, cp.ndarray) or cpsparse.issparse(a.X)
@@ -101,7 +109,7 @@ def test_input_types(counts, convert):
 @pytest.mark.parametrize("fmt", ["dense", "csr", "csc"])
 def test_backed_empty(counts, tmp_path, monkeypatch, fmt, reordered):
     cells, empty = counts
-    expected = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, copy=True).X
+    expected = _dsb(cells, empty, isotype_controls=ISOTYPES).X
     if reordered:
         empty = empty[:, empty.var_names[::-1]].copy()
     x = empty.X if fmt == "dense" else getattr(sparse, f"{fmt}_matrix")(empty.X)
@@ -112,19 +120,24 @@ def test_backed_empty(counts, tmp_path, monkeypatch, fmt, reordered):
     inputs, empty_stats = [], dsb_mod._empty_stats
     monkeypatch.setattr(dsb_mod, "_empty_stats", lambda x, *a: inputs.append(x) or empty_stats(x, *a))
     with pytest.warns(UserWarning, match="Reordered") if reordered else nullcontext():
-        res = rsc.pp.dsb(cells, backed, isotype_controls=ISOTYPES, copy=True)
+        res = _dsb(cells, backed, isotype_controls=ISOTYPES)
     assert not isinstance(inputs[0], np.ndarray | sparse.spmatrix | sparse.sparray)
     np.testing.assert_array_equal(res.X, expected)
 
 
-def test_layer_and_key_added(counts):
+def test_use_and_out(counts):
     cells, empty = counts
-    expected = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, copy=True).X
+    expected = _dsb(cells, empty, isotype_controls=ISOTYPES).X
     a, e = AnnData(np.zeros_like(cells.X), var=cells.var), AnnData(np.zeros_like(empty.X), var=empty.var)
     a.layers["counts"], e.layers["counts"] = cells.X.copy(), empty.X.copy()
-    rsc.pp.dsb(a, e, isotype_controls=ISOTYPES, layer="counts", key_added="dsb")
+    rsc.pp.dsb(a, e, isotype_controls=ISOTYPES, use="layers.counts", out="layers.dsb")
     np.testing.assert_allclose(a.layers["dsb"], expected, rtol=0, atol=1e-12)
     assert not a.X.any()
+    res = rsc.pp.dsb(a, e, isotype_controls=ISOTYPES, use="layers.counts", out=True)
+    np.testing.assert_allclose(res, expected, rtol=0, atol=1e-12)
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.pp.dsb(a, e, isotype_controls=ISOTYPES, use="layers.counts", key_added="old")
+    np.testing.assert_allclose(a.layers["old"], expected, rtol=0, atol=1e-12)
 
 
 def test_view_is_made_actual(counts):
@@ -154,7 +167,7 @@ def test_invalid_inputs(counts):
         (c, e, {**iso, "pseudocount": 0}, "pseudocount"),
         (c, e, {**iso, "quantile_clip": (0.5, 0.1)}, "quantile_clip"),
         (c, e, {**iso, "dtype": np.int32}, "dtype"),
-        (c, e, {**iso, "layer": "raw"}, "no layer"),
+        (c, e, {**iso, "use": "layers.raw"}, "no layer"),
         (c[:1].copy(), e, iso, "at least 2 cells"),
         (c, e[:1].copy(), iso, "at least 2 empty"),
         (c, e[:, 1:].copy(), iso, "different proteins"),
@@ -166,12 +179,12 @@ def test_invalid_inputs(counts):
     ]
     for cells, empty, kwargs, match in cases:
         with pytest.raises(ValueError, match=match):
-            rsc.pp.dsb(cells, empty, copy=True, **kwargs)
+            _dsb(cells, empty, **kwargs)
 
 
 def test_fast_km_is_optimal_two_means(counts):
     cells, empty = counts
-    res = rsc.pp.dsb(cells, empty, isotype_controls=ISOTYPES, fast_km=True, dtype=np.float64, copy=True)
+    res = _dsb(cells, empty, isotype_controls=ISOTYPES, fast_km=True, dtype=np.float64)
     for x, low in zip(_step1(cells, empty), res.obs["dsb_cell_background_mean"], strict=True):
         xs = np.sort(x)
         sse = [((xs[:s] - xs[:s].mean()) ** 2).sum() + ((xs[s:] - xs[s:].mean()) ** 2).sum() for s in range(1, len(xs))]
@@ -185,9 +198,9 @@ def test_constant_technical_component(counts, n_cells, dtype):
     # here one whose mean differs from its values by an ulp
     cells, empty = counts
     same = AnnData(np.repeat(cells.X[:1], n_cells, axis=0), var=cells.var)
-    expected = rsc.pp.dsb(same, empty, denoise_counts=False, dtype=dtype, copy=True).X
+    expected = _dsb(same, empty, denoise_counts=False, dtype=dtype).X
     with pytest.warns(UserWarning, match="technical component is constant"):
-        res = rsc.pp.dsb(same, empty, use_isotype_controls=False, dtype=dtype, copy=True)
+        res = _dsb(same, empty, use_isotype_controls=False, dtype=dtype)
     np.testing.assert_array_equal(res.X, expected)
 
 

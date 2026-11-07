@@ -45,6 +45,10 @@ class ScoreGenesPreset(NamedTuple):
     ctrl_as_ref: bool
 
 
+class QcMetricsPreset(NamedTuple):
+    out: bool
+
+
 class Preset(enum.StrEnum):
     """Presets for :attr:`rapids_singlecell.settings.preset`.
 
@@ -134,6 +138,14 @@ class Preset(enum.StrEnum):
         `ctrl_as_ref=True` (v1) or `ctrl_as_ref=False` (v2).
         """
         return ScoreGenesPreset(ctrl_as_ref=self is Preset.ScanpyV1)
+
+    @property
+    def calculate_qc_metrics(self) -> QcMetricsPreset:
+        """Settings for :func:`~rapids_singlecell.pp.calculate_qc_metrics`.
+
+        `out=True` (v1, return the metrics) or `out=False` (v2, write them).
+        """
+        return QcMetricsPreset(out=self is Preset.ScanpyV1)
 
     def _embedding(self, name: str) -> BasicEmbeddingPreset:
         return BasicEmbeddingPreset(key_added=None if self is Preset.ScanpyV1 else name)

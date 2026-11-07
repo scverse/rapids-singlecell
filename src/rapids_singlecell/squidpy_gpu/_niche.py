@@ -13,7 +13,7 @@ from cupyx.scipy import sparse as sparse_gpu
 from scverse_misc import Deprecation, deprecated
 
 import rapids_singlecell as rsc
-from rapids_singlecell._keys import _embedding_keys
+from rapids_singlecell.get._out import own_deprecations
 
 from ._spatial_data import _extract_adata
 
@@ -662,15 +662,10 @@ def _leiden_cluster(
         )
 
     inner = AnnData(X=embedding, obs=pd.DataFrame(index=adata.obs_names.copy()))
-    rsc.pp.neighbors(inner, n_neighbors=effective_n_neighbors, use_rep="X")
-
     base = "_niche_leiden"
-    rsc.tl.leiden(
-        inner,
-        resolution=res_list,
-        key_added=base,
-        dtype=np.float64,
-    )
+    with own_deprecations():  # `use`/`out` strings need `anndata.acc`
+        rsc.pp.neighbors(inner, n_neighbors=effective_n_neighbors, use_rep="X")
+        rsc.tl.leiden(inner, resolution=res_list, key_added=base, dtype=np.float64)
 
     for res, out_key in zip(res_list, result_columns, strict=True):
         src = f"{base}_{res}" if len(res_list) > 1 else base
@@ -760,8 +755,7 @@ def _utag_embedding(adata: AnnData, *, key: str) -> cp.ndarray:
     adj, X = _utag_operands(adata, key)
     if not sparse_gpu.issparse(X):
         inner = AnnData(X=adj @ X, obs=pd.DataFrame(index=adata.obs_names.copy()))
-        rsc.pp.pca(inner, key_added=None)
-        return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
+        return cp.asarray(rsc.pp.pca(inner, out=True).embedding)
 
     # Sparse A @ X has ~mean-degree times the nnz of X (billions on large panels):
     # run the PCA on the implicit, mean-centered operator A @ X instead.
@@ -814,8 +808,7 @@ def _cellcharter_embedding(
             feat = feat[:, nonzero]
     inner = AnnData(X=feat, obs=pd.DataFrame(index=adata.obs_names.copy()))
     rsc.get.anndata_to_GPU(inner)
-    rsc.pp.pca(inner, key_added=None)
-    return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm], dtype=cp.float32)
+    return cp.asarray(rsc.pp.pca(inner, out=True).embedding, dtype=cp.float32)
 
 
 def _neighborhood_profile(

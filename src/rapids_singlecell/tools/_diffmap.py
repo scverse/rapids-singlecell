@@ -7,54 +7,28 @@ import numpy as np
 from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import linalg
 from scipy.sparse import issparse
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._keys import _embedding_keys
-from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell._settings import Default
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
 )
+from rapids_singlecell.get._out import DEPR_KEY_ADDED, DEPR_NEIGHBORS_KEY, _out_key
+
+from ._utils import _neighbors
 
 if TYPE_CHECKING:
     from anndata import AnnData
 
+    from rapids_singlecell.get._utils import GraphAcc, MultiAcc
 
-def _load_connectivities(
-    adata: AnnData,
-    neighbors_key: str | None = None,
-) -> cp_sparse.csr_matrix:
-    """Load connectivities from ``adata.obsp`` and convert to CuPy CSR.
 
-    Parameters
-    ----------
-    adata
-        Annotated data matrix.
-    neighbors_key
-        Key in ``adata.uns`` where neighbor parameters are stored.
-        If ``None``, defaults to ``"neighbors"``.
-
-    Returns
-    -------
-    CuPy CSR matrix of connectivities.
-    """
-    if neighbors_key is None:
-        neighbors_key = "neighbors"
-
-    if neighbors_key not in adata.uns:
-        raise ValueError(f"No neighbors found in `adata.uns[{neighbors_key!r}]`. Run `pp.neighbors` first.")
-
-    neighbors_dict = adata.uns[neighbors_key]
-
-    if neighbors_key == "neighbors":
-        conns_key = "connectivities"
-    else:
-        conns_key = neighbors_dict["connectivities_key"]
-
-    if conns_key not in adata.obsp:
-        raise ValueError(f"No connectivities found at `adata.obsp[{conns_key!r}]`. Run `pp.neighbors` first.")
-
-    connectivities = adata.obsp[conns_key]
+def _load_connectivities(adata: AnnData, use=None, neighbors_key: str | None = None):
+    """Load the connectivities `use` (or the deprecated `neighbors_key`) points to as CuPy CSR or dense array."""
+    connectivities = _neighbors(adata, use, neighbors_key)["connectivities"]
     if issparse(connectivities):
         return cp_sparse.csr_matrix(connectivities, dtype=cp.float32)
     return cp.asarray(connectivities, dtype=cp.float32)
@@ -146,16 +120,21 @@ def _compute_eigen(
 
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("neighbors_key", DEPR_NEIGHBORS_KEY)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
 def diffmap(
     adata: AnnData,
     n_comps: int = 15,
     *,
-    neighbors_key: str | None = None,
-    key_added: str | Default | None = Default(("diffmap", "key_added")),
     sort: Literal["decrease", "increase"] = "decrease",
     density_normalize: bool = True,
     rng: SeedLike | RNGLike | None = None,
-) -> None:
+    use: GraphAcc | str | None = None,
+    out: MultiAcc | str | bool = False,
+    # deprecated
+    neighbors_key: str | None = None,
+    key_added: str | None = None,
+) -> np.ndarray | None:
     """
     Diffusion Maps :cite:p:`Coifman2005,Haghverdi2015`.
 
@@ -172,22 +151,25 @@ def diffmap(
         Annotated data matrix.
     n_comps
         The number of dimensions of the representation.
-    neighbors_key
-        Key in ``adata.uns`` where neighbor parameters are stored.
-        If ``None``, defaults to ``"neighbors"``.
     sort
         Leave as is for the same behavior as :func:`scanpy.tl.diffmap`.
     density_normalize
         Leave as is for the same behavior as :func:`scanpy.tl.diffmap`.
-    key_added
-        Control where the embedding and eigenvalues are stored.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
+    use
+        The neighborhood graph (connectivities) to use, e.g. `A.obsp['k']`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
+        If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
+    out
+        Where to write the embedding, e.g. `A.obsm['dm']`; the eigenvalues go to `.uns['dm']['evals']`.
+        If `True`, the embedding is returned instead.
+        If `False`, it is written to the default places below.
 
     Returns
     -------
-    Updates ``adata`` with the following fields:
+    The embedding if `out=True`, else `None`. By default sets (see `out` for other keys):
 
     ``adata.obsm['X_diffmap']`` : :class:`numpy.ndarray`
         Diffusion map representation of data, which is the right eigen basis of
@@ -197,12 +179,15 @@ def diffmap(
         Eigenvalues of transition matrix.
     """
     rng = np.random.default_rng(rng)
-    connectivities = _load_connectivities(adata, neighbors_key)
+    key = _out_key(out, key_added, kind="obsm", default=Default())
+    connectivities = _load_connectivities(adata, use, neighbors_key)
     transitions_sym, _Z = _compute_transitions(connectivities, density_normalize=density_normalize)
     evals, evecs = _compute_eigen(transitions_sym, n_comps=n_comps, sort=sort, rng=rng)
 
-    key_added = resolve_default(key_added)
-    keys = _embedding_keys("diffmap", key_added)
-    # the scanpy 1 key holds the bare evals, `key_added` holds a dict
-    adata.uns[keys.uns] = evals.get() if key_added is None else {"evals": evals.get()}
+    if key is True:
+        return evecs.get()
+    keys = _embedding_keys("diffmap", key)
+    # the scanpy 1 key holds the bare evals, the others a dict
+    adata.uns[keys.uns] = evals.get() if keys.uns == "diffmap_evals" else {"evals": evals.get()}
     adata.obsm[keys.obsm] = evecs.get()
+    return None
