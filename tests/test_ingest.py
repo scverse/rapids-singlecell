@@ -206,8 +206,8 @@ def test_sparse_layer_mask_and_neighbors_key() -> None:
     rsc.pp.pca(
         ref,
         n_comps=4,
-        layer="scaled",
-        mask_var="feature_mask",
+        use=A.layers["scaled"],
+        mask=A.var["feature_mask"],
     )
     rsc.pp.neighbors(ref, n_neighbors=4, use=A.obsm["X_pca"], out=A.obsp["alternate"])
 

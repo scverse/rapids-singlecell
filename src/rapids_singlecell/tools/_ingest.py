@@ -19,8 +19,9 @@ from rapids_singlecell._keys import (
     _preset_obsm_names,
 )
 from rapids_singlecell._settings import settings
-from rapids_singlecell.get import X_to_GPU, _get_obs_rep
-from rapids_singlecell.get._out import DEPR_COPY
+from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
+from rapids_singlecell.get._out import DEPR_COPY, _ref_from_json
+from rapids_singlecell.get._utils import AdRef
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
@@ -356,11 +357,13 @@ def _resolve_pca_feature_mask(
     pca_params: Mapping[str, Any],
     components,
 ) -> np.ndarray | None:
-    mask = pca_params.get("mask_var")
+    mask = _ref_from_json(pca_params.get("mask_var"))
     if mask is None and pca_params.get("use_highly_variable", False):
         mask = "highly_variable"
 
-    if isinstance(mask, str):
+    if isinstance(mask, AdRef):
+        mask = _check_mask(adata_ref, mask, "var")
+    elif isinstance(mask, str):
         mask_key = mask.removeprefix("var.") if mask.startswith("var.") else mask
         if mask_key not in adata_ref.var:
             raise ValueError(f"Did not find `adata_ref.var[{mask_key!r}]`.")

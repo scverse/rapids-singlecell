@@ -11,11 +11,11 @@ from cupyx.scipy.sparse import issparse as cpissparse
 from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
-from scverse_misc import deprecated_arg
+from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._keys import _embedding_keys
-from rapids_singlecell._settings import Default, Preset, settings
+from rapids_singlecell._settings import Default, settings
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
@@ -25,7 +25,9 @@ from rapids_singlecell.get import X_to_GPU, _check_mask, _get_arr
 from rapids_singlecell.get._out import (
     DEPR_KEY_ADDED,
     DEPR_USE,
+    _mask_arg,
     _out_dests,
+    _ref_to_json,
     _use_args,
     _use_to_uns,
     _write_dests,
@@ -38,7 +40,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from rapids_singlecell._utils import ArrayTypesDask
-    from rapids_singlecell.get._utils import LayerAcc, MultiAcc
+    from rapids_singlecell.get._utils import AdRef, LayerAcc, MultiAcc
 
 _empty = Default(repr="adata.var.get('highly_variable')")
 
@@ -49,7 +51,7 @@ class PcaResult(NamedTuple):
     embedding: Any
     """PCA representation of the observations, shape `(n_obs, n_comps)`."""
     loadings: Any
-    """Principal components, shape `(n_vars, n_comps)` (rows outside `mask_var` are zero)."""
+    """Principal components, shape `(n_vars, n_comps)` (rows outside `mask` are zero)."""
 
 
 class PcaOut(TypedDict, total=False):
@@ -65,6 +67,7 @@ def _pca_dests(key: str | Default | None, *, multi: bool) -> PcaResult:
 
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("mask_var", Deprecation("0.19.0", "Use `mask` instead."))
 @deprecated_arg("layer", DEPR_USE)
 @deprecated_arg("key_added", DEPR_KEY_ADDED)
 @deprecated_copy
@@ -76,7 +79,7 @@ def pca(
     zero_center: bool = True,
     svd_solver: str | None = None,
     rng: SeedLike | RNGLike | None = None,
-    mask_var: NDArray[np.bool] | str | Default | None = _empty,
+    mask: NDArray[np.bool] | AdRef | str | Default | None = _empty,
     dtype: str = "float32",
     chunked: bool = False,
     chunk_size: int = None,
@@ -86,6 +89,7 @@ def pca(
     key_added: str | None = None,
     layer: str | None = None,
     copy: bool = False,
+    mask_var: NDArray[np.bool] | str | None = None,
     **kwargs,
 ) -> None | AnnData | PcaResult | ArrayTypesDask:
     r"""Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
@@ -157,11 +161,10 @@ def pca(
         Random seed or :class:`~numpy.random.Generator` for initialization.
         The superseded `random_state` argument is still accepted.
 
-    mask_var
-        Mask to use for the PCA computation.
-        If `None`, all variables are used.
-        If `np.ndarray`, use the provided mask.
-        If `str`, use the mask stored in `adata.var[mask_var]`.
+    mask
+        To run only on a certain set of genes, given by a boolean array or a reference like
+        `A.var['selected']`. Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'var.selected'`.
+        By default, uses `.var['highly_variable']` if available, else everything.
 
     dtype
         Numpy data type string to which to convert the result.
@@ -223,8 +226,9 @@ def pca(
         if layer is not None or use is not None or out is not False:
             raise ValueError("`use` and `out` can only be used with an AnnData object.")
         X = data
-        mask_var = None if isinstance(mask_var, Default) else _check_mask(X, mask_var, "var")
-        X = X[:, mask_var] if mask_var is not None else X
+        mask = _mask_arg(mask, mask_var, dim="var")
+        mask = None if isinstance(mask, Default) else _check_mask(X, mask, "var")
+        X = X[:, mask] if mask is not None else X
         pca_func, X_pca, _ = _pca_compute(
             X,
             n_comps,
@@ -256,22 +260,16 @@ def pca(
         uns=True,
         default=Default(),
     )
-    if multi and not isinstance(mask_var, Default) and mask_var is not None:
-        raise ValueError("Argument `mask_var` is incompatible with `.obsm` arrays.")
+    mask = _mask_arg(mask, mask_var, dim="var")
+    if multi and not isinstance(mask, Default) and mask is not None:
+        raise ValueError("Argument `mask` is incompatible with `.obsm` arrays.")
 
     X = _get_arr(adata, dim="obs", **src)
 
-    if isinstance(mask_var, Default):
-        if multi or "highly_variable" not in adata.var.columns:
-            mask_var = None
-        elif settings.preset is Preset.ScanpyV2Preview:
-            mask_var = "var.highly_variable"
-        else:
-            mask_var = "highly_variable"
-
-    # Keep the recorded param as the column name for strings, else None.
-    mask_var_param = mask_var if isinstance(mask_var, str) else None
-    mask_var = _check_mask(adata, mask_var, "var")
+    if isinstance(mask, Default):
+        hvg = not multi and "highly_variable" in adata.var.columns
+        mask = _mask_arg(None, "highly_variable", dim="var") if hvg else None
+    mask_param, mask_var = _ref_to_json(mask), _check_mask(adata, mask, "var")
     X = X[:, mask_var] if mask_var is not None else X
 
     pca_func, X_pca, n_comps = _pca_compute(
@@ -297,7 +295,7 @@ def pca(
     adata.uns[_embedding_keys("pca", key).uns] = {
         "params": {
             "zero_center": zero_center,
-            "mask_var": mask_var_param,
+            "mask_var": mask_param,
             **({"layer": layer} if layer is not None else {}),
             **_use_to_uns(use, rep=False),
         },

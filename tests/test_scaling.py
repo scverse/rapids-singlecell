@@ -198,6 +198,9 @@ def test_mask_string():
         rsc.pp.scale(adata, mask_obs="some cells")
     cp.testing.assert_allclose(adata.X, X_centered_for_mask)
     assert "mean of some cells" in adata.var.keys()
+    with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview), pytest.warns(FutureWarning, match="mask_obs"):
+        rsc.pp.scale(adata, zero_center=True, mask_obs="some cells")
+    assert "mean of A.obs['some cells']" in adata.var.keys()
 
 
 def test_scale_use_out():

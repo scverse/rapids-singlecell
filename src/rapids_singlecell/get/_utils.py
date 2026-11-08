@@ -327,7 +327,7 @@ def _check_mask(
             else:
                 message = f"Did not find `adata.{dim}[{mask!r}]`."
             raise ValueError(message) from None
-        if isinstance(mask_array, pd.Series):
+        if isinstance(mask_array, pd.Series | pd.api.extensions.ExtensionArray):
             mask_array = mask_array.to_numpy()
     else:
         mask_array = mask

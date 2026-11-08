@@ -33,7 +33,6 @@ class BasicEmbeddingPreset(NamedTuple):
 
 class RankGenesGroupsPreset(NamedTuple):
     method: DETest
-    mask_var: str | None
     mean_in_log_space: bool
 
 
@@ -119,8 +118,8 @@ class Preset(enum.StrEnum):
         `method="t-test", mean_in_log_space=True` (v1) or `method="wilcoxon", mean_in_log_space=False` (v2).
         """
         return {
-            Preset.ScanpyV1: RankGenesGroupsPreset(method="t-test", mask_var=None, mean_in_log_space=True),
-            Preset.ScanpyV2Preview: RankGenesGroupsPreset(method="wilcoxon", mask_var=None, mean_in_log_space=False),
+            Preset.ScanpyV1: RankGenesGroupsPreset(method="t-test", mean_in_log_space=True),
+            Preset.ScanpyV2Preview: RankGenesGroupsPreset(method="wilcoxon", mean_in_log_space=False),
         }[self]
 
     @property

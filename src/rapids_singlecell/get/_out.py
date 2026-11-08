@@ -7,6 +7,7 @@ or for several outputs a mapping from output names to accessors.
 
 from __future__ import annotations
 
+import json
 import warnings
 from collections import Counter
 from collections.abc import Mapping
@@ -15,8 +16,11 @@ from functools import wraps
 from inspect import signature
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+import numpy as np
 from anndata import AnnData
 from scverse_misc import Deprecation, deprecated_arg
+
+from rapids_singlecell._settings import Default, Preset, settings
 
 from ._utils import AdRef, GraphAcc, LayerAcc, MultiAcc, _require_anndata_acc, _resolve_matrix_acc, _to_numpy_1d
 
@@ -281,3 +285,28 @@ def _obs_col(ref: AdRef | str | None, *, param: str) -> str | None:
     if (dest := _dest(resolved)).keys() != {"obs"}:
         raise TypeError(f"`{param}` must point to a column of `.obs`, was {ref!r}.")
     return dest["obs"]
+
+
+def _mask_arg(mask: Any, legacy: Any, *, dim: Literal["obs", "var"]) -> Any:
+    """Merge `mask` with its deprecated `mask_{dim}`, whose strings name a column of `.{dim}`."""
+    if legacy is None:
+        return _resolve(mask, vec=True) if isinstance(mask, str) else mask
+    if mask is not None and not isinstance(mask, Default):
+        raise TypeError(f"Pass either `mask` or `mask_{dim}`, not both.")
+    if isinstance(legacy, str) and settings.preset is Preset.ScanpyV2Preview:
+        return getattr(_require_anndata_acc(), dim)[legacy]
+    return legacy
+
+
+def _ref_to_json(ref: Any) -> str | list[str] | None:
+    """Store a mask in `.uns` params like scanpy: an `AdRef` as JSON, a column name as is, arrays as `None`."""
+    if isinstance(ref, AdRef):
+        return [json.dumps(_require_anndata_acc().to_json(ref))]
+    return ref if isinstance(ref, str) else None
+
+
+def _ref_from_json(ref: Any) -> Any:
+    """Parse a mask stored by `_ref_to_json` or scanpy."""
+    if isinstance(ref, list | tuple | np.ndarray) and len(ref) == 1 and isinstance(ref[0], str):
+        return _require_anndata_acc().from_json(json.loads(ref[0]))
+    return ref

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData
+from anndata.acc import A
 from cupyx.scipy import sparse as cusparse
 from scanpy.datasets import pbmc3k, pbmc3k_processed
 from scipy import sparse
@@ -375,14 +376,14 @@ def test_mask_length_error():
     adata = AnnData(np.array(A_list).astype("float32"))
     mask_var = np.random.choice([True, False], adata.shape[1] + 1)
     with pytest.raises(ValueError, match=r"shape of the mask do not match"):
-        rsc.pp.pca(adata, mask_var=mask_var)
+        rsc.pp.pca(adata, mask=mask_var)
 
 
 def test_mask_var_non_boolean_error():
     """Non-boolean mask_var is rejected (Scanpy parity via `_check_mask`)."""
     adata = AnnData(np.array(A_list).astype("float32"))
     with pytest.raises(ValueError, match="boolean"):
-        rsc.pp.pca(adata, mask_var=np.arange(adata.shape[1]))
+        rsc.pp.pca(adata, mask=np.arange(adata.shape[1]))
 
 
 @pytest.mark.parametrize("float_dtype", [np.float32, np.float64])
@@ -400,11 +401,11 @@ def test_mask_var_argument_equivalence(float_dtype, array_type):
         mask_var = rng.choice([True, False], adata_base.shape[1])
 
     adata = adata_base.copy()
-    rsc.pp.pca(adata, mask_var=mask_var, dtype=float_dtype)
+    rsc.pp.pca(adata, mask=mask_var, dtype=float_dtype)
 
     adata_w_mask = adata_base.copy()
     adata_w_mask.var["mask"] = mask_var
-    rsc.pp.pca(adata_w_mask, mask_var="mask", dtype=float_dtype)
+    rsc.pp.pca(adata_w_mask, mask="var.mask", dtype=float_dtype)
 
     assert cp.allclose(
         adata.X.toarray() if cusparse.issparse(adata.X) else adata.X,
@@ -418,7 +419,7 @@ def test_mask_correctness():
     mask_var = np.random.choice([True, False], adata.shape[1])
 
     adata_masked = adata[:, mask_var].copy()
-    rsc.pp.pca(adata, mask_var=mask_var)
+    rsc.pp.pca(adata, mask=mask_var)
     rsc.pp.pca(adata_masked)
 
     # Masked variables should have zero loadings
@@ -444,7 +445,7 @@ def test_mask_sparse_solvers(svd_solver):
 
     # Test: full data with mask
     adata_masked = adata.copy()
-    rsc.pp.pca(adata_masked, svd_solver=svd_solver, mask_var=mask_var, n_comps=5)
+    rsc.pp.pca(adata_masked, svd_solver=svd_solver, mask=mask_var, n_comps=5)
 
     # Masked variables should have zero loadings
     masked_loadings = adata_masked.varm["PCs"][~mask_var]
@@ -479,7 +480,7 @@ def test_mask_defaults(float_dtype):
     assert not np.array_equal(without_var.obsm["X_pca"], with_var.obsm["X_pca"])
 
     with_no_mask = adata.copy()
-    rsc.pp.pca(with_no_mask, mask_var=None, dtype=float_dtype)
+    rsc.pp.pca(with_no_mask, mask=None, dtype=float_dtype)
     assert np.array_equal(without_var.obsm["X_pca"], with_no_mask.obsm["X_pca"])
 
 
@@ -500,7 +501,7 @@ def test_mask_var_ndarray():
     """Passing an ndarray mask_var records no name and masks the loadings."""
     adata = _mask_var_adata()
     mask = np.array([True, False, True, False, True])
-    rsc.pp.pca(adata, n_comps=2, mask_var=mask)
+    rsc.pp.pca(adata, n_comps=2, mask=mask)
     assert adata.uns["pca"]["params"]["mask_var"] is None
     assert np.array_equal(adata.varm["PCs"][~mask], np.zeros((2, 2)))
 
@@ -542,11 +543,23 @@ def test_pca_deprecated_params():
     with pytest.warns(FutureWarning, match="copy"):
         copied = rsc.pp.pca(adata, n_comps=2, copy=True)
     assert "X_pca" in copied.obsm
+    with pytest.warns(FutureWarning, match="mask_var"):
+        rsc.pp.pca(adata, n_comps=2, mask_var="highly_variable", out=A.obsm["m"])
+    assert adata.uns["m"]["params"]["mask_var"] == "highly_variable"
+    np.testing.assert_allclose(np.abs(adata.obsm["m"]), np.abs(adata.obsm["X_pca"]), atol=1e-5)
+    with pytest.raises(TypeError, match="either `mask` or `mask_var`"):
+        rsc.pp.pca(adata, mask="var.highly_variable", mask_var="highly_variable")
+
+
+def test_pca_mask_ref():
+    adata = _mask_var_adata()
+    rsc.pp.pca(adata, n_comps=2, mask=A.var["highly_variable"])
+    assert adata.uns["pca"]["params"]["mask_var"] == ['["var", "highly_variable"]']
+    with pytest.raises(ValueError, match="incompatible with `.obsm`"):
+        rsc.pp.pca(adata, use=A.obsm["X_pca"], mask="var.highly_variable", out=A.obsm["x"])
 
 
 def test_pca_out():
-    from anndata.acc import A
-
     adata = _mask_var_adata()
     res = rsc.pp.pca(adata, n_comps=2, out=True)
     assert res.embedding.shape == (20, 2)

@@ -2058,13 +2058,13 @@ def test_rank_genes_groups_chunk_size_deprecated():
 
 def test_rank_genes_groups_mask_var_missing_key_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(KeyError, match="not found in adata.var"):
+    with pytest.raises(ValueError, match=r"Did not find `adata\.var\['nope'\]`"):
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", mask_var="nope")
 
 
 def test_rank_genes_groups_mask_var_wrong_shape_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(ValueError, match="mask_var has wrong shape"):
+    with pytest.raises(ValueError, match="shape of the mask do not match"):
         rsc.tl.rank_genes_groups(
             adata,
             "group",

@@ -11,9 +11,9 @@ from rapids_singlecell.get import _check_mask
 from rapids_singlecell.get._out import (
     DEPR_RAW,
     DEPR_USE,
+    _mask_arg,
     _obs_col,
     _out_key,
-    _resolve,
     _use_args,
     deprecated_copy,
 )
@@ -302,22 +302,8 @@ def rank_genes_groups(
     if use is not None and use_raw is None:
         use_raw = False
 
-    mask_var_array: NDArray[np.bool_] | None = None
-    if mask is not None:
-        if mask_var is not None:
-            raise TypeError("Pass either `mask` or `mask_var`, not both.")
-        mask_var_array = np.asarray(_check_mask(adata, _resolve(mask, vec=True), "var"), dtype=bool)
-    elif mask_var is not None:
-        if isinstance(mask_var, str):
-            if mask_var not in adata.var.columns:
-                msg = f"mask_var key {mask_var!r} not found in adata.var."
-                raise KeyError(msg)
-            mask_var_array = adata.var[mask_var].values.astype(bool)
-        else:
-            mask_var_array = np.asarray(mask_var, dtype=bool)
-            if mask_var_array.shape[0] != adata.n_vars:
-                msg = f"mask_var has wrong shape: {mask_var_array.shape[0]} != {adata.n_vars}"
-                raise ValueError(msg)
+    mask_var_array = _check_mask(adata, _mask_arg(mask, mask_var, dim="var"), "var")
+    mask_var_array = None if mask_var_array is None else np.asarray(mask_var_array, dtype=bool)
 
     adata.strings_to_categoricals()
     test_obj = _RankGenes(

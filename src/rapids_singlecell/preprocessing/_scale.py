@@ -22,8 +22,8 @@ from rapids_singlecell.get._out import (
     DEPR_INPLACE,
     DEPR_USE,
     _legacy_out,
+    _mask_arg,
     _out_dests,
-    _resolve,
     _use_args,
     _write_dests,
     deprecated_copy,
@@ -124,12 +124,7 @@ def scale(
     if zero_center is None:
         raise TypeError("scale() missing 1 required keyword argument: 'zero_center'")
 
-    if mask_obs is not None:
-        if mask is not None:
-            raise TypeError("Pass either `mask` or `mask_obs`, not both.")
-        mask = mask_obs
-    elif isinstance(mask, str):
-        mask = _resolve(mask, vec=True)
+    mask = _mask_arg(mask, mask_obs, dim="obs")
 
     if not isinstance(data, AnnData):
         if layer is not None or obsm is not None or use is not None or out is not False:
