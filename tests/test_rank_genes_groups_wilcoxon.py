@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import anndata as ad
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
 import numpy as np
@@ -7,11 +8,13 @@ import pandas as pd
 import pytest
 import scanpy as sc
 import scipy.sparse as sp
+from anndata.acc import A
 from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_host
+from testing.rapids_singlecell._helper import sc_use
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
@@ -116,7 +119,7 @@ def test_device_sparse_int64_indptr_matches_scanpy(layout, reference):
         "n_genes": 8,
     }
     rsc.tl.rank_genes_groups(adata, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g = adata.uns["rank_genes_groups"]
     c = adata_cpu.uns["rank_genes_groups"]
     for field in ("scores", "pvals", "pvals_adj"):
@@ -147,7 +150,7 @@ def test_rank_genes_groups_structured_results_get_df_and_h5ad_match_scanpy(tmp_p
         "n_genes": 4,
     }
     rsc.tl.rank_genes_groups(adata_rsc, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     rsc_result = adata_rsc.uns["rank_genes_groups"]
     assert isinstance(rsc_result["names"], np.ndarray)
@@ -160,7 +163,7 @@ def test_rank_genes_groups_structured_results_get_df_and_h5ad_match_scanpy(tmp_p
 
     h5ad_path = tmp_path / "rank_genes_groups.h5ad"
     adata_rsc.write_h5ad(h5ad_path)
-    adata_rsc = sc.read_h5ad(h5ad_path)
+    adata_rsc = ad.read_h5ad(h5ad_path)
 
     rsc_df = sc.get.rank_genes_groups_df(adata_rsc, group=None)
     scanpy_df = sc.get.rank_genes_groups_df(adata_cpu, group=None)
@@ -343,7 +346,7 @@ def test_rank_genes_groups_wilcoxon_matches_scanpy(reference, tie_correct, spars
         adata_cpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         n_genes=3,
         reference=reference,
         tie_correct=tie_correct,
@@ -395,7 +398,7 @@ def test_rank_genes_groups_wilcoxon_dense_ovr_ties_match_scanpy():
         "n_genes": adata_gpu.n_vars,
     }
     rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -557,7 +560,7 @@ def test_wilcoxon_subset_rest_stats_match_scanpy(fmt):
         "n_genes": 6,
     }
     rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -828,7 +831,7 @@ def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt):
         "n_genes": 5,
     }
     rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -990,7 +993,7 @@ def test_wilcoxon_ovo_large_group_tiers_match_scanpy(fmt, tie_correct, big):
         "n_genes": 6,
     }
     rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu = adata_gpu.uns["rank_genes_groups"]
     cpu = adata_cpu.uns["rank_genes_groups"]
@@ -1156,7 +1159,7 @@ def test_wilcoxon_ovr_pts_many_groups_match_scanpy(fmt):
         "n_genes": 8,
     }
     rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu = adata_gpu.uns["rank_genes_groups"]
     cpu = adata_cpu.uns["rank_genes_groups"]
@@ -1242,7 +1245,7 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
         method="wilcoxon",
         groups=groups,
         reference=reference,
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         tie_correct=tie_correct,
     )
 
@@ -1389,7 +1392,7 @@ def test_rank_genes_groups_wilcoxon_pts(reference):
         adata_cpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         pts=True,
         tie_correct=False,
         reference=reference,
@@ -1584,7 +1587,7 @@ def test_wilcoxon_host_sparse_float64_data_matches_scanpy(fmt, reference):
         "n_genes": adata.n_vars,
     }
     rsc.tl.rank_genes_groups(adata, use="X", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, use_raw=False, **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
     g = adata.uns["rank_genes_groups"]
     c = adata_cpu.uns["rank_genes_groups"]
     for field in ("scores", "pvals", "pvals_adj"):
@@ -1706,7 +1709,7 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
         bdata,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         groups=groups,
         reference=reference,
     )
@@ -1743,7 +1746,7 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy(monkeypatch):
         cpu,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         reference="rest",
         pts=True,
         tie_correct=True,
@@ -1789,7 +1792,7 @@ def test_wilcoxon_fdr_ties_nan_match_scanpy():
     cpu = sc.AnnData(X=X.copy(), obs=obs.copy(), var=var.copy())
 
     rsc.tl.rank_genes_groups(gpu, "group", method="wilcoxon", use="X", tie_correct=True)
-    sc.tl.rank_genes_groups(cpu, "group", method="wilcoxon", use_raw=False, tie_correct=True)
+    sc.tl.rank_genes_groups(cpu, "group", method="wilcoxon", **sc_use(A.X, use_raw=False), tie_correct=True)
     g = gpu.uns["rank_genes_groups"]
     c = cpu.uns["rank_genes_groups"]
     for group in g["names"].dtype.names:
@@ -1871,7 +1874,7 @@ def _assert_ovo_matches_scanpy(adata, reference, fmt="numpy_dense"):
         "tie_correct": True,
     }
     rsc.tl.rank_genes_groups(adata, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(bdata, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(bdata, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = adata.uns["rank_genes_groups"], bdata.uns["rank_genes_groups"]
     for fld in ("scores", "pvals", "pvals_adj"):
         for grp in g[fld].dtype.names:
@@ -1990,7 +1993,7 @@ def test_ovr_tie_correct_false_tie_heavy_matches_scanpy(fmt):
         "tie_correct": False,
     }
     rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
@@ -2138,6 +2141,7 @@ def test_unused_category_without_skip_raises():
 
 
 @pytest.mark.parametrize("use_raw", [None, True])
+@pytest.mark.filterwarnings("ignore:The argument use_raw is deprecated:FutureWarning")
 def test_rank_genes_groups_reads_raw_matches_scanpy(use_raw):
     """use_raw=None and use_raw=True both read adata.raw, matching scanpy."""
     adata = _anndata_with_group_sizes({"0": 30, "1": 30, "2": 30}, seed=6)
@@ -2176,7 +2180,7 @@ def test_log1p_base_logfoldchanges_match_scanpy(reference, fmt):
         "tie_correct": True,
     }
     rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for grp in g["logfoldchanges"].dtype.names:
         gm = dict(zip(g["names"][grp], np.asarray(g["logfoldchanges"][grp], float), strict=False))
@@ -2207,7 +2211,7 @@ def test_ovo_dense_fallback_pts_match_scanpy():
         "n_genes": 8,
     }
     rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for col in c["pts"].columns:
         np.testing.assert_allclose(
@@ -2236,7 +2240,7 @@ def test_bonferroni_matches_scanpy(fmt):
         "n_genes": 6,
     }
     rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals", "pvals_adj"):
         for grp in g[fld].dtype.names:
@@ -2287,7 +2291,7 @@ def test_ovr_fully_dense_column_match_scanpy(fmt):
         "tie_correct": True,
     }
     rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
@@ -2315,7 +2319,7 @@ def test_ovr_device_sparse_subset_match_scanpy(fmt):
         "tie_correct": True,
     }
     rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", use_raw=False, **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
@@ -2662,7 +2666,7 @@ def test_wilcoxon_ovo_exact_tier_boundaries_match_scanpy(boundary):
         "n_genes": adata.n_vars,
     }
     rsc.tl.rank_genes_groups(adata, "group", multi_gpu=False, use="X", **kwargs)
-    sc.tl.rank_genes_groups(expected, "group", use_raw=False, **kwargs)
+    sc.tl.rank_genes_groups(expected, "group", **sc_use(A.X, use_raw=False), **kwargs)
 
     actual_result = adata.uns["rank_genes_groups"]
     expected_result = expected.uns["rank_genes_groups"]

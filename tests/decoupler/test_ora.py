@@ -19,6 +19,11 @@ from rapids_singlecell.decoupler_gpu._method_ora import (
     _ora_tables,
 )
 
+# decoupler's CPU reference compiles numba code that uses reflected sets
+pytestmark = pytest.mark.filterwarnings(
+    r"ignore:\s*Encountered the use of a type that is scheduled for deprecation:numba.NumbaPendingDeprecationWarning"
+)
+
 
 @pytest.fixture(scope="module")
 def cpu_ora():
@@ -257,9 +262,6 @@ def test_ora_and_query_set_public_parameter_contract():
 
 
 @pytest.mark.parametrize("background,correction", [(20_000.5, 0.5), (8.5, 0.5), (6.5, 0.5), (8, -0.1)])
-@pytest.mark.filterwarnings(
-    r"ignore:\s*Encountered the use of a type that is scheduled for deprecation:numba.NumbaPendingDeprecationWarning"
-)
 def test_ora_numeric_options(background, correction, cpu_ora):
     # Every contingency-table cell stays positive after this correction.
     data = pd.DataFrame([np.arange(1, 9)], columns=list("abcdefgh"))

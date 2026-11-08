@@ -121,7 +121,7 @@ def test_regress_out_categorical(dtype, sparse_format):
 
     # scanpy reference
     adata_sc = adata.copy()
-    sc.pp.regress_out(adata_sc, keys=["batch"])
+    sc.pp.regress_out(adata_sc, ["batch"])
 
     # rapids
     rsc.get.anndata_to_GPU(adata)

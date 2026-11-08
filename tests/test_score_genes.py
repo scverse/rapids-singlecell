@@ -66,9 +66,9 @@ def test_score_with_reference(array_type):
     adata.X = adata.X.astype(np.float64)
     sc.pp.normalize_total(adata, target_sum=10000)
 
-    sc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_cpu")
+    sc.tl.score_genes(adata, gene_list=adata.var_names[:100])
     rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], out="obs.Test_gpu")
-    np.testing.assert_allclose(adata.obs["Test_cpu"].to_numpy(), adata.obs["Test_gpu"].to_numpy())
+    np.testing.assert_allclose(adata.obs["score"].to_numpy(), adata.obs["Test_gpu"].to_numpy())
 
 
 def test_add_score():

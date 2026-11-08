@@ -249,6 +249,7 @@ def test_neighbors_obsm_named_x():
     np.testing.assert_array_equal(res.distances.toarray(), ref.distances.toarray())
 
 
+@pytest.mark.filterwarnings("ignore:The function bbknn is deprecated:FutureWarning")
 def test_bbknn():
     """
     Test the bbknn function against the scanpy implementation. We want more than a 90% overlap between the two.
