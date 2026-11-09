@@ -81,11 +81,11 @@ __global__ void edistance_kernel(const T* __restrict__ embedding,
     T* smem_b = reinterpret_cast<T*>(smem_raw);
 
     const int thread_id = threadIdx.x;
-    const int pair_id = blockIdx.x;
-    const int block_in_pair = blockIdx.y;
+    const int pair_id = blockIdx.x / blocks_per_pair;
+    const int block_in_pair = blockIdx.x % blocks_per_pair;
     const int block_size = blockDim.x;
 
-    T local_sum = T(0.0);
+    T local_sum = T(0.0), comp = T(0.0);  // Kahan
 
     const int pair_a = pair_left[pair_id];
     const int pair_b = pair_right[pair_id];
@@ -108,8 +108,15 @@ __global__ void edistance_kernel(const T* __restrict__ embedding,
         const bool valid_a = (ia < end_a);
         const int idx_i = valid_a ? cell_indices[ia] : 0;
         const int i_local = ia - start_a;
+        // Diagonal pairs: tiles holding only j <= the block's first A cell add
+        // nothing.
+        const int jb_start = pair_a == pair_b
+                                 ? (iter_a * total_threads_for_pair +
+                                    block_in_pair * block_size + 1) /
+                                       CELL_TILE * CELL_TILE
+                                 : 0;
 
-        for (int jb_base = 0; jb_base < n_b; jb_base += CELL_TILE) {
+        for (int jb_base = jb_start; jb_base < n_b; jb_base += CELL_TILE) {
             const int cells_in_tile = min(CELL_TILE, n_b - jb_base);
 
             T dist_sq[CELL_TILE];
@@ -162,14 +169,17 @@ __global__ void edistance_kernel(const T* __restrict__ embedding,
                     if (c >= cells_in_tile) break;
                     int j_local = jb_base + c;
                     if (pair_a == pair_b && i_local >= j_local) continue;
-                    local_sum += sqrt(dist_sq[c]);
+                    const T y = sqrt(dist_sq[c]) - comp;
+                    const T s = local_sum + y;
+                    comp = (s - local_sum) - y;
+                    local_sum = s;
                 }
             }
         }
     }
 
-    edistance_block_reduce_add(local_sum, pairwise_sums, pair_id, thread_id,
-                               block_size);
+    edistance_block_reduce_add(local_sum - comp, pairwise_sums, pair_id,
+                               thread_id, block_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,11 +202,11 @@ __global__ void edistance_sparse_kernel(
     T* smem_b = reinterpret_cast<T*>(smem_raw);
 
     const int thread_id = threadIdx.x;
-    const int pair_id = blockIdx.x;
-    const int block_in_pair = blockIdx.y;
+    const int pair_id = blockIdx.x / blocks_per_pair;
+    const int block_in_pair = blockIdx.x % blocks_per_pair;
     const int block_size = blockDim.x;
 
-    T local_sum = T(0.0);
+    T local_sum = T(0.0), comp = T(0.0);  // Kahan
 
     const int pair_a = pair_left[pair_id];
     const int pair_b = pair_right[pair_id];
@@ -219,8 +229,15 @@ __global__ void edistance_sparse_kernel(
         const bool valid_a = (ia < end_a);
         const int idx_i = valid_a ? cell_indices[ia] : 0;
         const int i_local = ia - start_a;
+        // Diagonal pairs: tiles holding only j <= the block's first A cell add
+        // nothing.
+        const int jb_start = pair_a == pair_b
+                                 ? (iter_a * total_threads_for_pair +
+                                    block_in_pair * block_size + 1) /
+                                       CELL_TILE * CELL_TILE
+                                 : 0;
 
-        for (int jb_base = 0; jb_base < n_b; jb_base += CELL_TILE) {
+        for (int jb_base = jb_start; jb_base < n_b; jb_base += CELL_TILE) {
             const int cells_in_tile = min(CELL_TILE, n_b - jb_base);
 
             // CSR cursors for this B tile / A cell. Thread `t` owns B cell `t`
@@ -305,12 +322,15 @@ __global__ void edistance_sparse_kernel(
                     if (c >= cells_in_tile) break;
                     int j_local = jb_base + c;
                     if (pair_a == pair_b && i_local >= j_local) continue;
-                    local_sum += sqrt(dist_sq[c]);
+                    const T y = sqrt(dist_sq[c]) - comp;
+                    const T s = local_sum + y;
+                    comp = (s - local_sum) - y;
+                    local_sum = s;
                 }
             }
         }
     }
 
-    edistance_block_reduce_add(local_sum, pairwise_sums, pair_id, thread_id,
-                               block_size);
+    edistance_block_reduce_add(local_sum - comp, pairwise_sums, pair_id,
+                               thread_id, block_size);
 }

@@ -114,7 +114,7 @@ struct DenseLaunch {
 
     template <int CELL_TILE, int FEAT_TILE>
     void run() const {
-        dim3 grid(num_pairs, blocks_per_pair);
+        dim3 grid(num_pairs * blocks_per_pair);
         dim3 block(block_size);
         edistance_kernel<T, CELL_TILE, FEAT_TILE>
             <<<grid, block, shared_mem, stream>>>(
@@ -140,7 +140,7 @@ struct SparseLaunch {
 
     template <int CELL_TILE, int FEAT_TILE>
     void run() const {
-        dim3 grid(num_pairs, blocks_per_pair);
+        dim3 grid(num_pairs * blocks_per_pair);
         dim3 block(block_size);
         edistance_sparse_kernel<T, CELL_TILE, FEAT_TILE, IndptrT>
             <<<grid, block, shared_mem, stream>>>(
@@ -217,9 +217,9 @@ void def_compute_distances_sparse(nb::module_& m) {
             dispatch_tiles<T>(launcher, cell_tile, feat_tile);
         },
         "indptr"_a, "indices"_a, "data"_a, "cat_offsets"_a, "cell_indices"_a,
-        "pair_left"_a, "pair_right"_a, "pairwise_sums"_a, "num_pairs"_a,
-        "n_features"_a, "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a,
-        "block_size"_a, "shared_mem"_a, "stream"_a = 0);
+        "pair_left"_a, "pair_right"_a, "pairwise_sums"_a.noconvert(),
+        "num_pairs"_a, "n_features"_a, "blocks_per_pair"_a, "cell_tile"_a,
+        "feat_tile"_a, "block_size"_a, "shared_mem"_a, "stream"_a = 0);
 }
 
 template <typename T, typename Device>
@@ -249,9 +249,9 @@ void def_compute_distances(nb::module_& m) {
             dispatch_tiles<T>(launcher, cell_tile, feat_tile);
         },
         "embedding"_a, "cat_offsets"_a, "cell_indices"_a, "pair_left"_a,
-        "pair_right"_a, "pairwise_sums"_a, "num_pairs"_a, "n_features"_a,
-        "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a, "block_size"_a,
-        "shared_mem"_a, "stream"_a = 0);
+        "pair_right"_a, "pairwise_sums"_a.noconvert(), "num_pairs"_a,
+        "n_features"_a, "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a,
+        "block_size"_a, "shared_mem"_a, "stream"_a = 0);
 }
 
 template <typename Device>
