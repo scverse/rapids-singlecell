@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from anndata import AnnData
+from scipy.sparse import csr_matrix
 from scipy.spatial.distance import cdist
 
 from rapids_singlecell.pertpy_gpu import Distance, MeanVar
@@ -344,6 +345,42 @@ def test_onesided_distances_correctness_vs_cpu(small_adata: AnnData) -> None:
                 atol=1e-6,
                 err_msg=f"Onesided mismatch for ({selected_group}, {target_group})",
             )
+
+
+@pytest.fixture(scope="module")
+def large_group_data() -> tuple[np.ndarray, np.ndarray, pd.Series]:
+    """A 17,000-cell control (more than one pass of its pair's 32 x 512 threads) and a float64 CPU reference."""
+    rng = np.random.default_rng(0)
+    sizes = {"ctrl": 17_000, "a": 700, "b": 2}
+    labels = np.repeat(list(sizes), list(sizes.values()))
+    X = rng.normal(size=(len(labels), 4)) + 0.3 * (labels == "a")[:, None] + (labels == "b")[:, None]
+    X[rng.random(X.shape) > 0.6] = 0.0  # zeros for the CSR path
+    X = X.astype(np.float32).astype(np.float64)  # exact in float32 too
+
+    def mean_dist(A: np.ndarray, B: np.ndarray) -> float:  # within a group (A is B) over i != j
+        total = sum(cdist(A[s : s + 1024], B).sum() for s in range(0, len(A), 1024))
+        return total / (len(A) * (len(A) - 1) if A is B else len(A) * len(B))
+
+    g = {k: X[labels == k] for k in sizes}
+    ctrl_mean = mean_dist(g["ctrl"], g["ctrl"])
+    expected = pd.Series({k: 2 * mean_dist(g["ctrl"], v) - ctrl_mean - mean_dist(v, v) for k, v in g.items()})
+    return X, labels, expected
+
+
+@pytest.mark.parametrize(
+    ("dtype", "sparse", "atol"), [(np.float32, False, 1e-5), (np.float32, True, 1e-5), (np.float64, False, 1e-12)]
+)
+def test_onesided_large_group_vs_cpu(large_group_data, dtype, sparse: bool, atol: float) -> None:
+    """Within-group tiles skipped on later passes match a float64 CPU reference, dense and CSR, in the input's dtype."""
+    X, labels, expected = large_group_data
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=list(expected.index))})
+    if sparse:
+        adata, distance = AnnData(csr_matrix(X.astype(dtype)), obs=obs), Distance(metric="edistance", layer_key="X")
+    else:
+        adata, distance = AnnData(obs=obs, obsm={"X_pca": cp.asarray(X, dtype=dtype)}), Distance(metric="edistance")
+    result = distance.onesided_distances(adata, groupby="group", selected_group="ctrl")
+    assert result.dtype == dtype
+    np.testing.assert_allclose(result.loc[expected.index].to_numpy(), expected.to_numpy(), rtol=0, atol=atol)
 
 
 # ============================================================================
