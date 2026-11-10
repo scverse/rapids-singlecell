@@ -50,6 +50,7 @@ def _dense_adata(X: np.ndarray) -> AnnData:
 def test_sparse_equals_dense_bitwise(precision, dtype) -> None:
     """CSR input gives the dense result bit for bit, also with every value stored as two duplicate entries."""
     X = _make_matrix(40, dtype)
+    X[:, 0], X[0, 0] = 1000, 0  # the scale comes from a zero the CSR input does not store
     kwargs = {"metric": "edistance", "precision": precision}
     ref = Distance(obsm_key="emb", **kwargs).pairwise(_dense_adata(X), groupby="group")
     csr = csr_matrix(X)
@@ -59,6 +60,21 @@ def test_sparse_equals_dense_bitwise(precision, dtype) -> None:
         assert got.values.dtype == dtype
         np.testing.assert_array_equal(got.values, ref.values)
     assert matrix.nnz == 2 * csr.nnz  # the caller's matrix keeps its duplicates
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("case", ["nan", "all_zero"])
+def test_sparse_equals_dense_nan_and_all_zero(dtype, case) -> None:
+    """As for dense input, a NaN only costs the group of its cell and an all-zero matrix gives zeros."""
+    X = _make_matrix(40, dtype)
+    if case == "nan":
+        X[0, 3] = np.copysign(np.nan, -1)  # the sign-set NaN that arithmetic such as 0 / 0 produces
+    else:
+        X[:] = 0
+    ref = Distance(metric="edistance", obsm_key="emb").pairwise(_dense_adata(X), groupby="group")
+    got = Distance(metric="edistance", layer_key="X").pairwise(AnnData(csr_matrix(X), obs=_obs()), groupby="group")
+    np.testing.assert_array_equal(got.values, ref.values)
+    assert not got.values.any() if case == "all_zero" else np.isfinite(got.values[1:, 1:]).all()
 
 
 @pytest.mark.parametrize("dtype,atol", [(np.float32, 1e-4), (np.float64, 1e-9)])
