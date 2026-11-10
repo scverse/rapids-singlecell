@@ -38,7 +38,7 @@ _TILE_B = 128  # B-tile rows
 _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
-_TRIM = 16.0  # sampled rows this many times further from the column medians than the median row are left out
+_TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
 
 
 def _sample(X):
@@ -46,6 +46,14 @@ def _sample(X):
     n, d = X.shape
     rows = max(1, min(_SAMPLE_ROWS, 2**25 // max(d, 1)))
     return X[:: max(1, -(-n // rows))]
+
+
+def _canonical(X):
+    """CSR ``X`` with sorted columns and summed duplicates; the caller's matrix is not changed."""
+    if not X.has_canonical_format:
+        X = X.copy()
+        X.sum_duplicates()
+    return X
 
 
 def _center(sample, dtype, precision: str) -> tuple[cp.ndarray, float]:
@@ -57,23 +65,42 @@ def _center(sample, dtype, precision: str) -> tuple[cp.ndarray, float]:
     two (exact to undo) that puts the largest centered sample value in
     ``[2**10, 2**11)`` and ``nm = -mean * sc``. ``sample`` comes from all cells
     of the input, not the ones a call loads, so a distance does not depend on
-    which other groups are computed with it.
+    which other groups are computed with it. A CSR sample is read through its
+    stored values only and gives the ``nm`` and ``sc`` of the same dense rows.
     """
-    if cpsp.issparse(sample):
-        sub = sample.toarray().astype(dtype, copy=False)
+    d = sample.shape[1]
+    sparse = cpsp.issparse(sample)
+    if sparse:  # canonical CSR: the zeros stay implicit
+        row, col, v = sample.tocoo().row, sample.indices, sample.data
+        r = cp.zeros(sample.shape[0], dtype=v.dtype)
+        bits = np.dtype(f"u{v.itemsize}")  # |values| order like their bit patterns, a NaN of either sign last
+        cp.maximum.at(r.view(bits), row, cp.abs(v).view(bits))
     else:
-        sub = cp.array(sample, dtype=dtype, order="C")
-    d = sub.shape[1]
-    cp.copyto(sub, cp.nan, where=~cp.isfinite(sub))  # non-finite values enter neither the mean nor the scale
-    cb, rb = max(1, 2**22 // max(1, len(sub))), max(1, 2**22 // max(1, d))  # columns / rows per batch
-    med = cp.concatenate([cp.nanmedian(sub[:, j : j + cb], 0) for j in range(0, d, cb)])
-    dev = cp.concatenate([cp.nanmax(cp.abs(sub[i : i + rb] - med), 1) for i in range(0, max(1, len(sub)), rb)])
-    ref = dev[dev > 0]
-    keep = dev <= _TRIM * (cp.nanmedian(ref) if len(ref) else 0.0)
-    kept = bool(keep.any())
-    cp.copyto(sub, cp.nan, where=~keep[:, None])
-    mu = cp.nan_to_num(cp.nanmean(sub, 0)) if kept else cp.zeros(d, dtype=dtype)
-    top = float(cp.nanmax(cp.abs(cp.subtract(sub, mu, out=sub), out=sub))) if kept else 0.0
+        v = cp.asarray(sample, dtype=dtype)
+        r = cp.abs(v).max(1) if d else cp.zeros(len(v), dtype=dtype)
+    # r is the largest |value| of a row. Left out: rows with a non-finite value or above _TRIM times the median row
+    ref = r[(r > 0) & (r < cp.inf)]
+    keep = (r < cp.inf) & (r / _TRIM <= (cp.median(ref) if len(ref) else 0.0))
+    n_kept = int(keep.sum())
+    if n_kept < len(r):  # the usual sample keeps every row and is not copied
+        k = keep[row] if sparse else cp.flatnonzero(keep)
+        col, v = (col[k] if sparse else None), v[k]
+    row = k = None  # the row indices are not needed again
+    if sparse and not v.size:  # no stored value in a kept row
+        sparse, v = False, cp.zeros((0, d), dtype=dtype)
+    # The column sums add integers, exact in float64 in any order: dense and CSR input get the same mean
+    shift = min(np.finfo(dtype).nmant, 52 - _SAMPLE_ROWS.bit_length())
+    shift -= math.frexp(float(cp.where(keep, r, 0).max()))[1] if n_kept else 0
+    q = cp.ldexp(v, shift)
+    cp.rint(q, out=q)
+    total = cp.bincount(col, weights=q, minlength=d) if sparse else q.sum(0, dtype=cp.float64)
+    mu = cp.ldexp(total / max(n_kept, 1), -shift).astype(dtype)
+    cp.abs(cp.subtract(v, mu[col] if sparse else mu, out=q), out=q)
+    top = float(q.max()) if q.size else 0.0
+    if sparse:  # a column with fewer stored values than kept rows holds a zero
+        stored = cp.zeros(d, dtype=np.int32)
+        cp.add.at(stored, col, 1)
+        top = max(top, float(cp.where(stored < n_kept, cp.abs(mu), 0).max()))
     work = np.result_type(dtype, _MATH[precision][3])  # the kernels center in it: sc has to stay finite there
     sc = math.ldexp(1.0, min(10 - math.floor(math.log2(top)), np.finfo(work).maxexp - 2)) if 0 < top < math.inf else 1.0
     nm = 0.0 - mu.astype(work) * sc
@@ -176,7 +203,7 @@ def _build_csr_source(embedding_raw, selector):
     (keep all rows). Rows are kept in ``selector`` order so the caller's
     ``cell_indices`` line up. The result is canonical CSR (sorted columns,
     duplicate entries summed); the caller's matrix is not changed. Also
-    returns the :func:`_sample` of all rows.
+    returns the :func:`_sample` of all rows, canonical as well.
     """
     from rapids_singlecell.get._anndata import X_to_GPU
 
@@ -199,10 +226,7 @@ def _build_csr_source(embedding_raw, selector):
         if not cpsp.isspmatrix_csr(X):
             X = X.tocsr()
 
-    if not X.has_canonical_format:
-        X = X.copy()
-        X.sum_duplicates()
-    return X, sample
+    return _canonical(X), _canonical(sample)
 
 
 def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
