@@ -5,10 +5,11 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData
-from anndata.acc import A
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 
 import rapids_singlecell as rsc
+
+A = pytest.importorskip("anndata.acc").A
 
 X_total = cp.array([[1, 0], [3, 0], [5, 6]], dtype=np.float64)
 

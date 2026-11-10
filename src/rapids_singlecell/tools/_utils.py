@@ -38,6 +38,8 @@ def _choose_representation(adata, use_rep=None, n_pcs=None, *, use=None):
         if isinstance(use, LayerAcc):
             return _get_arr(adata, use)
         use_rep = use.k
+        if use_rep not in adata.obsm:  # unlike `use_rep='X'`, `A.obsm['X']` never means `.X`
+            raise KeyError(use_rep)
     if use_rep is None and n_pcs == 0:  # backwards compat for specifying `.X`
         use_rep = "X"
     if use_rep is None:

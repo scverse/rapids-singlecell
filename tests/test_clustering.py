@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._clustering import _create_graph
+
+A = pytest.importorskip("anndata.acc").A
 
 # `tl.louvain` is deprecated; only `test_louvain_deprecated` expects the warning
 pytestmark = pytest.mark.filterwarnings("ignore:The function louvain is deprecated:FutureWarning")

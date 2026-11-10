@@ -128,7 +128,7 @@ def tsne(
     if isinstance(use, LayerAcc):
         X = _get_arr(adata, use, dim="obs")
     else:
-        X = _choose_representation(adata, use_rep=use_rep if use is None else use.k, n_pcs=n_pcs)
+        X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs, use=use)
     logger_level = _get_logger_level(logger)
     X_tsne = TSNE(
         perplexity=perplexity,

@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 import scanpy.external as sce
 from anndata import AnnData
-from anndata.acc import A
 from bbknn.matrix import trimming as trimming_cpu
 from scanpy.datasets import pbmc68k_reduced
 from scanpy.neighbors._connectivity import gauss as scanpy_gauss
@@ -24,6 +23,8 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _get_connectivities_gauss,
     _get_connectivities_jaccard,
 )
+
+A = pytest.importorskip("anndata.acc").A
 
 # the input data
 X = np.array([[1, 0], [3, 0], [5, 6], [0, 4]])
@@ -236,6 +237,16 @@ def test_neighbors_out():
     assert "u" in adata.uns and "cl" in adata.uns
     assert adata.obs["cl"].dtype == "category"
     assert isinstance(rsc.tl.leiden(adata, use=A.obsp["nn"], out=True), pd.Categorical)
+
+
+def test_neighbors_obsm_named_x():
+    """`use=A.obsm['X']` reads that `.obsm` key and never `.X`, unlike the deprecated `use_rep='X'`."""
+    adata = pbmc68k_reduced()
+    with pytest.raises(KeyError, match="^'X'$"):
+        neighbors(adata, n_neighbors=5, use=A.obsm["X"], out=True)
+    adata.obsm["X"] = adata.obsm["Y"] = adata.obsm["X_pca"][:, :5]
+    res, ref = (neighbors(adata, n_neighbors=5, use=A.obsm[k], out=True) for k in "XY")
+    np.testing.assert_array_equal(res.distances.toarray(), ref.distances.toarray())
 
 
 def test_bbknn():

@@ -645,7 +645,7 @@ def test_ttest_host_multi_gpu_matches_single(layout, reference):
 
 
 def test_rank_genes_groups_use_out():
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     adata = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")

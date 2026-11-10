@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Literal, Union
 
 import cupy as cp
@@ -24,13 +24,16 @@ from rapids_singlecell.get._out import (
     _write_out,
     deprecated_copy,
 )
+from rapids_singlecell.get._utils import AdRef, _to_numpy_1d
 
 from ._utils import _check_gpu_X, _sparse_to_dense
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from anndata import AnnData
 
-    from rapids_singlecell.get._utils import AdRef, LayerAcc, MultiAcc
+    from rapids_singlecell.get._utils import LayerAcc, MultiAcc
 
 
 @deprecated_arg("layer", DEPR_USE)
@@ -105,9 +108,9 @@ def regress_out(
     if not sparse.issparse(X) and not isinstance(X, DaskArray) and out is not False:
         X = cp.array(X)
 
-    if isinstance(covariates, str) or not isinstance(covariates, Sequence):
+    if isinstance(covariates, AdRef | str) or not isinstance(covariates, Collection):
         covariates = [covariates]
-    cov = pd.DataFrame({str(c): _get_vec(adata, c, dim="obs") for c in covariates}, index=adata.obs_names)
+    cov = pd.DataFrame({str(c): _to_numpy_1d(_get_vec(adata, c, dim="obs")) for c in covariates}, index=adata.obs_names)
 
     if any(isinstance(dtype, CategoricalDtype) for dtype in cov.dtypes):
         if cov.shape[1] > 1:

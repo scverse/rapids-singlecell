@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import scanpy as sc
-from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 
 from rapids_singlecell.tools._diffmap import (
@@ -12,6 +11,8 @@ from rapids_singlecell.tools._diffmap import (
     _load_connectivities,
     diffmap,
 )
+
+A = pytest.importorskip("anndata.acc").A
 
 
 @pytest.fixture

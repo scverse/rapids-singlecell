@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
+from pandas.api.types import infer_dtype
 from scverse_misc import deprecated_arg
 
 from rapids_singlecell._keys import _EMBEDDINGS, _existing_preset_keys
@@ -95,7 +96,7 @@ def embedding_density(
         use = _resolve_matrix_acc(use)
     basis = "umap" if isinstance(use, Default) else use
     groupby = _obs_col(groupby, param="groupby")
-    if isinstance(basis, MultiAcc):
+    if not isinstance(basis, str):
         basis = _resolve_obs(basis, kinds=(MultiAcc,))
         basis_key = basis.k if basis.k in adata.obsm else None
         basis = basis.k.removeprefix("X_")
@@ -129,7 +130,7 @@ def embedding_density(
 
     if groupby is not None:
         groups = adata.obs[groupby]
-        if key is True and groups.dtype.name != "category":
+        if key is True and infer_dtype(groups) == "string":
             groups = groups.astype("category")  # like `_sanitize_column`, but local
         if groups.dtype.name != "category":
             raise ValueError(f"{groupby!r} column does not contain categorical data")

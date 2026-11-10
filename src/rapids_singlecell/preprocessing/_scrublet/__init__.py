@@ -223,9 +223,12 @@ def scrublet(
 
     start = logg.info("Running Scrublet")
 
-    adata_obs = adata.copy()
-    if src := _use_args(use, kinds=(LayerAcc,)):
-        adata_obs.X = _get_arr(adata, dim="obs", **src)
+    # work on the counts and the names only: the steps below never write into the matrix they are given
+    adata_obs = AnnData(
+        _get_arr(adata, dim="obs", **_use_args(use, kinds=(LayerAcc,))),
+        obs=pd.DataFrame(index=adata.obs_names),
+        var=pd.DataFrame(index=adata.var_names),
+    )
 
     def _run_scrublet(
         ad_obs: AnnData,
@@ -340,10 +343,10 @@ def scrublet(
 
 def _ref_to_uns(ref: AdRef | str, vals: np.ndarray) -> str | np.ndarray:
     """Accessors can't be stored in `.uns`: a column becomes its name, anything else its values."""
-    from anndata.acc import MetaAcc
-
     if isinstance(ref, str):
         return ref
+    from anndata.acc import MetaAcc
+
     return ref.idx if isinstance(ref.acc, MetaAcc) else vals
 
 

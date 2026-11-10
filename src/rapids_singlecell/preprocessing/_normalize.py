@@ -127,13 +127,14 @@ def normalize_total(
 
     _check_gpu_X(X, allow_dask=True)
 
+    detached = dests is True or dests[1].normalized != src  # the result isn't written back to its source
     if X.dtype.kind in "iu":
         X = X.astype(cp.float32)
-    elif dests is True or dests[1].normalized != src:
+    elif detached:
         X = X.copy()
     need_factor = dests is True or dests[1].norm_factor is not None
     if need_factor:
-        before = X.sum(axis=1).ravel()
+        before = _row_sums(X)
 
     if sparse.isspmatrix_csc(X):
         X = X.tocsr()
@@ -145,7 +146,7 @@ def normalize_total(
             raise ValueError(f"`max_fraction` must be between 0 and 1, got {max_fraction}.")
 
     if isinstance(X, DaskArray):
-        X = _normalize_total_dask(X, target_sum)
+        X = _normalize_total_dask(X, target_sum, copy=detached or need_factor)
     elif isinstance(X, sparse.csr_matrix):
         X = _normalize_total_csr(
             X,
@@ -165,7 +166,7 @@ def normalize_total(
 
     norm_factor = None
     if need_factor:  # each row was scaled uniformly, so the ratio of row sums is the factor
-        after = X.sum(axis=1).ravel()
+        after = _row_sums(X)
         norm_factor = before / (after + (after == 0)) * (after != 0)
     vals = NormalizeTotalResult(X, norm_factor)
     if dests is True:
@@ -314,7 +315,7 @@ def _normalize_total_dense(
     return X
 
 
-def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
+def _normalize_total_dask(X: DaskArray, target_sum: float | None, *, copy: bool) -> DaskArray:
     if target_sum is None:
         target_sum = _get_target_sum_dask(X)
 
@@ -322,6 +323,8 @@ def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
         def __mul(X_part):
+            if copy:  # scaled in place: keep the input blocks for other results and the row sums taken before
+                X_part = X_part.copy()
             _nc.mul_csr(
                 X_part.indptr,
                 X_part.data,
@@ -336,6 +339,8 @@ def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
         def __mul(X_part):
+            if copy:
+                X_part = X_part.copy()
             _nc.mul_dense(
                 X_part,
                 nrows=X_part.shape[0],
@@ -351,7 +356,10 @@ def _normalize_total_dask(X: DaskArray, target_sum: float | None) -> DaskArray:
     return X
 
 
-def _get_target_sum_dask(X: DaskArray) -> int:
+def _row_sums(X: ArrayTypesDask) -> cp.ndarray | DaskArray:
+    """Row sums, lazy for Dask arrays (whose sparse blocks `X.sum` can't reduce)."""
+    if not isinstance(X, DaskArray):
+        return X.sum(axis=1).ravel()
     if isinstance(X._meta, sparse.csr_matrix):
         from rapids_singlecell._cuda import _norm_cuda as _nc
 
@@ -372,14 +380,17 @@ def _get_target_sum_dask(X: DaskArray) -> int:
             return X_part.sum(axis=1)
     else:
         raise ValueError(f"Cannot compute target sum for {type(X)}")
-    target_sum_chunk_matrices = X.map_blocks(
+    return X.map_blocks(
         __sum,
         meta=cp.array((1.0,), dtype=X.dtype),
         dtype=X.dtype,
-        chunks=(X.chunksize[0],),
+        chunks=(X.chunks[0],),
         drop_axis=1,
     )
-    counts_per_cell = target_sum_chunk_matrices.compute()
+
+
+def _get_target_sum_dask(X: DaskArray) -> int:
+    counts_per_cell = _row_sums(X).compute()
     counts_per_cell = counts_per_cell[counts_per_cell > 0]
     target_sum = cp.median(counts_per_cell)
     return target_sum
@@ -789,6 +800,7 @@ def normalize_shifted_clr(
     -------
     The normalized matrix if `out=True`, else `None`.
     """
+    out = _legacy_out(out, "inplace", None if inplace else True)
     src = _use_args(use, layer=layer)
     view_to_actual(adata)
 

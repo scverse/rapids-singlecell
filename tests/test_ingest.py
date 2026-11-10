@@ -6,12 +6,13 @@ import pandas as pd
 import pytest
 import scanpy as sc
 from anndata import AnnData
-from anndata.acc import A
 from scipy import sparse
 from sklearn.neighbors import KDTree
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._ingest import _knn_classify, _query_neighbors, ingest
+
+A = pytest.importorskip("anndata.acc").A
 
 N_FEATURES = 8
 N_COMPONENTS = 5

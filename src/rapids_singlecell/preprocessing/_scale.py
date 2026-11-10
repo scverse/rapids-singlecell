@@ -172,7 +172,7 @@ def scale(
     )
     vals = ScaleResult(X, means, std)
     if dests is True:
-        return vals
+        return vals if inplace else X  # the deprecated `inplace=False` returns the matrix alone
     _write_dests(adata, vals, dests[1])
     return None
 

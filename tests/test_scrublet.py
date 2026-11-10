@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 import scipy.sparse as sparse
 from anndata import AnnData, concat
-from anndata.acc import A
 from anndata.tests.helpers import assert_equal
 from cupyx.scipy import sparse as cp_sparse
 from cupyx.scipy.sparse import coo_matrix
@@ -19,6 +18,8 @@ from rapids_singlecell.preprocessing._scrublet.sparse_utils import subsample_cou
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+A = pytest.importorskip("anndata.acc").A
 
 
 def pbmc200() -> AnnData:
@@ -124,6 +125,20 @@ def test_scrublet_batched_preserves_obs(monkeypatch, legacy):
     assert_allclose(result.obs["doublet_score"], [0, 0.1, 0.2, 0.3])
     assert_array_equal(result.obs["predicted_doublet"], [False, False, True, True])
     assert result.uns["scrublet"]["batches"].keys() == {"a", "b"}
+
+
+def test_scrublet_use_layer_no_copy(monkeypatch):
+    """`use` runs on the selected layer without copying X and every other layer."""
+    adata = pbmc200()
+    rsc.get.anndata_to_GPU(adata)
+    expected = rsc.pp.scrublet(adata, use_approx_neighbors=False, out=True)
+    adata.layers["counts"], adata.X = adata.X, adata.X.log1p()
+    counts = adata.layers["counts"].copy()
+    monkeypatch.setattr(adata, "copy", lambda: pytest.fail("scrublet copied the whole object"))
+    res = rsc.pp.scrublet(adata, use=A.layers["counts"], use_approx_neighbors=False, out=True)
+    assert_array_equal(res.predicted_doublet, expected.predicted_doublet)
+    assert_allclose(res.doublet_score, expected.doublet_score)
+    assert (adata.layers["counts"] != counts).nnz == 0
 
 
 def _preprocess_for_scrublet(adata: AnnData) -> AnnData:

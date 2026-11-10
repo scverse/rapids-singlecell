@@ -22,7 +22,17 @@ from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._settings import Default, Preset, settings
 
-from ._utils import AdRef, GraphAcc, LayerAcc, MultiAcc, _require_anndata_acc, _resolve_matrix_acc, _to_numpy_1d
+from ._utils import (
+    AdRef,
+    GraphAcc,
+    LayerAcc,
+    MetaAcc,
+    MultiAcc,
+    _require_anndata_acc,
+    _resolve_matrix_acc,
+    _resolve_vector_acc,
+    _to_numpy_1d,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -58,7 +68,7 @@ def own_deprecations() -> Generator[None]:
 def _resolve(acc: ArrAcc | AdRef | str, *, vec: bool = False) -> ArrAcc | AdRef:
     if not isinstance(acc, str):
         return acc
-    return _require_anndata_acc().resolve(acc, vec=True) if vec else _resolve_matrix_acc(acc)
+    return _resolve_vector_acc(acc, strict=True) if vec else _resolve_matrix_acc(acc)
 
 
 def _resolve_obs(use: Any, *, kinds: tuple[type, ...] = (LayerAcc, MultiAcc)) -> Any:
@@ -90,8 +100,6 @@ def _use_args(use: ArrAcc | str | None, *, kinds: tuple[type, ...] = (LayerAcc, 
 
 def _dest(acc: Any) -> Dest:
     """Translate an accessor into old-style choices, e.g. `A.obsm['x']` -> `{'obsm': 'x'}`."""
-    from anndata.acc import MetaAcc
-
     if isinstance(acc, str):
         acc = _resolve(acc, vec="." in acc and acc.split(".", 1)[0] in {"obs", "var"})
     match acc:

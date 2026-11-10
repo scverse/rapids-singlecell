@@ -5,11 +5,12 @@ import itertools
 import cuvs
 import numpy as np
 import pytest
-from anndata.acc import A
 from packaging.version import parse as parse_version
 from scanpy.datasets import pbmc68k_reduced
 
 import rapids_singlecell as rsc
+
+A = pytest.importorskip("anndata.acc").A
 
 
 def _calc_recall(distances, reference_distances, tolerance=0.9):

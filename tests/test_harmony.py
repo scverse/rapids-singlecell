@@ -903,7 +903,7 @@ def test_harmony_integrate(correction_method):
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
 def test_harmony_integrate_use_out():
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     adata = sc.datasets.pbmc68k_reduced()
     kw = {"dtype": cp.float32, "max_iter_harmony": 1, "rng": 0}

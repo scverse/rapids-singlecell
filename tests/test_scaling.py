@@ -204,7 +204,7 @@ def test_mask_string():
 
 
 def test_scale_use_out():
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     adata = AnnData(cp.array(X_original, dtype=cp.float32))
     adata.obs["m"] = np.arange(adata.n_obs) > 0
@@ -217,6 +217,18 @@ def test_scale_use_out():
     rsc.pp.scale(adata, use=A.layers["s"], out={"std": A.var["sd"]}, mask="obs.m")
     assert "sd" in adata.var
     cp.testing.assert_allclose(adata.layers["s"], X_centered_original)
+
+
+def test_scale_inplace_false_returns_matrix():
+    adata = AnnData(cp.array(X_original, dtype=cp.float32))
+    with pytest.warns(FutureWarning, match="inplace"):
+        scaled = rsc.pp.scale(adata, inplace=False)
+    assert isinstance(scaled, cp.ndarray)
+    cp.testing.assert_allclose(scaled, X_centered_original)
+    cp.testing.assert_allclose(adata.X, X_original)
+    assert "mean" not in adata.var
+    with pytest.warns(FutureWarning, match="inplace"), pytest.raises(TypeError, match="not both"):
+        rsc.pp.scale(adata, inplace=False, out=True)
 
 
 @pytest.mark.parametrize("zero_center", [True, False])

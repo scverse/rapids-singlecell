@@ -223,6 +223,19 @@ def test_perturbation_signature_recomputes_short_pca(mixscape_adata, analyzer, p
     cp.testing.assert_allclose(adata.layers["X_pert"], expected.layers["X_pert"])
 
 
+@pytest.mark.filterwarnings("error::FutureWarning")
+@pytest.mark.parametrize("preset", list(rsc.Preset))
+@pytest.mark.parametrize("stored", list(rsc.Preset))
+def test_perturbation_signature_recompute_updates_uns(mixscape_adata, preset, stored):
+    adata = mixscape_adata
+    with rsc.settings.override(preset=stored):
+        rsc.pp.pca(adata, n_comps=2)
+    with rsc.settings.override(preset=preset, N_PCS=3):
+        rsc.ptg.Mixscape().perturbation_signature(adata, pert_key="gene_target", control="NT", n_pcs=4)
+    varm = "PCs" if stored is rsc.Preset.ScanpyV1 else "pca"
+    assert adata.varm[varm].shape[1] == len(adata.uns["pca"]["variance"]) == 4
+
+
 @pytest.mark.parametrize("use_rep", ["X_pca", "pca", "custom"])
 def test_perturbation_signature_explicit_rep_is_not_recomputed(mixscape_adata, use_rep):
     adata = mixscape_adata

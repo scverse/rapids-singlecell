@@ -60,12 +60,46 @@ def test_regress_out_layer(dtype, batchsize):
         )
     cp.testing.assert_array_equal(single, layer)
 
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     rsc.pp.regress_out(
         adata, [A.obs["n_counts"], "percent_mito"], use="layers.counts", out=A.layers["r"], batchsize=batchsize
     )
     cp.testing.assert_array_equal(single, adata.layers["r"])
+
+
+@pytest.mark.parametrize("container", ["ndarray", "Index"])
+def test_regress_out_key_containers(container):
+    import pandas as pd
+
+    adata = sc.datasets.pbmc68k_reduced().raw.to_adata()[:200, :50].copy()
+    rsc.get.anndata_to_GPU(adata)
+    keys = ["n_counts", "percent_mito"]
+    covariates = {"ndarray": np.array, "Index": pd.Index}[container](keys)
+    expected = rsc.pp.regress_out(adata, keys, out=True)
+    cp.testing.assert_array_equal(rsc.pp.regress_out(adata, covariates, out=True), expected)
+
+
+def test_regress_out_gpu_references():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = sc.datasets.pbmc68k_reduced().raw.to_adata()[:200, :50].copy()
+    rsc.get.anndata_to_GPU(adata)
+    adata.obsm["X_pca"] = cp.asarray(adata.obsm["X_pca"])
+    gene = adata.var_names[3]
+    adata.obs["gene"] = adata.X[:, 3].toarray().ravel().get()
+    adata.obs["pc"] = adata.obsm["X_pca"][:, 0].get()
+    expected = rsc.pp.regress_out(adata, ["gene", "pc"], out=True)
+    result = rsc.pp.regress_out(adata, [A.X[:, gene], A.obsm["X_pca"][:, 0]], out=True)
+    cp.testing.assert_array_equal(result, expected)
+
+
+def test_regress_out_rejects_array_reference():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = AnnData(cp.ones((5, 3), dtype=cp.float32), obsm={"X_pca": cp.ones((5, 2), dtype=cp.float32)})
+    with pytest.raises(TypeError, match="References must be strings or AdRefs"):
+        rsc.pp.regress_out(adata, A.obsm["X_pca"], out=True)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])

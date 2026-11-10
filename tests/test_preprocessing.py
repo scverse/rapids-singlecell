@@ -133,7 +133,7 @@ def test_filter_cells_single_column(kwargs, expected, unexpected):
     ("func", "kw", "dim"), [("filter_genes", "min_cells", "var"), ("filter_cells", "min_genes", "obs")]
 )
 def test_filter_out(func, kw, dim):
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     adata = AnnData(cp.asarray(_COUNTS.astype("float32")))
     f = getattr(rsc.pp, func)

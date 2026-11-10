@@ -74,7 +74,7 @@ def test_qc_metrics_format(cls, dtype):
 
 
 def test_qc_metrics_use_out():
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     adata = adata_mito(np.float32)
     adata.layers["counts"] = adata.X.copy()

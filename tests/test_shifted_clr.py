@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData
-from anndata.acc import A
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 
 import rapids_singlecell as rsc
@@ -212,6 +211,14 @@ def test_inplace_false():
     np.testing.assert_array_equal(_dense(adata.X), x_before)
 
 
+def test_inplace_false_out_error():
+    A = pytest.importorskip("anndata.acc").A
+    adata = AnnData(cp.asarray(X_clr))
+    with pytest.raises(TypeError, match="either `out` or `inplace`"), pytest.warns(FutureWarning, match="inplace"):
+        rsc.pp.normalize_shifted_clr(adata, inplace=False, out=A.layers["clr"])
+    assert "clr" not in adata.layers
+
+
 def test_out_true():
     adata = AnnData(csr_matrix(cp.asarray(X_clr_estimated)))
     out = rsc.pp.normalize_shifted_clr(adata, out=True)
@@ -238,6 +245,7 @@ def test_copy_inplace_error():
 
 def test_use():
     """`use` selects the input layer and leaves `X` untouched."""
+    A = pytest.importorskip("anndata.acc").A
     adata = AnnData(
         csr_matrix(cp.asarray(X_clr_estimated)),
         layers={"counts": csr_matrix(cp.asarray(X_clr_estimated))},

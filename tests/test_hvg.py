@@ -486,7 +486,7 @@ def test_poisson_gene_selection_compare_to_scvi(dtype, sparse):
 
 @pytest.mark.parametrize("flavor", ["seurat", "seurat_v3", "pearson_residuals", "poisson_gene_selection"])
 def test_hvg_out_true(flavor):
-    from anndata.acc import A
+    A = pytest.importorskip("anndata.acc").A
 
     adata = sc.datasets.pbmc3k()[:500].copy()
     sc.pp.filter_genes(adata, min_cells=10)
@@ -503,3 +503,25 @@ def test_hvg_out_true(flavor):
     with pytest.warns(FutureWarning, match="batch_key"):
         rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=50, use=use, batch_key="b")
     pd.testing.assert_frame_equal(adata.var[df.columns], df)
+
+
+def test_hvg_proxy_reuses_obs_names(monkeypatch):
+    """The internal proxy shares the caller's obs_names (here duplicated) instead of generating one per cell."""
+    import warnings
+
+    from rapids_singlecell.preprocessing import _hvg
+
+    adata = sc.datasets.blobs()
+    adata.X = cp.asarray(adata.X)
+    adata.obs_names = ["a", "b"] * (adata.n_obs // 2)
+    names, single, seen = adata.obs_names, _hvg._highly_variable_genes_single_batch, []
+
+    def spy(ad, **kwargs):
+        seen.append(ad.obs_names)
+        return single(ad, **kwargs)
+
+    monkeypatch.setattr(_hvg, "_highly_variable_genes_single_batch", spy)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", "Observation names are not unique")
+        rsc.pp.highly_variable_genes(adata)
+    assert seen[0].equals(names)

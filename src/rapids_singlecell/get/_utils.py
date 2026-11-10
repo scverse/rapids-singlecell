@@ -15,13 +15,14 @@ from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._settings import Preset, settings
 
 if TYPE_CHECKING or find_spec("anndata.acc") is not None:
-    from anndata.acc import A, AdRef, GraphAcc, Idx2D, LayerAcc, MultiAcc
+    from anndata.acc import A, AdRef, GraphAcc, Idx2D, LayerAcc, MetaAcc, MultiAcc
 else:
     A = None
     AdRef = type("AdRef", (), {"__module__": "anndata.acc"})
     GraphAcc = type("GraphAcc", (), {"__module__": "anndata.acc"})
     Idx2D = object
     LayerAcc = type("LayerAcc", (), {"__module__": "anndata.acc"})
+    MetaAcc = type("MetaAcc", (), {"__module__": "anndata.acc"})
     MultiAcc = type("MultiAcc", (), {"__module__": "anndata.acc"})
 
 type ArrAcc = GraphAcc | LayerAcc | MultiAcc

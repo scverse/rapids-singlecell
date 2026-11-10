@@ -4,13 +4,14 @@ import cupy as cp
 import numpy as np
 import pytest
 import scanpy as sc
-from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 from scipy import sparse
 
 from rapids_singlecell.tools import draw_graph, tsne, umap
 from rapids_singlecell.tools._umap import _device_coo
 from testing.rapids_singlecell._pytest import needs
+
+A = pytest.importorskip("anndata.acc").A
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"rng": None}])

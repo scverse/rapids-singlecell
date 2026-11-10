@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData
-from anndata.acc import A
 from cupyx.scipy import sparse as cusparse
 from scanpy.datasets import pbmc3k, pbmc3k_processed
 from scipy import sparse
@@ -13,6 +12,8 @@ from scipy import sparse
 import rapids_singlecell as rsc
 from rapids_singlecell.preprocessing._sparse_pca._block_lanczos import randomized_svd
 from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import lanczos_svd
+
+A = pytest.importorskip("anndata.acc").A
 
 # Reference values computed with sklearn PCA
 A_list = [

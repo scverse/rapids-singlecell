@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -169,7 +170,12 @@ def highly_variable_genes(
     if batch_key is not None and batch is not None:
         raise TypeError("Pass either `batch` or `batch_key`, not both.")
     # run on a proxy holding only the input matrix and batches, then copy the results
-    target, adata = adata, AnnData(_get_arr(adata, dim="obs", **src))
+    target = adata
+    # share string obs_names: generating new ones takes 0.2 s per million cells
+    obs = pd.DataFrame(index=target.obs_names) if pd.api.types.is_string_dtype(target.obs_names) else None
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Observation names are not unique")
+        adata = AnnData(_get_arr(target, dim="obs", **src), obs=obs)
     if batch_key is not None or batch is not None:
         vals = target.obs[batch_key] if batch is None else _get_vec(target, _resolve(batch, vec=True), dim="obs")
         adata.obs["batch"] = vals.values if isinstance(vals, pd.Series) else vals

@@ -176,8 +176,8 @@ def dsb(
     )
     if adata.n_obs < 2 or (denoise_counts and adata.n_vars < 2):
         raise ValueError("dsb needs at least 2 cells, and 2 proteins with `denoise_counts`.")
-    out = _legacy_out(out, "key_added", None if key_added is None else f"layers.{key_added}")
     src = _use_args(use, kinds=(LayerAcc,), layer=layer)
+    dest = src if key_added is None else {"layer": _legacy_out(out, "key_added", key_added)}  # no `anndata.acc` needed
     empty_order = None
     if adata_empty is not None:
         empty_order = _match_proteins(adata_empty.var_names, proteins)
@@ -289,7 +289,7 @@ def dsb(
         q = cp.quantile(norm, cp.asarray(quantile_clip, dtype=dtype), axis=0)
         cp.clip(norm, q[0], q[1], out=norm)
 
-    if (res := _write_out(adata, norm if on_gpu else cp.asnumpy(norm), out=out, dest=src)) is not None:
+    if (res := _write_out(adata, norm if on_gpu else cp.asnumpy(norm), out=out, dest=dest)) is not None:
         return res
     adata.var = cast("pd.DataFrame", adata.var).drop(columns=[k for k in _VAR_KEYS if k in adata.var])
     adata.obs = cast("pd.DataFrame", adata.obs).drop(columns=[k for k in _OBS_KEYS if k in adata.obs])

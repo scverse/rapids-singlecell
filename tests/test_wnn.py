@@ -7,11 +7,12 @@ import numpy as np
 import pytest
 import scanpy as sc
 from anndata import AnnData, read_h5ad
-from anndata.acc import A
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wnn_cuda
 from rapids_singlecell.preprocessing._neighbors import _wnn
+
+A = pytest.importorskip("anndata.acc").A
 
 
 def _ref_jaccard(nn, prune=0.0):  # Seurat's ComputeSNN

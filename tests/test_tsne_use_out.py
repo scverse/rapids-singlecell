@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import pytest
-from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 
 import rapids_singlecell as rsc
+
+A = pytest.importorskip("anndata.acc").A
 
 
 def test_tsne_use_out():
@@ -29,3 +30,9 @@ def test_tsne_deprecated():
     assert "X_tsne" not in pbmc.obsm
     with pytest.raises(TypeError, match="not both"):
         rsc.tl.tsne(pbmc, use=A.obsm["X_pca"], use_rep="X_pca")
+
+
+def test_tsne_obsm_named_x():
+    """`use=A.obsm['X']` needs that `.obsm` key, it is not the deprecated `use_rep='X'`."""
+    with pytest.raises(KeyError, match="^'X'$"):
+        rsc.tl.tsne(pbmc68k_reduced(), use=A.obsm["X"], out=True)
