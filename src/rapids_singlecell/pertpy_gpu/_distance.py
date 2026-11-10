@@ -87,6 +87,16 @@ class Distance:
         If neither key is specified, the PCA key of the active
         ``rapids_singlecell.settings.preset`` is used. Either spelling
         resolves to whichever one the data actually uses.
+    **kwargs
+        Options of the metric. ``metric="edistance"`` takes ``precision``, the
+        arithmetic of the cell-to-cell distances in :meth:`pairwise`,
+        :meth:`onesided_distances` and :meth:`contrast_distances` (not in
+        ``distance(X, Y)`` and ``bootstrap(X, Y)``): ``"auto"`` (default;
+        ``"float64"`` for float64 data, else ``"float32"``), ``"float32"``
+        (loses accuracy for tight clusters far from the center of the data),
+        ``"float64"`` or ``"float16"`` (tensor cores: the fastest, with larger
+        errors, and ``ValueError`` for data beyond the float16 range after
+        centering and scaling). Results are float32 unless the data is float64.
 
     Notes
     -----

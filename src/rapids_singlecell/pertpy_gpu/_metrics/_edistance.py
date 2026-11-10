@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import warnings
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -13,12 +15,7 @@ import numpy as np
 import pandas as pd
 
 from rapids_singlecell._cuda import _edistance_cuda as _ed
-from rapids_singlecell._utils import (
-    _calculate_blocks_per_pair,
-    _concat_on_device,
-    _copy_to_device,
-    _split_pairs,
-)
+from rapids_singlecell._utils import _concat_on_device, _copy_to_device, _split_pairs
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 from ._base_metric import BaseMetric, _is_sparse, parse_device_ids
@@ -31,38 +28,155 @@ if TYPE_CHECKING:
 _INT32_MAX = np.iinfo(np.int32).max
 
 
-@dataclass(frozen=True)
-class _CSRData:
-    """A row-subset of a CSR matrix on GPU, fed to the sparse edistance kernel.
+# Per precision: kernel, A-tile rows, features per step, dtype of the norms, shared-memory element.
+_MATH = {
+    "float64": (_ed.pair_sums_f64, 64, 2, np.float64, np.float64),
+    "float32": (_ed.pair_sums_f32, 128, 4, np.float32, np.float32),
+    "float16": (_ed.pair_sums_f16, 128, 16, np.float32, np.float16),
+}
+_TILE_B = 128  # B-tile rows
+_PAIR_CHUNK = 1 << 20  # pairs per kernel launch
+_BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
+_SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
+_TRIM = 16.0  # sampled rows this many times further from the column medians than the median row are left out
 
-    Holds canonical (column-sorted) CSR arrays for the cells of the requested
-    groups. ``indptr`` is int32 when ``nnz`` fits, else int64; ``indices`` are
-    always int32 (gene columns) and ``data`` is float32 or float64. Exposes
-    ``.dtype`` and ``.shape`` so it is a drop-in for the dense embedding array
-    everywhere except the kernel launch.
+
+def _sample(X):
+    """Strided rows of ``X`` the center is estimated from, at most 2**25 values."""
+    n, d = X.shape
+    rows = max(1, min(_SAMPLE_ROWS, 2**25 // max(d, 1)))
+    return X[:: max(1, -(-n // rows))]
+
+
+def _center(sample, dtype, precision: str) -> tuple[cp.ndarray, float]:
+    """Shift ``nm`` and scale ``sc`` of the rows ``x * sc + nm`` the kernels compute on.
+
+    The kernels get a distance from ``|a|² + |b|² - 2ab``, which needs centered
+    rows to be accurate, and float16 needs them scaled into its range. The mean
+    is taken over ``sample`` without its outlier rows; ``sc`` is the power of
+    two (exact to undo) that puts the largest centered sample value in
+    ``[2**10, 2**11)`` and ``nm = -mean * sc``. ``sample`` comes from all cells
+    of the input, not the ones a call loads, so a distance does not depend on
+    which other groups are computed with it.
+    """
+    if cpsp.issparse(sample):
+        sub = sample.toarray().astype(dtype, copy=False)
+    else:
+        sub = cp.array(sample, dtype=dtype, order="C")
+    d = sub.shape[1]
+    cp.copyto(sub, cp.nan, where=~cp.isfinite(sub))  # non-finite values enter neither the mean nor the scale
+    cb, rb = max(1, 2**22 // max(1, len(sub))), max(1, 2**22 // max(1, d))  # columns / rows per batch
+    med = cp.concatenate([cp.nanmedian(sub[:, j : j + cb], 0) for j in range(0, d, cb)])
+    dev = cp.concatenate([cp.nanmax(cp.abs(sub[i : i + rb] - med), 1) for i in range(0, max(1, len(sub)), rb)])
+    ref = dev[dev > 0]
+    keep = dev <= _TRIM * (cp.nanmedian(ref) if len(ref) else 0.0)
+    kept = bool(keep.any())
+    cp.copyto(sub, cp.nan, where=~keep[:, None])
+    mu = cp.nan_to_num(cp.nanmean(sub, 0)) if kept else cp.zeros(d, dtype=dtype)
+    top = float(cp.nanmax(cp.abs(cp.subtract(sub, mu, out=sub), out=sub))) if kept else 0.0
+    work = np.result_type(dtype, _MATH[precision][3])  # the kernels center in it: sc has to stay finite there
+    sc = math.ldexp(1.0, min(10 - math.floor(math.log2(top)), np.finfo(work).maxexp - 2)) if 0 < top < math.inf else 1.0
+    nm = 0.0 - mu.astype(work) * sc
+    if precision == "float16":  # a zero then centers to an exact float16
+        snap = nm.astype(np.float32).astype(np.float16)
+        nm = cp.where(cp.isfinite(snap), snap.astype(nm.dtype), nm)
+    return nm, sc
+
+
+@dataclass(eq=False)
+class _Source:
+    """The cells on GPU as the edistance kernels read them.
+
+    ``arrays`` is ``(X,)`` for C-contiguous dense rows or ``(indptr, indices, data)``
+    for canonical CSR (int32 ``indices``, int32 or int64 ``indptr``), in float32
+    or float64; ``nm`` and ``sc`` come from :func:`_center`. The copies and row
+    norms on each device depend only on the cells, so they are computed once and
+    reused by every launch (e.g. each bootstrap iteration).
     """
 
-    data: cp.ndarray
-    indices: cp.ndarray
-    indptr: cp.ndarray
-    n_rows: int
-    n_features: int
+    arrays: tuple[cp.ndarray, ...]
+    shape: tuple[int, int]
+    precision: str
+    nm: cp.ndarray
+    sc: float
+    _devices: dict[int, tuple] = field(default_factory=dict)
 
     @property
     def dtype(self) -> np.dtype:
-        return self.data.dtype
+        return self.arrays[-1].dtype
 
-    @property
-    def shape(self) -> tuple[int, int]:
-        return (self.n_rows, self.n_features)
+    def on_device(self, device_id: int) -> None:
+        """Copy the cells to a device and compute their row norms there, once."""
+        if device_id in self._devices:
+            return
+        fn, _, step, acc, elem = _MATH[self.precision]
+        n, d = self.shape
+        kp = -(-d // step) * step
+        with cp.cuda.Device(device_id):
+            arrays = tuple(_copy_to_device(a, device_id) for a in self.arrays)
+            nm = _copy_to_device(self.nm, device_id)
+            if len(arrays) == 1:
+                at = arrays[0].data.ptr | (d * arrays[0].itemsize)
+                args = (*arrays, min(16, at & -at), nm, self.sc, kp)
+            else:  # the row of an all-zero cell, padded to whole shared-memory windows
+                width = 128 // np.dtype(elem).itemsize
+                zero = cp.zeros(-(-kp // width) * width, dtype=elem)
+                zero[:d] = nm.astype(acc).astype(elem)
+                args = (*arrays, nm, self.sc, zero.view(cp.uint16) if elem is np.float16 else zero, kp)
+            norms, unused = cp.full(n, -1, dtype=acc), cp.zeros(1, dtype=cp.int32)
+            stream = cp.cuda.get_current_stream()
+            rows = cp.arange(n, dtype=cp.int32)
+            fn(*args, norms, unused, rows, unused, unused, unused, 0, cp.zeros(1), norms_only=True, stream=stream.ptr)
+            stream.synchronize()
+            if self.precision == "float16" and n and float(norms[0]) < 0:  # the kernels did not run
+                raise ValueError("precision='float16' needs compute capability 7.5 or newer; use precision='float32'.")
+            n_sm = cp.cuda.runtime.deviceGetAttribute(cp.cuda.runtime.cudaDevAttrMultiProcessorCount, device_id)
+        self._devices[device_id] = args, norms, n_sm
+
+    def pair_sums(
+        self,
+        device_id: int,
+        cat_offsets: cp.ndarray,
+        cell_indices: cp.ndarray,
+        pair_left: cp.ndarray,
+        pair_right: cp.ndarray,
+    ) -> cp.ndarray:
+        """Distance sums of the pairs on one device, at most ``_PAIR_CHUNK`` pairs per kernel launch."""
+        fn, tile_a = _MATH[self.precision][:2]
+        args, row_norms, n_sm = self._devices[device_id]
+        with cp.cuda.Device(device_id):
+            stream = cp.cuda.get_current_stream()
+            norms = row_norms[cell_indices]
+            if self.precision == "float16" and bool(cp.isinf(norms).any()):
+                raise ValueError("The centered and scaled data exceeds the float16 range; use precision='float32'.")
+            groups = (norms, cat_offsets, cell_indices)
+            sizes = cp.diff(cat_offsets).astype(cp.int64)
+            out = cp.empty(pair_left.size, dtype=self.dtype)
+            for start in range(0, pair_left.size, _PAIR_CHUNK):
+                left, right = pair_left[start : start + _PAIR_CHUNK], pair_right[start : start + _PAIR_CHUNK]
+                # Blocks per pair follow its tiles (the triangle within a group): at least 1, at most its A tiles
+                tiles_a = -(-cp.maximum(sizes[left], sizes[right]) // tile_a)
+                tiles_b = -(-cp.minimum(sizes[left], sizes[right]) // _TILE_B)
+                work = cp.where(left == right, tiles_a * (tiles_b + 1) // 2, tiles_a * tiles_b)
+                per_block = max(1, -(-int(work.sum()) // (_BLOCKS_PER_SM * n_sm)))
+                n_blocks = cp.minimum(cp.maximum(-(-work // per_block), 1), cp.maximum(tiles_a, 1))
+                block_offsets = cp.concatenate([cp.zeros(1, dtype=cp.int64), cp.cumsum(n_blocks)]).astype(cp.int32)
+                sums = cp.zeros(left.size, dtype=cp.float64)
+                grid = int(block_offsets[-1])
+                fn(*args, *groups, left, right, block_offsets, grid, sums, norms_only=False, stream=stream.ptr)
+                out[start : start + left.size] = sums / self.sc
+                stream.synchronize()  # the chunk's arrays stay referenced until its kernel has finished
+        return out
 
 
-def _build_csr_source(embedding_raw, selector) -> _CSRData:
+def _build_csr_source(embedding_raw, selector):
     """Move a (host or device) sparse matrix to GPU and subset its rows.
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``
     (keep all rows). Rows are kept in ``selector`` order so the caller's
-    ``cell_indices`` line up. The result is canonical CSR (column-sorted).
+    ``cell_indices`` line up. The result is canonical CSR (sorted columns,
+    duplicate entries summed); the caller's matrix is not changed. Also
+    returns the :func:`_sample` of all rows.
     """
     from rapids_singlecell.get._anndata import X_to_GPU
 
@@ -75,6 +189,7 @@ def _build_csr_source(embedding_raw, selector) -> _CSRData:
     X = X_to_GPU(embedding_raw)
     if not cpsp.isspmatrix_csr(X):
         X = X.tocsr()
+    sample = _sample(X)
 
     if selector is not None:
         rows = selector
@@ -84,35 +199,32 @@ def _build_csr_source(embedding_raw, selector) -> _CSRData:
         if not cpsp.isspmatrix_csr(X):
             X = X.tocsr()
 
-    X.sort_indices()
-
-    n_rows, n_features = X.shape
-    indices = cp.ascontiguousarray(X.indices.astype(cp.int32, copy=False))
-    nnz = int(X.nnz)
-    indptr_dtype = cp.int64 if nnz > _INT32_MAX else cp.int32
-    indptr = cp.ascontiguousarray(X.indptr.astype(indptr_dtype, copy=False))
-    data = cp.ascontiguousarray(X.data)
-
-    return _CSRData(
-        data=data,
-        indices=indices,
-        indptr=indptr,
-        n_rows=int(n_rows),
-        n_features=int(n_features),
-    )
+    if not X.has_canonical_format:
+        X = X.copy()
+        X.sum_duplicates()
+    return X, sample
 
 
-def _materialize_source(embedding_raw, selector):
-    """Materialize the subset as a C-contiguous CuPy array (dense input) or a :class:`_CSRData` bundle (sparse input).
+def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
+    """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or canonical CSR (sparse).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``.
     """
     if _is_sparse(embedding_raw):
-        return _build_csr_source(embedding_raw, selector)
-    if selector is not None:
-        embedding_raw = embedding_raw[selector]
-    # Dense kernels index rows as embedding[row * n_features + feature].
-    return cp.asarray(embedding_raw, order="C")
+        X, sample = _build_csr_source(embedding_raw, selector)
+        indptr = X.indptr.astype(cp.int64 if X.nnz > _INT32_MAX else cp.int32, copy=False)
+        arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
+    else:
+        sample = _sample(embedding_raw)
+        if selector is not None:
+            embedding_raw = embedding_raw[selector]
+        X = cp.asarray(embedding_raw, order="C")
+        if X.dtype not in (np.float32, np.float64):  # the kernels read float32 and float64
+            X = X.astype(cp.float32)
+        arrays = (X,)
+    if precision == "auto":
+        precision = "float64" if X.dtype == np.float64 else "float32"
+    return _Source(arrays, X.shape, precision, *_center(sample, X.dtype, precision))
 
 
 class EDistanceMetric(BaseMetric):
@@ -129,6 +241,9 @@ class EDistanceMetric(BaseMetric):
         Key in adata.layers for cell data. Mutually exclusive with obsm_key.
     obsm_key
         Key in adata.obsm for embeddings (default: 'X_pca')
+    precision
+        Arithmetic of the cell-to-cell distances; see
+        :class:`~rapids_singlecell.ptg.Distance`.
 
     References
     ----------
@@ -143,26 +258,30 @@ class EDistanceMetric(BaseMetric):
         self,
         layer_key: str | None = None,
         obsm_key: str | None = "X_pca",
+        precision: Literal["auto", "float32", "float64", "float16"] = "auto",
     ):
         """Initialize energy distance metric."""
         super().__init__(layer_key=layer_key, obsm_key=obsm_key)
+        if not isinstance(precision, str) or precision not in ("auto", *_MATH):
+            raise ValueError(f"precision must be 'auto', 'float32', 'float64' or 'float16', got {precision!r}.")
+        self.precision = precision
 
     def _load_source(
         self,
         adata: AnnData,
         groupby: str,
         needed_groups: Sequence[str] | None,
-    ) -> tuple[cp.ndarray | _CSRData, cp.ndarray, cp.ndarray, list[str]]:
+    ) -> tuple[_Source, cp.ndarray, cp.ndarray, list[str]]:
         """Load the cell data for ``groupby``, dense or sparse.
 
-        Dense input returns a CuPy array; sparse (CSR/CSC) input returns a
-        :class:`_CSRData` bundle that the kernel densifies on the fly. Both
-        share the category mapping built by :meth:`_subset_indices`, so the
-        downstream means/bootstrap/contrast math is layout-agnostic.
+        Dense and sparse (CSR/CSC) input both return a :class:`_Source`; sparse
+        rows are densified by the kernel on the fly. Both share the category
+        mapping built by :meth:`_subset_indices`, so the downstream
+        means/bootstrap/contrast math is layout-agnostic.
         """
         embedding_raw = self._get_embedding(adata)
         mask, cat_offsets, cell_indices, groups_list = self._subset_indices(adata, groupby, needed_groups)
-        source = _materialize_source(embedding_raw, mask)
+        source = _materialize_source(embedding_raw, mask, self.precision)
         return source, cat_offsets, cell_indices, groups_list
 
     def pairwise(
@@ -515,17 +634,17 @@ class EDistanceMetric(BaseMetric):
         cat_offsets = cp.array(offsets, dtype=cp.int32)
         original_indices = np.concatenate(all_cell_idx)
 
-        # Subset the referenced cells. For sparse input always row-subset into a
-        # CSR bundle (the kernel densifies on the fly); for dense input only
+        # Subset the referenced cells. For sparse input always row-subset into
+        # CSR (the kernel densifies on the fly); for dense input only
         # subset when most cells are unused, else transfer the whole array.
         if _is_sparse(embedding_raw):
-            embedding = _materialize_source(embedding_raw, original_indices)
+            embedding = _materialize_source(embedding_raw, original_indices, self.precision)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         elif len(original_indices) < int(len(embedding_raw) * 0.7):
-            embedding = _materialize_source(embedding_raw, original_indices)
+            embedding = _materialize_source(embedding_raw, original_indices, self.precision)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         else:
-            embedding = _materialize_source(embedding_raw, None)
+            embedding = _materialize_source(embedding_raw, None, self.precision)
             cell_indices = cp.array(original_indices, dtype=cp.int32)
 
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
@@ -574,7 +693,7 @@ class EDistanceMetric(BaseMetric):
         flat_means_cpu = flat_means.get()
 
         # Extract edistances
-        edistances = np.empty(len(contrast_pairs), dtype=np.float64)
+        edistances = np.empty(len(contrast_pairs), dtype=flat_means_cpu.dtype)
         for i, (idx_a, idx_b) in enumerate(contrast_pairs):
             if idx_a == idx_b:
                 edistances[i] = 0.0
@@ -728,7 +847,7 @@ class EDistanceMetric(BaseMetric):
 
     def _launch_distance_kernel(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
         *,
@@ -744,7 +863,7 @@ class EDistanceMetric(BaseMetric):
         Parameters
         ----------
         embedding
-            Cell embeddings on GPU 0
+            Cells as a :class:`_Source`
         cat_offsets
             Category offsets on GPU 0
         cell_indices
@@ -761,119 +880,36 @@ class EDistanceMetric(BaseMetric):
         cp.ndarray
             Raw distance sums of shape (n_pairs,), NOT normalized.
         """
-        n_devices = len(device_ids)
-        n_total_pairs = len(pair_left)
-        _, n_features = embedding.shape
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
-
-        is_sparse = isinstance(embedding, _CSRData)
         result_device = cat_offsets.device.id
 
         # Split pairs across devices with load balancing
-        pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
+        pair_chunks = _split_pairs(pair_left, pair_right, len(device_ids), group_sizes)
 
-        # Phase 1: Create streams and start async data transfer to all devices
-        streams = {}
-        device_data = []
+        # Every device's inputs are in place before the first one starts
+        jobs = []
+        for device_id, chunk in zip(device_ids, pair_chunks, strict=True):
+            if len(chunk[0]):
+                embedding.on_device(device_id)
+                arrays = (cat_offsets, cell_indices, *chunk)
+                jobs.append((device_id, *(_copy_to_device(a, device_id) for a in arrays)))
+        if not jobs:
+            with cp.cuda.Device(result_device):
+                return cp.zeros(len(pair_left), dtype=embedding.dtype)
 
-        for i, device_id in enumerate(device_ids):
-            chunk_left, chunk_right = pair_chunks[i]
-            if len(chunk_left) == 0:
-                device_data.append(None)
-                continue
+        # One thread per device: its chunks wait on the host without idling the others
+        if len(jobs) == 1:
+            sums = [embedding.pair_sums(*jobs[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+                sums = list(executor.map(lambda job: embedding.pair_sums(*job), jobs))
 
-            n_chunk_pairs = len(chunk_left)
-            # Reuse local arrays; route remote copies through P2P or host memory.
-            with cp.cuda.Device(device_id):
-                streams[device_id] = cp.cuda.Stream(non_blocking=True)
-
-                with streams[device_id]:
-                    data = {
-                        "off": _copy_to_device(cat_offsets, device_id),
-                        "idx": _copy_to_device(cell_indices, device_id),
-                        "pair_left": _copy_to_device(chunk_left, device_id),
-                        "pair_right": _copy_to_device(chunk_right, device_id),
-                        "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
-                        "n_pairs": n_chunk_pairs,
-                        "device_id": device_id,
-                    }
-                    if is_sparse:
-                        data["data"] = _copy_to_device(embedding.data, device_id)
-                        data["indices"] = _copy_to_device(embedding.indices, device_id)
-                        data["indptr"] = _copy_to_device(embedding.indptr, device_id)
-                    else:
-                        data["emb"] = _copy_to_device(embedding, device_id)
-                    device_data.append(data)
-
-        # Phase 2: Synchronize data transfers, then launch kernels
-        for data in device_data:
-            if data is None:
-                continue
-
-            device_id = data["device_id"]
-            with cp.cuda.Device(device_id):
-                streams[device_id].synchronize()
-
-                is_double = embedding.dtype == np.float64
-                config = _ed.get_kernel_config(n_features, is_double)
-                if config is None:
-                    raise RuntimeError("Insufficient shared memory for edistance kernel")
-                cell_tile, feat_tile, block_size, shared_mem = config
-                blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
-
-                if is_sparse:
-                    _ed.compute_distances_sparse(
-                        data["indptr"],
-                        data["indices"],
-                        data["data"],
-                        data["off"],
-                        data["idx"],
-                        data["pair_left"],
-                        data["pair_right"],
-                        data["sums"],
-                        data["n_pairs"],
-                        n_features,
-                        blocks_per_pair,
-                        cell_tile,
-                        feat_tile,
-                        block_size,
-                        shared_mem,
-                        cp.cuda.get_current_stream().ptr,
-                    )
-                else:
-                    _ed.compute_distances(
-                        data["emb"],
-                        data["off"],
-                        data["idx"],
-                        data["pair_left"],
-                        data["pair_right"],
-                        data["sums"],
-                        data["n_pairs"],
-                        n_features,
-                        blocks_per_pair,
-                        cell_tile,
-                        feat_tile,
-                        block_size,
-                        shared_mem,
-                        cp.cuda.get_current_stream().ptr,
-                    )
-
-        # Phase 3: Synchronize all devices
-        for data in device_data:
-            if data is not None:
-                with cp.cuda.Device(data["device_id"]):
-                    cp.cuda.Stream.null.synchronize()
-
-        # Phase 4: Gather on the input device (chunks are consecutive pair ranges)
-        sums = [data["sums"] for data in device_data if data is not None]
-        if sums:
-            return _concat_on_device(sums, result_device)
-        with cp.cuda.Device(result_device):
-            return cp.zeros(n_total_pairs, dtype=embedding.dtype)
+        # Gather on the input device (chunks are consecutive pair ranges)
+        return _concat_on_device(sums, result_device)
 
     def _pairwise_means(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
         k: int,
@@ -886,7 +922,7 @@ class EDistanceMetric(BaseMetric):
         Parameters
         ----------
         embedding
-            Cell embeddings on GPU 0
+            Cells as a :class:`_Source`
         cat_offsets
             Category offsets on GPU 0
         cell_indices
@@ -944,7 +980,7 @@ class EDistanceMetric(BaseMetric):
 
     def _onesided_means(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
         k: int,
@@ -959,7 +995,7 @@ class EDistanceMetric(BaseMetric):
         Parameters
         ----------
         embedding
-            Cell embeddings on GPU 0
+            Cells as a :class:`_Source`
         cat_offsets
             Category offsets on GPU 0
         cell_indices
@@ -1056,7 +1092,7 @@ class EDistanceMetric(BaseMetric):
 
     def _pairwise_means_bootstrap(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         *,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
@@ -1072,7 +1108,7 @@ class EDistanceMetric(BaseMetric):
         Parameters
         ----------
         embedding
-            Cell embeddings on GPU 0
+            Cells as a :class:`_Source`
         cat_offsets
             Category offsets on GPU 0
         cell_indices
@@ -1125,7 +1161,7 @@ class EDistanceMetric(BaseMetric):
 
     def _onesided_means_bootstrap(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         *,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
@@ -1142,7 +1178,7 @@ class EDistanceMetric(BaseMetric):
         Parameters
         ----------
         embedding
-            Cell embeddings on GPU 0
+            Cells as a :class:`_Source`
         cat_offsets
             Category offsets on GPU 0
         cell_indices
@@ -1266,7 +1302,7 @@ class EDistanceMetric(BaseMetric):
 
     def _prepare_edistance_df_bootstrap(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         *,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
@@ -1314,7 +1350,7 @@ class EDistanceMetric(BaseMetric):
 
     def _prepare_edistance_df(
         self,
-        embedding: cp.ndarray,
+        embedding: _Source,
         *,
         cat_offsets: cp.ndarray,
         cell_indices: cp.ndarray,
