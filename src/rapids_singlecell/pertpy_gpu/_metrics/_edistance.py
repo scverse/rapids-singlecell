@@ -51,7 +51,9 @@ def _sample(X):
 def _canonical(X):
     """CSR ``X`` with sorted columns and summed duplicates; the caller's matrix is not changed."""
     if not X.has_canonical_format:
-        X = X.copy()
+        # a copy without the cached flags: sorting is most often all it needs, summing goes through COO
+        X = cpsp.csr_matrix((X.data, X.indices, X.indptr), shape=X.shape, copy=True)
+        X.sort_indices()
         X.sum_duplicates()
     return X
 
