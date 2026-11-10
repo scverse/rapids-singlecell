@@ -1,8 +1,9 @@
 """Parity tests for the sparse (CSR) edistance data path.
 
 The sparse path densifies each feature window inside the kernel instead of
-materializing the N x G dense matrix, so its results must match the dense
-kernel bit-for-bit (direct squared differences, no norm-plus-dot rewrite).
+materializing the N x G dense matrix. Both paths center the rows alike and
+run the same arithmetic, so the results match bit for bit while one block
+sums each group pair.
 """
 
 from __future__ import annotations
@@ -42,6 +43,22 @@ def _dense_adata(X: np.ndarray) -> AnnData:
     adata = AnnData(X.astype(np.float32).copy(), obs=_obs())
     adata.obsm["emb"] = cp.asarray(X, dtype=cp.dtype(X.dtype))
     return adata
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_sparse_equals_dense_bitwise(precision, dtype) -> None:
+    """CSR input gives the dense result bit for bit, also with every value stored as two duplicate entries."""
+    X = _make_matrix(40, dtype)
+    kwargs = {"metric": "edistance", "precision": precision}
+    ref = Distance(obsm_key="emb", **kwargs).pairwise(_dense_adata(X), groupby="group")
+    csr = csr_matrix(X)
+    halves = csr_matrix((np.repeat(csr.data / 2, 2), np.repeat(csr.indices, 2), 2 * csr.indptr), shape=csr.shape)
+    for matrix in (csr, cpsp.csr_matrix(halves)):
+        got = Distance(layer_key="X", **kwargs).pairwise(AnnData(matrix, obs=_obs()), groupby="group")
+        assert got.values.dtype == dtype
+        np.testing.assert_array_equal(got.values, ref.values)
+    assert matrix.nnz == 2 * csr.nnz  # the caller's matrix keeps its duplicates
 
 
 @pytest.mark.parametrize("dtype,atol", [(np.float32, 1e-4), (np.float64, 1e-9)])
