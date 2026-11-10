@@ -48,18 +48,23 @@ def _dense_adata(X: np.ndarray) -> AnnData:
 @pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_sparse_equals_dense_bitwise(precision, dtype) -> None:
-    """CSR input gives the dense result bit for bit, also with every value stored as two duplicate entries."""
-    X = _make_matrix(40, dtype)
+    """CSR input gives the dense result bit for bit, also with unsorted columns or two duplicate entries per value."""
+    X = _make_matrix(72, dtype)  # more than the 64 features of one float16 window of the CSR loader
     X[:, 0], X[0, 0] = 1000, 0  # the scale comes from a zero the CSR input does not store
     kwargs = {"metric": "edistance", "precision": precision}
     ref = Distance(obsm_key="emb", **kwargs).pairwise(_dense_adata(X), groupby="group")
     csr = csr_matrix(X)
     halves = csr_matrix((np.repeat(csr.data / 2, 2), np.repeat(csr.indices, 2), 2 * csr.indptr), shape=csr.shape)
-    for matrix in (csr, cpsp.csr_matrix(halves)):
+    rev = csr_matrix(X[::-1])  # its arrays read backwards are X with descending columns
+    unsorted = csr_matrix((rev.data[::-1], rev.indices[::-1], rev.nnz - rev.indptr[::-1]), shape=X.shape)
+    unsorted, halves = cpsp.csr_matrix(unsorted), cpsp.csr_matrix(halves)
+    kept = [[a.copy() for a in (m.data, m.indices, m.indptr)] for m in (unsorted, halves)]
+    for matrix in (csr, unsorted, halves):
         got = Distance(layer_key="X", **kwargs).pairwise(AnnData(matrix, obs=_obs()), groupby="group")
         assert got.values.dtype == dtype
         np.testing.assert_array_equal(got.values, ref.values)
-    assert matrix.nnz == 2 * csr.nnz  # the caller's matrix keeps its duplicates
+    for m, arrays in zip((unsorted, halves), kept, strict=True):  # the caller's matrices are not changed
+        assert all(cp.array_equal(a, b) for a, b in zip((m.data, m.indices, m.indptr), arrays, strict=True))
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
