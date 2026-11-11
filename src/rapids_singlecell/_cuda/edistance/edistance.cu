@@ -59,20 +59,20 @@ static EdPlan plan(int kp) {
         arr<double, Device> pairwise_sums, bool norms_only,                    \
         std::uintptr_t stream
 
-// norms_only: the norm of every position in cell_indices. Otherwise the pair
-// sums of one chunk of pairs on grid = block_offsets[num_pairs] blocks.
+// norms_only: norms[row] of every row. Otherwise the pair sums of one chunk of
+// pairs on grid = block_offsets[num_pairs] blocks.
 template <class M, class L, typename Device>
 static void launch(const L& ld, ED_LAUNCH_ARGS) {
     constexpr int TA = M::TA;
     const EdPlan p = plan<M>(kp);
     const auto s = reinterpret_cast<cudaStream_t>(stream);
     if (norms_only) {
-        const int n = static_cast<int>(cell_indices.size());
+        const int n = static_cast<int>(norms.size());
         if (n == 0) return;
         set_smem(edistance_norms_kernel<M, L>, p.streamed);
         edistance_norms_kernel<M, L>
-            <<<(n + TA - 1) / TA, ED_THREADS, p.streamed, s>>>(
-                ld, cell_indices.data(), n, kp, norms.data());
+            <<<(n + TA - 1) / TA, ED_THREADS, p.streamed, s>>>(ld, n, kp,
+                                                               norms.data());
         CUDA_CHECK_LAST_ERROR(edistance_norms_kernel);
         return;
     }
@@ -101,18 +101,21 @@ static void def_sparse(nb::module_& m, const char* name) {
         name,
         [](arr<const IndptrT, Device> indptr, arr<const int, Device> indices,
            arr<const In, Device> data, arr<const W<M, In>, Device> nm,
-           W<M, In> sc, arr<const elem_t<M>, Device> zero, ED_LAUNCH_ARGS) {
+           W<M, In> sc, arr<const elem_t<M>, Device> zero, bool duplicates,
+           ED_LAUNCH_ARGS) {
             const EdCsrRows<M, In, IndptrT> ld{
                 data.data(),
                 indices.data(),
                 indptr.data(),
                 nm.data(),
                 sc,
-                reinterpret_cast<const uint4*>(zero.data())};
+                reinterpret_cast<const uint4*>(zero.data()),
+                duplicates};
             launch<M>(ld, ED_LAUNCH_PASS);
         },
         "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
-        "nm"_a.noconvert(), "sc"_a, "zero"_a.noconvert(), ED_LAUNCH_NAMES);
+        "nm"_a.noconvert(), "sc"_a, "zero"_a.noconvert(), "duplicates"_a,
+        ED_LAUNCH_NAMES);
 }
 
 // One entry point per math policy, overloaded on the layout and dtypes: dense
@@ -144,8 +147,78 @@ static void def_math(nb::module_& m, const char* name) {
     def_sparse<M, float, long long, Device>(m, name);
 }
 
+#define ED_CENTER_ARGS                                                      \
+    long long step, int pass, int shift, arr<const bool, Device> keep,      \
+        arr<In, Device> ext, arr<In, Device> out, arr<double, Device> sums, \
+        std::uintptr_t stream
+#define ED_CENTER_NAMES                                                       \
+    "step"_a, "pass"_a, "shift"_a, "keep"_a.noconvert(), "ext"_a.noconvert(), \
+        "out"_a.noconvert(), "sums"_a.noconvert(), "stream"_a = 0
+
+// One pass of the center kernel over the rows i * step, i < out.size(), in
+// windows of cw columns
+template <typename In, class R, typename Device>
+static void center(const R& rd, ED_CENTER_ARGS, int cw = R::CW) {
+    const int m = static_cast<int>(out.size());
+    const int d = static_cast<int>(ext.size() / 2);
+    nb_require(!pass || (keep.size() == out.size() && sums.size() == (size_t)d),
+               "center: keep / sums do not match out / ext");
+    if (m == 0 || d == 0) return;
+    const long long units = (long long)m * ((d - 1) / cw + 1);
+    edistance_center_kernel<In, R>
+        <<<(unsigned)((units + ED_THREADS - 1) / ED_THREADS), ED_THREADS, 0,
+           reinterpret_cast<cudaStream_t>(stream)>>>(
+            rd, step, m, d, cw, pass, shift, keep.data(), ext.data(),
+            out.data(), sums.data());
+    CUDA_CHECK_LAST_ERROR(edistance_center_kernel);
+}
+
+// Dense rows, the column extremes less mu, or CSR with int32 / int64 indptr
+// and int32 / int64 indices
+template <typename In, typename Device>
+static void def_center(nb::module_& m) {
+    m.def(
+        "center",
+        [](arr<const In, Device> X, ED_CENTER_ARGS) {
+            center<In>(EdCenterDense<In>{X.data(), (long long)X.shape(1)}, step,
+                       pass, shift, keep, ext, out, sums, stream);
+        },
+        "X"_a.noconvert(), ED_CENTER_NAMES);
+    m.def(
+        "center",
+        [](arr<const In, Device> keys, arr<const In, Device> mu,
+           ED_CENTER_ARGS) {
+            center<In>(
+                EdCenterReach<In>{keys.data(), mu.data(), (long long)mu.size()},
+                step, pass, shift, keep, ext, out, sums, stream);
+        },
+        "keys"_a.noconvert(), "mu"_a.noconvert(), ED_CENTER_NAMES);
+    auto csr = [&](auto ptag, auto itag) {
+        using P = decltype(ptag);
+        using I = decltype(itag);
+        m.def(
+            "center",
+            [](arr<const P, Device> indptr, arr<const I, Device> indices,
+               arr<const In, Device> data, bool sorted, ED_CENTER_ARGS) {
+                using R = EdCenterCsr<In, P, I>;
+                center<In>(
+                    R{data.data(), indices.data(), indptr.data(), sorted}, step,
+                    pass, shift, keep, ext, out, sums, stream,
+                    sorted ? 64 : R::CW);
+            },
+            "indptr"_a.noconvert(), "indices"_a.noconvert(),
+            "data"_a.noconvert(), "sorted"_a, ED_CENTER_NAMES);
+    };
+    csr(0, 0);
+    csr(0LL, 0);
+    csr(0, 0LL);
+    csr(0LL, 0LL);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
+    def_center<double, Device>(m);
+    def_center<float, Device>(m);
     def_math<EdFma<double>, Device>(m, "pair_sums_f64");
     def_math<EdFma<float>, Device>(m, "pair_sums_f32");
     def_math<EdMma16, Device>(m, "pair_sums_f16");

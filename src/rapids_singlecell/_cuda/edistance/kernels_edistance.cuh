@@ -345,10 +345,35 @@ struct EdDenseRows {
     }
 };
 
-// CSR (canonical: sorted columns, no duplicates). Thread t owns tile row t and
-// keeps a forward cursor through its columns across the windows. Per window:
-// copy the window's converted zeros, then scatter the nonzeros converted as
-// the dense loader does.
+// The entries of window w of a CSR row whose columns may repeat: the (adjacent)
+// entries of a column are summed before the conversion. Returns the cursor.
+// Not inlined, so the kernels keep the registers of the canonical loop.
+template <class M, typename In, typename W, typename IndptrT>
+__device__ __noinline__ IndptrT edistance_load_sum(uint4* row, const In* data,
+                                                   const int* indices,
+                                                   const W* nm, W sc,
+                                                   IndptrT cur, IndptrT end,
+                                                   int w) {
+    using E = typename M::E;
+    constexpr int KW = ED_WB / sizeof(E);
+    In x = 0;
+    int prev = -1;
+    for (int col; cur < end && (col = __ldg(indices + cur)) < (w + 1) * KW;
+         ++cur) {
+        const In v = __ldg(data + cur);
+        x = col == prev ? x + v : v;
+        prev = col;
+        if (col >= w * KW)
+            reinterpret_cast<E*>(row)[col - w * KW] =
+                M::cvt(x, sc, __ldg(nm + col));
+    }
+    return cur;
+}
+
+// CSR with sorted columns. Thread t owns tile row t and keeps a forward cursor
+// through its columns across the windows. Per window: copy the window's
+// converted zeros, then scatter the nonzeros converted as the dense loader
+// does. Only a matrix with duplicates takes edistance_load_sum.
 template <class M, typename In, typename IndptrT>
 struct EdCsrRows {
     using E = typename M::E;
@@ -359,6 +384,7 @@ struct EdCsrRows {
     const W* nm;
     W sc;
     const uint4* zero;  // M::cvt(0, sc, nm[col]) per column, zeros past d
+    bool duplicates;    // not canonical: a column may have several entries
     IndptrT cur, end;
     __device__ void load(unsigned char* s, int p, const int* rows, int r0,
                          int nr, int w) {
@@ -372,12 +398,17 @@ struct EdCsrRows {
 #pragma unroll
         for (int c = 0; c < ED_WB / 16; ++c)
             row[c] = __ldg(zero + w * (ED_WB / 16) + c);
-        for (int col; cur < end && (col = __ldg(indices + cur)) < (w + 1) * KW;
-             ++cur)
-            // true for canonical input; keeps unsorted columns inside the row
-            if (col >= w * KW)
-                reinterpret_cast<E*>(row)[col - w * KW] =
-                    M::cvt(__ldg(data + cur), sc, __ldg(nm + col));
+        if (!duplicates) {
+            for (int col;
+                 cur < end && (col = __ldg(indices + cur)) < (w + 1) * KW;
+                 ++cur)
+                // true for sorted input; keeps unsorted columns inside the row
+                if (col >= w * KW)
+                    reinterpret_cast<E*>(row)[col - w * KW] =
+                        M::cvt(__ldg(data + cur), sc, __ldg(nm + col));
+            return;
+        }
+        cur = edistance_load_sum<M>(row, data, indices, nm, sc, cur, end, w);
     }
 };
 
@@ -463,8 +494,9 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
                     const int r = is_a ? threadIdx.x : threadIdx.x - TA;
                     const int pos = (is_a ? t.start_a + ia : t.start_b + jb) +
                                     min(r, (is_a ? ma : mb) - 1);
-                    s_rows[threadIdx.x] = cell_indices[pos];
-                    s_norm[threadIdx.x] = norms[pos];
+                    const int row = cell_indices[pos];
+                    s_rows[threadIdx.x] = row;
+                    s_norm[threadIdx.x] = norms[row];
                 }
                 __syncthreads();
                 if (a_resident && jb == jb_start) {
@@ -492,20 +524,19 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
     }
 }
 
-// Norms by position in cell_indices: block b loads positions [TA b, TA b + TA)
-// as A rows and again as B rows and keeps the diagonal of A A^T.
+// Norms of the n rows: block b loads rows [TA b, TA b + TA) as A rows and
+// again as B rows and keeps the diagonal of A A^T.
 template <class M, class L>
 __global__ void __launch_bounds__(ED_THREADS, 1)
-    edistance_norms_kernel(const L ld, const int* __restrict__ cell_indices,
-                           int n, int kp, typename M::Acc* __restrict__ norms) {
+    edistance_norms_kernel(const L ld, int n, int kp,
+                           typename M::Acc* __restrict__ norms) {
     if constexpr (M::ok) {
         constexpr int TA = M::TA;
         extern __shared__ __align__(16) unsigned char smem[];
         __shared__ int s_rows[TA + ED_TB];
         const int p0 = blockIdx.x * TA, m = min(TA, n - p0);
         if (threadIdx.x < TA + ED_TB)
-            s_rows[threadIdx.x] =
-                cell_indices[p0 + min((int)threadIdx.x % TA, m - 1)];
+            s_rows[threadIdx.x] = p0 + min((int)threadIdx.x % TA, m - 1);
         __syncthreads();
         L l = ld;
         typename M::Frag f;
@@ -515,4 +546,128 @@ __global__ void __launch_bounds__(ED_THREADS, 1)
             if (i == j && i < m) norms[p0 + i] = v;
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Center and scale (_center in _edistance.py) from every step-th row, read in
+// place: a thread reduces one window of cw <= R::CW columns of sampled row i.
+//   pass 0: out[i] = the row's largest |x|, compared as bit patterns (a NaN
+//           of either sign ranks last)
+//   pass 1: over the kept rows (finite values): sums[c] += rint(ldexp(x,
+//           shift)), integers, exact in float64 in any order; ext[c] and
+//           ext[d + c] = the largest key of x and of -x in column c
+// The largest |x - mu[c]| of the kept rows is pass 0 over EdCenterReach.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ unsigned int edistance_bits(float x) {
+    return __float_as_uint(x);
+}
+__device__ __forceinline__ unsigned long long edistance_bits(double x) {
+    return __double_as_longlong(x);
+}
+
+// A key orders the non-NaN values as unsigned integers above 0 (-0.0 below
+// +0.0), and ~key(x) is key(-x); edistance_unkey gives the value back.
+template <typename In>
+__device__ __forceinline__ auto edistance_key(In x) {
+    const auto b = edistance_bits(x);
+    const auto sign = decltype(b)(1) << (8 * sizeof(b) - 1);
+    return b & sign ? ~b : b | sign;
+}
+__device__ __forceinline__ float edistance_unkey(unsigned int k) {
+    return __uint_as_float(k >> 31 ? k ^ 1u << 31 : ~k);
+}
+__device__ __forceinline__ double edistance_unkey(unsigned long long k) {
+    return __longlong_as_double(k >> 63 ? k ^ 1ull << 63 : ~k);
+}
+
+template <typename In>
+struct EdCenterDense {
+    static constexpr int CW = 64;
+    const In* X;
+    long long ldx;  // row stride (elements)
+    __device__ void fill(In* win, long long row, int c0, int nw) const {
+        for (int c = 0; c < nw; ++c) win[c] = X[row * ldx + c0 + c];
+    }
+};
+
+// CSR as the caller holds it: the stored values of a column are summed. A
+// sorted row is searched for the window's first entry; an unsorted one is
+// scanned once per window, so its windows fill 768 bytes of thread stack.
+template <typename In, typename P, typename I>
+struct EdCenterCsr {
+    static constexpr int CW = 768 / sizeof(In);
+    const In* data;
+    const I* indices;
+    const P* indptr;
+    bool sorted;
+    __device__ void fill(In* win, long long row, int c0, int nw) const {
+        for (int c = 0; c < nw; ++c) win[c] = In(0);
+        P j = indptr[row];
+        const P end = indptr[row + 1];
+        for (P hi = sorted ? end : j; j < hi;) {
+            const P mid = j + (hi - j) / 2;
+            if (indices[mid] < c0) {
+                j = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for (; j < end; ++j) {
+            const long long c = (long long)indices[j] - c0;
+            if (sorted && c >= nw) break;
+            if (c >= 0 && c < nw) win[c] += data[j];
+        }
+    }
+};
+
+// The largest (row 0) and smallest (row 1) kept value of each column from the
+// keys of pass 1, less mu: rounding is monotone, so a column's largest
+// |x - mu[c]| is at one of the two.
+template <typename In>
+struct EdCenterReach {
+    static constexpr int CW = 64;
+    const In* ext;
+    const In* mu;
+    long long d;
+    __device__ void fill(In* win, long long row, int c0, int nw) const {
+        for (int c = 0; c < nw; ++c) {
+            const In x = edistance_unkey(edistance_bits(ext[row * d + c0 + c]));
+            win[c] = (row ? -x : x) - mu[c0 + c];
+        }
+    }
+};
+
+template <typename In, class R>
+__global__ void edistance_center_kernel(const R rd, long long step, int m,
+                                        int d, int cw, int pass, int shift,
+                                        const bool* __restrict__ keep,
+                                        In* __restrict__ ext,
+                                        In* __restrict__ out,
+                                        double* __restrict__ sums) {
+    const unsigned u = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = u % m;
+    const long long c0 = (long long)(u / m) * cw;
+    if (c0 >= d || (pass && !keep[i])) return;
+    const int nw = min((long long)cw, d - c0);
+    In win[R::CW];
+    rd.fill(win, i * step, (int)c0, nw);
+    auto top = edistance_bits(In(0));
+    auto* keys = reinterpret_cast<decltype(top)*>(ext) + c0;
+    // the threads of a warp (rows i, i + 1, ...) start at different columns, so
+    // they do not add to one sum at a time
+    for (int k = 0, c = i % nw; k < nw; ++k, c = c + 1 < nw ? c + 1 : 0) {
+        if (pass) {
+            const In q = rint(ldexp(win[c], shift));
+            if (q != 0) atomicAdd(sums + c0 + c, (double)q);
+            // a plain read first: only a key above the stored one issues an
+            // atomic
+            const auto up = edistance_key(win[c]), down = ~up;
+            if (up > keys[c]) atomicMax(keys + c, up);
+            if (down > keys[d + c]) atomicMax(keys + d + c, down);
+        } else {
+            top = max(top, edistance_bits(fabs(win[c])));
+        }
+    }
+    if (!pass) atomicMax(reinterpret_cast<decltype(top)*>(out) + i, top);
 }

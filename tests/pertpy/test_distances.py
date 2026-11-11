@@ -261,6 +261,16 @@ def test_edistance_dense_integer_input(small_adata: AnnData) -> None:
     pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
 
 
+def test_edistance_dense_big_endian_input(small_adata: AnnData) -> None:
+    """Host dense input in another byte order gives the result of its native dtype."""
+    distance = Distance(metric="edistance")
+    X = small_adata.obsm["X_pca"].get().astype(np.float64)
+    small_adata.obsm["X_pca"] = X
+    expected = distance.pairwise(small_adata, groupby="group")
+    small_adata.obsm["X_pca"] = X.astype(">f8")
+    pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
+
+
 def test_edistance_correctness_vs_cpu(small_adata: AnnData) -> None:
     """Test that GPU energy distance matches CPU reference implementation."""
     distance = Distance(metric="edistance")
