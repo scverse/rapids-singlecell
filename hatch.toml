@@ -24,7 +24,7 @@ overrides.matrix.cuda.features = [
 
 # Python per deps
 overrides.matrix.deps.python = [
-  { if = ["stable"], value = "3.12" },
+  { if = ["stable"], value = "3.13" },
   { if = ["dev"], value = "3.14" },
   { if = ["rapids_prerelease"], value = "3.14" },
 ]

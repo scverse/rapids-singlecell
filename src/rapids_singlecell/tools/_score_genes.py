@@ -188,7 +188,7 @@ def _score_genes_bins(
     ctrl_size: int,
     n_bins: int,
     rng: np.random.Generator,
-) -> Generator[pd.Index[str], None, None]:
+) -> Generator[pd.Index[str]]:
     # average expression of genes
     idx = cp.array(var_names.isin(gene_pool), dtype=cp.bool_)
     nanmeans = _nan_mean(X, axis=0, mask=idx, n_features=len(gene_pool))
