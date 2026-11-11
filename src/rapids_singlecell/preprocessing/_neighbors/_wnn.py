@@ -4,15 +4,17 @@ import itertools
 import operator
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 from warnings import warn
 
 import cupy as cp
 import numpy as np
 from cupyx.scipy import sparse as cp_sparse
 from scipy import sparse as sc_sparse
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._utils._random import RNGLike, SeedLike, _accepts_legacy_random_state, _LegacyRng
+from rapids_singlecell.get._out import DEPR_COPY, DEPR_KEY_ADDED, _out_dests
 from rapids_singlecell.preprocessing._neighbors._helper import _check_neighbors_X
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     KNN_ALGORITHMS,
@@ -26,6 +28,20 @@ from rapids_singlecell.tools._utils import _choose_representation
 if TYPE_CHECKING:
     from anndata import AnnData
     from mudata import MuData
+
+    from rapids_singlecell.get._utils import GraphAcc
+
+
+class WnnResult(NamedTuple):
+    """Outputs of :func:`~rapids_singlecell.pp.wnn`."""
+
+    connectivities: Any
+    """Weighted adjacency matrix of the multimodal neighbors."""
+    distances: Any
+    """WNN distances of the multimodal neighbors."""
+    snn: Any
+    """Seurat's ``wsnn`` shared nearest neighbor graph."""
+
 
 _DEFAULT_SEED = 0
 # Partner keys per chunk for the rows whose shared-neighbor (SNN) partners do not fit in
@@ -216,6 +232,8 @@ def _get_reps(adata, use_rep: Sequence[str] | Mapping[str, str], n_pcs) -> tuple
 
 
 @_accepts_legacy_random_state(_DEFAULT_SEED)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_arg("copy", DEPR_COPY)
 def wnn(
     adata: AnnData | MuData,
     use_rep: Sequence[str] | Mapping[str, str],
@@ -232,10 +250,12 @@ def wnn(
     algorithm_kwds: Mapping[str, Any] = MappingProxyType({}),
     method: Literal["umap", "gauss", "jaccard"] = "umap",
     rng: SeedLike | RNGLike | None = None,
-    key_added: str | None = None,
     weight_key: str | None = "{}_weight",
+    out: GraphAcc | str | dict[str, GraphAcc | str] | bool = False,
+    # deprecated
+    key_added: str | None = None,
     copy: bool = False,
-) -> AnnData | MuData | None:
+) -> AnnData | MuData | WnnResult | None:
     r"""Weighted nearest neighbor (WNN) graph across modalities :cite:p:`Hao2021`.
 
     GPU implementation of Seurat's ``FindMultiModalNeighbors``. Each cell gets a weight per modality from how well
@@ -281,19 +301,20 @@ def wnn(
     rng
         Random seed or :class:`~numpy.random.Generator` for the UMAP connectivities.
         The superseded `random_state` argument is still accepted.
-    key_added
-        If specified, the neighbors data is stored in `.uns[key_added]` and the graphs in
-        `.obsp[f'{key_added}_distances']`, `.obsp[f'{key_added}_connectivities']` and `.obsp[f'{key_added}_snn']`,
-        else in `.uns['neighbors']`, `.obsp['distances']`, `.obsp['connectivities']` and `.obsp['snn']`.
     weight_key
         Format string for the `.obs` columns of the modality weights, filled with the modality name (the `.obsm` key
         or the mapping key of `use_rep`). ``'{}:mod_weight'`` gives muon's names; `None` skips the weights.
-    copy
-        Return a copy instead of writing to `adata`.
+    out
+        Where to write the graphs. A single accessor `A.obsp['k']` writes the connectivities to `.obsp['k']`,
+        the others to `.obsp['k_distances']` and `.obsp['k_snn']`, and the metadata to `.uns['k']`.
+        A mapping writes only the graphs it names, e.g. `{'connectivities': A.obsp['wnn']}`.
+        If `True`, they are returned as a :class:`~rapids_singlecell.pp.WnnResult` and nothing is written.
+        If `False`, they are written to `.obsp['connectivities']`, `.obsp['distances']`, `.obsp['snn']`
+        and `.uns['neighbors']`.
 
     Returns
     -------
-    Depending on `copy`, updates or returns `adata` with the following:
+    A :class:`~rapids_singlecell.pp.WnnResult` if `out=True`, else `None`. See `out` for where these are written:
 
     **distances** : sparse matrix of dtype `float32`.
         The `n_neighbors` multimodal neighbors of every cell, excluding itself, with Seurat's WNN distance
@@ -310,7 +331,7 @@ def wnn(
     **weights** : `.obs[weight_key.format(name)]`
         The weight of each modality per cell.
 
-    ``.uns[neighbors_key]['params']['modalities']`` holds each modality's representation key and number of
+    ``.uns['neighbors']['params']['modalities']`` holds each modality's representation key and number of
     dimensions. Its standard ``use_rep`` and ``n_pcs`` entries refer to the first modality with AnnData (for
     Scanpy's layout initialization) and map the modalities to them with MuData, as in muon.
     :func:`~rapids_singlecell.tl.ingest` rejects WNN references; :func:`scanpy.tl.ingest` uses the first modality.
@@ -329,6 +350,13 @@ def wnn(
     if algorithm not in get_args(_Algorithms):
         raise ValueError(f"Invalid algorithm '{algorithm}' for KNN. Valid options are: {get_args(_Algorithms)}.")
     adata = adata.copy() if copy else adata
+    dests = _out_dests(
+        out,
+        key_added,
+        dests=lambda k: WnnResult(*({"obsp": f"{'' if k is None else f'{k}_'}{n}"} for n in WnnResult._fields)),
+        kinds=WnnResult({"obsp"}, {"obsp"}, {"obsp"}),
+        uns=True,
+    )
 
     modalities, reps = _get_reps(adata, use_rep, n_pcs)
     names = list(modalities)
@@ -431,19 +459,18 @@ def wnn(
     )
     connectivities = _connectivities_to_host_csr(connectivities)
 
+    if dests is True:
+        return WnnResult(connectivities, distances, snn)
     if adata.is_view:  # only now, so that errors leave a view untouched
         adata._init_as_actual(adata.copy())
-    neighbors_key = "neighbors" if key_added is None else key_added
-    prefix = "" if neighbors_key == "neighbors" else f"{neighbors_key}_"
-    graphs = {"connectivities": connectivities, "distances": distances, "snn": snn}
     params = {"n_neighbors": n_neighbors, "method": method, **meta_random_state, "metric": "euclidean", **layout_rep}
     params |= {"modalities": modalities, "knn_range": knn_range, "l2_norm": l2_norm, "sd_scale": sd_scale}
     params |= {"smooth": smooth, "prune_snn": prune_snn}
     if algorithm_kwds:
         params["algorithm_kwds"] = dict(algorithm_kwds)
-    adata.uns[neighbors_key] = {f"{name}_key": f"{prefix}{name}" for name in graphs} | {"params": params}
-    for name, graph in graphs.items():
-        adata.obsp[f"{prefix}{name}"] = graph
+    from . import _store_neighbors  # circular: `__init__` imports `wnn`
+
+    _store_neighbors(adata, dests, WnnResult(connectivities, distances, snn), params)
     if weight_cols:  # weight_key=None skips them
         for col, w in zip(weight_cols, weights.get(), strict=True):
             adata.obs[col] = w

@@ -8,13 +8,13 @@ import cupyx
 import numpy as np
 from cuml.manifold.umap import find_ab_params, simplicial_set_embedding
 from cupyx.scipy import sparse
-from scanpy._utils import NeighborsView
 from scanpy.tools._utils import get_init_pos_from_paga
 from scipy import sparse as sc_sparse
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import _rng_kwargs
 from rapids_singlecell._keys import _embedding_keys
-from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell._settings import Default
 from rapids_singlecell._utils import _get_logger_level
 from rapids_singlecell._utils._random import (
     RNGLike,
@@ -23,11 +23,14 @@ from rapids_singlecell._utils._random import (
     _legacy_random_state,
     _LegacyRng,
 )
+from rapids_singlecell.get._out import DEPR_KEY_ADDED, DEPR_NEIGHBORS_KEY, _out_key, deprecated_copy
 
-from ._utils import _validate_init_pos
+from ._utils import _neighbors, _validate_init_pos
 
 if TYPE_CHECKING:
     from anndata import AnnData
+
+    from rapids_singlecell.get._utils import GraphAcc, MultiAcc
 
 _InitPos = Literal["auto", "spectral", "random", "paga"]
 
@@ -52,6 +55,9 @@ def _device_coo(graph) -> sparse.coo_matrix:
 
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_arg("neighbors_key", DEPR_NEIGHBORS_KEY)
+@deprecated_copy
 def umap(
     adata: AnnData,
     *,
@@ -65,10 +71,14 @@ def umap(
     rng: SeedLike | RNGLike | None = None,
     a: float | None = None,
     b: float | None = None,
-    key_added: str | Default | None = Default(("umap", "key_added")),
+    use: GraphAcc | str | None = None,
+    rep: MultiAcc | str | None = None,
+    out: MultiAcc | str | bool = False,
+    # deprecated
+    key_added: str | None = None,
     neighbors_key: str | None = None,
     copy: bool = False,
-) -> AnnData | None:
+) -> AnnData | np.ndarray | None:
     r"""Embed the neighborhood graph using UMAP :cite:p:`McInnes2018` :cite:p:`Nolet2021`.
 
     UMAP (Uniform Manifold Approximation and Projection) is a manifold learning
@@ -130,45 +140,35 @@ def umap(
         More specific parameters controlling the embedding. If `None` these
         values are set automatically as determined by `min_dist` and
         `spread`.
-    key_added
-        If not specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\ `['X_umap']` and the the parameters in
-        :attr:`~anndata.AnnData.uns`\ `['umap']`.
-        If specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\ ``[key_added]`` and the the parameters in
-        :attr:`~anndata.AnnData.uns`\ ``[key_added]``.
-    neighbors_key
-        If not specified, umap looks .uns['neighbors'] for neighbors settings
-        and .obsp['connectivities'] for connectivities
-        (default storage places for pp.neighbors).
-        If specified, umap looks .uns[neighbors_key] for neighbors settings and
-        .obsp[.uns[neighbors_key]['connectivities_key']] for connectivities.
-    copy
-        Return a copy instead of writing to adata.
+    use
+        The neighborhood graph (connectivities) to embed, e.g. `A.obsp['k']` after
+        `rsc.pp.neighbors(adata, out=A.obsp['k'])`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
+        If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
+    rep
+        Accepted for compatibility with :func:`scanpy.tl.umap`, which lays out the graph's
+        connected components with it. cuML lays them out from the graph alone, so it is not read.
+    out
+        Where to write the embedding, e.g. `A.obsm['umap2']`; the parameters go to `.uns` under the same key.
+        If `True`, the embedding is returned instead.
+        If `False`, it is written to `.obsm['X_umap']` and `.uns['umap']`
+        (`'umap'` for both if ``rapids_singlecell.settings.preset`` is `scanpy-v2-preview`).
 
     Returns
     -------
-    Depending on `copy`, returns or updates `adata` with the following fields.
+    The embedding if `out=True`, else `None`. By default sets (see `out` for other keys):
 
-        `adata.obsm['X_umap' | key_added]` : :class:`~numpy.ndarray` (dtype `float`)
+        `adata.obsm['X_umap']` : :class:`~numpy.ndarray` (dtype `float`)
             UMAP coordinates of data.
-        `adata.uns['umap' | key_added]['params']` : :class:`dict`
+        `adata.uns['umap']['params']` : :class:`dict`
             UMAP parameters `a`, `b`, and `random_state` (if specified).
     """
     # a seed forces cuML's slower deterministic optimizer
     unseeded = rng is None or (isinstance(rng, _LegacyRng) and rng.arg is None)
     rng = np.random.default_rng(rng)
 
-    adata = adata.copy() if copy else adata
-    key_added = resolve_default(key_added)
-
-    if neighbors_key is None:
-        neighbors_key = "neighbors"
-
-    if neighbors_key not in adata.uns:
-        raise ValueError(f'Did not find .uns["{neighbors_key}"]. Run `sc.pp.neighbors` first.')
-
-    neighbors = NeighborsView(adata, neighbors_key)
+    key = _out_key(out, key_added, kind="obsm", default=Default())
+    neighbors = _neighbors(adata, use, neighbors_key)
     if a is None or b is None:
         a, b = find_ab_params(spread, min_dist)
 
@@ -187,7 +187,7 @@ def umap(
             init_coords = get_init_pos_from_paga(
                 adata,
                 **_rng_kwargs(get_init_pos_from_paga, rng),
-                neighbors_key=neighbors_key,
+                adjacency=neighbors["connectivities"],
             )
         case str() if init_pos == "auto":
             init_coords = "spectral" if n_obs < 1000000 else "random"
@@ -217,9 +217,9 @@ def umap(
     )
     logger.set_level(logger_level)
     X_umap = cp.asarray(X_umap).get()
-
-    keys = _embedding_keys("umap", key_added)
+    if key is True:
+        return X_umap
+    keys = _embedding_keys("umap", key)
     adata.obsm[keys.obsm] = X_umap
-
     adata.uns[keys.uns] = {"params": stored_params}
-    return adata if copy else None
+    return None

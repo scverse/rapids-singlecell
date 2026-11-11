@@ -51,16 +51,18 @@ The preprocessing can be handled by the functions in {mod}`~.pp`. They offer acc
 Example:
 
 ```python
+from anndata.acc import A
+
 rsc.get.anndata_to_GPU(adata, layer="counts")
 rsc.pp.highly_variable_genes(
     adata,
     n_top_genes=5000,
     flavor="seurat_v3",
-    batch_key="PatientNumber",
-    layer="counts",
+    batch=A.obs["PatientNumber"],
+    use=A.layers["counts"],
 )
 adata = adata[:, adata.var["highly_variable"]].copy()
-rsc.pp.regress_out(adata, keys=["total_counts", "pct_counts_MT"])
+rsc.pp.regress_out(adata, [A.obs["total_counts"], A.obs["pct_counts_MT"]])
 rsc.pp.scale(adata, max_value=10)
 ```
 
