@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
+import pandas as pd
+from anndata import AnnData
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell.get import _get_arr, _get_vec
+from rapids_singlecell.get._out import DEPR_BATCH_KEY, DEPR_INPLACE, DEPR_USE, _legacy_out, _resolve, _use_args
+from rapids_singlecell.get._utils import LayerAcc
 from rapids_singlecell.preprocessing._utils import _sanitize_column
 
 from ._cutoffs import _Cutoffs
@@ -17,7 +24,7 @@ from ._seurat_cellranger import (
 from ._seurat_v3 import _highly_variable_genes_seurat_v3
 
 if TYPE_CHECKING:
-    from anndata import AnnData
+    from rapids_singlecell.get._utils import AdRef
 
 flavors = Literal[
     "seurat",
@@ -29,10 +36,13 @@ flavors = Literal[
 ]
 
 
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_arg("batch_key", DEPR_BATCH_KEY)
 def highly_variable_genes(
     adata: AnnData,
     *,
-    layer: str = None,
+    use: LayerAcc | str | None = None,
     min_mean: float = 0.0125,
     max_mean: float = 3,
     min_disp: float = 0.5,
@@ -46,8 +56,13 @@ def highly_variable_genes(
     clip: bool = None,
     chunksize: int = 1000,
     n_samples: int = 10000,
+    batch: AdRef | str | None = None,
+    out: bool = False,
+    # deprecated
+    layer: str = None,
+    inplace: bool = True,
     batch_key: str | None = None,
-) -> None:
+) -> pd.DataFrame | None:
     """Annotate highly variable genes :cite:p:`Satija2015,Zheng2017,Stuart2019,Lause2021,Andrews2019`.
 
     Expects logarithmized data, except when `flavor='seurat_v3','seurat_v3_paper','pearson_residuals','poisson_gene_selection'`, in which count data is expected.
@@ -66,20 +81,21 @@ def highly_variable_genes(
     per feature) with a regularized standard deviation. Next, the normalized variance
     is computed as the variance of each gene after the transformation. Genes are ranked
     by the normalized variance.
-    Only if `batch_key` is not `None`, the two flavors differ: For `flavor='seurat_v3'`, genes are first sorted by the median (across batches) rank, with ties broken by the number of batches a gene is a HVG.
+    Only if `batch` is not `None`, the two flavors differ: For `flavor='seurat_v3'`, genes are first sorted by the median (across batches) rank, with ties broken by the number of batches a gene is a HVG.
     For `flavor='seurat_v3_paper'`, genes are first sorted by the number of batches a gene is a HVG, with ties broken by the median (across batches) rank.
 
     The following may help when comparing to Seurat's naming:
-    If `batch_key=None` and `flavor='seurat'`, this mimics Seurat's `FindVariableFeatures(…, method='mean.var.plot')`.
-    If `batch_key=None` and `flavor='seurat_v3'`/`flavor='seurat_v3_paper'`, this mimics Seurat's `FindVariableFeatures(..., method='vst')`.
-    If `batch_key` is not `None` and `flavor='seurat_v3_paper'`, this mimics Seurat's `SelectIntegrationFeatures`.
+    If `batch=None` and `flavor='seurat'`, this mimics Seurat's `FindVariableFeatures(…, method='mean.var.plot')`.
+    If `batch=None` and `flavor='seurat_v3'`/`flavor='seurat_v3_paper'`, this mimics Seurat's `FindVariableFeatures(..., method='vst')`.
+    If `batch` is not `None` and `flavor='seurat_v3_paper'`, this mimics Seurat's `SelectIntegrationFeatures`.
 
     Parameters
     ----------
         adata
             AnnData object
-        layer
-            If provided, use `adata.layers[layer]` for expression values instead of `adata.X`.
+        use
+            Which matrix to use for expression values, e.g. `A.X` or `A.layers['counts']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
         min_mean
             If n_top_genes unequals None, this and all other cutoffs for the means and the normalized dispersions are ignored.
         max_mean
@@ -114,12 +130,15 @@ def highly_variable_genes(
         n_samples
             The number of Binomial samples to use to estimate posterior probability
             of enrichment of zeros for each gene (only for `flavor='poisson_gene_selection'`).
-        batch_key
-            If specified, highly-variable genes are selected within each batch separately and merged.
+        batch
+            If specified (e.g. `A.obs['batch']` or `'obs.batch'`),
+            highly-variable genes are selected within each batch separately and merged.
+        out
+            If `True`, return the metrics as a :class:`~pandas.DataFrame` instead of writing them.
 
     Returns
     -------
-        updates `adata.var` with the following fields:
+        A :class:`~pandas.DataFrame` if `out=True`, else updates `adata.var` with the following fields:
 
             `highly_variable` : bool
                 boolean indicator of highly-variable genes
@@ -146,9 +165,24 @@ def highly_variable_genes(
                 If batch_key is given, this denotes the genes that are highly variable in all batches
     """
     flavor = resolve_default(flavor)
-
-    if batch_key is not None:
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, kinds=(LayerAcc,), layer=layer)
+    if batch_key is not None and batch is not None:
+        raise TypeError("Pass either `batch` or `batch_key`, not both.")
+    # run on a proxy holding only the input matrix and batches, then copy the results
+    target = adata
+    # share string obs_names: generating new ones takes 0.2 s per million cells
+    obs = pd.DataFrame(index=target.obs_names) if pd.api.types.is_string_dtype(target.obs_names) else None
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Observation names are not unique")
+        adata = AnnData(_get_arr(target, dim="obs", **src), obs=obs)
+    if batch_key is not None or batch is not None:
+        vals = target.obs[batch_key] if batch is None else _get_vec(target, _resolve(batch, vec=True), dim="obs")
+        adata.obs["batch"] = vals.values if isinstance(vals, pd.Series) else vals
+        batch_key = "batch"
         _sanitize_column(adata, batch_key)
+        adata.obs[batch_key] = adata.obs[batch_key].astype("category")
+    layer = None
 
     if flavor == "seurat_v3" or flavor == "seurat_v3_paper":
         _highly_variable_genes_seurat_v3(
@@ -216,3 +250,12 @@ def highly_variable_genes(
         if batch_key is not None:
             adata.var["highly_variable_nbatches"] = df["highly_variable_nbatches"]
             adata.var["highly_variable_intersection"] = df["highly_variable_intersection"]
+
+    res = adata.var.set_axis(target.var_names)
+    if out:
+        return res
+    target.var[res.columns] = res
+    target.uns.update(adata.uns)
+    if "computed_on" in target.uns.get("hvg", {}):
+        target.uns["hvg"]["computed_on"] = src.get("layer", "adata.X") if use is None else repr(use)
+    return None

@@ -189,19 +189,19 @@ def test_aggregate_entry():
         var=adata.var,
         layers={"test": adata.X.copy()},
     )
-    layer_result = rsc.get.aggregate(layer_adata, *args, layer="test")
+    layer_result = rsc.get.aggregate(layer_adata, *args, use="layers.test")
     obsm_adata = ad.AnnData(
         obs=adata.obs,
         var=adata.var,
         obsm={"test": adata.X.copy()},
     )
-    obsm_result = rsc.get.aggregate(obsm_adata, *args, obsm="test")
+    obsm_result = rsc.get.aggregate(obsm_adata, *args, use="obsm.test")
     varm_adata = ad.AnnData(
         obs=adata.var,
         var=adata.obs,
         varm={"test": adata.X.copy()},
     )
-    varm_result = rsc.get.aggregate(varm_adata, *args, varm="test")
+    varm_result = rsc.get.aggregate(varm_adata, *args, axis="var", use="varm.test")
 
     X_result_min = X_result.copy()
     del X_result_min.var
@@ -211,6 +211,10 @@ def test_aggregate_entry():
     assert_equal(X_result_min, obsm_result)
     assert_equal(X_result.layers, obsm_result.layers)
     assert_equal(X_result.layers, varm_result.T.layers)
+    with pytest.warns(FutureWarning, match="layer"):
+        assert_equal(X_result, rsc.get.aggregate(layer_adata, *args, layer="test"))
+    with pytest.warns(FutureWarning, match="acc"):
+        assert_equal(X_result, rsc.get.aggregate(layer_adata, *args, acc="layers.test"))
 
 
 def test_aggregate_incorrect_dim():

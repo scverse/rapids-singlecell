@@ -4,6 +4,7 @@ import itertools
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import pytest
 import scanpy.external as sce
 from anndata import AnnData
@@ -13,13 +14,17 @@ from scanpy.neighbors._connectivity import gauss as scanpy_gauss
 from scanpy.neighbors._connectivity import jaccard as scanpy_jaccard
 from scipy import sparse as sc_sparse
 
+import rapids_singlecell as rsc
 from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.pp import bbknn, neighbors
+from rapids_singlecell.preprocessing._neighbors import NeighborsResult
 from rapids_singlecell.preprocessing._neighbors._helper import _trimming as trimming_gpu
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _get_connectivities_gauss,
     _get_connectivities_jaccard,
 )
+
+A = pytest.importorskip("anndata.acc").A
 
 # the input data
 X = np.array([[1, 0], [3, 0], [5, 6], [0, 4]])
@@ -57,7 +62,7 @@ def test_inner_product_connectivities_match_cosine(batch_balanced):
             adata.obs["batch"] = np.arange(adata.n_obs) % 2
             bbknn(
                 adata,
-                batch_key="batch",
+                batches=A.obs["batch"],
                 neighbors_within_batch=5,
                 trim=0,
                 metric=metric,
@@ -118,7 +123,7 @@ def test_inner_product_bbknn_preserves_cross_batch_neighbors():
     adata.obs["batch"] = ["a", "a", "b", "b"]
     bbknn(
         adata,
-        batch_key="batch",
+        batches=A.obs["batch"],
         neighbors_within_batch=1,
         metric="inner_product",
         trim=0,
@@ -197,14 +202,51 @@ def test_neighbors_key_added():
     adata = pbmc68k_reduced()
     del adata.obsp
     neighbors(adata, n_neighbors=5, random_state=0)
-    neighbors(adata, n_neighbors=5, random_state=0, key_added=KEY)
+    with pytest.warns(FutureWarning, match="key_added"):
+        neighbors(adata, n_neighbors=5, random_state=0, key_added=KEY)
 
     conns_key = adata.uns[KEY]["connectivities_key"]
     dists_key = adata.uns[KEY]["distances_key"]
 
+    assert (conns_key, dists_key) == (f"{KEY}_connectivities", f"{KEY}_distances")
     assert adata.uns["neighbors"]["params"] == adata.uns[KEY]["params"]
     assert np.allclose(adata.obsp["connectivities"].toarray(), adata.obsp[conns_key].toarray())
     assert np.allclose(adata.obsp["distances"].toarray(), adata.obsp[dists_key].toarray())
+
+
+def test_neighbors_out():
+    adata = pbmc68k_reduced()
+    del adata.obsp
+    neighbors(adata, n_neighbors=5, random_state=0, out=A.obsp["nn"])
+    assert adata.uns["nn"]["connectivities_key"] == "nn"
+    assert adata.uns["nn"]["distances_key"] == "nn_distances"
+    assert set(adata.obsp) == {"nn", "nn_distances"}
+
+    res = neighbors(adata, n_neighbors=5, random_state=0, out=True)
+    assert isinstance(res, NeighborsResult)
+    np.testing.assert_allclose(res.connectivities.toarray(), adata.obsp["nn"].toarray())
+
+    neighbors(adata, n_neighbors=5, random_state=0, out={"connectivities": "obsp.c"})
+    assert "c_distances" not in adata.obsp
+    assert adata.uns["c"].keys() == {"connectivities_key", "params"}
+
+    # consumers take the graph
+    rsc.tl.umap(adata, use=A.obsp["nn"], rep=A.obsm["X_pca"], out=A.obsm["u"], maxiter=10)
+    rsc.tl.leiden(adata, use="obsp.c", out=A.obs["cl"])
+    assert adata.obsm["u"].shape == (adata.n_obs, 2)
+    assert "u" in adata.uns and "cl" in adata.uns
+    assert adata.obs["cl"].dtype == "category"
+    assert isinstance(rsc.tl.leiden(adata, use=A.obsp["nn"], out=True), pd.Categorical)
+
+
+def test_neighbors_obsm_named_x():
+    """`use=A.obsm['X']` reads that `.obsm` key and never `.X`, unlike the deprecated `use_rep='X'`."""
+    adata = pbmc68k_reduced()
+    with pytest.raises(KeyError, match="^'X'$"):
+        neighbors(adata, n_neighbors=5, use=A.obsm["X"], out=True)
+    adata.obsm["X"] = adata.obsm["Y"] = adata.obsm["X_pca"][:, :5]
+    res, ref = (neighbors(adata, n_neighbors=5, use=A.obsm[k], out=True) for k in "XY")
+    np.testing.assert_array_equal(res.distances.toarray(), ref.distances.toarray())
 
 
 def test_bbknn():
@@ -221,7 +263,7 @@ def test_bbknn():
         computation="pynndescent",
         metric="euclidean",
     )
-    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute", key_added="rapids")
+    bbknn(adata, n_pcs=15, batches=A.obs["phase"], algorithm="brute", out=A.obsp["rapids"])
     counter = 0
     for (rsc_start, rsc_stop), (b_start, b_stop) in zip(
         itertools.pairwise(adata.obsp["rapids_distances"].indptr),
@@ -241,7 +283,8 @@ def test_bbknn_distances_sorted_per_row():
     # fuzzy_simplicial_set uses the first non-zero distance per row as rho;
     # unsorted per-batch columns break sigma estimation and collapse weights.
     adata = pbmc68k_reduced()
-    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
+    with pytest.warns(FutureWarning, match="batch_key"):
+        bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
     dists = adata.obsp["distances"]
     for start, stop in itertools.pairwise(dists.indptr):
         row = dists.data[start:stop]
@@ -253,7 +296,7 @@ def test_bbknn_connectivities_not_collapsed():
     # dataset was ~0.85 with most weights pinned near 1.0. With sorted input
     # the distribution spreads out properly.
     adata = pbmc68k_reduced()
-    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
+    bbknn(adata, n_pcs=15, batches="obs.phase", algorithm="brute")
     weights = adata.obsp["connectivities"].data
     # Regression bounds chosen vs pre-fix behaviour (mean ~0.60, >0.99 frac ~0.28
     # on this dataset). Anything close to those values indicates sigma estimation
@@ -271,7 +314,7 @@ def test_bbknn_trim_default_matches_upstream():
     bbknn(
         adata,
         n_pcs=15,
-        batch_key="phase",
+        batches=A.obs["phase"],
         algorithm="brute",
         neighbors_within_batch=neighbors_within_batch,
     )

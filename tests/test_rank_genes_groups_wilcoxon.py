@@ -168,7 +168,7 @@ def test_rank_genes_groups_return_format_removed():
             adata,
             "blobs",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             return_format="arrays",
         )
 
@@ -203,7 +203,7 @@ def test_rank_genes_groups_wilcoxon_return_u_values(reference, fmt):
         groups=["a"],
         reference=reference,
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         tie_correct=True,
         use_continuity=True,
         return_u_values=True,
@@ -260,7 +260,7 @@ def test_rank_genes_groups_wilcoxon_dense_edge_cases_match_scipy():
         groups=["a"],
         reference="b",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         tie_correct=True,
         use_continuity=True,
         return_u_values=True,
@@ -298,7 +298,7 @@ def test_rank_genes_groups_return_u_values_requires_wilcoxon():
             adata,
             "blobs",
             method="t-test",
-            use_raw=False,
+            use="X",
             return_u_values=True,
         )
 
@@ -322,7 +322,7 @@ def test_rank_genes_groups_wilcoxon_matches_scanpy(reference, tie_correct, spars
         adata_gpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         n_genes=3,
         reference=reference,
         corr_method="benjamini-hochberg",
@@ -404,7 +404,7 @@ def test_rank_genes_groups_wilcoxon_honors_layer_and_use_raw(reference):
     base.layers["signal"] = base.X.copy()
 
     ref_adata = base.copy()
-    rsc.tl.rank_genes_groups(ref_adata, "blobs", method="wilcoxon", use_raw=False, reference=reference)
+    rsc.tl.rank_genes_groups(ref_adata, "blobs", method="wilcoxon", use="X", reference=reference)
     reference_names = ref_adata.uns["rank_genes_groups"]["names"].copy()
 
     rng = np.random.default_rng(0)
@@ -417,15 +417,14 @@ def test_rank_genes_groups_wilcoxon_honors_layer_and_use_raw(reference):
         layered,
         "blobs",
         method="wilcoxon",
-        layer="signal",
-        use_raw=False,
+        use="layers.signal",
         reference=reference,
     )
     layered_names = layered.uns["rank_genes_groups"]["names"].copy()
 
     no_layer = base.copy()
     no_layer.X = perturbed_matrix
-    rsc.tl.rank_genes_groups(no_layer, "blobs", method="wilcoxon", use_raw=False, reference=reference)
+    rsc.tl.rank_genes_groups(no_layer, "blobs", method="wilcoxon", use="X", reference=reference)
     no_layer_names = no_layer.uns["rank_genes_groups"]["names"].copy()
 
     assert layered_names.dtype.names == reference_names.dtype.names
@@ -453,7 +452,7 @@ def test_rank_genes_groups_wilcoxon_subset_and_bonferroni(reference):
         method="wilcoxon",
         groups=groups,
         reference=reference,
-        use_raw=False,
+        use="X",
         n_genes=2,
         corr_method="bonferroni",
     )
@@ -484,7 +483,7 @@ def test_rank_genes_groups_wilcoxon_skip_empty_groups_filters_singletons():
         "target",
         method="wilcoxon",
         reference="ref",
-        use_raw=False,
+        use="X",
         n_genes=3,
         skip_empty_groups=True,
     )
@@ -508,7 +507,7 @@ def test_rank_genes_groups_wilcoxon_skip_empty_groups_all_tests_filtered():
         "target",
         method="wilcoxon",
         reference="ref",
-        use_raw=False,
+        use="X",
         skip_empty_groups=True,
     )
 
@@ -591,7 +590,7 @@ def test_wilcoxon_zero_nnz_host_sparse_does_not_crash(reference, fmt):
         adata,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         reference=reference,
         pts=True,
     )
@@ -702,7 +701,7 @@ def test_wilcoxon_host_csr_strided_indices(multi_gpu, reference, monkeypatch):
             reference=reference,
             tie_correct=True,
             multi_gpu=multi_gpu,
-            use_raw=False,
+            use="X",
         )
         results.append(adata.uns["rank_genes_groups"])
     for field in ("names", "scores", "pvals"):
@@ -723,7 +722,7 @@ def test_wilcoxon_wide_batches_match_default(fmt, monkeypatch):
             for key in list(_wilcoxon._SUB_BATCH):
                 monkeypatch.setitem(_wilcoxon._SUB_BATCH, key, 20_000)
         adata = sc.AnnData(X=X, obs=obs.copy())
-        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", multi_gpu=False, n_genes=100, use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", multi_gpu=False, n_genes=100, use="X")
         results.append(adata.uns["rank_genes_groups"])
     for field in ("names", "scores", "pvals"):
         for group in ("a", "b"):
@@ -742,7 +741,7 @@ def test_wilcoxon_host_csc_read_only_memmap(tmp_path):
     results = []
     for M in (X, sp.csc_matrix(arrays, shape=X.shape)):
         adata = sc.AnnData(X=M, obs=obs.copy())
-        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", reference="a", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", reference="a", use="X")
         results.append(adata.uns["rank_genes_groups"])
     for group in ("b", "c"):
         np.testing.assert_array_equal(results[1]["scores"][group], results[0]["scores"][group])
@@ -850,7 +849,7 @@ def test_wilcoxon_expression_space_logfoldchanges(groups, reference, pts, fmt):
         reference=reference,
         mean_in_log_space=False,
         pts=pts,
-        use_raw=False,
+        use="X",
     )
     result = adata.uns["rank_genes_groups"]
     for group in result["names"].dtype.names:
@@ -929,7 +928,7 @@ def test_wilcoxon_pts_ignore_stored_zeros(fmt, reference, mean_in_log_space):
         reference=reference,
         pts=True,
         mean_in_log_space=mean_in_log_space,
-        use_raw=False,
+        use="X",
     )
     result = adata.uns["rank_genes_groups"]
     for group in result["names"].dtype.names:
@@ -1003,7 +1002,7 @@ def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
             a,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=tie_correct,
             n_genes=6,
@@ -1033,7 +1032,7 @@ def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
             a,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
         )
@@ -1071,7 +1070,7 @@ def test_wilcoxon_dense_nonfloat_data_matches_float32(data_dtype):
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
             n_genes=n_genes,
@@ -1105,7 +1104,7 @@ def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
         )
@@ -1172,7 +1171,7 @@ def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
             a,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
             pts=True,
@@ -1217,7 +1216,7 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
         method="wilcoxon",
         groups=groups,
         reference=reference,
-        use_raw=False,
+        use="X",
         tie_correct=tie_correct,
     )
     sc.tl.rank_genes_groups(
@@ -1364,7 +1363,7 @@ def test_rank_genes_groups_wilcoxon_pts(reference):
         adata_gpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         pts=True,
         tie_correct=False,
         reference=reference,
@@ -1475,7 +1474,7 @@ class TestWilcoxonAgainstScipy:
             groups=["treatment"],
             reference="control",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             tie_correct=True,
             use_continuity=True,
         )
@@ -1497,7 +1496,7 @@ class TestWilcoxonAgainstScipy:
             groups=["treatment"],
             reference="control",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             tie_correct=True,
             use_continuity=False,
         )
@@ -1605,7 +1604,7 @@ def test_wilcoxon_sparse_integer_bool_data_matches_float32(fmt, data_dtype):
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
             n_genes=n_genes,
@@ -1630,7 +1629,7 @@ def test_wilcoxon_device_sparse_bool_data_raises():
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="float32 or float64"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
@@ -1647,7 +1646,7 @@ def test_wilcoxon_sparse_float16_data_raises(fmt):
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="float32"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
@@ -1662,7 +1661,7 @@ def test_wilcoxon_sparse_complex_data_raises(fmt):
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="complex sparse data is not supported"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 @pytest.mark.parametrize("reference", ["rest", "2"])
@@ -1681,7 +1680,7 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
         adata,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         groups=groups,
         reference=reference,
     )
@@ -1714,7 +1713,7 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy(monkeypatch):
         gpu,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         reference="rest",
         pts=True,
         tie_correct=True,
@@ -1766,7 +1765,7 @@ def test_wilcoxon_fdr_ties_nan_match_scanpy():
     gpu = sc.AnnData(X=cp.asarray(X), obs=obs.copy(), var=var.copy())  # GPU FDR path
     cpu = sc.AnnData(X=X.copy(), obs=obs.copy(), var=var.copy())
 
-    rsc.tl.rank_genes_groups(gpu, "group", method="wilcoxon", use_raw=False, tie_correct=True)
+    rsc.tl.rank_genes_groups(gpu, "group", method="wilcoxon", use="X", tie_correct=True)
     sc.tl.rank_genes_groups(cpu, "group", method="wilcoxon", use_raw=False, tie_correct=True)
     g = gpu.uns["rank_genes_groups"]
     c = cpu.uns["rank_genes_groups"]
@@ -1894,7 +1893,7 @@ def test_ovr_dense_gmem_branch_matches_scipy():
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
     adata = sc.AnnData(X=X, obs=obs, var=var)
 
-    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, tie_correct=True)
+    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", tie_correct=True)
     res = adata.uns["rank_genes_groups"]
     for grp in ("0", "1", "250", "1000", "3057", "6112", "6199"):
         gp = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float), strict=False))
@@ -1920,7 +1919,7 @@ def test_ovr_dense_gmem_branch_matches_scipy():
 def test_skip_empty_groups_vs_rest_drops_singleton():
     """skip_empty_groups=True with reference='rest' drops singleton groups."""
     adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=4)
-    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True)
+    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", skip_empty_groups=True)
     names = set(adata.uns["rank_genes_groups"]["names"].dtype.names)
     assert names == {"a", "b"}  # singleton "c" dropped, no error
 
@@ -1933,7 +1932,7 @@ def test_skip_empty_groups_reference_too_small_raises():
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="c",
             skip_empty_groups=True,
         )
@@ -1943,7 +1942,7 @@ def test_skip_empty_groups_none_remain_raises():
     """skip_empty_groups=True raises when no group has >=2 cells (vs-rest)."""
     adata = _anndata_with_group_sizes({"a": 1, "b": 1, "c": 1}, seed=4)
     with pytest.raises(ValueError, match="No groups with at least two samples remain"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", skip_empty_groups=True)
 
 
 @pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
@@ -1995,7 +1994,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
         gpu,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         reference=reference,
         tie_correct=True,
         use_continuity=True,
@@ -2023,7 +2022,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
 def test_rank_genes_groups_default_method_is_ttest():
     """Omitting method= defaults to t-test (rank_genes_groups path)."""
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    rsc.tl.rank_genes_groups(adata, "group", use_raw=False)
+    rsc.tl.rank_genes_groups(adata, "group", use="X")
     assert adata.uns["rank_genes_groups"]["params"]["method"] == "t-test"
 
 
@@ -2048,9 +2047,9 @@ def test_rank_genes_groups_invalid_args_raise(override, exc, match):
 def test_rank_genes_groups_chunk_size_deprecated():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
     expected = adata.copy()
-    rsc.tl.rank_genes_groups(expected, "group", method="wilcoxon", use_raw=False)
+    rsc.tl.rank_genes_groups(expected, "group", method="wilcoxon", use="X")
     with pytest.warns(FutureWarning, match="chunk_size"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, chunk_size=8)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", chunk_size=8)
     for group in ("0", "1"):
         np.testing.assert_array_equal(
             adata.uns["rank_genes_groups"]["scores"][group], expected.uns["rank_genes_groups"]["scores"][group]
@@ -2059,18 +2058,18 @@ def test_rank_genes_groups_chunk_size_deprecated():
 
 def test_rank_genes_groups_mask_var_missing_key_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(KeyError, match="not found in adata.var"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, mask_var="nope")
+    with pytest.raises(ValueError, match=r"Did not find `adata\.var\['nope'\]`"):
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", mask_var="nope")
 
 
 def test_rank_genes_groups_mask_var_wrong_shape_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(ValueError, match="mask_var has wrong shape"):
+    with pytest.raises(ValueError, match="shape of the mask do not match"):
         rsc.tl.rank_genes_groups(
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             mask_var=np.ones(adata.n_vars + 3, dtype=bool),
         )
 
@@ -2092,14 +2091,14 @@ def test_singleton_group_without_skip_raises():
     """Non-skip path: a <2-cell group raises in _select_groups (line 131-135)."""
     adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=5)
     with pytest.raises(ValueError, match="fewer than two samples"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 def test_unused_category_without_skip_raises():
     adata = _anndata_with_group_sizes({"a": 10, "b": 10}, seed=5)
     adata.obs["group"] = adata.obs["group"].cat.add_categories(["unused"])
     with pytest.raises(ValueError, match="unused"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, reference="a")
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", reference="a")
 
 
 @pytest.mark.parametrize("use_raw", [None, True])
@@ -2222,7 +2221,7 @@ def test_ovr_all_empty_csc_totals_runs():
         adata,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         groups=["0", "1"],
         reference="rest",
         pts=True,

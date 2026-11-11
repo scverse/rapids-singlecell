@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from cupyx.scipy import sparse as cp_sparse
 from scipy import sparse as sc_sparse
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._keys import (
     _embedding_keys,
@@ -18,7 +19,9 @@ from rapids_singlecell._keys import (
     _preset_obsm_names,
 )
 from rapids_singlecell._settings import settings
-from rapids_singlecell.get import X_to_GPU, _get_obs_rep
+from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
+from rapids_singlecell.get._out import DEPR_COPY, _ref_from_json
+from rapids_singlecell.get._utils import AdRef
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
@@ -76,6 +79,7 @@ def _reference_umap_storage_keys(adata_ref: AnnData) -> _EmbeddingKeys:
     raise ValueError("`adata_ref` is missing UMAP results. Run `rsc.tl.umap(adata_ref)` first.")
 
 
+@deprecated_arg("inplace", DEPR_COPY)
 def ingest(
     adata: AnnData,
     adata_ref: AnnData,
@@ -89,6 +93,7 @@ def ingest(
     neighbors_key: str | None = None,
     algorithm: _IngestAlgorithm = "brute",
     algorithm_kwds: Mapping[str, Any] = MappingProxyType({}),
+    # deprecated
     inplace: bool = True,
 ) -> AnnData | None:
     """Map labels and embeddings from reference data to new data.
@@ -161,12 +166,14 @@ def ingest(
     neighbor_params = adata_ref.uns[neighbors_key].get("params")
     if neighbor_params is None or "n_neighbors" not in neighbor_params:
         raise ValueError(f"`adata_ref.uns[{neighbors_key!r}]` does not contain valid neighbor parameters.")
+    if "layer" in neighbor_params:
+        raise NotImplementedError("`ingest` cannot map into neighbors computed on a layer (`use=A.layers[...]`).")
 
     need_representation = "umap" in embedding_methods or bool(obs_keys)
     if "modalities" in neighbor_params and need_representation:
         raise NotImplementedError(
             f"`adata_ref.uns[{neighbors_key!r}]` is a multimodal graph from `rsc.pp.wnn`, which `ingest` cannot "
-            "map into. Compute single-modality neighbors, e.g. `rsc.pp.neighbors(adata_ref, key_added='rna')`, "
+            "map into. Compute single-modality neighbors, e.g. `rsc.pp.neighbors(adata_ref, out=A.obsp['rna'])`, "
             "and pass `neighbors_key='rna'`."
         )
     pca_output_key = _embedding_keys("pca").obsm
@@ -350,11 +357,13 @@ def _resolve_pca_feature_mask(
     pca_params: Mapping[str, Any],
     components,
 ) -> np.ndarray | None:
-    mask = pca_params.get("mask_var")
+    mask = _ref_from_json(pca_params.get("mask_var"))
     if mask is None and pca_params.get("use_highly_variable", False):
         mask = "highly_variable"
 
-    if isinstance(mask, str):
+    if isinstance(mask, AdRef):
+        mask = _check_mask(adata_ref, mask, "var")
+    elif isinstance(mask, str):
         mask_key = mask.removeprefix("var.") if mask.startswith("var.") else mask
         if mask_key not in adata_ref.var:
             raise ValueError(f"Did not find `adata_ref.var[{mask_key!r}]`.")
