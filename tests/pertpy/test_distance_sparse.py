@@ -69,7 +69,7 @@ def test_sparse_equals_dense_bitwise(precision, dtype) -> None:
     host = [unsorted, unsorted.copy(), _halves(csr), _halves(unsorted), unsorted.copy(), unsorted.copy()]
     device = [cpsp.csr_matrix(m) for m in host]
     assert not device[1].has_canonical_format  # cached: still False once its columns are sorted
-    for name in ("data", "indices"):  # in every other element of larger buffers
+    for name in ("data", "indices", "indptr"):  # in every other element of larger buffers
         setattr(device[-2], name, cp.repeat(getattr(device[-2], name), 2)[::2])
     device[-1].data = cp.concatenate([device[-1].data[:1], device[-1].data])[1:]
     assert device[-1].data.data.ptr % 16  # values that do not start on a 16-byte boundary
@@ -107,7 +107,7 @@ def test_duplicates_flag(selector) -> None:
 @pytest.mark.parametrize("which", ["indptr", "indices"])
 @pytest.mark.parametrize("halves", [False, True])
 def test_two_index_dtypes(which, halves) -> None:
-    """int64 ``indptr`` with int32 ``indices``, or the reverse, gives the dense result; unsorted it is refused."""
+    """A matrix used whole with int64 ``indptr`` or int64 ``indices`` gives the dense result; unsorted it is refused."""
     X = _make_matrix(72, np.float32)
     distance = Distance(metric="edistance", layer_key="X")
     ref = Distance(metric="edistance", obsm_key="emb").pairwise(_dense_adata(X), groupby="group")
@@ -136,6 +136,14 @@ def test_scaled_input(precision, factor) -> None:
     for adata, where in ((_dense_adata(X), {"obsm_key": "emb"}), (sparse, {"layer_key": "X"})):
         got = Distance(**where, **kwargs).pairwise(adata, groupby="group")
         np.testing.assert_array_equal(got.values, ref * np.float32(abs(factor)))
+
+
+def test_scale_follows_spread() -> None:
+    """The scale comes from the spread of a column around its mean, not from its distance from zero."""
+    X = cp.asarray(_make_matrix(72, np.float32))
+    sc = _materialize_source(X, None, "float16").sc
+    X[:, 0] = 4096
+    assert _materialize_source(X, None, "float16").sc == sc
 
 
 def test_sparse_big_endian_values() -> None:
@@ -264,7 +272,7 @@ def test_integer_counts_sparse_matches_dense() -> None:
 
 @pytest.mark.parametrize("fmt", ["csc", "gpu_csr"])
 def test_non_csr_sparse_inputs(fmt) -> None:
-    """CSC (host) and an already-on-GPU cupyx CSR are normalized to canonical CSR."""
+    """CSC (host) and an already-on-GPU cupyx CSR are read as CSR with sorted columns."""
     X = _make_matrix(30, np.float64, seed=1)
     dense = _dense_adata(X)
     adata = AnnData(X.astype(np.float64).copy(), obs=_obs())

@@ -425,6 +425,7 @@ def test_edistance_launcher_jobs_and_chunks(small_adata: AnnData, precision: str
     assert float(one[0]) == 0.0  # the distances within g0
 
 
+@pytest.mark.filterwarnings("error::RuntimeWarning")
 def test_edistance_precision_errors(small_adata: AnnData) -> None:
     """An unknown precision raises, and so does float16 on a cell beyond its range, only in calls that use the cell."""
     for bad in ("float8", np.dtype("float32")):
@@ -434,10 +435,29 @@ def test_edistance_precision_errors(small_adata: AnnData) -> None:
     auto, f32 = (Distance(precision=p).pairwise(small_adata, groupby="group") for p in ("auto", "float32"))
     pd.testing.assert_frame_equal(auto, f32, check_exact=True)
     small_adata.obsm["X_pca"][0, 0] = 1e9  # a g0 cell
+    small_adata.obsm["X_pca"][1, 0] = np.nan  # a NaN cell of g0 does not hide it
     distance = Distance(metric="edistance", precision="float16")
     with pytest.raises(ValueError, match="precision='float32'"):
         distance.pairwise(small_adata, groupby="group")
     assert np.isfinite(distance.pairwise(small_adata, groupby="group", groups=["g1", "g2"]).values).all()
+    small_adata.obsm["X_pca"][4:] = np.nan  # g1 and g2: NaN cells pass the range check without a warning
+    distance.pairwise(small_adata, groupby="group", groups=["g1", "g2"])  # alone: g0 is not loaded
+    distance.contrast_distances(small_adata, pd.DataFrame({"group": ["g1"], "reference": "g2"}))  # next to g0
+
+
+def test_float16_range_check_cells() -> None:
+    """The float16 range check reads every cell a call uses, also behind the first 2**16, and no other loaded cell."""
+    n = 2**16 + 4
+    X = np.random.default_rng(0).normal(size=(n, 2)).astype(np.float32)
+    X[n // 4 - 1] = 1e9  # the last "a" cell
+    adata = AnnData(X, obs=pd.DataFrame({"group": pd.Categorical(np.repeat(list("abcd"), n // 4))}))
+    adata.obsm["X_pca"] = cp.asarray(X)
+    distance = Distance(metric="edistance", precision="float16")
+    contrasts = pd.DataFrame({"group": list("cda"), "reference": "b"})  # used in the order c, b, d, a
+    with pytest.raises(ValueError, match="precision='float32'"):
+        distance.contrast_distances(adata, contrasts)
+    # Three of four groups: all cells are loaded
+    assert np.isfinite(distance.contrast_distances(adata, contrasts[:2])["edistance"]).all()
 
 
 # ============================================================================
