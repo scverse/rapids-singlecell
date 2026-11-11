@@ -40,6 +40,14 @@ def test_start_cluster(client):
     pipelines = set(client.run(lambda: __import__("zarr").config.get("codec_pipeline.path")).values())
     default = zarr.config.get("codec_pipeline.path")
     assert pipelines == ({PIPELINE_PATH} if gpu_io_available() else {default})
+    # Dask itself counts 48 bytes for any cupyx sparse matrix (30 values, indices; 11 indptr)
+    assert set(client.run(_sizeof_cupyx_csr).values()) == {_sizeof_cupyx_csr()} == {(30 + 30 + 11) * 4}
+
+
+def _sizeof_cupyx_csr():
+    from dask.sizeof import sizeof
+
+    return sizeof(cpx.random(10, 30, density=0.1, format="csr", dtype=np.float32))
 
 
 @needs_zarr_kvikio

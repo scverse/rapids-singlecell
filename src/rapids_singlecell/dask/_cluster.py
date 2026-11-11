@@ -94,6 +94,7 @@ def start_cluster(
     except ImportError as e:
         msg = "`rapids_singlecell.dask.start_cluster` needs `dask-cuda` (`pip install dask-cuda`)."
         raise ImportError(msg) from e
+    from rapids_singlecell.dask import _sizeof
     from rapids_singlecell.io._config import gpu_io_available, require_gpu_io
 
     if gpu_reads is True:
@@ -119,6 +120,8 @@ def start_cluster(
     client = Client(local_cluster)
     try:
         _wait_for_workers(client, len(local_cluster.worker_spec))
+        # import rapids_singlecell on the workers, which registers sizes Dask lacks (._sizeof)
+        client.run(_sizeof.register)
         if gpu_reads is True or (gpu_reads == "auto" and gpu_io_available()):
             from rapids_singlecell.io import enable
 
