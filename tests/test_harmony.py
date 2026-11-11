@@ -901,6 +901,39 @@ def test_harmony_integrate(correction_method):
     assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_integrate_use_out():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = sc.datasets.pbmc68k_reduced()
+    kw = {"dtype": cp.float32, "max_iter_harmony": 1, "rng": 0}
+    res = rsc.pp.harmony_integrate(adata, A.obs["bulk_labels"], use="obsm.X_pca", out=True, **kw)
+    assert "X_pca_harmony" not in adata.obsm
+    rsc.pp.harmony_integrate(adata, "bulk_labels", out=A.obsm["h"], **kw)
+    np.testing.assert_array_equal(adata.obsm["h"], res)
+    with pytest.warns(FutureWarning, match="key"):
+        rsc.pp.harmony_integrate(adata, key="bulk_labels", **kw)
+    with pytest.warns(FutureWarning, match="adjusted_basis"):
+        rsc.pp.harmony_integrate(adata, "bulk_labels", basis="X_pca", adjusted_basis="old", **kw)
+    np.testing.assert_array_equal(adata.obsm["old"], res)
+    np.testing.assert_array_equal(adata.obsm["X_pca_harmony"], res)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_integrate_accessor_list():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = sc.datasets.pbmc68k_reduced()
+    kw = {"dtype": cp.float32, "max_iter_harmony": 1, "rng": 0, "out": True}
+    res = rsc.pp.harmony_integrate(adata, [A.obs["bulk_labels"], A.obs["phase"]], **kw)
+    np.testing.assert_array_equal(res, rsc.pp.harmony_integrate(adata, ["bulk_labels", "phase"], **kw))
+    assert not np.array_equal(res, rsc.pp.harmony_integrate(adata, A.obs["bulk_labels"], **kw))
+    with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
+        np.testing.assert_array_equal(res, rsc.pp.harmony_integrate(adata, ["obs.bulk_labels", "obs.phase"], **kw))
+    with pytest.raises(TypeError, match="not a mix"):
+        rsc.pp.harmony_integrate(adata, [A.obs["bulk_labels"], "phase"], **kw)
+
+
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("correction_method", ["fast", "batched"])
 def test_harmony_integrate_reference(adata_reference, *, dtype, correction_method):

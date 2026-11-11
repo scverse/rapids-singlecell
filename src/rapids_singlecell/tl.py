@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from .tools import (
+    CellCycleOut,
+    CellCycleResult,
     diffmap,
     draw_graph,
     embedding_density,
@@ -24,6 +26,8 @@ from .tools import (
 )
 
 __all__ = [
+    "CellCycleOut",
+    "CellCycleResult",
     "diffmap",
     "draw_graph",
     "embedding_density",
@@ -36,6 +40,9 @@ __all__ = [
     "tsne",
     "umap",
 ]
+
+# `out=True` results and `out` mappings have no public members beyond their fields.
+__api_members__: dict[str, list[str]] = {n: [] for n in __all__ if n[0].isupper()}
 
 __deprecated_exports__ = {
     "kmeans": "Deprecated; do not use in new analyses.",
