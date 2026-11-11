@@ -108,7 +108,9 @@ __device__ __forceinline__ float edistance_sqrt_approx(float x) {
 
 // FFMA / DFMA register tile, 8 x 8 floats or 4 x 8 doubles per thread: thread
 // (tm, tn) of a 16 x 16 grid owns A rows tm + 16 i and B rows tn + 16 j and
-// reads k 16 bytes at a time.
+// reads k 16 bytes at a time. float64 is bound by the FP64 rate: of a tile with
+// ma x mb real rows a thread skips the products of its padding rows, whose
+// sums the kernels drop.
 template <typename T>
 struct EdFma {
     using E = T;
@@ -153,7 +155,8 @@ struct EdFma {
         return 8 * (threadIdx.x >> 7) + (threadIdx.x & 7);
     }
     __device__ static void window(Frag& f, const unsigned char* a, int pa,
-                                  const unsigned char* b, int kn) {
+                                  const unsigned char* b, int kn, int ma,
+                                  int mb) {
         a += tm() * pa, b += tn() * ED_PITCH;
 #pragma unroll 2
         for (int kb = 0; kb < kn * (int)sizeof(T); kb += 16) {
@@ -163,10 +166,14 @@ struct EdFma {
                 av[i] = *reinterpret_cast<const V*>(a + 16 * i * pa + kb);
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
+                if (sizeof(T) == 8 && tn() + 16 * j >= mb) break;
                 const V bv =
                     *reinterpret_cast<const V*>(b + 16 * j * ED_PITCH + kb);
 #pragma unroll
-                for (int i = 0; i < RI; ++i) dot(f.c[i][j], av[i], bv);
+                for (int i = 0; i < RI; ++i) {
+                    if (sizeof(T) == 8 && tm() + 16 * i >= ma) break;
+                    dot(f.c[i][j], av[i], bv);
+                }
             }
         }
     }
@@ -248,7 +255,7 @@ struct EdMma16 {
         return (threadIdx.x >> 5 & 3) * 32;
     }
     __device__ static void window(Frag& f, const unsigned char* a, int pa,
-                                  const unsigned char* b, int kn) {
+                                  const unsigned char* b, int kn, int, int) {
         const int lane = threadIdx.x & 31, nb = kn * (int)sizeof(E);
         a += wm() * pa + (lane & 15) * pa + (lane >> 4) * 16;
         b += wn() * ED_PITCH + ((lane & 7) + (lane >> 4 << 3)) * ED_PITCH +
@@ -415,13 +422,14 @@ struct EdCsrRows {
 // ---------------------------------------------------------------------------
 // One (A tile, B tile): the feature-window loop. With a_loaded the A rows
 // of every window already sit in sA (pitch pa); otherwise they stream with B.
+// ma x mb of the tile's rows are real, the rest padding.
 // ---------------------------------------------------------------------------
 template <class M, class L>
 __device__ __forceinline__ void edistance_tile(typename M::Frag& f, L& l,
                                                unsigned char* sA, int pa,
                                                unsigned char* sB,
                                                const int* rows, int kp,
-                                               bool a_loaded) {
+                                               bool a_loaded, int ma, int mb) {
     constexpr int KW = ED_WB / sizeof(typename M::E);
     M::zero(f);
     for (int w = 0; w * KW < kp; ++w) {
@@ -429,7 +437,7 @@ __device__ __forceinline__ void edistance_tile(typename M::Frag& f, L& l,
         l.load(sB, ED_PITCH, rows, M::TA, ED_TB, w);
         __syncthreads();
         M::window(f, a_loaded ? sA + w * ED_WB : sA, pa, sB,
-                  min(KW, kp - w * KW));
+                  min(KW, kp - w * KW), ma, mb);
         __syncthreads();
     }
 }
@@ -503,7 +511,8 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
                     for (int w = 0; w * KW < kp; ++w)
                         l.load(sA + w * ED_WB, pa, s_rows, 0, TA, w);
                 }
-                edistance_tile<M>(f, l, sA, pa, sB, s_rows, kp, a_resident);
+                edistance_tile<M>(f, l, sA, pa, sB, s_rows, kp, a_resident, ma,
+                                  mb);
                 T part[4] = {};
                 M::each(f, [&](int i, int j, int k, T v) {
                     const bool keep =
@@ -541,7 +550,7 @@ __global__ void __launch_bounds__(ED_THREADS, 1)
         L l = ld;
         typename M::Frag f;
         edistance_tile<M>(f, l, smem, ED_PITCH, smem + TA * ED_PITCH, s_rows,
-                          kp, false);
+                          kp, false, m, m);
         M::each(f, [&](int i, int j, int, typename M::Acc v) {
             if (i == j && i < m) norms[p0 + i] = v;
         });
