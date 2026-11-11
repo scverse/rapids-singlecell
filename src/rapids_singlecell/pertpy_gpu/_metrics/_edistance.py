@@ -90,8 +90,6 @@ def _center(X, precision: str, chunk: int = 0) -> tuple[cp.ndarray, float]:
     if chunk:  # one chunk stays on the device over the passes, more are uploaded again in each pass
         parts = list(chunks()) if m <= chunk else None
     elif cpsp.issparse(X):
-        if step > 1 and not all(a.flags.c_contiguous for a in (X.indptr, X.indices, X.data)):
-            X, step = X[::step], 1  # of a strided matrix only the sampled rows are copied
         parts = [(0, m, *map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)), X.has_sorted_indices, step)]
     else:
         parts = [(0, m, X, step)]
@@ -181,7 +179,8 @@ class _Source:
             stream.synchronize()
             if self.precision == "float16" and n and float(norms[0]) < 0:  # the kernels did not run
                 raise ValueError("precision='float16' needs compute capability 7.5 or newer; use precision='float32'.")
-            overflow = self.precision == "float16" and n > 0 and bool(cp.isinf(cp.nanmax(norms)))
+            # Beyond the float16 range a norm is inf; their sum tells without a warning for NaN cells
+            overflow = self.precision == "float16" and bool(cp.isinf(cp.nansum(norms)))
             n_sm = cp.cuda.runtime.deviceGetAttribute(cp.cuda.runtime.cudaDevAttrMultiProcessorCount, device_id)
         self._devices[device_id] = args, norms, n_sm, overflow
 
@@ -200,7 +199,7 @@ class _Source:
             stream = cp.cuda.get_current_stream()
             # Only the cells of this call count: their norms are read 2**16 at a time
             if overflow and any(
-                bool(cp.isinf(cp.nanmax(norms[cell_indices[i : i + (1 << 16)]])))
+                bool(cp.isinf(cp.nansum(norms[cell_indices[i : i + (1 << 16)]])))
                 for i in range(0, cell_indices.size, 1 << 16)
             ):
                 raise ValueError("The centered and scaled data exceeds the float16 range; use precision='float32'.")
