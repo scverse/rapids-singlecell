@@ -4,11 +4,12 @@ import cupy as cp
 import numpy as np
 import pytest
 import scanpy as sc
-from anndata.acc import A
 from scanpy.datasets import pbmc3k_processed
 
 import rapids_singlecell as rsc
 from testing.rapids_singlecell._helper import sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 

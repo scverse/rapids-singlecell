@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import pytest
-from anndata.acc import A
 from scanpy.datasets import pbmc3k_processed
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import rapids_singlecell as rsc
+
+A = pytest.importorskip("anndata.acc").A
 
 pytestmark = pytest.mark.filterwarnings("ignore:The function louvain is deprecated:FutureWarning")
 

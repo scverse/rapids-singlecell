@@ -8,13 +8,14 @@ import pandas as pd
 import pytest
 import scanpy as sc
 import scipy.sparse as sp
-from anndata.acc import A
 from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_host
 from testing.rapids_singlecell._helper import sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 

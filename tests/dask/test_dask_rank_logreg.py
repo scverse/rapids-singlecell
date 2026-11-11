@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import cupy as cp
 import pytest
-from anndata.acc import A
 from scanpy.datasets import pbmc3k_processed, pbmc68k_reduced
 
 import rapids_singlecell as rsc
@@ -10,6 +9,8 @@ from testing.rapids_singlecell._helper import (
     as_dense_cupy_dask_array,
     as_sparse_cupy_dask_array,
 )
+
+A = pytest.importorskip("anndata.acc").A
 
 
 def _compare_top_genes(result1, result2, top_n=10, min_overlap=9):

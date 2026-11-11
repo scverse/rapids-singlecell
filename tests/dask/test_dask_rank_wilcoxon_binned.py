@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from anndata.acc import A
 from scanpy.datasets import pbmc3k_processed, pbmc68k_reduced
 
 import rapids_singlecell as rsc
@@ -10,6 +9,8 @@ from testing.rapids_singlecell._helper import (
     as_dense_cupy_dask_array,
     as_sparse_cupy_dask_array,
 )
+
+A = pytest.importorskip("anndata.acc").A
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:wilcoxon_binned expects log-normalized data:UserWarning"),

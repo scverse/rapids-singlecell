@@ -548,7 +548,7 @@ def test_pca_deprecated_params():
         rsc.pp.pca(adata, n_comps=2, mask_var="highly_variable", out=A.obsm["m"])
     assert adata.uns["m"]["params"]["mask_var"] == "highly_variable"
     np.testing.assert_allclose(np.abs(adata.obsm["m"]), np.abs(adata.obsm["X_pca"]), atol=1e-5)
-    with pytest.raises(TypeError, match="either `mask` or `mask_var`"):
+    with pytest.warns(FutureWarning, match="mask_var"), pytest.raises(TypeError, match="either `mask` or `mask_var`"):
         rsc.pp.pca(adata, mask="var.highly_variable", mask_var="highly_variable")
 
 

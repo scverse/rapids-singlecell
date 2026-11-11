@@ -6,12 +6,13 @@ import numpy as np
 import pytest
 import scanpy as sc
 import scipy.sparse as sp
-from anndata.acc import A
 from scanpy.datasets import pbmc68k_reduced
 from scipy import stats
 
 import rapids_singlecell as rsc
 from testing.rapids_singlecell._helper import SC_USE_OUT, sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
@@ -651,7 +652,6 @@ def test_ttest_host_multi_gpu_matches_single(layout, reference):
 
 @pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
 def test_rank_genes_groups_use_out():
-
     adata = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
     adata.layers["x"] = adata.X.copy()
