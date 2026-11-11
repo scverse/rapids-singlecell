@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from functools import partial
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 
 import cupy as cp
 import numpy as np
@@ -10,16 +11,28 @@ from cupyx.scipy.sparse import issparse as cpissparse
 from cupyx.scipy.sparse import issparse as issparse_cupy
 from cupyx.scipy.sparse import isspmatrix_csr
 from scipy.sparse import issparse
+from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._keys import _embedding_keys
-from rapids_singlecell._settings import Default, Preset, resolve_default, settings
+from rapids_singlecell._settings import Default, settings
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
 )
-from rapids_singlecell.get import X_to_GPU, _check_mask, _get_obs_rep
+from rapids_singlecell.get import X_to_GPU, _check_mask, _get_arr
+from rapids_singlecell.get._out import (
+    DEPR_KEY_ADDED,
+    DEPR_USE,
+    _mask_arg,
+    _out_dests,
+    _ref_to_json,
+    _use_args,
+    _use_to_uns,
+    _write_dests,
+    deprecated_copy,
+)
 
 from ._utils import _check_gpu_X
 
@@ -27,28 +40,58 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from rapids_singlecell._utils import ArrayTypesDask
+    from rapids_singlecell.get._utils import AdRef, LayerAcc, MultiAcc
 
 _empty = Default(repr="adata.var.get('highly_variable')")
 
 
+class PcaResult(NamedTuple):
+    """Outputs of :func:`~rapids_singlecell.pp.pca`."""
+
+    embedding: Any
+    """PCA representation of the observations, shape `(n_obs, n_comps)`."""
+    loadings: Any
+    """Principal components, shape `(n_vars, n_comps)` (rows outside `mask` are zero)."""
+
+
+class PcaOut(TypedDict, total=False):
+    """Where a mapping `out` of :func:`~rapids_singlecell.pp.pca` writes each output."""
+
+    embedding: MultiAcc | str
+    loadings: MultiAcc | str
+
+
+def _pca_dests(key: str | Default | None, *, multi: bool) -> PcaResult:
+    keys = _embedding_keys("pca", key)
+    return PcaResult({"obsm": keys.obsm}, None if multi else {"varm": keys.varm})
+
+
 @_accepts_legacy_random_state(0)
+@deprecated_arg("mask_var", Deprecation("0.19.0", "Use `mask` instead."))
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_copy
 def pca(
     data: AnnData | ArrayTypesDask,
     n_comps: int | None = None,
     *,
-    layer: str = None,
+    use: LayerAcc | MultiAcc | str | None = None,
     zero_center: bool = True,
     svd_solver: str | None = None,
     rng: SeedLike | RNGLike | None = None,
-    mask_var: NDArray[np.bool] | str | Default | None = _empty,
+    mask: NDArray[np.bool] | AdRef | str | Default | None = _empty,
     dtype: str = "float32",
     chunked: bool = False,
     chunk_size: int = None,
-    key_added: str | Default | None = Default(("pca", "key_added")),
     return_info: bool = False,
+    out: MultiAcc | str | PcaOut | bool = False,
+    # deprecated
+    key_added: str | None = None,
+    layer: str | None = None,
     copy: bool = False,
+    mask_var: NDArray[np.bool] | str | None = None,
     **kwargs,
-) -> None | AnnData | ArrayTypesDask:
+) -> None | AnnData | PcaResult | ArrayTypesDask:
     r"""Principal component analysis using GPU acceleration :cite:p:`Halko2009,Tomas2024`.
 
     Uses the following implementations based on data type (defaults for `svd_solver` in parentheses):
@@ -84,8 +127,9 @@ def pca(
         Number of principal components to compute. Defaults to 50, or 1 - minimum
         dimension size of selected representation.
 
-    layer
-        If provided, use `adata.layers[layer]` for expression values instead of `adata.X`.
+    use
+        Which matrix to run PCA on, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
 
     zero_center
         If `True`, compute standard PCA from covariance matrix.
@@ -117,11 +161,10 @@ def pca(
         Random seed or :class:`~numpy.random.Generator` for initialization.
         The superseded `random_state` argument is still accepted.
 
-    mask_var
-        Mask to use for the PCA computation.
-        If `None`, all variables are used.
-        If `np.ndarray`, use the provided mask.
-        If `str`, use the mask stored in `adata.var[mask_var]`.
+    mask
+        To run only on a certain set of genes, given by a boolean array or a reference like
+        `A.var['selected']`. Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'var.selected'`.
+        By default, uses `.var['highly_variable']` if available, else everything.
 
     dtype
         Numpy data type string to which to convert the result.
@@ -135,23 +178,19 @@ def pca(
         Number of observations to include in each chunk.
         Required if `chunked=True` was passed.
 
-    key_added
-        If not specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\ `['X_pca']`, the loadings as
-        :attr:`~anndata.AnnData.varm`\ `['PCs']`, and the parameters in
-        :attr:`~anndata.AnnData.uns`\ `['pca']`.
-        If specified, the embedding is stored as
-        :attr:`~anndata.AnnData.obsm`\ `[key_added]`, the loadings as
-        :attr:`~anndata.AnnData.varm`\ `[key_added]`, and the parameters in
-        :attr:`~anndata.AnnData.uns`\ `[key_added]`.
-
     return_info
         Only relevant when passing a matrix instead of an
         :class:`~anndata.AnnData`: see "Returns".
 
-    copy
-        Whether to return a copy or update `data`. Only applies to
-        :class:`~anndata.AnnData` input.
+    out
+        Where to write the outputs. A single accessor writes `embedding` to it and names the
+        others after its key `k`, e.g. `out=A.obsm['k']` writes `.varm['k']` and `.uns['k']`.
+        A mapping (:class:`~rapids_singlecell.pp.PcaOut`) writes only the outputs it names,
+        e.g. `{'embedding': A.obsm['pca']}`; it has to include `embedding`, after which the `.uns`
+        entry is named. If `True`, they are returned as a :class:`~rapids_singlecell.pp.PcaResult`
+        (without the `.uns` entry). If `False`, they are written to `.obsm['X_pca']` and
+        `.varm['PCs']` (`'pca'` under the v2 preset). If `use` points to `.obsm`, the loadings
+        are stored in the `.uns` entry instead.
 
     **kwargs
         Additional arguments for specific SVD solvers.
@@ -166,15 +205,16 @@ def pca(
     -------
         If a matrix is passed and `return_info=False`, the PCA representation is returned. If a matrix is passed and `return_info=True`, a tuple of ``(X_pca, components, variance_ratio, variance)`` is returned.
 
-        If an AnnData object is passed, adds fields to `adata`:
+        If an AnnData object is passed, returns a :class:`~rapids_singlecell.pp.PcaResult` if `out=True`,
+        else `None`. By default sets (see `out` for others):
 
-            `.obsm['X_pca' | key_added]`
+            `.obsm['X_pca']`
                 PCA representation of data.
-            `.varm['PCs' | key_added]`
+            `.varm['PCs']`
                 The principal components containing the loadings.
-            `.uns['pca' | key_added]['variance_ratio']`
+            `.uns['pca']['variance_ratio']`
                 Ratio of explained variance.
-            `.uns['pca' | key_added]['variance']`
+            `.uns['pca']['variance']`
                 Explained variance, equivalent to the eigenvalues of the covariance matrix.
     """
     if "use_highly_variable" in kwargs:
@@ -183,11 +223,12 @@ def pca(
     rng = np.random.default_rng(rng)
 
     if not isinstance(data, AnnData):
-        if layer is not None:
-            raise ValueError("`layer` can only be used with an AnnData object.")
+        if layer is not None or use is not None or out is not False:
+            raise ValueError("`use` and `out` can only be used with an AnnData object.")
         X = data
-        mask_var = None if isinstance(mask_var, Default) else _check_mask(X, mask_var, "var")
-        X = X[:, mask_var] if mask_var is not None else X
+        mask = _mask_arg(mask, mask_var, dim="var")
+        mask = None if isinstance(mask, Default) else _check_mask(X, mask, "var")
+        X = X[:, mask] if mask is not None else X
         pca_func, X_pca, _ = _pca_compute(
             X,
             n_comps,
@@ -209,23 +250,26 @@ def pca(
         return X_pca
 
     adata = data
-    key_added = resolve_default(key_added)
-    if copy:
-        adata = adata.copy()
+    src = _use_args(use, layer=layer)
+    multi = "obsm" in src  # `.obsm` columns aren't variables, so the loadings can't go to `.varm`
+    dests = _out_dests(
+        out,
+        key_added,
+        dests=partial(_pca_dests, multi=multi),
+        kinds=PcaResult({"obsm"}, {"varm"}),
+        uns=True,
+        default=Default(),
+    )
+    mask = _mask_arg(mask, mask_var, dim="var")
+    if multi and not isinstance(mask, Default) and mask is not None:
+        raise ValueError("Argument `mask` is incompatible with `.obsm` arrays.")
 
-    X = _get_obs_rep(adata, layer=layer)
+    X = _get_arr(adata, dim="obs", **src)
 
-    if isinstance(mask_var, Default):
-        if "highly_variable" not in adata.var.columns:
-            mask_var = None
-        elif settings.preset is Preset.ScanpyV2Preview:
-            mask_var = "var.highly_variable"
-        else:
-            mask_var = "highly_variable"
-
-    # Keep the recorded param as the column name for strings, else None.
-    mask_var_param = mask_var if isinstance(mask_var, str) else None
-    mask_var = _check_mask(adata, mask_var, "var")
+    if isinstance(mask, Default):
+        hvg = not multi and "highly_variable" in adata.var.columns
+        mask = _mask_arg(None, "highly_variable", dim="var") if hvg else None
+    mask_param, mask_var = _ref_to_json(mask), _check_mask(adata, mask, "var")
     X = X[:, mask_var] if mask_var is not None else X
 
     pca_func, X_pca, n_comps = _pca_compute(
@@ -240,25 +284,26 @@ def pca(
         kwargs=kwargs,
     )
 
-    keys = _embedding_keys("pca", key_added)
-    adata.obsm[keys.obsm] = X_pca
-    adata.uns[keys.uns] = {
+    loadings = _as_numpy(pca_func.components_.T)
+    if mask_var is not None:
+        loadings = np.zeros(shape=(adata.n_vars, n_comps))
+        loadings[mask_var] = _as_numpy(pca_func.components_.T)
+    vals = PcaResult(X_pca, loadings)
+    if dests is True:
+        return vals
+    key, dests = dests
+    adata.uns[_embedding_keys("pca", key).uns] = {
         "params": {
             "zero_center": zero_center,
-            "mask_var": mask_var_param,
+            "mask_var": mask_param,
             **({"layer": layer} if layer is not None else {}),
+            **_use_to_uns(use, rep=False),
         },
         "variance": _as_numpy(pca_func.explained_variance_),
         "variance_ratio": _as_numpy(pca_func.explained_variance_ratio_),
+        **({"components": loadings} if multi else {}),
     }
-    if mask_var is not None:
-        adata.varm[keys.varm] = np.zeros(shape=(adata.n_vars, n_comps))
-        adata.varm[keys.varm][mask_var] = _as_numpy(pca_func.components_.T)
-    else:
-        adata.varm[keys.varm] = _as_numpy(pca_func.components_.T)
-
-    if copy:
-        return adata
+    _write_dests(adata, vals, dests)
     return None
 
 

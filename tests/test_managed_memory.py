@@ -72,7 +72,7 @@ def test_scale(managed_memory, sparse):
 
 def test_qc_metrics(managed_memory):
     adata = _make_adata(sparse=True)
-    rsc.pp.calculate_qc_metrics(adata, log1p=False)
+    rsc.pp.calculate_qc_metrics(adata, log1p=False, out=False)
     assert "total_counts" in adata.obs.columns
     assert "n_genes_by_counts" in adata.obs.columns
 

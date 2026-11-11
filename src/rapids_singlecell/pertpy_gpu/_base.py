@@ -10,7 +10,9 @@ from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
 
 from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
+from rapids_singlecell._settings import Preset
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
+from rapids_singlecell.get._out import own_deprecations
 from rapids_singlecell.tools._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -226,7 +228,7 @@ class PerturbationEfficacyAnalyzer:
             group_labels = np.where(split_mask, pert_str, _DE_IGNORE_LABEL)
             adata.obs[group_key] = pd.Categorical(group_labels)
             try:
-                with warnings.catch_warnings():
+                with warnings.catch_warnings(), own_deprecations():
                     warnings.simplefilter("ignore", RuntimeWarning)
                     rank_genes_groups(
                         adata,
@@ -286,8 +288,10 @@ def _choose_representation_gpu(adata: AnnData, *, use_rep: str | None, n_pcs: in
             raise
         from rapids_singlecell.preprocessing import pca
 
-        key_added = None if pca_keys == _embedding_keys("pca", None) else pca_keys.obsm
-        pca(adata, n_comps=n_pcs, key_added=key_added)
+        # a `Preset` as `key_added` gives its key names (`uns` too) without needing `anndata.acc`
+        key_added = Preset.ScanpyV1 if pca_keys == _embedding_keys("pca", None) else pca_keys.obsm
+        with own_deprecations():
+            pca(adata, n_comps=n_pcs, key_added=key_added)
         rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     rep = _to_dense_gpu(rep)
     rep = cp.asarray(rep, dtype=cp.float32)

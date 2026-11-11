@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
 from warnings import warn
 
 import cupy as cp
 import numpy as np
+from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._utils._random import (
     RNGLike,
@@ -13,6 +14,17 @@ from rapids_singlecell._utils._random import (
     _accepts_legacy_random_state,
     _LegacyRng,
 )
+from rapids_singlecell.get._out import (
+    DEPR_KEY_ADDED,
+    _key,
+    _out_dests,
+    _resolve,
+    _resolve_obs,
+    _use_to_uns,
+    _write_dests,
+    deprecated_copy,
+)
+from rapids_singlecell.get._utils import _get_vec, _to_numpy_1d
 from rapids_singlecell.preprocessing._neighbors._helper import (
     _check_metrics,
     _check_neighbors_X,
@@ -27,7 +39,7 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _connectivities_to_host_csr,
     _Metrics,
 )
-from rapids_singlecell.preprocessing._neighbors._wnn import wnn
+from rapids_singlecell.preprocessing._neighbors._wnn import WnnResult, wnn
 from rapids_singlecell.tools._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -35,27 +47,71 @@ if TYPE_CHECKING:
 
     from anndata import AnnData
 
+    from rapids_singlecell.get._utils import AdRef, GraphAcc, LayerAcc, MultiAcc
+
 _Algorithms_bbknn = Literal["brute", "cagra", "ivfflat", "ivfpq", "mg_ivfflat", "mg_ivfpq"]
 
 _DEFAULT_SEED = 0
 
 
+class NeighborsResult(NamedTuple):
+    """Outputs of :func:`~rapids_singlecell.pp.neighbors` and :func:`~rapids_singlecell.pp.bbknn`."""
+
+    connectivities: Any
+    """Weighted adjacency matrix of the neighborhood graph."""
+    distances: Any
+    """Distances to each observation's nearest neighbors."""
+
+
+class NeighborsOut(TypedDict, total=False):
+    """Where a mapping `out` of :func:`~rapids_singlecell.pp.neighbors` writes each output."""
+
+    connectivities: GraphAcc | str
+    distances: GraphAcc | str
+
+
+def _neighbors_dests(key_added: str | None) -> NeighborsResult:
+    prefix = "" if key_added is None else f"{key_added}_"
+    return NeighborsResult({"obsp": f"{prefix}connectivities"}, {"obsp": f"{prefix}distances"})
+
+
+def _neighbors_out(out, key_added):
+    return _out_dests(out, key_added, dests=_neighbors_dests, kinds=NeighborsResult({"obsp"}, {"obsp"}), uns=True)
+
+
+def _store_neighbors(adata: AnnData, dests, vals: tuple, params: dict) -> tuple | None:
+    """Write the graphs to `dests` (from `_out_dests`), and the `.uns` entry naming them."""
+    if dests is True:
+        return vals
+    key, dests = dests
+    entry = {f"{name}_key": _key(d) for name, d in zip(vals._fields, dests, strict=True) if d is not None}
+    adata.uns[key or "neighbors"] = entry | {"params": params}
+    _write_dests(adata, vals, dests)
+    return None
+
+
 @_accepts_legacy_random_state(_DEFAULT_SEED)
+@deprecated_arg("use_rep", Deprecation("0.19.0", "Use `use` instead."))
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_copy
 def neighbors(
     adata: AnnData,
     n_neighbors: int = 15,
     n_pcs: int | None = None,
     *,
-    use_rep: str | None = None,
+    use: LayerAcc | MultiAcc | str | None = None,
     rng: SeedLike | RNGLike | None = None,
     algorithm: _Algorithms = "brute",
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
     algorithm_kwds: Mapping[str, Any] = MappingProxyType({}),
     method: Literal["umap", "gauss", "jaccard"] = "umap",
+    out: GraphAcc | str | NeighborsOut | bool = False,
+    # deprecated
+    use_rep: str | None = None,
     key_added: str | None = None,
     copy: bool = False,
-) -> AnnData | None:
+) -> AnnData | NeighborsResult | None:
     """Compute a neighborhood graph of observations :cite:p:`Ootomo2024`.
 
     The neighbor search efficiency of this heavily relies on cuVS,
@@ -72,13 +128,12 @@ def neighbors(
         global views of the manifold, while smaller values result in more local
         data being preserved. In general values should be in the range 2 to 100.
     n_pcs
-        Use this many PCs. If `n_pcs==0` use `.X` if `use_rep is None`.
-    use_rep
-        Use the indicated representation. `'X'` or any key for `.obsm` is valid.
-        If None, the representation is chosen automatically: For .n_vars < 50, .X
-        is used, otherwise the PCA embedding, under whichever key the active
-        ``rapids_singlecell.settings.preset`` uses. If no PCA embedding is
-        present, it's computed with default parameters or `n_pcs` if present.
+        Use this many PCs. If `n_pcs==0` use `.X` if `use is None`.
+    use
+        The representation to use, e.g. `A.obsm['pca']` or `A.X`.
+        Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsm.pca'`.
+        If `None`, `.X` is used for `.n_vars < 50`, otherwise the PCA embedding
+        (under the key the active ``rapids_singlecell.settings.preset`` uses), computed if missing.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -163,22 +218,18 @@ def neighbors(
         * 'n_probes': Number of lists to probe during search. Default is 20. Higher values
           increase accuracy but reduce speed.
 
-    key_added
-        If not specified, the neighbors data is stored in .uns['neighbors'],
-        distances and connectivities are stored in .obsp['distances'] and
-        .obsp['connectivities'] respectively.
-        If specified, the neighbors data is added to .uns[key_added],
-        distances are stored in .obsp[key_added+'_distances'] and
-        connectivities in .obsp[key_added+'_connectivities'].
-    copy
-        Return a copy instead of writing to adata.
+    out
+        Where to write the graphs. A single accessor `A.obsp['k']` writes the connectivities to `.obsp['k']`,
+        the distances to `.obsp['k_distances']` and the metadata to `.uns['k']`.
+        A mapping (:class:`~rapids_singlecell.pp.NeighborsOut`) writes only the matrices it names,
+        e.g. `{'connectivities': A.obsp['conns']}`.
+        If `True`, they are returned as a :class:`~rapids_singlecell.pp.NeighborsResult`.
+        If `False`, they are written to `.obsp['connectivities']`, `.obsp['distances']` and `.uns['neighbors']`.
 
     Returns
     -------
-    Depending on `copy`, updates or returns `adata` with the following:
-
-    See `key_added` parameter description for the storage path of
-    connectivities and distances.
+    A :class:`~rapids_singlecell.pp.NeighborsResult` if `out=True`, else `None`.
+    See `out` for where these are written:
 
         **connectivities** : sparse matrix of dtype `float32`.
             Weighted adjacency matrix of the neighborhood graph of data
@@ -200,15 +251,15 @@ def neighbors(
         )
         meta_random_state.pop("random_state", None)
 
-    adata = adata.copy() if copy else adata
-
+    use = _resolve_obs(use)
+    dests = _neighbors_out(out, key_added)
     if adata.is_view:
         adata._init_as_actual(adata.copy())
 
     if algorithm not in get_args(_Algorithms):
         raise ValueError(f"Invalid algorithm '{algorithm}' for KNN. Valid options are: {get_args(_Algorithms)}.")
 
-    X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+    X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs, use=use)
     X_contiguous = _check_neighbors_X(X, algorithm)
     _check_metrics(algorithm, metric)
 
@@ -231,7 +282,7 @@ def neighbors(
         metric=metric,
         **({"metric_kwds": metric_kwds} if metric_kwds else {}),
         **({"algorithm_kwds": algorithm_kwds} if algorithm_kwds else {}),
-        **({"use_rep": use_rep} if use_rep is not None else {}),
+        **({"use_rep": use_rep} if use_rep is not None else _use_to_uns(use, rep=True)),
         **({"n_pcs": n_pcs} if n_pcs is not None else {}),
     )
 
@@ -247,44 +298,34 @@ def neighbors(
         metric=metric,
     )
     connectivities = _connectivities_to_host_csr(connectivities)
-
-    # Store results
-    neighbors_key = key_added if key_added is not None else "neighbors"
-    if neighbors_key == "neighbors":
-        conns_key = "connectivities"
-        dists_key = "distances"
-    else:
-        conns_key = neighbors_key + "_connectivities"
-        dists_key = neighbors_key + "_distances"
-
-    adata.uns[neighbors_key] = {
-        "connectivities_key": conns_key,
-        "distances_key": dists_key,
-        "params": params,
-    }
-    adata.obsp[dists_key] = distances
-    adata.obsp[conns_key] = connectivities
-
-    return adata if copy else None
+    return _store_neighbors(adata, dests, NeighborsResult(connectivities, distances), params)
 
 
 @_accepts_legacy_random_state(_DEFAULT_SEED)
+@deprecated_arg("batch_key", Deprecation("0.19.0", "Use `batches` instead, e.g. `batches=A.obs['b']`."))
+@deprecated_arg("use_rep", Deprecation("0.19.0", "Use `use` instead."))
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_copy
 def bbknn(
     adata: AnnData,
     neighbors_within_batch: int = 3,
     n_pcs: int | None = None,
     *,
-    batch_key: str | None = None,
-    use_rep: str | None = None,
+    batches: AdRef | str | None = None,
+    use: LayerAcc | MultiAcc | str | None = None,
     rng: SeedLike | RNGLike | None = None,
     algorithm: _Algorithms_bbknn = "brute",
     metric: _Metrics = "euclidean",
     metric_kwds: Mapping[str, Any] = MappingProxyType({}),
     algorithm_kwds: Mapping[str, Any] = MappingProxyType({}),
     trim: int | None = None,
+    out: GraphAcc | str | NeighborsOut | bool = False,
+    # deprecated
+    batch_key: str | None = None,
+    use_rep: str | None = None,
     key_added: str | None = None,
     copy: bool = False,
-) -> AnnData | None:
+) -> AnnData | NeighborsResult | None:
     """Batch balanced KNN :cite:p:`Polanski2019`.
 
     Batch balanced KNN alters the KNN procedure to identify each cell's top neighbours in
@@ -303,14 +344,11 @@ def bbknn(
         the number of batches. This then serves as the basis for the construction
         of a symmetrical matrix of connectivities.
     n_pcs
-        Use this many PCs. If `n_pcs==0` and `use_rep is None`, use `.X`.
-    batch_key
-        Key in `adata.obs` containing the batch labels to balance. Required.
-    use_rep
-        Use the indicated representation. `'X'` or any key for `.obsm` is valid.
-        If `None`, the representation is chosen automatically: For `.n_vars < 50`, `.X`
-        is used, otherwise `'X_pca'` is used. If `'X_pca'` is not present, it's
-        computed with default parameters or `n_pcs` if present.
+        Use this many PCs. If `n_pcs==0` and `use is None`, use `.X`.
+    batches
+        The batch labels to balance, e.g. `A.obs['batch']` (or `'obs.batch'`). Required.
+    use
+        The representation to use, see :func:`~rapids_singlecell.pp.neighbors`.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
         The superseded `random_state` argument is still accepted.
@@ -364,19 +402,13 @@ def bbknn(
         If `None`, sets the parameter value automatically to
         10 times `neighbors_within_batch` times the number of batches.
         Set to 0 to skip.
-    key_added
-        If not specified, the neighbors data is stored in `.uns['neighbors']`,
-        distances and connectivities are stored in `.obsp['distances']` and
-        `.obsp['connectivities']` respectively.
-        If specified, the neighbors data is added to `.uns[key_added]`,
-        distances are stored in `.obsp[f'{key_added}_distances']` and
-        connectivities in `.obsp[f'{key_added}_connectivities']`.
-    copy
-        Return a copy instead of writing to adata.
+    out
+        Where to write the graphs, see :func:`~rapids_singlecell.pp.neighbors`.
 
     Returns
     -------
-    Depending on `copy`, updates or returns `adata` with the following:
+    A :class:`~rapids_singlecell.pp.NeighborsResult` if `out=True`, else `None`.
+    See `out` for where these are written:
 
     connectivities : sparse matrix of dtype `float32`.
         Weighted adjacency matrix of the neighborhood graph of data
@@ -384,33 +416,35 @@ def bbknn(
     distances : sparse matrix of dtype `float32`.
         Instead of decaying weights, this stores distances for each pair of
         neighbors.
-
-    See `key_added` parameter description for the storage path of
-    connectivities and distances.
     """
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
-    if batch_key is None:
-        raise ValueError("Please provide a batch key to perform batch-balanced KNN.")
-
-    if batch_key not in adata.obs:
-        raise ValueError(f"Batch key '{batch_key}' not present in `adata.obs`.")
+    if batch_key is not None:
+        if batches is not None:
+            raise TypeError("Pass either `batches` or `batch_key`, not both.")
+        if batch_key not in adata.obs:
+            raise ValueError(f"Batch key '{batch_key}' not present in `adata.obs`.")
+        batch_array = adata.obs[batch_key].to_numpy()
+    elif batches is None:
+        raise ValueError("Please provide `batches` to perform batch-balanced KNN.")
+    else:
+        batch_array = np.asarray(_to_numpy_1d(_get_vec(adata, _resolve(batches, vec=True), dim="obs")))
+    use = _resolve_obs(use)
+    dests = _neighbors_out(out, key_added)
 
     if algorithm not in get_args(_Algorithms_bbknn):
         raise ValueError(
             f"Invalid algorithm '{algorithm}' for batch-balanced KNN. Valid options are: {get_args(_Algorithms_bbknn)}."
         )
-    adata = adata.copy() if copy else adata
     if adata.is_view:
         adata._init_as_actual(adata.copy())
 
-    X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+    X = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs, use=use)
     X_contiguous = _check_neighbors_X(X, algorithm)
     _check_metrics(algorithm, metric)
 
     n_obs = adata.shape[0]
-    batch_array = adata.obs[batch_key].values
     unique_batches = np.unique(batch_array)
     total_neighbors = neighbors_within_batch * len(unique_batches)
     knn_dist = cp.zeros((X.shape[0], total_neighbors), dtype=np.float32)
@@ -457,7 +491,7 @@ def bbknn(
         trim=trim,
         **({"metric_kwds": metric_kwds} if metric_kwds else {}),
         **({"algorithm_kwds": algorithm_kwds} if algorithm_kwds else {}),
-        **({"use_rep": use_rep} if use_rep is not None else {}),
+        **({"use_rep": use_rep} if use_rep is not None else _use_to_uns(use, rep=True)),
         **({"n_pcs": n_pcs} if n_pcs is not None else {}),
     )
 
@@ -478,22 +512,4 @@ def bbknn(
         if trim > 0:
             connectivities = _trimming(connectivities, trim)
         connectivities = connectivities.get()
-
-    # Store results
-    neighbors_key = key_added if key_added is not None else "neighbors"
-    if neighbors_key == "neighbors":
-        conns_key = "connectivities"
-        dists_key = "distances"
-    else:
-        conns_key = neighbors_key + "_connectivities"
-        dists_key = neighbors_key + "_distances"
-
-    adata.uns[neighbors_key] = {
-        "connectivities_key": conns_key,
-        "distances_key": dists_key,
-        "params": params,
-    }
-    adata.obsp[dists_key] = distances
-    adata.obsp[conns_key] = connectivities
-
-    return adata if copy else None
+    return _store_neighbors(adata, dests, NeighborsResult(connectivities, distances), params)

@@ -1,6 +1,19 @@
 from __future__ import annotations
 
 from .preprocessing import (
+    NeighborsOut,
+    NeighborsResult,
+    NormalizeTotalOut,
+    NormalizeTotalResult,
+    PcaOut,
+    PcaResult,
+    QcMetricsOut,
+    QcMetricsResult,
+    ScaleOut,
+    ScaleResult,
+    ScrubletOut,
+    ScrubletResult,
+    WnnResult,
     bbknn,
     calculate_qc_metrics,
     dsb,
@@ -29,6 +42,19 @@ from .preprocessing import (
 )
 
 __all__ = [
+    "NeighborsOut",
+    "NeighborsResult",
+    "NormalizeTotalOut",
+    "NormalizeTotalResult",
+    "PcaOut",
+    "PcaResult",
+    "QcMetricsOut",
+    "QcMetricsResult",
+    "ScaleOut",
+    "ScaleResult",
+    "ScrubletOut",
+    "ScrubletResult",
+    "WnnResult",
     "bbknn",
     "calculate_qc_metrics",
     "dsb",
@@ -49,6 +75,9 @@ __all__ = [
     "sqrt",
     "wnn",
 ]
+
+# `out=True` results and `out` mappings have no public members beyond their fields.
+__api_members__: dict[str, list[str]] = {n: [] for n in __all__ if n[0].isupper()}
 
 __deprecated_exports__ = {
     "filter_highly_variable": "Deprecated; do not use in new analyses.",
