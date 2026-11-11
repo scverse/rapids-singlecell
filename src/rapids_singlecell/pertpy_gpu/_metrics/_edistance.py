@@ -39,73 +39,92 @@ _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
 _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
+_SAMPLE_CHUNK = 1 << 18  # values a chunk of sampled host rows holds at least (1 MiB of float32)
 
 
-def _sample(X):
-    """Strided rows of ``X`` the center is estimated from, at most 2**25 values."""
-    n, d = X.shape
-    rows = max(1, min(_SAMPLE_ROWS, 2**25 // max(d, 1)))
-    return X[:: max(1, -(-n // rows))]
+def _float_dtype(dtype) -> np.dtype:
+    """The dtype the kernels read data of dtype in: float32 or float64 in native byte order."""
+    dtype = np.dtype(dtype).newbyteorder("=")
+    return dtype if dtype in (np.float32, np.float64) else np.dtype(np.float32)
 
 
-def _canonical(X):
-    """CSR ``X`` with sorted columns and summed duplicates; the caller's matrix is not changed."""
-    if not X.has_canonical_format:
-        # a copy without the cached flags: sorting is most often all it needs, summing goes through COO
-        X = cpsp.csr_matrix((X.data, X.indices, X.indptr), shape=X.shape, copy=True)
-        X.sort_indices()
-        X.sum_duplicates()
-    return X
+def _rows(a) -> cp.ndarray:
+    """Dense rows on the device as the kernels read them: C-contiguous float32 or float64."""
+    a = a.astype(_float_dtype(a.dtype), copy=False)  # converted where the array lives, then uploaded
+    return cp.asarray(a, order="C")
 
 
-def _center(sample, dtype, precision: str) -> tuple[cp.ndarray, float]:
+def _center(X, precision: str, chunk: int = 0) -> tuple[cp.ndarray, float]:
     """Shift ``nm`` and scale ``sc`` of the rows ``x * sc + nm`` the kernels compute on.
 
     The kernels get a distance from ``|a|² + |b|² - 2ab``, which needs centered
     rows to be accurate, and float16 needs them scaled into its range. The mean
-    is taken over ``sample`` without its outlier rows; ``sc`` is the power of
-    two (exact to undo) that puts the largest centered sample value in
-    ``[2**10, 2**11)`` and ``nm = -mean * sc``. ``sample`` comes from all cells
-    of the input, not the ones a call loads, so a distance does not depend on
-    which other groups are computed with it. A CSR sample is read through its
-    stored values only and gives the ``nm`` and ``sc`` of the same dense rows.
+    is taken over a sample of rows without its outlier rows; ``sc`` is the power
+    of two (exact to undo) that puts the largest centered sample value in
+    ``[2**10, 2**11)`` and ``nm = -mean * sc``. The sample is at most
+    ``_SAMPLE_ROWS`` strided rows (2**25 values) of all cells of the input, not
+    the ones a call loads, so a distance does not depend on which other groups
+    are computed with it.
+
+    The kernel reads the sampled rows where they are: C-contiguous float32 or
+    float64 device rows, or a device CSR matrix (columns sorted or not, in its
+    own index dtype), whose stored values give the ``nm`` and ``sc`` of the
+    same dense rows. With ``chunk``, ``X`` is any dense array whose sampled rows
+    go to the device ``chunk`` rows at a time.
     """
-    d = sample.shape[1]
-    sparse = cpsp.issparse(sample)
-    if sparse:  # canonical CSR: the zeros stay implicit
-        row, col, v = sample.tocoo().row, sample.indices, sample.data
-        r = cp.zeros(sample.shape[0], dtype=v.dtype)
-        bits = np.dtype(f"u{v.itemsize}")  # |values| order like their bit patterns, a NaN of either sign last
-        cp.maximum.at(r.view(bits), row, cp.abs(v).view(bits))
+    n, d = X.shape
+    dtype = _float_dtype(X.dtype)
+    step = max(1, -(-n // max(1, min(_SAMPLE_ROWS, 2**25 // max(d, 1)))))
+    m = -(-n // step)
+    stream = cp.cuda.get_current_stream()
+    r, keep = cp.zeros(m, dtype=dtype), cp.zeros(m, dtype=bool)
+    total, ext = cp.zeros(d, dtype=cp.float64), cp.zeros((2, d), dtype=dtype)
+    spare = -(-(r.nbytes + keep.nbytes + total.nbytes + ext.nbytes) // max(d * dtype.itemsize, 1))
+    if chunk and chunk < m + spare:  # the vectors above count against the chunk: both stay within the subset's bytes
+        chunk = max(1, chunk - spare)
+
+    def chunks():  # sampled rows lo to hi and the arguments that read them
+        for lo in range(0, m, chunk):
+            yield lo, min(m, lo + chunk), _rows(X[lo * step : (lo + chunk) * step : step]), 1
+
+    if chunk:  # one chunk stays on the device over the passes, more are uploaded again in each pass
+        parts = list(chunks()) if m <= chunk else None
+    elif cpsp.issparse(X):
+        if step > 1 and not all(a.flags.c_contiguous for a in (X.indptr, X.indices, X.data)):
+            X, step = X[::step], 1  # of a strided matrix only the sampled rows are copied
+        parts = [(0, m, *map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)), X.has_sorted_indices, step)]
     else:
-        v = cp.asarray(sample, dtype=dtype)
-        r = cp.abs(v).max(1) if d else cp.zeros(len(v), dtype=dtype)
-    # r is the largest |value| of a row. Left out: rows with a non-finite value or above _TRIM times the median row
-    ref = r[(r > 0) & (r < cp.inf)]
-    keep = (r < cp.inf) & (r / _TRIM <= (cp.median(ref) if len(ref) else 0.0))
-    n_kept = int(keep.sum())
-    if n_kept < len(r):  # the usual sample keeps every row and is not copied
-        k = keep[row] if sparse else cp.flatnonzero(keep)
-        col, v = (col[k] if sparse else None), v[k]
-    row = k = None  # the row indices are not needed again
-    if sparse and not v.size:  # no stored value in a kept row
-        sparse, v = False, cp.zeros((0, d), dtype=dtype)
+        parts = [(0, m, X, step)]
+
+    def run(what, shift=0):
+        for lo, hi, *reader in parts or chunks():
+            _ed.center(*reader, what, shift, keep[lo:hi], ext, r[lo:hi], total, stream=stream.ptr)
+            stream.synchronize()  # a chunk stays referenced until its kernel has finished
+            del reader  # and is freed before the next one is uploaded
+
+    run(0)  # r = the largest |value| of each row
+    # Left out: rows with a non-finite value or above _TRIM times the median row (picked on the host)
+    big = r.get()
+    ref = big[(big > 0) & (big < np.inf)]
+    kept = (big < np.inf) & (big / _TRIM <= (np.median(ref) if len(ref) else 0.0))
+    keep.set(kept)
+    n_kept = int(kept.sum())
     # The column sums add integers, exact in float64 in any order: dense and CSR input get the same mean
     shift = min(np.finfo(dtype).nmant, 52 - _SAMPLE_ROWS.bit_length())
-    shift -= math.frexp(float(cp.where(keep, r, 0).max()))[1] if n_kept else 0
-    q = cp.ldexp(v, shift)
-    cp.rint(q, out=q)
-    total = cp.bincount(col, weights=q, minlength=d) if sparse else q.sum(0, dtype=cp.float64)
-    mu = cp.ldexp(total / max(n_kept, 1), -shift).astype(dtype)
-    cp.abs(cp.subtract(v, mu[col] if sparse else mu, out=q), out=q)
-    top = float(q.max()) if q.size else 0.0
-    if sparse:  # a column with fewer stored values than kept rows holds a zero
-        stored = cp.zeros(d, dtype=np.int32)
-        cp.add.at(stored, col, 1)
-        top = max(top, float(cp.where(stored < n_kept, cp.abs(mu), 0).max()))
+    shift -= math.frexp(float(big[kept].max()))[1] if n_kept else 0
+    run(1, shift)  # total = the column sums of rint(value * 2**shift) over the kept rows, ext = their column extremes
+    total /= max(n_kept, 1)
+    mu = cp.ldexp(total, -shift, out=total).astype(dtype, copy=False)
+    top = cp.zeros(2, dtype=dtype)  # the largest |value - mu| of the kept rows: at a column's largest or smallest value
+    if n_kept:
+        _ed.center(ext, mu, 1, 0, 0, keep, ext, top, total, stream=stream.ptr)
+    top = float(top.max())  # reading it waits for the kernel
+    total = ext = r = keep = None  # not held while nm is built
     work = np.result_type(dtype, _MATH[precision][3])  # the kernels center in it: sc has to stay finite there
     sc = math.ldexp(1.0, min(10 - math.floor(math.log2(top)), np.finfo(work).maxexp - 2)) if 0 < top < math.inf else 1.0
-    nm = 0.0 - mu.astype(work) * sc
+    nm = mu.astype(work, copy=False)  # -mu * sc in place, with +0.0 for a zero mean
+    nm *= sc
+    cp.subtract(0.0, nm, out=nm)
     if precision == "float16":  # a zero then centers to an exact float16
         snap = nm.astype(np.float32).astype(np.float16)
         nm = cp.where(cp.isfinite(snap), snap.astype(nm.dtype), nm)
@@ -117,10 +136,12 @@ class _Source:
     """The cells on GPU as the edistance kernels read them.
 
     ``arrays`` is ``(X,)`` for C-contiguous dense rows or ``(indptr, indices, data)``
-    for canonical CSR (int32 ``indices``, int32 or int64 ``indptr``), in float32
-    or float64; ``nm`` and ``sc`` come from :func:`_center`. The copies and row
-    norms on each device depend only on the cells, so they are computed once and
-    reused by every launch (e.g. each bootstrap iteration).
+    for CSR with sorted columns (int32 ``indices``, int32 or int64 ``indptr``), in
+    float32 or float64; only with ``duplicates`` (CSR that is not canonical) do
+    the kernels sum the entries of a column. ``nm`` and ``sc`` come from
+    :func:`_center`. The copies and row norms on each device depend only on the
+    cells, so they are computed once and reused by every launch (e.g. each
+    bootstrap iteration).
     """
 
     arrays: tuple[cp.ndarray, ...]
@@ -128,6 +149,7 @@ class _Source:
     precision: str
     nm: cp.ndarray
     sc: float
+    duplicates: bool = False
     _devices: dict[int, tuple] = field(default_factory=dict)
 
     @property
@@ -150,17 +172,18 @@ class _Source:
             else:  # the row of an all-zero cell, padded to whole shared-memory windows
                 width = 128 // np.dtype(elem).itemsize
                 zero = cp.zeros(-(-kp // width) * width, dtype=elem)
-                zero[:d] = nm.astype(acc).astype(elem)
-                args = (*arrays, nm, self.sc, zero.view(cp.uint16) if elem is np.float16 else zero, kp)
+                zero[:d] = nm.astype(acc, copy=False).astype(elem, copy=False)
+                zero = zero.view(cp.uint16) if elem is np.float16 else zero
+                args = (*arrays, nm, self.sc, zero, self.duplicates, kp)
             norms, unused = cp.full(n, -1, dtype=acc), cp.zeros(1, dtype=cp.int32)
             stream = cp.cuda.get_current_stream()
-            rows = cp.arange(n, dtype=cp.int32)
-            fn(*args, norms, unused, rows, unused, unused, unused, 0, cp.zeros(1), norms_only=True, stream=stream.ptr)
+            fn(*args, norms, *[unused] * 5, 0, cp.zeros(1), norms_only=True, stream=stream.ptr)
             stream.synchronize()
             if self.precision == "float16" and n and float(norms[0]) < 0:  # the kernels did not run
                 raise ValueError("precision='float16' needs compute capability 7.5 or newer; use precision='float32'.")
+            overflow = self.precision == "float16" and n > 0 and bool(cp.isinf(cp.nanmax(norms)))
             n_sm = cp.cuda.runtime.deviceGetAttribute(cp.cuda.runtime.cudaDevAttrMultiProcessorCount, device_id)
-        self._devices[device_id] = args, norms, n_sm
+        self._devices[device_id] = args, norms, n_sm, overflow
 
     def pair_sums(
         self,
@@ -172,11 +195,14 @@ class _Source:
     ) -> cp.ndarray:
         """Distance sums of the pairs on one device, at most ``_PAIR_CHUNK`` pairs per kernel launch."""
         fn, tile_a = _MATH[self.precision][:2]
-        args, row_norms, n_sm = self._devices[device_id]
+        args, norms, n_sm, overflow = self._devices[device_id]
         with cp.cuda.Device(device_id):
             stream = cp.cuda.get_current_stream()
-            norms = row_norms[cell_indices]
-            if self.precision == "float16" and bool(cp.isinf(norms).any()):
+            # Only the cells of this call count: their norms are read 2**16 at a time
+            if overflow and any(
+                bool(cp.isinf(cp.nanmax(norms[cell_indices[i : i + (1 << 16)]])))
+                for i in range(0, cell_indices.size, 1 << 16)
+            ):
                 raise ValueError("The centered and scaled data exceeds the float16 range; use precision='float32'.")
             groups = (norms, cat_offsets, cell_indices)
             sizes = cp.diff(cat_offsets).astype(cp.int64)
@@ -187,38 +213,60 @@ class _Source:
                 tiles_a = -(-cp.maximum(sizes[left], sizes[right]) // tile_a)
                 tiles_b = -(-cp.minimum(sizes[left], sizes[right]) // _TILE_B)
                 work = cp.where(left == right, tiles_a * (tiles_b + 1) // 2, tiles_a * tiles_b)
+                del tiles_b
                 per_block = max(1, -(-int(work.sum()) // (_BLOCKS_PER_SM * n_sm)))
                 n_blocks = cp.minimum(cp.maximum(-(-work // per_block), 1), cp.maximum(tiles_a, 1))
-                block_offsets = cp.concatenate([cp.zeros(1, dtype=cp.int64), cp.cumsum(n_blocks)]).astype(cp.int32)
+                del tiles_a, work
+                block_offsets = cp.zeros(left.size + 1, dtype=cp.int32)
+                cp.cumsum(n_blocks, dtype=cp.int32, out=block_offsets[1:])
                 sums = cp.zeros(left.size, dtype=cp.float64)
                 grid = int(block_offsets[-1])
                 fn(*args, *groups, left, right, block_offsets, grid, sums, norms_only=False, stream=stream.ptr)
                 out[start : start + left.size] = sums / self.sc
                 stream.synchronize()  # the chunk's arrays stay referenced until its kernel has finished
+                del n_blocks, block_offsets, sums  # and are freed before the next chunk's
         return out
 
 
-def _build_csr_source(embedding_raw, selector):
+def _sort_indices(X):
+    """Sort the columns of CSR ``X`` in place; a copy of it when its buffers are strided or not aligned."""
+    if not X.has_sorted_indices:
+        if X.indptr.dtype != X.indices.dtype:  # CuPy sorts int64 indptr with int32 indices into a wrong order
+            raise ValueError(f"unsorted CSR needs one index dtype, got {X.indptr.dtype} and {X.indices.dtype}")
+        # CuPy's sort reads the buffers without their strides and needs the values aligned to 16 bytes: such a
+        # matrix is copied into C-contiguous buffers of its own and the caller's stays untouched
+        if not all(a.flags.c_contiguous for a in (X.data, X.indices, X.indptr)) or X.data.data.ptr % 16:
+            X = X.copy()
+        X.sort_indices()
+    return X
+
+
+def _build_csr_source(embedding_raw, selector, precision: str):
     """Move a (host or device) sparse matrix to GPU and subset its rows.
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``
     (keep all rows). Rows are kept in ``selector`` order so the caller's
-    ``cell_indices`` line up. The result is canonical CSR (sorted columns,
-    duplicate entries summed); the caller's matrix is not changed. Also
-    returns the :func:`_sample` of all rows, canonical as well.
+    ``cell_indices`` line up. The result is CSR with sorted columns: a device
+    matrix that is used whole is sorted in place, a sorted one is not touched;
+    duplicate entries stay. The ``has_sorted_indices`` and
+    ``has_canonical_format`` flags a matrix has cached are trusted. Also
+    returns the :func:`_center` of the whole matrix, which a selector leaves
+    as it is.
     """
     from rapids_singlecell.get._anndata import X_to_GPU
 
     # cupyx CSR only stores float/complex/bool data, so cast unsupported dtypes
     # (e.g. integer raw counts) to float32 BEFORE the GPU transfer. The kernel
     # itself only has float32/float64 specializations.
-    if embedding_raw.dtype not in (np.float32, np.float64):
-        embedding_raw = embedding_raw.astype(np.float32)
+    if embedding_raw.dtype != (dtype := _float_dtype(embedding_raw.dtype)):
+        embedding_raw = embedding_raw.astype(dtype)
 
     X = X_to_GPU(embedding_raw)
     if not cpsp.isspmatrix_csr(X):
         X = X.tocsr()
-    sample = _sample(X)
+    if selector is None:
+        X = _sort_indices(X)
+    center = _center(X, precision)
 
     if selector is not None:
         rows = selector
@@ -227,30 +275,37 @@ def _build_csr_source(embedding_raw, selector):
         X = X[cp.asarray(rows)]
         if not cpsp.isspmatrix_csr(X):
             X = X.tocsr()
+        X = _sort_indices(X)
 
-    return _canonical(X), _canonical(sample)
+    return X, center
 
 
 def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
-    """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or canonical CSR (sparse).
+    """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or sorted CSR (sparse).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``.
     """
+    dtype = _float_dtype(embedding_raw.dtype)
+    if precision == "auto":
+        precision = "float64" if dtype == np.float64 else "float32"
     if _is_sparse(embedding_raw):
-        X, sample = _build_csr_source(embedding_raw, selector)
+        X, center = _build_csr_source(embedding_raw, selector, precision)
         indptr = X.indptr.astype(cp.int64 if X.nnz > _INT32_MAX else cp.int32, copy=False)
         arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
     else:
-        sample = _sample(embedding_raw)
+        X = embedding_raw if selector is not None else _rows(embedding_raw)
+        if isinstance(X, cp.ndarray) and X.flags.c_contiguous and X.dtype == dtype:
+            center = _center(X, precision)
+        else:  # a subset of host (or strided, or non-float) rows: the sample is uploaded in chunks of its size
+            count = np.count_nonzero(selector) if getattr(selector, "dtype", None) == np.bool_ else len(selector)
+            center = _center(X, precision, chunk=max(count, _SAMPLE_CHUNK // max(X.shape[1], 1), 1))
         if selector is not None:
-            embedding_raw = embedding_raw[selector]
-        X = cp.asarray(embedding_raw, order="C")
-        if X.dtype not in (np.float32, np.float64):  # the kernels read float32 and float64
-            X = X.astype(cp.float32)
+            X = _rows(embedding_raw[selector])
         arrays = (X,)
-    if precision == "auto":
-        precision = "float64" if X.dtype == np.float64 else "float32"
-    return _Source(arrays, X.shape, precision, *_center(sample, X.dtype, precision))
+    # CuPy caches the flag: asked before the sort it would stay False. It cannot scan indptr and indices of
+    # different dtypes: such a matrix takes the summing loop.
+    duplicates = cpsp.issparse(X) and (X.indptr.dtype != X.indices.dtype or not X.has_canonical_format)
+    return _Source(arrays, X.shape, precision, *center, duplicates)
 
 
 class EDistanceMetric(BaseMetric):
