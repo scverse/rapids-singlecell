@@ -390,8 +390,13 @@ def bbknn(
         parameters can be specified:
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)).
-        * 'nprobes': Number of lists to probe during search. Default is 1. Higher values
+        * 'n_probes': Number of lists to probe during search. Default is 20. Higher values
           increase accuracy but reduce speed.
+
+        For `cagra` algorithm, the following parameters can be specified:
+
+        * 'itopk_size': Number of candidates kept during the search. Default is cuVS's default (64), raised
+          to `neighbors_within_batch` if smaller. Higher values increase accuracy but reduce speed.
 
         For `mg_ivfflat` and `mg_ivfpq` algorithms, the following parameters can be specified:
 

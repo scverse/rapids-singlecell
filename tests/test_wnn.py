@@ -270,8 +270,9 @@ def test_wnn_approximate_searches(monkeypatch):
     kwargs = {"use_rep": ["X_pca", "X_apca"], "knn_range": 100}
     with monkeypatch.context() as patch:
         patch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
-        with pytest.raises(ValueError, match="n_probes"):
+        with pytest.raises(ValueError, match="n_probes") as err:
             rsc.pp.wnn(adata, **kwargs, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+        assert "knn_range" in err.value.__notes__[0]
     # searching all IVF lists repairs the candidates in the same CUDA context;
     # nn_descent and cagra need a graph degree and search width beyond cuVS's defaults
     for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {}), ("cagra", {})):

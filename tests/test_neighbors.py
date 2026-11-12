@@ -19,6 +19,7 @@ import rapids_singlecell as rsc
 from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.pp import bbknn, neighbors
 from rapids_singlecell.preprocessing._neighbors import NeighborsResult
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
 from rapids_singlecell.preprocessing._neighbors._helper import _trimming as trimming_gpu
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _get_connectivities_gauss,
@@ -141,13 +142,14 @@ def test_algo(algo):
     neighbors(adata, n_neighbors=5, algorithm=algo)
 
 
-def test_nn_descent_intermediate_graph_degree():
+@pytest.mark.parametrize("degree", [10, None])
+def test_nn_descent_intermediate_graph_degree(degree):
     adata = pbmc68k_reduced()
     neighbors(
         adata,
         n_neighbors=5,
         algorithm="nn_descent",
-        algorithm_kwds={"intermediate_graph_degree": 10},
+        algorithm_kwds={"intermediate_graph_degree": degree},
     )
 
 
@@ -243,6 +245,14 @@ def test_invalid_neighbors_raise(monkeypatch, bad_id, bad_dist, batch_balanced):
         else:
             neighbors(adata, n_neighbors=5, algorithm="ivfflat")
     assert not adata.obsp
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "hint"), [("brute", "NaN"), ("all_neighbors", "n_clusters"), ("cagra", "Reduce")]
+)
+def test_incomplete_search_hints(algorithm, hint):
+    with pytest.raises(ValueError, match=hint):
+        _check_knn_complete(cp.array([[0, 9]]), n_index=2, algorithm=algorithm)
 
 
 def test_brute_large_distances():

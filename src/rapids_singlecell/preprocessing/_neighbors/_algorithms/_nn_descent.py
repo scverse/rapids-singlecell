@@ -34,7 +34,7 @@ def _nn_descent_knn(
 
     # cuVS's default (96) is below the recommended 1.5 * k for k > 64, and fails for k > 96
     default = max(nn_descent.IndexParams().intermediate_graph_degree, int(1.5 * k))
-    intermediate_graph_degree = max(algorithm_kwds.get("intermediate_graph_degree", default), k)
+    intermediate_graph_degree = max(algorithm_kwds.get("intermediate_graph_degree") or default, k)
 
     idxparams = nn_descent.IndexParams(
         graph_degree=k,

@@ -143,7 +143,10 @@ def _check_knn_complete(
     elif "ivf" in algorithm:
         hint = "Increase `n_probes` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
     elif algorithm == "all_neighbors":
-        hint = "Lower `n_lists` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
+        hint = (
+            "Lower `n_clusters` (`n_lists` for `algo='ivf_pq'`) in `algorithm_kwds`, reduce the number of neighbors, "
+            "or use `algorithm='brute'`."
+        )
     else:
         hint = "Reduce the number of neighbors or use `algorithm='brute'`."
     raise ValueError(f"The {algorithm!r} search returned incomplete or invalid neighbors. {hint}")

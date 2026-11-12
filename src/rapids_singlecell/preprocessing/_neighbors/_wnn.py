@@ -291,7 +291,7 @@ def _modality_knns(
         try:
             _check_knn_complete(knn, dist, n_index=n_obs, algorithm=algorithm)
         except ValueError as e:
-            e.add_note(f"in modality {names[m]!r}")
+            e.add_note(f"in modality {names[m]!r}, which searches `knn_range` neighbors")
             raise
         knns[m] = _ensure_self_first(knn.astype(cp.int32, copy=False))
         del knn, dist  # free them before the next search
