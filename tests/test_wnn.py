@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import cupy as cp
@@ -239,11 +240,19 @@ def test_wnn_rejects_invalid_neighbors(monkeypatch, bad_id, bad_dist):
         return idx, dist
 
     adata = _multimodal_adata(n=40)
-    monkeypatch.setitem(_wnn.KNN_ALGORITHMS, "brute", incomplete_knn)
+    monkeypatch.setitem(_wnn.KNN_ALGORITHMS, "ivfflat", incomplete_knn)
     monkeypatch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
     with pytest.raises(ValueError, match="incomplete"):
-        rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24)
+        rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24, algorithm="ivfflat")
     assert not adata.obsp and "neighbors" not in adata.uns
+
+
+def test_wnn_missing_extension(monkeypatch):
+    # a missing extension fails before any work
+    monkeypatch.setitem(sys.modules, "rapids_singlecell._cuda._wnn_cuda", None)
+    monkeypatch.setattr(_wnn, "_get_reps", lambda *args, **kwargs: pytest.fail("wnn started without its extension"))
+    with pytest.raises(ModuleNotFoundError):
+        rsc.pp.wnn(_multimodal_adata(n=40), ["X_pca", "X_apca"])
 
 
 def test_wnn_approximate_searches(monkeypatch):

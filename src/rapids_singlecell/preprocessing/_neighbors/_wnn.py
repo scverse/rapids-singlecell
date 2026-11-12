@@ -13,13 +13,12 @@ from cupyx.scipy import sparse as cp_sparse
 from scipy import sparse as sc_sparse
 
 from rapids_singlecell._utils._random import RNGLike, SeedLike, _accepts_legacy_random_state, _LegacyRng
-from rapids_singlecell.preprocessing._neighbors._helper import _check_neighbors_X
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete, _check_neighbors_X
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     KNN_ALGORITHMS,
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
-    _check_knn_complete,
     _connectivities_to_host_csr,
 )
 from rapids_singlecell.tools._utils import _choose_representation
@@ -453,8 +452,8 @@ def wnn(
     Scanpy's layout initialization) and map the modalities to them with MuData, as in muon.
     :func:`~rapids_singlecell.tl.ingest` rejects WNN references; :func:`scanpy.tl.ingest` uses the first modality.
     """
-    # fail before any work if the extension is missing
-    from rapids_singlecell._cuda import _wnn_cuda  # noqa: F401
+    # fail before any work if the extension is missing (the `_cuda` attribute would be None)
+    import rapids_singlecell._cuda._wnn_cuda  # noqa: F401
 
     rng = np.random.default_rng(rng)
     random_state_param = _random_state_param(rng, method)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+from types import SimpleNamespace
 
 import cupy as cp
 import numpy as np
@@ -237,6 +238,26 @@ def test_invalid_neighbors_raise(monkeypatch, bad_id, bad_dist, batch_balanced):
         else:
             neighbors(adata, n_neighbors=5, algorithm="ivfflat")
     assert not adata.obsp
+
+
+def test_brute_large_distances():
+    # an exact search pads nothing, so distances beyond the padding threshold are valid
+    adata = AnnData(np.random.default_rng(0).normal(scale=1e10, size=(40, 5)).astype(np.float32))
+    neighbors(adata, n_neighbors=5, metric="sqeuclidean", method="jaccard")
+    assert 1e18 < adata.obsp["distances"].max() < np.inf
+
+
+def test_nn_descent_invalid_ids_raise(monkeypatch):
+    from rapids_singlecell._cuda import _nn_descent_cuda
+    from rapids_singlecell.preprocessing._neighbors._algorithms import _nn_descent
+
+    # unfilled graph slots must not reach the distance kernel, which indexes X with them
+    graph = cp.full((40, 5), 2**32 - 1, dtype=cp.uint32)
+    monkeypatch.setattr(_nn_descent.nn_descent, "build", lambda *args, **kwargs: SimpleNamespace(graph=graph))
+    monkeypatch.setattr(_nn_descent_cuda, "sqeuclidean", lambda *args, **kwargs: pytest.fail("kernel reached"))
+    adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        neighbors(adata, n_neighbors=5, algorithm="nn_descent")
 
 
 KEY = "test"

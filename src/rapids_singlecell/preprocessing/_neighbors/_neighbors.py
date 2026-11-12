@@ -90,29 +90,6 @@ KNN_ALGORITHMS = {
     "mg_ivfpq": _mg_ivf_pq_knn,
 }
 
-# Searches fill the slots they found no neighbor for with out-of-range IDs or huge distances
-# (IVF repeats an ID at infinity, CAGRA uses FLT_MAX, all_neighbors sqrt(FLT_MAX)).
-_PAD_DIST = 1e18
-
-
-def _check_knn_complete(indices: cp.ndarray, distances: cp.ndarray, *, n_index: int, algorithm: str) -> None:
-    """Raise if a kNN search left neighbor slots unfilled or returned invalid IDs or distances."""
-    if indices.size == 0:
-        return
-    lo, hi = int(indices.min()), int(indices.max())
-    d_lo, d_hi = float(distances.min()), float(distances.max())
-    if lo >= 0 and hi < n_index and -_PAD_DIST < d_lo and d_hi < _PAD_DIST:  # also False for NaN
-        return
-    if algorithm == "brute":
-        hint = "Check the representation for NaN or infinite values."
-    elif "ivf" in algorithm:
-        hint = "Increase `n_probes` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
-    elif algorithm == "all_neighbors":
-        hint = "Lower `n_lists` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
-    else:
-        hint = "Reduce the number of neighbors or use `algorithm='brute'`."
-    raise ValueError(f"The {algorithm!r} search returned incomplete or invalid neighbors. {hint}")
-
 
 def _build_sparse_distances(
     knn_indices: cp.ndarray,

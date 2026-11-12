@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -44,6 +46,8 @@ def _nn_descent_knn(
         dataset=X,
     )
     neighbors = cp.array(idx.graph).astype(cp.uint32)
+    # the distance kernels index X with these IDs
+    _check_knn_complete(neighbors, n_index=X.shape[0], algorithm="nn_descent")
     if metric == "euclidean" or metric == "sqeuclidean":
         from rapids_singlecell._cuda._nn_descent_cuda import (
             sqeuclidean as dist_func,

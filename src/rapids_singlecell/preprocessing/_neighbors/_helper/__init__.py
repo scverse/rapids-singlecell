@@ -120,6 +120,35 @@ def _batched_search(search, Y: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
     )
 
 
+# Searches fill the slots they found no neighbor for with out-of-range IDs or huge distances
+# (IVF repeats an ID at infinity, CAGRA uses FLT_MAX, all_neighbors sqrt(FLT_MAX)).
+_PAD_DIST = 1e18
+
+
+def _check_knn_complete(
+    indices: cp.ndarray, distances: cp.ndarray | None = None, *, n_index: int, algorithm: str
+) -> None:
+    """Raise if a kNN search left neighbor slots unfilled or returned invalid IDs or distances."""
+    if indices.size == 0:
+        return
+    valid = int(indices.min()) >= 0 and int(indices.max()) < n_index
+    if valid and distances is not None:
+        # an exact search pads nothing, so any finite distance is valid
+        limit = cp.inf if algorithm == "brute" else _PAD_DIST
+        valid = -limit < float(distances.min()) and float(distances.max()) < limit  # also False for NaN
+    if valid:
+        return
+    if algorithm == "brute":
+        hint = "Check the representation for NaN or infinite values."
+    elif "ivf" in algorithm:
+        hint = "Increase `n_probes` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
+    elif algorithm == "all_neighbors":
+        hint = "Lower `n_lists` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
+    else:
+        hint = "Reduce the number of neighbors or use `algorithm='brute'`."
+    raise ValueError(f"The {algorithm!r} search returned incomplete or invalid neighbors. {hint}")
+
+
 def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:
     """Ensure zero self-distances for all definitionally applicable metrics.
 

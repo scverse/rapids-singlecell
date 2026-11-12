@@ -14,6 +14,7 @@ from rapids_singlecell._utils._random import (
     _LegacyRng,
 )
 from rapids_singlecell.preprocessing._neighbors._helper import (
+    _check_knn_complete,
     _check_metrics,
     _check_neighbors_X,
     _fix_self_distances,
@@ -24,7 +25,6 @@ from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _Algorithms,
     _build_sparse_distances,
     _calc_connectivities,
-    _check_knn_complete,
     _connectivities_to_host_csr,
     _Metrics,
 )
