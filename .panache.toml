@@ -1,4 +1,5 @@
 #:schema https://panache.bz/panache.schema.json
+
 flavor = "myst"
 
 [format]
