@@ -44,17 +44,18 @@ _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times 
 def _float_dtype(dtype) -> np.dtype:
     """The dtype the kernels read data of dtype in: float32 or float64 in native byte order."""
     dtype = np.dtype(dtype).newbyteorder("=")
+    if dtype.kind not in "biuf":  # complex, strings, dates, objects
+        raise ValueError(f"Unsupported dtype {dtype}")
     return dtype if dtype in (np.float32, np.float64) else np.dtype(np.float32)
 
 
 def _rows(a, order="C") -> cp.ndarray:
     """Dense rows on the device in float32 or float64; the kernels read them C-contiguous."""
-    a = a if hasattr(a, "astype") else np.asarray(a)
     a = a.astype(_float_dtype(a.dtype), copy=False)  # converted where the array lives, then uploaded
     return cp.asarray(a, order=order)
 
 
-def _center(X, precision: str) -> tuple[cp.ndarray, float]:
+def _center(X, precision: str, rows=None) -> tuple[cp.ndarray, float]:
     """Shift ``nm`` and scale ``sc`` of the rows ``x * sc + nm`` the kernels compute on.
 
     The kernels get a distance from ``|a|² + |b|² - 2ab``, which needs centered
@@ -62,15 +63,16 @@ def _center(X, precision: str) -> tuple[cp.ndarray, float]:
     is taken over a sample of rows without its outlier rows; ``sc`` is the power
     of two (exact to undo) that puts the largest centered sample value in
     ``[2**10, 2**11)`` and ``nm = -mean * sc``. The sample is at most
-    ``_SAMPLE_ROWS`` strided rows (2**25 values) of ``X``, the cells a call
-    loads, so a distance does not depend on cells the call does not read.
+    ``_SAMPLE_ROWS`` strided rows (2**25 values) of the cells a call reads, so
+    a distance does not depend on other cells: the rows of ``X``, or those the
+    int32 device array ``rows`` lists when a call reads part of a dense ``X``.
 
     The kernel reads the sampled rows where they are: C-contiguous float32 or
-    float64 device rows, or a device CSR matrix (columns sorted or not, in its
-    own index dtype), whose stored values give the ``nm`` and ``sc`` of the
-    same dense rows.
+    float64 device rows, or a device CSR matrix with sorted columns (in its own
+    index dtype), whose stored values give the ``nm`` and ``sc`` of the same
+    dense rows.
     """
-    n, d = X.shape
+    n, d = X.shape[0] if rows is None else rows.size, X.shape[1]
     dtype = X.dtype
     step = max(1, -(-n // max(1, min(_SAMPLE_ROWS, 2**25 // max(d, 1)))))
     m = -(-n // step)
@@ -78,9 +80,9 @@ def _center(X, precision: str) -> tuple[cp.ndarray, float]:
     r, keep = cp.zeros(m, dtype=dtype), cp.zeros(m, dtype=bool)
     total, ext = cp.zeros(d, dtype=cp.float64), cp.zeros((2, d), dtype=dtype)
     if cpsp.issparse(X):
-        reader = (*map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)), X.has_sorted_indices, step)
+        reader = (*map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)), step)
     else:
-        reader = (X, step)
+        reader = (X, rows, step)
 
     def run(what, shift=0):
         _ed.center(*reader, what, shift, keep, ext, r, total, stream=stream.ptr)
@@ -257,10 +259,11 @@ def _build_csr_source(embedding_raw, selector):
     return _sort_indices(X)
 
 
-def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
+def _materialize_source(embedding_raw, selector, precision: str, rows=None) -> _Source:
     """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or sorted CSR (sparse).
 
-    ``selector`` is a boolean mask, an integer row-index array, or ``None``.
+    ``selector`` is a boolean mask, an integer row-index array, or ``None``;
+    ``rows`` are the rows a call reads of a dense array it loads whole.
     """
     dtype = _float_dtype(embedding_raw.dtype)
     if precision == "auto":
@@ -272,7 +275,7 @@ def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
         arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
     else:
         X = _rows(embedding_raw if selector is None else embedding_raw[selector])
-        center = _center(X, precision)
+        center = _center(X, precision, rows)
         arrays = (X,)
     # CuPy caches the flag: asked before the sort it would stay False. It cannot scan indptr and indices of
     # different dtypes: such a matrix takes the summing loop.
@@ -697,8 +700,8 @@ class EDistanceMetric(BaseMetric):
             embedding = _materialize_source(embedding_raw, original_indices, self.precision)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
         else:
-            embedding = _materialize_source(embedding_raw, None, self.precision)
             cell_indices = cp.array(original_indices, dtype=cp.int32)
+            embedding = _materialize_source(embedding_raw, None, self.precision, cell_indices)
 
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
         group_sizes_cpu = group_sizes.get()
@@ -785,8 +788,7 @@ class EDistanceMetric(BaseMetric):
         float
             Energy distance between X and Y
         """
-        # On the device in float32 or float64
-        X_gpu, Y_gpu = _rows(X, None), _rows(Y, None)
+        X_gpu, Y_gpu = (_rows(cp.asarray(a), None) for a in (X, Y))  # in float32 or float64
 
         if len(X_gpu) == 0 or len(Y_gpu) == 0:
             raise ValueError("Neither X nor Y can be empty.")
@@ -828,8 +830,7 @@ class EDistanceMetric(BaseMetric):
         variance
             Bootstrap variance
         """
-        # On the device in float32 or float64
-        X_gpu, Y_gpu = _rows(X, None), _rows(Y, None)
+        X_gpu, Y_gpu = (_rows(cp.asarray(a), None) for a in (X, Y))  # in float32 or float64
 
         if len(X_gpu) == 0 or len(Y_gpu) == 0:
             raise ValueError("Neither X nor Y can be empty.")

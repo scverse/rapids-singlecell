@@ -263,6 +263,9 @@ def test_edistance_dense_integer_input(small_adata: AnnData) -> None:
     for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
         assert distance(a.astype(dtype), b.get().astype(dtype)) == distance(a, b)
         assert distance.bootstrap(a.astype(dtype), b.astype(dtype)) == distance.bootstrap(a, b)
+    assert distance(pd.DataFrame(a.get()), pd.DataFrame(b.get())) == distance(a, b)  # anything cp.asarray takes
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        distance(a.astype(cp.complex64), b)
 
 
 def test_edistance_dense_big_endian_input(small_adata: AnnData) -> None:

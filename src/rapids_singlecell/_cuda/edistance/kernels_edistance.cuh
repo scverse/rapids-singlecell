@@ -559,7 +559,7 @@ __global__ void __launch_bounds__(ED_THREADS, 1)
 
 // ---------------------------------------------------------------------------
 // Center and scale (_center in _edistance.py) from every step-th row, read in
-// place: a thread reduces one window of cw <= R::CW columns of sampled row i.
+// place: a thread reduces one window of cw = R::CW columns of sampled row i.
 //   pass 0: out[i] = the row's largest |x|, compared as bit patterns (a NaN
 //           of either sign ranks last)
 //   pass 1: over the kept rows (finite values): sums[c] += rint(ldexp(x,
@@ -594,27 +594,27 @@ template <typename In>
 struct EdCenterDense {
     static constexpr int CW = 64;
     const In* X;
-    long long ldx;  // row stride (elements)
+    long long ldx;    // row stride (elements)
+    const int* rows;  // sampled row i is row rows[i] of X; null: row i
     __device__ void fill(In* win, long long row, int c0, int nw) const {
+        if (rows) row = rows[row];
         for (int c = 0; c < nw; ++c) win[c] = X[row * ldx + c0 + c];
     }
 };
 
-// CSR as the caller holds it: the stored values of a column are summed. A
-// sorted row is searched for the window's first entry; an unsorted one is
-// scanned once per window, so its windows fill 768 bytes of thread stack.
+// CSR with sorted columns: a row is searched for the window's first entry,
+// and the stored values of a column are summed.
 template <typename In, typename P, typename I>
 struct EdCenterCsr {
-    static constexpr int CW = 768 / sizeof(In);
+    static constexpr int CW = 64;
     const In* data;
     const I* indices;
     const P* indptr;
-    bool sorted;
     __device__ void fill(In* win, long long row, int c0, int nw) const {
         for (int c = 0; c < nw; ++c) win[c] = In(0);
         P j = indptr[row];
         const P end = indptr[row + 1];
-        for (P hi = sorted ? end : j; j < hi;) {
+        for (P hi = end; j < hi;) {
             const P mid = j + (hi - j) / 2;
             if (indices[mid] < c0) {
                 j = mid + 1;
@@ -622,11 +622,8 @@ struct EdCenterCsr {
                 hi = mid;
             }
         }
-        for (; j < end; ++j) {
-            const long long c = (long long)indices[j] - c0;
-            if (sorted && c >= nw) break;
-            if (c >= 0 && c < nw) win[c] += data[j];
-        }
+        for (; j < end && indices[j] - c0 < nw; ++j)
+            win[indices[j] - c0] += data[j];
     }
 };
 

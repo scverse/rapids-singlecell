@@ -156,34 +156,36 @@ static void def_math(nb::module_& m, const char* name) {
         "out"_a.noconvert(), "sums"_a.noconvert(), "stream"_a = 0
 
 // One pass of the center kernel over the rows i * step, i < out.size(), in
-// windows of cw columns
+// windows of R::CW columns
 template <typename In, class R, typename Device>
-static void center(const R& rd, ED_CENTER_ARGS, int cw = R::CW) {
+static void center(const R& rd, ED_CENTER_ARGS) {
     const int m = static_cast<int>(out.size());
     const int d = static_cast<int>(ext.size() / 2);
     nb_require(!pass || (keep.size() == out.size() && sums.size() == (size_t)d),
                "center: keep / sums do not match out / ext");
     if (m == 0 || d == 0) return;
-    const long long units = (long long)m * ((d - 1) / cw + 1);
+    const long long units = (long long)m * ((d - 1) / R::CW + 1);
     edistance_center_kernel<In, R>
         <<<(unsigned)((units + ED_THREADS - 1) / ED_THREADS), ED_THREADS, 0,
            reinterpret_cast<cudaStream_t>(stream)>>>(
-            rd, step, m, d, cw, pass, shift, keep.data(), ext.data(),
+            rd, step, m, d, R::CW, pass, shift, keep.data(), ext.data(),
             out.data(), sums.data());
     CUDA_CHECK_LAST_ERROR(edistance_center_kernel);
 }
 
-// Dense rows, the column extremes less mu, or CSR with int32 / int64 indptr
-// and int32 / int64 indices
+// Dense rows (those of the index array rows, if given), the column extremes
+// less mu, or sorted CSR with int32 / int64 indptr and int32 / int64 indices
 template <typename In, typename Device>
 static void def_center(nb::module_& m) {
     m.def(
         "center",
-        [](arr<const In, Device> X, ED_CENTER_ARGS) {
-            center<In>(EdCenterDense<In>{X.data(), (long long)X.shape(1)}, step,
-                       pass, shift, keep, ext, out, sums, stream);
+        [](arr<const In, Device> X, arr<const int, Device> rows,
+           ED_CENTER_ARGS) {
+            center<In>(
+                EdCenterDense<In>{X.data(), (long long)X.shape(1), rows.data()},
+                step, pass, shift, keep, ext, out, sums, stream);
         },
-        "X"_a.noconvert(), ED_CENTER_NAMES);
+        "X"_a.noconvert(), "rows"_a.noconvert().none(), ED_CENTER_NAMES);
     m.def(
         "center",
         [](arr<const In, Device> keys, arr<const In, Device> mu,
@@ -199,15 +201,13 @@ static void def_center(nb::module_& m) {
         m.def(
             "center",
             [](arr<const P, Device> indptr, arr<const I, Device> indices,
-               arr<const In, Device> data, bool sorted, ED_CENTER_ARGS) {
-                using R = EdCenterCsr<In, P, I>;
-                center<In>(
-                    R{data.data(), indices.data(), indptr.data(), sorted}, step,
-                    pass, shift, keep, ext, out, sums, stream,
-                    sorted ? 64 : R::CW);
+               arr<const In, Device> data, ED_CENTER_ARGS) {
+                center<In>(EdCenterCsr<In, P, I>{data.data(), indices.data(),
+                                                 indptr.data()},
+                           step, pass, shift, keep, ext, out, sums, stream);
             },
             "indptr"_a.noconvert(), "indices"_a.noconvert(),
-            "data"_a.noconvert(), "sorted"_a, ED_CENTER_NAMES);
+            "data"_a.noconvert(), ED_CENTER_NAMES);
     };
     csr(0, 0);
     csr(0LL, 0);
