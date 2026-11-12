@@ -2,12 +2,11 @@
 
 Process datasets larger than GPU memory by chunking work with Dask while keeping arrays on the GPU via CuPy. Chunking also mitigates the CuPy sparse limit of `.nnz ≤ 2**31-1` by operating on smaller blocks.
 
-
 ## Start a Dask CUDA cluster
 
 Choose one of these presets:
 
----
+--------------------------------------------------------------------------------
 
 ### A) NVLink / Performance preset (UCX + RMM pool, no managed memory)
 
@@ -28,9 +27,11 @@ cluster = LocalCUDACluster(
 )
 client = Client(cluster)
 ```
+
 ### B) Capacity / Robustness preset (TCP + Managed memory)
 
 Best when you need to stretch VRAM (slower P2P, but fewer OOMs).
+
 ```python
 from dask.distributed import Client
 from dask_cuda import LocalCUDACluster
@@ -116,7 +117,6 @@ adata.X.compute_chunk_sizes()
 ```
 
 Persisting loads data into GPU memory across workers. This can quickly cause OOM if the dataset does not fit. On sufficiently large clusters, persisting can be extremely fast and effective.
-
 
 ## Multi-GPU notes
 

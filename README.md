@@ -7,7 +7,6 @@
 [![codecov](https://codecov.io/gh/scverse/rapids-singlecell/graph/badge.svg?token=PFHJEQD94X)](https://codecov.io/gh/scverse/rapids-singlecell)
 [![Chat](https://img.shields.io/badge/zulip-join_chat-%2367b08f.svg)](https://scverse.zulipchat.com)
 
-
 # rapids-singlecell: GPU-Accelerated Single-Cell Analysis within scverse®
 
 rapids-singlecell provides GPU-accelerated single-cell analysis with an AnnData-first API.
@@ -53,6 +52,6 @@ If you like scverse® and want to support our mission, please consider making a 
   <img
     src="https://raw.githubusercontent.com/numfocus/templates/master/images/numfocus-logo.png"
     width="200"
-  >
+>
 </a>
 </div>

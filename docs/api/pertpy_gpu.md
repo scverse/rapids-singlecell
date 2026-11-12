@@ -12,11 +12,12 @@
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    Distance
+   Distance
 ```
 
+<!-- panache-ignore-format-start -->
 ```{eval-rst}
 .. autoclass:: Distance
     :no-index:
@@ -44,16 +45,18 @@
     .. automethod:: bootstrap
         :no-index:
 ```
+<!-- panache-ignore-format-end -->
 
 ## GuideAssignment
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    GuideAssignment
+   GuideAssignment
 ```
 
+<!-- panache-ignore-format-start -->
 ```{eval-rst}
 .. autoclass:: GuideAssignment
     :no-index:
@@ -73,16 +76,18 @@
     .. automethod:: assign_mixture_model
         :no-index:
 ```
+<!-- panache-ignore-format-end -->
 
 ## Mixscape
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    Mixscape
+   Mixscape
 ```
 
+<!-- panache-ignore-format-start -->
 ```{eval-rst}
 .. autoclass:: Mixscape
     :no-index:
@@ -102,16 +107,18 @@
     .. automethod:: lda
         :no-index:
 ```
+<!-- panache-ignore-format-end -->
 
 ## Mixscale
 
 ```{eval-rst}
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    Mixscale
+   Mixscale
 ```
 
+<!-- panache-ignore-format-start -->
 ```{eval-rst}
 .. autoclass:: Mixscale
     :no-index:
@@ -128,3 +135,4 @@
     .. automethod:: mixscale
         :no-index:
 ```
+<!-- panache-ignore-format-end -->
