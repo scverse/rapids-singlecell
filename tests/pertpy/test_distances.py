@@ -252,13 +252,17 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
 
 
 def test_edistance_dense_integer_input(small_adata: AnnData) -> None:
-    """Dense integer input gives the result of its float32 cast."""
+    """Dense integer and float16 input gives the result of its float32 cast."""
     distance = Distance(metric="edistance")
     X = cp.rint(small_adata.obsm["X_pca"] * 4)
     small_adata.obsm["X_pca"] = X.astype(cp.float32)
     expected = distance.pairwise(small_adata, groupby="group")
     small_adata.obsm["X_pca"] = X.astype(cp.int32)
     pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
+    a, b = X[:4].astype(cp.float32), X[4:].astype(cp.float32)
+    for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
+        assert distance(a.astype(dtype), b.get().astype(dtype)) == distance(a, b)
+        assert distance.bootstrap(a.astype(dtype), b.astype(dtype)) == distance.bootstrap(a, b)
 
 
 def test_edistance_dense_big_endian_input(small_adata: AnnData) -> None:
@@ -705,9 +709,9 @@ def test_contrast_distances_filtered(contrast_adata: AnnData) -> None:
     full_result = distance.contrast_distances(contrast_adata, contrasts=contrasts)
     assert len(full_result) == 2
 
-    # The T-cell row should match between filtered and full
+    # The T-cell row should match between filtered and full, to float32 rounding: each call centers on its own cells
     full_t = full_result[full_result["celltype"] == "T"]["edistance"].iloc[0]
-    np.testing.assert_allclose(result["edistance"].iloc[0], full_t, atol=1e-10)
+    np.testing.assert_allclose(result["edistance"].iloc[0], full_t, atol=5e-6)
 
 
 def test_contrast_distances_two_split_by() -> None:
@@ -1471,8 +1475,8 @@ def test_pairwise_groups_parameter_values_correct(small_adata: AnnData) -> None:
     # Filtered pairwise
     filtered_result = distance.pairwise(small_adata, groupby="group", groups=["g0", "g2"])
 
-    # Values should match
-    np.testing.assert_allclose(filtered_result.loc["g0", "g2"], full_result.loc["g0", "g2"], atol=1e-10)
+    # Values should match, to float32 rounding: each call centers on its own cells
+    np.testing.assert_allclose(filtered_result.loc["g0", "g2"], full_result.loc["g0", "g2"], atol=5e-6)
     np.testing.assert_allclose(filtered_result.loc["g0", "g0"], full_result.loc["g0", "g0"], atol=1e-10)
 
 
