@@ -308,6 +308,16 @@ def test_perturbation_signature_knn_backends(knn_algorithm):
     assert np.all(np.isfinite(xp))
 
 
+def test_perturbation_signature_incomplete_neighbors_raise():
+    # probing one of 64 lists cannot fill 100 neighbor slots
+    adata = anndata.AnnData(np.clip(np.random.default_rng(0).normal(size=(600, 30)), 0, None).astype(np.float32))
+    adata.obs["pert"] = ["control"] * 500 + ["g"] * 100
+    kwargs = {"n_neighbors": 100, "knn_algorithm": "ivfflat", "knn_kwargs": {"n_lists": 64, "n_probes": 1}}
+    with pytest.raises(ValueError, match="n_probes"):
+        rsc.ptg.Mixscape().perturbation_signature(adata, pert_key="pert", control="control", use_rep="X", **kwargs)
+    assert "X_pert" not in adata.layers
+
+
 def test_mixscape_split_by():
     """split_by conditions per group: with strong, group-specific baselines, the
     planted KO cells are predominantly called KO within each group."""

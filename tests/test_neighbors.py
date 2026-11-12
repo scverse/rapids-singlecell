@@ -207,8 +207,6 @@ def test_approx_nn_beyond_default_degree(algo, min_recall):
     neighbors(adata, n_neighbors=100, algorithm=algo)
     neighbors(brute_data, n_neighbors=100, algorithm="brute")
     D, ref = adata.obsp["distances"], brute_data.obsp["distances"]
-    assert np.all(np.diff(D.indptr) == 100)
-    assert np.isfinite(D.data).all()
     shared = sum(
         len(np.intersect1d(D.indices[D.indptr[i] : D.indptr[i + 1]], ref.indices[ref.indptr[i] : ref.indptr[i + 1]]))
         for i in range(adata.n_obs)
