@@ -1,6 +1,6 @@
 # Installation
 
-_rapids-singlecell_ requires Python 3.12–3.14 and an NVIDIA GPU.
+_rapids-singlecell_ requires Python 3.13 or newer and an NVIDIA GPU.
 
 (conda-installation)=
 ## Conda

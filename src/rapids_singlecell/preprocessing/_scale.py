@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, Union
 
 import cupy as cp
 import dask
@@ -9,6 +9,7 @@ import numpy as np
 from anndata import AnnData
 from cupyx.scipy import sparse
 from scanpy._utils import view_to_actual
+from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._compat import (
     DaskArray,
@@ -16,7 +17,18 @@ from rapids_singlecell._compat import (
     _meta_sparse,
 )
 from rapids_singlecell._settings import Default, resolve_default
-from rapids_singlecell.get import _check_mask, _get_obs_rep, _set_obs_rep
+from rapids_singlecell.get import _check_mask, _get_arr
+from rapids_singlecell.get._out import (
+    DEPR_INPLACE,
+    DEPR_USE,
+    _legacy_out,
+    _mask_arg,
+    _out_dests,
+    _use_args,
+    _write_dests,
+    deprecated_copy,
+)
+from rapids_singlecell.get._utils import AdRef
 from rapids_singlecell.preprocessing._utils import (
     _check_gpu_X,
     _get_mean_var,
@@ -25,19 +37,48 @@ from rapids_singlecell.preprocessing._utils import (
 
 if TYPE_CHECKING:
     from rapids_singlecell._utils import ArrayTypesDask
+    from rapids_singlecell.get._utils import LayerAcc, MultiAcc
 
 
+class ScaleResult(NamedTuple):
+    """Outputs of :func:`~rapids_singlecell.pp.scale`."""
+
+    scaled: Any
+    """The scaled matrix."""
+    mean: Any
+    """Means per variable before scaling."""
+    std: Any
+    """Standard deviations per variable before scaling."""
+
+
+class ScaleOut(TypedDict, total=False):
+    """Where a mapping `out` of :func:`~rapids_singlecell.pp.scale` writes each output."""
+
+    scaled: LayerAcc | MultiAcc | str
+    mean: AdRef | str
+    std: AdRef | str
+
+
+@deprecated_arg("mask_obs", Deprecation("0.19.0", "Use `mask` instead."))
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("obsm", DEPR_USE)
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_copy
 def scale(
     data: AnnData | ArrayTypesDask,
     *,
     zero_center: bool | Default = Default(("scale", "zero_center")),
     max_value: float | None = None,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | ScaleOut | bool = False,
+    mask: np.ndarray | AdRef | str | None = None,
+    # deprecated
     copy: bool = False,
     layer: str | None = None,
     obsm: str | None = None,
     mask_obs: np.ndarray | str | None = None,
     inplace: bool = True,
-) -> Union[sparse.spmatrix, cp.ndarray, None]:  # noqa: UP007
+) -> Union[AnnData, ScaleResult, sparse.spmatrix, cp.ndarray, None]:  # noqa: UP007
     """
     Scales matrix to unit variance and clips values
 
@@ -55,88 +96,84 @@ def scale(
         max_value
             Clip (truncate) to this value after scaling. If `None`, do not clip.
 
-        copy
-            Whether this function should be performed inplace. If an AnnData object
-            is passed, this also determines if a copy is returned. Only applies to
-            :class:`~anndata.AnnData` input.
+        use
+            Which matrix to scale, e.g. `A.X`, `A.layers['counts']` or `A.obsm['x']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
 
-        layer
-            If provided, which element of layers to scale.
+        out
+            Where to write the outputs. A single accessor writes `scaled` to it,
+            a mapping (:class:`~rapids_singlecell.pp.ScaleOut`) writes only the outputs it names,
+            e.g. `{'scaled': A.layers['scaled'], 'mean': A.var['m']}`.
+            If `True`, they are returned as a :class:`~rapids_singlecell.pp.ScaleResult`.
+            If `False`, `scaled` is written to the place `use` reads from and `mean`/`std`
+            to `.var['mean']`/`.var['std']` (`.var['mean of {mask}']` or `.var['mean with mask']`
+            if `mask` is given; not written if `use` is an `.obsm` array).
 
-        obsm
-            If provided, which element of obsm to scale.
-
-        mask_obs
+        mask
             Restrict both the derivation of scaling parameters and the scaling itself
-            to a certain set of observations. The mask is specified as a boolean array
-            or a string referring to an array in :attr:`~anndata.AnnData.obs`. If the matrix is in csc format and a mask is provided, the matrix will be transformed to csr format.
-
-        inplace
-            If True, update AnnData with results. Otherwise, return results. See below for details of what is returned. For matrix input the scaled matrix is always returned.
-
+            to a certain set of observations: a boolean array or a reference like `A.obs['m']`
+            (strings are resolved, e.g. `'obs.m'`). If the matrix is in csc format and a mask is provided,
+            the matrix will be transformed to csr format.
 
     Returns
     -------
-    Returns a scaled copy or updates `data` with a scaled version of the original :attr:`~anndata.AnnData.X` and `data.layers['layer']`, \
-    depending on `inplace`. If a matrix is passed, the scaled matrix is returned.
+    The scaled matrix if a matrix is passed, a :class:`~rapids_singlecell.pp.ScaleResult` if `out=True`, else `None`.
 
     """
     zero_center = resolve_default(zero_center)
     if zero_center is None:
         raise TypeError("scale() missing 1 required keyword argument: 'zero_center'")
 
+    mask = _mask_arg(mask, mask_obs, dim="obs")
+
     if not isinstance(data, AnnData):
-        if layer is not None or obsm is not None:
-            raise ValueError("`layer` and `obsm` can only be used with an AnnData object.")
+        if layer is not None or obsm is not None or use is not None or out is not False:
+            raise ValueError("`use` and `out` can only be used with an AnnData object.")
         X = data
         _check_gpu_X(X, allow_dask=True)
-        mask_obs = _check_mask(X, mask_obs, "obs")
         X, _, _ = _scale_dispatch(
             X,
-            mask_obs=mask_obs,
+            mask_obs=_check_mask(X, mask, "obs"),
             zero_center=zero_center,
-            inplace=inplace,
+            inplace=inplace and not copy,
             max_value=max_value,
         )
         return X
 
     adata = data
-    if copy:
-        if not inplace:
-            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
-        adata = adata.copy()
-
-    view_to_actual(adata)
-
-    X = _get_obs_rep(adata, layer=layer, obsm=obsm)
-    _check_gpu_X(X, allow_dask=True)
-
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, layer=layer, obsm=obsm)
     str_mean_std = ("mean", "std")
-    if mask_obs is not None:
-        if isinstance(mask_obs, str):
-            str_mean_std = (f"mean of {mask_obs}", f"std of {mask_obs}")
+    if mask is not None:
+        if isinstance(mask, str | AdRef):
+            str_mean_std = (f"mean of {mask}", f"std of {mask}")
         else:
             str_mean_std = ("mean with mask", "std with mask")
-        mask_obs = _check_mask(adata, mask_obs, "obs")
+        mask = _check_mask(adata, mask, "obs")
+    on_var = "obsm" not in src
+    dests = _out_dests(
+        out,
+        None,
+        dests=lambda _: ScaleResult(src, *({"var": k} if on_var else None for k in str_mean_std)),
+        kinds=ScaleResult({"layer", "obsm"}, {"var"}, {"var"}),
+    )
+    view_to_actual(adata)
+
+    X = _get_arr(adata, dim="obs", **src)
+    _check_gpu_X(X, allow_dask=True)
 
     X, means, std = _scale_dispatch(
         X,
-        mask_obs=mask_obs,
+        mask_obs=mask,
         zero_center=zero_center,
-        inplace=inplace,
+        # scaling is in-place, so leave the source alone unless we write back over it
+        inplace=dests is not True and dests[1].scaled == src,
         max_value=max_value,
     )
-
-    if inplace:
-        _set_obs_rep(adata, X, layer=layer, obsm=obsm)
-        if obsm is None:
-            adata.var[str_mean_std[0]] = means.get()
-            adata.var[str_mean_std[1]] = std.get()
-
-    if copy:
-        return adata
-    elif not inplace:
-        return X
+    vals = ScaleResult(X, means, std)
+    if dests is True:
+        return vals if inplace else X  # the deprecated `inplace=False` returns the matrix alone
+    _write_dests(adata, vals, dests[1])
     return None
 
 

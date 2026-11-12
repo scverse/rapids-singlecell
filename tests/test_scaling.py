@@ -125,7 +125,7 @@ def test_scale_obsm_does_not_write_var_statistics():
     adata = AnnData(cp.ones((3, 4), dtype=cp.float32))
     adata.obsm["X_embedding"] = cp.array([[1, 2], [2, 4], [3, 6]], dtype=cp.float32)
 
-    rsc.pp.scale(adata, obsm="X_embedding")
+    rsc.pp.scale(adata, use="obsm.X_embedding")
 
     cp.testing.assert_allclose(
         adata.obsm["X_embedding"],
@@ -143,7 +143,7 @@ def test_mask(typ):
     mask = np.random.randint(0, 2, adata.shape[0], dtype=bool)
     adata_mask = adata[mask].copy()
     rsc.pp.scale(adata_mask, zero_center=False)
-    rsc.pp.scale(adata, mask_obs=mask, zero_center=False)
+    rsc.pp.scale(adata, mask=mask, zero_center=False)
     adata = adata[mask].copy()
     cp.testing.assert_allclose(cp_csr_matrix(adata_mask.X).toarray(), cp_csr_matrix(adata.X).toarray())
 
@@ -170,20 +170,20 @@ def test_scale(*, use_array, typ, dtype, mask_obs, X, X_centered, X_scaled):
     adata0 = rsc.get.anndata_to_GPU(adata, copy=True)
     if use_array:
         # feeding the matrix directly should match feeding the AnnData
-        out = rsc.pp.scale(adata0.X, mask_obs=mask_obs)
+        out = rsc.pp.scale(adata0.X, mask=mask_obs)
         result = out.toarray() if hasattr(out, "toarray") else out
     else:
-        rsc.pp.scale(adata0, mask_obs=mask_obs)
+        rsc.pp.scale(adata0, mask=mask_obs)
         result = cp_csr_matrix(adata0.X).toarray()
     cp.testing.assert_allclose(result, X_centered)
     """
     # test scaling with explicit zero_center == True
     adata1 = rsc.get.anndata_to_GPU(adata, copy=True)
-    rsc.pp.scale(adata1, zero_center=True, mask_obs=mask_obs)
+    rsc.pp.scale(adata1, zero_center=True, mask=mask_obs)
     cp.testing.assert_allclose(cp_csr_matrix(adata1.X).toarray(), X_centered)
     # test scaling with explicit zero_center == False
     adata2 = rsc.get.anndata_to_GPU(adata, copy=True)
-    rsc.pp.scale(adata2, zero_center=False, mask_obs=mask_obs)
+    rsc.pp.scale(adata2, zero_center=False, mask=mask_obs)
     cp.testing.assert_allclose(cp_csr_matrix(adata2.X).toarray(), X_scaled)
     """
 
@@ -192,11 +192,43 @@ def test_mask_string():
     adata = AnnData(np.array(X_for_mask, dtype="float32"))
     rsc.get.anndata_to_GPU(adata)
     with pytest.raises(ValueError):
-        rsc.pp.scale(adata, mask_obs="mask")
+        rsc.pp.scale(adata, mask="obs.mask")
     adata.obs["some cells"] = np.array((0, 0, 1, 1, 1, 0, 0), dtype=bool)
-    rsc.pp.scale(adata, mask_obs="some cells")
+    with pytest.warns(FutureWarning, match="mask_obs"):
+        rsc.pp.scale(adata, mask_obs="some cells")
     cp.testing.assert_allclose(adata.X, X_centered_for_mask)
     assert "mean of some cells" in adata.var.keys()
+    with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview), pytest.warns(FutureWarning, match="mask_obs"):
+        rsc.pp.scale(adata, zero_center=True, mask_obs="some cells")
+    assert "mean of A.obs['some cells']" in adata.var.keys()
+
+
+def test_scale_use_out():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = AnnData(cp.array(X_original, dtype=cp.float32))
+    adata.obs["m"] = np.arange(adata.n_obs) > 0
+    res = rsc.pp.scale(adata, out=True)
+    cp.testing.assert_allclose(res.scaled, X_centered_original)
+    cp.testing.assert_allclose(adata.X, X_original)
+    rsc.pp.scale(adata, out=A.layers["s"])
+    cp.testing.assert_allclose(adata.layers["s"], X_centered_original)
+    np.testing.assert_allclose(adata.var["s_mean"], res.mean.get())
+    rsc.pp.scale(adata, use=A.layers["s"], out={"std": A.var["sd"]}, mask="obs.m")
+    assert "sd" in adata.var
+    cp.testing.assert_allclose(adata.layers["s"], X_centered_original)
+
+
+def test_scale_inplace_false_returns_matrix():
+    adata = AnnData(cp.array(X_original, dtype=cp.float32))
+    with pytest.warns(FutureWarning, match="inplace"):
+        scaled = rsc.pp.scale(adata, inplace=False)
+    assert isinstance(scaled, cp.ndarray)
+    cp.testing.assert_allclose(scaled, X_centered_original)
+    cp.testing.assert_allclose(adata.X, X_original)
+    assert "mean" not in adata.var
+    with pytest.warns(FutureWarning, match="inplace"), pytest.raises(TypeError, match="not both"):
+        rsc.pp.scale(adata, inplace=False, out=True)
 
 
 @pytest.mark.parametrize("zero_center", [True, False])
@@ -224,9 +256,9 @@ def test_clip(zero_center):
 def test_scale_sparse(*, mask_obs, X, X_scaled, X_clipped):
     adata = AnnData(csr_matrix(X).astype(np.float32))
     adata0 = rsc.get.anndata_to_GPU(adata, copy=True)
-    rsc.pp.scale(adata0, mask_obs=mask_obs, zero_center=False)
+    rsc.pp.scale(adata0, mask=mask_obs, zero_center=False)
     cp.testing.assert_allclose(adata0.X.toarray(), X_scaled)
     # test scaling with explicit zero_center == True
     adata1 = rsc.get.anndata_to_GPU(adata, copy=True)
-    rsc.pp.scale(adata1, zero_center=False, mask_obs=mask_obs, max_value=1)
+    rsc.pp.scale(adata1, zero_center=False, mask=mask_obs, max_value=1)
     cp.testing.assert_allclose(adata1.X.toarray(), X_clipped)

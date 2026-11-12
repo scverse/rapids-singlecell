@@ -6,10 +6,11 @@ import cudf
 import cupy as cp
 import numpy as np
 from scanpy.tools._utils import get_init_pos_from_paga
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import _rng_kwargs
 from rapids_singlecell._keys import _embedding_keys
-from rapids_singlecell._settings import Default, resolve_default
+from rapids_singlecell._settings import Default
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
@@ -17,23 +18,30 @@ from rapids_singlecell._utils._random import (
     _LegacyRng,
     _seed_from_rng,
 )
+from rapids_singlecell.get._out import DEPR_KEY_ADDED, _out_key
 
 from ._clustering import _create_graph
-from ._utils import _validate_init_pos
+from ._utils import _use_graph, _validate_init_pos
 
 if TYPE_CHECKING:
     from anndata import AnnData
 
+    from rapids_singlecell.get._utils import GraphAcc, MultiAcc
+
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
 def draw_graph(
     adata: AnnData,
     *,
     init_pos: str | bool | None = None,
     max_iter: int = 500,
     rng: SeedLike | RNGLike | None = None,
-    key_added: str | Default | None = Default(("draw_graph", "key_added")),
-) -> None:
+    use: GraphAcc | str | None = None,
+    out: MultiAcc | str | bool = False,
+    # deprecated
+    key_added: str | None = None,
+) -> np.ndarray | None:
     """
     Force-directed graph drawing :cite:p:`Fruchterman1991,Jacomy2014`.
 
@@ -62,12 +70,18 @@ def draw_graph(
             `None` is passed, a hash of process id, time, and hostname is
             used by `cugraph`.
             The superseded `random_state` argument is still accepted.
-        key_added
-            Template controlling where coordinates and parameters are stored.
+        use
+            The neighborhood graph (connectivities) to lay out, e.g. `A.obsp['k']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
+            If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
+        out
+            Where to write the coordinates, e.g. `A.obsm['fa']`; the parameters go to `.uns` under the same key.
+            If `True`, the coordinates are returned instead.
+            If `False`, they are written to `.obsm['X_draw_graph_fa']` and `.uns['draw_graph']`.
 
     Returns
     -------
-        updates `adata` with the following fields.
+        The coordinates if `out=True`, else updates `adata` with the following fields (see `out` for other keys).
 
             X_draw_graph_layout_fa : `adata.obsm`
                 Coordinates of graph layout.
@@ -77,8 +91,10 @@ def draw_graph(
 
     from cugraph.layout import force_atlas2
 
-    # Adjacency graph
-    adjacency = adata.obsp["connectivities"]
+    key = _out_key(out, key_added, kind="obsm", default=Default())
+    if out is not False and not isinstance(key, bool):  # keys from `out` are literal, not templates
+        key = key.replace("{", "{{").replace("}", "}}")
+    adjacency = _use_graph(adata, use)
     g = _create_graph(adjacency, use_weights=False, dtype=np.float32)
     # Get Initial Positions
     match init_pos:
@@ -88,6 +104,7 @@ def draw_graph(
             init_coords = get_init_pos_from_paga(
                 adata,
                 **_rng_kwargs(get_init_pos_from_paga, rng),
+                adjacency=adjacency,
             )
         case False:
             init_coords = None
@@ -126,7 +143,9 @@ def draw_graph(
     positions = positions.sort_values("vertex").reset_index(drop=True)
     positions = cp.vstack((positions["x"].to_cupy(), positions["y"].to_cupy())).T
     layout = "fa"
-    key_added = resolve_default(key_added)
-    keys = _embedding_keys("draw_graph", key_added, layout=layout)
+    if key is True:
+        return positions.get()
+    keys = _embedding_keys("draw_graph", key, layout=layout)
     adata.uns[keys.uns] = {"params": {"layout": layout, **meta_random_state}}
     adata.obsm[keys.obsm] = positions.get()  # Format output
+    return None

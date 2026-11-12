@@ -14,13 +14,13 @@ readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
 maintainers = [ { name = "Severin Dicks", email = "severin.dicks@scverse.org" } ]
 authors = [ { name = "Severin Dicks" } ]
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.13"
 classifiers = [
   "Environment :: GPU :: NVIDIA CUDA",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Typing :: Typed",
 ]
 dynamic = [ "version" ]
@@ -123,7 +123,7 @@ cmake.define.CMAKE_CUDA_ARCHITECTURES = "native"
 cmake.version = ">=3.24"
 ninja.version = ">=1.10"
 # Use limited ABI wheels (one wheel for all Python minor versions on one platform)
-wheel.py-api = "cp312"
+wheel.py-api = "cp313"
 
 [tool.cibuildwheel]
 # Use abi3audit to catch issues with Limited API wheels
@@ -202,7 +202,7 @@ skip = "*.ipynb,*.csv"
 mypy_path = "src"
 files = [ "src" ]
 explicit_package_bases = true
-python_version = "3.12"
+python_version = "3.13"
 warn_redundant_casts = true
 warn_unused_ignores = true
 enable_error_code = [ "ignore-without-code" ]

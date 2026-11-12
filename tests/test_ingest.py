@@ -12,9 +12,18 @@ from sklearn.neighbors import KDTree
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._ingest import _knn_classify, _query_neighbors, ingest
 
+A = pytest.importorskip("anndata.acc").A
+
 N_FEATURES = 8
 N_COMPONENTS = 5
 N_NEIGHBORS = 5
+
+
+def _ingest(adata: AnnData, adata_ref: AnnData, **kwargs) -> AnnData:
+    adata = adata.copy()
+    rsc.tl.ingest(adata, adata_ref, **kwargs)
+    return adata
+
 
 # Scanpy parity cases are semantically adapted from its BSD-3-Clause
 # ``tests/test_ingest.py`` at tag 1.12.1.
@@ -53,11 +62,7 @@ def _clustered_data(*, gpu: bool = False) -> tuple[AnnData, AnnData]:
 def fitted_data() -> tuple[AnnData, AnnData]:
     ref, query = _clustered_data()
     rsc.pp.pca(ref, n_comps=N_COMPONENTS)
-    rsc.pp.neighbors(
-        ref,
-        n_neighbors=N_NEIGHBORS,
-        use_rep="X_pca",
-    )
+    rsc.pp.neighbors(ref, n_neighbors=N_NEIGHBORS, use=A.obsm["X_pca"])
     return ref, query
 
 
@@ -68,11 +73,10 @@ def test_public_api() -> None:
 def test_pca_projection_uses_reference_mean(fitted_data) -> None:
     ref, query = fitted_data
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         embedding_method="pca",
-        inplace=False,
     )
 
     expected = (query.X - ref.X.mean(axis=0)) @ ref.varm["PCs"]
@@ -105,11 +109,10 @@ def test_pca_projection_matches_scanpy(zero_center: bool) -> None:
         embedding_method="pca",
         inplace=False,
     )
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         embedding_method="pca",
-        inplace=False,
     )
 
     np.testing.assert_allclose(
@@ -125,11 +128,10 @@ def test_pca_only_does_not_require_neighbor_representation(fitted_data) -> None:
     ref.obsm["shared"] = np.zeros((ref.n_obs, 2), dtype=np.float32)
     ref.uns["neighbors"]["params"]["use_rep"] = "shared"
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         embedding_method="pca",
-        inplace=False,
     )
 
     assert result.obsm["X_pca"].shape == (query.n_obs, N_COMPONENTS)
@@ -137,21 +139,19 @@ def test_pca_only_does_not_require_neighbor_representation(fitted_data) -> None:
 
 def test_pca_projection_is_query_batch_invariant(fitted_data) -> None:
     ref, query = fitted_data
-    whole = rsc.tl.ingest(
+    whole = _ingest(
         query,
         ref,
         obs="label",
         embedding_method="pca",
-        inplace=False,
     )
 
     single_results = [
-        rsc.tl.ingest(
+        _ingest(
             query[[i]].copy(),
             ref,
             obs="label",
             embedding_method="pca",
-            inplace=False,
         )
         for i in range(query.n_obs)
     ]
@@ -170,13 +170,8 @@ def test_pca_projection_is_query_batch_invariant(fitted_data) -> None:
 
 def test_copy_inplace_and_multiple_obs(fitted_data) -> None:
     ref, query = fitted_data
-    result = rsc.tl.ingest(
-        query,
-        ref,
-        obs=["label", "second"],
-        embedding_method="pca",
-        inplace=False,
-    )
+    with pytest.warns(FutureWarning, match="inplace"):
+        result = rsc.tl.ingest(query, ref, obs=["label", "second"], embedding_method="pca", inplace=False)
 
     assert "X_pca" not in query.obsm
     assert "label" not in query.obs
@@ -189,13 +184,7 @@ def test_copy_inplace_and_multiple_obs(fitted_data) -> None:
         "unused",
     ]
 
-    returned = rsc.tl.ingest(
-        query,
-        ref,
-        obs="label",
-        embedding_method="pca",
-        inplace=True,
-    )
+    returned = rsc.tl.ingest(query, ref, obs="label", embedding_method="pca")
     assert returned is None
     assert "X_pca" in query.obsm
     assert "label" in query.obs
@@ -218,22 +207,16 @@ def test_sparse_layer_mask_and_neighbors_key() -> None:
     rsc.pp.pca(
         ref,
         n_comps=4,
-        layer="scaled",
-        mask_var="feature_mask",
+        use=A.layers["scaled"],
+        mask=A.var["feature_mask"],
     )
-    rsc.pp.neighbors(
-        ref,
-        n_neighbors=4,
-        use_rep="X_pca",
-        key_added="alternate",
-    )
+    rsc.pp.neighbors(ref, n_neighbors=4, use=A.obsm["X_pca"], out=A.obsp["alternate"])
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         embedding_method="pca",
         neighbors_key="alternate",
-        inplace=False,
     )
 
     expected = (query_values[:, mask] - ref_values[:, mask].mean(axis=0)) @ ref.varm["PCs"][mask]
@@ -253,13 +236,12 @@ def test_uncentered_sparse_pca_projection() -> None:
     ref = AnnData(sparse.csr_matrix(ref_values))
     query = AnnData(sparse.csr_matrix(query_values))
     rsc.pp.pca(ref, n_comps=4, zero_center=False, dtype="float64")
-    rsc.pp.neighbors(ref, n_neighbors=4, use_rep="X_pca")
+    rsc.pp.neighbors(ref, n_neighbors=4, use=A.obsm["X_pca"])
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         embedding_method="pca",
-        inplace=False,
     )
 
     expected = query_values @ ref.varm["PCs"]
@@ -280,12 +262,11 @@ def test_neighbors_on_gpu_X_do_not_require_pca() -> None:
         n_pcs=3,
     )
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         obs="label",
         embedding_method=[],
-        inplace=False,
     )
 
     assert result.obs["label"].tolist() == ["low"] * 3 + ["high"] * 3
@@ -296,14 +277,13 @@ def test_sparse_X_label_transfer() -> None:
     ref, query = _clustered_data()
     ref.X = sparse.csr_matrix(ref.X)
     query.X = sparse.csr_matrix(query.X)
-    rsc.pp.neighbors(ref, n_neighbors=3, use_rep="X")
+    rsc.pp.neighbors(ref, n_neighbors=3, use=A.X)
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         obs="label",
         embedding_method=[],
-        inplace=False,
     )
 
     assert result.obs["label"].tolist() == ["low"] * 3 + ["high"] * 3
@@ -320,12 +300,11 @@ def test_label_transfer_matches_scanpy_on_X() -> None:
         embedding_method=(),
         inplace=False,
     )
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         obs="label",
         embedding_method=(),
-        inplace=False,
     )
 
     np.testing.assert_array_equal(result.obs["label"].to_numpy(), expected.obs["label"].to_numpy())
@@ -372,12 +351,11 @@ def test_automatic_neighbors_reuse_all_stored_pcs() -> None:
     ref.uns["pca"] = {"params": {"zero_center": False}}
     rsc.pp.neighbors(ref, n_neighbors=2)
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         obs="label",
         embedding_method=[],
-        inplace=False,
     )
 
     assert result.obs["label"].iloc[0] == "all-pcs"
@@ -387,14 +365,13 @@ def test_custom_neighbor_representation() -> None:
     ref, query = _clustered_data()
     ref.obsm["shared"] = np.concatenate([np.zeros((40, 2)), np.full((40, 2), 10.0)]).astype(np.float32)
     query.obsm["shared"] = np.concatenate([np.zeros((3, 2)), np.full((3, 2), 10.0)]).astype(np.float32)
-    rsc.pp.neighbors(ref, n_neighbors=3, use_rep="shared")
+    rsc.pp.neighbors(ref, n_neighbors=3, use=A.obsm["shared"])
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         obs="label",
         embedding_method=[],
-        inplace=False,
     )
     assert result.obs["label"].tolist() == ["low"] * 3 + ["high"] * 3
 
@@ -438,21 +415,19 @@ def test_knn_classify_preserves_categories_and_ignores_missing() -> None:
 
 def test_umap_mapping_uses_reference_state() -> None:
     ref, query = _clustered_data()
-    rsc.pp.neighbors(ref, n_neighbors=8, use_rep="X")
+    rsc.pp.neighbors(ref, n_neighbors=8, use=A.X)
     rsc.tl.umap(ref, random_state=0)
     ref_embedding = ref.obsm["X_umap"].copy()
 
-    result = rsc.tl.ingest(
+    result = _ingest(
         query,
         ref,
         embedding_method="umap",
-        inplace=False,
     )
-    repeated = rsc.tl.ingest(
+    repeated = _ingest(
         query,
         ref,
         embedding_method="umap",
-        inplace=False,
     )
     scanpy_result = sc.tl.ingest(
         query,
@@ -508,7 +483,7 @@ def test_missing_prerequisites_raise() -> None:
     with pytest.raises(ValueError, match="neighbors"):
         rsc.tl.ingest(query, ref, embedding_method=[])
 
-    rsc.pp.neighbors(ref, n_neighbors=3, use_rep="X")
+    rsc.pp.neighbors(ref, n_neighbors=3, use=A.X)
     with pytest.raises(ValueError, match="missing PCA"):
         rsc.tl.ingest(query, ref, embedding_method="pca")
     with pytest.raises(ValueError, match="missing UMAP"):

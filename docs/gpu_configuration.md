@@ -181,7 +181,7 @@ print(type(adata.raw.X))  # NumPy or SciPy: CPU
 
 This behavior matters because an RSC function can choose a different execution path for CPU input than for GPU-resident input.
 
-For example, exact Wilcoxon with `use_raw=True` receives CPU input.
+For example, exact Wilcoxon on a host layer (`use=A.layers["counts"]`) receives CPU input.
 If several GPUs are visible, `multi_gpu=False` restricts this call to the current device:
 
 ```python
@@ -189,7 +189,7 @@ rsc.tl.rank_genes_groups(
     adata,
     groupby="leiden",
     method="wilcoxon",
-    use_raw=True,
+    use="layers.counts",
     multi_gpu=False,
 )
 ```
@@ -198,7 +198,7 @@ A single-element list instead selects that exact logical device.
 For example, `multi_gpu=[0]` runs Wilcoxon on logical device `0` even when device `1` is current.
 If `adata.X` already created a context on device `1`, both devices can appear in `nvidia-smi`, although Wilcoxon runs only on device `0`.
 
-Alternatively, use `use_raw=False` when `adata.X` contains the expression data intended for differential-expression testing.
+Alternatively, omit `use` when the GPU-resident `adata.X` contains the expression data intended for differential-expression testing.
 
 ## Troubleshooting unexpected GPU use
 
