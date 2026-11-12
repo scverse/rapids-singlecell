@@ -1,6 +1,6 @@
 # Perturbation analysis
 
-`rsc.ptg` ports pertpy's `Distance`, `GuideAssignment`, `Mixscape` and `Mixscale`.
+`rsc.ptg` ports pertpy’s `Distance`, `GuideAssignment`, `Mixscape` and `Mixscale`.
 Use pertpy itself for everything else (Augur, Milo, scCODA, E-test, DE wrappers, embedding-space methods).
 
 ## Guides and perturbation signatures

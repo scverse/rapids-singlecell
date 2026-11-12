@@ -8,16 +8,16 @@
 .. currentmodule:: rapids_singlecell
 
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    dcg.mlm
-    dcg.ulm
-    dcg.viper
-    dcg.aucell
-    dcg.gsea
-    dcg.gsva
-    dcg.ora
-    dcg.query_set
-    dcg.waggr
-    dcg.zscore
+   dcg.mlm
+   dcg.ulm
+   dcg.viper
+   dcg.aucell
+   dcg.gsea
+   dcg.gsva
+   dcg.ora
+   dcg.query_set
+   dcg.waggr
+   dcg.zscore
 ```

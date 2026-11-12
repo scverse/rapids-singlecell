@@ -113,11 +113,11 @@ and take a `…Out` mapping as `out` to write each output to a place of choice.
 .. autosummary::
    :toctree: generated/
 
-    tl.umap
-    tl.tsne
-    tl.diffmap
-    tl.draw_graph
-    tl.embedding_density
+   tl.umap
+   tl.tsne
+   tl.diffmap
+   tl.draw_graph
+   tl.embedding_density
 ```
 
 ### Data integration
@@ -126,7 +126,7 @@ and take a `…Out` mapping as `out` to write each output to a place of choice.
 .. autosummary::
    :toctree: generated/
 
-    tl.ingest
+   tl.ingest
 ```
 
 ### Clustering
@@ -135,7 +135,7 @@ and take a `…Out` mapping as `out` to write each output to a place of choice.
 .. autosummary::
    :toctree: generated/
 
-    tl.leiden
+   tl.leiden
 ```
 
 ### Gene scores, Cell cycle
@@ -144,8 +144,8 @@ and take a `…Out` mapping as `out` to write each output to a place of choice.
 .. autosummary::
    :toctree: generated/
 
-    tl.score_genes
-    tl.score_genes_cell_cycle
+   tl.score_genes
+   tl.score_genes_cell_cycle
 ```
 
 ### Marker genes
@@ -154,7 +154,7 @@ and take a `…Out` mapping as `out` to write each output to a place of choice.
 .. autosummary::
    :toctree: generated/
 
-    tl.rank_genes_groups
+   tl.rank_genes_groups
 ```
 
 ### Output types
@@ -164,10 +164,10 @@ and take a `…Out` mapping as `out` to write each output to a place of choice.
    :nosignatures:
    :toctree: generated/
 
-    tl.CellCycleResult
-    tl.CellCycleOut
+   tl.CellCycleResult
+   tl.CellCycleOut
 ```
 
 ## Plotting
 
-For plotting please use scanpy's plotting API {mod}`scanpy.pl`.
+For plotting please use scanpy’s plotting API {mod}`scanpy.pl`.

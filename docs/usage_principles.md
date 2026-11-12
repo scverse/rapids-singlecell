@@ -10,7 +10,7 @@ import scanpy as sc
 
 ## Workflow
 
-The workflow of _rapids-singlecell_ is broadly the same as _scanpy's_.
+The workflow of *rapids-singlecell* is broadly the same as *scanpy’s*.
 For more information, see the tutorials and API documentation.
 
 ### Settings
@@ -69,7 +69,7 @@ rsc.pp.scale(adata, max_value=10)
 ### Tools
 
 The functions provided in {mod}`~.tl` are designed as near drop-in replacements for the functions in {mod}`scanpy.tl`, but offer significantly improved performance.
-Consequently, you can continue to use scanpy's plotting API.
+Consequently, you can continue to use scanpy’s plotting API.
 
 Example:
 
