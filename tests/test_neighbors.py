@@ -253,6 +253,14 @@ def test_incomplete_search_hints(algorithm, hint):
         _check_knn_complete(cp.array([[0, 9]]), n_index=2, algorithm=algorithm)
 
 
+def test_brute_undefined_metric_raises():
+    # cosine distances to an all-zero row are NaN
+    X = np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32)
+    X[3] = 0
+    with pytest.raises(ValueError, match="all-zero"):
+        neighbors(AnnData(X), n_neighbors=5, metric="cosine")
+
+
 def test_brute_large_distances():
     # an exact search pads nothing, so distances beyond the padding threshold are valid
     adata = AnnData(np.random.default_rng(0).normal(scale=1e10, size=(40, 5)).astype(np.float32))

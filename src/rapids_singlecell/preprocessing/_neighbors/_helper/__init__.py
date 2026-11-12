@@ -139,7 +139,10 @@ def _check_knn_complete(
     if valid:
         return
     if algorithm == "brute":
-        hint = "Check the representation for NaN or infinite values."
+        hint = (
+            "Check the representation for NaN or infinite values, and for rows the metric is undefined for "
+            "(all-zero with `metric='cosine'`, constant with `metric='correlation'`)."
+        )
     elif "ivf" in algorithm:
         hint = "Increase `n_probes` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
     elif algorithm == "all_neighbors":
