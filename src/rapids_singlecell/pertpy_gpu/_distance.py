@@ -94,9 +94,9 @@ class Distance:
         ``distance(X, Y)`` and ``bootstrap(X, Y)``): ``"auto"`` (default;
         ``"float64"`` for float64 data, else ``"float32"``), ``"float32"``
         (loses accuracy for tight clusters far from the center of the data),
-        ``"float64"`` or ``"float16"`` (tensor cores: the fastest, with larger
-        errors, and ``ValueError`` for data beyond the float16 range after
-        centering and scaling). Results are float32 unless the data is float64.
+        ``"float64"`` or ``"float16"`` (tensor cores: the fastest on large inputs,
+        with larger errors, and ``ValueError`` for data beyond the float16 range
+        after centering and scaling). Results are float32 unless the data is float64.
 
     Notes
     -----
