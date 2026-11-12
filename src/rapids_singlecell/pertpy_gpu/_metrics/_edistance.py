@@ -39,7 +39,6 @@ _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
 _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
-_SAMPLE_CHUNK = 1 << 18  # values a chunk of sampled host rows holds at least (1 MiB of float32)
 
 
 def _float_dtype(dtype) -> np.dtype:
@@ -48,13 +47,14 @@ def _float_dtype(dtype) -> np.dtype:
     return dtype if dtype in (np.float32, np.float64) else np.dtype(np.float32)
 
 
-def _rows(a) -> cp.ndarray:
-    """Dense rows on the device as the kernels read them: C-contiguous float32 or float64."""
+def _rows(a, order="C") -> cp.ndarray:
+    """Dense rows on the device in float32 or float64; the kernels read them C-contiguous."""
+    a = a if hasattr(a, "astype") else np.asarray(a)
     a = a.astype(_float_dtype(a.dtype), copy=False)  # converted where the array lives, then uploaded
-    return cp.asarray(a, order="C")
+    return cp.asarray(a, order=order)
 
 
-def _center(X, precision: str, chunk: int = 0) -> tuple[cp.ndarray, float]:
+def _center(X, precision: str) -> tuple[cp.ndarray, float]:
     """Shift ``nm`` and scale ``sc`` of the rows ``x * sc + nm`` the kernels compute on.
 
     The kernels get a distance from ``|a|² + |b|² - 2ab``, which needs centered
@@ -62,43 +62,29 @@ def _center(X, precision: str, chunk: int = 0) -> tuple[cp.ndarray, float]:
     is taken over a sample of rows without its outlier rows; ``sc`` is the power
     of two (exact to undo) that puts the largest centered sample value in
     ``[2**10, 2**11)`` and ``nm = -mean * sc``. The sample is at most
-    ``_SAMPLE_ROWS`` strided rows (2**25 values) of all cells of the input, not
-    the ones a call loads, so a distance does not depend on which other groups
-    are computed with it.
+    ``_SAMPLE_ROWS`` strided rows (2**25 values) of ``X``, the cells a call
+    loads, so a distance does not depend on cells the call does not read.
 
     The kernel reads the sampled rows where they are: C-contiguous float32 or
     float64 device rows, or a device CSR matrix (columns sorted or not, in its
     own index dtype), whose stored values give the ``nm`` and ``sc`` of the
-    same dense rows. With ``chunk``, ``X`` is any dense array whose sampled rows
-    go to the device ``chunk`` rows at a time.
+    same dense rows.
     """
     n, d = X.shape
-    dtype = _float_dtype(X.dtype)
+    dtype = X.dtype
     step = max(1, -(-n // max(1, min(_SAMPLE_ROWS, 2**25 // max(d, 1)))))
     m = -(-n // step)
     stream = cp.cuda.get_current_stream()
     r, keep = cp.zeros(m, dtype=dtype), cp.zeros(m, dtype=bool)
     total, ext = cp.zeros(d, dtype=cp.float64), cp.zeros((2, d), dtype=dtype)
-    spare = -(-(r.nbytes + keep.nbytes + total.nbytes + ext.nbytes) // max(d * dtype.itemsize, 1))
-    if chunk and chunk < m + spare:  # the vectors above count against the chunk: both stay within the subset's bytes
-        chunk = max(1, chunk - spare)
-
-    def chunks():  # sampled rows lo to hi and the arguments that read them
-        for lo in range(0, m, chunk):
-            yield lo, min(m, lo + chunk), _rows(X[lo * step : (lo + chunk) * step : step]), 1
-
-    if chunk:  # one chunk stays on the device over the passes, more are uploaded again in each pass
-        parts = list(chunks()) if m <= chunk else None
-    elif cpsp.issparse(X):
-        parts = [(0, m, *map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)), X.has_sorted_indices, step)]
+    if cpsp.issparse(X):
+        reader = (*map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)), X.has_sorted_indices, step)
     else:
-        parts = [(0, m, X, step)]
+        reader = (X, step)
 
     def run(what, shift=0):
-        for lo, hi, *reader in parts or chunks():
-            _ed.center(*reader, what, shift, keep[lo:hi], ext, r[lo:hi], total, stream=stream.ptr)
-            stream.synchronize()  # a chunk stays referenced until its kernel has finished
-            del reader  # and is freed before the next one is uploaded
+        _ed.center(*reader, what, shift, keep, ext, r, total, stream=stream.ptr)
+        stream.synchronize()  # the rows stay referenced until the kernel has finished
 
     run(0)  # r = the largest |value| of each row
     # Left out: rows with a non-finite value or above _TRIM times the median row (picked on the host)
@@ -240,7 +226,7 @@ def _sort_indices(X):
     return X
 
 
-def _build_csr_source(embedding_raw, selector, precision: str):
+def _build_csr_source(embedding_raw, selector):
     """Move a (host or device) sparse matrix to GPU and subset its rows.
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``
@@ -248,9 +234,7 @@ def _build_csr_source(embedding_raw, selector, precision: str):
     ``cell_indices`` line up. The result is CSR with sorted columns: a device
     matrix that is used whole is sorted in place, a sorted one is not touched;
     duplicate entries stay. The ``has_sorted_indices`` and
-    ``has_canonical_format`` flags a matrix has cached are trusted. Also
-    returns the :func:`_center` of the whole matrix, which a selector leaves
-    as it is.
+    ``has_canonical_format`` flags a matrix has cached are trusted.
     """
     from rapids_singlecell.get._anndata import X_to_GPU
 
@@ -263,10 +247,6 @@ def _build_csr_source(embedding_raw, selector, precision: str):
     X = X_to_GPU(embedding_raw)
     if not cpsp.isspmatrix_csr(X):
         X = X.tocsr()
-    if selector is None:
-        X = _sort_indices(X)
-    center = _center(X, precision)
-
     if selector is not None:
         rows = selector
         if getattr(rows, "dtype", None) == np.bool_:
@@ -274,9 +254,7 @@ def _build_csr_source(embedding_raw, selector, precision: str):
         X = X[cp.asarray(rows)]
         if not cpsp.isspmatrix_csr(X):
             X = X.tocsr()
-        X = _sort_indices(X)
-
-    return X, center
+    return _sort_indices(X)
 
 
 def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
@@ -288,18 +266,13 @@ def _materialize_source(embedding_raw, selector, precision: str) -> _Source:
     if precision == "auto":
         precision = "float64" if dtype == np.float64 else "float32"
     if _is_sparse(embedding_raw):
-        X, center = _build_csr_source(embedding_raw, selector, precision)
+        X = _build_csr_source(embedding_raw, selector)
+        center = _center(X, precision)  # of the loaded cells, before the copies below
         indptr = X.indptr.astype(cp.int64 if X.nnz > _INT32_MAX else cp.int32, copy=False)
         arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
     else:
-        X = embedding_raw if selector is not None else _rows(embedding_raw)
-        if isinstance(X, cp.ndarray) and X.flags.c_contiguous and X.dtype == dtype:
-            center = _center(X, precision)
-        else:  # a subset of host (or strided, or non-float) rows: the sample is uploaded in chunks of its size
-            count = np.count_nonzero(selector) if getattr(selector, "dtype", None) == np.bool_ else len(selector)
-            center = _center(X, precision, chunk=max(count, _SAMPLE_CHUNK // max(X.shape[1], 1), 1))
-        if selector is not None:
-            X = _rows(embedding_raw[selector])
+        X = _rows(embedding_raw if selector is None else embedding_raw[selector])
+        center = _center(X, precision)
         arrays = (X,)
     # CuPy caches the flag: asked before the sort it would stay False. It cannot scan indptr and indices of
     # different dtypes: such a matrix takes the summing loop.
@@ -812,9 +785,8 @@ class EDistanceMetric(BaseMetric):
         float
             Energy distance between X and Y
         """
-        # Convert to cupy arrays, preserving dtype
-        X_gpu = cp.asarray(X)
-        Y_gpu = cp.asarray(Y)
+        # On the device in float32 or float64
+        X_gpu, Y_gpu = _rows(X, None), _rows(Y, None)
 
         if len(X_gpu) == 0 or len(Y_gpu) == 0:
             raise ValueError("Neither X nor Y can be empty.")
@@ -856,9 +828,8 @@ class EDistanceMetric(BaseMetric):
         variance
             Bootstrap variance
         """
-        # Convert to cupy arrays, preserving dtype
-        X_gpu = cp.asarray(X)
-        Y_gpu = cp.asarray(Y)
+        # On the device in float32 or float64
+        X_gpu, Y_gpu = _rows(X, None), _rows(Y, None)
 
         if len(X_gpu) == 0 or len(Y_gpu) == 0:
             raise ValueError("Neither X nor Y can be empty.")

@@ -138,6 +138,25 @@ def test_scaled_input(precision, factor) -> None:
         np.testing.assert_array_equal(got.values, ref * np.float32(abs(factor)))
 
 
+@pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
+def test_center_of_read_cells(precision) -> None:
+    """Some groups of the data give the bits of their cells alone: the center comes from the cells a call reads."""
+    X = _make_matrix(72, np.float32)
+    X[2 * CELLS_PER_GROUP :] += 1e6  # g2 and g3: far away and not read below
+    contrasts = pd.DataFrame({"group": ["g1"], "reference": "g0"})
+
+    def results(n):  # of g0 and g1 from the first n cells, dense and CSR
+        adata = AnnData(csr_matrix(X[:n]), obs=_obs()[:n])
+        adata.obsm["emb"] = cp.asarray(X[:n])
+        for where in ({"obsm_key": "emb"}, {"layer_key": "X"}):
+            distance = Distance(metric="edistance", precision=precision, **where)
+            yield distance.pairwise(adata, groupby="group", groups=["g0", "g1"]).values
+            yield distance.contrast_distances(adata, contrasts)["edistance"].values
+
+    for got, expected in zip(results(len(X)), results(2 * CELLS_PER_GROUP), strict=True):
+        np.testing.assert_array_equal(got, expected)
+
+
 def test_scale_follows_spread() -> None:
     """The scale comes from the spread of a column around its mean, not from its distance from zero."""
     X = cp.asarray(_make_matrix(72, np.float32))
