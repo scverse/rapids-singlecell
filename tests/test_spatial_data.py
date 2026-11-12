@@ -189,6 +189,7 @@ _DOWNSTREAM = [
 
 @pytest.mark.parametrize("name,kwargs", _DOWNSTREAM)
 @pytest.mark.parametrize("copy", [False, True])
+@pytest.mark.filterwarnings("ignore:The function calculate_niche is deprecated:FutureWarning")
 def test_downstream_spatialdata(sdata, name, kwargs, copy):
     table, _ = _resolve(sdata)
     table.obsm["spatial"] = table.obsm["coords"].copy()
@@ -243,6 +244,7 @@ def test_downstream_spatialdata(sdata, name, kwargs, copy):
 
 
 @pytest.mark.parametrize("name,kwargs", _MODES + _DOWNSTREAM)
+@pytest.mark.filterwarnings("ignore:The function calculate_niche is deprecated:FutureWarning")
 def test_table_required_everywhere(sdata, name, kwargs):
     with pytest.raises(TypeError, match="table_key"):
         getattr(rsc.gr, name)(sdata, **kwargs)

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from functools import partial, singledispatch
 from importlib.metadata import version
+from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 import cupy as cp
 import numpy as np
 import pytest
+import scanpy as sc
 from anndata.tests.helpers import asarray
 from cupyx.scipy import sparse as cusparse
 from cupyx.scipy.sparse import csr_matrix as CupyCSRMatrix
@@ -149,6 +151,14 @@ def as_dense_cupy_dask_array(X):
 # Minimal feature detection: SciPy provides sparse arrays; dask support varies but
 # we optimistically enable and fallback to spmatrix at runtime if needed.
 DASK_CAN_SPARRAY = Version(version("dask")) >= Version("2025.3.0")
+
+SC_USE_OUT = "use" in signature(sc.tl.rank_genes_groups).parameters
+"""Whether scanpy has the `use`/`out` arguments (scverse/scanpy#4359)."""
+
+
+def sc_use(use: Any, **legacy: Any) -> dict[str, Any]:
+    """Keyword arguments for a scanpy reference call: `use` where scanpy has it, else the `legacy` ones."""
+    return {"use": use} if SC_USE_OUT else legacy
 
 
 def as_cupy(a: NDArray | CSArray | CSMatrix) -> CupyCSRMatrix | cp.ndarray:

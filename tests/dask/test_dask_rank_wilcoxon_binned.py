@@ -10,6 +10,14 @@ from testing.rapids_singlecell._helper import (
     as_sparse_cupy_dask_array,
 )
 
+A = pytest.importorskip("anndata.acc").A
+
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:wilcoxon_binned expects log-normalized data:UserWarning"),
+    pytest.mark.filterwarnings("ignore:Group .* has size .*normal approximation:RuntimeWarning"),
+    pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning"),
+]
+
 
 def _setup_data(data_kind):
     """Create GPU in-memory and Dask versions of a dataset."""
@@ -65,7 +73,7 @@ def test_wilcoxon_binned_dask(client, data_kind):
         method="wilcoxon_binned",
         n_bins=1000,
         bin_range="log1p",
-        use_raw=False,
+        use=A.X,
     )
     rsc.tl.rank_genes_groups(
         dask_data,
@@ -73,7 +81,7 @@ def test_wilcoxon_binned_dask(client, data_kind):
         method="wilcoxon_binned",
         n_bins=1000,
         bin_range="log1p",
-        use_raw=False,
+        use=A.X,
     )
 
     _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
@@ -95,7 +103,7 @@ def test_wilcoxon_binned_dask_group_subset(client, data_kind):
         groups=groups,
         n_bins=1000,
         bin_range="log1p",
-        use_raw=False,
+        use=A.X,
     )
     rsc.tl.rank_genes_groups(
         dask_data,
@@ -104,7 +112,7 @@ def test_wilcoxon_binned_dask_group_subset(client, data_kind):
         groups=groups,
         n_bins=1000,
         bin_range="log1p",
-        use_raw=False,
+        use=A.X,
     )
 
     _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
@@ -124,7 +132,7 @@ def test_wilcoxon_binned_dask_reference(client, data_kind):
         reference=reference,
         n_bins=1000,
         bin_range="log1p",
-        use_raw=False,
+        use=A.X,
     )
     rsc.tl.rank_genes_groups(
         dask_data,
@@ -133,7 +141,7 @@ def test_wilcoxon_binned_dask_reference(client, data_kind):
         reference=reference,
         n_bins=1000,
         bin_range="log1p",
-        use_raw=False,
+        use=A.X,
     )
 
     _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
@@ -152,7 +160,7 @@ def test_wilcoxon_binned_dask_auto_range(client, data_kind):
             method="wilcoxon_binned",
             n_bins=200,
             bin_range="auto",
-            use_raw=False,
+            use=A.X,
         )
 
     _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
@@ -176,7 +184,7 @@ def test_wilcoxon_binned_dask_reference_subset(client, data_kind):
             reference=reference,
             n_bins=1000,
             bin_range="log1p",
-            use_raw=False,
+            use=A.X,
         )
 
     _compare_scores(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
@@ -193,7 +201,7 @@ def test_wilcoxon_binned_dask_negative_sparse_raises(client):
     X = np.abs(rng.standard_normal((60, 8))).astype(np.float32)
     X[X < 0.5] = 0.0
     X[0, 0] = -1.0  # one stored negative
-    obs = pd.DataFrame({"g": pd.Categorical([f"{i % 3}" for i in range(60)])})
+    obs = pd.DataFrame({"g": pd.Categorical([f"{i % 3}" for i in range(60)])}, index=[str(i) for i in range(60)])
     var = pd.DataFrame(index=[f"v{i}" for i in range(8)])
     adata = ad_mod.AnnData(X=sp.csr_matrix(X), obs=obs, var=var)
     adata.X = as_sparse_cupy_dask_array(adata.X).persist()
@@ -204,5 +212,5 @@ def test_wilcoxon_binned_dask_negative_sparse_raises(client):
             groupby="g",
             method="wilcoxon_binned",
             bin_range="auto",
-            use_raw=False,
+            use=A.X,
         )

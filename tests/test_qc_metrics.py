@@ -54,7 +54,10 @@ def test_qc_metrics(dtype):
 
 def adata_mito(dtype):
     a = cp.random.binomial(100, 0.005, (1000, 1000), dtype=dtype)
-    init_var = pd.DataFrame({"mito": np.concatenate((np.ones(100, dtype=bool), np.zeros(900, dtype=bool)))})
+    init_var = pd.DataFrame(
+        {"mito": np.concatenate((np.ones(100, dtype=bool), np.zeros(900, dtype=bool)))},
+        index=pd.RangeIndex(1000).astype(str),
+    )
     adata_dense = AnnData(X=a, var=init_var.copy())
     return adata_dense
 

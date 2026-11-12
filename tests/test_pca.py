@@ -548,7 +548,7 @@ def test_pca_deprecated_params():
         rsc.pp.pca(adata, n_comps=2, mask_var="highly_variable", out=A.obsm["m"])
     assert adata.uns["m"]["params"]["mask_var"] == "highly_variable"
     np.testing.assert_allclose(np.abs(adata.obsm["m"]), np.abs(adata.obsm["X_pca"]), atol=1e-5)
-    with pytest.raises(TypeError, match="either `mask` or `mask_var`"):
+    with pytest.warns(FutureWarning, match="mask_var"), pytest.raises(TypeError, match="either `mask` or `mask_var`"):
         rsc.pp.pca(adata, mask="var.highly_variable", mask_var="highly_variable")
 
 
@@ -580,6 +580,9 @@ def test_pca_out():
     assert adata.uns["pp"]["params"]["obsm"] == "p"
 
 
+@pytest.mark.filterwarnings("ignore:Some cells have zero counts:UserWarning")
+@pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in divide:RuntimeWarning")
 def test_pca_layer_mask():
     """Test error when layer has zero-expression genes."""
     adata = sc.datasets.pbmc3k()[:, 1000].copy()

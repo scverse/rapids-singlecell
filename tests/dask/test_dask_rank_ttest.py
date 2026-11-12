@@ -13,6 +13,10 @@ from testing.rapids_singlecell._helper import (
     as_sparse_dask_matrix,
 )
 
+A = pytest.importorskip("anndata.acc").A
+
+pytestmark = pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
+
 
 def _compare_top_genes(result1, result2, top_n=10, min_overlap=9):
     """
@@ -77,14 +81,14 @@ def test_rank_genes_groups_ttest_dask(client, data_kind, dtype, method, mean_in_
         adata,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
     rsc.tl.rank_genes_groups(
         dask_data,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
 
@@ -130,7 +134,7 @@ def test_rank_genes_groups_wilcoxon_dask_errors(client, data_kind):
         groupby = "louvain"
 
     with pytest.raises(ValueError, match="Wilcoxon test is not supported for Dask"):
-        rsc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", use=A.X)
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
@@ -170,7 +174,7 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         adata,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
 
@@ -179,7 +183,7 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         cpu_dask,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
 
