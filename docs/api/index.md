@@ -6,7 +6,6 @@ Import rapids-singlecell as:
 import rapids_singlecell as rsc
 ```
 
-
 ```{toctree}
 :maxdepth: 2
 

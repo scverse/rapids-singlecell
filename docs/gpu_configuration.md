@@ -5,14 +5,14 @@ On systems with several GPUs, you can assign different GPUs to independent analy
 
 ## Quick guide
 
-| What you want to do                              | Recommended setup                                                                              |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| Run one analysis on one GPU                      | Start Python with `CUDA_VISIBLE_DEVICES=0`.                                                    |
-| Run two independent scripts on two GPUs          | Start one with `CUDA_VISIBLE_DEVICES=0` and the other with `CUDA_VISIBLE_DEVICES=1`.           |
-| Run two notebooks on two GPUs                    | Set a different `CUDA_VISIBLE_DEVICES` value in the first cell of each fresh kernel.           |
-| Keep a small display GPU out of an analysis      | Exclude it from `CUDA_VISIBLE_DEVICES`, for example by starting with `CUDA_VISIBLE_DEVICES=1`. |
-| Use several GPUs for one supported RSC operation | Make only the intended GPUs visible and pass `multi_gpu=True` or an explicit device list.      |
-| Process an out-of-core or distributed dataset    | Use Dask-CUDA; see {doc}`out_of_core`.                                                         |
+  | What you want to do                              | Recommended setup                                                                              |
+  | ------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+  | Run one analysis on one GPU                      | Start Python with `CUDA_VISIBLE_DEVICES=0`.                                                    |
+  | Run two independent scripts on two GPUs          | Start one with `CUDA_VISIBLE_DEVICES=0` and the other with `CUDA_VISIBLE_DEVICES=1`.           |
+  | Run two notebooks on two GPUs                    | Set a different `CUDA_VISIBLE_DEVICES` value in the first cell of each fresh kernel.           |
+  | Keep a small display GPU out of an analysis      | Exclude it from `CUDA_VISIBLE_DEVICES`, for example by starting with `CUDA_VISIBLE_DEVICES=1`. |
+  | Use several GPUs for one supported RSC operation | Make only the intended GPUs visible and pass `multi_gpu=True` or an explicit device list.      |
+  | Process an out-of-core or distributed dataset    | Use Dask-CUDA; see {doc}`out_of_core`.                                                         |
 
 > Assign GPUs before CUDA is initialized in the Python process or notebook kernel.
 > Use an RSC function's `multi_gpu` argument to control work inside that process.
@@ -86,7 +86,7 @@ There is no need to change the RSC code between the two scripts.
 GPU isolation does not isolate CPU cores, host RAM, or storage bandwidth.
 Use different output and temporary paths, and make sure the machine has enough host memory for both analyses.
 
-On a managed cluster, prefer the scheduler's GPU assignment mechanism.
+On a managed cluster, prefer the scheduler’s GPU assignment mechanism.
 Slurm, Kubernetes, and similar platforms normally set device visibility for the job.
 Do not replace a scheduler-provided `CUDA_VISIBLE_DEVICES` unless the platform documentation tells you to.
 
@@ -153,7 +153,7 @@ rsc.gr.co_occurrence(
 )
 ```
 
-The meaning of `multi_gpu=None` and `multi_gpu=False` is function-specific, so consult the function's API documentation.
+The meaning of `multi_gpu=None` and `multi_gpu=False` is function-specific, so consult the function’s API documentation.
 Use `multi_gpu=True` when all visible GPUs should participate, and use an explicit list when the exact device set matters.
 
 Multi-GPU execution requires splitting work and transferring data to each GPU.
@@ -162,7 +162,7 @@ For smaller datasets, one GPU can be faster.
 ## Use Dask for distributed or out-of-core data
 
 Dask-CUDA normally starts one worker process per GPU.
-This differs from a single Python process using an RSC function's `multi_gpu` argument.
+This differs from a single Python process using an RSC function’s `multi_gpu` argument.
 
 Use Dask when data are already Dask-backed, do not fit on one GPU, or need a distributed pipeline.
 See {doc}`out_of_core` for supported functions and cluster configuration.
@@ -215,13 +215,13 @@ For independent jobs, give each process or kernel only its assigned GPU.
 
 The controls involved in GPU execution have different purposes:
 
-| Control                           | Scope                            | Purpose                                                                |
-| --------------------------------- | -------------------------------- | ---------------------------------------------------------------------- |
-| Scheduler or container assignment | Job or container                 | Enforces the platform's GPU allocation.                                |
-| `CUDA_VISIBLE_DEVICES`            | Python process or Jupyter kernel | Determines which GPUs CUDA libraries can see.                          |
-| A function's `multi_gpu` argument | One RSC operation                | Selects visible GPUs for that operation.                               |
-| {class}`cupy.cuda.Device`         | Current host thread              | Selects the default logical device for new CUDA work.                  |
-| `rmm.reinitialize(devices=...)`   | RMM memory resources             | Configures allocators but does not hide or select GPUs for algorithms. |
+  | Control                           | Scope                            | Purpose                                                                |
+  | --------------------------------- | -------------------------------- | ---------------------------------------------------------------------- |
+  | Scheduler or container assignment | Job or container                 | Enforces the platform’s GPU allocation.                                |
+  | `CUDA_VISIBLE_DEVICES`            | Python process or Jupyter kernel | Determines which GPUs CUDA libraries can see.                          |
+  | A function’s `multi_gpu` argument | One RSC operation                | Selects visible GPUs for that operation.                               |
+  | {class}`cupy.cuda.Device`         | Current host thread              | Selects the default logical device for new CUDA work.                  |
+  | `rmm.reinitialize(devices=...)`   | RMM memory resources             | Configures allocators but does not hide or select GPUs for algorithms. |
 
 CuPy creates new arrays on the current device:
 

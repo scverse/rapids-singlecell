@@ -1,5 +1,4 @@
 ---
-
 name: rapids-singlecell
 description: "Read before writing any rapids-singlecell code (`import rapids_singlecell as rsc`) or running scanpy-, squidpy-, decoupler- or pertpy-style analysis on a GPU. Covers QC, doublets, normalization, HVGs, PCA, integration, clustering, UMAP, markers, annotation, pseudobulk DE, pathway scoring, CRISPR screens, spatial statistics and niches, out-of-core or multi-GPU runs, and GPU setup. rsc differs from scanpy in where data live and in defaults."
 ---
@@ -63,7 +62,7 @@ from anndata.acc import A
 ## Standard workflow
 
 Inspect first: shape, whether `X` holds integer counts, and which `obs` columns hold the biological sample, batch and condition.
-`sample` and `condition` stand for the dataset's own columns.
+`sample` and `condition` stand for the dataset’s own columns.
 Convert dense counts to CSR (`scipy.sparse.csr_matrix`) before moving them to the GPU.
 Cross-tabulate sample against condition, because a batch nested in condition cannot be corrected without erasing the condition.
 For spatial data, read [references/spatial.md](references/spatial.md) first; its QC and normalization replace those below.
@@ -138,17 +137,17 @@ rsc.tl.rank_genes_groups(adata, "leiden_1.0", method="wilcoxon", pts=True)
 
 ## Outside rsc
 
-| Need                                   | Use                                                |
-| -------------------------------------- | -------------------------------------------------- |
-| Ambient RNA                            | CellBender, SoupX                                  |
-| scVI, scANVI, sysVI                    | scvi-tools                                         |
-| Annotation                             | CellTypist, scANVI                                 |
-| Integration metrics                    | scib-metrics                                       |
-| Pseudobulk DE                          | PyDESeq2 on `rsc.get.aggregate` output             |
-| Pathway resources and plots            | decoupler `dc.op`, `dc.pl`, scoring with `rsc.dcg` |
-| Cell-cell communication across samples | LIANA+                                             |
-| Neighborhood enrichment                | squidpy                                            |
-| Condition & perturbation analysis      | pertpy                                             |
+  | Need                                   | Use                                                |
+  | -------------------------------------- | -------------------------------------------------- |
+  | Ambient RNA                            | CellBender, SoupX                                  |
+  | scVI, scANVI, sysVI                    | scvi-tools                                         |
+  | Annotation                             | CellTypist, scANVI                                 |
+  | Integration metrics                    | scib-metrics                                       |
+  | Pseudobulk DE                          | PyDESeq2 on `rsc.get.aggregate` output             |
+  | Pathway resources and plots            | decoupler `dc.op`, `dc.pl`, scoring with `rsc.dcg` |
+  | Cell-cell communication across samples | LIANA+                                             |
+  | Neighborhood enrichment                | squidpy                                            |
+  | Condition & perturbation analysis      | pertpy                                             |
 
 Never replace a missing rsc capability with a silent CPU reimplementation.
 For CRISPR screens and perturbation distances, read [references/perturbation.md](references/perturbation.md).
