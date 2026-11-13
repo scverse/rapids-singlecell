@@ -407,7 +407,7 @@ def large_group_data() -> tuple[np.ndarray, np.ndarray, pd.Series]:
 def test_onesided_large_group_vs_cpu(large_group_data, dtype, sparse: bool, precision: str) -> None:
     """Every precision matches a float64 CPU reference, dense and CSR, in the input's dtype."""
     X, labels, expected = large_group_data
-    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=list(expected.index))})
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=list(expected.index))}).rename(str)
     kwargs = {"metric": "edistance", "precision": precision}
     if sparse:
         adata, distance = AnnData(csr_matrix(X.astype(dtype)), obs=obs), Distance(layer_key="X", **kwargs)
@@ -464,7 +464,7 @@ def test_float16_range_check_cells() -> None:
     n = 2**16 + 4
     X = np.random.default_rng(0).normal(size=(n, 2)).astype(np.float32)
     X[n // 4 - 1] = 1e9  # the last "a" cell
-    adata = AnnData(X, obs=pd.DataFrame({"group": pd.Categorical(np.repeat(list("abcd"), n // 4))}))
+    adata = AnnData(X, obs=pd.DataFrame({"group": pd.Categorical(np.repeat(list("abcd"), n // 4))}).rename(str))
     adata.obsm["X_pca"] = cp.asarray(X)
     distance = Distance(metric="edistance", precision="float16")
     contrasts = pd.DataFrame({"group": list("cda"), "reference": "b"})  # used in the order c, b, d, a
