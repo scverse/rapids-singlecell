@@ -43,9 +43,10 @@ _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times 
 
 def _float_dtype(dtype) -> np.dtype:
     """The dtype the kernels read data of dtype in: float32 or float64 in native byte order."""
-    dtype = np.dtype(dtype).newbyteorder("=")
+    dtype = np.dtype(dtype)
     if dtype.kind not in "biuf":  # complex, strings, dates, objects
         raise ValueError(f"Unsupported dtype {dtype}")
+    dtype = dtype.newbyteorder("=")
     return dtype if dtype in (np.float32, np.float64) else np.dtype(np.float32)
 
 
