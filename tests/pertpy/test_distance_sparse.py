@@ -140,10 +140,11 @@ def test_scaled_input(precision, factor) -> None:
 
 @pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
 @pytest.mark.parametrize("used", [2, 3])  # of the four groups; dense contrasts on 3 of them load the whole array
-def test_center_of_read_cells(precision, used) -> None:
+@pytest.mark.parametrize("offset", [30, 1e6])  # of the other groups: a center of all cells keeps or drops them
+def test_center_of_read_cells(precision, used, offset) -> None:
     """Some groups of the data give the bits of their cells alone: the center comes from the cells a call reads."""
     X = _make_matrix(72, np.float32)
-    X[used * CELLS_PER_GROUP :] += 1e6  # the other groups: far away and not read below
+    X[used * CELLS_PER_GROUP :] += offset  # the other groups are not read below
     groups = [f"g{i}" for i in range(used)]
     contrasts = pd.DataFrame({"group": groups[1:], "reference": "g0"})
 
@@ -157,6 +158,17 @@ def test_center_of_read_cells(precision, used) -> None:
 
     for got, expected in zip(results(len(X)), results(used * CELLS_PER_GROUP), strict=True):
         np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16"])
+def test_center_of_listed_rows(precision) -> None:
+    """A strided sample of the rows a call lists is the sample of those rows as an array of their own."""
+    rng = np.random.default_rng(0)
+    X = cp.asarray(rng.normal(size=(20_000, 4)), dtype=cp.float32)
+    rows = cp.asarray(rng.permutation(len(X))[:17_000], dtype=cp.int32)  # more than the sample holds, shuffled
+    got, expected = _materialize_source(X, None, precision, rows), _materialize_source(X[rows], None, precision)
+    assert got.sc == expected.sc
+    cp.testing.assert_array_equal(got.nm, expected.nm)
 
 
 def test_scale_follows_spread() -> None:

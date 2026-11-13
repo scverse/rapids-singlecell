@@ -595,7 +595,7 @@ struct EdCenterDense {
     static constexpr int CW = 64;
     const In* X;
     long long ldx;    // row stride (elements)
-    const int* rows;  // sampled row i is row rows[i] of X; null: row i
+    const int* rows;  // read cell r is row rows[r] of X; null: row r
     __device__ void fill(In* win, long long row, int c0, int nw) const {
         if (rows) row = rows[row];
         for (int c = 0; c < nw; ++c) win[c] = X[row * ldx + c0 + c];
@@ -623,7 +623,8 @@ struct EdCenterCsr {
             }
         }
         for (; j < end && indices[j] - c0 < nw; ++j)
-            win[indices[j] - c0] += data[j];
+            // true for sorted input; keeps unsorted columns inside the window
+            if (indices[j] >= c0) win[indices[j] - c0] += data[j];
     }
 };
 
