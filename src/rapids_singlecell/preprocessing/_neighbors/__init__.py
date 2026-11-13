@@ -146,7 +146,7 @@ def neighbors(
                 Uses inverted file indexing to partition the dataset into coarse quantizer cells and performs the search within the relevant cells.
 
             `'ivfpq'`
-                Combines inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation.
+                Combines inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation. Indexes with fewer than 512 cells are searched exactly.
 
             `'cagra'`
                 Employs the Compressed, Accurate Graph-based search to quickly find nearest neighbors by traversing a graph structure.
@@ -163,7 +163,7 @@ def neighbors(
                 Uses the Multi-GPU inverted file indexing to partition the dataset into coarse quantizer cells and performs the search within the relevant cells.
 
             `'mg_ivfpq'`
-                Combines Multi-GPU inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation.
+                Combines Multi-GPU inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation. Indexes with fewer than 512 cells are searched exactly.
 
         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
     metric
@@ -360,7 +360,7 @@ def bbknn(
         `'ivfflat'`
             Uses inverted file indexing to partition the dataset into coarse quantizer cells and performs the search within the relevant cells.
         `'ivfpq'`
-            Combines inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation.
+            Combines inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation. Indexes with fewer than 512 cells are searched exactly.
         `'cagra'`
             Employs the Compressed, Accurate Graph-based search to quickly find nearest neighbors by traversing a graph structure.
 
@@ -368,7 +368,7 @@ def bbknn(
             Uses the Multi-GPU inverted file indexing to partition the dataset into coarse quantizer cells and performs the search within the relevant cells.
 
         `'mg_ivfpq'`
-            Combines Multi-GPU inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation.
+            Combines Multi-GPU inverted file indexing with product quantization to encode sub-vectors of the dataset, facilitating faster distance computation. Indexes with fewer than 512 cells are searched exactly.
 
         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
     metric

@@ -9,7 +9,8 @@ import cuvs
 import numpy as np
 from packaging.version import parse as parse_version
 
-from rapids_singlecell.preprocessing._neighbors._helper import _compute_nlist
+from rapids_singlecell.preprocessing._neighbors._algorithms._brute import _brute_knn
+from rapids_singlecell.preprocessing._neighbors._helper import _IVF_PQ_MIN_ROWS, _compute_nlist
 
 try:
     from cuvs.neighbors import all_neighbors
@@ -153,6 +154,11 @@ def _all_neighbors_knn(
                 f"all_neighbors with algo='ivf_pq' only supports 'euclidean' and "
                 f"'sqeuclidean' metrics, got {metric!r}. Use algo='nn_descent' instead."
             )
+        # cuVS builds one index per cluster; its clusters can be half the average size
+        rows = X.shape[0] if n_clusters == 1 else X.shape[0] * overlap_factor // (n_clusters * _CLUSTER_IMBALANCE)
+        if rows < _IVF_PQ_MIN_ROWS:  # too few rows to train the PQ codebooks
+            X_gpu = cp.asarray(X)
+            return _brute_knn(X_gpu, X_gpu, k, metric=metric, metric_kwds=metric_kwds, algorithm_kwds=algorithm_kwds)
         n_lists = algorithm_kwds.get("n_lists", _compute_nlist(X.shape[0]))
         ivf_pq_params = ivf_pq.IndexParams(n_lists=n_lists, metric=cuvs_metric)
         nn_descent_params = None

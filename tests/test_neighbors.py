@@ -195,6 +195,16 @@ def test_indices_approx_nn(algo):
     assert counter / b_stop > 0.9
 
 
+@pytest.mark.parametrize("algo", ["ivfpq", "mg_ivfpq"])
+def test_ivfpq_small_index_is_exact(algo):
+    # too few cells to train the PQ codebooks (cuVS >= 26.12 refuses): searched by brute force
+    adata = pbmc68k_reduced()[:300].copy()
+    brute_data = adata.copy()
+    neighbors(adata, n_neighbors=5, algorithm=algo)
+    neighbors(brute_data, n_neighbors=5, algorithm="brute")
+    assert (adata.obsp["distances"] != brute_data.obsp["distances"]).nnz == 0
+
+
 KEY = "test"
 
 
