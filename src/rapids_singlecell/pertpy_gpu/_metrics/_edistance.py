@@ -856,11 +856,12 @@ class EDistanceMetric(BaseMetric):
     def _energy(self, X: cp.ndarray, Y: cp.ndarray) -> float:
         """Energy distance of two device arrays.
 
-        float32 and float64 arrays are read as they are. Any other dtype is cast
-        one block of columns at a time to float32 (float64 next to a float64
-        array). The blocks add up the row norms and the three Gram matrices; a
-        block and the Gram matrices together hold no more than the bytes of the
-        larger array, unless the Gram matrices alone need more.
+        Two float32 or float64 arrays take the float calls. Otherwise both arrays
+        are read one block of columns at a time in float32 (float64 next to a
+        float64 array). The blocks add up the row norms and the three Gram
+        matrices. A block holds what the larger array has in bytes beyond the
+        Gram matrices and one product, or as many bytes as these where that is
+        more, and at most ``_CAST_VALUES`` values.
         """
         if all(a.dtype in (np.float32, np.float64) for a in (X, Y)):
             d_xy = self._mean_pairwise_distance(X, Y)
@@ -872,7 +873,9 @@ class EDistanceMetric(BaseMetric):
         dtype = np.result_type(_float_dtype(X.dtype), _float_dtype(Y.dtype))
         n, m = len(X), len(Y)
         grams = (n * n + n * m + m * m + max(n, m) ** 2) * dtype.itemsize  # the Gram matrices and one product
-        room = max(max(X.nbytes, Y.nbytes) - grams, grams)  # bytes of a block
+        # the float calls hold 45 B per pair of cells of a group (33 B in float16); grams and a block stay below that
+        held = max((32 if a.dtype == np.float16 else 44) * len(a) ** 2 for a in (X, Y))
+        room = max(max(X.nbytes, Y.nbytes) - grams, min(grams, held - grams))  # bytes of a block
         step = max(1, min(_CAST_VALUES, room // dtype.itemsize) // (n + m + 1))  # + 1: CuPy copies a single row
         gxx, gxy, gyy = (cp.zeros(shape, dtype=dtype) for shape in ((n, n), (n, m), (m, m)))
         nx, ny = cp.zeros(n, dtype=dtype), cp.zeros(m, dtype=dtype)
