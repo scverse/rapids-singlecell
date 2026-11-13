@@ -39,6 +39,7 @@ _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
 _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
+_CAST_VALUES = 1 << 24  # values of two-array input that is cast, held in float32 or float64 at a time
 
 
 def _float_dtype(dtype) -> np.dtype:
@@ -50,10 +51,17 @@ def _float_dtype(dtype) -> np.dtype:
     return dtype if dtype in (np.float32, np.float64) else np.dtype(np.float32)
 
 
-def _rows(a, order="C") -> cp.ndarray:
+def _rows(a) -> cp.ndarray:
     """Dense rows on the device in float32 or float64; the kernels read them C-contiguous."""
     a = a.astype(_float_dtype(a.dtype), copy=False)  # converted where the array lives, then uploaded
-    return cp.asarray(a, order=order)
+    return cp.asarray(a, order="C")
+
+
+def _device(a) -> cp.ndarray:
+    """A two-array input on the device in the dtype it came in; raises for a dtype that is not a real number."""
+    a = cp.asarray(a)
+    _float_dtype(a.dtype)
+    return a
 
 
 def _center(X, precision: str, rows=None) -> tuple[cp.ndarray, float]:
@@ -161,7 +169,9 @@ class _Source:
                 zero = cp.zeros(-(-kp // width) * width, dtype=elem)
                 zero[:d] = nm.astype(acc, copy=False).astype(elem, copy=False)
                 zero = zero.view(cp.uint16) if elem is np.float16 else zero
-                args = (*arrays, nm, self.sc, zero, self.duplicates, kp)
+                pad = cp.zeros(zero.size, dtype=nm.dtype)  # as long as zero: a column past d stays inside it
+                pad[:d] = nm
+                args = (*arrays, pad, self.sc, zero, self.duplicates, kp)
             norms, unused = cp.full(n, -1, dtype=acc), cp.zeros(1, dtype=cp.int32)
             stream = cp.cuda.get_current_stream()
             fn(*args, norms, *[unused] * 5, 0, cp.zeros(1), norms_only=True, stream=stream.ptr)
@@ -275,6 +285,8 @@ def _materialize_source(embedding_raw, selector, precision: str, rows=None) -> _
         indptr = X.indptr.astype(cp.int64 if X.nnz > _INT32_MAX else cp.int32, copy=False)
         arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
     else:
+        if getattr(selector, "dtype", None) == np.bool_:  # CuPy scans every element of the array for a row mask
+            selector = np.flatnonzero(selector)
         X = _rows(embedding_raw if selector is None else embedding_raw[selector])
         center = _center(X, precision, rows)
         arrays = (X,)
@@ -692,8 +704,9 @@ class EDistanceMetric(BaseMetric):
         original_indices = np.concatenate(all_cell_idx)
 
         # Subset the referenced cells. For sparse input always row-subset into
-        # CSR (the kernel densifies on the fly); for dense input only
-        # subset when most cells are unused, else transfer the whole array.
+        # CSR (the kernel densifies on the fly); for dense input subset when fewer
+        # than 70 % of the cells are used, else load the whole array and read the
+        # used cells through cell_indices.
         if _is_sparse(embedding_raw):
             embedding = _materialize_source(embedding_raw, original_indices, self.precision)
             cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
@@ -789,18 +802,12 @@ class EDistanceMetric(BaseMetric):
         float
             Energy distance between X and Y
         """
-        X_gpu, Y_gpu = (_rows(cp.asarray(a), None) for a in (X, Y))  # in float32 or float64
+        X_gpu, Y_gpu = (_device(a) for a in (X, Y))
 
         if len(X_gpu) == 0 or len(Y_gpu) == 0:
             raise ValueError("Neither X nor Y can be empty.")
 
-        # Compute mean pairwise distances
-        d_xy = self._mean_pairwise_distance(X_gpu, Y_gpu)
-        d_xx = self._mean_pairwise_distance_within(X_gpu)
-        d_yy = self._mean_pairwise_distance_within(Y_gpu)
-
-        # Energy distance formula
-        return float(2 * d_xy - d_xx - d_yy)
+        return self._energy(X_gpu, Y_gpu)
 
     def bootstrap_arrays(
         self,
@@ -831,7 +838,7 @@ class EDistanceMetric(BaseMetric):
         variance
             Bootstrap variance
         """
-        X_gpu, Y_gpu = (_rows(cp.asarray(a), None) for a in (X, Y))  # in float32 or float64
+        X_gpu, Y_gpu = (_device(a) for a in (X, Y))
 
         if len(X_gpu) == 0 or len(Y_gpu) == 0:
             raise ValueError("Neither X nor Y can be empty.")
@@ -843,19 +850,47 @@ class EDistanceMetric(BaseMetric):
             # Bootstrap sample indices
             X_idx = rng.choice(len(X_gpu), size=len(X_gpu), replace=True)
             Y_idx = rng.choice(len(Y_gpu), size=len(Y_gpu), replace=True)
-
-            X_boot = X_gpu[X_idx]
-            Y_boot = Y_gpu[Y_idx]
-
-            # Compute distance for this bootstrap sample
-            d_xy = self._mean_pairwise_distance(X_boot, Y_boot)
-            d_xx = self._mean_pairwise_distance_within(X_boot)
-            d_yy = self._mean_pairwise_distance_within(Y_boot)
-
-            distance = 2 * d_xy - d_xx - d_yy
-            distances.append(float(distance))
+            distances.append(self._energy(X_gpu[X_idx], Y_gpu[Y_idx]))
 
         return float(np.mean(distances)), float(np.var(distances))
+
+    def _energy(self, X: cp.ndarray, Y: cp.ndarray) -> float:
+        """Energy distance of two device arrays.
+
+        float32 and float64 arrays are read as they are. Any other dtype is cast
+        to float32 one block of columns at a time (``_CAST_VALUES`` values), which
+        adds up the three Gram matrices without a float32 copy of the arrays.
+        """
+        if all(a.dtype in (np.float32, np.float64) for a in (X, Y)):
+            d_xy = self._mean_pairwise_distance(X, Y)
+            d_xx = self._mean_pairwise_distance_within(X)
+            d_yy = self._mean_pairwise_distance_within(Y)
+            return float(2 * d_xy - d_xx - d_yy)
+        if X.ndim != 2 or Y.ndim != 2 or X.shape[1] != Y.shape[1]:
+            raise ValueError("X and Y need two dimensions and the same number of features.")
+        dtype = np.result_type(_float_dtype(X.dtype), _float_dtype(Y.dtype))
+        n, m = len(X), len(Y)
+        step = max(1, _CAST_VALUES // (n + m))
+        gxx, gxy, gyy = (cp.zeros(shape, dtype=dtype) for shape in ((n, n), (n, m), (m, m)))
+        for c in range(0, X.shape[1], step):
+            xb, yb = (a[:, c : c + step].astype(dtype) for a in (X, Y))  # one compact copy of the block
+            gxx += xb @ xb.T
+            gxy += xb @ yb.T
+            gyy += yb @ yb.T
+            del xb, yb  # before the next block is cast
+        nx, ny = gxx.diagonal().copy(), gyy.diagonal().copy()
+
+        def mean_distance(g, a, b, pairs):  # the Gram matrix becomes the distances in place
+            g *= -2
+            g += a[:, None]
+            g += b[None, :]
+            cp.maximum(g, 0, out=g)
+            return float(cp.sqrt(g, out=g).sum()) / pairs if pairs else 0.0
+
+        d_xy = mean_distance(gxy, nx, ny, n * m)
+        d_xx = mean_distance(gxx, nx, nx, n * (n - 1))  # both triangles: the diagonal is exactly 0
+        d_yy = mean_distance(gyy, ny, ny, m * (m - 1))
+        return float(2 * d_xy - d_xx - d_yy)
 
     def _mean_pairwise_distance(
         self,

@@ -143,7 +143,7 @@ def test_scaled_input(precision, factor) -> None:
 @pytest.mark.parametrize("offset", [30, 1e6])  # of the other groups: a center of all cells keeps or drops them
 def test_center_of_read_cells(precision, used, offset) -> None:
     """Some groups of the data give the bits of their cells alone: the center comes from the cells a call reads."""
-    X = _make_matrix(72, np.float32)
+    X = _make_matrix(72, np.float64 if precision == "float64" else np.float32)  # float64 results for float64 data
     X[used * CELLS_PER_GROUP :] += offset  # the other groups are not read below
     groups = [f"g{i}" for i in range(used)]
     contrasts = pd.DataFrame({"group": groups[1:], "reference": "g0"})
