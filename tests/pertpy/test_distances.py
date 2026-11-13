@@ -259,6 +259,9 @@ def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> Non
     expected = distance.pairwise(small_adata, groupby="group")
     small_adata.obsm["X_pca"] = X.astype(cp.int32)
     pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
+    rng = cp.random.default_rng(0)  # float16 values whose row norms are not exact in float32
+    x, y = ((rng.standard_normal((n, 50)) + loc).astype(cp.float16) for n, loc in ((200, 20), (300, 20.5)))
+    assert distance(x, y) == pytest.approx(distance(x.astype(cp.float64), y.astype(cp.float64)), rel=2e-5)
     a, b = X[:4].astype(cp.float32), X[4:].astype(cp.float32)
     for values in (1 << 24, 1):  # of cast two-array input at a time: all columns in one block, then one column each
         monkeypatch.setattr("rapids_singlecell.pertpy_gpu._metrics._edistance._CAST_VALUES", values)
