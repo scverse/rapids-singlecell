@@ -252,9 +252,9 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
 
 
 def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> None:
-    """Dense integer and float16 input gives the result of its float32 cast."""
+    """Dense integer and float16 input is computed in float32: AnnData input to the bit, two-array input to rounding."""
     distance = Distance(metric="edistance")
-    X = cp.rint(small_adata.obsm["X_pca"] * 4)
+    X = cp.rint(small_adata.obsm["X_pca"] * 4) * 14  # int8 values whose sums of squares do not fit float16
     small_adata.obsm["X_pca"] = X.astype(cp.float32)
     expected = distance.pairwise(small_adata, groupby="group")
     small_adata.obsm["X_pca"] = X.astype(cp.int32)
@@ -264,11 +264,15 @@ def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> Non
         monkeypatch.setattr("rapids_singlecell.pertpy_gpu._metrics._edistance._CAST_VALUES", values)
         for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
             assert distance(a.astype(dtype), b.get().astype(dtype)) == pytest.approx(distance(a, b), rel=1e-5)
-            got, expected = distance.bootstrap(a.astype(dtype), b.astype(dtype)), distance.bootstrap(a, b)
-            np.testing.assert_allclose(got, expected, rtol=1e-4)
+            got, want = distance.bootstrap(a.astype(dtype), b.astype(dtype)), distance.bootstrap(a, b)
+            np.testing.assert_allclose(got, want, rtol=1e-4)
+    a64, b8 = a.astype(cp.float64) / 3, b.astype(cp.int8)  # next to a float64 array the cast is to float64
+    assert distance(a64, b8) == pytest.approx(distance(a64, b8.astype(cp.float64)), rel=1e-10)
     assert distance(pd.DataFrame(a.get()), pd.DataFrame(b.get())) == distance(a, b)  # anything cp.asarray takes
     with pytest.raises(ValueError, match="Unsupported dtype"):
         distance(a.astype(cp.complex64), b)
+    with pytest.raises(ValueError, match="same number of features"):
+        distance(a.astype(cp.int8), b[:, :3])
 
 
 def test_edistance_dense_big_endian_input(small_adata: AnnData) -> None:

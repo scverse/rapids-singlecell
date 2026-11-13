@@ -39,7 +39,7 @@ _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
 _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
-_CAST_VALUES = 1 << 24  # values of two-array input that is cast, held in float32 or float64 at a time
+_CAST_VALUES = 1 << 24  # values of cast two-array input held in float32 or float64 at a time, at most
 
 
 def _float_dtype(dtype) -> np.dtype:
@@ -58,7 +58,7 @@ def _rows(a) -> cp.ndarray:
 
 
 def _device(a) -> cp.ndarray:
-    """A two-array input on the device in the dtype it came in; raises for a dtype that is not a real number."""
+    """A two-array input on the device in the dtype it came in; raises unless that is boolean, integer or float."""
     a = cp.asarray(a)
     _float_dtype(a.dtype)
     return a
@@ -164,14 +164,10 @@ class _Source:
             if len(arrays) == 1:
                 at = arrays[0].data.ptr | (d * arrays[0].itemsize)
                 args = (*arrays, min(16, at & -at), nm, self.sc, kp)
-            else:  # the row of an all-zero cell, padded to whole shared-memory windows
-                width = 128 // np.dtype(elem).itemsize
-                zero = cp.zeros(-(-kp // width) * width, dtype=elem)
-                zero[:d] = nm.astype(acc, copy=False).astype(elem, copy=False)
+            else:  # the row of an all-zero cell: nm in the shared-memory element, nm itself where that is its dtype
+                zero = nm.astype(acc, copy=False).astype(elem, copy=False)
                 zero = zero.view(cp.uint16) if elem is np.float16 else zero
-                pad = cp.zeros(zero.size, dtype=nm.dtype)  # as long as zero: a column past d stays inside it
-                pad[:d] = nm
-                args = (*arrays, pad, self.sc, zero, self.duplicates, kp)
+                args = (*arrays, nm, self.sc, zero, self.duplicates, kp)
             norms, unused = cp.full(n, -1, dtype=acc), cp.zeros(1, dtype=cp.int32)
             stream = cp.cuda.get_current_stream()
             fn(*args, norms, *[unused] * 5, 0, cp.zeros(1), norms_only=True, stream=stream.ptr)
@@ -282,6 +278,9 @@ def _materialize_source(embedding_raw, selector, precision: str, rows=None) -> _
     if _is_sparse(embedding_raw):
         X = _build_csr_source(embedding_raw, selector)
         center = _center(X, precision)  # of the loaded cells, before the copies below
+        # nm with zeros up to whole shared-memory windows: a column index of invalid input in the last window reads a 0
+        width = 128 // np.dtype(_MATH[precision][4]).itemsize
+        center = cp.pad(center[0], (0, -X.shape[1] % width)), center[1]
         indptr = X.indptr.astype(cp.int64 if X.nnz > _INT32_MAX else cp.int32, copy=False)
         arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
     else:
@@ -858,8 +857,10 @@ class EDistanceMetric(BaseMetric):
         """Energy distance of two device arrays.
 
         float32 and float64 arrays are read as they are. Any other dtype is cast
-        to float32 one block of columns at a time (``_CAST_VALUES`` values), which
-        adds up the three Gram matrices without a float32 copy of the arrays.
+        one block of columns at a time to float32 (float64 next to a float64
+        array). The blocks add up the row norms and the three Gram matrices; a
+        block and the Gram matrices together hold no more than the bytes of the
+        larger array, unless the Gram matrices alone need more.
         """
         if all(a.dtype in (np.float32, np.float64) for a in (X, Y)):
             d_xy = self._mean_pairwise_distance(X, Y)
@@ -870,25 +871,31 @@ class EDistanceMetric(BaseMetric):
             raise ValueError("X and Y need two dimensions and the same number of features.")
         dtype = np.result_type(_float_dtype(X.dtype), _float_dtype(Y.dtype))
         n, m = len(X), len(Y)
-        step = max(1, _CAST_VALUES // (n + m))
+        grams = (n * n + n * m + m * m + max(n, m) ** 2) * dtype.itemsize  # the Gram matrices and one product
+        room = max(max(X.nbytes, Y.nbytes) - grams, grams)  # bytes of a block
+        step = max(1, min(_CAST_VALUES, room // dtype.itemsize) // (n + m + 1))  # + 1: CuPy copies a single row
         gxx, gxy, gyy = (cp.zeros(shape, dtype=dtype) for shape in ((n, n), (n, m), (m, m)))
+        nx, ny = cp.zeros(n, dtype=dtype), cp.zeros(m, dtype=dtype)
         for c in range(0, X.shape[1], step):
             xb, yb = (a[:, c : c + step].astype(dtype) for a in (X, Y))  # one compact copy of the block
             gxx += xb @ xb.T
             gxy += xb @ yb.T
             gyy += yb @ yb.T
+            nx += cp.square(xb, out=xb).sum(axis=1)  # summed as the float calls sum the norms, in the block's memory
+            ny += cp.square(yb, out=yb).sum(axis=1)
             del xb, yb  # before the next block is cast
-        nx, ny = gxx.diagonal().copy(), gyy.diagonal().copy()
 
         def mean_distance(g, a, b, pairs):  # the Gram matrix becomes the distances in place
+            g -= a[:, None] / 2  # the halves first: a + b - 2 g overflows only where the squared distance does
+            g -= b[None, :] / 2
             g *= -2
-            g += a[:, None]
-            g += b[None, :]
             cp.maximum(g, 0, out=g)
+            if a is b:
+                cp.fill_diagonal(g, 0)  # a cell against itself
             return float(cp.sqrt(g, out=g).sum()) / pairs if pairs else 0.0
 
         d_xy = mean_distance(gxy, nx, ny, n * m)
-        d_xx = mean_distance(gxx, nx, nx, n * (n - 1))  # both triangles: the diagonal is exactly 0
+        d_xx = mean_distance(gxx, nx, nx, n * (n - 1))  # both triangles
         d_yy = mean_distance(gyy, ny, ny, m * (m - 1))
         return float(2 * d_xy - d_xx - d_yy)
 
