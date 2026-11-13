@@ -251,7 +251,7 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_edistance_dense_integer_input(small_adata: AnnData) -> None:
+def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> None:
     """Dense integer and float16 input gives the result of its float32 cast."""
     distance = Distance(metric="edistance")
     X = cp.rint(small_adata.obsm["X_pca"] * 4)
@@ -260,9 +260,12 @@ def test_edistance_dense_integer_input(small_adata: AnnData) -> None:
     small_adata.obsm["X_pca"] = X.astype(cp.int32)
     pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
     a, b = X[:4].astype(cp.float32), X[4:].astype(cp.float32)
-    for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
-        assert distance(a.astype(dtype), b.get().astype(dtype)) == distance(a, b)
-        assert distance.bootstrap(a.astype(dtype), b.astype(dtype)) == distance.bootstrap(a, b)
+    for values in (1 << 24, 1):  # of cast two-array input at a time: all columns in one block, then one column each
+        monkeypatch.setattr("rapids_singlecell.pertpy_gpu._metrics._edistance._CAST_VALUES", values)
+        for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
+            assert distance(a.astype(dtype), b.get().astype(dtype)) == pytest.approx(distance(a, b), rel=1e-5)
+            got, expected = distance.bootstrap(a.astype(dtype), b.astype(dtype)), distance.bootstrap(a, b)
+            np.testing.assert_allclose(got, expected, rtol=1e-4)
     assert distance(pd.DataFrame(a.get()), pd.DataFrame(b.get())) == distance(a, b)  # anything cp.asarray takes
     with pytest.raises(ValueError, match="Unsupported dtype"):
         distance(a.astype(cp.complex64), b)
