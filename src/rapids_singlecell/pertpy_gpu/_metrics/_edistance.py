@@ -861,7 +861,9 @@ class EDistanceMetric(BaseMetric):
         float64 array). The blocks add up the row norms and the three Gram
         matrices. A block holds what the larger array has in bytes beyond the
         Gram matrices and one product, or as many bytes as these where that is
-        more, and at most ``_CAST_VALUES`` values.
+        more; next to a float64 array that second size is cut to what the float
+        calls hold beyond the Gram matrices. A block has at most
+        ``_CAST_VALUES`` values and at least one column.
         """
         if all(a.dtype in (np.float32, np.float64) for a in (X, Y)):
             d_xy = self._mean_pairwise_distance(X, Y)
@@ -873,7 +875,7 @@ class EDistanceMetric(BaseMetric):
         dtype = np.result_type(_float_dtype(X.dtype), _float_dtype(Y.dtype))
         n, m = len(X), len(Y)
         grams = (n * n + n * m + m * m + max(n, m) ** 2) * dtype.itemsize  # the Gram matrices and one product
-        # the float calls hold 45 B per pair of cells of a group (33 B in float16); grams and a block stay below that
+        # on the input as it came the float calls hold 45 B per pair of cells of a group, 33 B in float16: stay below
         held = max((32 if a.dtype == np.float16 else 44) * len(a) ** 2 for a in (X, Y))
         room = max(max(X.nbytes, Y.nbytes) - grams, min(grams, held - grams))  # bytes of a block
         step = max(1, min(_CAST_VALUES, room // dtype.itemsize) // (n + m + 1))  # + 1: CuPy copies a single row
@@ -881,9 +883,11 @@ class EDistanceMetric(BaseMetric):
         nx, ny = cp.zeros(n, dtype=dtype), cp.zeros(m, dtype=dtype)
         for c in range(0, X.shape[1], step):
             xb, yb = (a[:, c : c + step].astype(dtype) for a in (X, Y))  # one compact copy of the block
-            gxx += xb @ xb.T
+            if n > 1:  # one cell has no pairs
+                gxx += xb @ xb.T
             gxy += xb @ yb.T
-            gyy += yb @ yb.T
+            if m > 1:
+                gyy += yb @ yb.T
             nx += cp.square(xb, out=xb).sum(axis=1)  # summed as the float calls sum the norms, in the block's memory
             ny += cp.square(yb, out=yb).sum(axis=1)
             del xb, yb  # before the next block is cast
