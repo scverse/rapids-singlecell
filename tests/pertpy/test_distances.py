@@ -262,17 +262,19 @@ def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> Non
     rng = cp.random.default_rng(0)  # float16 values whose row norms are not exact in float32
     x, y = ((rng.standard_normal((n, 50)) + loc).astype(cp.float16) for n, loc in ((200, 20), (300, 20.5)))
     assert distance(x, y) == pytest.approx(distance(x.astype(cp.float64), y.astype(cp.float64)), rel=2e-5)
+    one = (x.reshape(1, -1)[:, :128] * 1000).astype(cp.int32)  # one cell whose norm is not exact in float32
+    assert distance(one, one) == 0
     a, b = X[:4].astype(cp.float32), X[4:].astype(cp.float32)
+    a64, b8 = a.astype(cp.float64) / 3, b.astype(cp.int8)  # next to a float64 array the cast is to float64
     for values in (1 << 24, 1):  # of cast two-array input at a time: all columns in one block, then one column each
         monkeypatch.setattr("rapids_singlecell.pertpy_gpu._metrics._edistance._CAST_VALUES", values)
+        assert distance(a64, b8) == pytest.approx(distance(a64, b8.astype(cp.float64)), rel=1e-10)
         for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
             assert distance(a.astype(dtype), b.get().astype(dtype)) == pytest.approx(distance(a, b), rel=1e-5)
             got, want = distance.bootstrap(a.astype(dtype), b.astype(dtype)), distance.bootstrap(a, b)
             np.testing.assert_allclose(got, want, rtol=1e-4)
     big = cp.array([[3 << 62], [11 << 60]], dtype=cp.uint64)  # two norms that pass float32's maximum together
     assert distance(big, cp.zeros((1, 1), dtype=cp.uint64)) == 22 * 2.0**60  # no distance does
-    a64, b8 = a.astype(cp.float64) / 3, b.astype(cp.int8)  # next to a float64 array the cast is to float64
-    assert distance(a64, b8) == pytest.approx(distance(a64, b8.astype(cp.float64)), rel=1e-10)
     assert distance(pd.DataFrame(a.get()), pd.DataFrame(b.get())) == distance(a, b)  # anything cp.asarray takes
     with pytest.raises(ValueError, match="Unsupported dtype"):
         distance(a.astype(cp.complex64), b)

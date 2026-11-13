@@ -859,7 +859,8 @@ class EDistanceMetric(BaseMetric):
         Two float32 or float64 arrays take the float calls. Otherwise both arrays
         are read one block of columns at a time in float32 (float64 next to a
         float64 array). The blocks add up the row norms and the three Gram
-        matrices. A block holds what the larger array has in bytes beyond the
+        matrices (the within-group one only for an array of two or more
+        cells). A block holds what the larger array has in bytes beyond the
         Gram matrices and one product, or as many bytes as these where that is
         more; next to a float64 array that second size is cut to what the float
         calls hold beyond the Gram matrices. A block has at most
@@ -878,14 +879,14 @@ class EDistanceMetric(BaseMetric):
         # on the input as it came the float calls hold 45 B per pair of cells of a group, 33 B in float16: stay below
         held = max((32 if a.dtype == np.float16 else 44) * len(a) ** 2 for a in (X, Y))
         room = max(max(X.nbytes, Y.nbytes) - grams, min(grams, held - grams))  # bytes of a block
-        step = max(1, min(_CAST_VALUES, room // dtype.itemsize) // (n + m + 1))  # + 1: CuPy copies a single row
+        step = max(1, min(_CAST_VALUES, room // dtype.itemsize) // (n + m + 1))  # + 1: the product of two single cells
         gxx, gxy, gyy = (cp.zeros(shape, dtype=dtype) for shape in ((n, n), (n, m), (m, m)))
         nx, ny = cp.zeros(n, dtype=dtype), cp.zeros(m, dtype=dtype)
         for c in range(0, X.shape[1], step):
             xb, yb = (a[:, c : c + step].astype(dtype) for a in (X, Y))  # one compact copy of the block
             if n > 1:  # one cell has no pairs
                 gxx += xb @ xb.T
-            gxy += xb @ yb.T
+            gxy += xb @ yb.T if n + m > 2 else (xb * yb).sum(axis=1)  # two single cells: summed as their norms
             if m > 1:
                 gyy += yb @ yb.T
             nx += cp.square(xb, out=xb).sum(axis=1)  # summed as the float calls sum the norms, in the block's memory
