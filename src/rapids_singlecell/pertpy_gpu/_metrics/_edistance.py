@@ -270,8 +270,13 @@ def _materialize_source(embedding_raw, selector, precision: str, rows=None) -> _
     """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or sorted CSR (sparse).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``;
-    ``rows`` are the rows a call reads of a dense array it loads whole.
+    ``rows`` are the rows a call reads of a dense array it loads whole. A sparse
+    device matrix on another GPU than the current one is loaded and centered
+    there, where its arrays stay.
     """
+    if cpsp.issparse(embedding_raw) and (home := embedding_raw.data.device) != cp.cuda.Device():
+        with home:  # cuSPARSE and the center kernel read the matrix where it lives
+            return _materialize_source(embedding_raw, selector, precision)
     dtype = _float_dtype(embedding_raw.dtype)
     if precision == "auto":
         precision = "float64" if dtype == np.float64 else "float32"
