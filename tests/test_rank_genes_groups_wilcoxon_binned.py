@@ -23,6 +23,7 @@ def adata_blobs():
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
     # Shift to non-negative range (simulating log1p data)
     adata.X = np.abs(adata.X).astype(np.float32)
+    adata.uns["log1p"] = {"base": None}
     return adata
 
 
@@ -506,7 +507,7 @@ def test_binned_bin_exact_matches_scipy(reference):
     def run(tie_correct, use_continuity):
         a = sc.AnnData(
             X=X.copy(),
-            obs=pd.DataFrame({"g": pd.Categorical(labels)}),
+            obs=pd.DataFrame({"g": pd.Categorical(labels)}, index=[str(i) for i in range(n_obs)]),
             var=pd.DataFrame(index=genes),
         )
         a.uns["log1p"] = {"base": None}  # silence the log-norm warning
@@ -609,7 +610,7 @@ def test_binned_host_multi_gpu_matches_single(adata_blobs, array_type, reference
     base.X = array_type(base.X)
     single = base.copy()
     multi = base.copy()
-    kwargs = {"method": "wilcoxon_binned", "use_raw": False, "reference": reference}
+    kwargs = {"method": "wilcoxon_binned", "use": "X", "reference": reference}
     rsc.tl.rank_genes_groups(single, "blobs", multi_gpu=False, **kwargs)
     rsc.tl.rank_genes_groups(multi, "blobs", multi_gpu=[0, 1], **kwargs)
 
@@ -640,6 +641,8 @@ def test_auto_chunk_width_budgets_densified_tile(monkeypatch):
     assert 1 <= width and width * gene_bytes <= _wilcoxon_binned._AUTO_CHUNK_MEMORY_FRACTION * (8 << 30)
 
 
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:wilcoxon_binned expects log-normalized data:UserWarning")
 def test_binned_signed_host_sparse_fits_free_memory(monkeypatch):
     """Densifying signed host CSR windows (a GPU CSC window plus its float64 tile) stays within the reported free
     memory, enforced here as a CuPy pool limit. (Host CSC means stream through kernels sized from the real free

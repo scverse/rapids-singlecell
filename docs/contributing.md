@@ -232,6 +232,7 @@ For quick iteration during development, you can pass specific test paths:
 ```{important}
 Always set a timeout when running tests with new CUDA kernels, as they may hang on launch failures.
 Tests have a default 60-second per-test timeout configured in `pyproject.toml`.
+A test stuck for 10 minutes ends the whole run; pass `-o faulthandler_timeout=0` to turn that off while debugging.
 ```
 
 ### Test guidelines

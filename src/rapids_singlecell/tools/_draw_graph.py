@@ -118,7 +118,7 @@ def draw_graph(
     if init_coords is not None:
         x, y = np.hsplit(init_coords, init_coords.shape[1])
         inital_df = cudf.DataFrame({"x": x.ravel(), "y": y.ravel()})
-        inital_df["vertex"] = inital_df.index
+        inital_df["vertex"] = inital_df.index.astype(g.nodes().dtype)
     else:
         inital_df = None
     # Run cugraphs Force Atlas 2

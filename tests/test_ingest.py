@@ -11,6 +11,7 @@ from sklearn.neighbors import KDTree
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._ingest import _knn_classify, _query_neighbors, ingest
+from testing.rapids_singlecell._helper import sc_use
 
 A = pytest.importorskip("anndata.acc").A
 
@@ -101,13 +102,13 @@ def test_pca_projection_matches_scanpy(zero_center: bool) -> None:
         zero_center=zero_center,
         random_state=0,
     )
-    sc.pp.neighbors(ref, n_neighbors=N_NEIGHBORS, use_rep="X")
+    sc.pp.neighbors(ref, n_neighbors=N_NEIGHBORS, **sc_use(A.X, use_rep="X"))
 
-    expected = sc.tl.ingest(
-        query,
+    expected = query.copy()
+    sc.tl.ingest(
+        expected,
         ref,
         embedding_method="pca",
-        inplace=False,
     )
     result = _ingest(
         query,
@@ -291,14 +292,14 @@ def test_sparse_X_label_transfer() -> None:
 
 def test_label_transfer_matches_scanpy_on_X() -> None:
     ref, query = _clustered_data()
-    sc.pp.neighbors(ref, n_neighbors=N_NEIGHBORS, use_rep="X", random_state=0)
+    sc.pp.neighbors(ref, n_neighbors=N_NEIGHBORS, **sc_use(A.X, use_rep="X"), random_state=0)
 
-    expected = sc.tl.ingest(
-        query,
+    expected = query.copy()
+    sc.tl.ingest(
+        expected,
         ref,
         obs="label",
         embedding_method=(),
-        inplace=False,
     )
     result = _ingest(
         query,
@@ -429,11 +430,11 @@ def test_umap_mapping_uses_reference_state() -> None:
         ref,
         embedding_method="umap",
     )
-    scanpy_result = sc.tl.ingest(
-        query,
+    scanpy_result = query.copy()
+    sc.tl.ingest(
+        scanpy_result,
         ref,
         embedding_method="umap",
-        inplace=False,
     )
 
     assert result.obsm["X_umap"].shape == (query.n_obs, 2)

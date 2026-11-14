@@ -66,9 +66,9 @@ def test_score_with_reference(array_type):
     adata.X = adata.X.astype(np.float64)
     sc.pp.normalize_total(adata, target_sum=10000)
 
-    sc.tl.score_genes(adata, gene_list=adata.var_names[:100], score_name="Test_cpu")
+    sc.tl.score_genes(adata, gene_list=adata.var_names[:100])
     rsc.tl.score_genes(adata, gene_list=adata.var_names[:100], out="obs.Test_gpu")
-    np.testing.assert_allclose(adata.obs["Test_cpu"].to_numpy(), adata.obs["Test_gpu"].to_numpy())
+    np.testing.assert_allclose(adata.obs["score"].to_numpy(), adata.obs["Test_gpu"].to_numpy())
 
 
 def test_add_score():
@@ -85,7 +85,8 @@ def test_add_score():
     # create some non-estinsting names with 7 letters:
     non_existing_genes = _create_random_gene_names(n_genes=3, name_length=7)
     some_genes = np.r_[np.unique(np.random.choice(adata.var_names, 10)), np.unique(non_existing_genes)]
-    rsc.tl.score_genes(adata, some_genes, out="obs.Test")
+    with pytest.warns(UserWarning, match="genes are not in var_names and ignored"):
+        rsc.tl.score_genes(adata, some_genes, out="obs.Test")
     assert adata.obs["Test"].dtype == "float64"
 
 
@@ -118,6 +119,7 @@ def test_sparse_nanmean(array_type):
     cp.testing.assert_allclose(cp.mean(A, 1).ravel(), (_nan_mean(S, 1)).ravel())
 
 
+@pytest.mark.filterwarnings("ignore:Variable names are not unique:UserWarning")
 def test_score_genes_sparse_vs_dense():
     """
     score_genes() should give the same result for dense and sparse matrices
@@ -137,6 +139,7 @@ def test_score_genes_sparse_vs_dense():
     np.testing.assert_allclose(adata_sparse.obs["Test"].values, adata_dense.obs["Test"].values)
 
 
+@pytest.mark.filterwarnings("ignore:Changing the sparsity structure:scipy.sparse.SparseEfficiencyWarning")
 def test_score_genes_deplete():
     """
     deplete some cells from a set of genes.
@@ -170,7 +173,7 @@ def test_missing_genes():
     # These genes have a different length of name
     non_extant_genes = _create_random_gene_names(n_genes=3, name_length=7)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError), pytest.warns(UserWarning, match="genes are not in var_names and ignored"):
         rsc.tl.score_genes(adata, non_extant_genes)
 
 

@@ -62,7 +62,7 @@ def pseudobulk_adata() -> tuple[AnnData, np.ndarray, np.ndarray]:
     blocks = [rng.normal(loc=i * 0.5, size=(cells_per_group, n_features)) for i in range(n_groups)]
     X = np.vstack(blocks).astype(np.float32)
     groups = np.array([f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)])
-    obs = pd.DataFrame({"group": pd.Categorical(groups)})
+    obs = pd.DataFrame({"group": pd.Categorical(groups)}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
     return adata, X, groups
@@ -176,7 +176,7 @@ def test_pseudobulk_input_variants(input_kind: str) -> None:
     n_features = 5
     X = rng.normal(size=(24, n_features)).astype(np.float32)
     groups = np.array(["a", "b", "c"] * 8)
-    obs = pd.DataFrame({"group": pd.Categorical(groups)})
+    obs = pd.DataFrame({"group": pd.Categorical(groups)}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
 
     layer_key, obsm_key = None, None
@@ -226,7 +226,7 @@ def test_pseudobulk_contrast_distances_matches_reference(metric: str) -> None:
             blocks.append(rng.normal(loc=ti * 0.7 + ci * 0.2, size=(per_cond, n_features)))
             obs_rows.extend({"treatment": t, "celltype": c} for _ in range(per_cond))
     X = np.vstack(blocks).astype(np.float32)
-    obs = pd.DataFrame(obs_rows).astype({"treatment": "category", "celltype": "category"})
+    obs = pd.DataFrame(obs_rows).astype({"treatment": "category", "celltype": "category"}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
 
@@ -332,7 +332,7 @@ def test_pseudobulk_pairwise_cross_check_pertpy(
 
 def _make_adata(X: np.ndarray, group_sizes: list[int]) -> AnnData:
     groups = np.concatenate([np.repeat(f"g{i}", n) for i, n in enumerate(group_sizes)])
-    obs = pd.DataFrame({"group": pd.Categorical(groups)})
+    obs = pd.DataFrame({"group": pd.Categorical(groups)}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
     return adata
@@ -416,7 +416,7 @@ def bootstrap_adata() -> tuple[AnnData, np.ndarray, np.ndarray]:
     blocks = [rng.normal(loc=i * 0.8, size=(cells_per_group, n_features)) for i in range(n_groups)]
     X = np.vstack(blocks).astype(np.float32)
     groups = np.array([f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)])
-    obs = pd.DataFrame({"group": pd.Categorical(groups)})
+    obs = pd.DataFrame({"group": pd.Categorical(groups)}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = cp.asarray(X)
     return adata, X, groups

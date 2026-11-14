@@ -28,7 +28,7 @@ def test_tsne_deprecated():
         res = rsc.tl.tsne(pbmc, copy=True)
     assert "X_tsne" in res.obsm
     assert "X_tsne" not in pbmc.obsm
-    with pytest.raises(TypeError, match="not both"):
+    with pytest.raises(TypeError, match="not both"), pytest.warns(FutureWarning, match="use_rep"):
         rsc.tl.tsne(pbmc, use=A.obsm["X_pca"], use_rep="X_pca")
 
 

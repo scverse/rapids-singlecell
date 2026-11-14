@@ -10,6 +10,9 @@ from scanpy.datasets import pbmc68k_reduced
 from scipy import stats
 
 import rapids_singlecell as rsc
+from testing.rapids_singlecell._helper import SC_USE_OUT, sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
@@ -49,7 +52,7 @@ def test_rank_genes_groups_ttest_matches_scanpy(reference, method, sparse):
         adata_cpu,
         "blobs",
         method=method,
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         n_genes=3,
         reference=reference,
     )
@@ -169,6 +172,7 @@ def test_rank_genes_groups_ttest_subset_and_bonferroni(reference, method):
     ],
 )
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
 def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
@@ -189,7 +193,7 @@ def test_rank_genes_groups_ttest_subset_matches_scanpy(method, groups, reference
         method=method,
         groups=groups,
         reference=reference,
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
     )
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
@@ -306,7 +310,7 @@ def test_rank_genes_groups_ttest_pts(reference, method):
         adata_cpu,
         "blobs",
         method=method,
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         pts=True,
         reference=reference,
     )
@@ -509,7 +513,9 @@ def test_rank_genes_groups_ttest_mask_var_matches_scanpy(method):
     mask = np.array([True, False, True, False, True, True, False, True])
 
     rsc.tl.rank_genes_groups(adata_gpu, "blobs", method=method, mask=mask, use="X")
-    sc.tl.rank_genes_groups(adata_cpu, "blobs", method=method, mask_var=mask, use_raw=False)
+    sc.tl.rank_genes_groups(
+        adata_cpu, "blobs", method=method, **{"mask" if SC_USE_OUT else "mask_var": mask}, **sc_use(A.X, use_raw=False)
+    )
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -595,7 +601,7 @@ def test_ttest_host_csc_matches_scanpy(reference, method):
     cpu.X = cpu.X.astype(np.float64)
 
     rsc.tl.rank_genes_groups(gpu, "blobs", method=method, use="X", n_genes=3, reference=reference)
-    sc.tl.rank_genes_groups(cpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference)
+    sc.tl.rank_genes_groups(cpu, "blobs", method=method, **sc_use(A.X, use_raw=False), n_genes=3, reference=reference)
     for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
         for group in gpu.uns["rank_genes_groups"][field].dtype.names:
             np.testing.assert_allclose(
@@ -624,7 +630,7 @@ def test_ttest_host_multi_gpu_matches_single(layout, reference):
     multi = base.copy()
     kwargs = {
         "method": "t-test",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "n_genes": 12,
     }
@@ -644,9 +650,8 @@ def test_ttest_host_multi_gpu_matches_single(layout, reference):
             )
 
 
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
 def test_rank_genes_groups_use_out():
-    A = pytest.importorskip("anndata.acc").A
-
     adata = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
     adata.obs["blobs"] = adata.obs["blobs"].astype("category")
     adata.layers["x"] = adata.X.copy()
@@ -658,5 +663,5 @@ def test_rank_genes_groups_use_out():
     with pytest.warns(FutureWarning, match="layer"):
         rsc.tl.rank_genes_groups(adata, "blobs", method="t-test", layer="x", key_added="old")
     np.testing.assert_array_equal(res["scores"], adata.uns["old"]["scores"])
-    with pytest.raises(TypeError, match="not both"):
+    with pytest.raises(TypeError, match="not both"), pytest.warns(FutureWarning, match="layer"):
         rsc.tl.rank_genes_groups(adata, "blobs", use="X", layer="x")

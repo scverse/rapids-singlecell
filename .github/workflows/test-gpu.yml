@@ -141,6 +141,7 @@ jobs:
           hatch -v env create "$ENV_NAME"
 
       - name: Run tests
+        timeout-minutes: 30 # a full run takes 12-20; a hang would otherwise use the whole job limit
         run: |
           mkdir -p test-data
           if [[ "$ENV_NAME" == *"stable"* ]]; then
@@ -230,6 +231,7 @@ jobs:
           hatch -v env create "$ENV_NAME"
 
       - name: Run tests
+        timeout-minutes: 30
         run: hatch run "${ENV_NAME}:run" -v --color=yes
 
   remove-label:

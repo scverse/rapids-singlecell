@@ -12,6 +12,7 @@ from anndata import AnnData, read_h5ad
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wnn_cuda
 from rapids_singlecell.preprocessing._neighbors import _wnn
+from testing.rapids_singlecell._helper import sc_use
 
 A = pytest.importorskip("anndata.acc").A
 
@@ -172,7 +173,7 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
     with pytest.warns(FutureWarning, match="key_added"):
         rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, key_added="k")
     assert {"k_connectivities", "k_distances", "k_snn"} <= adata.obsp.keys()
-    sc.tl.umap(loaded, neighbors_key="wnn", maxiter=10, random_state=0)
+    sc.tl.umap(loaded, **sc_use(A.obsp["wnn"], neighbors_key="wnn"), maxiter=10, random_state=0)
     assert np.isfinite(loaded.obsm["X_umap"]).all()
     # ingest would silently map through the first modality only
     with pytest.raises(NotImplementedError, match="multimodal"):

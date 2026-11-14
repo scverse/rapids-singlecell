@@ -417,7 +417,8 @@ def test_mask_var_argument_equivalence(float_dtype, array_type):
 def test_mask_correctness():
     """Test masked PCA matches PCA on subset."""
     adata = sc.datasets.blobs(n_variables=10, n_centers=3, n_observations=100)
-    mask_var = np.random.choice([True, False], adata.shape[1])
+    # fixed: a random mask selects fewer than the 2 variables cuML needs for 1% of seeds
+    mask_var = np.arange(adata.shape[1]) % 2 == 0
 
     adata_masked = adata[:, mask_var].copy()
     rsc.pp.pca(adata, mask=mask_var)
@@ -548,7 +549,7 @@ def test_pca_deprecated_params():
         rsc.pp.pca(adata, n_comps=2, mask_var="highly_variable", out=A.obsm["m"])
     assert adata.uns["m"]["params"]["mask_var"] == "highly_variable"
     np.testing.assert_allclose(np.abs(adata.obsm["m"]), np.abs(adata.obsm["X_pca"]), atol=1e-5)
-    with pytest.raises(TypeError, match="either `mask` or `mask_var`"):
+    with pytest.warns(FutureWarning, match="mask_var"), pytest.raises(TypeError, match="either `mask` or `mask_var`"):
         rsc.pp.pca(adata, mask="var.highly_variable", mask_var="highly_variable")
 
 
@@ -580,6 +581,9 @@ def test_pca_out():
     assert adata.uns["pp"]["params"]["obsm"] == "p"
 
 
+@pytest.mark.filterwarnings("ignore:Some cells have zero counts:UserWarning")
+@pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in divide:RuntimeWarning")
 def test_pca_layer_mask():
     """Test error when layer has zero-expression genes."""
     adata = sc.datasets.pbmc3k()[:, 1000].copy()

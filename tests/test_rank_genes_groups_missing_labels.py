@@ -7,6 +7,9 @@ import scanpy as sc
 from scanpy.datasets import pbmc3k_processed
 
 import rapids_singlecell as rsc
+from testing.rapids_singlecell._helper import sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
 
@@ -99,7 +102,6 @@ def test_rank_genes_groups_missing_leiden_matches_scanpy(method, execution, refe
         "groups": [test_group],
         "reference": reference,
         "method": method,
-        "use_raw": False,
         "pts": True,
         "n_genes": actual.n_vars,
     }
@@ -108,10 +110,11 @@ def test_rank_genes_groups_missing_leiden_matches_scanpy(method, execution, refe
     if execution == "multi-gpu":
         kwargs["multi_gpu"] = [0, 1]
 
-    rsc.tl.rank_genes_groups(actual, "leiden", **kwargs)
+    rsc.tl.rank_genes_groups(actual, "leiden", use="X", **kwargs)
     sc.tl.rank_genes_groups(
         expected,
         "leiden",
+        **sc_use(A.X, use_raw=False),
         **{key: value for key, value in kwargs.items() if key != "multi_gpu"},
     )
 

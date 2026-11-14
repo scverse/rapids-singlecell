@@ -279,6 +279,14 @@ def test_nn_descent_invalid_ids_raise(monkeypatch):
     adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
     with pytest.raises(ValueError, match="incomplete or invalid"):
         neighbors(adata, n_neighbors=5, algorithm="nn_descent")
+@pytest.mark.parametrize("algo", ["ivfpq", "mg_ivfpq"])
+def test_ivfpq_small_index_is_exact(algo):
+    # too few cells to train the PQ codebooks (cuVS >= 26.12 refuses): searched by brute force
+    adata = pbmc68k_reduced()[:300].copy()
+    brute_data = adata.copy()
+    neighbors(adata, n_neighbors=5, algorithm=algo)
+    neighbors(brute_data, n_neighbors=5, algorithm="brute")
+    assert (adata.obsp["distances"] != brute_data.obsp["distances"]).nnz == 0
 
 
 KEY = "test"
@@ -335,6 +343,7 @@ def test_neighbors_obsm_named_x():
     np.testing.assert_array_equal(res.distances.toarray(), ref.distances.toarray())
 
 
+@pytest.mark.filterwarnings("ignore:The function bbknn is deprecated:FutureWarning")
 def test_bbknn():
     """
     Test the bbknn function against the scanpy implementation. We want more than a 90% overlap between the two.
