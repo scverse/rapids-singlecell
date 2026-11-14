@@ -2149,6 +2149,45 @@ def test_multi_gpu_device_attrs_cache_per_device() -> None:
     assert attrs_0_again is attrs_0  # Same object (cached)
 
 
+@pytest.mark.skipif(not _has_multiple_gpus(), reason="Requires 2+ GPUs")
+@pytest.mark.filterwarnings("error::cupy._util.PerformanceWarning")  # no peer access
+def test_edistance_sparse_input_on_another_gpu(monkeypatch) -> None:
+    """A sparse device matrix on another GPU is loaded and centered there and gives the result of one on this GPU."""
+    import cupyx.scipy.sparse as cpsp
+
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
+
+    def where_the_matrix_lives(function):
+        def checked(X, *args):
+            assert X.data.device == cp.cuda.Device()
+            return function(X, *args)
+
+        return checked
+
+    for name in ("_build_csr_source", "_center"):  # loaded and centered
+        monkeypatch.setattr(_edistance, name, where_the_matrix_lives(getattr(_edistance, name)))
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(60, 7)).astype(np.float32)
+    X[rng.random(X.shape) > 0.5] = 0
+    obs = pd.DataFrame({"group": pd.Categorical(np.repeat(list("abc"), 20))}).rename(str)
+    contrasts = pd.DataFrame({"group": ["b", "c"], "reference": "a"})
+    distance = Distance(metric="edistance", layer_key="X")
+
+    def results(device: int, multi_gpu: bool):
+        with cp.cuda.Device(device):
+            adata = AnnData(cpsp.csr_matrix(csr_matrix(X)), obs=obs)
+            csc = AnnData(cpsp.csc_matrix(csr_matrix(X)), obs=obs)
+        yield distance.pairwise(adata, groupby="group", multi_gpu=multi_gpu)  # the whole matrix
+        yield distance.pairwise(adata, groupby="group", groups=["a", "c"], multi_gpu=multi_gpu)  # some of its rows
+        yield distance.contrast_distances(adata, contrasts, multi_gpu=multi_gpu)
+        yield distance.pairwise(csc, groupby="group", multi_gpu=multi_gpu)  # converted by cuSPARSE
+
+    for multi_gpu in (False, True):
+        for got, expected in zip(results(1, multi_gpu), results(0, multi_gpu), strict=True):
+            pd.testing.assert_frame_equal(got, expected, check_exact=True)
+    assert cp.cuda.Device().id == 0
+
+
 def test_multi_gpu_invalid_device_id_list(small_adata: AnnData) -> None:
     """Test that invalid device IDs in list raise ValueError."""
     distance = Distance(metric="edistance")
