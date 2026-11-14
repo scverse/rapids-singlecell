@@ -658,7 +658,9 @@ class Distance:
             Annotated data matrix
         contrasts
             DataFrame with a groupby column, a ``reference`` column,
-            and optional split columns.
+            and optional split columns. With ``metric="edistance"`` the
+            cells of each combination of the split columns are centered
+            on their own.
         multi_gpu
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
