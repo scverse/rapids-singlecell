@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+from types import SimpleNamespace
 
 import cupy as cp
 import numpy as np
@@ -18,6 +19,7 @@ import rapids_singlecell as rsc
 from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.pp import bbknn, neighbors
 from rapids_singlecell.preprocessing._neighbors import NeighborsResult
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
 from rapids_singlecell.preprocessing._neighbors._helper import _trimming as trimming_gpu
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _get_connectivities_gauss,
@@ -140,13 +142,14 @@ def test_algo(algo):
     neighbors(adata, n_neighbors=5, algorithm=algo)
 
 
-def test_nn_descent_intermediate_graph_degree():
+@pytest.mark.parametrize("degree", [10, None])
+def test_nn_descent_intermediate_graph_degree(degree):
     adata = pbmc68k_reduced()
     neighbors(
         adata,
         n_neighbors=5,
         algorithm="nn_descent",
-        algorithm_kwds={"intermediate_graph_degree": 10},
+        algorithm_kwds={"intermediate_graph_degree": degree},
     )
 
 
@@ -193,6 +196,89 @@ def test_indices_approx_nn(algo):
             )
         )
     assert counter / b_stop > 0.9
+
+
+# cuVS nn_descent itself loses recall beyond a graph degree of 64 (about 0.8 here)
+@pytest.mark.parametrize(("algo", "min_recall"), [("nn_descent", 0.7), ("cagra", 0.9)])
+def test_approx_nn_beyond_default_degree(algo, min_recall):
+    # beyond cuVS's default intermediate graph degree (96) and CAGRA search width (64)
+    adata = pbmc68k_reduced()
+    brute_data = adata.copy()
+    neighbors(adata, n_neighbors=100, algorithm=algo)
+    neighbors(brute_data, n_neighbors=100, algorithm="brute")
+    D, ref = adata.obsp["distances"], brute_data.obsp["distances"]
+    shared = sum(
+        len(np.intersect1d(D.indices[D.indptr[i] : D.indptr[i + 1]], ref.indices[ref.indptr[i] : ref.indptr[i + 1]]))
+        for i in range(adata.n_obs)
+    )
+    assert shared / ref.nnz > min_recall
+
+
+def test_ivf_incomplete_neighbors_raise():
+    # probing one of 64 lists cannot fill 100 neighbor slots
+    X = np.random.default_rng(0).normal(size=(500, 20)).astype(np.float32)
+    adata = AnnData(X)
+    with pytest.raises(ValueError, match="n_probes"):
+        neighbors(adata, n_neighbors=100, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+    assert not adata.obsp
+
+
+@pytest.mark.parametrize(("bad_id", "bad_dist"), [(10**6, 1.0), (5, np.inf), (5, np.nan)])
+@pytest.mark.parametrize("batch_balanced", [False, True])
+def test_invalid_neighbors_raise(monkeypatch, bad_id, bad_dist, batch_balanced):
+    from rapids_singlecell.preprocessing._neighbors._neighbors import KNN_ALGORITHMS
+
+    def padded_knn(X, Y, k, **kwargs):
+        idx = (cp.arange(Y.shape[0])[:, None] + cp.arange(k)) % X.shape[0]
+        dist = cp.tile(cp.arange(k, dtype=cp.float32), (Y.shape[0], 1))
+        idx[0, -1], dist[0, -1] = bad_id, bad_dist
+        return idx, dist
+
+    monkeypatch.setitem(KNN_ALGORITHMS, "ivfflat", padded_knn)
+    adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        if batch_balanced:
+            adata.obs["batch"] = np.arange(adata.n_obs) % 2
+            bbknn(adata, batches=A.obs["batch"], neighbors_within_batch=3, algorithm="ivfflat")
+        else:
+            neighbors(adata, n_neighbors=5, algorithm="ivfflat")
+    assert not adata.obsp
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "hint"), [("brute", "NaN"), ("all_neighbors", "n_clusters"), ("cagra", "Reduce")]
+)
+def test_incomplete_search_hints(algorithm, hint):
+    with pytest.raises(ValueError, match=hint):
+        _check_knn_complete(cp.array([[0, 9]]), n_index=2, algorithm=algorithm)
+
+
+def test_brute_undefined_metric_raises():
+    # cosine distances to an all-zero row are NaN
+    X = np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32)
+    X[3] = 0
+    with pytest.raises(ValueError, match="all-zero"):
+        neighbors(AnnData(X), n_neighbors=5, metric="cosine")
+
+
+def test_brute_large_distances():
+    # an exact search pads nothing, so distances beyond the padding threshold are valid
+    adata = AnnData(np.random.default_rng(0).normal(scale=1e10, size=(40, 5)).astype(np.float32))
+    neighbors(adata, n_neighbors=5, metric="sqeuclidean", method="jaccard")
+    assert 1e18 < adata.obsp["distances"].max() < np.inf
+
+
+def test_nn_descent_invalid_ids_raise(monkeypatch):
+    from rapids_singlecell._cuda import _nn_descent_cuda
+    from rapids_singlecell.preprocessing._neighbors._algorithms import _nn_descent
+
+    # unfilled graph slots must not reach the distance kernel, which indexes X with them
+    graph = cp.full((40, 5), 2**32 - 1, dtype=cp.uint32)
+    monkeypatch.setattr(_nn_descent.nn_descent, "build", lambda *args, **kwargs: SimpleNamespace(graph=graph))
+    monkeypatch.setattr(_nn_descent_cuda, "sqeuclidean", lambda *args, **kwargs: pytest.fail("kernel reached"))
+    adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        neighbors(adata, n_neighbors=5, algorithm="nn_descent")
 
 
 @pytest.mark.parametrize("algo", ["ivfpq", "mg_ivfpq"])

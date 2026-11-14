@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import cupy as cp
@@ -185,8 +186,9 @@ def test_wnn_connectivity_methods(method):
     keys = ["X_pca", "X_apca"]
     # NumPy scalars broadcast; only the UMAP connectivities use the seed
     kw = {"n_pcs": np.int64(5), "cross_constant": np.float32(1e-4), "random_state": 5}
-    with pytest.warns(UserWarning, match="ignored"):
+    with pytest.warns(UserWarning, match="ignored") as record:
         rsc.pp.wnn(adata, keys, knn_range=50, method=method, weight_key=None, **kw)
+    assert record[0].filename == __file__  # the caller, not wnn's decorators
     params = adata.uns["neighbors"]["params"]
     assert (params["method"], params["modalities"]["X_apca"]["n_pcs"]) == (method, 5)
     assert "random_state" not in params
@@ -249,11 +251,19 @@ def test_wnn_rejects_invalid_neighbors(monkeypatch, bad_id, bad_dist):
         return idx, dist
 
     adata = _multimodal_adata(n=40)
-    monkeypatch.setitem(_wnn.KNN_ALGORITHMS, "brute", incomplete_knn)
+    monkeypatch.setitem(_wnn.KNN_ALGORITHMS, "ivfflat", incomplete_knn)
     monkeypatch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
     with pytest.raises(ValueError, match="incomplete"):
-        rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24)
+        rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24, algorithm="ivfflat")
     assert not adata.obsp and "neighbors" not in adata.uns
+
+
+def test_wnn_missing_extension(monkeypatch):
+    # a missing extension fails before any work
+    monkeypatch.setitem(sys.modules, "rapids_singlecell._cuda._wnn_cuda", None)
+    monkeypatch.setattr(_wnn, "_get_reps", lambda *args, **kwargs: pytest.fail("wnn started without its extension"))
+    with pytest.raises(ModuleNotFoundError):
+        rsc.pp.wnn(_multimodal_adata(n=40), ["X_pca", "X_apca"])
 
 
 def test_wnn_approximate_searches(monkeypatch):
@@ -261,11 +271,12 @@ def test_wnn_approximate_searches(monkeypatch):
     kwargs = {"use_rep": ["X_pca", "X_apca"], "knn_range": 100}
     with monkeypatch.context() as patch:
         patch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
-        with pytest.raises(ValueError, match="n_probes"):
+        with pytest.raises(ValueError, match="n_probes") as err:
             rsc.pp.wnn(adata, **kwargs, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+        assert "knn_range" in err.value.__notes__[0]
     # searching all IVF lists repairs the candidates in the same CUDA context;
-    # nn_descent needs a graph degree beyond its default
-    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {})):
+    # nn_descent and cagra need a graph degree and search width beyond cuVS's defaults
+    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {}), ("cagra", {})):
         rsc.pp.wnn(adata, **kwargs, algorithm=algorithm, algorithm_kwds=kwds)
         D = adata.obsp["distances"]
         assert np.all(np.diff(D.indptr) == 20)
@@ -284,7 +295,6 @@ def test_wnn_approximate_searches(monkeypatch):
         ({"algorithm": "kd_tree"}, "Invalid algorithm"),
         ({"use_rep": ["X_pca", "X_pca"]}, "unique strings"),
         ({"weight_key": "weight"}, "distinct column"),
-        ({"algorithm": "cagra", "knn_range": 100}, "up to 64"),
     ],
 )
 def test_wnn_errors(kwargs, match):

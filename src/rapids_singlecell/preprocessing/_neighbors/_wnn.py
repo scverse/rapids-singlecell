@@ -15,7 +15,7 @@ from scverse_misc import deprecated_arg
 
 from rapids_singlecell._utils._random import RNGLike, SeedLike, _accepts_legacy_random_state, _LegacyRng
 from rapids_singlecell.get._out import DEPR_COPY, DEPR_KEY_ADDED, _out_dests
-from rapids_singlecell.preprocessing._neighbors._helper import _check_neighbors_X
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete, _check_neighbors_X
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     KNN_ALGORITHMS,
     _Algorithms,
@@ -48,8 +48,6 @@ _DEFAULT_SEED = 0
 # shared memory; they are sorted globally.
 _SNN_CHUNK_PAIRS = 1 << 25
 _SPREAD3 = ((16, 0x030000FF), (8, 0x0300F00F), (4, 0x030C30C3), (2, 0x09249249))
-# all_neighbors pads unfilled neighbor slots with sqrt(FLT_MAX) distances
-_PAD_DIST = 1e18
 
 
 def _stream() -> int:
@@ -231,6 +229,147 @@ def _get_reps(adata, use_rep: Sequence[str] | Mapping[str, str], n_pcs) -> tuple
     return modalities, reps
 
 
+def _random_state_param(rng: np.random.Generator, method: str) -> dict[str, int | None]:
+    """The ``random_state`` entry of ``params``, as in :func:`~rapids_singlecell.pp.neighbors`."""
+    param = {}
+    if isinstance(rng, _LegacyRng) and isinstance(rng.arg, int | np.integer | None):  # only plain seeds
+        param["random_state"] = None if rng.arg is None else int(rng.arg)
+    if method != "umap" and param.get("random_state") != _DEFAULT_SEED:
+        # only the UMAP connectivities are randomized; stacklevel skips this, wnn and its three decorators
+        warn(f"Parameter `rng`/`random_state` ignored if `method={method!r}`.", UserWarning, stacklevel=6)
+        return {}
+    return param
+
+
+def _check_params(
+    *,
+    n_obs: int,
+    n_mod: int,
+    n_neighbors: int,
+    knn_range: int,
+    cross_constant: float | Sequence[float],
+) -> tuple[int, int, list[float]]:
+    n_neighbors, knn_range = operator.index(n_neighbors), operator.index(knn_range)
+    if n_neighbors < 2:
+        raise ValueError("`n_neighbors` must be at least 2.")
+    if knn_range <= n_neighbors:
+        raise ValueError("`knn_range` must be larger than `n_neighbors`.")
+    if knn_range > n_obs:
+        raise ValueError(f"`knn_range` must be at most the number of cells ({n_obs}).")
+    if n_mod * (knn_range - 1) > 4096:
+        raise ValueError("`knn_range * n_modalities` must be at most 4096.")
+    if np.ndim(cross_constant) == 0:
+        return n_neighbors, knn_range, [float(cross_constant)] * n_mod
+    if len(cross_constant) != n_mod:
+        raise ValueError("`cross_constant` needs one entry per modality.")
+    return n_neighbors, knn_range, [float(cross_constant[m]) for m in range(n_mod)]
+
+
+def _l2_normalize(X: cp.ndarray) -> cp.ndarray:
+    norm = cp.linalg.norm(X, axis=1, keepdims=True)
+    return X / cp.where(norm > 0, norm, 1)
+
+
+def _modality_knns(
+    reps: list[cp.ndarray],
+    names: list[str],
+    *,
+    knn_range: int,
+    algorithm: _Algorithms,
+    algorithm_kwds: Mapping[str, Any],
+) -> cp.ndarray:
+    """The ``knn_range`` nearest neighbors within each modality, shape ``(n_mod, n_obs, knn_range)``."""
+    n_obs = reps[0].shape[0]
+    knns = cp.empty((len(reps), n_obs, knn_range), dtype=cp.int32)
+    for m, X in enumerate(reps):
+        X = _check_neighbors_X(X, algorithm)
+        knn, dist = KNN_ALGORITHMS[algorithm](
+            X, X, k=knn_range, metric="euclidean", metric_kwds={}, algorithm_kwds=algorithm_kwds
+        )
+        knn, dist = cp.asarray(knn), cp.asarray(dist)
+        # before narrowing the IDs or indexing kernels with them
+        try:
+            _check_knn_complete(knn, dist, n_index=n_obs, algorithm=algorithm)
+        except ValueError as e:
+            e.add_note(f"in modality {names[m]!r}, which searches `knn_range` neighbors")
+            raise
+        knns[m] = _ensure_self_first(knn.astype(cp.int32, copy=False))
+        del knn, dist  # free them before the next search
+    return knns
+
+
+def _modality_weights(
+    reps: list[cp.ndarray],
+    knns: cp.ndarray,
+    *,
+    n_neighbors: int,
+    sd_scale: float,
+    cross_constant: list[float],
+    smooth: bool,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Each cell's modality weights, kernel widths and distance to its nearest neighbor, each ``(n_mod, n_obs)``."""
+    from rapids_singlecell._cuda._wnn_cuda import impute_dist
+
+    n_mod, n_obs = knns.shape[:2]
+    nearest = cp.empty((n_mod, n_obs), dtype=cp.float32)
+    sigma = cp.empty((n_mod, n_obs), dtype=cp.float32)
+    # dist[m, r]: distance of modality m to its prediction from modality r's neighbors
+    dist = cp.empty((n_mod, n_mod, n_obs), dtype=cp.float32)
+    zero = cp.zeros(n_obs, dtype=cp.float32)
+    for m, X in enumerate(reps):
+        # the multimodal kernel's arithmetic, so a neighbor nearest in every modality gets WNN distance 0
+        impute_dist(X, knns[m], k=2, nearest=zero, out=nearest[m], stream=_stream())
+        for r in range(n_mod):
+            impute_dist(X, knns[r], k=n_neighbors, nearest=nearest[m], out=dist[m, r], stream=_stream())
+        sigma[m] = _snn_bandwidth(knns[m], X, nearest[m], s_nn=n_neighbors)
+    sigma *= sd_scale  # in place, so that it stays float32 for a NumPy float64 `sd_scale`
+    # a zero width (duplicated cells) makes R produce NaN weights
+    sigma = cp.maximum(sigma, cp.finfo(cp.float32).tiny)
+
+    kernel = cp.exp(-dist.astype(cp.float64) / sigma[:, None, :])
+    exp_scores = cp.zeros((n_mod, n_obs), dtype=cp.float64)
+    for m, r in itertools.permutations(range(n_mod), 2):
+        score = cp.clip(kernel[m, m] / (kernel[m, r] + cross_constant[m]), 0, 200)
+        if smooth:
+            score = score[knns[m, :, 1:n_neighbors]].mean(axis=1)
+        exp_scores[m] += cp.exp(score)
+    weights = (exp_scores / exp_scores.sum(axis=0)).astype(cp.float32)
+    return weights, sigma, nearest
+
+
+def _multimodal_knn(
+    emb: cp.ndarray,
+    dims: list[int],
+    knns: cp.ndarray,
+    *,
+    weights: cp.ndarray,
+    sigma: cp.ndarray,
+    nearest: cp.ndarray,
+    n_neighbors: int,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """The multimodal neighbors among the union of ``knns``, and their WNN distances."""
+    from rapids_singlecell._cuda._wnn_cuda import multimodal_knn
+
+    n_obs = emb.shape[0]
+    indices = cp.empty((n_obs, n_neighbors), dtype=cp.int32)
+    dissim = cp.empty((n_obs, n_neighbors), dtype=cp.float32)
+    multimodal_knn(
+        emb,
+        dim_off=cp.asarray(np.cumsum([0, *dims]), dtype=cp.int32),
+        knn=knns,
+        knn_range=knns.shape[2],
+        weight=weights,
+        sigma=sigma,
+        nearest=nearest,
+        k_out=n_neighbors,
+        out_idx=indices,
+        out_dissim=dissim,
+        stream=_stream(),
+    )
+    # Seurat's sqrt((1 - s) / 2) of the weighted kernel similarity s
+    return indices, cp.sqrt(cp.clip(dissim / 2, 0, 1))
+
+
 @_accepts_legacy_random_state(_DEFAULT_SEED)
 @deprecated_arg("key_added", DEPR_KEY_ADDED)
 @deprecated_arg("copy", DEPR_COPY)
@@ -290,12 +429,10 @@ def wnn(
     algorithm
         The kNN search within each modality, see :func:`~rapids_singlecell.pp.neighbors`. ``'brute'`` (default) is
         exact and bit-identical across runs up to ``knn_range=256`` (beyond, cuVS orders exactly tied neighbors
-        arbitrarily). ``'ivfflat'`` is much faster, yet closer to exact than Seurat's Annoy search; ``'cagra'``
-        needs ``knn_range <= 64``.
+        arbitrarily). ``'ivfflat'`` is much faster, yet closer to exact than Seurat's Annoy search.
     algorithm_kwds
         Options for the kNN search, see :func:`~rapids_singlecell.pp.neighbors`. Incomplete results raise a
-        :class:`ValueError` (for IVF, increase ``n_probes``). For ``'nn_descent'``, ``intermediate_graph_degree``
-        defaults to ``max(128, 1.5 * knn_range)``.
+        :class:`ValueError` (for IVF, increase ``n_probes``).
     method
         Method for the `connectivities`, see :func:`~rapids_singlecell.pp.neighbors`.
     rng
@@ -336,17 +473,11 @@ def wnn(
     Scanpy's layout initialization) and map the modalities to them with MuData, as in muon.
     :func:`~rapids_singlecell.tl.ingest` rejects WNN references; :func:`scanpy.tl.ingest` uses the first modality.
     """
-    from rapids_singlecell._cuda._wnn_cuda import impute_dist, multimodal_knn
+    # fail before any work if the extension is missing (the `_cuda` attribute would be None)
+    import rapids_singlecell._cuda._wnn_cuda  # noqa: F401
 
     rng = np.random.default_rng(rng)
-    meta_random_state = {}
-    if isinstance(rng, _LegacyRng) and isinstance(rng.arg, int | np.integer | None):  # only plain seeds
-        meta_random_state["random_state"] = None if rng.arg is None else int(rng.arg)
-    if method != "umap" and meta_random_state.get("random_state") != _DEFAULT_SEED:
-        # only the UMAP connectivities are randomized
-        warn(f"Parameter `rng`/`random_state` ignored if `method={method!r}`.", UserWarning, stacklevel=2)
-        meta_random_state.pop("random_state", None)
-
+    random_state_param = _random_state_param(rng, method)
     if algorithm not in get_args(_Algorithms):
         raise ValueError(f"Invalid algorithm '{algorithm}' for KNN. Valid options are: {get_args(_Algorithms)}.")
     adata = adata.copy() if copy else adata
@@ -358,96 +489,29 @@ def wnn(
         uns=True,
     )
 
+    # validate before any work, so that errors leave `adata` unchanged
     modalities, reps = _get_reps(adata, use_rep, n_pcs)
     names = list(modalities)
-    # Scanpy's UMAP initializes disconnected components from one representation, muon's per modality
-    layout_rep = modalities[names[0]]
-    if hasattr(adata, "mod"):
-        layout_rep = {f: {n: m[f] for n, m in modalities.items()} for f in ("use_rep", "n_pcs")}
-    # validate before any work, so that errors leave `adata` unchanged
     weight_cols = [] if weight_key is None else [weight_key.format(n) for n in names]
     if len(set(weight_cols)) < len(weight_cols) or "" in weight_cols:
         raise ValueError(f"`weight_key` {weight_key!r} must give a distinct column per modality, e.g. '{{}}_weight'.")
-    n_mod, n_obs = len(reps), adata.n_obs
-    n_neighbors, knn_range = operator.index(n_neighbors), operator.index(knn_range)
-    if n_neighbors < 2:
-        raise ValueError("`n_neighbors` must be at least 2.")
-    if knn_range <= n_neighbors:
-        raise ValueError("`knn_range` must be larger than `n_neighbors`.")
-    if knn_range > n_obs:
-        raise ValueError(f"`knn_range` must be at most the number of cells ({n_obs}).")
-    if n_mod * (knn_range - 1) > 4096:
-        raise ValueError("`knn_range * n_modalities` must be at most 4096.")
-    if algorithm == "cagra" and knn_range > 64:
-        raise ValueError("`algorithm='cagra'` supports `knn_range` up to 64; use e.g. 'ivfflat'.")
-    if np.ndim(cross_constant) == 0:
-        cross_constant = [float(cross_constant)] * n_mod
-    elif len(cross_constant) != n_mod:
-        raise ValueError("`cross_constant` needs one entry per modality.")
+    n_obs = adata.n_obs
+    n_neighbors, knn_range, cross_constant = _check_params(
+        n_obs=n_obs, n_mod=len(reps), n_neighbors=n_neighbors, knn_range=knn_range, cross_constant=cross_constant
+    )
 
     if l2_norm:
-        norms = [cp.linalg.norm(X, axis=1, keepdims=True) for X in reps]
-        reps = [X / cp.where(norm > 0, norm, 1) for X, norm in zip(reps, norms, strict=True)]
-
-    # kNN within each modality: the first `n_neighbors` give the weights, all `knn_range` the candidates
-    search_kwds = dict(algorithm_kwds)
-    if algorithm == "nn_descent":  # cuVS fails if this is below the graph degree
-        search_kwds.setdefault("intermediate_graph_degree", max(128, int(1.5 * knn_range)))
-    kw = {"metric": "euclidean", "metric_kwds": {}, "algorithm_kwds": search_kwds}
-    knns = cp.empty((n_mod, n_obs, knn_range), dtype=cp.int32)
-    for m, X in enumerate(reps):
-        Xc = _check_neighbors_X(X, algorithm)
-        knn, knn_dist = KNN_ALGORITHMS[algorithm](Xc, Xc, k=knn_range, **kw)
-        knn, knn_dist = cp.asarray(knn), cp.asarray(knn_dist)
-        # IVF can pad incomplete lists with sentinel IDs (or repeated IDs with infinite
-        # distances), all_neighbors with huge distances; check before narrowing IDs or indexing kernels.
-        valid = (knn >= 0) & (knn < n_obs) & (knn_dist < _PAD_DIST)
-        if not bool(valid.all()):
-            raise ValueError(
-                f"The {algorithm!r} search returned incomplete or invalid neighbors for modality {names[m]!r}. "
-                "Increase `n_probes` in `algorithm_kwds` for IVF searches (lower `n_lists` for 'all_neighbors'), "
-                "reduce `knn_range`, or use `algorithm='brute'`."
-            )
-        knns[m] = _ensure_self_first(knn.astype(cp.int32, copy=False))
-        del knn, knn_dist, valid, Xc
-
-    # dist[m, r]: distance of modality m to its prediction from modality r's neighbors
-    nearest = cp.empty((n_mod, n_obs), dtype=cp.float32)
-    sigma = cp.empty((n_mod, n_obs), dtype=cp.float32)
-    dist = cp.empty((n_mod, n_mod, n_obs), dtype=cp.float32)
-    zero = cp.zeros(n_obs, dtype=cp.float32)
-    for m, X in enumerate(reps):
-        # the multimodal kernel's arithmetic, so a neighbor nearest in every modality gets WNN distance 0
-        impute_dist(X, knns[m], k=2, nearest=zero, out=nearest[m], stream=_stream())
-        for r in range(n_mod):
-            impute_dist(X, knns[r], k=n_neighbors, nearest=nearest[m], out=dist[m, r], stream=_stream())
-        sigma[m] = _snn_bandwidth(knns[m], X, nearest[m], s_nn=n_neighbors)
-    sigma *= sd_scale
-    # a zero width (duplicated cells) makes R produce NaN weights
-    sigma = cp.maximum(sigma, cp.finfo(cp.float32).tiny)
-
-    kernel = cp.exp(-dist.astype(cp.float64) / sigma[:, None, :])
-    exp_scores = cp.zeros((n_mod, n_obs), dtype=cp.float64)
-    for m, r in itertools.permutations(range(n_mod), 2):
-        score = cp.clip(kernel[m, m] / (kernel[m, r] + cross_constant[m]), 0, 200)
-        if smooth:
-            score = score[knns[m, :, 1:n_neighbors]].mean(axis=1)
-        exp_scores[m] += cp.exp(score)
-    weights = (exp_scores / exp_scores.sum(axis=0)).astype(cp.float32)
-    del kernel, exp_scores, dist
-
-    emb = cp.concatenate(reps, axis=1)
-    dim_off = cp.asarray(np.cumsum([0] + [X.shape[1] for X in reps]), dtype=cp.int32)
+        reps = [_l2_normalize(X) for X in reps]
+    knns = _modality_knns(reps, names, knn_range=knn_range, algorithm=algorithm, algorithm_kwds=algorithm_kwds)
+    weights, sigma, nearest = _modality_weights(
+        reps, knns, n_neighbors=n_neighbors, sd_scale=sd_scale, cross_constant=cross_constant, smooth=smooth
+    )
+    emb, dims = cp.concatenate(reps, axis=1), [X.shape[1] for X in reps]
     del reps
-    knn_indices = cp.empty((n_obs, n_neighbors), dtype=cp.int32)
-    knn_dissim = cp.empty((n_obs, n_neighbors), dtype=cp.float32)
-    out = {"k_out": n_neighbors, "out_idx": knn_indices, "out_dissim": knn_dissim, "stream": _stream()}
-    multimodal_knn(
-        emb, dim_off=dim_off, knn=knns, knn_range=knn_range, weight=weights, sigma=sigma, nearest=nearest, **out
+    knn_indices, knn_dist = _multimodal_knn(
+        emb, dims, knns, weights=weights, sigma=sigma, nearest=nearest, n_neighbors=n_neighbors
     )
     del emb, knns
-    # Seurat's sqrt((1 - s) / 2) of the weighted kernel similarity s
-    knn_dist = cp.sqrt(cp.clip(knn_dissim / 2, 0, 1))
 
     distances = _build_sparse_distances(knn_indices, knn_dist, n_obs=n_obs)
     snn = _snn_graph(knn_indices, prune=prune_snn)
@@ -461,17 +525,33 @@ def wnn(
 
     if dests is True:
         return WnnResult(connectivities, distances, snn)
-    if adata.is_view:  # only now, so that errors leave a view untouched
-        adata._init_as_actual(adata.copy())
-    params = {"n_neighbors": n_neighbors, "method": method, **meta_random_state, "metric": "euclidean", **layout_rep}
-    params |= {"modalities": modalities, "knn_range": knn_range, "l2_norm": l2_norm, "sd_scale": sd_scale}
-    params |= {"smooth": smooth, "prune_snn": prune_snn}
+    # Scanpy's UMAP initializes disconnected components from one representation, muon's per modality
+    if hasattr(adata, "mod"):
+        layout_rep = {f: {n: m[f] for n, m in modalities.items()} for f in ("use_rep", "n_pcs")}
+    else:
+        layout_rep = modalities[names[0]]
+    params = {
+        "n_neighbors": n_neighbors,
+        "method": method,
+        **random_state_param,
+        "metric": "euclidean",
+        **layout_rep,
+        "modalities": modalities,
+        "knn_range": knn_range,
+        "l2_norm": l2_norm,
+        "sd_scale": sd_scale,
+        "smooth": smooth,
+        "prune_snn": prune_snn,
+    }
     if algorithm_kwds:
         params["algorithm_kwds"] = dict(algorithm_kwds)
+
+    if adata.is_view:  # only now, so that errors leave a view untouched
+        adata._init_as_actual(adata.copy())
     from . import _store_neighbors  # circular: `__init__` imports `wnn`
 
     _store_neighbors(adata, dests, WnnResult(connectivities, distances, snn), params)
-    if weight_cols:  # weight_key=None skips them
+    if weight_cols:
         for col, w in zip(weight_cols, weights.get(), strict=True):
             adata.obs[col] = w
 

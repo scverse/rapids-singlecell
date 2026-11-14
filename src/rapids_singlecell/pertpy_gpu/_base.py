@@ -137,9 +137,8 @@ class PerturbationEfficacyAnalyzer:
                 split_obs = adata.obs[split_by]
                 split_masks = [(split_obs == cat).to_numpy() for cat in split_obs.unique()]
 
-            from rapids_singlecell.preprocessing._neighbors._neighbors import (
-                KNN_ALGORITHMS,
-            )
+            from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
+            from rapids_singlecell.preprocessing._neighbors._neighbors import KNN_ALGORITHMS
 
             if knn_algorithm not in KNN_ALGORITHMS:
                 raise ValueError(f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, got {knn_algorithm!r}")
@@ -166,7 +165,7 @@ class PerturbationEfficacyAnalyzer:
                 R_control = representation[cp.asarray(control_mask_split)]
                 k = min(n_neighbors, n_control)
 
-                indices, _ = knn(
+                indices, dist = knn(
                     R_control,
                     R_split,
                     k,
@@ -174,6 +173,7 @@ class PerturbationEfficacyAnalyzer:
                     metric_kwds={},
                     algorithm_kwds=algorithm_kwds,
                 )
+                _check_knn_complete(indices, dist, n_index=n_control, algorithm=knn_algorithm)
 
                 X_control = cp.expm1(X[cp.asarray(control_mask_split)])
                 col_indices = indices.ravel().astype(cp.int32, copy=False)

@@ -26,6 +26,7 @@ from rapids_singlecell.get._out import (
 )
 from rapids_singlecell.get._utils import _get_vec, _to_numpy_1d
 from rapids_singlecell.preprocessing._neighbors._helper import (
+    _check_knn_complete,
     _check_metrics,
     _check_neighbors_X,
     _fix_self_distances,
@@ -192,8 +193,14 @@ def neighbors(
 
         For `nn_descent` algorithm, the following parameters can be specified:
 
-        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is None.
-          It is recommended to set it to `>= 1.5 * n_neighbors`.
+        * 'intermediate_graph_degree': The degree of the intermediate graph. Default is cuVS's default (96),
+          raised to `1.5 * n_neighbors` for larger `n_neighbors`. A smaller user-supplied value is raised
+          to `n_neighbors`.
+
+        For `cagra` algorithm, the following parameters can be specified:
+
+        * 'itopk_size': Number of candidates kept during the search. Default is cuVS's default (64), raised
+          to `n_neighbors` if smaller. Higher values increase accuracy but reduce speed.
 
         For `all_neighbors` algorithm, the following parameters can be specified:
 
@@ -271,6 +278,7 @@ def neighbors(
         metric_kwds=metric_kwds,
         algorithm_kwds=algorithm_kwds,
     )
+    _check_knn_complete(knn_indices, knn_dist, n_index=X_contiguous.shape[0], algorithm=algorithm)
     knn_dist = _fix_self_distances(knn_dist, metric)
     # free the GPU copy of the representation: the connectivities need the memory for large data
     del X, X_contiguous
@@ -382,8 +390,13 @@ def bbknn(
         parameters can be specified:
 
         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)).
-        * 'nprobes': Number of lists to probe during search. Default is 1. Higher values
+        * 'n_probes': Number of lists to probe during search. Default is 20. Higher values
           increase accuracy but reduce speed.
+
+        For `cagra` algorithm, the following parameters can be specified:
+
+        * 'itopk_size': Number of candidates kept during the search. Default is cuVS's default (64), raised
+          to `neighbors_within_batch` if smaller. Higher values increase accuracy but reduce speed.
 
         For `mg_ivfflat` and `mg_ivfpq` algorithms, the following parameters can be specified:
 
@@ -465,6 +478,7 @@ def bbknn(
             metric_kwds=metric_kwds,
             algorithm_kwds=algorithm_kwds,
         )
+        _check_knn_complete(sub_ind, sub_dist, n_index=X_to.shape[0], algorithm=algorithm)
 
         col_range = cp.arange(idx * neighbors_within_batch, (idx + 1) * neighbors_within_batch)
         knn_indices[:, col_range] = ind_to[sub_ind]
