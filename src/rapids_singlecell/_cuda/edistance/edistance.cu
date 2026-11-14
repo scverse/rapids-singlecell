@@ -1,279 +1,229 @@
 #include <cuda_runtime.h>
 #include "../nb_types.h"
-#include <nanobind/stl/tuple.h>
 
 #include "kernels_edistance.cuh"
 
 using namespace nb::literals;
 
-// Tile sizes for feature dimension (CELL_TILE=16 or 32)
-static constexpr int TILE_SIZES[] = {32, 50, 64};
-static constexpr int NUM_TILE_SIZES = 3;
+template <typename T, typename Device>
+using arr = gpu_array_c<T, Device>;
+// A policy's smem element as nanobind sees it (fp16 bits as uint16)
+template <class M>
+using elem_t =
+    std::conditional_t<sizeof(typename M::E) == 2, uint16_t, typename M::E>;
 
-// Feature tile sizes for CELL_TILE=64 configuration (Ampere+)
-// 25 is optimal for common PC counts (50, 100), 16 for better coalescing
-// otherwise
-static constexpr int FEAT_TILE_64_PREFERRED = 25;
-static constexpr int FEAT_TILE_64_COALESCED = 16;
+// The loaders' conversion type
+template <class M, typename In>
+using W = std::common_type_t<In, typename M::Acc>;
 
-// Choose feat_tile for CELL_TILE=64 configuration
-static int choose_feat_tile_64(int n_features) {
-    if (n_features % FEAT_TILE_64_PREFERRED == 0) {
-        return FEAT_TILE_64_PREFERRED;
-    }
-    return FEAT_TILE_64_COALESCED;
+template <class K>
+static void set_smem(K* kernel, int bytes) {
+    cuda_check(cudaFuncSetAttribute(
+                   kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes),
+               "cudaFuncSetAttribute");
 }
 
-// Choose optimal feat_tile based on n_features and shared memory limits
-static int choose_feat_tile(int n_features, size_t max_shared_bytes,
-                            int cell_tile, int dtype_size) {
-    // Shared memory: cell_tile * feat_tile * dtype_size + warp_sums overhead
-    size_t warp_sums_overhead = WARP_SIZE * dtype_size;
-    size_t available_shared = max_shared_bytes - warp_sums_overhead;
-
-    int best_tile = 32;  // default minimum
-
-    // Check exact divisibility - prefer larger tiles
-    for (int i = NUM_TILE_SIZES - 1; i >= 0; --i) {
-        int tile = TILE_SIZES[i];
-        size_t required = static_cast<size_t>(cell_tile) * tile * dtype_size;
-        if (required <= available_shared) {
-            if (n_features % tile == 0) {
-                return tile;
-            }
-            if (best_tile == 32 || tile > best_tile) {
-                best_tile = tile;
-            }
-        }
-    }
-
-    return best_tile;
-}
-
-// Get kernel configuration for given parameters
-// Returns (cell_tile, feat_tile, block_size, shared_mem_bytes) or None if
-// insufficient memory
-static nb::object get_kernel_config(int n_features, bool is_double) {
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-
-    int dtype_size = is_double ? 8 : 4;
-    bool is_ampere_plus = prop.major >= 8;
-    int cell_tile;
-    int block_size;
-    int feat_tile;
-
-    if (is_double) {
-        // float64: CELL_TILE=16
-        // double kernels use 74 regs/thread; cap at 512 to stay within 64K
-        // register limit
-        cell_tile = 16;
-        block_size = is_ampere_plus ? 512 : 256;
-        feat_tile = choose_feat_tile(n_features, prop.sharedMemPerBlock,
-                                     cell_tile, dtype_size);
-    } else {
-        // float32: CELL_TILE=64 with block_size=512
-        // Same register pressure as CELL_TILE=32 with block_size=1024, but
-        // faster
-        cell_tile = 64;
-        block_size = 512;
-        feat_tile = choose_feat_tile_64(n_features);
-    }
-
-    // Shared memory: smem_b (cell_tile * feat_tile)
-    size_t shared_mem_bytes =
-        static_cast<size_t>(cell_tile) * feat_tile * dtype_size;
-
-    if (shared_mem_bytes > prop.sharedMemPerBlock) {
-        return nb::none();
-    }
-
-    return nb::make_tuple(cell_tile, feat_tile, block_size,
-                          static_cast<int>(shared_mem_bytes));
-}
-
-// ---------------------------------------------------------------------------
-// Launch policies: each builds the appropriate loader and launches the shared
-// edistance_kernel_impl for compile-time tile sizes <CELL_TILE, FEAT_TILE>.
-// The dense and sparse paths differ ONLY here (and in their loaders); the tile
-// selection below is shared.
-// ---------------------------------------------------------------------------
-template <typename T>
-struct DenseLaunch {
-    const T* embedding;
-    const int* cat_offsets;
-    const int* cell_indices;
-    const int* pair_left;
-    const int* pair_right;
-    T* pairwise_sums;
-    int num_pairs, n_features, blocks_per_pair, block_size;
-    size_t shared_mem;
-    cudaStream_t stream;
-
-    template <int CELL_TILE, int FEAT_TILE>
-    void run() const {
-        dim3 grid(num_pairs, blocks_per_pair);
-        dim3 block(block_size);
-        edistance_kernel<T, CELL_TILE, FEAT_TILE>
-            <<<grid, block, shared_mem, stream>>>(
-                embedding, cat_offsets, cell_indices, pair_left, pair_right,
-                pairwise_sums, n_features, blocks_per_pair);
-        CUDA_CHECK_LAST_ERROR(edistance_kernel);
-    }
+// Dynamic shared memory: A rows stay resident over all feature windows only
+// when that keeps the blocks per SM of the launch that streams them with B.
+struct EdPlan {
+    bool a_resident;
+    int smem, streamed;
 };
-
-template <typename T, typename IndptrT>
-struct SparseLaunch {
-    const T* data;
-    const int* indices;
-    const IndptrT* indptr;
-    const int* cat_offsets;
-    const int* cell_indices;
-    const int* pair_left;
-    const int* pair_right;
-    T* pairwise_sums;
-    int num_pairs, n_features, blocks_per_pair, block_size;
-    size_t shared_mem;
-    cudaStream_t stream;
-
-    template <int CELL_TILE, int FEAT_TILE>
-    void run() const {
-        dim3 grid(num_pairs, blocks_per_pair);
-        dim3 block(block_size);
-        edistance_sparse_kernel<T, CELL_TILE, FEAT_TILE, IndptrT>
-            <<<grid, block, shared_mem, stream>>>(
-                data, indices, indptr, cat_offsets, cell_indices, pair_left,
-                pair_right, pairwise_sums, n_features, blocks_per_pair);
-        CUDA_CHECK_LAST_ERROR(edistance_sparse_kernel);
-    }
-};
-
-// Pick the (CELL_TILE, FEAT_TILE) specialization at compile time and invoke
-// launcher.run<CELL_TILE, FEAT_TILE>(). f32 uses CELL_TILE=64 (FEAT_TILE 25/16)
-// with a legacy CELL_TILE=32 fallback; f64 uses CELL_TILE=16. Shared by both
-// the dense and sparse bindings via the launch policy.
-template <typename T, typename Launcher>
-static void dispatch_tiles(const Launcher& launcher, int cell_tile,
-                           int feat_tile) {
-    (void)cell_tile;  // unused for f64 (always 16)
-    if constexpr (std::is_same_v<T, double>) {
-        if (feat_tile == 64) {
-            launcher.template run<16, 64>();
-        } else if (feat_tile == 50) {
-            launcher.template run<16, 50>();
-        } else {
-            launcher.template run<16, 32>();
-        }
-    } else {
-        if (cell_tile == 64) {
-            if (feat_tile == 25) {
-                launcher.template run<64, 25>();
-            } else {  // feat_tile == 16
-                launcher.template run<64, 16>();
-            }
-        } else {  // legacy CELL_TILE=32 fallback
-            if (feat_tile == 64) {
-                launcher.template run<32, 64>();
-            } else if (feat_tile == 50) {
-                launcher.template run<32, 50>();
-            } else {
-                launcher.template run<32, 32>();
-            }
-        }
-    }
+template <class M>
+static EdPlan plan(int kp) {
+    constexpr int TA = M::TA, KW = ED_WB / sizeof(typename M::E);
+    const int streamed = (TA + ED_TB) * ED_PITCH;
+    const long long nwin = (kp + KW - 1) / KW;
+    const long long resident = TA * (nwin * ED_WB + 16) + ED_TB * ED_PITCH;
+    const int fixed = (TA + ED_TB) * (4 + (int)sizeof(typename M::Acc)) +
+                      WARP_SIZE * 8 + 1024;  // static + reserved
+    const int opt_in =
+        device_attribute(cudaDevAttrMaxSharedMemoryPerBlockOptin);
+    const int per_sm =
+        device_attribute(cudaDevAttrMaxSharedMemoryPerMultiprocessor);
+    auto blocks = [&](long long dyn) {
+        return dyn + fixed > opt_in + 1024
+                   ? 0LL
+                   : std::min<long long>(M::min_blocks, per_sm / (dyn + fixed));
+    };
+    const bool a_resident = blocks(resident) == blocks(streamed);
+    return {a_resident, a_resident ? (int)resident : streamed, streamed};
 }
 
-template <typename T, typename Device, typename IndptrT>
-void def_compute_distances_sparse(nb::module_& m) {
+#define ED_LAUNCH_ARGS                                                         \
+    int kp, arr<typename M::Acc, Device> norms,                                \
+        arr<const int, Device> cat_offsets,                                    \
+        arr<const int, Device> cell_indices, arr<const int, Device> pair_left, \
+        arr<const int, Device> pair_right,                                     \
+        arr<const int, Device> block_offsets, int grid,                        \
+        arr<double, Device> pairwise_sums, bool norms_only,                    \
+        std::uintptr_t stream
+
+// norms_only: norms[row] of every row. Otherwise the pair sums of one chunk of
+// pairs on grid = block_offsets[num_pairs] blocks.
+template <class M, class L, typename Device>
+static void launch(const L& ld, ED_LAUNCH_ARGS) {
+    constexpr int TA = M::TA;
+    const EdPlan p = plan<M>(kp);
+    const auto s = reinterpret_cast<cudaStream_t>(stream);
+    if (norms_only) {
+        const int n = static_cast<int>(norms.size());
+        if (n == 0) return;
+        set_smem(edistance_norms_kernel<M, L>, p.streamed);
+        edistance_norms_kernel<M, L>
+            <<<(n + TA - 1) / TA, ED_THREADS, p.streamed, s>>>(ld, n, kp,
+                                                               norms.data());
+        CUDA_CHECK_LAST_ERROR(edistance_norms_kernel);
+        return;
+    }
+    if (grid == 0) return;
+    set_smem(edistance_kernel<M, L>, p.smem);
+    edistance_kernel<M, L><<<grid, ED_THREADS, p.smem, s>>>(
+        ld, norms.data(), cat_offsets.data(), cell_indices.data(),
+        pair_left.data(), pair_right.data(), block_offsets.data(),
+        static_cast<int>(pair_left.size()), kp, p.a_resident,
+        pairwise_sums.data());
+    CUDA_CHECK_LAST_ERROR(edistance_kernel);
+}
+
+#define ED_LAUNCH_PASS                                           \
+    kp, norms, cat_offsets, cell_indices, pair_left, pair_right, \
+        block_offsets, grid, pairwise_sums, norms_only, stream
+#define ED_LAUNCH_NAMES                                                      \
+    "kp"_a, "norms"_a.noconvert(), "cat_offsets"_a.noconvert(),              \
+        "cell_indices"_a.noconvert(), "pair_left"_a.noconvert(),             \
+        "pair_right"_a.noconvert(), "block_offsets"_a.noconvert(), "grid"_a, \
+        "pairwise_sums"_a.noconvert(), "norms_only"_a, "stream"_a = 0
+
+template <class M, typename In, typename IndptrT, typename Device>
+static void def_sparse(nb::module_& m, const char* name) {
     m.def(
-        "compute_distances_sparse",
-        [](gpu_array_c<const IndptrT, Device> indptr,
-           gpu_array_c<const int, Device> indices,
-           gpu_array_c<const T, Device> data,
-           gpu_array_c<const int, Device> cat_offsets,
-           gpu_array_c<const int, Device> cell_indices,
-           gpu_array_c<const int, Device> pair_left,
-           gpu_array_c<const int, Device> pair_right,
-           gpu_array_c<T, Device> pairwise_sums, int num_pairs, int n_features,
-           int blocks_per_pair, int cell_tile, int feat_tile, int block_size,
-           int shared_mem, std::uintptr_t stream) {
-            SparseLaunch<T, IndptrT> launcher{
+        name,
+        [](arr<const IndptrT, Device> indptr, arr<const int, Device> indices,
+           arr<const In, Device> data, arr<const W<M, In>, Device> nm,
+           W<M, In> sc, arr<const elem_t<M>, Device> zero, bool duplicates,
+           ED_LAUNCH_ARGS) {
+            const EdCsrRows<M, In, IndptrT> ld{
                 data.data(),
                 indices.data(),
                 indptr.data(),
-                cat_offsets.data(),
-                cell_indices.data(),
-                pair_left.data(),
-                pair_right.data(),
-                pairwise_sums.data(),
-                num_pairs,
-                n_features,
-                blocks_per_pair,
-                block_size,
-                static_cast<size_t>(shared_mem),
-                reinterpret_cast<cudaStream_t>(stream)};
-            dispatch_tiles<T>(launcher, cell_tile, feat_tile);
+                nm.data(),
+                sc,
+                reinterpret_cast<const uint4*>(zero.data()),
+                duplicates};
+            launch<M>(ld, ED_LAUNCH_PASS);
         },
-        "indptr"_a, "indices"_a, "data"_a, "cat_offsets"_a, "cell_indices"_a,
-        "pair_left"_a, "pair_right"_a, "pairwise_sums"_a, "num_pairs"_a,
-        "n_features"_a, "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a,
-        "block_size"_a, "shared_mem"_a, "stream"_a = 0);
+        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
+        "nm"_a.noconvert(), "sc"_a, "zero"_a.noconvert(), "duplicates"_a,
+        ED_LAUNCH_NAMES);
 }
 
-template <typename T, typename Device>
-void def_compute_distances(nb::module_& m) {
+// One entry point per math policy, overloaded on the layout and dtypes: dense
+// float64 / float32 rows, CSR with int32 / int64 indptr. f64 before f32.
+template <class M, typename Device>
+static void def_math(nb::module_& m, const char* name) {
+    auto dense = [&](auto tag) {
+        using In = decltype(tag);
+        m.def(
+            name,
+            [](arr<const In, Device> X, int align,
+               arr<const W<M, In>, Device> nm, W<M, In> sc, ED_LAUNCH_ARGS) {
+                const EdDenseRows<M, In> ld{X.data(),
+                                            static_cast<long long>(X.shape(1)),
+                                            static_cast<int>(X.shape(1)),
+                                            align,
+                                            nm.data(),
+                                            sc};
+                launch<M>(ld, ED_LAUNCH_PASS);
+            },
+            "X"_a.noconvert(), "align"_a, "nm"_a.noconvert(), "sc"_a,
+            ED_LAUNCH_NAMES);
+    };
+    dense(double{});
+    dense(float{});
+    def_sparse<M, double, int, Device>(m, name);
+    def_sparse<M, float, int, Device>(m, name);
+    def_sparse<M, double, long long, Device>(m, name);
+    def_sparse<M, float, long long, Device>(m, name);
+}
+
+#define ED_CENTER_ARGS                                                      \
+    long long step, int pass, int shift, arr<const bool, Device> keep,      \
+        arr<In, Device> ext, arr<In, Device> out, arr<double, Device> sums, \
+        std::uintptr_t stream
+#define ED_CENTER_NAMES                                                       \
+    "step"_a, "pass"_a, "shift"_a, "keep"_a.noconvert(), "ext"_a.noconvert(), \
+        "out"_a.noconvert(), "sums"_a.noconvert(), "stream"_a = 0
+
+// One pass of the center kernel over the rows i * step, i < out.size(), in
+// windows of R::CW columns
+template <typename In, class R, typename Device>
+static void center(const R& rd, ED_CENTER_ARGS) {
+    const int m = static_cast<int>(out.size());
+    const int d = static_cast<int>(ext.size() / 2);
+    nb_require(!pass || (keep.size() == out.size() && sums.size() == (size_t)d),
+               "center: keep / sums do not match out / ext");
+    if (m == 0 || d == 0) return;
+    const long long units = (long long)m * ((d - 1) / R::CW + 1);
+    edistance_center_kernel<In, R>
+        <<<(unsigned)((units + ED_THREADS - 1) / ED_THREADS), ED_THREADS, 0,
+           reinterpret_cast<cudaStream_t>(stream)>>>(
+            rd, step, m, d, R::CW, pass, shift, keep.data(), ext.data(),
+            out.data(), sums.data());
+    CUDA_CHECK_LAST_ERROR(edistance_center_kernel);
+}
+
+// Dense rows (those of the index array rows, if given), the column extremes
+// less mu, or sorted CSR with int32 / int64 indptr and int32 / int64 indices
+template <typename In, typename Device>
+static void def_center(nb::module_& m) {
     m.def(
-        "compute_distances",
-        [](gpu_array_c<const T, Device> embedding,
-           gpu_array_c<const int, Device> cat_offsets,
-           gpu_array_c<const int, Device> cell_indices,
-           gpu_array_c<const int, Device> pair_left,
-           gpu_array_c<const int, Device> pair_right,
-           gpu_array_c<T, Device> pairwise_sums, int num_pairs, int n_features,
-           int blocks_per_pair, int cell_tile, int feat_tile, int block_size,
-           int shared_mem, std::uintptr_t stream) {
-            DenseLaunch<T> launcher{embedding.data(),
-                                    cat_offsets.data(),
-                                    cell_indices.data(),
-                                    pair_left.data(),
-                                    pair_right.data(),
-                                    pairwise_sums.data(),
-                                    num_pairs,
-                                    n_features,
-                                    blocks_per_pair,
-                                    block_size,
-                                    static_cast<size_t>(shared_mem),
-                                    reinterpret_cast<cudaStream_t>(stream)};
-            dispatch_tiles<T>(launcher, cell_tile, feat_tile);
+        "center",
+        [](arr<const In, Device> X, arr<const int, Device> rows,
+           ED_CENTER_ARGS) {
+            center<In>(
+                EdCenterDense<In>{X.data(), (long long)X.shape(1), rows.data()},
+                step, pass, shift, keep, ext, out, sums, stream);
         },
-        "embedding"_a, "cat_offsets"_a, "cell_indices"_a, "pair_left"_a,
-        "pair_right"_a, "pairwise_sums"_a, "num_pairs"_a, "n_features"_a,
-        "blocks_per_pair"_a, "cell_tile"_a, "feat_tile"_a, "block_size"_a,
-        "shared_mem"_a, "stream"_a = 0);
+        "X"_a.noconvert(), "rows"_a.noconvert().none(), ED_CENTER_NAMES);
+    m.def(
+        "center",
+        [](arr<const In, Device> keys, arr<const In, Device> mu,
+           ED_CENTER_ARGS) {
+            center<In>(
+                EdCenterReach<In>{keys.data(), mu.data(), (long long)mu.size()},
+                step, pass, shift, keep, ext, out, sums, stream);
+        },
+        "keys"_a.noconvert(), "mu"_a.noconvert(), ED_CENTER_NAMES);
+    auto csr = [&](auto ptag, auto itag) {
+        using P = decltype(ptag);
+        using I = decltype(itag);
+        m.def(
+            "center",
+            [](arr<const P, Device> indptr, arr<const I, Device> indices,
+               arr<const In, Device> data, ED_CENTER_ARGS) {
+                center<In>(EdCenterCsr<In, P, I>{data.data(), indices.data(),
+                                                 indptr.data()},
+                           step, pass, shift, keep, ext, out, sums, stream);
+            },
+            "indptr"_a.noconvert(), "indices"_a.noconvert(),
+            "data"_a.noconvert(), ED_CENTER_NAMES);
+    };
+    csr(0, 0);
+    csr(0LL, 0);
+    csr(0, 0LL);
+    csr(0LL, 0LL);
 }
 
 template <typename Device>
 void register_bindings(nb::module_& m) {
-    // IMPORTANT: f64 must be defined before f32 for proper overload dispatch.
-    def_compute_distances<double, Device>(m);
-    def_compute_distances<float, Device>(m);
-
-    // Sparse (CSR) variants. Nanobind dispatches on data and indptr dtype.
-    // Keep f64 before f32 for proper overload dispatch.
-    def_compute_distances_sparse<double, Device, int>(m);
-    def_compute_distances_sparse<float, Device, int>(m);
-    def_compute_distances_sparse<double, Device, long long>(m);
-    def_compute_distances_sparse<float, Device, long long>(m);
+    def_center<double, Device>(m);
+    def_center<float, Device>(m);
+    def_math<EdFma<double>, Device>(m, "pair_sums_f64");
+    def_math<EdFma<float>, Device>(m, "pair_sums_f32");
+    def_math<EdMma16, Device>(m, "pair_sums_f16");
 }
 
 NB_MODULE(_edistance_cuda, m) {
-    m.def("get_kernel_config", &get_kernel_config, "n_features"_a,
-          "is_double"_a,
-          "Get kernel configuration (cell_tile, feat_tile, block_size, "
-          "shared_mem) for given "
-          "parameters. Returns None if insufficient shared memory.");
-
     REGISTER_GPU_BINDINGS(register_bindings, m);
 }

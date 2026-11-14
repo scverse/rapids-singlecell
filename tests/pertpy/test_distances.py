@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from anndata import AnnData
+from scipy.sparse import csr_matrix
 from scipy.spatial.distance import cdist
 
 from rapids_singlecell.pertpy_gpu import Distance, MeanVar
@@ -250,6 +251,47 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> None:
+    """Dense integer and float16 input is computed in float32: AnnData input to the bit, two-array input to rounding."""
+    distance = Distance(metric="edistance")
+    X = cp.rint(small_adata.obsm["X_pca"] * 4) * 14  # int8 values whose sums of squares do not fit float16
+    small_adata.obsm["X_pca"] = X.astype(cp.float32)
+    expected = distance.pairwise(small_adata, groupby="group")
+    small_adata.obsm["X_pca"] = X.astype(cp.int32)
+    pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
+    rng = cp.random.default_rng(0)  # float16 values whose row norms are not exact in float32
+    x, y = ((rng.standard_normal((n, 50)) + loc).astype(cp.float16) for n, loc in ((200, 20), (300, 20.5)))
+    assert distance(x, y) == pytest.approx(distance(x.astype(cp.float64), y.astype(cp.float64)), rel=2e-5)
+    one = (x.reshape(1, -1)[:, :128] * 1000).astype(cp.int32)  # one cell whose norm is not exact in float32
+    assert distance(one, one) == 0
+    a, b = X[:4].astype(cp.float32), X[4:].astype(cp.float32)
+    a64, b8 = a.astype(cp.float64) / 3, b.astype(cp.int8)  # next to a float64 array the cast is to float64
+    for values in (1 << 24, 1):  # of cast two-array input at a time: all columns in one block, then one column each
+        monkeypatch.setattr("rapids_singlecell.pertpy_gpu._metrics._edistance._CAST_VALUES", values)
+        assert distance(a64, b8) == pytest.approx(distance(a64, b8.astype(cp.float64)), rel=1e-10)
+        for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
+            assert distance(a.astype(dtype), b.get().astype(dtype)) == pytest.approx(distance(a, b), rel=1e-5)
+            got, want = distance.bootstrap(a.astype(dtype), b.astype(dtype)), distance.bootstrap(a, b)
+            np.testing.assert_allclose(got, want, rtol=1e-4)
+    big = cp.array([[3 << 62], [11 << 60]], dtype=cp.uint64)  # two norms that pass float32's maximum together
+    assert distance(big, cp.zeros((1, 1), dtype=cp.uint64)) == 22 * 2.0**60  # no distance does
+    assert distance(pd.DataFrame(a.get()), pd.DataFrame(b.get())) == distance(a, b)  # anything cp.asarray takes
+    with pytest.raises(ValueError, match="Unsupported dtype"):
+        distance(a.astype(cp.complex64), b)
+    with pytest.raises(ValueError, match="same number of features"):
+        distance(a.astype(cp.int8), b[:, :3])
+
+
+def test_edistance_dense_big_endian_input(small_adata: AnnData) -> None:
+    """Host dense input in another byte order gives the result of its native dtype."""
+    distance = Distance(metric="edistance")
+    X = small_adata.obsm["X_pca"].get().astype(np.float64)
+    small_adata.obsm["X_pca"] = X
+    expected = distance.pairwise(small_adata, groupby="group")
+    small_adata.obsm["X_pca"] = X.astype(">f8")
+    pd.testing.assert_frame_equal(distance.pairwise(small_adata, groupby="group"), expected)
+
+
 def test_edistance_correctness_vs_cpu(small_adata: AnnData) -> None:
     """Test that GPU energy distance matches CPU reference implementation."""
     distance = Distance(metric="edistance")
@@ -346,6 +388,99 @@ def test_onesided_distances_correctness_vs_cpu(small_adata: AnnData) -> None:
             )
 
 
+@pytest.fixture(scope="module")
+def large_group_data() -> tuple[np.ndarray, np.ndarray, pd.Series]:
+    """A 17,000-cell control (many blocks per pair), a 700-cell and a 2-cell group, and a float64 CPU reference."""
+    rng = np.random.default_rng(0)
+    sizes = {"ctrl": 17_000, "a": 700, "b": 2}
+    labels = np.repeat(list(sizes), list(sizes.values()))
+    X = rng.normal(size=(len(labels), 4)) + 0.3 * (labels == "a")[:, None] + (labels == "b")[:, None]
+    X[rng.random(X.shape) > 0.6] = 0.0  # zeros for the CSR path
+    X = X.astype(np.float32).astype(np.float64)  # exact in float32 too
+
+    def mean_dist(A: np.ndarray, B: np.ndarray) -> float:  # within a group (A is B) over i != j
+        total = sum(cdist(A[s : s + 1024], B).sum() for s in range(0, len(A), 1024))
+        return total / (len(A) * (len(A) - 1) if A is B else len(A) * len(B))
+
+    g = {k: X[labels == k] for k in sizes}
+    ctrl_mean = mean_dist(g["ctrl"], g["ctrl"])
+    expected = pd.Series({k: 2 * mean_dist(g["ctrl"], v) - ctrl_mean - mean_dist(v, v) for k, v in g.items()})
+    return X, labels, expected
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_onesided_large_group_vs_cpu(large_group_data, dtype, sparse: bool, precision: str) -> None:
+    """Every precision matches a float64 CPU reference, dense and CSR, in the input's dtype."""
+    X, labels, expected = large_group_data
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=list(expected.index))}).rename(str)
+    kwargs = {"metric": "edistance", "precision": precision}
+    if sparse:
+        adata, distance = AnnData(csr_matrix(X.astype(dtype)), obs=obs), Distance(layer_key="X", **kwargs)
+    else:
+        adata, distance = AnnData(obs=obs, obsm={"X_pca": cp.asarray(X, dtype=dtype)}), Distance(**kwargs)
+    result = distance.onesided_distances(adata, groupby="group", selected_group="ctrl")
+    assert result.dtype == dtype
+    if precision == "float16":  # values rounded to float16 (5e-4 relative), averaging out least over the 2-cell group
+        atol = 1e-3
+    else:  # float64 arithmetic on float64 data, else float32 arithmetic or a float32 result
+        atol = 1e-12 if dtype == np.float64 and precision != "float32" else 1e-5
+    np.testing.assert_allclose(result.loc[expected.index].to_numpy(), expected.to_numpy(), rtol=0, atol=atol)
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
+def test_edistance_launcher_jobs_and_chunks(small_adata: AnnData, precision: str, monkeypatch) -> None:
+    """Two jobs on one device, each in several launches, give the sums of one launch bit for bit."""
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
+
+    small_adata.obsm["X_pca"][:4] = small_adata.obsm["X_pca"][0]  # g0: identical cells
+    metric = Distance(metric="edistance", precision=precision)._metric_impl
+    source, offsets, cells, groups = metric._load_source(small_adata, "group", None)
+    left, right = (a.astype(cp.int32) for a in cp.triu_indices(len(groups)))
+    one = metric._launch_distance_kernel(source, offsets, cells, pair_left=left, pair_right=right, device_ids=[0])
+    monkeypatch.setattr(_edistance, "_PAIR_CHUNK", 2)
+    two = metric._launch_distance_kernel(source, offsets, cells, pair_left=left, pair_right=right, device_ids=[0, 0])
+    assert one.dtype == cp.float32
+    cp.testing.assert_array_equal(one, two)
+    assert float(one[0]) == 0.0  # the distances within g0
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_edistance_precision_errors(small_adata: AnnData) -> None:
+    """An unknown precision raises, and so does float16 on a cell beyond its range, only in calls that use the cell."""
+    for bad in ("float8", np.dtype("float32")):
+        with pytest.raises(ValueError, match="precision must be"):
+            Distance(metric="edistance", precision=bad)
+    # "auto" is "float32" on float32 input
+    auto, f32 = (Distance(precision=p).pairwise(small_adata, groupby="group") for p in ("auto", "float32"))
+    pd.testing.assert_frame_equal(auto, f32, check_exact=True)
+    small_adata.obsm["X_pca"][0, 0] = 1e9  # a g0 cell
+    small_adata.obsm["X_pca"][1, 0] = np.nan  # a NaN cell of g0 does not hide it
+    distance = Distance(metric="edistance", precision="float16")
+    with pytest.raises(ValueError, match="precision='float32'"):
+        distance.pairwise(small_adata, groupby="group")
+    assert np.isfinite(distance.pairwise(small_adata, groupby="group", groups=["g1", "g2"]).values).all()
+    small_adata.obsm["X_pca"][4:] = np.nan  # g1 and g2: NaN cells pass the range check without a warning
+    distance.pairwise(small_adata, groupby="group", groups=["g1", "g2"])  # alone: g0 is not loaded
+    distance.contrast_distances(small_adata, pd.DataFrame({"group": ["g1"], "reference": "g2"}))  # next to g0
+
+
+def test_float16_range_check_cells() -> None:
+    """The float16 range check reads every cell a call uses, also behind the first 2**16, and no other loaded cell."""
+    n = 2**16 + 4
+    X = np.random.default_rng(0).normal(size=(n, 2)).astype(np.float32)
+    X[n // 4 - 1] = 1e9  # the last "a" cell
+    adata = AnnData(X, obs=pd.DataFrame({"group": pd.Categorical(np.repeat(list("abcd"), n // 4))}).rename(str))
+    adata.obsm["X_pca"] = cp.asarray(X)
+    distance = Distance(metric="edistance", precision="float16")
+    contrasts = pd.DataFrame({"group": list("cda"), "reference": "b"})  # used in the order c, b, d, a
+    with pytest.raises(ValueError, match="precision='float32'"):
+        distance.contrast_distances(adata, contrasts)
+    # Three of four groups: all cells are loaded
+    assert np.isfinite(distance.contrast_distances(adata, contrasts[:2])["edistance"]).all()
+
+
 # ============================================================================
 # Contrast distance tests
 # ============================================================================
@@ -386,7 +521,7 @@ def test_contrast_distances_matches_compute_distance(
     result = d.contrast_distances(contrast_adata, contrasts=contrasts)
 
     assert isinstance(result, pd.DataFrame)
-    assert "edistance" in result.columns
+    assert result["edistance"].dtype == contrast_adata.obsm["X_pca"].dtype == np.float32
     assert len(result) == len(contrasts)
 
     # Verify each contrast against compute_distance
@@ -591,9 +726,9 @@ def test_contrast_distances_filtered(contrast_adata: AnnData) -> None:
     full_result = distance.contrast_distances(contrast_adata, contrasts=contrasts)
     assert len(full_result) == 2
 
-    # The T-cell row should match between filtered and full
+    # The T-cell row should match between filtered and full, to float32 rounding: each call centers on its own cells
     full_t = full_result[full_result["celltype"] == "T"]["edistance"].iloc[0]
-    np.testing.assert_allclose(result["edistance"].iloc[0], full_t, atol=1e-10)
+    np.testing.assert_allclose(result["edistance"].iloc[0], full_t, atol=5e-6)
 
 
 def test_contrast_distances_two_split_by() -> None:
@@ -656,6 +791,51 @@ def test_contrast_distances_two_split_by() -> None:
             rtol=1e-6,
             atol=1e-6,
         )
+
+
+@pytest.mark.parametrize(("precision", "atol"), [("auto", 2e-5), ("float16", 5e-3)])
+def test_contrast_distances_centers_each_split(precision: str, atol: float) -> None:
+    """Splits far apart: each is centered on its own cells and gives the bits of a call on it alone."""
+    import cupyx.scipy.sparse as cpsp
+
+    rng = np.random.default_rng(0)
+    n = 30
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(np.tile(np.repeat(["ctrl", "drug"], n), 3)),
+            "celltype": pd.Categorical(np.repeat(list("xyz"), 2 * n)),
+        }
+    ).rename(str)
+    X = rng.normal(size=(6 * n, 12)).astype(np.float32)
+    X[(obs["treatment"] == "drug").to_numpy()] += 0.1  # a small effect
+    X += np.repeat(np.float32([0, 1e3, -3e3]), 2 * n)[:, None]  # of cell types thousands of spreads apart
+    contrasts = Distance.create_contrasts(
+        AnnData(X, obs=obs), groupby="treatment", selected_group="ctrl", split_by="celltype"
+    )
+
+    def cpu(celltype: str) -> float:
+        a, b = (
+            X[(obs["celltype"] == celltype).to_numpy() & (obs["treatment"] == t).to_numpy()] for t in ("drug", "ctrl")
+        )
+        within = lambda x: cdist(x, x).sum() / (len(x) * (len(x) - 1))
+        return 2 * cdist(a, b).mean() - within(a) - within(b)
+
+    expected = [cpu(celltype) for celltype in contrasts["celltype"]]
+    distance = Distance(metric="edistance", layer_key="X", precision=precision)
+    to_device = lambda sparse: lambda x: sparse(csr_matrix(x))  # CSR, and CSC that is converted once
+    for container in (np.asarray, csr_matrix, cp.asarray, to_device(cpsp.csr_matrix), to_device(cpsp.csc_matrix)):
+        adata = AnnData(container(X), obs=obs)
+        got = distance.contrast_distances(adata, contrasts)
+        alone = pd.concat([distance.contrast_distances(adata, contrasts[contrasts["celltype"] == c]) for c in "xyz"])
+        pd.testing.assert_frame_equal(got, alone.loc[got.index], check_exact=True)
+        np.testing.assert_allclose(got["edistance"], expected, atol=atol)
+    empty = distance.contrast_distances(adata, contrasts.iloc[:0])
+    assert len(empty) == 0 and empty["edistance"].dtype == np.float32
+    if precision == "float16":  # a cell beyond the float16 range of its combination: the error names the combination
+        X[-1] += 1e5
+        with pytest.raises(ValueError, match="float16 range") as error:
+            distance.contrast_distances(AnnData(X, obs=obs), contrasts)
+        assert "'celltype': 'z'" in error.value.__notes__[0]
 
 
 # ============================================================================
@@ -1160,69 +1340,6 @@ def test_correctness_float64_small() -> None:
 
 
 # ============================================================================
-# Block size consistency test
-# ============================================================================
-
-
-def test_block_size_consistency() -> None:
-    """Test that both block sizes (1024 and 256) produce identical results.
-
-    This test runs on GPUs that support both block sizes (Ampere+, CC >= 8.0)
-    and verifies both code paths produce the same results.
-    """
-    from rapids_singlecell._utils import _multi_gpu
-
-    # Check if GPU supports both block sizes (Ampere+)
-    device_attrs = _multi_gpu._get_device_attrs()
-    if device_attrs["cc_major"] < 8:
-        pytest.skip("GPU does not support both block sizes (requires CC >= 8.0)")
-
-    rng = np.random.default_rng(42)
-    n_groups = 3
-    cells_per_group = 10
-    n_features = 20
-    total_cells = n_groups * cells_per_group
-
-    # Use float64 since block size difference only matters for float64 on pre-Ampere
-    cpu_embedding = rng.normal(size=(total_cells, n_features)).astype(np.float64)
-    groups = [f"g{idx}" for idx in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
-
-    adata = AnnData(cpu_embedding.copy().astype(np.float32), obs=obs)
-    adata.obsm["X_pca"] = cp.asarray(cpu_embedding, dtype=cp.float64)
-
-    # Get result with default block size (1024 for Ampere+)
-    distance = Distance(metric="edistance")
-    result = distance.pairwise(adata, groupby="group")
-
-    # Temporarily override cc_major to force 256 block size
-    device_id = cp.cuda.Device().id
-    original_cc = device_attrs["cc_major"]
-    try:
-        _multi_gpu._DEVICE_ATTRS_CACHE[device_id]["cc_major"] = 7  # Force pre-Ampere path
-        distance_256 = Distance(metric="edistance")
-        result_256 = distance_256.pairwise(adata, groupby="group")
-    finally:
-        _multi_gpu._DEVICE_ATTRS_CACHE[device_id]["cc_major"] = original_cc  # Restore
-
-    # Results should be identical between 256 and 1024 block paths
-    np.testing.assert_allclose(
-        result.values,
-        result_256.values,
-        rtol=1e-7,
-        atol=1e-7,
-        err_msg="256-block and 1024-block paths should produce identical results",
-    )
-    # Diagonal should be zero (self-distance)
-    np.testing.assert_allclose(
-        np.diag(result.values),
-        0,
-        atol=1e-7,
-        err_msg="Diagonal (self-distance) should be zero",
-    )
-
-
-# ============================================================================
 # Distance axioms tests (semimetric properties)
 # ============================================================================
 
@@ -1420,8 +1537,8 @@ def test_pairwise_groups_parameter_values_correct(small_adata: AnnData) -> None:
     # Filtered pairwise
     filtered_result = distance.pairwise(small_adata, groupby="group", groups=["g0", "g2"])
 
-    # Values should match
-    np.testing.assert_allclose(filtered_result.loc["g0", "g2"], full_result.loc["g0", "g2"], atol=1e-10)
+    # Values should match, to float32 rounding: each call centers on its own cells
+    np.testing.assert_allclose(filtered_result.loc["g0", "g2"], full_result.loc["g0", "g2"], atol=5e-6)
     np.testing.assert_allclose(filtered_result.loc["g0", "g0"], full_result.loc["g0", "g0"], atol=1e-10)
 
 
@@ -2075,6 +2192,45 @@ def test_multi_gpu_device_attrs_cache_per_device() -> None:
     # Getting attrs again should return cached values
     attrs_0_again = _multi_gpu._get_device_attrs(device_id=0)
     assert attrs_0_again is attrs_0  # Same object (cached)
+
+
+@pytest.mark.skipif(not _has_multiple_gpus(), reason="Requires 2+ GPUs")
+@pytest.mark.filterwarnings("error::cupy._util.PerformanceWarning")  # no peer access
+def test_edistance_sparse_input_on_another_gpu(monkeypatch) -> None:
+    """A sparse device matrix on another GPU is loaded and centered there and gives the result of one on this GPU."""
+    import cupyx.scipy.sparse as cpsp
+
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
+
+    def where_the_matrix_lives(function):
+        def checked(X, *args):
+            assert X.data.device == cp.cuda.Device()
+            return function(X, *args)
+
+        return checked
+
+    for name in ("_build_csr_source", "_center"):  # loaded and centered
+        monkeypatch.setattr(_edistance, name, where_the_matrix_lives(getattr(_edistance, name)))
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(60, 7)).astype(np.float32)
+    X[rng.random(X.shape) > 0.5] = 0
+    obs = pd.DataFrame({"group": pd.Categorical(np.repeat(list("abc"), 20))}).rename(str)
+    contrasts = pd.DataFrame({"group": ["b", "c"], "reference": "a"})
+    distance = Distance(metric="edistance", layer_key="X")
+
+    def results(device: int, multi_gpu: bool):
+        with cp.cuda.Device(device):
+            adata = AnnData(cpsp.csr_matrix(csr_matrix(X)), obs=obs)
+            csc = AnnData(cpsp.csc_matrix(csr_matrix(X)), obs=obs)
+        yield distance.pairwise(adata, groupby="group", multi_gpu=multi_gpu)  # the whole matrix
+        yield distance.pairwise(adata, groupby="group", groups=["a", "c"], multi_gpu=multi_gpu)  # some of its rows
+        yield distance.contrast_distances(adata, contrasts, multi_gpu=multi_gpu)
+        yield distance.pairwise(csc, groupby="group", multi_gpu=multi_gpu)  # converted by cuSPARSE
+
+    for multi_gpu in (False, True):
+        for got, expected in zip(results(1, multi_gpu), results(0, multi_gpu), strict=True):
+            pd.testing.assert_frame_equal(got, expected, check_exact=True)
+    assert cp.cuda.Device().id == 0
 
 
 def test_multi_gpu_invalid_device_id_list(small_adata: AnnData) -> None:
