@@ -793,6 +793,51 @@ def test_contrast_distances_two_split_by() -> None:
         )
 
 
+@pytest.mark.parametrize(("precision", "atol"), [("auto", 2e-5), ("float16", 5e-3)])
+def test_contrast_distances_centers_each_split(precision: str, atol: float) -> None:
+    """Splits far apart: each is centered on its own cells and gives the bits of a call on it alone."""
+    import cupyx.scipy.sparse as cpsp
+
+    rng = np.random.default_rng(0)
+    n = 30
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(np.tile(np.repeat(["ctrl", "drug"], n), 3)),
+            "celltype": pd.Categorical(np.repeat(list("xyz"), 2 * n)),
+        }
+    ).rename(str)
+    X = rng.normal(size=(6 * n, 12)).astype(np.float32)
+    X[(obs["treatment"] == "drug").to_numpy()] += 0.1  # a small effect
+    X += np.repeat(np.float32([0, 1e3, -3e3]), 2 * n)[:, None]  # of cell types thousands of spreads apart
+    contrasts = Distance.create_contrasts(
+        AnnData(X, obs=obs), groupby="treatment", selected_group="ctrl", split_by="celltype"
+    )
+
+    def cpu(celltype: str) -> float:
+        a, b = (
+            X[(obs["celltype"] == celltype).to_numpy() & (obs["treatment"] == t).to_numpy()] for t in ("drug", "ctrl")
+        )
+        within = lambda x: cdist(x, x).sum() / (len(x) * (len(x) - 1))
+        return 2 * cdist(a, b).mean() - within(a) - within(b)
+
+    expected = [cpu(celltype) for celltype in contrasts["celltype"]]
+    distance = Distance(metric="edistance", layer_key="X", precision=precision)
+    to_device = lambda sparse: lambda x: sparse(csr_matrix(x))  # CSR, and CSC that is converted once
+    for container in (np.asarray, csr_matrix, cp.asarray, to_device(cpsp.csr_matrix), to_device(cpsp.csc_matrix)):
+        adata = AnnData(container(X), obs=obs)
+        got = distance.contrast_distances(adata, contrasts)
+        alone = pd.concat([distance.contrast_distances(adata, contrasts[contrasts["celltype"] == c]) for c in "xyz"])
+        pd.testing.assert_frame_equal(got, alone.loc[got.index], check_exact=True)
+        np.testing.assert_allclose(got["edistance"], expected, atol=atol)
+    empty = distance.contrast_distances(adata, contrasts.iloc[:0])
+    assert len(empty) == 0 and empty["edistance"].dtype == np.float32
+    if precision == "float16":  # a cell beyond the float16 range of its combination: the error names the combination
+        X[-1] += 1e5
+        with pytest.raises(ValueError, match="float16 range") as error:
+            distance.contrast_distances(AnnData(X, obs=obs), contrasts)
+        assert "'celltype': 'z'" in error.value.__notes__[0]
+
+
 # ============================================================================
 # Bootstrap correctness tests
 # ============================================================================

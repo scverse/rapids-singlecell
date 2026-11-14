@@ -235,6 +235,20 @@ def _sort_indices(X):
     return X
 
 
+def _device_csr(embedding_raw):
+    """A (host or device) sparse matrix on GPU as CSR in float32 or float64."""
+    from rapids_singlecell.get._anndata import X_to_GPU
+
+    # cupyx CSR only stores float/complex/bool data, so cast unsupported dtypes
+    # (e.g. integer raw counts) to float32 BEFORE the GPU transfer. The kernel
+    # itself only has float32/float64 specializations.
+    if embedding_raw.dtype != (dtype := _float_dtype(embedding_raw.dtype)):
+        embedding_raw = embedding_raw.astype(dtype)
+
+    X = X_to_GPU(embedding_raw)
+    return X if cpsp.isspmatrix_csr(X) else X.tocsr()
+
+
 def _build_csr_source(embedding_raw, selector):
     """Move a (host or device) sparse matrix to GPU and subset its rows.
 
@@ -245,17 +259,7 @@ def _build_csr_source(embedding_raw, selector):
     duplicate entries stay. The ``has_sorted_indices`` and
     ``has_canonical_format`` flags a matrix has cached are trusted.
     """
-    from rapids_singlecell.get._anndata import X_to_GPU
-
-    # cupyx CSR only stores float/complex/bool data, so cast unsupported dtypes
-    # (e.g. integer raw counts) to float32 BEFORE the GPU transfer. The kernel
-    # itself only has float32/float64 specializations.
-    if embedding_raw.dtype != (dtype := _float_dtype(embedding_raw.dtype)):
-        embedding_raw = embedding_raw.astype(dtype)
-
-    X = X_to_GPU(embedding_raw)
-    if not cpsp.isspmatrix_csr(X):
-        X = X.tocsr()
+    X = _device_csr(embedding_raw)
     if selector is not None:
         rows = selector
         if getattr(rows, "dtype", None) == np.bool_:
@@ -634,7 +638,9 @@ class EDistanceMetric(BaseMetric):
             Annotated data matrix
         contrasts
             DataFrame with a groupby column (first), a ``reference``
-            column, and optional split columns.
+            column, and optional split columns. The cells of each
+            combination of the split columns are loaded and centered
+            on their own.
         multi_gpu
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
@@ -664,18 +670,39 @@ class EDistanceMetric(BaseMetric):
         ref_vals = contrasts["reference"].values
         split_arrays = [contrasts[col].values for col in split_by]
 
+        # One source per combination of the split columns: its cells are centered on their own
+        # mean, so a distance within it keeps its digits however far apart the combinations lie
+        rows: dict[tuple, list[int]] = {}  # the contrasts of each combination
+        for i in range(len(contrasts)):
+            rows.setdefault(tuple(arr[i] for arr in split_arrays), []).append(i)
+        if len(rows) > 1 and _is_sparse(embedding_raw):  # uploaded, cast or converted once, on a device matrix's GPU
+            with embedding_raw.data.device if cpsp.issparse(embedding_raw) else cp.cuda.Device():
+                embedding_raw = _device_csr(embedding_raw)
+        missing: list[tuple] = []
+        edistances = np.empty(len(contrasts), dtype=_float_dtype(embedding_raw.dtype))
+        for split_vals, idx in rows.items():
+            keys = [((target_vals[i], *split_vals), (ref_vals[i], *split_vals)) for i in idx]
+            try:
+                edistances[idx] = self._source_distances(embedding_raw, group_indices, keys, missing, device_ids)
+            except ValueError as error:  # e.g. cells beyond the float16 range: say whose
+                if split_by:
+                    error.add_note(f"Raised for the contrasts with {dict(zip(split_by, split_vals, strict=True))}.")
+                raise
+        if missing:
+            warnings.warn(
+                f"No cells found for {missing}; their contrasts are NaN.",
+                stacklevel=2,
+            )
+        result = contrasts.copy()
+        result["edistance"] = edistances
+        return result
+
+    def _source_distances(self, embedding_raw, group_indices, keys, missing, device_ids) -> np.ndarray:
+        """Energy distance per contrast (target key, reference key), one source; ``missing`` gets keys without cells."""
         cond_to_idx: dict[tuple, int] = {}
         contrast_pairs: list[tuple[int, int]] = []
 
-        for i in range(len(contrasts)):
-            if split_by:
-                split_vals = tuple(arr[i] for arr in split_arrays)
-                target_key = (target_vals[i], *split_vals)
-                ref_key = (ref_vals[i], *split_vals)
-            else:
-                target_key = (target_vals[i],)
-                ref_key = (ref_vals[i],)
-
+        for target_key, ref_key in keys:
             for key in (target_key, ref_key):
                 if key not in cond_to_idx:
                     cond_to_idx[key] = len(cond_to_idx)
@@ -684,18 +711,12 @@ class EDistanceMetric(BaseMetric):
         k = len(cond_to_idx)
         # Look up cell indices from the groupby
         group_cells: list[np.ndarray] = [None] * k  # type: ignore[list-item]
-        missing: list[tuple] = []
         for key, idx in cond_to_idx.items():
             lookup_key = key[0] if len(key) == 1 else key
             cell_idx = group_indices.get(lookup_key)
             if cell_idx is None:
                 missing.append(key)
             group_cells[idx] = cell_idx if cell_idx is not None else np.array([], dtype=np.intp)
-        if missing:
-            warnings.warn(
-                f"No cells found for {missing}; their contrasts are NaN.",
-                stacklevel=2,
-            )
         # Build cat_offsets and cell_indices, subsetting the embedding
         # to only the referenced cells for memory efficiency
         offsets = [0]
@@ -733,13 +754,6 @@ class EDistanceMetric(BaseMetric):
                 pair_to_flat[(idx_a, idx_a)] = len(pair_to_flat)
             if group_sizes_cpu[idx_b] >= 2 and (idx_b, idx_b) not in pair_to_flat:
                 pair_to_flat[(idx_b, idx_b)] = len(pair_to_flat)
-
-        n_pairs = len(pair_to_flat)
-
-        if n_pairs == 0:
-            result = contrasts.copy()
-            result["edistance"] = 0.0
-            return result
 
         pairs = sorted(pair_to_flat.keys(), key=lambda p: pair_to_flat[p])
         pair_left = cp.array([p[0] for p in pairs], dtype=cp.int32)
@@ -779,10 +793,7 @@ class EDistanceMetric(BaseMetric):
             diag_b = pair_to_flat.get((idx_b, idx_b))
             d_bb = flat_means_cpu[diag_b] if diag_b is not None else 0.0
             edistances[i] = 2 * d_cross - d_aa - d_bb
-
-        result = contrasts.copy()
-        result["edistance"] = edistances
-        return result
+        return edistances
 
     # Helper methods
 
