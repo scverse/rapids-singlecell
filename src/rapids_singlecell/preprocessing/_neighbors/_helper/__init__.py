@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from rapids_singlecell.preprocessing._neighbors import _Algorithms, _Metrics
 
 
+# cuVS trains 256 PQ codes on half of the rows, and 26.12 rejects fewer training rows than codes
+_IVF_PQ_MIN_ROWS = 512
+
+
 def _compute_nlist(N):
     base = math.sqrt(N)
     next_pow2 = 2 ** math.ceil(math.log2(base))

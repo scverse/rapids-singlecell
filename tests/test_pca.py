@@ -417,7 +417,8 @@ def test_mask_var_argument_equivalence(float_dtype, array_type):
 def test_mask_correctness():
     """Test masked PCA matches PCA on subset."""
     adata = sc.datasets.blobs(n_variables=10, n_centers=3, n_observations=100)
-    mask_var = np.random.choice([True, False], adata.shape[1])
+    # fixed: a random mask selects fewer than the 2 variables cuML needs for 1% of seeds
+    mask_var = np.arange(adata.shape[1]) % 2 == 0
 
     adata_masked = adata[:, mask_var].copy()
     rsc.pp.pca(adata, mask=mask_var)

@@ -192,6 +192,16 @@ def test_all_neighbors_inner_product(n_clusters):
     _calc_recall(distances, adata.obsp["distances"], tolerance=0.9)
 
 
+def test_all_neighbors_ivfpq_small_clusters_are_exact():
+    # clusters too small to train the PQ codebooks (cuVS >= 26.12 aborts): searched by brute force
+    adata = pbmc68k_reduced()
+    kwds = {"algo": "ivf_pq", "n_clusters": 4}
+    rsc.pp.neighbors(adata, n_pcs=50, n_neighbors=15, algorithm="all_neighbors", algorithm_kwds=kwds)
+    distances = adata.obsp["distances"].copy()
+    rsc.pp.neighbors(adata, n_pcs=50, n_neighbors=15, algorithm="brute")
+    assert (distances != adata.obsp["distances"]).nnz == 0
+
+
 @pytest.mark.parametrize("algo", ["mg_ivfflat", "mg_ivfpq"])
 def test_mg_bbknn(algo):
     if parse_version(cuvs.__version__) <= parse_version("25.08"):

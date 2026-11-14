@@ -105,6 +105,12 @@ def test_ridx_reproducible():
     assert cp.array_equal(idx1, idx2)
 
 
+def test_ridx_seed_zero_shuffles():
+    """seed=0 is a seed like any other, as in decoupler >= 2.3."""
+    idx = dc._method_waggr._ridx(times=5, nvar=10, seed=0)
+    assert not cp.array_equal(idx, cp.tile(cp.arange(10), (5, 1)))
+
+
 def test_custom_callable(mat, adjmat):
     """Test waggr with a custom callable function."""
 

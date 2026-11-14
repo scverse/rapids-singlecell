@@ -86,18 +86,19 @@ docs = [
 test-minimal = [
   "anyio",
   "bbknn",
-  "decoupler",
+  "decoupler>=2.3.1",
   "fast-array-utils",
   # beta without a numpy cap: uv backtracks into it and pairs it with numpy 2.5,
   # which numba-cuda (still imported by cudf) can't import against
   "numba!=0.63.0b1",
   "pooch",
   "profimp",
-  "pytest",
+  "pytest>=9",
   "pytest-cov",
   "pytest-rerunfailures",
   "pytest-timeout",
   "scanpy>=1.10",
+  "scikit-learn>=1.9.1",
 ]
 typecheck = [
   "cupy-stubs",
@@ -356,6 +357,9 @@ ini_options.markers = [
   "array_api: unused, registered because anndata.tests.helpers uses it",
   "gpu: unused, registered because anndata.tests.helpers uses it",
 ]
+# a hang in native code holds the GIL, so pytest-timeout cannot fire; this watchdog thread can
+ini_options.faulthandler_timeout = 600
+ini_options.faulthandler_exit_on_timeout = true
 
 [tool.coverage]
 run.source_pkgs = [ "rapids_singlecell" ]
