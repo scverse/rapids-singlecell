@@ -279,6 +279,8 @@ def test_nn_descent_invalid_ids_raise(monkeypatch):
     adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
     with pytest.raises(ValueError, match="incomplete or invalid"):
         neighbors(adata, n_neighbors=5, algorithm="nn_descent")
+
+
 @pytest.mark.parametrize("algo", ["ivfpq", "mg_ivfpq"])
 def test_ivfpq_small_index_is_exact(algo):
     # too few cells to train the PQ codebooks (cuVS >= 26.12 refuses): searched by brute force
