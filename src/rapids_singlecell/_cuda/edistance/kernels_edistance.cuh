@@ -24,6 +24,9 @@ static constexpr int WARP_SIZE = 32;
 // x -> M::cvt(x, sc, nm[col]) with nm = -mu * sc. Their norms come from the
 // same loader and policy on the same rows (the diagonal of A A^T), so
 // duplicate cells are exactly 0 apart and dense input matches CSR bit for bit.
+// The cells come in splits, each with a center of its own (a row of nm and
+// one sc): split s owns the cells at positions slots[s] up to slots[s + 1]
+// of cell_indices, the last split the rest; a pair lies within one split.
 // ---------------------------------------------------------------------------
 #ifdef __CUDA_ARCH__
 #define ED_ARCH __CUDA_ARCH__
@@ -34,6 +37,20 @@ static constexpr int WARP_SIZE = 32;
 // 8 rows 144 B apart hit distinct 16-byte bank groups (ldmatrix, LDS.128)
 static constexpr int ED_THREADS = 256, ED_TB = 128, ED_WB = 128,
                      ED_PITCH = ED_WB + 16;
+
+// The last i in [lo, hi] with offsets[i] <= x, of ascending offsets
+__device__ inline int edistance_last(const int* __restrict__ offsets, int lo,
+                                     int hi, int x) {
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (offsets[mid] <= x) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
 
 // Larger group becomes A (split across the pair's blocks); smaller becomes B
 // (tiled into shared memory and kept hot in L2 across A tiles).
@@ -329,8 +346,12 @@ struct EdDenseRows {
     long long ldx;  // row stride (elements)
     int d, align;   // columns; alignment (bytes) shared by X and its row stride
     using W = std::common_type_t<In, typename M::Acc>;
-    const W* nm;  // -mu * sc per column
+    const W* nm;   // -mu * sc per column, a row of d per split
+    const W* scs;  // sc per split
     W sc;
+    __device__ void split(int s) {  // the rows loaded next are those of split s
+        nm += (size_t)s * d, sc = scs[s];
+    }
     __device__ void load(unsigned char* s, int p, const int* rows, int r0,
                          int nr, int w) {
         constexpr int NE = 16 / sizeof(E), CH = ED_WB / 16;
@@ -388,11 +409,17 @@ struct EdCsrRows {
     const int* indices;
     const IndptrT* indptr;
     using W = std::common_type_t<In, typename M::Acc>;
-    const W* nm;
-    W sc;
+    const W* nm;        // a row of width columns per split
+    const W* scs;       // sc per split
     const uint4* zero;  // M::cvt(0, sc, nm[col]) per column, zeros past d
+    int width;          // columns of a row of nm and zero: whole windows
     bool duplicates;    // not canonical: a column may have several entries
+    W sc;
     IndptrT cur, end;
+    __device__ void split(int s) {
+        nm += (size_t)s * width, sc = scs[s];
+        zero += (size_t)s * width * sizeof(E) / 16;
+    }
     __device__ void load(unsigned char* s, int p, const int* rows, int r0,
                          int nr, int w) {
         constexpr int KW = ED_WB / sizeof(E);
@@ -447,7 +474,8 @@ __device__ __forceinline__ void edistance_tile(typename M::Frag& f, L& l,
 // first block of pair p (prefix sums of per-pair block counts).
 template <class M, class L>
 __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
-    edistance_kernel(const L ld, const typename M::Acc* __restrict__ norms,
+    edistance_kernel(const L ld, const int* __restrict__ slots, int n_splits,
+                     const typename M::Acc* __restrict__ norms,
                      const int* __restrict__ cat_offsets,
                      const int* __restrict__ cell_indices,
                      const int* __restrict__ pair_left,
@@ -464,15 +492,8 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
 
         const int b = blockIdx.x, extra = block_offsets[num_pairs] - num_pairs;
         // the last pair whose first block is <= b
-        int pair_id = max(0, b - extra);
-        for (int hi = min(b, num_pairs - 1); pair_id < hi;) {
-            const int mid = (pair_id + hi + 1) >> 1;
-            if (block_offsets[mid] <= (int)blockIdx.x) {
-                pair_id = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
+        const int pair_id = edistance_last(block_offsets, max(0, b - extra),
+                                           min(b, num_pairs - 1), b);
         const int block_in_pair = blockIdx.x - block_offsets[pair_id];
         const int blocks_per_pair =
             block_offsets[pair_id + 1] - block_offsets[pair_id];
@@ -483,7 +504,9 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
         const int pa = a_resident ? (kp + KW - 1) / KW * ED_WB + 16 : ED_PITCH;
         unsigned char* sA = smem;
         unsigned char* sB = smem + TA * pa;
+        // centered as the split of the A cells (any, for a pair without cells)
         L l = ld;
+        l.split(edistance_last(slots, 0, n_splits - 1, t.start_a));
         typename M::Frag f;
         EDistanceKahan<T> sum[4];  // a tile adds one partial sum per chain
 
@@ -533,39 +556,52 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
     }
 }
 
-// Norms of the n rows: block b loads rows [TA b, TA b + TA) as A rows and
-// again as B rows and keeps the diagonal of A A^T.
+// Norms of n cells, each centered as its split: norms[row] of row rows[p] for
+// the cell at position p (null: row p). Block b takes the cells at
+// [TA b, TA b + TA) one split at a time, loads them as A rows and again as B
+// rows and keeps the diagonal of A A^T.
 template <class M, class L>
 __global__ void __launch_bounds__(ED_THREADS, 1)
-    edistance_norms_kernel(const L ld, int n, int kp,
-                           typename M::Acc* __restrict__ norms) {
+    edistance_norms_kernel(const L ld, const int* __restrict__ rows,
+                           const int* __restrict__ slots, int n_splits, int n,
+                           int kp, typename M::Acc* __restrict__ norms) {
     if constexpr (M::ok) {
         constexpr int TA = M::TA;
         extern __shared__ __align__(16) unsigned char smem[];
         __shared__ int s_rows[TA + ED_TB];
-        const int p0 = blockIdx.x * TA, m = min(TA, n - p0);
-        if (threadIdx.x < TA + ED_TB)
-            s_rows[threadIdx.x] = p0 + min((int)threadIdx.x % TA, m - 1);
-        __syncthreads();
-        L l = ld;
-        typename M::Frag f;
-        edistance_tile<M>(f, l, smem, ED_PITCH, smem + TA * ED_PITCH, s_rows,
-                          kp, false, m, m);
-        M::each(f, [&](int i, int j, int, typename M::Acc v) {
-            if (i == j && i < m) norms[p0 + i] = v;
-        });
+        const int b0 = blockIdx.x * TA, end = b0 + min(TA, n - b0);
+        for (int p0 = b0, m; p0 < end; p0 += m) {
+            const int s = edistance_last(slots, 0, n_splits - 1, p0);
+            m = (s + 1 < n_splits ? min(end, slots[s + 1]) : end) - p0;
+            __syncthreads();  // the previous split's norms are written
+            if (threadIdx.x < TA + ED_TB) {
+                const int p = p0 + min((int)threadIdx.x % TA, m - 1);
+                s_rows[threadIdx.x] = rows ? rows[p] : p;
+            }
+            __syncthreads();
+            L l = ld;
+            l.split(s);
+            typename M::Frag f;
+            edistance_tile<M>(f, l, smem, ED_PITCH, smem + TA * ED_PITCH,
+                              s_rows, kp, false, m, m);
+            M::each(f, [&](int i, int j, int, typename M::Acc v) {
+                if (i == j && i < m) norms[s_rows[i]] = v;
+            });
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Center and scale (_center in _edistance.py) from every step-th row, read in
-// place: a thread reduces one window of cw = R::CW columns of sampled row i.
+// Center and scale (_center in _edistance.py) of every split from a strided
+// sample of its rows, read in place: a thread reduces one window of
+// cw = R::CW columns of sampled row i.
 //   pass 0: out[i] = the row's largest |x|, compared as bit patterns (a NaN
 //           of either sign ranks last)
-//   pass 1: over the kept rows (finite values): sums[c] += rint(ldexp(x,
-//           shift)), integers, exact in float64 in any order; ext[c] and
-//           ext[d + c] = the largest key of x and of -x in column c
-// The largest |x - mu[c]| of the kept rows is pass 0 over EdCenterReach.
+//   trim:   out[i] = whether the row is kept (edistance_trim_kernel)
+//   pass 1: over the kept rows (finite values) of split s: sums[s][c] +=
+//           rint(ldexp(x, shift[s])), integers, exact in float64 in any order
+//   pass 2: top[s] = the largest |x - mu| of the kept rows, with sums[s][c]
+//           (by then the mean) as mu in the type of x
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ unsigned int edistance_bits(float x) {
@@ -573,21 +609,6 @@ __device__ __forceinline__ unsigned int edistance_bits(float x) {
 }
 __device__ __forceinline__ unsigned long long edistance_bits(double x) {
     return __double_as_longlong(x);
-}
-
-// A key orders the non-NaN values as unsigned integers above 0 (-0.0 below
-// +0.0), and ~key(x) is key(-x); edistance_unkey gives the value back.
-template <typename In>
-__device__ __forceinline__ auto edistance_key(In x) {
-    const auto b = edistance_bits(x);
-    const auto sign = decltype(b)(1) << (8 * sizeof(b) - 1);
-    return b & sign ? ~b : b | sign;
-}
-__device__ __forceinline__ float edistance_unkey(unsigned int k) {
-    return __uint_as_float(k >> 31 ? k ^ 1u << 31 : ~k);
-}
-__device__ __forceinline__ double edistance_unkey(unsigned long long k) {
-    return __longlong_as_double(k >> 63 ? k ^ 1ull << 63 : ~k);
 }
 
 template <typename In>
@@ -628,53 +649,95 @@ struct EdCenterCsr {
     }
 };
 
-// The largest (row 0) and smallest (row 1) kept value of each column from the
-// keys of pass 1, less mu: rounding is monotone, so a column's largest
-// |x - mu[c]| is at one of the two.
-template <typename In>
-struct EdCenterReach {
-    static constexpr int CW = 64;
-    const In* ext;
-    const In* mu;
-    long long d;
-    __device__ void fill(In* win, long long row, int c0, int nw) const {
-        for (int c = 0; c < nw; ++c) {
-            const In x = edistance_unkey(edistance_bits(ext[row * d + c0 + c]));
-            win[c] = (row ? -x : x) - mu[c0 + c];
-        }
-    }
-};
-
+// sample holds first, slots and step of the n splits, n + 1 values each:
+// sampled row i is cell slots[s] + (i - first[s]) * step[s] of split s, the
+// last one with first[s] <= i.
 template <typename In, class R>
-__global__ void edistance_center_kernel(const R rd, long long step, int m,
-                                        int d, int cw, int pass, int shift,
-                                        const bool* __restrict__ keep,
-                                        In* __restrict__ ext,
-                                        In* __restrict__ out,
-                                        double* __restrict__ sums) {
-    const unsigned u = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void edistance_center_kernel(
+    const R rd, const int* __restrict__ sample, int n, int m, int d, int cw,
+    int pass, const int* __restrict__ shift, In* __restrict__ out,
+    double* __restrict__ sums, In* __restrict__ top) {
+    const long long u = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const int i = u % m;
-    const long long c0 = (long long)(u / m) * cw;
-    if (c0 >= d || (pass && !keep[i])) return;
+    const long long c0 = u / m * cw;
+    if (c0 >= d || (pass && !out[i])) return;
     const int nw = min((long long)cw, d - c0);
+    const int* slots = sample + n + 1;
+    const int s = edistance_last(sample, 0, n - 1, i);
     In win[R::CW];
-    rd.fill(win, i * step, (int)c0, nw);
-    auto top = edistance_bits(In(0));
-    auto* keys = reinterpret_cast<decltype(top)*>(ext) + c0;
+    rd.fill(win, slots[s] + (long long)(i - sample[s]) * slots[n + 1 + s],
+            (int)c0, nw);
+    sums += (long long)s * d + c0;
+    auto big = edistance_bits(In(0));
     // the threads of a warp (rows i, i + 1, ...) start at different columns, so
     // they do not add to one sum at a time
     for (int k = 0, c = i % nw; k < nw; ++k, c = c + 1 < nw ? c + 1 : 0) {
-        if (pass) {
-            const In q = rint(ldexp(win[c], shift));
-            if (q != 0) atomicAdd(sums + c0 + c, (double)q);
-            // a plain read first: only a key above the stored one issues an
-            // atomic
-            const auto up = edistance_key(win[c]), down = ~up;
-            if (up > keys[c]) atomicMax(keys + c, up);
-            if (down > keys[d + c]) atomicMax(keys + d + c, down);
+        if (pass == 1) {
+            const In q = rint(ldexp(win[c], shift[s]));
+            if (q != 0) atomicAdd(sums + c, (double)q);
         } else {
-            top = max(top, edistance_bits(fabs(win[c])));
+            const In x = pass ? win[c] - In(sums[c]) : win[c];
+            big = max(big, edistance_bits(fabs(x)));
         }
     }
-    if (!pass) atomicMax(reinterpret_cast<decltype(top)*>(out) + i, top);
+    // a plain read first: only a value above the stored one issues an atomic
+    auto* to = reinterpret_cast<decltype(big)*>(pass ? top + s : out + i);
+    if (pass != 1 && big > *to) atomicMax(to, big);
+}
+
+// The outlier rows of the sample: block s keeps the rows of split s, out[i]
+// for i from first[s] up to first[s + 1] (their largest |x| from pass 0), that
+// are finite and at most trim times the median of those in (0, inf) -
+// NumPy's, the mean of the two middle ones of an even number. out[i] becomes
+// 1 for a kept row and 0 for another, kept[s] the number of kept rows and
+// top[s] their largest |x|.
+template <typename In>
+__global__ void edistance_trim_kernel(const int* __restrict__ first, In trim,
+                                      In* __restrict__ out,
+                                      int* __restrict__ kept,
+                                      In* __restrict__ top) {
+    using K = decltype(edistance_bits(In(0)));
+    const int s = blockIdx.x, m = first[s + 1] - first[s];
+    K* key = reinterpret_cast<K*>(out) + first[s];
+    const K inf = edistance_bits(In(INFINITY));
+    __shared__ int count;
+    // how many of the values in (0, inf) lie below bound
+    auto below = [&](K bound) {
+        if (threadIdx.x == 0) count = 0;
+        __syncthreads();
+        int c = 0;
+        for (int i = threadIdx.x; i < m; i += blockDim.x)
+            c += key[i] > 0 && key[i] < inf && key[i] < bound;
+        atomicAdd(&count, c);
+        __syncthreads();
+        c = count;
+        __syncthreads();
+        return c;
+    };
+    // the r-th smallest of them: the largest value with at most r below it
+    auto nth = [&](int r) {
+        K v = 0;
+        for (K bit = K(1) << (8 * sizeof(K) - 2); bit; bit >>= 1)
+            if (below(v | bit) <= r) v |= bit;
+        return *reinterpret_cast<const In*>(&v);
+    };
+    const int n = below(inf);
+    In med = 0;
+    if (n) {
+        med = nth((n - 1) / 2);
+        if (n % 2 == 0) med = (med + nth(n / 2)) / 2;
+    }
+    int c = 0;
+    K big = 0;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        const K k = key[i];
+        const bool keep =
+            k < inf && *reinterpret_cast<const In*>(&k) / trim <= med;
+        if (keep) ++c, big = max(big, k);
+        out[first[s] + i] = keep;
+    }
+    if (c) {
+        atomicAdd(kept + s, c);
+        atomicMax(reinterpret_cast<K*>(top) + s, big);
+    }
 }
