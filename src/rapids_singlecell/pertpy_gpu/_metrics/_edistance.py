@@ -38,6 +38,7 @@ _TILE_B = 128  # B-tile rows
 _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
+_CENTER_VALUES = 1 << 22  # values of the centers of a source (a row per split) that holds more than one split, at most
 _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
 _CAST_VALUES = 1 << 24  # values of cast two-array input held in float32 or float64 at a time, at most
 
@@ -116,6 +117,7 @@ def _center(X, precision: str, slots, rows=None) -> tuple[cp.ndarray, np.ndarray
     nm = mu.astype(dtype, copy=False).astype(work, copy=False)  # -mu * sc in place, with +0.0 for a zero mean
     nm *= cp.asarray(sc, dtype=work)[:, None]
     cp.subtract(0.0, nm, out=nm)
+    total = mu = None  # the float64 sums are not held while nm is snapped
     if precision == "float16":  # a zero then centers to an exact float16
         snap = nm.astype(np.float32).astype(np.float16)
         nm = cp.where(cp.isfinite(snap), snap.astype(nm.dtype), nm)
@@ -133,9 +135,10 @@ class _Source:
     :func:`_center`, a row and a value per split: split ``s`` is the cells at
     positions ``slots[s]`` up to ``slots[s + 1]`` of the cell indices of a
     launch, and the groups of a pair lie in one split. ``rows`` lists the rows
-    a call reads of dense rows loaded whole: only these have norms. The copies
-    and row norms on each device depend only on the cells, so they are
-    computed once and reused by every launch (e.g. each bootstrap iteration).
+    the source reads of dense rows loaded whole: only these have norms. The
+    copies and row norms on each device depend only on the cells, so they are
+    computed once and reused by every launch (e.g. each bootstrap iteration);
+    sources that read the same arrays share ``copies``.
     """
 
     arrays: tuple[cp.ndarray, ...]
@@ -146,6 +149,7 @@ class _Source:
     slots: np.ndarray
     duplicates: bool = False
     rows: cp.ndarray | None = None
+    copies: dict[int, tuple] = field(default_factory=dict)
     _devices: dict[int, tuple] = field(default_factory=dict)
 
     @property
@@ -156,11 +160,13 @@ class _Source:
         """Copy the cells to a device and compute their row norms there, once."""
         if device_id in self._devices:
             return
-        fn, _, step, acc, elem = _MATH[self.precision]
+        fn, tile_a, step, acc, elem = _MATH[self.precision]
         n, d = self.shape
         kp = -(-d // step) * step
         with cp.cuda.Device(device_id):
-            arrays = tuple(_copy_to_device(a, device_id) for a in self.arrays)
+            if device_id not in self.copies:
+                self.copies[device_id] = tuple(_copy_to_device(a, device_id) for a in self.arrays)
+            arrays = self.copies[device_id]
             nm = _copy_to_device(self.nm, device_id)
             sc, slots = cp.asarray(self.sc, dtype=nm.dtype), cp.asarray(self.slots, dtype=cp.int32)
             rows = None if self.rows is None else _copy_to_device(self.rows, device_id)
@@ -172,8 +178,11 @@ class _Source:
                 zero = zero.view(cp.uint16) if elem is np.float16 else zero
                 args = (*arrays, nm, sc, zero, self.duplicates, slots, kp)
             norms, unused = cp.full(n, -1, dtype=acc), cp.zeros(1, dtype=cp.int32)
+            # A block takes the cells of one tile of a split: blocks[s] is the first block of split s
+            blocks = np.concatenate([[0], np.cumsum(-(-np.diff(self.slots) // tile_a))])
+            tiles = (norms, unused, rows, unused, unused, cp.asarray(blocks, dtype=cp.int32), int(blocks[-1]))
             stream = cp.cuda.get_current_stream()
-            fn(*args, norms, unused, rows, *[unused] * 3, 0, cp.zeros(1), norms_only=True, stream=stream.ptr)
+            fn(*args, *tiles, cp.zeros(1), norms_only=True, stream=stream.ptr)
             stream.synchronize()
             # The norm of a cell the call reads is still -1: the kernels did not run
             if self.precision == "float16" and self.slots[-1] and float(norms[0 if rows is None else rows[0]]) < 0:
@@ -286,7 +295,7 @@ def _materialize_source(embedding_raw, selector, precision: str, rows=None, slot
     """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or sorted CSR (sparse).
 
     ``selector`` is a boolean mask, an integer row-index array, or ``None``;
-    ``rows`` are the rows a call reads of a dense array it loads whole.
+    ``rows`` are the rows the source reads of a dense array loaded whole.
     ``slots[s]`` is the position of the first cell of split ``s`` among the
     cells read and ``slots[-1]`` their number; without ``slots`` they are one
     split. A sparse device matrix on another GPU than the current one is
@@ -730,21 +739,8 @@ class EDistanceMetric(BaseMetric):
 
         cat_offsets = cp.array(offsets, dtype=cp.int32)
         original_indices = np.concatenate(all_cell_idx)
-        slots = np.array(offsets)[[*first, k]]  # the cells of a combination: positions slots[s] up to slots[s + 1]
-
-        # Subset the referenced cells. For sparse input always row-subset into
-        # CSR (the kernel densifies on the fly); for dense input subset when fewer
-        # than 70 % of the cells are used, else load the whole array and read the
-        # used cells through cell_indices.
-        if _is_sparse(embedding_raw):
-            embedding = _materialize_source(embedding_raw, original_indices, self.precision, None, slots)
-            cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
-        elif len(original_indices) < int(len(embedding_raw) * 0.7):
-            embedding = _materialize_source(embedding_raw, original_indices, self.precision, None, slots)
-            cell_indices = cp.arange(len(original_indices), dtype=cp.int32)
-        else:
-            cell_indices = cp.array(original_indices, dtype=cp.int32)
-            embedding = _materialize_source(embedding_raw, None, self.precision, cell_indices, slots)
+        first.append(k)
+        slots = np.array(offsets)[first]  # the cells of a combination: positions slots[s] up to slots[s + 1]
 
         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
         group_sizes_cpu = group_sizes.get()
@@ -760,23 +756,57 @@ class EDistanceMetric(BaseMetric):
                 pair_to_flat[(idx_b, idx_b)] = len(pair_to_flat)
 
         pairs = sorted(pair_to_flat.keys(), key=lambda p: pair_to_flat[p])
-        pair_left = cp.array([p[0] for p in pairs], dtype=cp.int32)
+        left = np.array([p[0] for p in pairs], dtype=np.int32)
+        pair_left = cp.asarray(left)
         pair_right = cp.array([p[1] for p in pairs], dtype=cp.int32)
+        # The pairs of a combination: ends[s] up to ends[s + 1] (its groups are first[s] up to first[s + 1])
+        ends = np.searchsorted(left, first)
 
-        try:
-            flat_sums = self._launch_distance_kernel(
-                embedding,
-                cat_offsets,
-                cell_indices,
-                pair_left=pair_left,
-                pair_right=pair_right,
-                device_ids=device_ids,
-            )
-        except ValueError as error:  # cells beyond the float16 range: say whose
-            if split_by and hasattr(error, "cell"):
-                split_vals = list(rows)[np.searchsorted(slots, error.cell, side="right") - 1]
-                error.add_note(f"Raised for the contrasts with {dict(zip(split_by, split_vals, strict=True))}.")
-            raise
+        # Subset the referenced cells. For sparse input always row-subset into
+        # CSR (the kernel densifies on the fly); for dense input subset when fewer
+        # than 70 % of the cells are used, else load the whole array and read the
+        # used cells through cell_indices.
+        in_place = not _is_sparse(embedding_raw) and len(original_indices) >= int(len(embedding_raw) * 0.7)
+        # A source holds a center per combination: with many combinations of many features the call takes several
+        # sources in turn, of step combinations each. An array read in place and a sparse matrix are loaded once.
+        step = max(1, _CENTER_VALUES // max(embedding_raw.shape[1], 1))
+        if in_place:
+            embedding_raw = _rows(embedding_raw)
+        elif len(rows) > step and _is_sparse(embedding_raw):  # uploaded, cast or converted once
+            with embedding_raw.data.device if cpsp.issparse(embedding_raw) else cp.cuda.Device():
+                embedding_raw = _device_csr(embedding_raw)
+        copies: dict[int, tuple] = {}  # of an array read in place, per device
+        flat_sums = []
+        for a in range(0, len(rows), step):
+            embedding = cell_indices = None  # the last source is released before the next one is loaded
+            b = min(a + step, len(rows))
+            lo, cells = int(slots[a]), original_indices[slots[a] : slots[b]]
+            if in_place:
+                cell_indices = cp.array(cells, dtype=cp.int32)
+                embedding = _materialize_source(
+                    embedding_raw, None, self.precision, cell_indices, slots[a : b + 1] - lo
+                )
+                embedding.copies = copies
+            else:
+                embedding = _materialize_source(embedding_raw, cells, self.precision, None, slots[a : b + 1] - lo)
+                cell_indices = cp.arange(len(cells), dtype=cp.int32)
+            try:
+                flat_sums.append(
+                    self._launch_distance_kernel(
+                        embedding,
+                        cat_offsets[first[a] : first[b] + 1] - lo,
+                        cell_indices,
+                        pair_left=pair_left[ends[a] : ends[b]] - first[a],
+                        pair_right=pair_right[ends[a] : ends[b]] - first[a],
+                        device_ids=device_ids,
+                    )
+                )
+            except ValueError as error:  # cells beyond the float16 range: say whose
+                if split_by and hasattr(error, "cell"):
+                    split_vals = list(rows)[np.searchsorted(slots, lo + error.cell, side="right") - 1]
+                    error.add_note(f"Raised for the contrasts with {dict(zip(split_by, split_vals, strict=True))}.")
+                raise
+        flat_sums = cp.concatenate(flat_sums)
 
         # Vectorized normalization
         is_diag = pair_left == pair_right

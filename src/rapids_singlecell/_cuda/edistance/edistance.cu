@@ -60,31 +60,27 @@ static EdPlan plan(int kp) {
         std::uintptr_t stream
 
 // norms_only: norms[row] of the rows cell_indices lists, of every row without
-// it. Otherwise the pair sums of one chunk of pairs on
-// grid = block_offsets[num_pairs] blocks. slots are the first cells of the
-// splits, one per row of nm.
+// it, on grid = block_offsets[splits] blocks. Otherwise the pair sums of one
+// chunk of pairs on grid = block_offsets[num_pairs] blocks. slots are the
+// first cells of the splits (one per row of nm) and the number of cells.
 template <class M, class L, typename Device>
 static void launch(const L& ld, size_t centers, ED_LAUNCH_ARGS) {
-    constexpr int TA = M::TA;
-    nb_require(centers > 0 && slots.size() >= centers,
+    nb_require(centers > 0 && slots.size() == centers + 1,
                "edistance: nm, sc and slots do not match");
     const int n_splits = static_cast<int>(centers);
     const EdPlan p = plan<M>(kp);
     const auto s = reinterpret_cast<cudaStream_t>(stream);
+    if (grid == 0) return;
     if (norms_only) {
-        const bool listed = cell_indices.is_valid();
-        const int n =
-            static_cast<int>(listed ? cell_indices.size() : norms.size());
-        if (n == 0) return;
+        nb_require(block_offsets.size() == centers + 1,
+                   "edistance: block_offsets and slots do not match");
         set_smem(edistance_norms_kernel<M, L>, p.streamed);
-        edistance_norms_kernel<M, L>
-            <<<(n + TA - 1) / TA, ED_THREADS, p.streamed, s>>>(
-                ld, listed ? cell_indices.data() : nullptr, slots.data(),
-                n_splits, n, kp, norms.data());
+        edistance_norms_kernel<M, L><<<grid, ED_THREADS, p.streamed, s>>>(
+            ld, cell_indices.is_valid() ? cell_indices.data() : nullptr,
+            slots.data(), block_offsets.data(), n_splits, kp, norms.data());
         CUDA_CHECK_LAST_ERROR(edistance_norms_kernel);
         return;
     }
-    if (grid == 0) return;
     set_smem(edistance_kernel<M, L>, p.smem);
     edistance_kernel<M, L><<<grid, ED_THREADS, p.smem, s>>>(
         ld, slots.data(), n_splits, norms.data(), cat_offsets.data(),

@@ -794,9 +794,11 @@ def test_contrast_distances_two_split_by() -> None:
 
 
 @pytest.mark.parametrize(("precision", "atol"), [("auto", 2e-5), ("float16", 5e-3)])
-def test_contrast_distances_centers_each_split(precision: str, atol: float) -> None:
+def test_contrast_distances_centers_each_split(precision: str, atol: float, monkeypatch) -> None:
     """Splits far apart: each is centered on its own cells and gives the bits of a call on it alone."""
     import cupyx.scipy.sparse as cpsp
+
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
 
     rng = np.random.default_rng(0)
     n = 30
@@ -829,13 +831,21 @@ def test_contrast_distances_centers_each_split(precision: str, atol: float) -> N
         alone = pd.concat([distance.contrast_distances(adata, contrasts[contrasts["celltype"] == c]) for c in "xyz"])
         pd.testing.assert_frame_equal(got, alone.loc[got.index], check_exact=True)
         np.testing.assert_allclose(got["edistance"], expected, atol=atol)
+        # Several sources: x and y then z of an array read whole, x then y of gathered rows
+        for per_source, part in ((2, contrasts), (1, contrasts[contrasts["celltype"] != "z"])):
+            with monkeypatch.context() as patch:
+                patch.setattr(_edistance, "_CENTER_VALUES", per_source * X.shape[1])
+                again = distance.contrast_distances(adata, part)
+            pd.testing.assert_frame_equal(again, got.loc[part.index], check_exact=True)
     empty = distance.contrast_distances(adata, contrasts.iloc[:0])
     assert len(empty) == 0 and empty["edistance"].dtype == np.float32
     if precision == "float16":  # a cell beyond the float16 range of its combination: the error names the combination
         X[-1] += 1e5
-        with pytest.raises(ValueError, match="float16 range") as error:
-            distance.contrast_distances(AnnData(X, obs=obs), contrasts)
-        assert "'celltype': 'z'" in error.value.__notes__[0]
+        for values in (_edistance._CENTER_VALUES, 2 * X.shape[1]):  # z in the only source, and in the second one
+            monkeypatch.setattr(_edistance, "_CENTER_VALUES", values)
+            with pytest.raises(ValueError, match="float16 range") as error:
+                distance.contrast_distances(AnnData(X, obs=obs), contrasts)
+            assert "'celltype': 'z'" in error.value.__notes__[0]
 
 
 # ============================================================================

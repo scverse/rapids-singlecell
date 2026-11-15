@@ -556,38 +556,37 @@ __global__ void __launch_bounds__(ED_THREADS, M::min_blocks)
     }
 }
 
-// Norms of n cells, each centered as its split: norms[row] of row rows[p] for
-// the cell at position p (null: row p). Block b takes the cells at
-// [TA b, TA b + TA) one split at a time, loads them as A rows and again as B
-// rows and keeps the diagonal of A A^T.
+// Norms of the cells of the splits, each centered as its split: norms[row] of
+// row rows[p] for the cell at position p (null: row p). block_offsets[s] is
+// the first block of split s: a block loads TA of its cells as A rows and
+// again as B rows and keeps the diagonal of A A^T.
 template <class M, class L>
 __global__ void __launch_bounds__(ED_THREADS, 1)
     edistance_norms_kernel(const L ld, const int* __restrict__ rows,
-                           const int* __restrict__ slots, int n_splits, int n,
+                           const int* __restrict__ slots,
+                           const int* __restrict__ block_offsets, int n_splits,
                            int kp, typename M::Acc* __restrict__ norms) {
     if constexpr (M::ok) {
         constexpr int TA = M::TA;
         extern __shared__ __align__(16) unsigned char smem[];
         __shared__ int s_rows[TA + ED_TB];
-        const int b0 = blockIdx.x * TA, end = b0 + min(TA, n - b0);
-        for (int p0 = b0, m; p0 < end; p0 += m) {
-            const int s = edistance_last(slots, 0, n_splits - 1, p0);
-            m = (s + 1 < n_splits ? min(end, slots[s + 1]) : end) - p0;
-            __syncthreads();  // the previous split's norms are written
-            if (threadIdx.x < TA + ED_TB) {
-                const int p = p0 + min((int)threadIdx.x % TA, m - 1);
-                s_rows[threadIdx.x] = rows ? rows[p] : p;
-            }
-            __syncthreads();
-            L l = ld;
-            l.split(s);
-            typename M::Frag f;
-            edistance_tile<M>(f, l, smem, ED_PITCH, smem + TA * ED_PITCH,
-                              s_rows, kp, false, m, m);
-            M::each(f, [&](int i, int j, int, typename M::Acc v) {
-                if (i == j && i < m) norms[s_rows[i]] = v;
-            });
+        const int b = blockIdx.x;
+        const int s = edistance_last(block_offsets, 0, n_splits - 1, b);
+        const int p0 = slots[s] + (b - block_offsets[s]) * TA;
+        const int m = min(TA, slots[s + 1] - p0);
+        if (threadIdx.x < TA + ED_TB) {
+            const int p = p0 + min((int)threadIdx.x % TA, m - 1);
+            s_rows[threadIdx.x] = rows ? rows[p] : p;
         }
+        __syncthreads();
+        L l = ld;
+        l.split(s);
+        typename M::Frag f;
+        edistance_tile<M>(f, l, smem, ED_PITCH, smem + TA * ED_PITCH, s_rows,
+                          kp, false, m, m);
+        M::each(f, [&](int i, int j, int, typename M::Acc v) {
+            if (i == j && i < m) norms[s_rows[i]] = v;
+        });
     }
 }
 
