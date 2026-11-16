@@ -38,7 +38,7 @@ _TILE_B = 128  # B-tile rows
 _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
 _BLOCKS_PER_SM = 64  # blocks per multiprocessor a launch aims for
 _SAMPLE_ROWS = 1 << 14  # rows the center is estimated from
-_CENTER_VALUES = 1 << 22  # values of the centers of a source (a row per split) that holds more than one split, at most
+_CENTER_VALUES = 1 << 22  # values of the centers of a source of several splits (a row each), at most; more if sparse
 _TRIM = 16.0  # sampled rows whose largest |value| is more than this many times the median row's are left out
 _CAST_VALUES = 1 << 24  # values of cast two-array input held in float32 or float64 at a time, at most
 
@@ -769,12 +769,19 @@ class EDistanceMetric(BaseMetric):
         in_place = not _is_sparse(embedding_raw) and len(original_indices) >= int(len(embedding_raw) * 0.7)
         # A source holds a center per combination: with many combinations of many features the call takes several
         # sources in turn, of step combinations each. An array read in place and a sparse matrix are loaded once.
-        step = max(1, _CENTER_VALUES // max(embedding_raw.shape[1], 1))
+        values, d = _CENTER_VALUES, max(embedding_raw.shape[1], 1)
         if in_place:
             embedding_raw = _rows(embedding_raw)
-        elif len(rows) > step and _is_sparse(embedding_raw):  # uploaded, cast or converted once
+        elif _is_sparse(embedding_raw) and len(rows) * d > values:  # uploaded, cast or converted once
             with embedding_raw.data.device if cpsp.issparse(embedding_raw) else cp.cuda.Device():
                 embedding_raw = _device_csr(embedding_raw)
+                # A source reads its own rows of a matrix, which leaves room for more centers: a quarter of
+                # the call's (at least four sources), up to half the stored values of the cells read
+                ptr = embedding_raw.indptr
+                cells = cp.get_array_module(ptr).asarray(original_indices)
+                stored = int((ptr[cells + 1] - ptr[cells]).sum())
+            values = max(values, min(len(rows) * d // 4, stored // 2))
+        step = max(1, values // d)
         copies: dict[int, tuple] = {}  # of an array read in place, per device
         flat_sums = []
         for a in range(0, len(rows), step):

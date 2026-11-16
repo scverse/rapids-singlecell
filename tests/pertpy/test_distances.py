@@ -848,6 +848,35 @@ def test_contrast_distances_centers_each_split(precision: str, atol: float, monk
             assert "'celltype': 'z'" in error.value.__notes__[0]
 
 
+def test_contrast_distances_sparse_takes_fewer_sources(monkeypatch) -> None:
+    """A matrix gets room for the centers of more splits per source than dense rows, with the same results."""
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
+
+    rng = np.random.default_rng(0)
+    n, splits = 6, 8
+    obs = pd.DataFrame(
+        {
+            "treatment": pd.Categorical(np.tile(np.repeat(["ctrl", "drug"], n), splits)),
+            "celltype": pd.Categorical(np.repeat([f"c{i}" for i in range(splits)], 2 * n)),
+        }
+    ).rename(str)
+    X = rng.normal(size=(2 * n * splits, 10)).astype(np.float32)
+    X += np.repeat(100 * np.arange(splits, dtype=np.float32), 2 * n)[:, None]
+    contrasts = Distance.create_contrasts(
+        AnnData(X, obs=obs), groupby="treatment", selected_group="ctrl", split_by="celltype"
+    )
+    distance = Distance(metric="edistance", layer_key="X")
+    expected = distance.contrast_distances(AnnData(X, obs=obs), contrasts)  # one source
+    sources, load = [], _edistance._materialize_source
+    monkeypatch.setattr(_edistance, "_materialize_source", lambda *args: sources.append(args) or load(*args))
+    monkeypatch.setattr(_edistance, "_CENTER_VALUES", X.shape[1])  # the centers of one split per source
+    for container, count in ((np.asarray, splits), (csr_matrix, splits // 2)):  # a quarter of the 8 x 10 centers
+        del sources[:]
+        got = distance.contrast_distances(AnnData(container(X), obs=obs), contrasts)
+        pd.testing.assert_frame_equal(got, expected, check_exact=True)
+        assert len(sources) == count
+
+
 # ============================================================================
 # Bootstrap correctness tests
 # ============================================================================
