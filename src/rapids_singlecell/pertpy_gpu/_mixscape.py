@@ -40,6 +40,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         new_class_name: str = "mixscape_class",
         layer: str | None = None,
         min_de_genes: int = 5,
+        min_cells: int = 5,
         logfc_threshold: float = 0.25,
         de_layer: str | None = None,
         test_method: str = "wilcoxon",
@@ -74,6 +75,9 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         min_de_genes
             Minimum number of differentially expressed genes required to test a
             gene for perturbation.
+        min_cells
+            Minimum number of cells that must stay classified as perturbed for a
+            gene; if fewer remain, all of its cells are assigned NP.
         logfc_threshold
             Minimum absolute log fold change for a gene to count as
             differentially expressed.
@@ -118,9 +122,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         else:
             split_obs = adata.obs[split_by]
             categories = list(split_obs.unique())
-            split_masks = [
-                (split_obs == category).to_numpy() for category in categories
-            ]
+            split_masks = [(split_obs == category).to_numpy() for category in categories]
 
         perturbation_markers = self._get_perturbation_markers(
             adata,
@@ -231,7 +233,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
             self._fit_genes_batched(
                 gene_jobs,
                 iter_num=iter_num,
-                min_de_genes=min_de_genes,
+                min_cells=min_cells,
                 perturbation_type=perturbation_type,
                 pert_key=pert_key,
                 control=control,
@@ -247,9 +249,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         # The global class is just the last token of each class label and is only
         # read after every gene is processed, so derive it once here (pertpy
         # recomputes it inside the per-gene loop, an O(n_obs x n_perts) cost).
-        adata.obs[f"{new_class_name}_global"] = (
-            adata.obs[new_class_name].astype(str).str.split(" ").str[-1]
-        )
+        adata.obs[f"{new_class_name}_global"] = adata.obs[new_class_name].astype(str).str.split(" ").str[-1]
         adata.uns["mixscape"] = gv_list
 
         if copy:
@@ -370,16 +370,12 @@ class Mixscape(PerturbationEfficacyAnalyzer):
             projected.append(X_proj_base @ loadings)
 
         if len(projected) == 0:
-            raise ValueError(
-                "No perturbation had enough differentially expressed genes for LDA."
-            )
+            raise ValueError("No perturbation had enough differentially expressed genes for LDA.")
 
         projected_pcs = cp.concatenate(projected, axis=1)
         codes = cp.asarray(pd.factorize(pert_sub)[0])
         n_components = len(np.unique(pert_sub)) - 1
-        embedding = _lda_fit_transform_gpu(
-            projected_pcs, codes, n_components=n_components
-        )
+        embedding = _lda_fit_transform_gpu(projected_pcs, codes, n_components=n_components)
         adata.uns["mixscape_lda"] = cp.asnumpy(embedding)
 
         if copy:
@@ -391,7 +387,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         gene_jobs: list[dict],
         *,
         iter_num: int,
-        min_de_genes: int,
+        min_cells: int,
         perturbation_type: str,
         pert_key: str,
         control: str,
@@ -412,9 +408,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         n_genes = len(gene_jobs)
         dtype = gene_jobs[0]["dat"].dtype
         n_list = np.array([job["n_all"] for job in gene_jobs], dtype=np.int64)
-        k_list = np.array(
-            [int(job["dat"].shape[1]) for job in gene_jobs], dtype=np.int64
-        )
+        k_list = np.array([int(job["dat"].shape[1]) for job in gene_jobs], dtype=np.int64)
         cell_off = np.concatenate([[0], np.cumsum(n_list)]).astype(np.int32)
         feat_off = np.concatenate([[0], np.cumsum(k_list)]).astype(np.int32)
         dat_off = np.concatenate([[0], np.cumsum(n_list * k_list)]).astype(np.int64)
@@ -505,7 +499,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
                 post = post_all[orig_seg[gi] : orig_seg[gi + 1]]
                 ko = post > _KO_POSTERIOR_CUTOFF
                 post_final[gi] = post
-                if int(ko.sum()) < min_de_genes:
+                if int(ko.sum()) < min_cells:
                     np_collapse[gi] = True
                     converged[gi] = True
                 elif np.array_equal(ko, prev_ko[gi]):
@@ -515,9 +509,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
                 upd_pos.append(orig_pos_list[gi])
                 upd_ko.append(ko)
             if upd_pos:
-                guide_sel[cp.asarray(np.concatenate(upd_pos))] = cp.asarray(
-                    np.concatenate(upd_ko)
-                )
+                guide_sel[cp.asarray(np.concatenate(upd_pos))] = cp.asarray(np.concatenate(upd_ko))
 
         for gi, job in enumerate(gene_jobs):
             np_label = "NP" if np_collapse[gi] else f"{job['gene']} {perturbation_type}"
@@ -534,9 +526,7 @@ def _scale_gpu(dat: cp.ndarray) -> cp.ndarray:
     return (dat - mean) / std
 
 
-def _lda_fit_transform_gpu(
-    X: cp.ndarray, y: cp.ndarray, *, n_components: int, tol: float = 1e-4
-) -> cp.ndarray:
+def _lda_fit_transform_gpu(X: cp.ndarray, y: cp.ndarray, *, n_components: int, tol: float = 1e-4) -> cp.ndarray:
     """Fit-transform a linear discriminant analysis on the GPU.
 
     A CuPy port of scikit-learn's ``LinearDiscriminantAnalysis`` SVD solver
@@ -551,13 +541,9 @@ def _lda_fit_transform_gpu(
     dtype = X.dtype
 
     means = cp.stack([X[y == c].mean(axis=0) for c in class_list])
-    priors = cp.asarray(
-        [float((y == c).sum()) / n_samples for c in class_list], dtype=dtype
-    )
+    priors = cp.asarray([float((y == c).sum()) / n_samples for c in class_list], dtype=dtype)
     xbar = priors @ means
-    centered = cp.concatenate(
-        [X[y == c] - means[i] for i, c in enumerate(class_list)], axis=0
-    )
+    centered = cp.concatenate([X[y == c] - means[i] for i, c in enumerate(class_list)], axis=0)
 
     std = cp.std(centered, axis=0)
     std = cp.where(std == 0, dtype.type(1.0), std)
@@ -569,9 +555,7 @@ def _lda_fit_transform_gpu(
     scalings = (vt[:rank] / std).T / s[:rank]
 
     between_fac = dtype.type(1.0 if n_classes == 1 else 1.0 / (n_classes - 1))
-    between = (
-        (cp.sqrt((n_samples * priors) * between_fac)) * (means - xbar).T
-    ).T @ scalings
+    between = ((cp.sqrt((n_samples * priors) * between_fac)) * (means - xbar).T).T @ scalings
     _, s2, vt2 = cp.linalg.svd(between, full_matrices=False)
     rank2 = 0 if s2.size == 0 else int(cp.sum(s2 > tol * s2[0]).item())
     if rank < 1 or rank2 < 1:

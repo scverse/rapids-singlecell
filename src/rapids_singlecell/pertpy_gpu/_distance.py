@@ -106,8 +106,8 @@ class Distance:
     Examples
     --------
     >>> import rapids_singlecell as rsc
-    >>> distance = rsc.ptg.Distance(metric='edistance')
-    >>> result = distance.pairwise(adata, groupby='perturbation')
+    >>> distance = rsc.ptg.Distance(metric="edistance")
+    >>> result = distance.pairwise(adata, groupby="perturbation")
 
     >>> # Direct computation on arrays
     >>> d = distance(X, Y)
@@ -129,8 +129,7 @@ class Distance:
         """
         if layer_key is not None and obsm_key is not None:
             raise ValueError(
-                "Cannot use 'layer_key' and 'obsm_key' at the same time.\n"
-                "Please provide only one of the two keys."
+                "Cannot use 'layer_key' and 'obsm_key' at the same time.\nPlease provide only one of the two keys."
             )
         if layer_key is None and obsm_key is None:
             obsm_key = _embedding_keys("pca").obsm
@@ -177,13 +176,9 @@ class Distance:
                 **self._metric_kwargs,
             )
         else:
-            raise ValueError(
-                f"Unknown metric: {self.metric}. Supported metrics: {SUPPORTED_METRICS}"
-            )
+            raise ValueError(f"Unknown metric: {self.metric}. Supported metrics: {SUPPORTED_METRICS}")
 
-    def _check_multi_gpu_support(
-        self, *, multi_gpu: bool | list[int] | str | None
-    ) -> bool | list[int] | str:
+    def _check_multi_gpu_support(self, *, multi_gpu: bool | list[int] | str | None) -> bool | list[int] | str:
         """Check if metric supports multi-GPU and resolve None default.
 
         Parameters
@@ -211,8 +206,7 @@ class Distance:
             )
             if uses_multi_gpu:
                 warnings.warn(
-                    f"Metric '{self.metric}' does not support multi-GPU. "
-                    "Falling back to single GPU (device 0).",
+                    f"Metric '{self.metric}' does not support multi-GPU. Falling back to single GPU (device 0).",
                     UserWarning,
                     stacklevel=3,
                 )
@@ -243,15 +237,13 @@ class Distance:
 
         Examples
         --------
-        >>> distance = Distance(metric='edistance')
+        >>> distance = Distance(metric="edistance")
         >>> X = adata.obsm["X_pca"][adata.obs["group"] == "A"]
         >>> Y = adata.obsm["X_pca"][adata.obs["group"] == "B"]
         >>> d = distance(X, Y)
         """
         if not hasattr(self._metric_impl, "compute_distance"):
-            raise NotImplementedError(
-                f"Metric '{self.metric}' does not support direct distance computation"
-            )
+            raise NotImplementedError(f"Metric '{self.metric}' does not support direct distance computation")
         return self._metric_impl.compute_distance(X, Y)
 
     def pairwise(
@@ -298,8 +290,8 @@ class Distance:
 
         Examples
         --------
-        >>> distance = Distance(metric='edistance')
-        >>> result = distance.pairwise(adata, groupby='condition')
+        >>> distance = Distance(metric="edistance")
+        >>> result = distance.pairwise(adata, groupby="condition")
         """
         multi_gpu = self._check_multi_gpu_support(multi_gpu=multi_gpu)
         return self._metric_impl.pairwise(
@@ -323,12 +315,7 @@ class Distance:
         n_bootstrap: int = 100,
         random_state: int = 0,
         multi_gpu: bool | list[int] | str | None = None,
-    ) -> (
-        pd.Series
-        | pd.DataFrame
-        | tuple[pd.Series, pd.Series]
-        | tuple[pd.DataFrame, pd.DataFrame]
-    ):
+    ) -> pd.Series | pd.DataFrame | tuple[pd.Series, pd.Series] | tuple[pd.DataFrame, pd.DataFrame]:
         """
         Compute distances from one selected group to all other groups.
 
@@ -364,15 +351,11 @@ class Distance:
 
         Examples
         --------
-        >>> distance = Distance(metric='edistance')
-        >>> distances = distance.onesided_distances(
-        ...     adata, groupby='condition', selected_group='control'
-        ... )
+        >>> distance = Distance(metric="edistance")
+        >>> distances = distance.onesided_distances(adata, groupby="condition", selected_group="control")
         """
         if not hasattr(self._metric_impl, "onesided_distances"):
-            raise NotImplementedError(
-                f"Metric '{self.metric}' does not support onesided_distances"
-            )
+            raise NotImplementedError(f"Metric '{self.metric}' does not support onesided_distances")
         multi_gpu = self._check_multi_gpu_support(multi_gpu=multi_gpu)
         return self._metric_impl.onesided_distances(
             adata=adata,
@@ -417,16 +400,14 @@ class Distance:
 
         Examples
         --------
-        >>> distance = Distance(metric='edistance')
+        >>> distance = Distance(metric="edistance")
         >>> X = adata.obsm["X_pca"][adata.obs["group"] == "A"]
         >>> Y = adata.obsm["X_pca"][adata.obs["group"] == "B"]
         >>> result = distance.bootstrap(X, Y, n_bootstrap=100)
         >>> print(f"Distance: {result.mean:.3f} ± {result.variance**0.5:.3f}")
         """
         if not hasattr(self._metric_impl, "bootstrap_arrays"):
-            raise NotImplementedError(
-                f"Metric '{self.metric}' does not support bootstrap"
-            )
+            raise NotImplementedError(f"Metric '{self.metric}' does not support bootstrap")
         mean, variance = self._metric_impl.bootstrap_arrays(
             X=X,
             Y=Y,
@@ -444,9 +425,7 @@ class Distance:
         groups: Sequence[str] | None = None,
         split_by: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """
-        Build a contrasts DataFrame for use with
-        :meth:`~Distance.contrast_distances`.
+        """Build a contrasts DataFrame for use with :meth:`~Distance.contrast_distances`.
 
         Each row represents one contrast: comparing a group against the
         reference, optionally within each level of ``split_by`` columns.
@@ -489,19 +468,20 @@ class Distance:
         Examples
         --------
         >>> # All targets vs control, ignoring celltype
-        >>> contrasts = Distance.create_contrasts(
-        ...     adata, groupby="target_gene", selected_group="Non_target"
-        ... )
+        >>> contrasts = Distance.create_contrasts(adata, groupby="target_gene", selected_group="Non_target")
 
         >>> # Multiple references
         >>> contrasts = Distance.create_contrasts(
-        ...     adata, groupby="target_gene",
+        ...     adata,
+        ...     groupby="target_gene",
         ...     selected_group=["Non_target", "Scramble"],
         ... )
 
         >>> # Stratified by celltype
         >>> contrasts = Distance.create_contrasts(
-        ...     adata, groupby="target_gene", selected_group="Non_target",
+        ...     adata,
+        ...     groupby="target_gene",
+        ...     selected_group="Non_target",
         ...     split_by="group_name",
         ... )
 
@@ -511,11 +491,13 @@ class Distance:
 
         >>> # Manual construction (no helper needed)
         >>> import pandas as pd
-        >>> contrasts = pd.DataFrame({
-        ...     "target_gene": ["Irf7", "Ski"],
-        ...     "reference": ["Non_target", "Non_target"],
-        ...     "group_name": ["CD4", "CD4"],
-        ... })
+        >>> contrasts = pd.DataFrame(
+        ...     {
+        ...         "target_gene": ["Irf7", "Ski"],
+        ...         "reference": ["Non_target", "Non_target"],
+        ...         "group_name": ["CD4", "CD4"],
+        ...     }
+        ... )
         """
         import pandas as pd
 
@@ -561,8 +543,7 @@ class Distance:
                 target_vals = [
                     t
                     for t in adata.obs[groupby].unique()
-                    if t not in selected_set
-                    and (allowed_groups is None or t in allowed_groups)
+                    if t not in selected_set and (allowed_groups is None or t in allowed_groups)
                 ]
                 if not target_vals:
                     continue
@@ -613,37 +594,27 @@ class Distance:
 
         groupby = contrasts.columns[0]
         if groupby == "reference":
-            raise ValueError(
-                "First column cannot be 'reference'. The first column "
-                "must be the groupby column."
-            )
+            raise ValueError("First column cannot be 'reference'. The first column must be the groupby column.")
 
         split_by = [c for c in contrasts.columns if c not in (groupby, "reference")]
 
         # Check columns exist in adata.obs
         for col in [groupby, *split_by]:
             if col not in adata.obs.columns:
-                raise ValueError(
-                    f"Column '{col}' not found in adata.obs. "
-                    f"Available columns: {list(adata.obs.columns)}"
-                )
+                raise ValueError(f"Column '{col}' not found in adata.obs. Available columns: {list(adata.obs.columns)}")
 
         # Check reference values exist in adata
         obs_groupby_values = set(adata.obs[groupby].unique())
         ref_values = set(contrasts["reference"].unique())
         missing_refs = ref_values - obs_groupby_values
         if missing_refs:
-            raise ValueError(
-                f"Reference values not found in adata.obs['{groupby}']: {missing_refs}"
-            )
+            raise ValueError(f"Reference values not found in adata.obs['{groupby}']: {missing_refs}")
 
         # Check target values exist in adata
         target_values = set(contrasts[groupby].unique())
         missing_targets = target_values - obs_groupby_values
         if missing_targets:
-            raise ValueError(
-                f"Groups not found in adata.obs['{groupby}']: {missing_targets}"
-            )
+            raise ValueError(f"Groups not found in adata.obs['{groupby}']: {missing_targets}")
 
         # Check split_by values exist in adata
         for col in split_by:
@@ -651,9 +622,7 @@ class Distance:
             contrast_vals = set(contrasts[col].unique())
             missing_split = contrast_vals - obs_vals
             if missing_split:
-                raise ValueError(
-                    f"Values not found in adata.obs['{col}']: {missing_split}"
-                )
+                raise ValueError(f"Values not found in adata.obs['{col}']: {missing_split}")
 
     def contrast_distances(
         self,
@@ -694,28 +663,30 @@ class Distance:
 
         Examples
         --------
-        >>> distance = Distance(metric='edistance')
+        >>> distance = Distance(metric="edistance")
 
         >>> # Using create_contrasts helper
         >>> contrasts = Distance.create_contrasts(
-        ...     adata, groupby="target_gene", selected_group="Non_target",
+        ...     adata,
+        ...     groupby="target_gene",
+        ...     selected_group="Non_target",
         ...     split_by="group_name",
         ... )
         >>> result = distance.contrast_distances(adata, contrasts=contrasts)
 
         >>> # Manual DataFrame construction
         >>> import pandas as pd
-        >>> contrasts = pd.DataFrame({
-        ...     "target_gene": ["Irf7", "Ski"],
-        ...     "reference": ["Non_target", "Non_target"],
-        ...     "group_name": ["CD4", "CD4"],
-        ... })
+        >>> contrasts = pd.DataFrame(
+        ...     {
+        ...         "target_gene": ["Irf7", "Ski"],
+        ...         "reference": ["Non_target", "Non_target"],
+        ...         "group_name": ["CD4", "CD4"],
+        ...     }
+        ... )
         >>> result = distance.contrast_distances(adata, contrasts)
         """
         if not hasattr(self._metric_impl, "contrast_distances"):
-            raise NotImplementedError(
-                f"Metric '{self.metric}' does not support contrast_distances"
-            )
+            raise NotImplementedError(f"Metric '{self.metric}' does not support contrast_distances")
         multi_gpu = self._check_multi_gpu_support(multi_gpu=multi_gpu)
         return self._metric_impl.contrast_distances(
             adata=adata,

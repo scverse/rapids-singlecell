@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+from pathlib import Path
+
+import pandas as pd
 import pytest
 from scanpy.datasets import pbmc68k_reduced
 from scipy import sparse
@@ -9,10 +12,23 @@ import rapids_singlecell as rsc
 from rapids_singlecell.tools import _clustering
 from rapids_singlecell.tools._clustering import _create_graph
 
+A = pytest.importorskip("anndata.acc").A
+
+# `tl.louvain` is deprecated; only `test_louvain_deprecated` expects the warning
+pytestmark = pytest.mark.filterwarnings("ignore:The function louvain is deprecated:FutureWarning")
+
 
 @pytest.fixture
 def adata_neighbors():
     return pbmc68k_reduced()
+
+
+def test_louvain_deprecated(adata_neighbors):
+    with pytest.warns(FutureWarning, match=r"louvain is deprecated.*tl\.leiden") as record:
+        rsc.tl.louvain(adata_neighbors)
+    (warning,) = (w for w in record if "louvain is deprecated" in str(w.message))
+    # attributed to the caller, so a decorator stacked above `@deprecated` shows up here
+    assert Path(warning.filename).samefile(__file__)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64", "int32"])
@@ -65,7 +81,7 @@ def test_clustering_subset(adata_neighbors, key):
         clustering = rsc.tl.leiden
     else:
         clustering = rsc.tl.louvain
-    clustering(adata_neighbors, key_added=key)
+    clustering(adata_neighbors, out=A.obs[key])
 
     for c in adata_neighbors.obs[key].unique():
         cells_in_c = adata_neighbors.obs[key] == c
@@ -74,7 +90,7 @@ def test_clustering_subset(adata_neighbors, key):
         clustering(
             adata_neighbors,
             restrict_to=(key, [c]),
-            key_added=key_sub,
+            out=A.obs[key_sub],
         )
         # Get new clustering labels
         new_partition = adata_neighbors.obs[key_sub]
@@ -94,7 +110,7 @@ def test_clustering_subset(adata_neighbors, key):
 @pytest.mark.parametrize("resolution", [0.1, [0.5, 1.0]])
 def test_clustering_resolution(adata_neighbors, clustering_function, resolution):
     adata = adata_neighbors.copy()
-    clustering_function(adata, key_added="test_clustering", resolution=resolution)
+    clustering_function(adata, out=A.obs["test_clustering"], resolution=resolution)
     if isinstance(resolution, list):
         for r in resolution:
             assert f"test_clustering_{r}" in adata.obs.columns
@@ -110,3 +126,22 @@ def test_clustering_resolution(adata_neighbors, clustering_function, resolution)
 def test_kmeans_basic(adata_neighbors):
     rsc.tl.kmeans(adata_neighbors)
     assert adata_neighbors.obs["kmeans"].nunique() == 8
+
+
+def test_kmeans_use_out(adata_neighbors):
+    labels = rsc.tl.kmeans(adata_neighbors, n_clusters=4, use=A.obsm["X_pca"], out=True)
+    assert isinstance(labels, pd.Categorical)
+    rsc.tl.kmeans(adata_neighbors, n_clusters=4, use="obsm.X_pca", out=A.obs["km"])
+    assert (adata_neighbors.obs["km"].to_numpy() == labels).all()
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.tl.kmeans(adata_neighbors, n_clusters=4, key_added="km_old")
+    assert "km_old" in adata_neighbors.obs
+
+
+def test_leiden_deprecated_params(adata_neighbors):
+    with pytest.warns(FutureWarning, match="obsp"), pytest.warns(FutureWarning, match="key_added"):
+        rsc.tl.leiden(adata_neighbors, obsp="connectivities", key_added="old")
+    assert "old" in adata_neighbors.obs
+    assert "old" in adata_neighbors.uns
+    with pytest.raises(TypeError, match="Pass only one"), pytest.warns(FutureWarning):
+        rsc.tl.leiden(adata_neighbors, use=A.obsp["connectivities"], obsp="connectivities")

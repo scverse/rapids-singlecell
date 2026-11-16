@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from functools import partial, singledispatch
 from importlib.metadata import version
+from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 import cupy as cp
 import numpy as np
 import pytest
+import scanpy as sc
 from anndata.tests.helpers import asarray
 from cupyx.scipy import sparse as cusparse
 from cupyx.scipy.sparse import csr_matrix as CupyCSRMatrix
@@ -47,9 +49,7 @@ MAP_ARRAY_TYPES: dict[
     ),
 }
 
-ARRAY_TYPES_MEM = tuple(
-    at for (strg, _), ats in MAP_ARRAY_TYPES.items() if strg == "mem" for at in ats
-)
+ARRAY_TYPES_MEM = tuple(at for (strg, _), ats in MAP_ARRAY_TYPES.items() if strg == "mem" for at in ats)
 
 
 def _half_chunk_size(a: tuple[int, ...]) -> tuple[int, ...]:
@@ -76,9 +76,7 @@ def _(a):
 @as_dense_dask_array.register(DaskArray)
 def _(a):
     # Map to numpy arrays blockwise, preserving dtype; meta informs dask about target array type
-    return a.map_blocks(
-        asarray, dtype=a.dtype, meta=np.empty((0,) * a.ndim, dtype=a.dtype)
-    )
+    return a.map_blocks(asarray, dtype=a.dtype, meta=np.empty((0,) * a.ndim, dtype=a.dtype))
 
 
 @singledispatch
@@ -154,6 +152,14 @@ def as_dense_cupy_dask_array(X):
 # we optimistically enable and fallback to spmatrix at runtime if needed.
 DASK_CAN_SPARRAY = Version(version("dask")) >= Version("2025.3.0")
 
+SC_USE_OUT = "use" in signature(sc.tl.rank_genes_groups).parameters
+"""Whether scanpy has the `use`/`out` arguments (scverse/scanpy#4359)."""
+
+
+def sc_use(use: Any, **legacy: Any) -> dict[str, Any]:
+    """Keyword arguments for a scanpy reference call: `use` where scanpy has it, else the `legacy` ones."""
+    return {"use": use} if SC_USE_OUT else legacy
+
 
 def as_cupy(a: NDArray | CSArray | CSMatrix) -> CupyCSRMatrix | cp.ndarray:
     """Convert numpy/scipy sparse to cupy/cupyx sparse where appropriate."""
@@ -161,7 +167,7 @@ def as_cupy(a: NDArray | CSArray | CSMatrix) -> CupyCSRMatrix | cp.ndarray:
         return cp.asarray(a)
     if isinstance(a, CSMatrix):
         return cusparse.csr_matrix(a)
-    if isinstance(a, CSArray):  # type: ignore[arg-type]
+    if isinstance(a, CSArray):
         # Convert via SciPy csr_matrix then to Cupy
-        return cusparse.csr_matrix(sparse.csr_matrix(a))  # type: ignore[arg-type]
+        return cusparse.csr_matrix(sparse.csr_matrix(a))
     return a

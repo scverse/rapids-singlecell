@@ -19,6 +19,8 @@ from rapids_singlecell.preprocessing._scrublet.sparse_utils import subsample_cou
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+A = pytest.importorskip("anndata.acc").A
+
 
 def pbmc200() -> AnnData:
     from scanpy.datasets import pbmc3k
@@ -66,7 +68,7 @@ def test_scrublet_batched():
     adata.obs["batch"] = 100 * ["a"] + 100 * ["b"]
     split = [adata[adata.obs["batch"] == x].copy() for x in ("a", "b")]
 
-    rsc.pp.scrublet(adata, use_approx_neighbors=False, batch_key="batch")
+    rsc.pp.scrublet(adata, use_approx_neighbors=False, batch="obs.batch")
 
     doublet_idx = np.flatnonzero(adata.obs["predicted_doublet"]).tolist()
     # only one in the first batch (<100)
@@ -87,18 +89,14 @@ def test_scrublet_batched():
     pd.testing.assert_frame_equal(adata.obs[merged.obs.columns], merged.obs)
 
 
-@pytest.mark.parametrize("copy", [False, True])
-def test_scrublet_batched_preserves_obs(monkeypatch, copy):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_scrublet_batched_preserves_obs(monkeypatch, legacy):
     """Batch concatenation must preserve metadata and align results by cell."""
     from rapids_singlecell.preprocessing import _scrublet
 
     adata = AnnData(np.ones((4, 3)))
-    adata.obs["batch"] = pd.Categorical(
-        ["b", "a", "b", "a"], categories=["b", "a", "unused"], ordered=True
-    )
-    adata.obs["cell_type"] = pd.Categorical(
-        ["T", "B", "T", "B"], categories=["B", "T", "unused"]
-    )
+    adata.obs["batch"] = pd.Categorical(["b", "a", "b", "a"], categories=["b", "a", "unused"], ordered=True)
+    adata.obs["cell_type"] = pd.Categorical(["T", "B", "T", "B"], categories=["B", "T", "unused"])
     adata.obs["count"] = pd.array([1, None, 3, 4], dtype="Int64")
     original_obs = adata.obs.copy(deep=True)
 
@@ -110,19 +108,37 @@ def test_scrublet_batched_preserves_obs(monkeypatch, copy):
         return adata_obs
 
     monkeypatch.setattr(_scrublet, "_scrublet_call_doublets", fake_call_doublets)
-    result = rsc.pp.scrublet(
-        adata, adata_sim=adata.copy(), batch_key="batch", copy=copy, verbose=False
-    )
-    if copy:
-        pd.testing.assert_frame_equal(adata.obs, original_obs)
+    if legacy:
+        with pytest.warns(FutureWarning, match="batch_key"):
+            rsc.pp.scrublet(adata, adata_sim=adata.copy(), batch_key="batch", verbose=False)
     else:
-        assert result is None
-        result = adata
+        res = rsc.pp.scrublet(adata, adata_sim=adata.copy(), batch=A.obs["batch"], out=True, verbose=False)
+        pd.testing.assert_frame_equal(adata.obs, original_obs)
+        assert_allclose(res.doublet_score, [0, 0.1, 0.2, 0.3])
+        rsc.pp.scrublet(adata, adata_sim=adata.copy(), batch="obs.batch", out={"doublet_score": "obs.s"}, verbose=False)
+        assert_allclose(adata.obs.pop("s"), [0, 0.1, 0.2, 0.3])
+        assert adata.uns.pop("s")["batched_by"] == "batch"
+        rsc.pp.scrublet(adata, adata_sim=adata.copy(), batch=A.obs["batch"], verbose=False)
+    result = adata
 
     pd.testing.assert_frame_equal(result.obs[original_obs.columns], original_obs)
     assert_allclose(result.obs["doublet_score"], [0, 0.1, 0.2, 0.3])
     assert_array_equal(result.obs["predicted_doublet"], [False, False, True, True])
     assert result.uns["scrublet"]["batches"].keys() == {"a", "b"}
+
+
+def test_scrublet_use_layer_no_copy(monkeypatch):
+    """`use` runs on the selected layer without copying X and every other layer."""
+    adata = pbmc200()
+    rsc.get.anndata_to_GPU(adata)
+    expected = rsc.pp.scrublet(adata, use_approx_neighbors=False, out=True)
+    adata.layers["counts"], adata.X = adata.X, adata.X.log1p()
+    counts = adata.layers["counts"].copy()
+    monkeypatch.setattr(adata, "copy", lambda: pytest.fail("scrublet copied the whole object"))
+    res = rsc.pp.scrublet(adata, use=A.layers["counts"], use_approx_neighbors=False, out=True)
+    assert_array_equal(res.predicted_doublet, expected.predicted_doublet)
+    assert_allclose(res.doublet_score, expected.doublet_score)
+    assert (adata.layers["counts"] != counts).nnz == 0
 
 
 def _preprocess_for_scrublet(adata: AnnData) -> AnnData:
@@ -131,7 +147,8 @@ def _preprocess_for_scrublet(adata: AnnData) -> AnnData:
     rsc.pp.filter_cells(adata_pp, min_genes=3)
     adata_pp.layers["raw"] = adata_pp.X.copy()
     rsc.pp.normalize_total(adata_pp)
-    logged = rsc.pp.log1p(adata_pp, copy=True)
+    logged = adata_pp.copy()
+    rsc.pp.log1p(logged)
     rsc.pp.highly_variable_genes(logged)
     return adata_pp[:, logged.var["highly_variable"]].copy()
 
@@ -164,12 +181,8 @@ def test_scrublet_data():
     random_state = 1234
     adata = rsc.get.anndata_to_GPU(pbmc200(), copy=True)
     # Run Scrublet and let the main function run simulations
-    adata_scrublet_auto_sim = rsc.pp.scrublet(
-        adata,
-        use_approx_neighbors=False,
-        copy=True,
-        random_state=random_state,
-    )
+    adata_scrublet_auto_sim = adata.copy()
+    rsc.pp.scrublet(adata_scrublet_auto_sim, use_approx_neighbors=False, random_state=random_state)
 
     # Now make our own simulated data so we can check the result from function
     # is the same, and by inference that the processing steps have not been
@@ -179,20 +192,15 @@ def test_scrublet_data():
     adata_in = rsc.get.anndata_to_GPU(pbmc200(), copy=True)
     adata_obs = _preprocess_for_scrublet(adata_in)
     # Simulate doublets using the same parents
-    adata_sim = _create_sim_from_parents(
-        adata_obs, adata_scrublet_auto_sim.uns["scrublet"]["doublet_parents"]
-    )
+    adata_sim = _create_sim_from_parents(adata_obs, adata_scrublet_auto_sim.uns["scrublet"]["doublet_parents"])
 
     # Apply the same post-normalisation the Scrublet function would
     rsc.pp.normalize_total(adata_obs, target_sum=1e6)
     rsc.pp.normalize_total(adata_sim, target_sum=1e6)
 
-    adata_scrublet_manual_sim = rsc.pp.scrublet(
-        adata_obs,
-        adata_sim=adata_sim,
-        use_approx_neighbors=False,
-        copy=True,
-        random_state=random_state,
+    adata_scrublet_manual_sim = adata_obs.copy()
+    rsc.pp.scrublet(
+        adata_scrublet_manual_sim, adata_sim=adata_sim, use_approx_neighbors=False, random_state=random_state
     )
 
     # Require that the doublet scores are the same whether simulation is via
@@ -240,9 +248,8 @@ def test_scrublet_params(scrub_small: AnnData, param: str, value: Any):
 
     Check that changes to parameters change scrublet results.
     """
-    curr = rsc.pp.scrublet(
-        adata=scrub_small, use_approx_neighbors=False, copy=True, **{param: value}
-    )
+    curr = scrub_small.copy()
+    rsc.pp.scrublet(curr, use_approx_neighbors=False, **{param: value})
     with pytest.raises(AssertionError):
         assert_equal(scrub_small, curr)
 
@@ -255,14 +262,16 @@ def test_scrublet_simulate_doublets():
     rsc.pp.filter_cells(adata_obs, min_genes=3)
     adata_obs.layers["raw"] = adata_obs.X
     rsc.pp.normalize_total(adata_obs)
-    logged = rsc.pp.log1p(adata_obs, copy=True)
+    logged = adata_obs.copy()
+    rsc.pp.log1p(logged)
 
     _ = rsc.pp.highly_variable_genes(logged)
     adata_obs = adata_obs[:, logged.var["highly_variable"]]
 
-    adata_sim = rsc.pp.scrublet_simulate_doublets(
-        adata_obs, sim_doublet_ratio=0.02, layer="raw"
-    )
+    adata_sim = rsc.pp.scrublet_simulate_doublets(adata_obs, sim_doublet_ratio=0.02, use="layers.raw")
+    with pytest.warns(FutureWarning, match="layer"):
+        legacy = rsc.pp.scrublet_simulate_doublets(adata_obs, sim_doublet_ratio=0.02, layer="raw")
+    assert_array_equal(legacy.obsm["doublet_parents"], adata_sim.obsm["doublet_parents"])
 
     assert_array_equal(
         adata_sim.obsm["doublet_parents"],
@@ -281,23 +290,17 @@ def test_subsample_counts_uses_seeded_gpu_rng(dtype):
     seed = int(expected_host_rng.integers(0, 2**32))
     expected_gpu_rng = cp.random.default_rng(seed)
     expected = matrix.copy()
-    expected.data = expected_gpu_rng.binomial(
-        cp.round(expected.data).astype(np.int64), rate
-    ).astype(dtype, copy=False)
+    expected.data = expected_gpu_rng.binomial(cp.round(expected.data).astype(np.int64), rate).astype(dtype, copy=False)
     expected_current_totals = expected.sum(axis=1).ravel()
     expected_unsampled_totals = expected_gpu_rng.binomial(
         cp.round(original_totals - expected_current_totals).astype(np.int64), rate
     ).astype(dtype, copy=False)
 
     rng = np.random.default_rng(17)
-    actual, actual_totals = subsample_counts(
-        matrix.copy(), rate=rate, original_totals=original_totals, rng=rng
-    )
+    actual, actual_totals = subsample_counts(matrix.copy(), rate=rate, original_totals=original_totals, rng=rng)
 
     cp.testing.assert_array_equal(actual.toarray(), expected.toarray())
-    cp.testing.assert_array_equal(
-        actual_totals, expected_current_totals + expected_unsampled_totals
-    )
+    cp.testing.assert_array_equal(actual_totals, expected_current_totals + expected_unsampled_totals)
     assert actual.dtype == dtype
     assert actual_totals.dtype == dtype
     assert rng.integers(0, 2**32) == expected_host_rng.integers(0, 2**32)

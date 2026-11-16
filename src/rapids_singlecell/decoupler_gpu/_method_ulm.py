@@ -99,9 +99,7 @@ def _func_ulm(
         es = t
     else:
         # Compute coef
-        es = r * (
-            cp.std(mat.T, ddof=1, axis=0).reshape(-1, 1) / cp.std(adj, ddof=1, axis=0)
-        )
+        es = r * (cp.std(mat.T, ddof=1, axis=0).reshape(-1, 1) / cp.std(adj, ddof=1, axis=0))
     return es.get(), pv.get()
 
 

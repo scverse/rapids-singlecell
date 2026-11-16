@@ -19,10 +19,7 @@ def _precomputed_cdf() -> np.ndarray:
     z = x / np.sqrt(2)
     t = 1 / (1 + 0.3275911 * z)
     erf = 1 - (
-        (
-            (((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592
-        )
+        ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592)
         * t
         * np.exp(-(z**2))
     )
@@ -66,9 +63,7 @@ def _poisson_cdfs_gpu() -> cp.ndarray:
     return cp.asarray(_poisson_cdfs(np.arange(65, dtype=np.float64)))
 
 
-def _poisson_density_columns(
-    mat: cp.ndarray, *, max_entries: int = 1 << 20
-) -> cp.ndarray:
+def _poisson_density_columns(mat: cp.ndarray, *, max_entries: int = 1 << 20) -> cp.ndarray:
     """Keep CDF tables bounded for inputs with many distinct counts."""
     nobs, nvar = mat.shape
     density = cp.empty(mat.shape, dtype=cp.float64)
@@ -83,16 +78,14 @@ def _poisson_density_columns(
             cdfs = cp.asarray(_poisson_cdfs(values, start, end))
             lookup = cp.empty(end - start, dtype=cp.float64)
             _gs.poisson_lookup(counts, cdfs, lookup, nobs, 1, stream)
-            _gs.poisson_gather_tile(
-                counts, lookup, start, end, density[:, column], stream
-            )
+            _gs.poisson_gather_tile(counts, lookup, start, end, density[:, column], stream)
     return density
 
 
 def _density(mat: cp.ndarray, kcdf: str | None) -> cp.ndarray:
-    assert (
-        isinstance(kcdf, str) and kcdf in {"gaussian", "poisson"}
-    ) or kcdf is None, "kcdf must be gaussian, poisson or None"
+    assert (isinstance(kcdf, str) and kcdf in {"gaussian", "poisson"}) or kcdf is None, (
+        "kcdf must be gaussian, poisson or None"
+    )
     nobs, nvar = mat.shape
     stream = cp.cuda.get_current_stream().ptr
     if kcdf == "gaussian":
@@ -106,8 +99,7 @@ def _density(mat: cp.ndarray, kcdf: str | None) -> cp.ndarray:
         return density
     if kcdf == "poisson":
         assert float(cp.sum(mat, dtype=cp.float64).get()).is_integer(), (
-            "when kcdf=poisson input data must be integers (e.g. 3, 4, etc.), "
-            "not decimal values (e.g. 3.5, 4.9, etc.)"
+            "when kcdf=poisson input data must be integers (e.g. 3, 4, etc.), not decimal values (e.g. 3.5, 4.9, etc.)"
         )
         bounds = cp.stack((cp.min(mat), cp.max(mat))).get()
         max_count = int(bounds[1])
@@ -152,9 +144,7 @@ def _sparse_ecdf_values(
     _gs.sparse_ecdf_keys(coo.data, coo.col, keys, stream)
     order = cp.argsort(keys)
     keys = keys[order]
-    zero_keys = (cp.arange(nvar, dtype=cp.uint64) << np.uint64(32)) | np.uint64(
-        0x80000000
-    )
+    zero_keys = (cp.arange(nvar, dtype=cp.uint64) << np.uint64(32)) | np.uint64(0x80000000)
     zero_ranks = cp.searchsorted(keys, zero_keys, side="right") - starts[:-1]
     zero_ranks = (zero_ranks + nobs - counts).astype(cp.int32)
     values = cp.empty(coo.nnz, dtype=cp.int32)
@@ -200,9 +190,7 @@ def _rank_sparse_ecdf(
     srs = cp.empty_like(dos)
     lower = -1
     for capacity in (1024, 2048, 4096, 8192):
-        row_ids = np.flatnonzero((row_sizes > lower) & (row_sizes <= capacity)).astype(
-            np.int32
-        )
+        row_ids = np.flatnonzero((row_sizes > lower) & (row_sizes <= capacity)).astype(np.int32)
         if row_ids.size:
             row_ids = cp.asarray(row_ids)
             _gs.sparse_rank(
@@ -356,9 +344,7 @@ def _func_gsva(
         mat = cp.ascontiguousarray(mat, dtype=cp.float32)
     nvar = mat.shape[1]
     if mat.shape[0] > 1:
-        _log(
-            f"gsva - computing density with kcdf={kcdf}", level="info", verbose=verbose
-        )
+        _log(f"gsva - computing density with kcdf={kcdf}", level="info", verbose=verbose)
         if is_sparse:
             dos, srs, cnct = _rank_sparse_ecdf(mat, cnct)
         else:

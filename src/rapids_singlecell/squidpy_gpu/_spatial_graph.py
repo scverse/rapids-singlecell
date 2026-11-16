@@ -34,8 +34,6 @@ def build_graphs(
     return adj, cp_sparse.csr_matrix((dst, dst_indices, indptr.copy()), shape=adj.shape)
 
 
-def build_adjacency(
-    rows: cp.ndarray, cols: cp.ndarray, n_obs: int, *, set_diag: bool
-) -> cp_sparse.csr_matrix:
+def build_adjacency(rows: cp.ndarray, cols: cp.ndarray, n_obs: int, *, set_diag: bool) -> cp_sparse.csr_matrix:
     """Build the adjacency CSR, with the same edge contract as :func:`build_graphs`."""
     return build_graphs(rows, cols, None, n_obs, set_diag=set_diag)[0]

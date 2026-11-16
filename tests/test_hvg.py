@@ -33,7 +33,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
     cp.random.seed(0)
     cudata.obs["batch"] = np.random.binomial(3, 0.5, size=(cudata.n_obs))
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch")
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert "highly_variable_nbatches" in cudata.var.columns
     assert "highly_variable_intersection" in cudata.var.columns
 
@@ -47,7 +47,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
     batch = np.random.binomial(4, 0.5, size=(cudata.n_obs))
     cudata.obs["batch"] = batch
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch", n_top_genes=3)
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch", n_top_genes=3)
     assert "highly_variable_nbatches" in cudata.var.columns
     assert cudata.var["highly_variable"].sum() == 3
     highly_var_first_layer = cudata.var["highly_variable"].copy()
@@ -70,9 +70,7 @@ def test_highly_variable_genes_basic(dtype, sparse):
         cudata.layers["test_layer"] = new_layer
     cudata.obs["batch"] = batch
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(
-        cudata, batch_key="batch", n_top_genes=3, layer="test_layer"
-    )
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch", n_top_genes=3, use="layers.test_layer")
     assert "highly_variable_nbatches" in cudata.var.columns
     assert cudata.var["highly_variable"].sum() == 3
     assert (highly_var_first_layer != cudata.var["highly_variable"]).any()
@@ -82,13 +80,13 @@ def test_highly_variable_genes_basic(dtype, sparse):
     assert no_batch_hvg.any()
     cudata.obs["batch"] = "batch"
     cudata.obs["batch"] = cudata.obs["batch"].astype("category")
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch")
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert np.all(no_batch_hvg == cudata.var.highly_variable)
     assert np.all(cudata.var.highly_variable_intersection == cudata.var.highly_variable)
 
     cudata.obs["batch"] = "a"
-    cudata.obs.batch.loc[::2] = "b"
-    rsc.pp.highly_variable_genes(cudata, batch_key="batch")
+    cudata.obs.loc[::2, "batch"] = "b"
+    rsc.pp.highly_variable_genes(cudata, batch="obs.batch")
     assert cudata.var["highly_variable"].any()
 
     colnames = [
@@ -114,13 +112,9 @@ def test_highly_variable_genes_compare_to_seurat(dtype):
     pbmc.X.sort_indices()
     rsc.pp.normalize_total(pbmc, target_sum=1e4)
     rsc.pp.log1p(pbmc)
-    rsc.pp.highly_variable_genes(
-        pbmc, flavor="seurat", min_mean=0.0125, max_mean=3, min_disp=0.5
-    )
+    rsc.pp.highly_variable_genes(pbmc, flavor="seurat", min_mean=0.0125, max_mean=3, min_disp=0.5)
 
-    np.testing.assert_array_equal(
-        seurat_hvg_info["highly_variable"], pbmc.var["highly_variable"]
-    )
+    np.testing.assert_array_equal(seurat_hvg_info["highly_variable"], pbmc.var["highly_variable"])
 
     # (still) Not equal to tolerance rtol=2e-05, atol=2e-05
     # np.testing.assert_allclose(4, 3.9999, rtol=2e-05, atol=2e-05)
@@ -175,9 +169,7 @@ def test_compare_to_seurat_v3():
     )
     ### test with batch
     # introduce a dummy "technical covariate"; this is used in Seurat's SelectIntegrationFeatures
-    pbmc.obs["dummy_tech"] = (
-        "source_" + pd.array([*range(1, 6), 5]).repeat(500).astype("string")
-    )[: pbmc.n_obs]
+    pbmc.obs["dummy_tech"] = ("source_" + pd.array([*range(1, 6), 5]).repeat(500).astype("string"))[: pbmc.n_obs]
 
     pbmc_paper = pbmc.copy()
 
@@ -185,14 +177,14 @@ def test_compare_to_seurat_v3():
         pbmc_paper,
         n_top_genes=2000,
         flavor="seurat_v3_paper",
-        batch_key="dummy_tech",
+        batch="obs.dummy_tech",
     )
 
     rsc.pp.highly_variable_genes(
         pbmc,
         n_top_genes=2000,
         flavor="seurat_v3",
-        batch_key="dummy_tech",
+        batch="obs.dummy_tech",
     )
 
     seurat_v3_paper = pbmc_paper.var
@@ -201,12 +193,8 @@ def test_compare_to_seurat_v3():
     seurat_hvg_info_batch = pd.read_csv(FILE_V3_BATCH)
     seu = pd.Index(seurat_hvg_info_batch["x"].to_numpy())
 
-    gene_intersection_paper = seu.intersection(
-        seurat_v3_paper[seurat_v3_paper["highly_variable"]].index
-    )
-    gene_intersection_impl = seu.intersection(
-        seurat_v3[seurat_v3["highly_variable"]].index
-    )
+    gene_intersection_paper = seu.intersection(seurat_v3_paper[seurat_v3_paper["highly_variable"]].index)
+    gene_intersection_impl = seu.intersection(seurat_v3[seurat_v3["highly_variable"]].index)
     assert len(gene_intersection_paper) / 2000 > 0.95
     assert len(gene_intersection_impl) / 2000 < 0.95
 
@@ -236,9 +224,7 @@ def test_seurat_v3_mean_var_output_with_batchkey(dtype, sparse):
     true_mean = cp.mean(X, axis=0)
     true_var = cp.var(X, axis=0, dtype=np.float64, ddof=1)
 
-    rsc.pp.highly_variable_genes(
-        pbmc, batch_key="batch", flavor="seurat_v3", n_top_genes=4000
-    )
+    rsc.pp.highly_variable_genes(pbmc, batch="obs.batch", flavor="seurat_v3", n_top_genes=4000)
     cp.testing.assert_allclose(true_mean, pbmc.var["means"], rtol=2e-05, atol=2e-05)
     cp.testing.assert_allclose(true_var, pbmc.var["variances"], rtol=2e-05, atol=2e-05)
 
@@ -271,11 +257,9 @@ def _check_pearson_hvg_columns(output_df, n_top_genes):
 @pytest.mark.parametrize("n_top_genes", [100, 200])
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("sparse", [True, False])
-def test_highly_variable_genes_pearson_residuals_general(
-    clip, theta, n_top_genes, dtype, sparse
-):
+def test_highly_variable_genes_pearson_residuals_general(clip, theta, n_top_genes, dtype, sparse):
     cudata = sc.datasets.pbmc3k().copy()
-    cudata = cudata[:1000, :500]
+    cudata = cudata[:1000, :500].copy()
     np.random.seed(42)
     cudata.obs["batch"] = np.random.randint(0, 3, size=cudata.shape[0])
     sc.pp.filter_genes(cudata, min_cells=1)
@@ -286,9 +270,7 @@ def test_highly_variable_genes_pearson_residuals_general(
     else:
         cudata.X = cp.array(cudata.X.toarray(), dtype=dtype)
     # compute reference output
-    residuals_reference = rsc.pp.normalize_pearson_residuals(
-        cudata, clip=clip, theta=theta, inplace=False
-    )
+    residuals_reference = rsc.pp.normalize_pearson_residuals(cudata, clip=clip, theta=theta, out=True)
     residual_variances_reference = cp.var(residuals_reference, axis=0)
 
     # compute output to be tested
@@ -312,27 +294,19 @@ def test_highly_variable_genes_pearson_residuals_general(
 
     print(cudata.var["residual_variances"].values.shape)
     print(residual_variances_reference.shape)
-    print(
-        f"cudata.var['residual_variances'].values: {cudata.var['residual_variances'].values}"
-    )
+    print(f"cudata.var['residual_variances'].values: {cudata.var['residual_variances'].values}")
     print(f"residual_variances_reference: {residual_variances_reference}")
-    assert np.allclose(
-        cudata.var["residual_variances"].values, residual_variances_reference
-    )
+    assert np.allclose(cudata.var["residual_variances"].values, residual_variances_reference)
 
     # check hvg flag - verify HVG selection is reasonable
     # (genes marked as HVG should have high residual variance)
     hvg_idx = np.where(cudata.var["highly_variable"])[0]
-    topn_idx = np.sort(
-        np.argsort(-cudata.var["residual_variances"].values)[:n_top_genes]
-    )
+    topn_idx = np.sort(np.argsort(-cudata.var["residual_variances"].values)[:n_top_genes])
     # Allow for minor ranking differences due to numerical precision
     # when genes have nearly identical variances
     if dtype == "float32":
         overlap = len(set(hvg_idx) & set(topn_idx))
-        assert overlap >= n_top_genes - int(n_top_genes * 0.01), (
-            f"HVG overlap {overlap}/{n_top_genes} too low"
-        )
+        assert overlap >= n_top_genes - int(n_top_genes * 0.01), f"HVG overlap {overlap}/{n_top_genes} too low"
     else:
         assert np.all(hvg_idx == topn_idx)
     # check ranks
@@ -360,7 +334,7 @@ def test_highly_variable_genes_pearson_residuals_batch(n_top_genes, dtype):
         cudata,
         flavor="pearson_residuals",
         n_top_genes=n_top_genes,
-        batch_key="batch",
+        batch="obs.batch",
     )
 
     # check output is complete
@@ -382,9 +356,7 @@ def test_highly_variable_genes_pearson_residuals_batch(n_top_genes, dtype):
     nbatches = len(np.unique(cudata.obs["batch"]))
     assert cudata.var["highly_variable_intersection"].values.dtype is np.dtype("bool")
     assert np.sum(cudata.var["highly_variable_intersection"]) <= n_top_genes * nbatches
-    assert np.all(
-        cudata.var["highly_variable"][cudata.var.highly_variable_intersection]
-    )
+    assert np.all(cudata.var["highly_variable"][cudata.var.highly_variable_intersection])
 
     # check ranks (with batch_key these are the median of within-batch ranks)
     assert cudata.var["highly_variable_rank"].dtype.kind == "f"
@@ -412,7 +384,7 @@ def test_pearson_residuals_batch_order_invariant():
         a1,
         flavor="pearson_residuals",
         n_top_genes=100,
-        batch_key="batch",
+        batch="obs.batch",
         check_values=False,
     )
 
@@ -423,7 +395,7 @@ def test_pearson_residuals_batch_order_invariant():
         a2,
         flavor="pearson_residuals",
         n_top_genes=100,
-        batch_key="batch",
+        batch="obs.batch",
         check_values=False,
     )
 
@@ -498,9 +470,7 @@ def test_poisson_gene_selection_compare_to_scvi(dtype, sparse):
     our_hvg = set(pbmc.var[pbmc.var["highly_variable"]].index)
     overlap = len(ref_hvg & our_hvg)
     overlap_pct = overlap / n_top_genes
-    assert overlap_pct >= 0.95, (
-        f"HVG overlap {overlap_pct:.1%} is too low (expected >= 95%)"
-    )
+    assert overlap_pct >= 0.95, f"HVG overlap {overlap_pct:.1%} is too low (expected >= 95%)"
 
     # Check prob_zero_enriched_nbatches (should be 1 for HVGs, 0 for non-HVGs in single batch)
     hvg_mask = pbmc.var["highly_variable"]
@@ -512,3 +482,46 @@ def test_poisson_gene_selection_compare_to_scvi(dtype, sparse):
 
     # Check uns is set correctly
     assert pbmc.uns["hvg"]["flavor"] == "poisson_zeros"
+
+
+@pytest.mark.parametrize("flavor", ["seurat", "seurat_v3", "pearson_residuals", "poisson_gene_selection"])
+def test_hvg_out_true(flavor):
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = sc.datasets.pbmc3k()[:500].copy()
+    sc.pp.filter_genes(adata, min_cells=10)
+    adata.layers["counts"] = cpx.scipy.sparse.csr_matrix(adata.X.astype(np.float32))
+    adata.X = adata.layers["counts"].copy()
+    if flavor == "seurat":
+        adata.X = adata.X.log1p()
+    adata.obs["b"] = np.arange(adata.n_obs) % 2
+    use = A.X if flavor == "seurat" else A.layers["counts"]
+    df = rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=50, use=use, batch=A.obs["b"], out=True)
+    assert "highly_variable" not in adata.var
+    assert df.index.equals(adata.var_names)
+    assert df["highly_variable"].sum() == 50
+    with pytest.warns(FutureWarning, match="batch_key"):
+        rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=50, use=use, batch_key="b")
+    pd.testing.assert_frame_equal(adata.var[df.columns], df)
+
+
+def test_hvg_proxy_reuses_obs_names(monkeypatch):
+    """The internal proxy shares the caller's obs_names (here duplicated) instead of generating one per cell."""
+    import warnings
+
+    from rapids_singlecell.preprocessing import _hvg
+
+    adata = sc.datasets.blobs()
+    adata.X = cp.asarray(adata.X)
+    adata.obs_names = ["a", "b"] * (adata.n_obs // 2)
+    names, single, seen = adata.obs_names, _hvg._highly_variable_genes_single_batch, []
+
+    def spy(ad, **kwargs):
+        seen.append(ad.obs_names)
+        return single(ad, **kwargs)
+
+    monkeypatch.setattr(_hvg, "_highly_variable_genes_single_batch", spy)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", "Observation names are not unique")
+        rsc.pp.highly_variable_genes(adata)
+    assert seen[0].equals(names)

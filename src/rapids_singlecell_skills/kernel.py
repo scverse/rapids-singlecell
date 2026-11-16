@@ -31,9 +31,7 @@ def _fail(report: Report, step: str, error: BaseException) -> None:
 
 
 def _finish(report: Report, *, display: bool) -> Report:
-    report["ready"] = all(
-        report["checks"].get(step, {}).get("status") == "pass" for step in _STEPS
-    )
+    report["ready"] = all(report["checks"].get(step, {}).get("status") == "pass" for step in _STEPS)
     if display:
         print("RAPIDS-singlecell environment preflight")
         for step in _STEPS:
@@ -181,9 +179,7 @@ def _preflight(
             raise RuntimeError("no installed native _cuda extensions found")
         for name in names:
             try:
-                modules[name] = importlib.import_module(
-                    f"rapids_singlecell._cuda.{name}"
-                )
+                modules[name] = importlib.import_module(f"rapids_singlecell._cuda.{name}")
             except Exception as error:  # noqa: BLE001 - report every loader failure
                 failures[name] = " ".join(str(error).splitlines())
         if failures:

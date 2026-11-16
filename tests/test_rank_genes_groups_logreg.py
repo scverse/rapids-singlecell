@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 import scanpy as sc
 
 import rapids_singlecell as rsc
+
+pytestmark = pytest.mark.filterwarnings("ignore:The function rank_genes_groups_logreg is deprecated:FutureWarning")
 
 
 def test_rank_genes_groups_with_renamed_categories():
@@ -33,7 +36,7 @@ def test_rank_genes_groups_with_renamed_categories_use_rep():
     adata.layers["to_test"] = adata.X.copy()
     adata.X = adata.X[::-1, :]
 
-    rsc.tl.rank_genes_groups_logreg(adata, "blobs", layer="to_test", use_raw=False)
+    rsc.tl.rank_genes_groups_logreg(adata, "blobs", use="layers.to_test")
     assert adata.uns["rank_genes_groups"]["names"].dtype.names == ("0", "1", "2")
     assert adata.uns["rank_genes_groups"]["names"][0].tolist() == ("1", "3", "0")
 
@@ -48,10 +51,6 @@ def test_rank_genes_groups_with_unsorted_groups():
     bdata = adata.copy()
     rsc.tl.rank_genes_groups_logreg(adata, "blobs", groups=["Zero", "One", "Three"])
     rsc.tl.rank_genes_groups_logreg(bdata, "blobs", groups=["One", "Three", "Zero"])
-    array_ad = pd.DataFrame(
-        adata.uns["rank_genes_groups"]["scores"]["Three"]
-    ).to_numpy()
-    array_bd = pd.DataFrame(
-        bdata.uns["rank_genes_groups"]["scores"]["Three"]
-    ).to_numpy()
+    array_ad = pd.DataFrame(adata.uns["rank_genes_groups"]["scores"]["Three"]).to_numpy()
+    array_bd = pd.DataFrame(bdata.uns["rank_genes_groups"]["scores"]["Three"]).to_numpy()
     np.testing.assert_equal(array_ad, array_bd)

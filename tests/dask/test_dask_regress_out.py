@@ -19,9 +19,7 @@ def _make_adata(n_obs=1000, n_genes=100, density=0.6, dtype="float32"):
     from anndata import AnnData
 
     rng = np.random.default_rng(42)
-    X = sp_random(
-        n_obs, n_genes, density=density, format="csr", random_state=rng
-    ).astype(dtype)
+    X = sp_random(n_obs, n_genes, density=density, format="csr", random_state=rng).astype(dtype)
     adata = AnnData(X)
     adata.obs["percent_mito"] = rng.random(n_obs).astype(dtype)
     adata.obs["n_counts"] = np.array(X.sum(axis=1)).ravel()
@@ -38,7 +36,7 @@ def test_regress_out_categorical_dask(client, data_kind, dtype):
     # Non-dask reference
     ref = adata.copy()
     rsc.get.anndata_to_GPU(ref)
-    rsc.pp.regress_out(ref, keys=["batch"])
+    rsc.pp.regress_out(ref, ["batch"])
 
     # Dask version
     dask_data = adata.copy()
@@ -47,7 +45,7 @@ def test_regress_out_categorical_dask(client, data_kind, dtype):
     else:
         dask_data.X = as_dense_cupy_dask_array(dask_data.X)
 
-    rsc.pp.regress_out(dask_data, keys=["batch"])
+    rsc.pp.regress_out(dask_data, ["batch"])
 
     dask_X = dask_data.X.compute()
 
@@ -64,7 +62,7 @@ def test_regress_out_continuous_dask(client, data_kind, dtype):
     # Non-dask reference
     ref = adata.copy()
     rsc.get.anndata_to_GPU(ref)
-    rsc.pp.regress_out(ref, keys=["n_counts", "percent_mito"], batchsize="all")
+    rsc.pp.regress_out(ref, ["n_counts", "percent_mito"], batchsize="all")
 
     # Dask version
     dask_data = adata.copy()
@@ -73,7 +71,7 @@ def test_regress_out_continuous_dask(client, data_kind, dtype):
     else:
         dask_data.X = as_dense_cupy_dask_array(dask_data.X)
 
-    rsc.pp.regress_out(dask_data, keys=["n_counts", "percent_mito"])
+    rsc.pp.regress_out(dask_data, ["n_counts", "percent_mito"])
 
     dask_X = dask_data.X.compute()
 
@@ -94,7 +92,7 @@ def test_regress_out_reproducible_dask(client, data_kind, dtype):
     else:
         adata.X = as_dense_cupy_dask_array(adata.X)
 
-    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"])
+    rsc.pp.regress_out(adata, ["n_counts", "percent_mito"])
 
     # This file was generated for scanpy version 1.10.3
     tester = np.load(Path(__file__).parent.parent / "_data/regress_test_small.npy")
@@ -113,7 +111,7 @@ def test_regress_out_singular_dask(client, data_kind):
         adata.X = as_dense_cupy_dask_array(adata.X)
 
     with pytest.raises(ValueError, match="singular"):
-        rsc.pp.regress_out(adata, keys=["n_counts", "n_counts_copy"])
+        rsc.pp.regress_out(adata, ["n_counts", "n_counts_copy"])
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
@@ -126,9 +124,7 @@ def test_regress_out_inplace_false_dask(client, data_kind):
     else:
         dask_data.X = as_dense_cupy_dask_array(dask_data.X)
 
-    result = rsc.pp.regress_out(
-        dask_data, keys=["n_counts", "percent_mito"], inplace=False
-    )
+    result = rsc.pp.regress_out(dask_data, ["n_counts", "percent_mito"], out=True)
     assert result is not None
     # Result should be a DaskArray
     from dask.array import Array as DaskArray

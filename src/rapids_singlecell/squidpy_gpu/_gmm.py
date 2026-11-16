@@ -42,9 +42,7 @@ def _allocate_m_step_workspace(X: cp.ndarray, K: int) -> dict[str, cp.ndarray]:
     }
 
 
-def _allocate_em_workspace(
-    X: cp.ndarray, K: int, e_step_route: _EStepRoute
-) -> dict[str, cp.ndarray]:
+def _allocate_em_workspace(X: cp.ndarray, K: int, e_step_route: _EStepRoute) -> dict[str, cp.ndarray]:
     n = X.shape[0]
     workspace = {
         "log_prob": cp.empty((n, K), dtype=X.dtype),
@@ -326,10 +324,7 @@ def _initialize_parameters(
         return _random_from_data_init(X, K, random_state, reg_covar)
 
     if init not in ("kmeans", "sklearn_kmeans"):
-        raise ValueError(
-            "init must be 'kmeans', 'random_from_data', or "
-            f"'sklearn_kmeans', got {init!r}"
-        )
+        raise ValueError(f"init must be 'kmeans', 'random_from_data', or 'sklearn_kmeans', got {init!r}")
 
     labels, centers = _fit_kmeans(
         X,

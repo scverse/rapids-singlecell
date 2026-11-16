@@ -116,9 +116,7 @@ class Mixscale(PerturbationEfficacyAnalyzer):
         else:
             split_obs = adata.obs[split_by]
             categories = list(split_obs.unique())
-            split_masks = [
-                (split_obs == category).to_numpy() for category in categories
-            ]
+            split_masks = [(split_obs == category).to_numpy() for category in categories]
 
         perturbation_markers = self._get_perturbation_markers(
             adata,
@@ -199,18 +197,14 @@ class Mixscale(PerturbationEfficacyAnalyzer):
         scores_gpu = cp.zeros(adata.n_obs, dtype=X.dtype)
         if gene_jobs:
             _project_scores_batched(X, gene_jobs, scores_gpu, do_scale=scale)
-        adata.obs[new_class_name] = cp.asnumpy(scores_gpu).astype(
-            np.float64, copy=False
-        )
+        adata.obs[new_class_name] = cp.asnumpy(scores_gpu).astype(np.float64, copy=False)
 
         if copy:
             return adata
         return None
 
 
-def _project_scores_batched(
-    X: cp.ndarray, gene_jobs: list[dict], scores_gpu: cp.ndarray, *, do_scale: bool
-) -> None:
+def _project_scores_batched(X: cp.ndarray, gene_jobs: list[dict], scores_gpu: cp.ndarray, *, do_scale: bool) -> None:
     """Batched Mixscale scoring for all genes in one kernel launch.
 
     Flattens each gene's cell indices, DE-gene indices and guide/control masks

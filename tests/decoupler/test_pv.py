@@ -18,6 +18,4 @@ def test_func_mlm(
     dc_pv_df = adata.obsm["padj_mlm"]
     dc_pv = dc_pv_df.values.astype(np.float64)
     adj = fdr_bh_axis1(dc_pv, if_gpu=if_gpu)
-    np.testing.assert_allclose(
-        adj, sts.false_discovery_control(dc_pv, axis=1, method="bh")
-    )
+    np.testing.assert_allclose(adj, sts.false_discovery_control(dc_pv, axis=1, method="bh"))

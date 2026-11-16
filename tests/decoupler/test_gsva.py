@@ -14,9 +14,7 @@ from rapids_singlecell.decoupler_gpu import _method_gsva as g
 
 def _data(kcdf):
     rng = np.random.default_rng(820)
-    mat = (
-        rng.poisson(3, size=(9, 37)) if kcdf == "poisson" else rng.normal(size=(9, 37))
-    ).astype(np.float32)
+    mat = (rng.poisson(3, size=(9, 37)) if kcdf == "poisson" else rng.normal(size=(9, 37))).astype(np.float32)
     frame = pd.DataFrame(mat, columns=[f"g{i}" for i in range(mat.shape[1])])
     sets = [np.arange(7), np.arange(5, 18), np.arange(20, 37, 2)]
     net = pd.DataFrame(
@@ -96,9 +94,7 @@ def test_dask_rejects_nonfinite_values(value, sparse):
     mat[0, 0] = value
     if sparse:
         mat = sps.csr_matrix(mat)
-    adata = AnnData(
-        da.from_array(mat, chunks=(2, 11)), var=pd.DataFrame(index=frame.columns)
-    )
+    adata = AnnData(da.from_array(mat, chunks=(2, 11)), var=pd.DataFrame(index=frame.columns))
     with pytest.raises(ValueError, match="non finite"):
         dc.gsva(adata, net, tmin=0, kcdf=None)
 
@@ -109,9 +105,7 @@ def test_sparse_anndata_and_dask_match_dense():
     frame, net = _data("gaussian")
     dense, _ = dc.gsva(frame, net, tmin=0)
 
-    adata = AnnData(
-        sps.csr_matrix(frame.to_numpy()), var=pd.DataFrame(index=frame.columns)
-    )
+    adata = AnnData(sps.csr_matrix(frame.to_numpy()), var=pd.DataFrame(index=frame.columns))
     dc.gsva(adata, net, tmin=0)
     pd.testing.assert_frame_equal(adata.obsm["score_gsva"], dense)
 
@@ -161,9 +155,7 @@ def test_sparse_conversion_preserves_duplicate_values(nobs, kcdf, monkeypatch):
 @pytest.mark.parametrize("raw,layer", [(False, None), (True, None), (False, "signal")])
 def test_anndata_representation_and_return(raw, layer):
     frame, net = _data("gaussian")
-    adata = AnnData(
-        sps.csr_matrix(frame.to_numpy()), var=pd.DataFrame(index=frame.columns)
-    )
+    adata = AnnData(sps.csr_matrix(frame.to_numpy()), var=pd.DataFrame(index=frame.columns))
     adata.raw = adata.copy()
     adata = adata[:, :30].copy()
     adata.layers["signal"] = adata.X.copy()
@@ -188,9 +180,7 @@ def test_sparse_anndata_batching_matches_decoupler(backed, bsize, tmp_path):
     from anndata import read_h5ad
 
     frame, net = _data("gaussian")
-    adata = AnnData(
-        sps.csr_matrix(frame.to_numpy()), var=pd.DataFrame(index=frame.columns)
-    )
+    adata = AnnData(sps.csr_matrix(frame.to_numpy()), var=pd.DataFrame(index=frame.columns))
     if backed:
         path = tmp_path / "gsva.h5ad"
         adata.write_h5ad(path)
@@ -204,9 +194,7 @@ def test_sparse_anndata_batching_matches_decoupler(backed, bsize, tmp_path):
         reference_bsize = bsize if backed else adata.n_obs
         dc_cpu.mt.gsva(reference, net, tmin=0, kcdf=None, bsize=reference_bsize)
         assert dc.gsva(adata, net, tmin=0, kcdf=None, bsize=bsize) is None
-        pd.testing.assert_frame_equal(
-            adata.obsm["score_gsva"], reference.obsm["score_gsva"]
-        )
+        pd.testing.assert_frame_equal(adata.obsm["score_gsva"], reference.obsm["score_gsva"])
         assert "padj_gsva" not in adata.obsm
     finally:
         if backed:
@@ -322,9 +310,7 @@ def test_signed_symmetric_walk_all_score_kernels(factor, tau):
     # Scaling the same symmetric walk dispatches sets of 3, 33, and 2049
     # targets. Compare the reference scorer directly to avoid quadratic ranking.
     nvar = 37 * factor
-    targets = np.concatenate(
-        [np.arange(i * factor, (i + 1) * factor, dtype=np.int32) for i in (10, 16, 26)]
-    )
+    targets = np.concatenate([np.arange(i * factor, (i + 1) * factor, dtype=np.int32) for i in (10, 16, 26)])
     dos = np.arange(1, nvar + 1, dtype=np.int32)[None, :]
     srs = np.abs(2 * dos - nvar - 2) // 2
     expected = dc_cpu.mt._gsva._ks_fset(dos, srs, targets + 1, False, False, tau)
@@ -341,18 +327,14 @@ def test_signed_symmetric_walk_all_score_kernels(factor, tau):
     np.testing.assert_allclose(actual.get()[:, 0], expected, rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize(
-    ("maxdiff", "absrnk"), [(True, False), (True, True), (False, False)]
-)
+@pytest.mark.parametrize(("maxdiff", "absrnk"), [(True, False), (True, True), (False, False)])
 def test_degenerate_sets_match_decoupler(maxdiff, absrnk):
     mat = np.arange(5, dtype=np.float32)[None, :]
     sets = [np.arange(5), np.array([2])]
     sizes = np.array(list(map(len, sets)), dtype=np.int32)
     cnct = np.concatenate(sets).astype(np.int32)
     starts = np.r_[0, np.cumsum(sizes)[:-1]].astype(np.int32)
-    expected, _ = dc_cpu.mt._gsva._func_gsva(
-        mat, cnct, starts, sizes, maxdiff=maxdiff, absrnk=absrnk
-    )
+    expected, _ = dc_cpu.mt._gsva._func_gsva(mat, cnct, starts, sizes, maxdiff=maxdiff, absrnk=absrnk)
     actual, _ = g._func_gsva(
         cp.asarray(mat),
         cnct=cp.asarray(cnct),
@@ -378,9 +360,7 @@ def test_validation_matches_decoupler():
 def test_poisson_density_ties_preserve_default_scores(shift):
     mat = np.random.default_rng(61).poisson(3, (10, 20)).astype(np.float32) + shift
     frame = pd.DataFrame(mat, columns=[f"g{i}" for i in range(20)])
-    net = pd.DataFrame(
-        {"source": np.tile(["a", "b", "c", "d"], 5), "target": frame.columns}
-    )
+    net = pd.DataFrame({"source": np.tile(["a", "b", "c", "d"], 5), "target": frame.columns})
     expected, _ = dc_cpu.mt.gsva(frame, net, kcdf="poisson", tmin=0)
     actual, _ = dc.gsva(frame, net, kcdf="poisson", tmin=0)
     pd.testing.assert_frame_equal(actual, expected, rtol=1e-6, atol=1e-6)
@@ -427,15 +407,11 @@ def test_large_poisson_counts_match_decoupler():
 def test_large_feature_sets_match_decoupler():
     rng = np.random.default_rng(12)
     mat = rng.normal(size=(4, 300)).astype(np.float32)
-    sets = [
-        rng.choice(mat.shape[1], size, replace=False) for size in (1, 127, 129, 250)
-    ]
+    sets = [rng.choice(mat.shape[1], size, replace=False) for size in (1, 127, 129, 250)]
     sizes = np.array(list(map(len, sets)), dtype=np.int32)
     cnct = np.concatenate(sets).astype(np.int32)
     starts = np.r_[0, np.cumsum(sizes)[:-1]].astype(np.int32)
-    expected, _ = dc_cpu.mt._gsva._func_gsva(
-        mat, cnct, starts, sizes, kcdf=None, maxdiff=False, tau=0.5
-    )
+    expected, _ = dc_cpu.mt._gsva._func_gsva(mat, cnct, starts, sizes, kcdf=None, maxdiff=False, tau=0.5)
     actual, _ = g._func_gsva(
         cp.asarray(mat),
         cnct=cp.asarray(cnct),

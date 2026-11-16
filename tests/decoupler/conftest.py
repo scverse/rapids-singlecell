@@ -33,9 +33,7 @@ def tdata_obsm(
     rng,
 ):
     sc.tl.pca(tdata)
-    tdata.obsm["X_umap"] = tdata.obsm["X_pca"][:, :2] + rng.random(
-        tdata.obsm["X_pca"][:, :2].shape
-    )
+    tdata.obsm["X_umap"] = tdata.obsm["X_pca"][:, :2] + rng.random(tdata.obsm["X_pca"][:, :2].shape)
     dc.mt.ulm(data=tdata, net=net, tmin=0)
     return tdata
 

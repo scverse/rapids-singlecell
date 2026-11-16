@@ -22,9 +22,7 @@ def mixscape_adata() -> anndata.AnnData:
     rng = np.random.default_rng(seed=1)
     X = None
     for _ in range(NUM_NOT_DE):
-        cols = [
-            np.clip(rng.normal(0, 1, NUM_CELLS_PER_GROUP), 0, None) for _ in range(3)
-        ]
+        cols = [np.clip(rng.normal(0, 1, NUM_CELLS_PER_GROUP), 0, None) for _ in range(3)]
         gene_i = np.concatenate(cols)[:, None]
         X = gene_i if X is None else np.concatenate((X, gene_i), axis=1)
     for i in range(NUM_DE):
@@ -34,12 +32,7 @@ def mixscape_adata() -> anndata.AnnData:
         gene_i = np.concatenate((nt, npert, ko))[:, None]
         X = np.concatenate((X, gene_i), axis=1)
 
-    obs = pd.DataFrame(
-        {
-            "gene_target": ["NT"] * NUM_CELLS_PER_GROUP
-            + ["target_gene_a"] * NUM_CELLS_PER_GROUP * 2
-        }
-    )
+    obs = pd.DataFrame({"gene_target": ["NT"] * NUM_CELLS_PER_GROUP + ["target_gene_a"] * NUM_CELLS_PER_GROUP * 2})
     obs = obs.set_index(np.arange(NUM_CELLS_PER_GROUP * 3).astype(str))
     var = pd.DataFrame(index=[f"gene{i}" for i in range(1, NUM_NOT_DE + NUM_DE + 1)])
     return anndata.AnnData(X=sparse.csr_matrix(X), obs=obs, var=var)

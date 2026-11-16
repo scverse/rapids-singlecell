@@ -16,8 +16,7 @@ def sparse_multiply(
     E: sparse.csr_matrix | sparse.csc_matrix | NDArray[np.float64],
     a: float | int | NDArray[np.float64],
 ) -> sparse.csr_matrix | sparse.csc_matrix:
-    """multiply each row of E by a scalar"""
-
+    """Multiply each row of E by a scalar"""
     nrow = E.shape[0]
     w = sparse.dia_matrix((a, 0), shape=(nrow, nrow), dtype=a.dtype)
     # w.setdiag(a)
@@ -50,14 +49,12 @@ def subsample_counts(
     if rate < 1:
         dtype = E.dtype
         gpu_rng = cp.random.default_rng(int(rng.integers(0, 2**32)))
-        E.data = gpu_rng.binomial(cp.round(E.data).astype(np.int64), rate).astype(
-            dtype, copy=False
-        )
+        E.data = gpu_rng.binomial(cp.round(E.data).astype(np.int64), rate).astype(dtype, copy=False)
         current_totals = E.sum(1).ravel()
         unsampled_orig_totals = original_totals - current_totals
-        unsampled_downsamp_totals = gpu_rng.binomial(
-            cp.round(unsampled_orig_totals).astype(np.int64), rate
-        ).astype(dtype, copy=False)
+        unsampled_downsamp_totals = gpu_rng.binomial(cp.round(unsampled_orig_totals).astype(np.int64), rate).astype(
+            dtype, copy=False
+        )
         final_downsamp_totals = current_totals + unsampled_downsamp_totals
     else:
         final_downsamp_totals = original_totals

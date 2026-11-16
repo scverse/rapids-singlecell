@@ -59,15 +59,11 @@ def query_set(  # noqa: PLR0917 - Preserve decoupler's positional API.
         "features must be an iterable collection such as a list"
     )
     features = set(features)
-    assert alternative in ("greater", "less", "two-sided"), (
-        "alternative must be 'greater', 'less', or 'two-sided'"
+    assert alternative in ("greater", "less", "two-sided"), "alternative must be 'greater', 'less', or 'two-sided'"
+    assert n_bg is None or (isinstance(n_bg, int | float) and np.isfinite(n_bg) and n_bg >= 0), (
+        "n_bg must be finite, numeric and >= 0, or None"
     )
-    assert n_bg is None or (
-        isinstance(n_bg, int | float) and np.isfinite(n_bg) and n_bg >= 0
-    ), "n_bg must be finite, numeric and >= 0, or None"
-    assert isinstance(ha_corr, int | float) and np.isfinite(ha_corr), (
-        "ha_corr must be finite and numeric"
-    )
+    assert isinstance(ha_corr, int | float) and np.isfinite(ha_corr), "ha_corr must be finite and numeric"
     if background is not None:
         if not hasattr(background, "__iter__") or isinstance(background, str | bytes):
             raise ValueError("background must be an iterable of feature names")
@@ -101,8 +97,7 @@ def query_set(  # noqa: PLR0917 - Preserve decoupler's positional API.
     if np.any(d < 0):
         source = sources[np.flatnonzero(d < 0)[0]]
         raise ValueError(
-            f"n_bg={n_bg} is too small for the union of the query and source={source}; "
-            "increase n_bg or use n_bg=None"
+            f"n_bg={n_bg} is too small for the union of the query and source={source}; increase n_bg or use n_bg=None"
         )
     _log(
         f"query_set - testing {count} selected features against {len(sources)} sets",

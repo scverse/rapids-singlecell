@@ -101,9 +101,7 @@ def _make_csc(dtype, idx_dtype, **kwargs) -> SparseGPU:
 
 def _make_adjacency(dtype, idx_dtype) -> SparseGPU:
     row = np.repeat(np.arange(N_ROWS), 2)
-    col = np.column_stack(
-        ((np.arange(N_ROWS) - 1) % N_ROWS, (np.arange(N_ROWS) + 1) % N_ROWS)
-    ).ravel()
+    col = np.column_stack(((np.arange(N_ROWS) - 1) % N_ROWS, (np.arange(N_ROWS) + 1) % N_ROWS)).ravel()
     data = np.ones(row.size, dtype=dtype)
     adj = sp.csr_matrix((data, (row, col)), shape=(N_ROWS, N_ROWS))
     return SparseGPU(
@@ -801,9 +799,7 @@ def test_sparse_var():
     # Per-group CSR: group major, gene minor, each row dense over all genes
     # so indptr is uniform; data is arbitrary float64.
     rng = np.random.default_rng(SEED)
-    n_cells_per_group = cp.asarray(
-        rng.integers(1, 20, size=n_groups).astype(np.float64)
-    )
+    n_cells_per_group = cp.asarray(rng.integers(1, 20, size=n_groups).astype(np.float64))
     means = cp.asarray(rng.random((n_groups, N_COLS)))
     base_data = cp.asarray(rng.random((n_groups, N_COLS)))
     base_indptr = (np.arange(n_groups + 1) * N_COLS).astype(np.int64)

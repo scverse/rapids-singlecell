@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
 import cupy as cp
+import numpy as np
 import pytest
 
 from rapids_singlecell._utils import _multi_gpu, _split_pairs, parse_device_ids
@@ -52,9 +55,7 @@ class TestSplitPairs:
         pair_right = cp.array([0, 1, 1, 2, 2], dtype=cp.int32)
         group_sizes = cp.array([100, 200, 300], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=3, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=3, group_sizes=group_sizes)
 
         # Concatenate all splits and verify they match original
         all_left = cp.concatenate([r[0] for r in result])
@@ -74,9 +75,7 @@ class TestSplitPairs:
         pair_right = cp.array([1, 2, 2, 2], dtype=cp.int32)
         group_sizes = cp.array([10, 10, 1000], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=2, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=2, group_sizes=group_sizes)
 
         # The diagonal pair (2,2) has most work, should likely be alone or with few others
         # First device should get the smaller pairs, second should get the large diagonal
@@ -95,9 +94,7 @@ class TestSplitPairs:
         # Group 1: 10 cells -> 10*9/2 = 45 work
         group_sizes = cp.array([100, 10], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=2, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=2, group_sizes=group_sizes)
 
         # Each device should get one pair since there are 2 pairs and 2 devices
         # The work is very unbalanced (4950 vs 45), but we only have 2 pairs
@@ -131,14 +128,12 @@ class TestSplitPairs:
         # Exponentially increasing group sizes to create unbalanced work
         group_sizes = cp.array([10, 20, 40, 80, 160], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=3, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=3, group_sizes=group_sizes)
 
         # Calculate actual work per device
         def calc_work(left, right, sizes):
             work = 0
-            for l, r in zip(left.get(), right.get()):
+            for l, r in zip(left.get(), right.get(), strict=False):
                 if l == r:
                     work += sizes[l] * (sizes[l] - 1) // 2
                 else:
@@ -167,9 +162,7 @@ class TestSplitPairs:
         if len(result[0][0]) > 0:
             first_left = result[0][0].get()
             # Should be monotonically increasing (or equal for diagonal)
-            assert all(
-                first_left[i] <= first_left[i + 1] for i in range(len(first_left) - 1)
-            )
+            assert all(first_left[i] <= first_left[i + 1] for i in range(len(first_left) - 1))
 
     def test_single_pair(self):
         """Single pair is assigned to exactly one device."""
@@ -177,9 +170,7 @@ class TestSplitPairs:
         pair_right = cp.array([1], dtype=cp.int32)
         group_sizes = cp.array([100, 100], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=4, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=4, group_sizes=group_sizes)
 
         assert len(result) == 4
         # Exactly one device should have the pair
@@ -205,9 +196,7 @@ class TestSplitPairs:
         n_pairs = len(pair_left)
         assert n_pairs == n_groups * (n_groups + 1) // 2  # 5050 pairs
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=8, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=8, group_sizes=group_sizes)
 
         assert len(result) == 8
         total = sum(len(r[0]) for r in result)
@@ -219,9 +208,7 @@ class TestSplitPairs:
         pair_right = cp.array([1, 2, 2], dtype=cp.int32)
         group_sizes = cp.array([10, 20, 30], dtype=cp.int64)
 
-        result = _split_pairs(
-            pair_left, pair_right, n_devices=2, group_sizes=group_sizes
-        )
+        result = _split_pairs(pair_left, pair_right, n_devices=2, group_sizes=group_sizes)
 
         for left, right in result:
             assert isinstance(left, cp.ndarray)
@@ -276,6 +263,11 @@ class TestParseDeviceIds:
             assert parse_device_ids(multi_gpu=True) == [0]
             assert parse_device_ids(multi_gpu=False) == [0]
 
+    @pytest.mark.parametrize("ids", [[0.0], [True], ["0"]])
+    def test_non_integer_ids_are_rejected(self, ids):
+        with pytest.raises(ValueError, match="must be integers"):
+            parse_device_ids(multi_gpu=ids)
+
 
 class TestDeviceCopy:
     @pytest.fixture(autouse=True)
@@ -293,8 +285,8 @@ class TestDeviceCopy:
 
         monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", cannot_access)
         monkeypatch.setattr(
-            cp,
-            "copyto",
+            cp.cuda.runtime,
+            "memcpyPeerAsync",
             lambda *_: pytest.fail("a non-P2P pair must not run the canary"),
         )
 
@@ -303,13 +295,42 @@ class TestDeviceCopy:
         assert not _multi_gpu._peer_copy_works(0, 1)
         assert checked == [(1, 0), (0, 1)]
 
-    def test_silent_copy_failure_is_detected(self, monkeypatch):
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
-        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
-        monkeypatch.setattr(cp, "copyto", lambda *_: None)
+    def test_one_way_peer_access_is_not_enabled(self, monkeypatch):
+        # Enabling the unsupported direction would fail with cudaErrorInvalidDevice.
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda device, peer: device == 1)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", lambda *_: pytest.fail("one-way access"))
 
         assert not _multi_gpu._peer_copy_works(1, 0)
+
+    @pytest.mark.two_gpus
+    def test_silent_copy_failure_is_detected(self, monkeypatch):
+        # The access enabled for the canary is disabled again, with a warning.
+        toggled = []
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+        monkeypatch.setattr(
+            cp.cuda.runtime, "deviceEnablePeerAccess", lambda peer: toggled.append(("on", cp.cuda.Device().id, peer))
+        )
+        monkeypatch.setattr(
+            cp.cuda.runtime, "deviceDisablePeerAccess", lambda peer: toggled.append(("off", cp.cuda.Device().id, peer))
+        )
+        monkeypatch.setattr(cp.cuda.runtime, "memcpyPeerAsync", lambda *_: None)
+
+        with pytest.warns(UserWarning, match="GPU 0 to GPU 1 do not work .the copies arrive corrupted"):
+            assert not _multi_gpu._peer_copy_works(1, 0)
+        assert toggled == [("on", 1, 0), ("on", 0, 1), ("off", 1, 0), ("off", 0, 1)]
+
+    @pytest.mark.two_gpus
+    def test_rejected_peer_access_is_reported(self, monkeypatch):
+        # A peer error while enabling (here: unsupported) means host copies, with the status in the warning.
+        def unsupported(peer):
+            raise cp.cuda.runtime.CUDARuntimeError(_multi_gpu._CUDA_ERROR_PEER_ACCESS_UNSUPPORTED)
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", unsupported)
+        monkeypatch.setattr(cp.cuda.runtime, "deviceDisablePeerAccess", lambda *_: pytest.fail("nothing enabled"))
+
+        with pytest.warns(UserWarning, match="status 217"):
+            assert not _multi_gpu._peer_copy_works(1, 0)
 
     @pytest.mark.parametrize(
         ("works", "selected", "unused"),
@@ -323,10 +344,8 @@ class TestDeviceCopy:
         copied = object()
         destination = source.device.id + 1
         monkeypatch.setattr(_multi_gpu, "_peer_copy_works", lambda *_: works)
-        monkeypatch.setattr(_multi_gpu, selected, lambda *_: copied)
-        monkeypatch.setattr(
-            _multi_gpu, unused, lambda *_: pytest.fail("wrong copy route")
-        )
+        monkeypatch.setattr(_multi_gpu, selected, lambda *_, **__: copied)
+        monkeypatch.setattr(_multi_gpu, unused, lambda *_, **__: pytest.fail("wrong copy route"))
 
         assert _multi_gpu._copy_to_device(source, destination) is copied
 
@@ -340,13 +359,102 @@ class TestDeviceCopy:
 
         assert _multi_gpu._copy_to_device(source, source.device.id) is source
 
-    def test_host_copy(self):
-        if cp.cuda.runtime.getDeviceCount() < 2:
-            pytest.skip("requires two GPUs")
+    @pytest.mark.two_gpus
+    def test_host_copy(self, monkeypatch):
+        monkeypatch.setattr(_multi_gpu, "_RELAY_BYTES", 24)  # several chunks through the two pinned buffers
         with cp.cuda.Device(0):
-            source = cp.arange(8)
+            source = cp.arange(80)
 
         copied = _multi_gpu._copy_to_device_via_host(source, 1)
 
         assert copied.device.id == 1
-        assert copied.get().tolist() == list(range(8))
+        assert copied.get().tolist() == list(range(80))
+
+    @pytest.mark.two_gpus
+    @pytest.mark.parametrize("copy", ["_copy_to_device_p2p", "_copy_to_device_via_host", "_copy_to_device"])
+    @pytest.mark.parametrize(
+        "view",
+        [
+            lambda a: a,
+            cp.asfortranarray,
+            lambda a: a.T,
+            lambda a: a[::3],
+            lambda a: a[:, ::-1],
+            lambda a: a[:0],
+        ],
+        ids=["C", "F", "transposed", "strided", "reversed", "empty"],
+    )
+    def test_copies_keep_values_and_layout(self, copy, view):
+        if copy == "_copy_to_device_p2p" and not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        with cp.cuda.Device(0):
+            source = view(cp.arange(60, dtype=cp.float32).reshape(12, 5))
+
+        copied = getattr(_multi_gpu, copy)(source, 1)
+
+        assert copied.device.id == 1
+        np.testing.assert_array_equal(copied.get(), source.get())
+        if source.flags.c_contiguous or source.flags.f_contiguous:
+            assert copied.flags.f_contiguous == source.flags.f_contiguous
+
+    @pytest.mark.two_gpus
+    @pytest.mark.parametrize("copy", ["_copy_to_device_p2p", "_copy_to_device_via_host", "_copy_to_device"])
+    def test_copies_into_out_check_it(self, copy):
+        if copy == "_copy_to_device_p2p" and not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        with cp.cuda.Device(0):
+            source = cp.arange(60, dtype=cp.float32).reshape(12, 5)
+            on_source = cp.empty_like(source)
+        with cp.cuda.Device(1):
+            out = cp.empty_like(source)
+            wrong = [cp.empty_like(source, dtype=cp.float64), cp.empty((5, 12), cp.float32), cp.asfortranarray(out)]
+
+        assert getattr(_multi_gpu, copy)(source, 1, out=out) is out
+
+        np.testing.assert_array_equal(out.get(), source.get())
+        for bad in [*wrong, on_source]:
+            with pytest.raises(ValueError, match="out must have"):
+                getattr(_multi_gpu, copy)(source, 1, out=bad)
+
+    @pytest.mark.two_gpus
+    def test_check_enables_peer_access(self, monkeypatch):
+        # The canary runs the direct path that later copies take.
+        enable, enabled = cp.cuda.runtime.deviceEnablePeerAccess, []
+
+        def record(peer):
+            enabled.append((cp.cuda.Device().id, peer))
+            return enable(peer)
+
+        monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", record)
+        if not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        assert enabled == [(1, 0), (0, 1)]
+
+    @pytest.mark.two_gpus
+    @pytest.mark.usefixtures("cupy_pool")  # stream-ordered block reuse
+    @pytest.mark.parametrize("other_stream", [False, True])
+    def test_peer_copy_orders_the_source_after_it(self, other_stream):
+        # The source may be released right away: with the destination's stream
+        # held up, the source GPU reuses its pool block only after the copy,
+        # also when the block belongs to a stream other than the current one.
+        if not _multi_gpu._peer_copy_works(1, 0):
+            pytest.skip("no working peer copies on this system")
+        n = 1 << 22
+        for device in (0, 1):  # loaded kernels and a pooled block
+            with cp.cuda.Device(device):
+                cp.full(n, -1, dtype=cp.float32)
+                cp.cuda.Device().synchronize()
+        with cp.cuda.Device(0):
+            allocating = cp.cuda.Stream(non_blocking=True) if other_stream else None
+            with allocating or cp.cuda.get_current_stream():
+                source = cp.arange(n, dtype=cp.float32)
+            cp.cuda.Device().synchronize()
+        with cp.cuda.Device(1), cp.cuda.Stream(non_blocking=True) as stream:
+            stream.launch_host_func(lambda _: time.sleep(0.2), None)
+            copied = _multi_gpu._copy_to_device(source, 1)
+        del source
+        with cp.cuda.Device(0), allocating or cp.cuda.get_current_stream():
+            cp.full(n, -1, dtype=cp.float32)  # takes the source's block
+        with cp.cuda.Device(1):
+            cp.cuda.Device().synchronize()
+            assert bool((copied == cp.arange(n, dtype=cp.float32)).all())

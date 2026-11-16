@@ -132,7 +132,7 @@ def _build_sparse_distances(
 
 
 def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
-    """Host CSR of a GPU COO matrix with too many entries for CuPy's 32-bit CSR.
+    """Host CSR of a GPU COO matrix.
 
     The graphs cuML builds are sorted by row and column, so only the row pointers
     have to be computed (on the GPU), instead of converting billions of entries on the host.
@@ -144,11 +144,19 @@ def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
     del canonical
     indptr = cp.zeros(coo.shape[0] + 1, dtype=cp.int64)
     cp.cumsum(cp.bincount(row, minlength=coo.shape[0]), out=indptr[1:])
-    csr = sc_sparse.csr_matrix(
-        (coo.data.get(), col.get(), indptr.get()), shape=coo.shape
-    )
+    csr = sc_sparse.csr_matrix((coo.data.get(), col.get(), indptr.get()), shape=coo.shape)
     csr.has_canonical_format = True
     return csr
+
+
+def _connectivities_to_host_csr(connectivities) -> sc_sparse.csr_matrix:
+    """Host CSR of the connectivities, never running CuPy's ``tocsr`` on the GPU.
+
+    It sorts every entry and its temporaries run out of memory well below 2**31 entries.
+    """
+    if connectivities.format == "coo":  # gauss and jaccard return CSR
+        return _large_coo_to_host_csr(connectivities)
+    return connectivities.get().tocsr()
 
 
 def _get_connectivities_umap(
@@ -209,7 +217,8 @@ def _get_connectivities_gauss(
 
     # Per-cell bandwidth from median of squared distances (exclude self at col 0)
     d_sq = knn_dist**2
-    sigmas_sq = cp.median(d_sq[:, 1:], axis=1)
+    # floor a zero bandwidth (duplicated cells) to keep the limits of 0/0: weight 1 at distance 0, else 0
+    sigmas_sq = cp.maximum(cp.median(d_sq[:, 1:], axis=1), cp.finfo(d_sq.dtype).tiny)
     sigmas = cp.sqrt(sigmas_sq)
 
     # Build sparse CSR from KNN edges (exclude self)
@@ -351,9 +360,7 @@ def _calc_connectivities(
     CuPy sparse matrix on GPU.
     """
     if metric == "inner_product" and method != "jaccard":
-        knn_indices, knn_dist = _inner_product_distances(
-            knn_indices, knn_dist, batch_codes=batch_codes
-        )
+        knn_indices, knn_dist = _inner_product_distances(knn_indices, knn_dist, batch_codes=batch_codes)
     if method == "gauss":
         return _get_connectivities_gauss(
             knn_indices,

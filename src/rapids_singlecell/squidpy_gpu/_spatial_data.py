@@ -9,9 +9,7 @@ if TYPE_CHECKING:
     from spatialdata import SpatialData
 
 
-def _extract_adata(
-    adata: AnnData | SpatialData, *, table_key: str | None = None
-) -> AnnData:
+def _extract_adata(adata: AnnData | SpatialData, *, table_key: str | None = None) -> AnnData:
     """Resolve an optional SpatialData input without importing it for AnnData."""
     if isinstance(adata, AnnData):
         return adata
@@ -30,10 +28,7 @@ def _extract_adata(
     if table_key is None:
         raise TypeError("SpatialData input requires `table_key`.")
     if table_key not in adata.tables:
-        raise ValueError(
-            f"Table {table_key!r} not found in SpatialData. "
-            f"Available tables: {list(adata.tables)}"
-        )
+        raise ValueError(f"Table {table_key!r} not found in SpatialData. Available tables: {list(adata.tables)}")
     return adata.tables[table_key]
 
 
@@ -63,20 +58,16 @@ def _resolve_spatial_data(
         raise ValueError(f"`adata.obs[{region_key!r}]` has missing labels.")
     missing = set(regions) - elements_to_coordinate_systems.keys()
     if missing:
-        raise ValueError(
-            f"Missing coordinate systems for table regions: {sorted(missing)}."
-        )
+        raise ValueError(f"Missing coordinate systems for table regions: {sorted(missing)}.")
     coords = np.empty((table.n_obs, 2), dtype=np.float64)
     for region in regions.unique():
-        centroids = get_centroids(
-            adata[region], coordinate_system=elements_to_coordinate_systems[region]
-        )[["x", "y"]].compute()
+        centroids = get_centroids(adata[region], coordinate_system=elements_to_coordinate_systems[region])[
+            ["x", "y"]
+        ].compute()
         rows = np.flatnonzero(regions == region)
         instances = table.obs[instance_key].iloc[rows]
         if not instances.isin(centroids.index).all():
-            raise ValueError(
-                f"Table instances are missing from spatial element {region!r}."
-            )
+            raise ValueError(f"Table instances are missing from spatial element {region!r}.")
         coords[rows] = centroids.loc[instances].to_numpy()
     table.obsm[spatial_key] = coords
     return table, region_key

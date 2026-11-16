@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Union
 
 import cupy as cp
 import numpy as np
+from cupyx.scipy.sparse import coo_matrix as coo_matrix_gpu
 from cupyx.scipy.sparse import csc_matrix as csc_matrix_gpu
 from cupyx.scipy.sparse import csr_matrix as csr_matrix_gpu
 from dask.array import Array as DaskArray
@@ -26,7 +27,7 @@ from ._utils import _get_obs_rep, _set_obs_rep
 if TYPE_CHECKING:
     from anndata import AnnData
 
-GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu]  # noqa: UP007
+GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu, coo_matrix_gpu]  # noqa: UP007
 CPU_ARRAY_TYPE = Union[np.ndarray, csr_matrix_cpu, csc_matrix_cpu]  # noqa: UP007
 
 
@@ -58,7 +59,6 @@ def anndata_to_GPU(
     -------
     Updates `adata` inplace or returns an updated copy
     """
-
     if copy:
         adata = adata.copy()
 
@@ -75,11 +75,10 @@ def anndata_to_GPU(
 
     if copy:
         return adata
+    return None
 
 
-def X_to_GPU(
-    X: CPU_ARRAY_TYPE | DaskArray, warning: str = "X"
-) -> GPU_ARRAY_TYPE | DaskArray:
+def X_to_GPU(X: CPU_ARRAY_TYPE | DaskArray, warning: str = "X") -> GPU_ARRAY_TYPE | DaskArray:
     """
     Transfers matrices and arrays to the GPU
 
@@ -94,26 +93,16 @@ def X_to_GPU(
         pass
     elif isinstance(X, DaskArray):
         if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu | np.ndarray):
-            meta = (
-                _meta_sparse
-                if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu)
-                else _meta_dense
-            )
+            meta = _meta_sparse if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu) else _meta_dense
             X = X.map_blocks(X_to_GPU, meta=meta(X.dtype))
     elif isinstance(X, csr_array_cpu | csr_matrix_cpu):
-        X = csr_matrix_gpu(
-            (X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape
-        )
+        X = csr_matrix_gpu((X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape)
     elif isinstance(X, csc_array_cpu | csc_matrix_cpu):
-        X = csc_matrix_gpu(
-            (X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape
-        )
+        X = csc_matrix_gpu((X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape)
     elif isinstance(X, np.ndarray):
         X = cp.array(X)
     else:
-        warnings.warn(
-            f"{warning} not supported for GPU conversion returning {warning}", Warning
-        )
+        warnings.warn(f"{warning} not supported for GPU conversion returning {warning}", Warning, stacklevel=2)
     return X
 
 
@@ -145,7 +134,6 @@ def anndata_to_CPU(
     -------
     Updates `adata` inplace or returns an updated copy
     """
-
     if copy:
         adata = adata.copy()
 
@@ -161,6 +149,7 @@ def anndata_to_CPU(
 
     if copy:
         return adata
+    return None
 
 
 def X_to_CPU(X: GPU_ARRAY_TYPE | DaskArray) -> CPU_ARRAY_TYPE | DaskArray:

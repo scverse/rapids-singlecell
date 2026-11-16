@@ -2,23 +2,32 @@
 
 # Release notes
 
+## Version 0.19.0
+
+```{include} /release-notes/0.19.0.md
+```
+
 ## Version 0.18.0
+
 ```{include} /release-notes/0.18.1.md
 ```
 ```{include} /release-notes/0.18.0.md
 ```
 
 ## Version 0.17.0
+
 ```{include} /release-notes/0.17.0.md
 ```
 
 ## Version 0.16.0
+
 ```{include} /release-notes/0.16.1.md
 ```
 ```{include} /release-notes/0.16.0.md
 ```
 
 ## Version 0.15.0
+
 ```{include} /release-notes/0.15.2.md
 ```
 ```{include} /release-notes/0.15.1.md
@@ -34,6 +43,7 @@
 ```
 
 ## Version 0.13.0
+
 ```{include} /release-notes/0.13.5.md
 ```
 ```{include} /release-notes/0.13.4.md
@@ -48,6 +58,7 @@
 ```
 
 ## Version 0.12.0
+
 ```{include} /release-notes/0.12.7.md
 ```
 ```{include} /release-notes/0.12.6.md
@@ -66,12 +77,14 @@
 ```
 
 ## Version 0.11.0
+
 ```{include} /release-notes/0.11.1.md
 ```
 ```{include} /release-notes/0.11.0.md
 ```
 
 ## Version 0.10.0
+
 ```{include} /release-notes/0.10.11.md
 ```
 ```{include} /release-notes/0.10.10.md
@@ -98,6 +111,7 @@
 ```
 
 ## Version 0.9.0
+
 ```{include} /release-notes/0.9.6.md
 ```
 ```{include} /release-notes/0.9.5.md
@@ -114,6 +128,7 @@
 ```
 
 ## Version 0.8.0
+
 ```{include} /release-notes/0.8.1.md
 ```
 ```{include} /release-notes/0.8.0.md

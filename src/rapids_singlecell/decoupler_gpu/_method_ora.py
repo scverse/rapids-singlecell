@@ -66,9 +66,7 @@ def _log_odds(a, b, c, d, correction):
 @cp.fuse
 def _fused_log_odds(a, b, c, d, correction):
     xp = cp.get_array_module(a)
-    ratio = ((a + correction) * (d + correction)) / (
-        (b + correction) * (c + correction)
-    )
+    ratio = ((a + correction) * (d + correction)) / ((b + correction) * (c + correction))
     return xp.where(ratio == 0, 0, xp.log(ratio))
 
 
@@ -115,22 +113,12 @@ def _validate_ora(nvar, n_up, n_bm, n_bg, ha_corr):
         ("n_bm", n_bm, False),
         ("n_bg", n_bg, False),
     ):
-        assert isinstance(value, int | float) and np.isfinite(value), (
-            f"{name} must be finite and numeric"
-        )
-        assert value > 0 if positive else value >= 0, (
-            f"{name} must be {'> 0' if positive else '>= 0'}"
-        )
+        assert isinstance(value, int | float) and np.isfinite(value), f"{name} must be finite and numeric"
+        assert value > 0 if positive else value >= 0, f"{name} must be {'> 0' if positive else '>= 0'}"
     n_up, n_bm = int(np.ceil(n_up)), int(np.ceil(n_bm))
-    assert n_up + n_bm <= nvar, (
-        f"For nvar={nvar}, n_up={n_up} and n_bm={n_bm} overlap, decrease any of them"
-    )
-    assert n_bg == 0 or n_bg >= n_up + n_bm, (
-        "n_bg must be at least the number of selected features n_up + n_bm"
-    )
-    assert isinstance(ha_corr, int | float) and np.isfinite(ha_corr), (
-        "ha_corr must be finite and numeric"
-    )
+    assert n_up + n_bm <= nvar, f"For nvar={nvar}, n_up={n_up} and n_bm={n_bm} overlap, decrease any of them"
+    assert n_bg == 0 or n_bg >= n_up + n_bm, "n_bg must be at least the number of selected features n_up + n_bm"
+    assert isinstance(ha_corr, int | float) and np.isfinite(ha_corr), "ha_corr must be finite and numeric"
     n_bg = nvar if n_bg == 0 else n_bg
     if max(nvar, n_bg) > np.iinfo(np.int32).max:
         raise ValueError("ORA feature counts and n_bg must fit in int32")
@@ -204,31 +192,20 @@ def _func_ora(
         if value_direction not in ("greater", "less"):
             raise ValueError("value_direction must be 'greater' or 'less'")
         if n_up is not None or n_bm != 0:
-            raise ValueError(
-                "value_cutoff cannot be combined with n_up or nonzero n_bm"
-            )
+            raise ValueError("value_cutoff cannot be combined with n_up or nonzero n_bm")
         # Cutoffs allow zero or all genes to be selected.
         if n_bg is None:
             n_bg = 0
-        if not (
-            isinstance(n_bg, int | float)
-            and np.isfinite(n_bg)
-            and n_bg >= 0
-            and n_bg == int(n_bg)
-        ):
+        if not (isinstance(n_bg, int | float) and np.isfinite(n_bg) and n_bg >= 0 and n_bg == int(n_bg)):
             raise ValueError("n_bg must be a nonnegative integer or None")
-        if not (
-            isinstance(ha_corr, int | float) and np.isfinite(ha_corr) and ha_corr >= 0
-        ):
+        if not (isinstance(ha_corr, int | float) and np.isfinite(ha_corr) and ha_corr >= 0):
             raise ValueError("ha_corr must be finite, numeric and nonnegative")
         if not bool(cp.isfinite(mat).all()):
             raise ValueError(
                 "ORA value_cutoff input must contain only finite values; "
                 "exclude untested genes before making DEG labels"
             )
-        mask = (
-            mat > value_cutoff if value_direction == "greater" else mat < value_cutoff
-        )
+        mask = mat > value_cutoff if value_direction == "greater" else mat < value_cutoff
         selected = cp.ascontiguousarray(mask.T, dtype=cp.uint8)
         n_bg = int(n_bg) if n_bg else nvar
         count = None
@@ -277,9 +254,7 @@ def _func_ora(
         counts = count if count is not None else selected.sum(axis=0, dtype=cp.int32)
         invalid = bool(_invalid_overlap(a, counts, offsets[:, None], np.float64(n_bg)))
     if invalid:
-        raise ValueError(
-            "n_bg is too small for the union of selected features and a term"
-        )
+        raise ValueError("n_bg is too small for the union of selected features and a term")
     if tables is None:
         b, c = offsets[:, None] - a, counts - a
         d = float(n_bg) - offsets[:, None] - c

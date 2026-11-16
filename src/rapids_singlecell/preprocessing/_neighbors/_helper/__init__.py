@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from rapids_singlecell.preprocessing._neighbors import _Algorithms, _Metrics
 
 
+# cuVS trains 256 PQ codes on half of the rows, and 26.12 rejects fewer training rows than codes
+_IVF_PQ_MIN_ROWS = 512
+
+
 def _compute_nlist(N):
     base = math.sqrt(N)
     next_pow2 = 2 ** math.ceil(math.log2(base))
@@ -43,31 +47,23 @@ def _check_neighbors_X(
     """
     if cp_sparse.issparse(X) or sc_sparse.issparse(X):
         if algorithm != "brute":
-            raise ValueError(
-                f"Sparse input is not supported for {algorithm} algorithm. Use 'brute' instead."
-            )
+            raise ValueError(f"Sparse input is not supported for {algorithm} algorithm. Use 'brute' instead.")
         X_contiguous = X.tocsr()
     # all_neighbors moves X itself once batching is resolved
-    elif algorithm in ["mg_ivfflat", "mg_ivfpq"] or (
-        algorithm == "all_neighbors" and isinstance(X, np.ndarray)
-    ):
+    elif algorithm in ["mg_ivfflat", "mg_ivfpq"] or (algorithm == "all_neighbors" and isinstance(X, np.ndarray)):
         if isinstance(X, np.ndarray):
             X_contiguous = np.asarray(X, order="C", dtype=np.float32)
         elif isinstance(X, cp.ndarray):
             X_contiguous = cp.ascontiguousarray(X, dtype=cp.float32).get()
         else:
-            raise TypeError(
-                "Unsupported type for X. Expected ndarray or sparse matrix."
-            )
+            raise TypeError("Unsupported type for X. Expected ndarray or sparse matrix.")
     else:
         if isinstance(X, np.ndarray):
             X_contiguous = cp.asarray(X, order="C", dtype=np.float32)
         elif isinstance(X, cp.ndarray):
             X_contiguous = cp.ascontiguousarray(X, dtype=np.float32)
         else:
-            raise TypeError(
-                "Unsupported type for X. Expected ndarray or sparse matrix."
-            )
+            raise TypeError("Unsupported type for X. Expected ndarray or sparse matrix.")
 
     return X_contiguous
 
@@ -90,9 +86,7 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
         return True
     elif algorithm == "cagra":
         if metric not in ["euclidean", "sqeuclidean", "inner_product"]:
-            raise ValueError(
-                "cagra only supports 'euclidean', 'inner_product' and 'sqeuclidean' metrics."
-            )
+            raise ValueError("cagra only supports 'euclidean', 'inner_product' and 'sqeuclidean' metrics.")
     elif algorithm in ["ivfpq", "ivfflat", "mg_ivfflat", "mg_ivfpq"]:
         if metric not in ["euclidean", "sqeuclidean", "inner_product", "cosine"]:
             raise ValueError(
@@ -106,8 +100,7 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
     elif algorithm == "all_neighbors":
         if metric not in ["euclidean", "sqeuclidean", "cosine", "inner_product"]:
             raise ValueError(
-                "all_neighbors only supports 'euclidean', 'sqeuclidean', "
-                "'inner_product' and 'cosine' metrics."
+                "all_neighbors only supports 'euclidean', 'sqeuclidean', 'inner_product' and 'cosine' metrics."
             )
     else:
         raise NotImplementedError(f"The {algorithm} algorithm is not implemented yet.")
@@ -129,6 +122,41 @@ def _batched_search(search, Y: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
         cp.concatenate([cp.asarray(d) for d, _ in parts]),
         cp.concatenate([cp.asarray(n) for _, n in parts]),
     )
+
+
+# Searches fill the slots they found no neighbor for with out-of-range IDs or huge distances
+# (IVF repeats an ID at infinity, CAGRA uses FLT_MAX, all_neighbors sqrt(FLT_MAX)).
+_PAD_DIST = 1e18
+
+
+def _check_knn_complete(
+    indices: cp.ndarray, distances: cp.ndarray | None = None, *, n_index: int, algorithm: str
+) -> None:
+    """Raise if a kNN search left neighbor slots unfilled or returned invalid IDs or distances."""
+    if indices.size == 0:
+        return
+    valid = int(indices.min()) >= 0 and int(indices.max()) < n_index
+    if valid and distances is not None:
+        # an exact search pads nothing, so any finite distance is valid
+        limit = cp.inf if algorithm == "brute" else _PAD_DIST
+        valid = -limit < float(distances.min()) and float(distances.max()) < limit  # also False for NaN
+    if valid:
+        return
+    if algorithm == "brute":
+        hint = (
+            "Check the representation for NaN or infinite values, and for rows the metric is undefined for "
+            "(all-zero with `metric='cosine'`, constant with `metric='correlation'`)."
+        )
+    elif "ivf" in algorithm:
+        hint = "Increase `n_probes` in `algorithm_kwds`, reduce the number of neighbors, or use `algorithm='brute'`."
+    elif algorithm == "all_neighbors":
+        hint = (
+            "Lower `n_clusters` (`n_lists` for `algo='ivf_pq'`) in `algorithm_kwds`, reduce the number of neighbors, "
+            "or use `algorithm='brute'`."
+        )
+    else:
+        hint = "Reduce the number of neighbors or use `algorithm='brute'`."
+    raise ValueError(f"The {algorithm!r} search returned incomplete or invalid neighbors. {hint}")
 
 
 def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:

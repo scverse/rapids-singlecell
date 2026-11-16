@@ -48,12 +48,12 @@ jobs:
       stable-dev: ${{ steps.get-envs.outputs.stable-dev }}
       prerelease: ${{ steps.get-envs.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           filter: blob:none
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
       - id: get-envs
@@ -92,7 +92,7 @@ jobs:
     name: Test (${{ matrix.env.name }})
     needs: get-envs
     runs-on: ${{ matrix.env.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -100,20 +100,36 @@ jobs:
         env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
+      # Build rapids-singlecell once per job: no isolated build env, incremental build dir
+      UV_CONFIG_FILE: ${{ github.workspace }}/.github/uv-ci.toml
+      SKBUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build
+      CUPY_CACHE_DIR: ${{ github.workspace }}/.cache/cupy
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.cache/numba
+      COVERAGE_CORE: sysmon
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.env.python }}
 
+      - name: Restore file mtimes from git
+        # ninja rebuilds by mtime; a fresh checkout would make the cached build dir rebuild everything
+        run: |
+          git ls-files -z | xargs -0 -P 4 -n 50 sh -c 'for f; do touch -d "@$(git log -1 --format=%ct -- "$f")" "$f"; done' sh
+      - name: Restore build and JIT caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache
+          key: ${{ matrix.env.name }}-cache-${{ github.run_id }}
+          restore-keys: ${{ matrix.env.name }}-cache-
       - name: Add CUDA to PATH
         run: |
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
@@ -125,6 +141,7 @@ jobs:
           hatch -v env create "$ENV_NAME"
 
       - name: Run tests
+        timeout-minutes: 30 # a full run takes 12-20; a hang would otherwise use the whole job limit
         run: |
           mkdir -p test-data
           if [[ "$ENV_NAME" == *"stable"* ]]; then
@@ -137,7 +154,7 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() && contains(matrix.env.name, 'stable') }}
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           report_type: test_results
           files: test-data/test-results.xml
@@ -147,7 +164,7 @@ jobs:
 
       - name: Upload coverage data
         if: contains(matrix.env.name, 'stable')
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: test-data/coverage.xml
           use_oidc: false
@@ -158,8 +175,8 @@ jobs:
     name: Test (${{ matrix.env.name }})
     needs: get-envs
     runs-on: ${{ matrix.env.runner }}
-    timeout-minutes: 30
-    continue-on-error: true  # Prerelease failures don't fail the workflow
+    timeout-minutes: 45
+    continue-on-error: true # Prerelease failures don't fail the workflow
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -167,20 +184,36 @@ jobs:
         env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
     env:
       ENV_NAME: ${{ matrix.env.name }}
+      # Build rapids-singlecell once per job: no isolated build env, incremental build dir
+      UV_CONFIG_FILE: ${{ github.workspace }}/.github/uv-ci.toml
+      SKBUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build
+      CUPY_CACHE_DIR: ${{ github.workspace }}/.cache/cupy
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.cache/numba
+      COVERAGE_CORE: sysmon
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.env.python }}
 
+      - name: Restore file mtimes from git
+        # ninja rebuilds by mtime; a fresh checkout would make the cached build dir rebuild everything
+        run: |
+          git ls-files -z | xargs -0 -P 4 -n 50 sh -c 'for f; do touch -d "@$(git log -1 --format=%ct -- "$f")" "$f"; done' sh
+      - name: Restore build and JIT caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache
+          key: ${{ matrix.env.name }}-cache-${{ github.run_id }}
+          restore-keys: ${{ matrix.env.name }}-cache-
       - name: Add CUDA to PATH
         run: |
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
@@ -198,6 +231,7 @@ jobs:
           hatch -v env create "$ENV_NAME"
 
       - name: Run tests
+        timeout-minutes: 30
         run: hatch run "${ENV_NAME}:run" -v --color=yes
 
   remove-label:

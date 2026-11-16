@@ -105,13 +105,14 @@ __device__ bool kd_before(double distance, long long column, double other,
 // behind MAXK - k fixed pads or, for MAXK == 0, in the outputs. Radius search
 // (MAXK < 0) counts into offsets[row + 1], then fills from offsets[row]. Edges
 // within radii beyond FLT_MAX whose float distance overflows stay infinite
-// for callers to reject.
+// for callers to reject. External points are not in the trees, so they skip
+// no point and may omit rows.
 template <typename T, int MAXK, bool fill = false>
 __global__ void kd_search(const T* points, const T* tree, const int* index,
                           const T* boxes, const long long* segments,
                           const int* codes, int n_rows, int dims, int k,
                           double radius, long long* offsets, long long* rows,
-                          long long* columns, T* distances) {
+                          long long* columns, T* distances, bool external) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
     const int library = codes ? codes[row] : 0;
@@ -148,7 +149,7 @@ __global__ void kd_search(const T* points, const T* tree, const int* index,
                                  : fabs(delta);
         const long long near = 2 * node + 1 + (delta > 0);
         const long long far = 2 * node + 1 + (delta <= 0);
-        if (previous == parent && index[node] != row) {
+        if (previous == parent && (external || index[node] != row)) {
             const int column = index[node];
             const T distance = kd_distance<T>(point, other, dims);
             if constexpr (knn) {
@@ -210,7 +211,7 @@ __global__ void kd_search(const T* points, const T* tree, const int* index,
         for (int j = 0; j < size; ++j)
             if (j >= size - k) {
                 const long long at = (long long)row * k + j - (size - k);
-                rows[at] = row;
+                if (rows) rows[at] = row;
                 columns[at] = best_columns[j];
                 distances[at] = best[j];
             }

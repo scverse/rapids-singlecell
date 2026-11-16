@@ -134,9 +134,7 @@ def spatial_autocorr(
         genes = [genes]
     if use_raw:
         if adata.raw is None:
-            raise AttributeError(
-                "No `.raw` attribute found. Try specifying `use_raw=False`."
-            )
+            raise AttributeError("No `.raw` attribute found. Try specifying `use_raw=False`.")
         genes = list(set(genes) & set(adata.raw.var_names))
         vals = adata.raw[:, genes].X
     else:
@@ -165,13 +163,9 @@ def spatial_autocorr(
     def _run_autocorr(data, adj_matrix_cupy, mode, n_perms, multi_gpu):
         """Run spatial autocorrelation computation."""
         if mode == "moran":
-            return _morans_I_cupy(
-                data, adj_matrix_cupy, n_permutations=n_perms, multi_gpu=multi_gpu
-            )
+            return _morans_I_cupy(data, adj_matrix_cupy, n_permutations=n_perms, multi_gpu=multi_gpu)
         elif mode == "geary":
-            return _gearys_C_cupy(
-                data, adj_matrix_cupy, n_permutations=n_perms, multi_gpu=multi_gpu
-            )
+            return _gearys_C_cupy(data, adj_matrix_cupy, n_permutations=n_perms, multi_gpu=multi_gpu)
         else:
             raise ValueError(f"Invalid mode: {mode}")
 
@@ -203,12 +197,11 @@ def spatial_autocorr(
 
     if corr_method is not None:
         for pv in filter(lambda x: "pval" in x, df.columns):
-            _, pvals_adj, _, _ = multipletests(
-                df[pv].values, alpha=0.05, method=corr_method
-            )
+            _, pvals_adj, _, _ = multipletests(df[pv].values, alpha=0.05, method=corr_method)
             df[f"{pv}_{corr_method}"] = pvals_adj
 
     df.sort_values(by=params["stat"], ascending=params["ascending"], inplace=True)
     if copy:
         return df
     adata.uns[params["mode"]] = df
+    return None

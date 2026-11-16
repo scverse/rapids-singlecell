@@ -21,9 +21,7 @@ if TYPE_CHECKING:
 __all__ = ["Scrublet"]
 
 
-def _sample_comb(
-    dims: tuple[int, ...], nsamp: int, *, rng: np.random.Generator
-) -> NDArray[np.int64]:
+def _sample_comb(dims: tuple[int, ...], nsamp: int, *, rng: np.random.Generator) -> NDArray[np.int64]:
     """Randomly sample indices from a grid without repeating a tuple."""
     if isinstance(rng, _LegacyRng):
         from sklearn.random_projection import sample_without_replacement
@@ -36,8 +34,7 @@ def _sample_comb(
 
 @dataclass(kw_only=True)
 class Scrublet:
-    """\
-    Initialize Scrublet object with counts matrix and doublet prediction parameters
+    """Initialize Scrublet object with counts matrix and doublet prediction parameters
 
     Parameters
     ----------
@@ -72,9 +69,7 @@ class Scrublet:
 
     # init fields
 
-    counts_obs: InitVar[sparse.csr_matrix | sparse.csc_matrix | NDArray[np.integer]] = (
-        field(kw_only=False)
-    )
+    counts_obs: InitVar[sparse.csr_matrix | sparse.csc_matrix | NDArray[np.integer]] = field(kw_only=False)
     total_counts_obs: InitVar[NDArray[np.integer] | None] = None
     sim_doublet_ratio: float = 2.0
     n_neighbors: InitVar[int | None] = None
@@ -89,15 +84,11 @@ class Scrublet:
 
     _counts_obs: sparse.csc_matrix = field(init=False, repr=False)
     _total_counts_obs: NDArray[np.integer] = field(init=False, repr=False)
-    _counts_obs_norm: sparse.csr_matrix | sparse.csc_matrix = field(
-        init=False, repr=False
-    )
+    _counts_obs_norm: sparse.csr_matrix | sparse.csc_matrix = field(init=False, repr=False)
 
     _counts_sim: sparse.csr_matrix | sparse.csc_matrix = field(init=False, repr=False)
     _total_counts_sim: NDArray[np.integer] = field(init=False, repr=False)
-    _counts_sim_norm: sparse.csr_matrix | sparse.csc_matrix | None = field(
-        default=None, init=False, repr=False
-    )
+    _counts_sim_norm: sparse.csr_matrix | sparse.csc_matrix | None = field(default=None, init=False, repr=False)
 
     # Fields set by methods
 
@@ -184,16 +175,8 @@ class Scrublet:
         rng: SeedLike | RNGLike | None,
     ) -> None:
         self._counts_obs = sparse.csc_matrix(counts_obs)
-        self._total_counts_obs = (
-            self._counts_obs.sum(1).flatten()
-            if total_counts_obs is None
-            else total_counts_obs
-        )
-        self._n_neighbors = (
-            int(round(0.5 * np.sqrt(self._counts_obs.shape[0])))
-            if n_neighbors is None
-            else n_neighbors
-        )
+        self._total_counts_obs = self._counts_obs.sum(1).flatten() if total_counts_obs is None else total_counts_obs
+        self._n_neighbors = int(round(0.5 * np.sqrt(self._counts_obs.shape[0]))) if n_neighbors is None else n_neighbors
         self._rng = np.random.default_rng(rng)
 
     def simulate_doublets(
@@ -221,7 +204,6 @@ class Scrublet:
         ----
         doublet_parents_
         """
-
         if sim_doublet_ratio is None:
             sim_doublet_ratio = self.sim_doublet_ratio
         else:
@@ -232,8 +214,8 @@ class Scrublet:
 
         pair_ix = _sample_comb((n_obs, n_obs), n_sim, rng=self._rng)
 
-        E1 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 0], :])
-        E2 = cast("sparse.csc_matrix", self._counts_obs[pair_ix[:, 1], :])
+        E1 = self._counts_obs[pair_ix[:, 0], :]
+        E2 = self._counts_obs[pair_ix[:, 1], :]
         tots1 = self._total_counts_obs[pair_ix[:, 0]]
         tots2 = self._total_counts_obs[pair_ix[:, 1]]
         if synthetic_doublet_umi_subsampling < 1:
@@ -248,11 +230,8 @@ class Scrublet:
             self._total_counts_sim = tots1 + tots2
         self.doublet_parents_ = pair_ix
 
-    def set_manifold(
-        self, manifold_obs: NDArray[np.float64], manifold_sim: NDArray[np.float64]
-    ) -> None:
-        """\
-        Set the manifold coordinates used in k-nearest-neighbor graph construction
+    def set_manifold(self, manifold_obs: NDArray[np.float64], manifold_sim: NDArray[np.float64]) -> None:
+        """Set the manifold coordinates used in k-nearest-neighbor graph construction
 
         Arguments
         ---------
@@ -272,7 +251,6 @@ class Scrublet:
         ----
         manifold_obs_, manifold_sim_,
         """
-
         self.manifold_obs_ = manifold_obs
         self.manifold_sim_ = manifold_sim
 
@@ -283,8 +261,7 @@ class Scrublet:
         distance_metric="euclidean",
         get_doublet_neighbor_parents: bool = False,
     ) -> NDArray[np.float64]:
-        """\
-        Calculate doublet scores for observed transcriptomes and simulated doublets
+        """Calculate doublet scores for observed transcriptomes and simulated doublets
 
         Requires that manifold_obs_ and manifold_sim_ have already been set.
 
@@ -312,7 +289,6 @@ class Scrublet:
         doublet_errors_obs_, doublet_errors_sim_,
         doublet_neighbor_parents_
         """
-
         self._nearest_neighbor_classifier(
             k=self._n_neighbors,
             exp_doub_rate=self.expected_doublet_rate,
@@ -362,9 +338,7 @@ class Scrublet:
         neighbors = neighbors[:, 1:]  # remove self from neighbors
         # print(neighbors)
         # Calculate doublet score based on ratio of simulated cell neighbors vs. observed cell neighbors
-        doub_neigh_mask: NDArray[np.bool_] = (
-            manifold.obs["doub_labels"].to_numpy()[neighbors] == "sim"
-        )
+        doub_neigh_mask: NDArray[np.bool_] = manifold.obs["doub_labels"].to_numpy()[neighbors] == "sim"
         n_sim_neigh: NDArray[np.int64] = doub_neigh_mask.sum(axis=1)
 
         rho = exp_doub_rate
@@ -401,19 +375,14 @@ class Scrublet:
             for iCell in range(n_obs):
                 this_doub_neigh = neighbors[iCell, :][neighbors[iCell, :] > -1]
                 if len(this_doub_neigh) > 0:
-                    this_doub_neigh_parents = np.unique(
-                        parent_cells[this_doub_neigh, :].flatten()
-                    )
+                    this_doub_neigh_parents = np.unique(parent_cells[this_doub_neigh, :].flatten())
                     neighbor_parents.append(this_doub_neigh_parents)
                 else:
                     neighbor_parents.append(np.array([], dtype=np.intp))
             self.doublet_neighbor_parents_ = neighbor_parents
 
-    def call_doublets(
-        self, *, threshold: float | None = None, verbose: bool = True
-    ) -> NDArray[np.bool_] | None:
-        """\
-        Call trancriptomes as doublets or singlets
+    def call_doublets(self, *, threshold: float | None = None, verbose: bool = True) -> NDArray[np.bool_] | None:
+        """Call trancriptomes as doublets or singlets
 
         Arguments
         ---------
@@ -434,7 +403,6 @@ class Scrublet:
         detected_doublet_rate_, detectable_doublet_fraction,
         overall_doublet_rate_
         """
-
         if threshold is None:
             # automatic threshold detection
             # http://scikit-image.org/docs/dev/api/skimage.filters.html
@@ -443,9 +411,7 @@ class Scrublet:
             try:
                 threshold = cast("float", threshold_minimum(self.doublet_scores_sim_))
                 if verbose:
-                    print(
-                        f"Automatically set threshold at doublet score = {threshold:.2f}"
-                    )
+                    print(f"Automatically set threshold at doublet score = {threshold:.2f}")
             except Exception:  # noqa: BLE001
                 self.predicted_doublets_ = None
                 if verbose:
@@ -463,12 +429,8 @@ class Scrublet:
         self.z_scores_ = Z
         self.threshold_ = threshold
         self.detected_doublet_rate_ = (Ld_obs > threshold).sum() / float(len(Ld_obs))
-        self.detectable_doublet_fraction_ = (Ld_sim > threshold).sum() / float(
-            len(Ld_sim)
-        )
-        self.overall_doublet_rate_ = (
-            self.detected_doublet_rate_ / self.detectable_doublet_fraction_
-        )
+        self.detectable_doublet_fraction_ = (Ld_sim > threshold).sum() / float(len(Ld_sim))
+        self.overall_doublet_rate_ = self.detected_doublet_rate_ / self.detectable_doublet_fraction_
 
         if verbose:
             print(

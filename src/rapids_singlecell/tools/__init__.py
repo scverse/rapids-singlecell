@@ -11,6 +11,6 @@ from ._rank_genes_groups import (
     rank_genes_groups,
     rank_genes_groups_logreg,
 )
-from ._score_genes import score_genes, score_genes_cell_cycle
+from ._score_genes import CellCycleOut, CellCycleResult, score_genes, score_genes_cell_cycle
 from ._tsne import tsne
 from ._umap import umap

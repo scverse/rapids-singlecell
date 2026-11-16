@@ -23,9 +23,7 @@ from rapids_singlecell.squidpy_gpu._gmm import (
 def _well_separated(n_per: int, K: int, d: int, sep: float, seed: int):
     rng = np.random.default_rng(seed)
     centers = rng.normal(scale=sep, size=(K, d))
-    X = np.vstack(
-        [rng.normal(loc=c, scale=1.0, size=(n_per, d)) for c in centers]
-    ).astype(np.float32)
+    X = np.vstack([rng.normal(loc=c, scale=1.0, size=(n_per, d)) for c in centers]).astype(np.float32)
     y = np.repeat(np.arange(K), n_per)
     perm = rng.permutation(len(X))
     return X[perm], y[perm]
@@ -62,12 +60,7 @@ def _reference_e_step(
     for k in range(K):
         y = (X - means[k]) @ prec_chol[k]
         mahal = cp.einsum("ij,ij->i", y, y)
-        log_prob[:, k] = (
-            -X.dtype.type(0.5) * mahal
-            + log_det_half[k]
-            - half_d_log2pi
-            + cp.log(weights[k])
-        )
+        log_prob[:, k] = -X.dtype.type(0.5) * mahal + log_det_half[k] - half_d_log2pi + cp.log(weights[k])
 
     log_total = logsumexp(log_prob, axis=1, keepdims=True)
     return cp.exp(log_prob - log_total), log_total.mean()
@@ -112,9 +105,7 @@ def _cuda_e_step(
     n, d = X.shape
     K = int(means.shape[0])
     e_step_route = _choose_e_step(d, X.dtype)
-    log_prob, responsibilities, ll_per_cell, centered, e_step_y = _e_step_buffers(
-        X, K, e_step_route
-    )
+    log_prob, responsibilities, ll_per_cell, centered, e_step_y = _e_step_buffers(X, K, e_step_route)
     return _e_step(
         X,
         weights,
@@ -161,9 +152,7 @@ def _cuda_m_step(
 def test_kmeans_init_recovers_well_separated_clusters():
     """kmeans init should land at near-truth on well-separated data."""
     X_np, y = _well_separated(n_per=300, K=5, d=20, sep=6.0, seed=0)
-    labels = cp.asnumpy(
-        gmm_fit_predict(cp.asarray(X_np), n_components=5, random_state=0, init="kmeans")
-    )
+    labels = cp.asnumpy(gmm_fit_predict(cp.asarray(X_np), n_components=5, random_state=0, init="kmeans"))
     assert ARI(y, labels) >= 0.95
 
 
@@ -196,11 +185,7 @@ def test_random_from_data_init_runs():
     """random_from_data may land at a worse local optimum than kmeans, but should
     still produce a non-trivial partition on well-separated data."""
     X_np, y = _well_separated(n_per=300, K=5, d=20, sep=6.0, seed=0)
-    labels = cp.asnumpy(
-        gmm_fit_predict(
-            cp.asarray(X_np), n_components=5, random_state=0, init="random_from_data"
-        )
-    )
+    labels = cp.asnumpy(gmm_fit_predict(cp.asarray(X_np), n_components=5, random_state=0, init="random_from_data"))
     assert ARI(y, labels) >= 0.35
     assert len(set(labels.tolist())) >= 2
 
@@ -424,9 +409,7 @@ def test_cuda_768_e_step_uses_cublas_route():
         stream=stream,
         handle=handle,
     )
-    log_prob_b, resp_b, ll_per_cell_b, centered_b, e_step_y_b = _e_step_buffers(
-        X, K, "cublas"
-    )
+    log_prob_b, resp_b, ll_per_cell_b, centered_b, e_step_y_b = _e_step_buffers(X, K, "cublas")
     r_b, ll_b = _e_step_cublas(
         X,
         weights,

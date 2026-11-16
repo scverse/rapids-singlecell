@@ -25,11 +25,10 @@ def _mg_ivf_flat_knn(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     try:
         from cuvs.neighbors.mg import ivf_flat as mg_ivf_flat
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
-            "The 'mg_ivf_flat' algorithm is only available in cuvs >= 25.10. "
-            "Please update your cuvs installation."
-        )
+            "The 'mg_ivf_flat' algorithm is only available in cuvs >= 25.10. Please update your cuvs installation."
+        ) from e
     distribution_mode = algorithm_kwds.get("distribution_mode", "replicated")
     assert distribution_mode in ["replicated", "shared"], "Invalid distribution mode"
     n_lists = algorithm_kwds.get("n_lists", _compute_nlist(X.shape[0]))

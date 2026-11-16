@@ -83,9 +83,7 @@ def _p_value_calc(
     n_perms = sims.shape[0]
     large_perm = (sims >= score).sum(axis=0)
     # subtract total perm for negative values
-    large_perm[(n_perms - large_perm) < large_perm] = (
-        n_perms - large_perm[(n_perms - large_perm) < large_perm]
-    )
+    large_perm[(n_perms - large_perm) < large_perm] = n_perms - large_perm[(n_perms - large_perm) < large_perm]
     # get p-value based on permutation
     p_sim: np.ndarray = (large_perm + 1) / (n_perms + 1)
 
@@ -108,19 +106,22 @@ def _p_value_calc(
 
 
 def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str, Any]):
-    """
-    Analytic p-value computation.
+    """Analytic p-value computation.
+
     See `Moran's I <https://pysal.org/esda/_modules/esda/moran.html#Moran>`_ and
     `Geary's C <https://pysal.org/esda/_modules/esda/geary.html#Geary>`_ implementation.
     """
     s0, s1, s2 = _g_moments(g)
     n = g.shape[0]
     s02 = s0 * s0
-    n2 = n * n
-    v_num = n2 * s1 - n * s2 + 3 * s02
-    v_den = (n - 1) * (n + 1) * s02
-
-    Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
+    if params["mode"] == "gearyC":
+        # Geary's C has its own normality variance (Cliff & Ord 1981; esda ``Geary``)
+        Vscore_norm = ((2 * s1 + s2) * (n - 1) - 4 * s02) / (2 * (n + 1) * s02)
+    else:
+        n2 = n * n
+        v_num = n2 * s1 - n * s2 + 3 * s02
+        v_den = (n - 1) * (n + 1) * s02
+        Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
     seScore_norm = Vscore_norm ** (1 / 2.0)
 
     z_norm = (score - params["expected"]) / seScore_norm
@@ -135,8 +136,8 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
 
 
 def _g_moments(w: spmatrix | np.ndarray):
-    """
-    Compute moments of adjacency matrix for analytic p-value calculation.
+    """Compute moments of adjacency matrix for analytic p-value calculation.
+
     See `pysal <https://pysal.org/libpysal/_modules/libpysal/weights/weights.html#W>`_ implementation.
     """
     # s0
@@ -144,7 +145,7 @@ def _g_moments(w: spmatrix | np.ndarray):
 
     # s1
     t = w.transpose() + w
-    t2 = t.multiply(t)  # type: ignore[union-attr]
+    t2 = t.multiply(t)
     s1 = t2.sum() / 2.0
 
     # s2
@@ -189,11 +190,7 @@ def _create_sparse_df(
     )
 
     if not issparse(data):
-        pred = (
-            (lambda col: ~np.isnan(col))
-            if fill_value is np.nan
-            else (lambda col: ~np.isclose(col, fill_value))
-        )
+        pred = (lambda col: ~np.isnan(col)) if fill_value is np.nan else (lambda col: ~np.isclose(col, fill_value))
         dtype = SparseDtype(data.dtype, fill_value=fill_value)
         n_rows, n_cols = data.shape
         arrays = []
@@ -204,9 +201,7 @@ def _create_sparse_df(
             arr = SparseArray._simple_new(data[mask, i], idx, dtype)
             arrays.append(arr)
 
-        return pd.DataFrame._from_arrays(
-            arrays, columns=columns, index=index, verify_integrity=False
-        )
+        return pd.DataFrame._from_arrays(arrays, columns=columns, index=index, verify_integrity=False)
 
     if TYPE_CHECKING:
         assert isinstance(data, spmatrix)
@@ -235,9 +230,7 @@ def _create_sparse_df(
         arr = SparseArray._simple_new(array_data[sl], idx, dtype)
         arrays.append(arr)
 
-    return pd.DataFrame._from_arrays(
-        arrays, columns=columns, index=index, verify_integrity=False
-    )
+    return pd.DataFrame._from_arrays(arrays, columns=columns, index=index, verify_integrity=False)
 
 
 def _assert_categorical_obs(adata, key):
@@ -245,11 +238,17 @@ def _assert_categorical_obs(adata, key):
         raise KeyError(f"Cluster key `{key}` not found in `adata.obs`.")
 
     if not isinstance(adata.obs[key].dtype, pd.CategoricalDtype):
-        raise TypeError(
-            f"Expected `adata.obs[{key!r}]` to be `categorical`, found `{infer_dtype(adata.obs[key])}`."
-        )
+        raise TypeError(f"Expected `adata.obs[{key!r}]` to be `categorical`, found `{infer_dtype(adata.obs[key])}`.")
 
 
 def _assert_spatial_basis(adata, key: str) -> None:
     if key not in adata.obsm:
         raise KeyError(f"Spatial basis `{key}` not found in `adata.obsm`.")
+
+
+def _assert_connectivity_key(adata, key: str) -> None:
+    if key not in adata.obsp:
+        raise KeyError(
+            f"Spatial connectivity key `{key}` not found in `adata.obsp`. "
+            "Please run `rapids_singlecell.gr.spatial_neighbors_*` first."
+        )

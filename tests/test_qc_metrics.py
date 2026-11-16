@@ -12,25 +12,15 @@ import rapids_singlecell as rsc
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_qc_metrics(dtype):
-    cudata = AnnData(
-        X=sparse_gpu.csr_matrix(
-            cp.random.binomial(100, 0.005, (1000, 1000), dtype=dtype), dtype=dtype
-        )
-    )
-    cudata.var["mito"] = np.concatenate(
-        (np.ones(100, dtype=bool), np.zeros(900, dtype=bool))
-    )
+    cudata = AnnData(X=sparse_gpu.csr_matrix(cp.random.binomial(100, 0.005, (1000, 1000), dtype=dtype), dtype=dtype))
+    cudata.var["mito"] = np.concatenate((np.ones(100, dtype=bool), np.zeros(900, dtype=bool)))
     cudata.var["negative"] = False
-    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito", "negative"])
+    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito", "negative"], out=False)
     assert (cudata.obs["n_genes_by_counts"] < cudata.shape[1]).all()
-    assert (
-        cudata.obs["n_genes_by_counts"] >= cudata.obs["log1p_n_genes_by_counts"]
-    ).all()
+    assert (cudata.obs["n_genes_by_counts"] >= cudata.obs["log1p_n_genes_by_counts"]).all()
     assert (cudata.obs["total_counts"] == cp.ravel(cudata.X.sum(axis=1)).get()).all()
     assert (cudata.obs["total_counts"] >= cudata.obs["log1p_total_counts"]).all()
-    assert (
-        cudata.obs["total_counts_mito"] >= cudata.obs["log1p_total_counts_mito"]
-    ).all()
+    assert (cudata.obs["total_counts_mito"] >= cudata.obs["log1p_total_counts_mito"]).all()
     assert (cudata.obs["total_counts_negative"] == 0).all()
 
     for col in filter(lambda x: "negative" not in x, cudata.obs.columns):
@@ -41,14 +31,12 @@ def test_qc_metrics(dtype):
             assert (cudata.obs[col] >= 0).all()
     for col in cudata.var.columns:
         assert (cudata.var[col] >= 0).all()
-    assert (
-        cudata.var["mean_counts"] < cp.ravel(cudata.X.max(axis=0).toarray()).get()
-    ).all()
+    assert (cudata.var["mean_counts"] < cp.ravel(cudata.X.max(axis=0).toarray()).get()).all()
     assert (cudata.var["mean_counts"] >= cudata.var["log1p_mean_counts"]).all()
     assert (cudata.var["total_counts"] >= cudata.var["log1p_total_counts"]).all()
     # Should return the same thing if run again
     old_obs, old_var = cudata.obs.copy(), cudata.var.copy()
-    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito", "negative"])
+    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito", "negative"], out=False)
     assert set(cudata.obs.columns) == set(old_obs.columns)
     assert set(cudata.var.columns) == set(old_var.columns)
     for col in cudata.obs:
@@ -56,16 +44,10 @@ def test_qc_metrics(dtype):
     for col in cudata.var:
         assert np.allclose(cudata.var[col], old_var[col])
     # with log1p=False
-    cudata = AnnData(
-        X=sparse_gpu.csr_matrix(
-            cp.random.binomial(100, 0.005, (1000, 1000), dtype=dtype), dtype=dtype
-        )
-    )
-    cudata.var["mito"] = np.concatenate(
-        (np.ones(100, dtype=bool), np.zeros(900, dtype=bool))
-    )
+    cudata = AnnData(X=sparse_gpu.csr_matrix(cp.random.binomial(100, 0.005, (1000, 1000), dtype=dtype), dtype=dtype))
+    cudata.var["mito"] = np.concatenate((np.ones(100, dtype=bool), np.zeros(900, dtype=bool)))
     cudata.var["negative"] = False
-    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito", "negative"], log1p=False)
+    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito", "negative"], log1p=False, out=False)
     assert not np.any(cudata.obs.columns.str.startswith("log1p_"))
     assert not np.any(cudata.var.columns.str.startswith("log1p_"))
 
@@ -73,23 +55,51 @@ def test_qc_metrics(dtype):
 def adata_mito(dtype):
     a = cp.random.binomial(100, 0.005, (1000, 1000), dtype=dtype)
     init_var = pd.DataFrame(
-        {"mito": np.concatenate((np.ones(100, dtype=bool), np.zeros(900, dtype=bool)))}
+        {"mito": np.concatenate((np.ones(100, dtype=bool), np.zeros(900, dtype=bool)))},
+        index=pd.RangeIndex(1000).astype(str),
     )
     adata_dense = AnnData(X=a, var=init_var.copy())
     return adata_dense
 
 
-@pytest.mark.parametrize(
-    "cls", [cp.array, sparse_gpu.csc_matrix, sparse_gpu.csr_matrix]
-)
+@pytest.mark.parametrize("cls", [cp.array, sparse_gpu.csc_matrix, sparse_gpu.csr_matrix])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_qc_metrics_format(cls, dtype):
     cudata_dense = adata_mito(dtype)
-    rsc.pp.calculate_qc_metrics(cudata_dense, qc_vars=["mito"])
+    rsc.pp.calculate_qc_metrics(cudata_dense, qc_vars=["mito"], out=False)
     cudata = cudata_dense.copy()
     cudata.X = cls(cudata.X)
 
-    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito"])
+    rsc.pp.calculate_qc_metrics(cudata, qc_vars=["mito"], out=False)
     assert np.allclose(cudata.obs, cudata_dense.obs)
     for col in cudata.var:  # np.allclose doesn't like mix of types
         assert np.allclose(cudata.var[col], cudata_dense.var[col])
+
+
+def test_qc_metrics_use_out():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = adata_mito(np.float32)
+    adata.layers["counts"] = adata.X.copy()
+    adata.X = cp.zeros_like(adata.X)
+    res = rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"], use=A.layers["counts"], out=True)
+    assert "total_counts" not in adata.obs
+    rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"], use="layers.counts", out=A.obsm["qc"])
+    pd.testing.assert_frame_equal(adata.obsm["qc"], res.obs)
+    pd.testing.assert_frame_equal(adata.varm["qc"], res.var)
+    rsc.pp.calculate_qc_metrics(adata, use="layers.counts", out={"var": A.varm["v"]})
+    assert "v" in adata.varm
+    assert "qc_obs" not in adata.obsm
+    with pytest.warns(FutureWarning, match="layer"):
+        rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"], layer="counts", out=False)
+    np.testing.assert_allclose(adata.obs["total_counts"], res.obs["total_counts"])
+
+
+def test_qc_metrics_preset_default():
+    adata = adata_mito(np.float32)
+    res = rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"])
+    assert isinstance(res, rsc.pp.QcMetricsResult)
+    assert "total_counts" not in adata.obs
+    with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
+        assert rsc.pp.calculate_qc_metrics(adata, qc_vars=["mito"]) is None
+    pd.testing.assert_frame_equal(adata.obs, res.obs)

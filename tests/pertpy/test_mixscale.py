@@ -27,9 +27,7 @@ def mixscale_adata() -> anndata.AnnData:
     X[200:300, :20] -= 1.0  # GeneA weak KO
     X[300:350, 20:40] -= 2.0  # GeneB moderate
     labels = ["NT"] * 100 + ["GeneA"] * 200 + ["GeneB"] * 50
-    obs = pd.DataFrame(
-        {"gene_target": labels}, index=[f"Cell_{i}" for i in range(n_cells)]
-    )
+    obs = pd.DataFrame({"gene_target": labels}, index=[f"Cell_{i}" for i in range(n_cells)])
     var = pd.DataFrame(index=[f"Gene_{i}" for i in range(n_genes)])
     adata = anndata.AnnData(X=X, obs=obs, var=var)
     adata.layers["X_pert"] = adata.X.copy()
@@ -39,9 +37,7 @@ def mixscale_adata() -> anndata.AnnData:
 def test_mixscale_basic_scoring(mixscale_adata):
     """mixscale runs, writes a float score column, and controls score 0."""
     adata = mixscale_adata
-    rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test")
     assert "mixscale_score" in adata.obs
     assert adata.obs["mixscale_score"].dtype.kind == "f"
     nt_scores = adata.obs.loc[adata.obs["gene_target"] == "NT", "mixscale_score"]
@@ -51,9 +47,7 @@ def test_mixscale_basic_scoring(mixscale_adata):
 def test_mixscale_perturbed_cells_nonzero(mixscale_adata):
     """Perturbed cells receive non-zero scores."""
     adata = mixscale_adata
-    rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test")
     ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
     assert ko.abs().mean() > 0
 
@@ -61,9 +55,7 @@ def test_mixscale_perturbed_cells_nonzero(mixscale_adata):
 def test_mixscale_strong_vs_weak(mixscale_adata):
     """Strongly perturbed cells get larger absolute scores than weak ones."""
     adata = mixscale_adata
-    rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test")
     scores = adata.obs["mixscale_score"].to_numpy()
     # Strong and weak share the 'GeneA' label (one model is fit over both), so
     # require a clear margin rather than a bare inequality.
@@ -75,9 +67,7 @@ def test_mixscale_strong_vs_weak(mixscale_adata):
 def test_mixscale_multiple_perturbations(mixscale_adata):
     """Every target gene with enough DE genes is scored."""
     adata = mixscale_adata
-    rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test")
     for gene in ("GeneA", "GeneB"):
         s = adata.obs.loc[adata.obs["gene_target"] == gene, "mixscale_score"]
         assert s.abs().mean() > 0
@@ -98,9 +88,7 @@ def test_mixscale_custom_column_name(mixscale_adata):
 
 def test_mixscale_copy_mode(mixscale_adata):
     adata = mixscale_adata
-    result = rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test", copy=True
-    )
+    result = rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test", copy=True)
     assert result is not None
     assert result is not adata
     assert "mixscale_score" in result.obs
@@ -110,18 +98,14 @@ def test_mixscale_copy_mode(mixscale_adata):
 def test_mixscale_requires_signature(mixscale_adata):
     del mixscale_adata.layers["X_pert"]
     with pytest.raises(KeyError, match="X_pert"):
-        rsc.ptg.Mixscale().mixscale(
-            mixscale_adata, pert_key="gene_target", control="NT", test_method="t-test"
-        )
+        rsc.ptg.Mixscale().mixscale(mixscale_adata, pert_key="gene_target", control="NT", test_method="t-test")
 
 
 def test_mixscale_sparse_input(mixscale_adata):
     """Sparse layers score the same as dense (matrix is densified internally)."""
     adata = mixscale_adata
     adata.layers["X_pert"] = sparse.csr_matrix(adata.layers["X_pert"])
-    rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test")
     pert = adata.obs.loc[adata.obs["gene_target"] != "NT", "mixscale_score"]
     assert not np.isnan(pert.to_numpy()).any()
 
@@ -139,9 +123,7 @@ def test_mixscale_matches_pertpy(mixscape_adata):
     ad_rsc.layers["X_pert"] = ad_rsc.X.copy()
     ad_pt = ad_rsc.copy()
 
-    rsc.ptg.Mixscale().mixscale(
-        ad_rsc, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscale().mixscale(ad_rsc, pert_key="gene_target", control="NT", test_method="t-test")
     pt.tl.Mixscale().mixscale(
         ad_pt,
         pert_key="gene_target",
@@ -204,9 +186,7 @@ def test_mixscale_matches_numpy_reference(dtype):
     ref = np.zeros(n_obs)
     for guide, cols in genes.values():
         rows = np.concatenate([ctrl, guide]).astype(np.int32)
-        is_guide = np.concatenate(
-            [np.zeros(ctrl.size, bool), np.ones(guide.size, bool)]
-        )
+        is_guide = np.concatenate([np.zeros(ctrl.size, bool), np.ones(guide.size, bool)])
         nt_in_all = ~is_guide
         gene_jobs.append(
             {
@@ -216,9 +196,7 @@ def test_mixscale_matches_numpy_reference(dtype):
                 "nt_in_all": nt_in_all,
             }
         )
-        block_scores = _ref_mixscale_gene(
-            X[rows][:, cols], is_guide, nt_in_all, do_scale=True
-        )
+        block_scores = _ref_mixscale_gene(X[rows][:, cols], is_guide, nt_in_all, do_scale=True)
         ref[guide] = block_scores[is_guide]
 
     Xg = cp.asarray(X)
@@ -231,9 +209,7 @@ def test_mixscale_matches_numpy_reference(dtype):
 def test_mixscale_no_scale(mixscale_adata):
     """The scale=False path runs and produces finite, non-zero perturbed scores."""
     adata = mixscale_adata
-    rsc.ptg.Mixscale().mixscale(
-        adata, pert_key="gene_target", control="NT", test_method="t-test", scale=False
-    )
+    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test", scale=False)
     assert not np.isnan(adata.obs["mixscale_score"].to_numpy()).any()
     ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
     assert ko.abs().mean() > 0
@@ -245,18 +221,14 @@ def test_mixscale_float32_matches_float64():
     n_genes, n = 200, 120
     X = rng.standard_normal((2 * n, n_genes)).astype(np.float64)
     X[n:, :40] -= 2.0
-    obs = pd.DataFrame(
-        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
-    )
+    obs = pd.DataFrame({"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
     ad64 = anndata.AnnData(X=X, obs=obs, var=var)
     ad64.layers["X_pert"] = ad64.X.copy()
     ad32 = anndata.AnnData(X=X.astype(np.float32), obs=obs.copy(), var=var.copy())
     ad32.layers["X_pert"] = ad32.X.copy()
     for ad_ in (ad64, ad32):
-        rsc.ptg.Mixscale().mixscale(
-            ad_, pert_key="pert", control="NT", test_method="t-test"
-        )
+        rsc.ptg.Mixscale().mixscale(ad_, pert_key="pert", control="NT", test_method="t-test")
     np.testing.assert_allclose(
         ad32.obs["mixscale_score"].to_numpy(dtype=float),
         ad64.obs["mixscale_score"].to_numpy(dtype=float),
@@ -272,9 +244,7 @@ def test_mixscale_large_de_set_shared_mem_optin():
     n_genes, n = 2500, 120
     X = rng.standard_normal((2 * n, n_genes)).astype(np.float32)
     X[n:] -= 2.0  # every gene differentially expressed in the guide group
-    obs = pd.DataFrame(
-        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
-    )
+    obs = pd.DataFrame({"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
     adata = anndata.AnnData(X=X, obs=obs, var=var)
     adata.layers["X_pert"] = adata.X.copy()

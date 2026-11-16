@@ -10,9 +10,7 @@ if TYPE_CHECKING:
     from ._core import _RankGenes
 
 
-def t_test(
-    rg: _RankGenes, method: Literal["t-test", "t-test_overestim_var"]
-) -> list[tuple[int, NDArray, NDArray]]:
+def t_test(rg: _RankGenes, method: Literal["t-test", "t-test_overestim_var"]) -> list[tuple[int, NDArray, NDArray]]:
     """Compute t-test statistics using Welch's t-test."""
     from scipy import stats
 

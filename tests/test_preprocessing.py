@@ -24,7 +24,7 @@ import rapids_singlecell as rsc
 )
 def test_filter_genes(array_type, max_cells, max_counts, min_cells, min_counts):
     adata = pbmc68k_reduced()
-    adata.X = adata.raw.X.todense()
+    adata.X = adata.raw.X.toarray()
     rsc.get.anndata_to_GPU(adata)
     adata_casted = adata.copy()
     if array_type is not cp.ndarray:
@@ -62,7 +62,7 @@ def test_filter_genes(array_type, max_cells, max_counts, min_cells, min_counts):
 )
 def test_filter_cells(array_type, max_genes, max_counts, min_genes, min_counts):
     adata = pbmc68k_reduced()
-    adata.X = adata.raw.X.todense()
+    adata.X = adata.raw.X.toarray()
     rsc.get.anndata_to_GPU(adata)
     adata_casted = adata.copy()
     if array_type is not cp.ndarray:
@@ -88,9 +88,7 @@ def test_filter_cells(array_type, max_genes, max_counts, min_genes, min_counts):
 
 
 # integer counts so n_counts (value sum) differs from n_cells (nonzero count)
-_COUNTS = (np.random.default_rng(0).random((40, 12)) > 0.4) * np.random.default_rng(
-    1
-).integers(1, 5, (40, 12))
+_COUNTS = (np.random.default_rng(0).random((40, 12)) > 0.4) * np.random.default_rng(1).integers(1, 5, (40, 12))
 
 
 @pytest.mark.parametrize(
@@ -109,9 +107,7 @@ def test_filter_genes_single_column(kwargs, expected, unexpected):
     sc.pp.filter_genes(sc_ad, **kwargs)
     assert expected in rsc_ad.var.columns
     assert unexpected not in rsc_ad.var.columns
-    np.testing.assert_allclose(
-        rsc_ad.var[expected].to_numpy(), sc_ad.var[expected].to_numpy()
-    )
+    np.testing.assert_allclose(rsc_ad.var[expected].to_numpy(), sc_ad.var[expected].to_numpy())
 
 
 @pytest.mark.parametrize(
@@ -130,6 +126,23 @@ def test_filter_cells_single_column(kwargs, expected, unexpected):
     sc.pp.filter_cells(sc_ad, **kwargs)
     assert expected in rsc_ad.obs.columns
     assert unexpected not in rsc_ad.obs.columns
-    np.testing.assert_allclose(
-        rsc_ad.obs[expected].to_numpy(), sc_ad.obs[expected].to_numpy()
-    )
+    np.testing.assert_allclose(rsc_ad.obs[expected].to_numpy(), sc_ad.obs[expected].to_numpy())
+
+
+@pytest.mark.parametrize(
+    ("func", "kw", "dim"), [("filter_genes", "min_cells", "var"), ("filter_cells", "min_genes", "obs")]
+)
+def test_filter_out(func, kw, dim):
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = AnnData(cp.asarray(_COUNTS.astype("float32")))
+    f = getattr(rsc.pp, func)
+    mask, number = f(adata, **{kw: 6}, out=True)
+    assert adata.shape == _COUNTS.shape
+    sub = f(adata, **{kw: 6}, out=getattr(A, dim)["n"], copy=True)
+    assert adata.shape == _COUNTS.shape
+    assert sub.shape[dim == "var"] == mask.sum()
+    np.testing.assert_array_equal(getattr(sub, dim)["n"].to_numpy(), number[mask])
+    with pytest.warns(FutureWarning, match="inplace"):
+        mask2, _ = f(adata, **{kw: 6}, inplace=False)
+    np.testing.assert_array_equal(mask, mask2)

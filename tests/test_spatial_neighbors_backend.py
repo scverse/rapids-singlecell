@@ -129,8 +129,7 @@ def test_csr_assembly_storage_gaps_and_stream(edges, n, dtype, set_diag):
     with stream:
         # Strided input conversion and assembly must respect the caller's stream.
         rows, cols, values = (
-            cp.repeat(cp.asarray(x, dtype=t), 2)[::2]
-            for x, t in zip(edges, (cp.int64, cp.int32, dtype), strict=True)
+            cp.repeat(cp.asarray(x, dtype=t), 2)[::2] for x, t in zip(edges, (cp.int64, cp.int32, dtype), strict=True)
         )
         adj, dst = build_graphs(rows, cols, values, n, set_diag=set_diag)
         adjacency = build_adjacency(rows, cols, n, set_diag=set_diag)
@@ -217,9 +216,7 @@ def test_ambiguous_delaunay_uses_gpu(force_gpu, monkeypatch, kind):
     if kind == "circle":
         # The input follows the convex hull; interleaved chords would cross.
         left, right = rows[rows < cols], cols[rows < cols]
-        assert not np.any(
-            (left[:, None] < left) & (left < right[:, None]) & (right[:, None] < right)
-        )
+        assert not np.any((left[:, None] < left) & (left < right[:, None]) & (right[:, None] < right))
 
 
 @pytest.mark.parametrize("case", ["small", "3d", AttributeError, TypeError])

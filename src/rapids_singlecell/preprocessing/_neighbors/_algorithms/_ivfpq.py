@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
+from rapids_singlecell.preprocessing._neighbors._algorithms._brute import _brute_knn
 from rapids_singlecell.preprocessing._neighbors._helper import (
+    _IVF_PQ_MIN_ROWS,
     _batched_search,
     _compute_nlist,
     _cuvs_switch,
@@ -26,6 +28,8 @@ def _ivf_pq_knn(
     metric_kwds: Mapping,
     algorithm_kwds: Mapping,
 ) -> tuple[cp.ndarray, cp.ndarray]:
+    if X.shape[0] < _IVF_PQ_MIN_ROWS:  # too few rows to train the PQ codebooks
+        return _brute_knn(X, Y, k, metric=metric, metric_kwds=metric_kwds, algorithm_kwds=algorithm_kwds)
     if not _cuvs_switch():
         from pylibraft.common import DeviceResources
         from pylibraft.neighbors import ivf_pq
@@ -34,7 +38,8 @@ def _ivf_pq_knn(
         build_kwargs = {"handle": resources}
         search_kwargs = {"handle": resources}
         warnings.warn(
-            "Using `pylibraft` for ANN was removed in RAFT 24.12 and is deprecated in rapids-singlecell. Please update RAPIDS to use `cuvs` for ANN."
+            "Using `pylibraft` for ANN was removed in RAFT 24.12 and is deprecated in rapids-singlecell. Please update RAPIDS to use `cuvs` for ANN.",
+            stacklevel=2,
         )
     else:
         from cuvs.neighbors import ivf_pq
@@ -51,9 +56,7 @@ def _ivf_pq_knn(
     index = ivf_pq.build(index_params, X, **build_kwargs)
     # Create SearchParams with nprobes if provided
     search_params = ivf_pq.SearchParams(n_probes=n_probes)
-    distances, neighbors = _batched_search(
-        lambda q: ivf_pq.search(search_params, index, q, k, **search_kwargs), Y
-    )
+    distances, neighbors = _batched_search(lambda q: ivf_pq.search(search_params, index, q, k, **search_kwargs), Y)
     if resources is not None:
         resources.sync()
 

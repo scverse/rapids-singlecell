@@ -17,6 +17,7 @@ from testing.rapids_singlecell._helper import (
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
 @pytest.mark.parametrize("zero_center", [True, False])
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
+@pytest.mark.filterwarnings("ignore:Sending large graph:UserWarning")
 def test_pca_dask(dist_client, data_kind, zero_center):
     adata_1 = pbmc3k_processed()
     adata_2 = pbmc3k_processed()
@@ -127,9 +128,7 @@ def test_pca_dask_full_pipeline(client, data_kind):
         atol=1e-6,
     )
 
-    cp.testing.assert_allclose(
-        np.abs(adata_1.varm["PCs"]), np.abs(adata_2.varm["PCs"]), rtol=1e-7, atol=1e-6
-    )
+    cp.testing.assert_allclose(np.abs(adata_1.varm["PCs"]), np.abs(adata_2.varm["PCs"]), rtol=1e-7, atol=1e-6)
 
     cp.testing.assert_allclose(
         np.abs(adata_1.uns["pca"]["variance_ratio"]),

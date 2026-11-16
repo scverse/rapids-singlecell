@@ -10,7 +10,9 @@ from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
 from cupyx.scipy.sparse import issparse as cp_issparse
 
 from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
+from rapids_singlecell._settings import Preset
 from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
+from rapids_singlecell.get._out import own_deprecations
 from rapids_singlecell.tools._utils import _choose_representation
 
 if TYPE_CHECKING:
@@ -105,9 +107,7 @@ class PerturbationEfficacyAnalyzer:
         if ref_selection_mode not in ("nn", "split_by"):
             raise ValueError("ref_selection_mode must be either 'nn' or 'split_by'.")
         if ref_selection_mode == "split_by" and split_by is None:
-            raise ValueError(
-                "split_by must be provided if ref_selection_mode is 'split_by'."
-            )
+            raise ValueError("split_by must be provided if ref_selection_mode is 'split_by'.")
 
         if copy:
             adata = adata.copy()
@@ -122,8 +122,7 @@ class PerturbationEfficacyAnalyzer:
                 control_group_np = control_mask & split_mask
                 if not control_group_np.any():
                     warnings.warn(
-                        f"No control cells in split {split!r}; leaving its "
-                        "perturbation signature equal to the input.",
+                        f"No control cells in split {split!r}; leaving its perturbation signature equal to the input.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -136,25 +135,17 @@ class PerturbationEfficacyAnalyzer:
                 split_masks = [np.ones(adata.n_obs, dtype=bool)]
             else:
                 split_obs = adata.obs[split_by]
-                split_masks = [
-                    (split_obs == cat).to_numpy() for cat in split_obs.unique()
-                ]
+                split_masks = [(split_obs == cat).to_numpy() for cat in split_obs.unique()]
 
-            from rapids_singlecell.preprocessing._neighbors._neighbors import (
-                KNN_ALGORITHMS,
-            )
+            from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
+            from rapids_singlecell.preprocessing._neighbors._neighbors import KNN_ALGORITHMS
 
             if knn_algorithm not in KNN_ALGORITHMS:
-                raise ValueError(
-                    f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, "
-                    f"got {knn_algorithm!r}"
-                )
+                raise ValueError(f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, got {knn_algorithm!r}")
             knn = KNN_ALGORITHMS[knn_algorithm]
             algorithm_kwds = dict(knn_kwargs) if knn_kwargs is not None else {}
 
-            representation = _choose_representation_gpu(
-                adata, use_rep=use_rep, n_pcs=n_pcs
-            )
+            representation = _choose_representation_gpu(adata, use_rep=use_rep, n_pcs=n_pcs)
             if n_dims is not None and n_dims < representation.shape[1]:
                 representation = representation[:, :n_dims]
             representation = cp.ascontiguousarray(representation)
@@ -165,8 +156,7 @@ class PerturbationEfficacyAnalyzer:
                 n_control = int(control_mask_split.sum())
                 if n_control == 0:
                     warnings.warn(
-                        "No control cells in a split; leaving its perturbation "
-                        "signature equal to the input.",
+                        "No control cells in a split; leaving its perturbation signature equal to the input.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -175,7 +165,7 @@ class PerturbationEfficacyAnalyzer:
                 R_control = representation[cp.asarray(control_mask_split)]
                 k = min(n_neighbors, n_control)
 
-                indices, _ = knn(
+                indices, dist = knn(
                     R_control,
                     R_split,
                     k,
@@ -183,6 +173,7 @@ class PerturbationEfficacyAnalyzer:
                     metric_kwds={},
                     algorithm_kwds=algorithm_kwds,
                 )
+                _check_knn_complete(indices, dist, n_index=n_control, algorithm=knn_algorithm)
 
                 X_control = cp.expm1(X[cp.asarray(control_mask_split)])
                 col_indices = indices.ravel().astype(cp.int32, copy=False)
@@ -195,9 +186,7 @@ class PerturbationEfficacyAnalyzer:
                     shape=(n_split, n_control),
                 )
                 split_dev = cp.asarray(split_mask)
-                X_pert[split_dev] = (
-                    cp.log1p(neigh_matrix @ X_control) - X_pert[split_dev]
-                )
+                X_pert[split_dev] = cp.log1p(neigh_matrix @ X_control) - X_pert[split_dev]
 
         _set_obs_rep(adata, X_pert, layer="X_pert")
 
@@ -239,7 +228,7 @@ class PerturbationEfficacyAnalyzer:
             group_labels = np.where(split_mask, pert_str, _DE_IGNORE_LABEL)
             adata.obs[group_key] = pd.Categorical(group_labels)
             try:
-                with warnings.catch_warnings():
+                with warnings.catch_warnings(), own_deprecations():
                     warnings.simplefilter("ignore", RuntimeWarning)
                     rank_genes_groups(
                         adata,
@@ -283,9 +272,7 @@ def _to_dense_gpu(X) -> cp.ndarray:
     return X
 
 
-def _choose_representation_gpu(
-    adata: AnnData, *, use_rep: str | None, n_pcs: int | None
-) -> cp.ndarray:
+def _choose_representation_gpu(adata: AnnData, *, use_rep: str | None, n_pcs: int | None) -> cp.ndarray:
     """Select a representation and return it as a dense GPU array.
 
     Always returns a float32 representation: neighbor selection does not need
@@ -301,8 +288,10 @@ def _choose_representation_gpu(
             raise
         from rapids_singlecell.preprocessing import pca
 
-        key_added = None if pca_keys == _embedding_keys("pca", None) else pca_keys.obsm
-        pca(adata, n_comps=n_pcs, key_added=key_added)
+        # a `Preset` as `key_added` gives its key names (`uns` too) without needing `anndata.acc`
+        key_added = Preset.ScanpyV1 if pca_keys == _embedding_keys("pca", None) else pca_keys.obsm
+        with own_deprecations():
+            pca(adata, n_comps=n_pcs, key_added=key_added)
         rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
     rep = _to_dense_gpu(rep)
     rep = cp.asarray(rep, dtype=cp.float32)

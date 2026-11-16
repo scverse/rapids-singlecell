@@ -17,9 +17,7 @@ if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 # Simple fused AXPY kernel - faster than function call overhead
-_kernel_axpy = cp.ElementwiseKernel(
-    "T alpha, T y", "T x", "x -= alpha * y", "lanczos_axpy"
-)
+_kernel_axpy = cp.ElementwiseKernel("T alpha, T y", "T x", "x -= alpha * y", "lanczos_axpy")
 
 
 def _cgs2_orth(

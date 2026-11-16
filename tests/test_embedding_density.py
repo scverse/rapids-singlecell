@@ -13,9 +13,7 @@ import rapids_singlecell as rsc
 def adata_grid():
     """3x3 grid embedding where center cell (index 4) should have highest density."""
     adata = AnnData(X=np.ones((9, 10), dtype=np.float32))
-    adata.obsm["X_test"] = np.array(
-        [[x, y] for x in range(3) for y in range(3)], dtype=np.float32
-    )
+    adata.obsm["X_test"] = np.array([[x, y] for x in range(3) for y in range(3)], dtype=np.float32)
     return adata
 
 
@@ -28,12 +26,8 @@ def adata_grouped():
 
     # Group A clustered around (0, 0), Group B clustered around (5, 5)
     embed = np.zeros((n, 2), dtype=np.float32)
-    embed[: n // 2] = rng.normal(loc=0.0, scale=0.5, size=(n // 2, 2)).astype(
-        np.float32
-    )
-    embed[n // 2 :] = rng.normal(loc=5.0, scale=0.5, size=(n // 2, 2)).astype(
-        np.float32
-    )
+    embed[: n // 2] = rng.normal(loc=0.0, scale=0.5, size=(n // 2, 2)).astype(np.float32)
+    embed[n // 2 :] = rng.normal(loc=5.0, scale=0.5, size=(n // 2, 2)).astype(np.float32)
     adata.obsm["X_umap"] = embed
 
     adata.obs["group"] = pd.Categorical(["A"] * (n // 2) + ["B"] * (n // 2))
@@ -79,11 +73,37 @@ def test_groupby(adata_grouped):
 
 
 def test_key_added(adata_grid):
-    """Custom key_added is respected."""
-    rsc.tl.embedding_density(adata_grid, "test", key_added="my_density")
+    """Deprecated `key_added` still names the outputs."""
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.tl.embedding_density(adata_grid, "test", key_added="my_density")
 
     assert "my_density" in adata_grid.obs.columns
     assert "my_density_params" in adata_grid.uns
+
+
+def test_use_out(adata_grouped):
+    """`use`/`groupby` take accessors, `out` names the column or returns the densities."""
+    A = pytest.importorskip("anndata.acc").A
+
+    rsc.tl.embedding_density(adata_grouped, A.obsm["X_umap"], groupby=A.obs["group"], out=A.obs["dens"])
+    assert "dens_params" in adata_grouped.uns
+    res = rsc.tl.embedding_density(adata_grouped, "umap", groupby="group", out=True)
+    np.testing.assert_array_equal(res, adata_grouped.obs["dens"].to_numpy())
+    with pytest.warns(FutureWarning, match="basis"):
+        rsc.tl.embedding_density(adata_grouped, basis="umap")
+    assert "umap_density" in adata_grouped.obs
+
+
+def test_use_outside_obsm_rejected(adata_grouped):
+    A = pytest.importorskip("anndata.acc").A
+    with pytest.raises(TypeError, match="`use` must be one of"):
+        rsc.tl.embedding_density(adata_grouped, A.layers["x"])
+
+
+def test_out_true_rejects_numeric_groupby(adata_grouped):
+    adata_grouped.obs["num"] = 1.0
+    with pytest.raises(ValueError, match="does not contain categorical data"):
+        rsc.tl.embedding_density(adata_grouped, "umap", groupby="num", out=True)
 
 
 def test_custom_components(adata_grouped):
@@ -134,9 +154,7 @@ def test_groupby_not_categorical():
 def test_diffmap_component_offset():
     """diffmap components are offset by 1 internally."""
     adata = AnnData(X=np.ones((9, 3), dtype=np.float32))
-    adata.obsm["X_diffmap"] = np.array(
-        [[0, x, y] for x in range(3) for y in range(3)], dtype=np.float32
-    )
+    adata.obsm["X_diffmap"] = np.array([[0, x, y] for x in range(3) for y in range(3)], dtype=np.float32)
 
     rsc.tl.embedding_density(adata, "diffmap")
     assert "diffmap_density" in adata.obs.columns
@@ -148,9 +166,7 @@ def test_diffmap_component_offset():
 def test_fa_alias():
     """'fa' basis is aliased to 'draw_graph_fa'."""
     adata = AnnData(X=np.ones((9, 3), dtype=np.float32))
-    adata.obsm["X_draw_graph_fa"] = np.array(
-        [[x, y] for x in range(3) for y in range(3)], dtype=np.float32
-    )
+    adata.obsm["X_draw_graph_fa"] = np.array([[x, y] for x in range(3) for y in range(3)], dtype=np.float32)
 
     rsc.tl.embedding_density(adata, "fa")
     assert "draw_graph_fa_density" in adata.obs.columns

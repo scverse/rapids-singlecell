@@ -91,9 +91,7 @@ class TestDask:
         dc.gsea(dask_adata, net, tmin=0, times=63)
 
         for key, tolerance in [("score_gsea", 1e-12), ("padj_gsea", 0)]:
-            pd.testing.assert_frame_equal(
-                dask_adata.obsm[key], dense.obsm[key], rtol=tolerance, atol=tolerance
-            )
+            pd.testing.assert_frame_equal(dask_adata.obsm[key], dense.obsm[key], rtol=tolerance, atol=tolerance)
         assert np.any(dask_adata.obsm["padj_gsea"].to_numpy() < 1)
 
     def test_zscore_dask_vs_dense(self, adata, net):

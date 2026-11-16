@@ -94,6 +94,7 @@ def _assert_graphs(result, expected, rtol=2e-5, atol=1e-6):
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("n_dims", [2, 3])
 @pytest.mark.parametrize("transform", [None, "spectral", "cosine"])
+@pytest.mark.filterwarnings("ignore:GPU Delaunay triangulation is not yet implemented for 3D:UserWarning")
 def test_cpu_parity(method, kwargs, dtype, n_dims, transform):
     coords = np.random.default_rng(12).normal(size=(24, n_dims)).astype(dtype)
     if transform:
@@ -321,6 +322,7 @@ _FILLER = np.random.default_rng(4).uniform(size=(64, 2))
         ("radius", {"radius": 1e39}, np.r_[[[0, 0], [3e38, 3e38]], _FILLER]),
     ],
 )
+@pytest.mark.filterwarnings("ignore:overflow encountered in cast:RuntimeWarning")
 def test_invalid_input_does_not_write(method, kwargs, coords):
     adata = _adata(coords)
     with pytest.raises(ValueError):
@@ -374,7 +376,5 @@ def test_builder_positional_arguments(name, args, kwargs):
     coords = np.random.default_rng(4).normal(size=(16, 2)).astype(np.float32)
     positional, keyword = builder(*args), builder(**kwargs)
     assert positional.uns_params() == keyword.uns_params()
-    for actual, expected in zip(
-        positional.build(coords), keyword.build(coords), strict=True
-    ):
+    for actual, expected in zip(positional.build(coords), keyword.build(coords), strict=True):
         np.testing.assert_allclose(actual.toarray().get(), expected.toarray().get())

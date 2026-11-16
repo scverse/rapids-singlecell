@@ -48,9 +48,7 @@ class _FullDelaunay(GDel2D):
     def _init_for_flip(self):
         # CuPy drops distinct points that share a Morton key; keep them all.
         low = self.points.min()
-        get_morton_number(
-            self.points, self.n_points - 1, low, self.points.max() - low, self.values
-        )
+        get_morton_number(self.points, self.n_points - 1, low, self.points.max() - low, self.values)
         self.values[-1] = 2**31 - 1
         self.points_idx = cp.argsort(self.values).astype(cp.int32)
         self.point_vec = self.point_vec[self.points_idx]
@@ -139,15 +137,11 @@ def _validated_edges(
     rows = cp.empty(2 * (n + nt - 1), dtype=cp.int32)
     cols = cp.empty_like(rows)
     cursor = cp.cumsum(seen, dtype=cp.int32) - seen
-    _spatial_cuda.delaunay_fill_edges(
-        triangles, opposite, cursor, rows, cols, _stream()
-    )
+    _spatial_cuda.delaunay_fill_edges(triangles, opposite, cursor, rows, cols, _stream())
     return rows, cols
 
 
-def _flip_delaunay_edges(
-    triangles: cp.ndarray, opposite: cp.ndarray, votes: cp.ndarray
-) -> bool:
+def _flip_delaunay_edges(triangles: cp.ndarray, opposite: cp.ndarray, votes: cp.ndarray) -> bool:
     """Flip a nonconflicting batch of illegal edges with CuPy's kernels."""
     nt = len(triangles)
     active = cp.arange(nt, dtype=cp.int32)
@@ -175,9 +169,7 @@ def _gpu_delaunay_edges(coords: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray] | N
     shift = -math.frexp(magnitude)[1]
     if coords.dtype == cp.float32:
         points = cp.empty(coords.shape, dtype=cp.float64)
-        _spatial_cuda.delaunay_widen(
-            cp.ascontiguousarray(coords), shift, points, _stream()
-        )
+        _spatial_cuda.delaunay_widen(cp.ascontiguousarray(coords), shift, points, _stream())
     else:
         points = cp.ldexp(coords.astype(cp.float64), shift)
     # Duplicates are represented by their first observation.
@@ -189,9 +181,7 @@ def _gpu_delaunay_edges(coords: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray] | N
     if representatives is not None:
         points = points[representatives]
     if len(points) < 3:
-        raise ValueError(
-            "Delaunay triangulation requires at least three distinct points."
-        )
+        raise ValueError("Delaunay triangulation requires at least three distinct points.")
     # Triangle references reserve four low bits for edge metadata.
     if len(points) >= 2**26:
         return None
@@ -210,9 +200,7 @@ def _qhull_edges(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.repeat(np.arange(len(points)), np.diff(indptr)), indices
 
 
-def _delaunay_edges(
-    coords: cp.ndarray, codes: cp.ndarray | None = None
-) -> tuple[cp.ndarray, cp.ndarray]:
+def _delaunay_edges(coords: cp.ndarray, codes: cp.ndarray | None = None) -> tuple[cp.ndarray, cp.ndarray]:
     """GPU Delaunay for suitable 2D inputs; Qhull for all other cases.
 
     With ``codes``, each library is triangulated independently, and edges use

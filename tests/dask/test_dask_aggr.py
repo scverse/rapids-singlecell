@@ -55,9 +55,7 @@ def test_dask_aggr(client, data_kind, use_mask):
         cp.testing.assert_allclose(a, b)
 
 
-@pytest.mark.parametrize(
-    "as_dask_array", [as_dense_cupy_dask_array, as_sparse_cupy_dask_array]
-)
+@pytest.mark.parametrize("as_dask_array", [as_dense_cupy_dask_array, as_sparse_cupy_dask_array])
 def test_dask_aggr_masked_mean_var(client, as_dask_array):
     X = np.array(
         [
@@ -74,15 +72,12 @@ def test_dask_aggr_masked_mean_var(client, as_dask_array):
         {
             "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
             "mask": [True, True, False, True, True, False],
-        }
+        },
+        index=[str(i) for i in range(6)],
     )
     adata = AnnData(X=as_dask_array(X), obs=obs)
 
     result = rsc.get.aggregate(adata, by="group", func=["mean", "var"], mask="mask")
 
-    cp.testing.assert_allclose(
-        result.layers["mean"], cp.array([[2, 4], [3, 6]], dtype=cp.float64)
-    )
-    cp.testing.assert_allclose(
-        result.layers["var"], cp.array([[2, 8], [2, 8]], dtype=cp.float64)
-    )
+    cp.testing.assert_allclose(result.layers["mean"], cp.array([[2, 4], [3, 6]], dtype=cp.float64))
+    cp.testing.assert_allclose(result.layers["var"], cp.array([[2, 8], [2, 8]], dtype=cp.float64))

@@ -84,9 +84,7 @@ def test_set_obs_rep_conflicting_choices():
         )
 
 
-@pytest.mark.parametrize(
-    "mtype", [csc_matrix, csr_matrix, csc_array, csr_array, "dense"]
-)
+@pytest.mark.parametrize("mtype", [csc_matrix, csr_matrix, csc_array, csr_array, "dense"])
 def test_utils(mtype):
     X = np.arange(12, dtype=np.float32).reshape(3, 4)
     adata = AnnData(X if mtype == "dense" else mtype(X))

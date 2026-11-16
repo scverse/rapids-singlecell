@@ -56,5 +56,5 @@ rsc.get.anndata_to_GPU(adata)
 
 ## Multi-GPU without Dask
 
-- `rank_genes_groups`, `rsc.gr.co_occurrence`, `rsc.gr.spatial_autocorr` and the `Distance` methods take `multi_gpu`.
+- `rsc.pp.harmony_integrate`, `rank_genes_groups`, `rsc.gr.co_occurrence`, `rsc.gr.spatial_autocorr` and the `Distance` methods take `multi_gpu` (Harmony: `False`/`None` mean the current GPU).
 - Configure all devices with `rmm.reinitialize(pool_allocator=True, devices=[0, 1])`, and restrict visible GPUs with `CUDA_VISIBLE_DEVICES` before the process starts.

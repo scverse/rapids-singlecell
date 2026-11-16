@@ -13,6 +13,10 @@ from testing.rapids_singlecell._helper import (
     as_sparse_dask_matrix,
 )
 
+A = pytest.importorskip("anndata.acc").A
+
+pytestmark = pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
+
 
 def _compare_top_genes(result1, result2, top_n=10, min_overlap=9):
     """
@@ -53,9 +57,7 @@ def _compare_top_genes(result1, result2, top_n=10, min_overlap=9):
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
 @pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
 @pytest.mark.parametrize("mean_in_log_space", [True, False])
-def test_rank_genes_groups_ttest_dask(
-    client, data_kind, dtype, method, mean_in_log_space
-):
+def test_rank_genes_groups_ttest_dask(client, data_kind, dtype, method, mean_in_log_space):
     """Test t-test methods with dask arrays."""
     if data_kind == "dense":
         adata = pbmc68k_reduced()
@@ -79,37 +81,31 @@ def test_rank_genes_groups_ttest_dask(
         adata,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
     rsc.tl.rank_genes_groups(
         dask_data,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
 
     # Compare top genes overlap
-    assert _compare_top_genes(
-        adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"]
-    )
+    assert _compare_top_genes(adata.uns["rank_genes_groups"], dask_data.uns["rank_genes_groups"])
 
     # Compare scores by gene name (accounts for tie-breaking differences in sorting)
     # Genes with tied scores may appear in different order, but scores should match
     for group in adata.uns["rank_genes_groups"]["scores"].dtype.names:
         gpu_names = list(adata.uns["rank_genes_groups"]["names"][group])
-        gpu_scores = np.asarray(
-            adata.uns["rank_genes_groups"]["scores"][group], dtype=float
-        )
+        gpu_scores = np.asarray(adata.uns["rank_genes_groups"]["scores"][group], dtype=float)
         dask_names = list(dask_data.uns["rank_genes_groups"]["names"][group])
-        dask_scores = np.asarray(
-            dask_data.uns["rank_genes_groups"]["scores"][group], dtype=float
-        )
+        dask_scores = np.asarray(dask_data.uns["rank_genes_groups"]["scores"][group], dtype=float)
 
         # Create gene->score mappings
-        gpu_score_map = dict(zip(gpu_names, gpu_scores))
-        dask_score_map = dict(zip(dask_names, dask_scores))
+        gpu_score_map = dict(zip(gpu_names, gpu_scores, strict=False))
+        dask_score_map = dict(zip(dask_names, dask_scores, strict=False))
 
         # All genes should have identical scores
         for gene in gpu_score_map:
@@ -138,9 +134,7 @@ def test_rank_genes_groups_wilcoxon_dask_errors(client, data_kind):
         groupby = "louvain"
 
     with pytest.raises(ValueError, match="Wilcoxon test is not supported for Dask"):
-        rsc.tl.rank_genes_groups(
-            adata, groupby=groupby, method="wilcoxon", use_raw=False
-        )
+        rsc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", use=A.X)
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
@@ -180,7 +174,7 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         adata,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
 
@@ -189,29 +183,23 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         cpu_dask,
         groupby=groupby,
         method=method,
-        use_raw=False,
+        use=A.X,
         mean_in_log_space=mean_in_log_space,
     )
 
     # Compare top genes overlap
-    assert _compare_top_genes(
-        adata.uns["rank_genes_groups"], cpu_dask.uns["rank_genes_groups"]
-    )
+    assert _compare_top_genes(adata.uns["rank_genes_groups"], cpu_dask.uns["rank_genes_groups"])
 
     # Compare scores by gene name
     for group in adata.uns["rank_genes_groups"]["scores"].dtype.names:
         gpu_names = list(adata.uns["rank_genes_groups"]["names"][group])
-        gpu_scores = np.asarray(
-            adata.uns["rank_genes_groups"]["scores"][group], dtype=float
-        )
+        gpu_scores = np.asarray(adata.uns["rank_genes_groups"]["scores"][group], dtype=float)
         dask_names = list(cpu_dask.uns["rank_genes_groups"]["names"][group])
-        dask_scores = np.asarray(
-            cpu_dask.uns["rank_genes_groups"]["scores"][group], dtype=float
-        )
+        dask_scores = np.asarray(cpu_dask.uns["rank_genes_groups"]["scores"][group], dtype=float)
 
         # Create gene->score mappings
-        gpu_score_map = dict(zip(gpu_names, gpu_scores))
-        dask_score_map = dict(zip(dask_names, dask_scores))
+        gpu_score_map = dict(zip(gpu_names, gpu_scores, strict=False))
+        dask_score_map = dict(zip(dask_names, dask_scores, strict=False))
 
         # All genes should have matching scores
         for gene in gpu_score_map:

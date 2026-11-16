@@ -126,9 +126,7 @@ def _validate_mat(
         if np.any(~np.isfinite(mat.data)):
             check = True
     if check:
-        raise ValueError(
-            """mat contains non finite values (nan or inf), please set them to 0 or remove them."""
-        )
+        raise ValueError("""mat contains non finite values (nan or inf), please set them to 0 or remove them.""")
     return mat, row, col
 
 
@@ -151,9 +149,7 @@ def _validate_backed(
         else:
             msk_col[i] = np.count_nonzero(bmat, axis=0) == 0
         has_nonfin = np.any(~np.isfinite(bmat.data))
-        assert not has_nonfin, (
-            "mat contains non finite values (nan or inf), set them to 0 or remove them"
-        )
+        assert not has_nonfin, "mat contains non finite values (nan or inf), set them to 0 or remove them"
     msk_col = np.logical_and.reduce(msk_col, axis=0)
     n_empty_col: float = np.sum(msk_col)
     if n_empty_col > 0 and empty:
@@ -198,7 +194,6 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
     c : ndarray
         Array of feature names.
     """
-
     if isinstance(data, list):
         m, r, c = data
         m = np.array(m, dtype=float)
@@ -215,11 +210,7 @@ def _extract(data: DataType, *, raw=None, layer=None, pre_load=False):
 
         use_raw = _check_use_raw(data, layer, use_raw=raw)
         m = _get_obs_rep(data, layer=layer, use_raw=raw)
-        c = (
-            data.raw.var.index.values.astype("U")
-            if use_raw
-            else data.var.index.values.astype("U")
-        )
+        c = data.raw.var.index.values.astype("U") if use_raw else data.var.index.values.astype("U")
         r = data.obs.index.values.astype("U")
 
     else:
@@ -253,10 +244,7 @@ def extract(
     bsize: int = 250_000,
     pre_load: bool = False,
     materialize: bool = False,
-) -> (
-    tuple[DataType_matrix, np.ndarray, np.ndarray]
-    | tuple[tuple[DataType_matrix, np.ndarray], np.ndarray, np.ndarray]
-):
+) -> tuple[DataType_matrix, np.ndarray, np.ndarray] | tuple[tuple[DataType_matrix, np.ndarray], np.ndarray, np.ndarray]:
     """
     Extracts matrix, rownames and colnames from data.
 
@@ -285,19 +273,14 @@ def extract(
     if not pd.Index(col).is_unique:
         raise ValueError("mat contains repeated feature names, please make them unique")
     isbacked = hasattr(data, "isbacked") and data.isbacked
-    mat_tuple: (
-        tuple[np.ndarray, np.ndarray, np.ndarray]
-        | tuple[tuple[np.ndarray, np.ndarray], np.ndarray, np.ndarray]
-    )
+    mat_tuple: tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[tuple[np.ndarray, np.ndarray], np.ndarray, np.ndarray]
     if not isbacked:
         mat, row, col = _validate_mat(mat, row, col, empty=empty, verbose=verbose)
         # Randomly sort features
         mat, col = _break_ties(mat=mat, features=col)
         mat_tuple = (mat, row, col)
     else:
-        msk_col = _validate_backed(
-            mat=mat, row=row, col=col, empty=empty, verbose=verbose, bsize=bsize
-        )
+        msk_col = _validate_backed(mat=mat, row=row, col=col, empty=empty, verbose=verbose, bsize=bsize)
         msk_col = ~msk_col
         col = col[msk_col]
         mat_tuple = ((mat, msk_col), row, col)

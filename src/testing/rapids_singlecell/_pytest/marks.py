@@ -27,9 +27,7 @@ class needs(QuietMarkDecorator, Enum):
 
     # _generate_next_value_ needs to come before members
     @staticmethod
-    def _generate_next_value_(
-        name: str, start: int, count: int, last_values: list[str]
-    ) -> str:
+    def _generate_next_value_(name: str, start: int, count: int, last_values: list[str]) -> str:
         """Distribution name for matching modules."""
         return name.replace("_", "-")
 

@@ -44,24 +44,43 @@ def _make_deterministic() -> tuple[anndata.AnnData, pd.DataFrame, np.ndarray, li
 def test_mixscape_classification(mixscape_adata):
     adata = mixscape_adata
     adata.layers["X_pert"] = adata.X.copy()
-    rsc.ptg.Mixscape().mixscape(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscape().mixscape(adata, pert_key="gene_target", control="NT", test_method="t-test")
 
     assert "mixscape_class" in adata.obs
     assert "mixscape_class_global" in adata.obs
     assert "mixscape_class_p_ko" in adata.obs
 
     glob = adata.obs["mixscape_class_global"]
-    np_correct = int(
-        (glob[NUM_CELLS_PER_GROUP : 2 * NUM_CELLS_PER_GROUP] == "NP").sum()
-    )
-    ko_correct = int(
-        (glob[2 * NUM_CELLS_PER_GROUP : 3 * NUM_CELLS_PER_GROUP] == "KO").sum()
-    )
+    np_correct = int((glob[NUM_CELLS_PER_GROUP : 2 * NUM_CELLS_PER_GROUP] == "NP").sum())
+    ko_correct = int((glob[2 * NUM_CELLS_PER_GROUP : 3 * NUM_CELLS_PER_GROUP] == "KO").sum())
     assert np_correct > ACCURACY_THRESHOLD * NUM_CELLS_PER_GROUP
     assert ko_correct > ACCURACY_THRESHOLD * NUM_CELLS_PER_GROUP
     assert "mixscape" in adata.uns
+
+
+def test_mixscape_min_cells_is_independent_of_min_de_genes():
+    rng = np.random.default_rng(7)
+    n_cells, n_genes = 6, 20
+    adata = anndata.AnnData(
+        X=np.vstack([rng.normal(1.0, 0.1, (n_cells, n_genes)), rng.normal(5.0, 0.1, (n_cells, n_genes))]),
+        obs=pd.DataFrame(
+            {"gene_target": ["NT"] * n_cells + ["target_gene"] * n_cells},
+            index=[f"cell_{i}" for i in range(2 * n_cells)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)]),
+    )
+    adata.layers["X_pert"] = adata.X.copy()
+    target = (adata.obs["gene_target"] == "target_gene").to_numpy()
+
+    result = rsc.ptg.Mixscape().mixscape(
+        adata, pert_key="gene_target", control="NT", test_method="t-test", min_de_genes=10, min_cells=3, copy=True
+    )
+    assert (result.obs.loc[target, "mixscape_class_global"] == "KO").all()
+
+    result = rsc.ptg.Mixscape().mixscape(
+        adata, pert_key="gene_target", control="NT", test_method="t-test", min_de_genes=1, min_cells=7, copy=True
+    )
+    assert (result.obs.loc[target, "mixscape_class_global"] == "NP").all()
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -74,19 +93,10 @@ def test_mixscape_matches_pertpy(mixscape_adata, dtype):
     ad_rsc.layers["X_pert"] = ad_rsc.X.copy()
     ad_pt = ad_rsc.copy()
 
-    rsc.ptg.Mixscape().mixscape(
-        ad_rsc, pert_key="gene_target", control="NT", test_method="t-test"
-    )
-    pt.tl.Mixscape().mixscape(
-        ad_pt, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscape().mixscape(ad_rsc, pert_key="gene_target", control="NT", test_method="t-test")
+    pt.tl.Mixscape().mixscape(ad_pt, pert_key="gene_target", control="NT", test_method="t-test")
 
-    agreement = float(
-        (
-            ad_rsc.obs["mixscape_class_global"].values
-            == ad_pt.obs["mixscape_class_global"].values
-        ).mean()
-    )
+    agreement = float((ad_rsc.obs["mixscape_class_global"].values == ad_pt.obs["mixscape_class_global"].values).mean())
     assert agreement >= 0.95
 
 
@@ -123,16 +133,12 @@ def test_lda(mixscape_adata):
 def test_gpu_lda_matches_sklearn():
     rng = np.random.default_rng(0)
     centers = rng.normal(scale=5.0, size=(4, 12))
-    X = np.vstack([rng.normal(c, 1.0, size=(150, 12)) for c in centers]).astype(
-        np.float64
-    )
+    X = np.vstack([rng.normal(c, 1.0, size=(150, 12)) for c in centers]).astype(np.float64)
     y = np.repeat(np.arange(4), 150)
     n_comp = 3
 
     skl = LinearDiscriminantAnalysis(n_components=n_comp).fit_transform(X, y)
-    gpu = cp.asnumpy(
-        _lda_fit_transform_gpu(cp.asarray(X), cp.asarray(y), n_components=n_comp)
-    )
+    gpu = cp.asnumpy(_lda_fit_transform_gpu(cp.asarray(X), cp.asarray(y), n_components=n_comp))
     assert gpu.shape == skl.shape
     # float64 SVD port: matches sklearn to ~machine precision (measured ~4e-14);
     # discriminant directions are unique only up to a per-column sign flip.
@@ -161,9 +167,7 @@ def test_lda_multiclass():
         blocks.append(ko)
         labels += [gene] * n_ko
     X = np.vstack(blocks).astype(np.float32)
-    obs = pd.DataFrame(
-        {"gene_target": labels}, index=[str(i) for i in range(X.shape[0])]
-    )
+    obs = pd.DataFrame({"gene_target": labels}, index=[str(i) for i in range(X.shape[0])])
     var = pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])
     adata = anndata.AnnData(X=sparse.csr_matrix(X), obs=obs, var=var)
     adata.layers["X_pert"] = adata.X.copy()
@@ -184,9 +188,7 @@ def test_lda_multiclass():
 
 
 def test_perturbation_signature_writes_layer(mixscape_adata):
-    rsc.ptg.Mixscape().perturbation_signature(
-        mixscape_adata, pert_key="gene_target", control="NT"
-    )
+    rsc.ptg.Mixscape().perturbation_signature(mixscape_adata, pert_key="gene_target", control="NT")
     assert "X_pert" in mixscape_adata.layers
     assert mixscape_adata.layers["X_pert"].shape == mixscape_adata.shape
 
@@ -194,29 +196,44 @@ def test_perturbation_signature_writes_layer(mixscape_adata):
 @pytest.mark.parametrize("analyzer", [rsc.ptg.Mixscape, rsc.ptg.Mixscale])
 @pytest.mark.parametrize("preset", list(rsc.Preset))
 @pytest.mark.parametrize("pca_keys", [("X_pca",), ("pca",), ("X_pca", "pca")])
-def test_perturbation_signature_recomputes_short_pca(
-    mixscape_adata, analyzer, preset, pca_keys
-):
+def test_perturbation_signature_recomputes_short_pca(mixscape_adata, analyzer, preset, pca_keys):
     adata = mixscape_adata
     selected_key = pca_keys[0]
-    key_added = None if selected_key == "X_pca" else selected_key
+    loadings = "PCs" if selected_key == "X_pca" else selected_key
+
+    def pca(adata, n_comps, key):
+        adata.obsm[key], adata.varm[loadings if key == selected_key else key] = rsc.pp.pca(
+            adata, n_comps=n_comps, out=True
+        )
+
     with rsc.settings.override(preset=preset, N_PCS=3):
-        rsc.pp.pca(adata, n_comps=2, key_added=key_added)
+        pca(adata, 2, selected_key)
         if len(pca_keys) > 1:
-            rsc.pp.pca(adata, n_comps=6, key_added="pca")
+            pca(adata, 6, "pca")
         expected = adata.copy()
-        rsc.pp.pca(expected, n_comps=4, key_added=key_added)
+        pca(expected, 4, selected_key)
 
         for target in (adata, expected):
-            analyzer().perturbation_signature(
-                target, pert_key="gene_target", control="NT", n_pcs=4
-            )
+            analyzer().perturbation_signature(target, pert_key="gene_target", control="NT", n_pcs=4)
 
     assert adata.obsm[selected_key].shape[1] == 4
     assert set(adata.obsm) == set(pca_keys)
     if len(pca_keys) > 1:
         np.testing.assert_array_equal(adata.obsm["pca"], expected.obsm["pca"])
     cp.testing.assert_allclose(adata.layers["X_pert"], expected.layers["X_pert"])
+
+
+@pytest.mark.filterwarnings("error::FutureWarning")
+@pytest.mark.parametrize("preset", list(rsc.Preset))
+@pytest.mark.parametrize("stored", list(rsc.Preset))
+def test_perturbation_signature_recompute_updates_uns(mixscape_adata, preset, stored):
+    adata = mixscape_adata
+    with rsc.settings.override(preset=stored):
+        rsc.pp.pca(adata, n_comps=2)
+    with rsc.settings.override(preset=preset, N_PCS=3):
+        rsc.ptg.Mixscape().perturbation_signature(adata, pert_key="gene_target", control="NT", n_pcs=4)
+    varm = "PCs" if stored is rsc.Preset.ScanpyV1 else "pca"
+    assert adata.varm[varm].shape[1] == len(adata.uns["pca"]["variance"]) == 4
 
 
 @pytest.mark.parametrize("use_rep", ["X_pca", "pca", "custom"])
@@ -227,18 +244,14 @@ def test_perturbation_signature_explicit_rep_is_not_recomputed(mixscape_adata, u
         rsc.settings.override(N_PCS=3),
         pytest.raises(ValueError, match="does not have enough Dimensions"),
     ):
-        rsc.ptg.Mixscape().perturbation_signature(
-            adata, pert_key="gene_target", control="NT", use_rep=use_rep, n_pcs=4
-        )
+        rsc.ptg.Mixscape().perturbation_signature(adata, pert_key="gene_target", control="NT", use_rep=use_rep, n_pcs=4)
     assert adata.obsm[use_rep].shape[1] == 2
     assert "pca" not in adata.uns
 
 
 def test_mixscape_requires_signature(mixscape_adata):
     with pytest.raises(KeyError, match="X_pert"):
-        rsc.ptg.Mixscape().mixscape(
-            mixscape_adata, pert_key="gene_target", control="NT", test_method="t-test"
-        )
+        rsc.ptg.Mixscape().mixscape(mixscape_adata, pert_key="gene_target", control="NT", test_method="t-test")
 
 
 def test_perturbation_signature_invalid_mode(mixscape_adata):
@@ -255,9 +268,7 @@ def test_mixscape_output_schema(mixscape_adata):
     """obs/uns keys and label format match pertpy's Mixscape output."""
     adata = mixscape_adata
     adata.layers["X_pert"] = adata.X.copy()
-    rsc.ptg.Mixscape().mixscape(
-        adata, pert_key="gene_target", control="NT", test_method="t-test"
-    )
+    rsc.ptg.Mixscape().mixscape(adata, pert_key="gene_target", control="NT", test_method="t-test")
     for key in ("mixscape_class", "mixscape_class_global", "mixscape_class_p_ko"):
         assert key in adata.obs
     classes = set(adata.obs["mixscape_class_global"].unique())
@@ -283,9 +294,7 @@ def test_perturbation_signature_knn_backends(knn_algorithm):
         {"pert": (["control"] * (n // 2) + ["g"] * (n - n // 2))},
         index=[str(i) for i in range(n)],
     )
-    adata = anndata.AnnData(
-        X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(30)])
-    )
+    adata = anndata.AnnData(X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(30)]))
     rsc.ptg.Mixscape().perturbation_signature(
         adata,
         pert_key="pert",
@@ -297,6 +306,16 @@ def test_perturbation_signature_knn_backends(knn_algorithm):
     xp = rsc.get.X_to_CPU(adata.layers["X_pert"])
     assert xp.shape == adata.shape
     assert np.all(np.isfinite(xp))
+
+
+def test_perturbation_signature_incomplete_neighbors_raise():
+    # probing one of 64 lists cannot fill 100 neighbor slots
+    adata = anndata.AnnData(np.clip(np.random.default_rng(0).normal(size=(600, 30)), 0, None).astype(np.float32))
+    adata.obs["pert"] = ["control"] * 500 + ["g"] * 100
+    kwargs = {"n_neighbors": 100, "knn_algorithm": "ivfflat", "knn_kwargs": {"n_lists": 64, "n_probes": 1}}
+    with pytest.raises(ValueError, match="n_probes"):
+        rsc.ptg.Mixscape().perturbation_signature(adata, pert_key="pert", control="control", use_rep="X", **kwargs)
+    assert "X_pert" not in adata.layers
 
 
 def test_mixscape_split_by():
@@ -319,9 +338,7 @@ def test_mixscape_split_by():
         {"perturbation": pert, "group": group},
         index=[str(i) for i in range(X.shape[0])],
     )
-    adata = anndata.AnnData(
-        X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
-    )
+    adata = anndata.AnnData(X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]))
 
     ms = rsc.ptg.Mixscape()
     ms.perturbation_signature(
@@ -355,9 +372,7 @@ def test_signature_no_control_in_split_warns():
     pert = ["control"] * 20 + ["g"] * 10 + ["g"] * 30
     group = ["a"] * 30 + ["b"] * 30
     obs = pd.DataFrame({"pert": pert, "group": group}, index=[str(i) for i in range(n)])
-    adata = anndata.AnnData(
-        X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(8)])
-    )
+    adata = anndata.AnnData(X=X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(8)]))
     with pytest.warns(UserWarning, match="[Nn]o control"):
         rsc.ptg.Mixscape().perturbation_signature(
             adata,

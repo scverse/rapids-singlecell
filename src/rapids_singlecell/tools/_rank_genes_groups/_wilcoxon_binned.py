@@ -38,8 +38,13 @@ def _auto_chunk_width(
     ireference: int | None,
     tie_correct: bool,
     gathers_multi_gpu: bool,
+    dense_bytes: int = 0,
 ) -> int:
-    """Choose a histogram width from the least-free selected device."""
+    """Choose a histogram width from the least-free selected device.
+
+    ``dense_bytes`` is what densifying one gene of a window (signed sparse
+    input) holds on the GPU, budgeted per gene too.
+    """
     free_bytes = []
     for device_id in device_ids:
         with cp.cuda.Device(device_id):
@@ -68,9 +73,18 @@ def _auto_chunk_width(
 
     # Account for group-wise statistic/result temporaries, then reserve the
     # remaining 40% for the input, allocator fragmentation, and other clients.
-    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES
+    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES + dense_bytes
     usable_bytes = int(min(free_bytes) * _AUTO_CHUNK_MEMORY_FRACTION)
     return min(n_genes, max(1, usable_bytes // max(bytes_per_gene, 1)))
+
+
+def _densified_gene_bytes(X, n_cells: int) -> int:
+    """GPU bytes one gene of a densified window holds.
+
+    Its float64 column plus, for host input, the uploaded window values and indices, budgeted as if full.
+    """
+    upload = X.data.itemsize + X.indices.itemsize if sp.issparse(X) else 0
+    return n_cells * (_FLOAT_BYTES + upload)
 
 
 def _fill_sparse_zero_bin(hist: cp.ndarray, group_counts: cp.ndarray) -> None:
@@ -115,14 +129,12 @@ def wilcoxon_binned(
     tie_correct: bool = False,
     use_continuity: bool = False,
     n_bins: int | None = None,
-    chunk_size: int | None = None,
     bin_range: Literal["log1p", "auto"] | None = None,
 ) -> list[tuple[int, NDArray, NDArray]]:
     """Histogram-based approximate Wilcoxon rank-sum test."""
     if not rg.is_log1p:
         warnings.warn(
-            "wilcoxon_binned expects log-normalized data "
-            "(adata.uns['log1p'] not found).",
+            "wilcoxon_binned expects log-normalized data (adata.uns['log1p'] not found).",
             UserWarning,
             stacklevel=4,
         )
@@ -189,9 +201,7 @@ def wilcoxon_binned(
     # Warn for small groups
     if ireference is not None:
         n_ref = int(group_sizes[ireference])
-        for gi, (name, size) in enumerate(
-            zip(rg.groups_order, group_sizes, strict=True)
-        ):
+        for gi, (name, size) in enumerate(zip(rg.groups_order, group_sizes, strict=True)):
             if gi == ireference:
                 continue
             if size <= MIN_GROUP_SIZE_WARNING or n_ref <= MIN_GROUP_SIZE_WARNING:
@@ -271,23 +281,15 @@ def wilcoxon_binned(
     fuse_means = (
         is_host
         and not rg._sparse_negative_fallback
-        and (
-            isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"})
-        )
+        and (isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"}))
     )
     n_hist_groups = n_cells_per_group_hist.shape[0]
-    from ._stream_multi_gpu import resolve_stream_devices
+    from rapids_singlecell._utils._multi_gpu import resolve_stream_devices
 
-    device_ids = (
-        resolve_stream_devices(multi_gpu=rg._multi_gpu)
-        if is_host
-        else [cp.cuda.Device().id]
-    )
+    device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [cp.cuda.Device().id]
     if fuse_means:
         group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
-        group_nnz_ext = (
-            cp.zeros((n_groups + 1, n_genes), dtype=cp.float64) if rg.comp_pts else None
-        )
+        group_nnz_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64) if rg.comp_pts else None
         batch_kwargs["group_sums"] = group_sums_ext
         batch_kwargs["group_nnz"] = group_nnz_ext
     else:
@@ -297,19 +299,17 @@ def wilcoxon_binned(
     if use_multi_stream:
         from ._stream_multi_gpu import run_binned_hist_multi
 
-    if chunk_size is not None:
-        chunk_width = chunk_size
-    else:
-        chunk_width = _auto_chunk_width(
-            n_genes,
-            n_groups,
-            n_hist_groups,
-            n_bins_total,
-            device_ids=device_ids,
-            ireference=ireference,
-            tie_correct=tie_correct,
-            gathers_multi_gpu=use_multi_stream,
-        )
+    chunk_width = _auto_chunk_width(
+        n_genes,
+        n_groups,
+        n_hist_groups,
+        n_bins_total,
+        device_ids=device_ids,
+        ireference=ireference,
+        tie_correct=tie_correct,
+        gathers_multi_gpu=use_multi_stream,
+        dense_bytes=_densified_gene_bytes(X, n_cells) if rg._sparse_negative_fallback else 0,
+    )
 
     is_host_csr = sp.issparse(X) and X.format == "csr"
     is_host_csc = sp.issparse(X) and X.format == "csc"
@@ -535,8 +535,10 @@ def _finish_binned_stats(
     tie_correct: bool,
     use_continuity: bool,
 ) -> tuple[cp.ndarray, cp.ndarray]:
-    """Zero-bin fill + z-scores/p-values from a full (n_genes, n_hist_groups, nbt)
-    histogram (single-GPU chunk or the gathered multi-GPU histogram)."""
+    """Zero-bin fill + z-scores/p-values from a full (n_genes, n_hist_groups, nbt) histogram.
+
+    The histogram is a single-GPU chunk or the gathered multi-GPU histogram.
+    """
     # Sparse kernels only fill bins 1..n_bins; compute bin 0 (zeros) here.
     if is_sparse:
         _fill_sparse_zero_bin(hist, n_cells_per_group_hist)
@@ -764,18 +766,16 @@ def _fill_binned_means(
     group_nnz_ext: cp.ndarray | None,
     n_cells: int,
 ) -> None:
-    """Fill exact means/pts from fused ``(n_groups+1, n_genes)`` sums (row
-    ``n_groups`` = unselected cells, so total = sum across rows)."""
+    """Fill exact means/pts from fused ``(n_groups+1, n_genes)`` sums.
+
+    Row ``n_groups`` holds the unselected cells, so the total is the sum across rows.
+    """
     n_groups = len(rg.groups_order)
     group_sums = group_sums_ext[:n_groups]
     sizes = cp.asarray(rg.group_sizes, dtype=cp.float64)[:, None]
     rg.means = cp.asnumpy(group_sums / sizes)
     rg.vars = None
-    rg.pts = (
-        cp.asnumpy(group_nnz_ext[:n_groups] / sizes)
-        if group_nnz_ext is not None
-        else None
-    )
+    rg.pts = cp.asnumpy(group_nnz_ext[:n_groups] / sizes) if group_nnz_ext is not None else None
     if rg.ireference is None:
         n_rest = cp.float64(n_cells) - sizes
         total_sums = group_sums_ext.sum(axis=0, keepdims=True)
@@ -918,15 +918,11 @@ def _process_dask(
 
         def _hist_block(block, block_info=None):
             if block_info is None or block_info == []:
-                return cp.zeros(
-                    (1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-                )
+                return cp.zeros((1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             row_start = block_info[0]["array-location"][0][0]
             row_stop = block_info[0]["array-location"][0][1]
             codes_chunk = group_codes[row_start:row_stop]
-            hist = cp.zeros(
-                (n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-            )
+            hist = cp.zeros((n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             _wb.csr_hist(
                 block.data,
                 block.indices,
@@ -948,17 +944,13 @@ def _process_dask(
 
         def _hist_block(block, block_info=None):
             if block_info is None or block_info == []:
-                return cp.zeros(
-                    (1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-                )
+                return cp.zeros((1, n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             row_start = block_info[0]["array-location"][0][0]
             row_stop = block_info[0]["array-location"][0][1]
             codes_chunk = group_codes[row_start:row_stop]
 
             blk = cp.asfortranarray(cp.asarray(block[:, start:stop]))
-            hist = cp.zeros(
-                (n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32
-            )
+            hist = cp.zeros((n_genes_batch, n_hist_groups, n_bins_total), dtype=cp.uint32)
             _wb.dense_hist(
                 blk,
                 codes_chunk,

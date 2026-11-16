@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,16 @@ static inline void cublas_check_status(cublasStatus_t status,
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(std::string(what) +
                                  " failed with cuBLAS status " +
+                                 std::to_string(static_cast<int>(status)));
+    }
+}
+
+// ---------- cusolver_check ----------
+
+static inline void cusolver_check(cusolverStatus_t status, const char* what) {
+    if (status != CUSOLVER_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(what) +
+                                 " failed with cuSOLVER status " +
                                  std::to_string(static_cast<int>(status)));
     }
 }

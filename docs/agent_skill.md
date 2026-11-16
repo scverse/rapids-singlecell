@@ -11,7 +11,7 @@ Its content, installer, and commands may change substantially between releases.
 
 ## 1. Install the skill
 
-Copy the bundled skill into your agent's personal skill directory:
+Copy the bundled skill into your agent’s personal skill directory:
 
 `````{tab-set}
 ````{tab-item} Claude Code
@@ -42,11 +42,11 @@ rapids-singlecell-install-skills --dest /other/skills/rapids-singlecell
 ````
 `````
 
-| Option | Effect |
-|---|---|
-| `--check` | Compare the installed copy with the bundle in the active package |
-| `--force` | Replace a differing copy, e.g. after upgrading rapids-singlecell |
-| `--print-path` | Print the location of the bundled skill |
+  | Option         | Effect                                                           |
+  | -------------- | ---------------------------------------------------------------- |
+  | `--check`      | Compare the installed copy with the bundle in the active package |
+  | `--force`      | Replace a differing copy, e.g. after upgrading rapids-singlecell |
+  | `--print-path` | Print the location of the bundled skill                          |
 
 The agent looks up the installed API with `python -m rapids_singlecell_skills.api`, so run it in the same environment as rapids-singlecell.
 
@@ -66,11 +66,11 @@ The preflight is disposable, so configure RMM again at the start of the notebook
 ````{tip}
 If the agent only has the skill but RSC is not installed yet, create a fresh environment
 from the matching definition on `main`
-([CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda13.yml),
-[CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.08_cuda12.yml)):
+([CUDA 13](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.10_cuda13.yml),
+[CUDA 12](https://github.com/scverse/rapids_singlecell/blob/main/conda/rsc_rapids_26.10_cuda12.yml)):
 
 ```bash
 CONDA_CHANNEL_PRIORITY=flexible mamba env create --name rsc \
-  --file /path/to/rsc_rapids_26.08_cuda13.yml
+  --file /path/to/rsc_rapids_26.10_cuda13.yml
 ```
 ````

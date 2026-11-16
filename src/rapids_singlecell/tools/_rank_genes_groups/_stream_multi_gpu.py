@@ -20,7 +20,6 @@ from rapids_singlecell._cuda import _rank_stream_cuda as _rss
 from rapids_singlecell._utils import (
     _concat_on_device,
     _sum_on_device,
-    parse_device_ids,
 )
 
 if TYPE_CHECKING:
@@ -31,13 +30,6 @@ if TYPE_CHECKING:
 _MAX_HOST_STAGING_WORKERS = os.cpu_count() or 32
 
 
-def resolve_stream_devices(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
-    """Device ids for a host-streaming run (single current device when off)."""
-    if multi_gpu is None or multi_gpu is False:
-        return [cp.cuda.Device().id]
-    return list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
-
-
 def _limit_host_workers(n_devices: int) -> None:
     """Split the host staging pool across device shards (no CPU oversubscription)."""
     _rss._set_host_worker_limit(max(1, _MAX_HOST_STAGING_WORKERS // n_devices))
@@ -45,9 +37,7 @@ def _limit_host_workers(n_devices: int) -> None:
 
 def _bands(n: int, k: int) -> list[tuple[int, int]]:
     edges = np.linspace(0, n, k + 1, dtype=np.int64)
-    return [
-        (int(a), int(b)) for a, b in zip(edges[:-1], edges[1:], strict=True) if b > a
-    ]
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:], strict=True) if b > a]
 
 
 def _is_col_shard(X) -> bool:
@@ -126,9 +116,7 @@ def aggr_host_planes(
     return out_sum, out_sqsum, out_count
 
 
-def stream_planes_multi(
-    rg: _RankGenes, device_ids: list[int]
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
+def stream_planes_multi(rg: _RankGenes, device_ids: list[int]) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
     """Sharded sum / sq_sum / (count) over groups plus the remainder."""
     X = rg.X
     n_cells, n_genes = X.shape
@@ -146,9 +134,7 @@ def stream_planes_multi(
         with cp.cuda.Device(device_id):
             _limit_host_workers(len(device_ids))
             shard = _shard_view(X, b0, b1)
-            shard_cats = cp.asarray(
-                codes if col_shard else codes[b0:b1], dtype=cp.int32
-            )
+            shard_cats = cp.asarray(codes if col_shard else codes[b0:b1], dtype=cp.int32)
             out = aggr_host_planes(shard, shard_cats, n_cats, comp_pts=comp_pts)
             cp.cuda.runtime.deviceSynchronize()
         return out
@@ -161,11 +147,7 @@ def stream_planes_multi(
     if col_shard:
         sums = _concat_on_device([s[0] for s in shards], dev0, axis=1)
         sqsums = _concat_on_device([s[1] for s in shards], dev0, axis=1)
-        counts = (
-            _concat_on_device([s[2] for s in shards], dev0, axis=1)
-            if comp_pts
-            else None
-        )
+        counts = _concat_on_device([s[2] for s in shards], dev0, axis=1) if comp_pts else None
     else:
         sums = _sum_on_device([s[0] for s in shards], dev0)
         sqsums = _sum_on_device([s[1] for s in shards], dev0)
@@ -226,16 +208,8 @@ def run_binned_hist_multi(
                 launch = _launch_csr_host if sp.issparse(X) else _launch_dense_host
                 launch_start, launch_stop = start, stop
             sum_genes = band_genes if col_shard else n_genes
-            gsum = (
-                cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64)
-                if accumulate_means
-                else None
-            )
-            gnnz = (
-                cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64)
-                if accumulate_means and comp_pts
-                else None
-            )
+            gsum = cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64) if accumulate_means else None
+            gnnz = cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64) if accumulate_means and comp_pts else None
             hist = launch(
                 shard,
                 codes,
@@ -257,24 +231,10 @@ def run_binned_hist_multi(
     home = cp.cuda.Device().id
     if col_shard:
         hist = _concat_on_device([s[0] for s in shards], home, axis=0)
-        gsum = (
-            _concat_on_device([s[1] for s in shards], home, axis=1)
-            if accumulate_means
-            else None
-        )
-        gnnz = (
-            _concat_on_device([s[2] for s in shards], home, axis=1)
-            if accumulate_means and comp_pts
-            else None
-        )
+        gsum = _concat_on_device([s[1] for s in shards], home, axis=1) if accumulate_means else None
+        gnnz = _concat_on_device([s[2] for s in shards], home, axis=1) if accumulate_means and comp_pts else None
     else:
         hist = _sum_on_device([s[0] for s in shards], home)
-        gsum = (
-            _sum_on_device([s[1] for s in shards], home) if accumulate_means else None
-        )
-        gnnz = (
-            _sum_on_device([s[2] for s in shards], home)
-            if accumulate_means and comp_pts
-            else None
-        )
+        gsum = _sum_on_device([s[1] for s in shards], home) if accumulate_means else None
+        gnnz = _sum_on_device([s[2] for s in shards], home) if accumulate_means and comp_pts else None
     return hist, gsum, gnnz

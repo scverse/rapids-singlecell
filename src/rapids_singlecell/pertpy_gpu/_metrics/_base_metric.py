@@ -60,8 +60,7 @@ class BaseMetric(ABC):
         """Initialize base metric."""
         if layer_key is not None and obsm_key is not None:
             raise ValueError(
-                "Cannot use 'layer_key' and 'obsm_key' at the same time. "
-                "Please provide only one of the two keys."
+                "Cannot use 'layer_key' and 'obsm_key' at the same time. Please provide only one of the two keys."
             )
         self.layer_key = layer_key
         self.obsm_key = obsm_key
@@ -119,9 +118,7 @@ class BaseMetric(ABC):
             Ordered group names matching the category indices.
         """
         embedding_raw = self._get_embedding(adata)
-        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(
-            adata, groupby, needed_groups
-        )
+        mask, cat_offsets, cell_indices, groups_list = self._subset_indices(adata, groupby, needed_groups)
         if mask is not None:
             embedding = cp.asarray(embedding_raw[mask])
         else:
@@ -156,9 +153,7 @@ class BaseMetric(ABC):
             if missing:
                 raise ValueError(f"No cells found for groups: {missing}")
         group_labels = cp.array(obs_col.cat.codes.values, dtype=cp.int32)
-        cat_offsets, cell_indices = _create_category_index_mapping(
-            group_labels, len(groups_list)
-        )
+        cat_offsets, cell_indices = _create_category_index_mapping(group_labels, len(groups_list))
         return mask, cat_offsets, cell_indices, groups_list
 
     @staticmethod
@@ -207,13 +202,9 @@ class BaseMetric(ABC):
 
         missing = set(selected_groups) - set(adata.obs[groupby].cat.categories.values)
         if missing:
-            raise ValueError(
-                f"Selected groups {missing} not found in groupby '{groupby}'"
-            )
+            raise ValueError(f"Selected groups {missing} not found in groupby '{groupby}'")
 
-        empty = set(selected_groups) - set(
-            adata.obs[groupby].cat.remove_unused_categories().cat.categories.values
-        )
+        empty = set(selected_groups) - set(adata.obs[groupby].cat.remove_unused_categories().cat.categories.values)
         if empty:
             raise ValueError(f"No cells found for selected groups: {sorted(empty)}")
 
@@ -313,9 +304,7 @@ class BaseMetric(ABC):
             DataFrame with distances from selected_group(s) to other groups.
             If bootstrap=True, returns tuple of (distances, distances_var).
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement onesided_distances"
-        )
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement onesided_distances")
 
     def bootstrap(
         self,
@@ -360,9 +349,7 @@ class BaseMetric(ABC):
         variance
             Bootstrap variance
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement bootstrap"
-        )
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement bootstrap")
 
     def contrast_distances(
         self,
@@ -394,6 +381,4 @@ class BaseMetric(ABC):
         pd.DataFrame
             Copy of the input DataFrame with an added distance column.
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement contrast_distances"
-        )
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement contrast_distances")

@@ -30,7 +30,6 @@ import rapids_singlecell as rsc
                 "draw_graph_key": None,
                 "rank_method": "t-test",
                 "mean_in_log_space": True,
-                "rank_mask_var": None,
                 "zero_center": True,
                 "ctrl_as_ref": True,
             },
@@ -47,7 +46,6 @@ import rapids_singlecell as rsc
                 "draw_graph_key": "graph_{layout}",
                 "rank_method": "wilcoxon",
                 "mean_in_log_space": False,
-                "rank_mask_var": None,
                 "zero_center": None,
                 "ctrl_as_ref": False,
             },
@@ -64,7 +62,6 @@ def test_scanpy_preset_values(preset, expected):
     assert preset.draw_graph.key_added == expected["draw_graph_key"]
     assert preset.rank_genes_groups.method == expected["rank_method"]
     assert preset.rank_genes_groups.mean_in_log_space is expected["mean_in_log_space"]
-    assert preset.rank_genes_groups.mask_var is expected["rank_mask_var"]
     assert preset.scale.zero_center is expected["zero_center"]
     assert preset.score_genes.ctrl_as_ref is expected["ctrl_as_ref"]
 
@@ -133,7 +130,7 @@ def test_pca_preset_storage_keys(preset, key_obsm, key_varm, key_uns):
     ("preset", "expected_mask_var"),
     [
         (rsc.Preset.ScanpyV1, "highly_variable"),
-        (rsc.Preset.ScanpyV2Preview, "var.highly_variable"),
+        (rsc.Preset.ScanpyV2Preview, ['["var", "highly_variable"]']),
     ],
 )
 def test_pca_preset_default_mask_metadata(preset, expected_mask_var):
@@ -151,7 +148,8 @@ def test_n_pcs_setting_controls_pca_and_representation_selection():
 
     with rsc.settings.override(N_PCS=3):
         rsc.pp.pca(adata)
-        representation = rsc.pp.neighbors(adata, n_neighbors=3, copy=True)
+        representation = adata.copy()
+        rsc.pp.neighbors(representation, n_neighbors=3)
 
     assert adata.obsm["X_pca"].shape == (10, 3)
     assert representation.uns["neighbors"]["params"].get("n_pcs") is None
@@ -179,7 +177,7 @@ def test_scanpy_v2_aggregate_legacy_selection_warning():
     adata.layers["counts"] = adata.X.copy()
 
     with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
-        with pytest.warns(FutureWarning, match="`acc` will replace"):
+        with pytest.warns(FutureWarning, match="argument layer is deprecated"):
             rsc.get.aggregate(adata, by="group", func="sum", layer="counts")
 
 
@@ -220,9 +218,7 @@ def test_scanpy_v2_hvg_default_reaches_implementation(monkeypatch):
 
     monkeypatch.setattr(hvg_module, "_highly_variable_genes_seurat_v3", record_call)
     with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
-        rsc.pp.highly_variable_genes(
-            AnnData(np.ones((3, 2), dtype=np.float32)), n_top_genes=1
-        )
+        rsc.pp.highly_variable_genes(AnnData(np.ones((3, 2), dtype=np.float32)), n_top_genes=1)
 
     assert called["flavor"] == "seurat_v3_paper"
 
@@ -255,9 +251,7 @@ def test_scanpy_v2_rank_genes_groups_defaults():
 )
 @pytest.mark.parametrize("method", ["t-test", "wilcoxon"])
 @pytest.mark.parametrize("array_type", ["numpy", "scipy_csr", "cupy", "cupy_csr"])
-def test_rank_genes_groups_mean_in_log_space_default(
-    preset, expected_logfc, method, array_type
-):
+def test_rank_genes_groups_mean_in_log_space_default(preset, expected_logfc, method, array_type):
     n_genes = 5
     n_group = 30
     group_a = np.zeros((n_group, n_genes))
@@ -271,9 +265,7 @@ def test_rank_genes_groups_mean_in_log_space_default(
         "cupy_csr": lambda: cp_sparse.csr_matrix(cp.asarray(X)),
     }[array_type]()
     group = pd.Categorical(["a"] * n_group + ["b"] * n_group)
-    obs = pd.DataFrame(
-        {"group": group}, index=[f"cell_{i}" for i in range(2 * n_group)]
-    )
+    obs = pd.DataFrame({"group": group}, index=[f"cell_{i}" for i in range(2 * n_group)])
     adata = AnnData(X=X, obs=obs)
 
     with rsc.settings.override(preset=preset):
@@ -304,7 +296,7 @@ def test_scverse_misc_deprecation_metadata():
 
 
 def test_changing_default_repr_mentions_scanpy_2():
-    default = inspect.signature(rsc.pp.pca).parameters["key_added"].default
+    default = inspect.signature(rsc.pp.scale).parameters["zero_center"].default
 
     with rsc.settings.override(preset=rsc.Preset.ScanpyV1):
         assert "changes in 2.0" in repr(default)

@@ -1,0 +1,3 @@
+# uv settings for the GPU test jobs (UV_CONFIG_FILE in test-gpu.yml): build rapids-singlecell
+# in the hatch env itself, so hatch's second editable install reuses the first build.
+no-build-isolation-package = ["rapids-singlecell"]

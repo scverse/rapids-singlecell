@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -27,12 +29,12 @@ def _nn_descent_knn(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     if nn_descent is None:
         raise ImportError(
-            "The 'nn_descent' algorithm is only available in cuvs >= 25.02. "
-            "Please update your cuvs installation."
+            "The 'nn_descent' algorithm is only available in cuvs >= 25.02. Please update your cuvs installation."
         )
 
-    # Extract intermediate_graph_degree from algorithm_kwds, with default
-    intermediate_graph_degree = algorithm_kwds.get("intermediate_graph_degree", None)
+    # cuVS's default (96) is below the recommended 1.5 * k for k > 64, and fails for k > 96
+    default = max(nn_descent.IndexParams().intermediate_graph_degree, int(1.5 * k))
+    intermediate_graph_degree = max(algorithm_kwds.get("intermediate_graph_degree") or default, k)
 
     idxparams = nn_descent.IndexParams(
         graph_degree=k,
@@ -44,6 +46,8 @@ def _nn_descent_knn(
         dataset=X,
     )
     neighbors = cp.array(idx.graph).astype(cp.uint32)
+    # the distance kernels index X with these IDs
+    _check_knn_complete(neighbors, n_index=X.shape[0], algorithm="nn_descent")
     if metric == "euclidean" or metric == "sqeuclidean":
         from rapids_singlecell._cuda._nn_descent_cuda import (
             sqeuclidean as dist_func,
@@ -74,9 +78,7 @@ def _nn_descent_knn(
         # Add self-neighbors and self-distances for distance metrics.
         # This is not needed for inner_product, as it is a similarity metric.
         add_self_neighbors = cp.arange(X.shape[0], dtype=cp.uint32)
-        neighbors = cp.concatenate(
-            (add_self_neighbors[:, None], neighbors[:, :-1]), axis=1
-        )
+        neighbors = cp.concatenate((add_self_neighbors[:, None], neighbors[:, :-1]), axis=1)
         add_self_distances = cp.zeros((X.shape[0], 1), dtype=cp.float32)
         distances = cp.concatenate((add_self_distances, distances[:, :-1]), axis=1)
     return neighbors, distances

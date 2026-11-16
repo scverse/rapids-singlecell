@@ -149,9 +149,7 @@ def _run_dask_idx(
     tasks = []
     for i in range(len(mat.chunks[0])):
         block = mat.blocks[i, 0]
-        task = dask.delayed(process_chunk)(
-            block, cnct_delayed, starts_delayed, offsets_delayed
-        )
+        task = dask.delayed(process_chunk)(block, cnct_delayed, starts_delayed, offsets_delayed)
         tasks.append(task)
 
     _log("dask - computing batches", level="info", verbose=verbose)
@@ -195,9 +193,7 @@ def _run(
     isbacked = isinstance(mat, tuple)
     if batch_on == "backed" and not isbacked:
         bsize = obs.size
-    is_dask = isinstance(mat, DaskArray) or (
-        isinstance(mat, tuple) and isinstance(mat[0], DaskArray)
-    )
+    is_dask = isinstance(mat, DaskArray) or (isinstance(mat, tuple) and isinstance(mat[0], DaskArray))
     # Process net
     net = prune(features=var, net=net, tmin=tmin, verbose=verbose)
     # Handle stat type
@@ -207,9 +203,7 @@ def _run(
         if is_dask:
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
             adjm_cpu = adjm  # Keep as numpy for Dask path
-            es, pv = _run_dask_adj(
-                func, mat, adjm_cpu, test=test, verbose=verbose, dense=dense, **kwargs
-            )
+            es, pv = _run_dask_adj(func, mat, adjm_cpu, test=test, verbose=verbose, dense=dense, **kwargs)
             es = pd.DataFrame(es, index=obs, columns=sources)
         # Handle batches for sparse/backed data
         elif issparse or isbacked:
@@ -238,9 +232,7 @@ def _run(
         # Handle Dask input (auto-detect)
         if is_dask:
             _log(f"{name} - using Dask execution", level="info", verbose=verbose)
-            es, pv = _run_dask_idx(
-                func, mat, cnct, starts, offsets, verbose=verbose, dense=dense, **kwargs
-            )
+            es, pv = _run_dask_idx(func, mat, cnct, starts, offsets, verbose=verbose, dense=dense, **kwargs)
             es = pd.DataFrame(es, index=obs, columns=sources)
         else:
             cnct = cp.array(cnct, dtype=cp.int32)

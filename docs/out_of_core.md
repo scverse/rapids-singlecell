@@ -2,12 +2,11 @@
 
 Process datasets larger than GPU memory by chunking work with Dask while keeping arrays on the GPU via CuPy. Chunking also mitigates the CuPy sparse limit of `.nnz ≤ 2**31-1` by operating on smaller blocks.
 
-
 ## Start a Dask CUDA cluster
 
 Choose one of these presets:
 
----
+--------------------------------------------------------------------------------
 
 ### A) NVLink / Performance preset (UCX + RMM pool, no managed memory)
 
@@ -28,9 +27,11 @@ cluster = LocalCUDACluster(
 )
 client = Client(cluster)
 ```
+
 ### B) Capacity / Robustness preset (TCP + Managed memory)
 
 Best when you need to stretch VRAM (slower P2P, but fewer OOMs).
+
 ```python
 from dask.distributed import Client
 from dask_cuda import LocalCUDACluster
@@ -46,10 +47,11 @@ client = Client(cluster)
 ```
 
 ### Notes
-* `threads_per_worker=1` is recommended for GPU workloads. More threads can be faster but often increase temporary allocations, causing VRAM spikes/overflows; some dask-cuda releases also showed leaks with multi-threaded workers. With row chunks around ~20,000, 4–5 threads can still work on many GPUs.
-* For capacity over speed, enable RMM managed memory (see {doc}`memory_management`). For highest peer-to-peer (NVLink) performance, prefer the RMM pool allocator and avoid managed memory.
-* Multi-GPU transport: use UCX (`protocol="ucx"`) to enable NVLink. UCX typically uses more memory; TCP is more stable but slower.
-* UCX is not compatible with CUDA managed memory. For UCX/NVLink, disable managed memory. TCP can be used with managed memory.
+
+- `threads_per_worker=1` is recommended for GPU workloads. More threads can be faster but often increase temporary allocations, causing VRAM spikes/overflows; some dask-cuda releases also showed leaks with multi-threaded workers. With row chunks around ~20,000, 4–5 threads can still work on many GPUs.
+- For capacity over speed, enable RMM managed memory (see {doc}`memory_management`). For highest peer-to-peer (NVLink) performance, prefer the RMM pool allocator and avoid managed memory.
+- Multi-GPU transport: use UCX (`protocol="ucx"`) to enable NVLink. UCX typically uses more memory; TCP is more stable but slower.
+- UCX is not compatible with CUDA managed memory. For UCX/NVLink, disable managed memory. TCP can be used with managed memory.
 
 ## Loading AnnData lazily from Zarr (from the multi-GPU notebook)
 
@@ -116,7 +118,6 @@ adata.X.compute_chunk_sizes()
 
 Persisting loads data into GPU memory across workers. This can quickly cause OOM if the dataset does not fit. On sufficiently large clusters, persisting can be extremely fast and effective.
 
-
 ## Multi-GPU notes
 
 - Use `LocalCUDACluster(CUDA_VISIBLE_DEVICES="0,1,2,3")` to scale across GPUs.
@@ -140,7 +141,7 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.pp.pca`
 - {func}`~.tl.score_genes`
 - {func}`~.tl.score_genes_cell_cycle`
-- {func}`~.tl.louvain` (set `use_dask=True` to distribute graph clustering)
+- `tl.louvain` (deprecated; set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.leiden` (set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`

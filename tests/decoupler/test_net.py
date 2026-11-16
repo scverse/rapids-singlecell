@@ -110,9 +110,7 @@ def test_adjmat(
 ):
     features = adata.var_names
     with caplog.at_level(logging.INFO):
-        sources, targets, adjmat = dc._helper._net.adjmat(
-            features=features, net=net, verbose=verbose
-        )
+        sources, targets, adjmat = dc._helper._net.adjmat(features=features, net=net, verbose=verbose)
     adjmat = adjmat.ravel()
     non_zero_adjmat = adjmat[adjmat != 0.0]
     assert not all(non_zero_adjmat == 1.0)
@@ -136,9 +134,7 @@ def test_idxmat(
 ):
     features = adata.var_names
     with caplog.at_level(logging.INFO):
-        sources, cnct, starts, offsets = dc._helper._net.idxmat(
-            features=features, net=net, verbose=verbose
-        )
+        sources, cnct, starts, offsets = dc._helper._net.idxmat(features=features, net=net, verbose=verbose)
     if verbose:
         assert len(caplog.text) > 0
     else:

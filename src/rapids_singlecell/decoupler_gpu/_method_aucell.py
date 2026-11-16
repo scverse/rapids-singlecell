@@ -47,17 +47,13 @@ def _validate_n_up(
     nvar: int,
     n_up: int | float | None = None,
 ) -> int:
-    assert isinstance(n_up, int | float) or n_up is None, (
-        "n_up must be numerical or None"
-    )
+    assert isinstance(n_up, int | float) or n_up is None, "n_up must be numerical or None"
     if n_up is None:
         n_up = np.ceil(0.05 * nvar)
         n_up = int(np.clip(n_up, a_min=2, a_max=nvar))
     else:
         n_up = int(np.ceil(n_up))
-    assert nvar >= n_up > 1, (
-        f"For nvar={nvar}, n_up={n_up} must be between 1 and {nvar}"
-    )
+    assert nvar >= n_up > 1, f"For nvar={nvar}, n_up={n_up} must be between 1 and {nvar}"
     return n_up
 
 

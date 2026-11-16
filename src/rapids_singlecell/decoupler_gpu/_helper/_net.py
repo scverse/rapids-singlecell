@@ -151,9 +151,7 @@ def idxmat(
     """
     # Stable sorting of integer source codes avoids constructing one pandas
     # Series and NumPy array per feature set.
-    sources, source_codes = np.unique(
-        net["source"].to_numpy(dtype="U"), return_inverse=True
-    )
+    sources, source_codes = np.unique(net["source"].to_numpy(dtype="U"), return_inverse=True)
     order = np.argsort(source_codes, kind="stable")
     cnct = pd.Index(features).get_indexer(net["target"].to_numpy())[order]
     assert np.all(cnct >= 0), "No overlap found between features and targets"
