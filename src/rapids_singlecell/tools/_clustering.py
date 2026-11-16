@@ -29,8 +29,7 @@ from rapids_singlecell.get._out import (
     deprecated_copy,
 )
 
-from ._utils import _choose_representation, _is_canonical_csr, _is_symmetric
-from ._utils import _choose_representation, _use_graph
+from ._utils import _choose_representation, _is_canonical_csr, _is_symmetric, _use_graph
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -79,11 +78,7 @@ def _upper_suffices(adjacency) -> bool:
     The graph is undirected, so cuGraph adds the reverse of every edge: for a symmetric
     adjacency, the upper triangle gives the same graph (and clusters) in half the memory and time.
     """
-    return (
-        not isinstance(adjacency.indptr, cp.ndarray)
-        and _is_canonical_csr(adjacency)
-        and _is_symmetric(adjacency)
-    )
+    return not isinstance(adjacency.indptr, cp.ndarray) and _is_canonical_csr(adjacency) and _is_symmetric(adjacency)
 
 
 def _summed_csr(adjacency):
@@ -157,9 +152,7 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
     client = default_client()
     workers = list(client.nthreads())
     adjacency = _summed_csr(adjacency)
-    rows = np.repeat(
-        np.arange(adjacency.shape[0], dtype=np.int32), np.diff(adjacency.indptr)
-    )
+    rows = np.repeat(np.arange(adjacency.shape[0], dtype=np.int32), np.diff(adjacency.indptr))
     keep = adjacency.data != 0
     if _upper_suffices(adjacency):
         keep &= adjacency.indices >= rows
@@ -173,28 +166,8 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
             [(rows[start:stop], cols[start:stop], weights[start:stop])],
             workers=[worker],
             direct=True,
-    rows = np.repeat(np.arange(adjacency.shape[0]), np.diff(adjacency.indptr)).astype(np.int32)
-    cols = adjacency.indices
-    weights = adjacency.data
-
-    n_devices = cp.cuda.runtime.getDeviceCount()
-    chunksize = int((adjacency.nnz + n_devices - 1) / n_devices)
-
-    boundaries = list(range(0, adjacency.nnz, chunksize))
-    pairs = [(start, min(start + chunksize, adjacency.nnz)) for start in boundaries]
-
-    def mapper(pair):
-        start, end = pair
-        return cudf.DataFrame(
-            {
-                "src": rows[start:end].astype(np.int64),
-                "dst": cols[start:end].astype(np.int64),
-                "weight": weights[start:end].astype(dtype),
-            }
         )
-        parts.append(
-            client.submit(_edge_frame, arrays, dtype, workers=[worker], pure=False)
-        )
+        parts.append(client.submit(_edge_frame, arrays, dtype, workers=[worker], pure=False))
     wait(parts)
     del rows, cols, weights
     meta = cudf.DataFrame(
