@@ -320,18 +320,12 @@ def _nan_mean(X, axis=0, *, mask=None, n_features=None):
 
 
 def _is_canonical_csr(graph) -> bool:
-    return (
-        cpu_sparse.issparse(graph)
-        and graph.format == "csr"
-        and graph.has_canonical_format
-    )
+    return cpu_sparse.issparse(graph) and graph.format == "csr" and graph.has_canonical_format
 
 
 def _is_symmetric(graph: cpu_sparse.csr_matrix) -> bool:
     """Whether a canonical CSR graph equals its transpose."""
-    return graph.shape[0] == graph.shape[1] and not _count_unmirrored(
-        graph.indptr, graph.indices, graph.data
-    )
+    return graph.shape[0] == graph.shape[1] and not _count_unmirrored(graph.indptr, graph.indices, graph.data)
 
 
 @nb.njit(parallel=True, cache=True)
