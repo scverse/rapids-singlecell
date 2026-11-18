@@ -65,6 +65,28 @@ def _device(a) -> cp.ndarray:
     return a
 
 
+@cp.fuse
+def _direct_row_distances(x, y):
+    def parts(a):
+        rounded = a.astype(np.float64)
+        if a.dtype.kind in "iu" and a.dtype.itemsize == 8:
+            # Splitting off 12 bits makes both pieces of a 64-bit count exact in float64.
+            high = (a >> 12).astype(np.float64) * 4096
+            return rounded, (a & 4095).astype(np.float64) - (rounded - high)
+        return rounded, 0.0
+
+    x_rounded, x_error = parts(x)
+    y_rounded, y_error = parts(y)
+    delta = (x_rounded - y_rounded) + (x_error - y_error)
+    return cp.sqrt(cp.sum(delta * delta, axis=2))
+
+
+def _mean_direct_distance(a, b, pairs):
+    if not pairs:
+        return 0.0
+    return float(_direct_row_distances(a[:, None, :], b[None, :, :]).sum()) / pairs
+
+
 def _center(X, precision: str, slots, rows=None) -> tuple[cp.ndarray, np.ndarray]:
     """Shift ``nm`` and scale ``sc`` of the rows ``x * sc + nm`` the kernels compute on, a row and a value per split.
 
@@ -922,11 +944,11 @@ class EDistanceMetric(BaseMetric):
     def _energy(self, X: cp.ndarray, Y: cp.ndarray) -> float:
         """Energy distance of two device arrays.
 
-        Two float32 or float64 arrays take the float calls. Otherwise both arrays
-        are read one block of columns at a time in float32 (float64 next to a
-        float64 array). The blocks add up the row norms and the three Gram
-        matrices (the within-group one only for an array of two or more
-        cells). A block holds what the larger array has in bytes beyond the
+        Two float32 or float64 arrays take the float calls. Integer inputs use
+        Gram products when their sums are exact, and direct differences
+        otherwise. The cast blocks accumulate the row norms and the three Gram
+        matrices (within-group products only for two or more cells).
+        A block holds what the larger array has in bytes beyond the
         Gram matrices and one product, or as many bytes as these where that is
         more; next to a float64 array that second size is cut to what the float
         calls hold beyond the Gram matrices. A block has at most
@@ -941,6 +963,18 @@ class EDistanceMetric(BaseMetric):
             raise ValueError("X and Y need two dimensions and the same number of features.")
         dtype = np.result_type(_float_dtype(X.dtype), _float_dtype(Y.dtype))
         n, m = len(X), len(Y)
+        if X.shape[1] == 0:
+            return 0.0
+        if any(a.dtype.kind in "iu" for a in (X, Y)):
+            norm_bound = math.inf
+            if all(a.dtype.kind in "biu" for a in (X, Y)):
+                largest = max(max(abs(int(a.min())), abs(int(a.max()))) for a in (X, Y))
+                norm_bound = X.shape[1] * largest**2
+            if norm_bound > 1 << 52:  # two norms may exceed the exact integers in float64
+                cross = _mean_direct_distance(X, Y, n * m)
+                return 2 * cross - _mean_direct_distance(X, X, n * (n - 1)) - _mean_direct_distance(Y, Y, m * (m - 1))
+            # Up to 2**22 even TF32 represents every input count (at most 2048) exactly.
+            dtype = np.dtype(np.float32 if norm_bound <= 1 << 22 else np.float64)
         grams = (n * n + n * m + m * m + max(n, m) ** 2) * dtype.itemsize  # the Gram matrices and one product
         # on the input as it came the float calls hold 45 B per pair of cells of a group, 33 B in float16: stay below
         held = max((32 if a.dtype == np.float16 else 44) * len(a) ** 2 for a in (X, Y))
@@ -1070,8 +1104,14 @@ class EDistanceMetric(BaseMetric):
         if len(jobs) == 1:
             sums = [embedding.pair_sums(*jobs[0])]
         else:
+            allocator = cp.cuda.get_allocator()
+
+            def pair_sums(job):
+                with cp.cuda.using_allocator(allocator):
+                    return embedding.pair_sums(*job)
+
             with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-                sums = list(executor.map(lambda job: embedding.pair_sums(*job), jobs))
+                sums = list(executor.map(pair_sums, jobs))
 
         # Gather on the input device (chunks are consecutive pair ranges)
         return _concat_on_device(sums, result_device)

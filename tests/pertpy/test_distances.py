@@ -252,7 +252,7 @@ def test_edistance_fortran_matches_contiguous(small_adata: AnnData, xp) -> None:
 
 
 def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> None:
-    """Dense integer and float16 input is computed in float32: AnnData input to the bit, two-array input to rounding."""
+    """Dense integer and float16 input agrees with the corresponding floating-point reference."""
     distance = Distance(metric="edistance")
     X = cp.rint(small_adata.obsm["X_pca"] * 4) * 14  # int8 values whose sums of squares do not fit float16
     small_adata.obsm["X_pca"] = X.astype(cp.float32)
@@ -269,7 +269,7 @@ def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> Non
     for values in (1 << 24, 1):  # of cast two-array input at a time: all columns in one block, then one column each
         monkeypatch.setattr("rapids_singlecell.pertpy_gpu._metrics._edistance._CAST_VALUES", values)
         assert distance(a64, b8) == pytest.approx(distance(a64, b8.astype(cp.float64)), rel=1e-10)
-        for dtype in (cp.int8, cp.float16):  # the two-array calls compute in float32 as well, not in the input dtype
+        for dtype in (cp.int8, cp.float16):
             assert distance(a.astype(dtype), b.get().astype(dtype)) == pytest.approx(distance(a, b), rel=1e-5)
             got, want = distance.bootstrap(a.astype(dtype), b.astype(dtype)), distance.bootstrap(a, b)
             np.testing.assert_allclose(got, want, rtol=1e-4)
@@ -280,6 +280,22 @@ def test_edistance_dense_integer_input(small_adata: AnnData, monkeypatch) -> Non
         distance(a.astype(cp.complex64), b)
     with pytest.raises(ValueError, match="same number of features"):
         distance(a.astype(cp.int8), b[:, :3])
+
+
+@pytest.mark.parametrize(
+    ("x", "y"),
+    [
+        (np.int32(10_000), np.int32(10_001)),
+        (np.int64(2**63 - 1), np.uint64(2**63)),
+        (np.uint64(2**63 + 1), np.float64(2**63)),
+    ],
+)
+def test_integer_one_count_distance(x, y) -> None:
+    distance = Distance()
+    a, b = np.array([[x]]), np.array([[y]])
+    assert distance(a, b) == 2
+    assert distance(a.repeat(2, axis=0), b) == 2
+    assert distance.bootstrap(a, b, n_bootstrap=2) == (2, 0)
 
 
 def test_edistance_dense_big_endian_input(small_adata: AnnData) -> None:
@@ -440,7 +456,18 @@ def test_edistance_launcher_jobs_and_chunks(small_adata: AnnData, precision: str
     left, right = (a.astype(cp.int32) for a in cp.triu_indices(len(groups)))
     one = metric._launch_distance_kernel(source, offsets, cells, pair_left=left, pair_right=right, device_ids=[0])
     monkeypatch.setattr(_edistance, "_PAIR_CHUNK", 2)
-    two = metric._launch_distance_kernel(source, offsets, cells, pair_left=left, pair_right=right, device_ids=[0, 0])
+    allocator = cp.cuda.MemoryPool().malloc
+    pair_sums = source.pair_sums
+
+    def check_allocator(*args):
+        assert cp.cuda.get_allocator() is allocator
+        return pair_sums(*args)
+
+    monkeypatch.setattr(source, "pair_sums", check_allocator)
+    with cp.cuda.using_allocator(allocator):
+        two = metric._launch_distance_kernel(
+            source, offsets, cells, pair_left=left, pair_right=right, device_ids=[0, 0]
+        )
     assert one.dtype == cp.float32
     cp.testing.assert_array_equal(one, two)
     assert float(one[0]) == 0.0  # the distances within g0
