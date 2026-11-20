@@ -14,7 +14,7 @@ from scipy import stats
 from scipy.sparse import issparse, spmatrix
 
 
-def _check_precision_issues(score: cp.ndarray, dtype: np.dtype) -> None:
+def _check_precision_issues(score: np.ndarray, dtype: np.dtype) -> None:
     """Check for numerical issues in autocorrelation scores.
 
     Parameters
@@ -29,7 +29,7 @@ def _check_precision_issues(score: cp.ndarray, dtype: np.dtype) -> None:
     ValueError
         If nan/inf values are detected.
     """
-    if cp.any(cp.isnan(score) | cp.isinf(score)):
+    if not np.isfinite(score).all():
         if dtype == np.float32:
             raise ValueError(
                 "Detected nan/inf values in results with float32 precision. "
@@ -50,8 +50,10 @@ def _check_precision_issues(score: cp.ndarray, dtype: np.dtype) -> None:
 def _p_value_calc(
     score: np.ndarray,
     *,
-    sims: np.ndarray | None,
-    weights: spmatrix | np.ndarray,
+    n_perms: int | None,
+    sim_stats: np.ndarray | None,
+    n_obs: int,
+    moments: tuple[float, float, float],
     params: dict[str, Any],
 ):
     """
@@ -61,8 +63,8 @@ def _p_value_calc(
     ----------
     score
         (n_features,).
-    sims
-        (n_simulations, n_features).
+    sim_stats
+        Per-feature exceedance counts, means, and variances of the simulated score changes.
     params
         Object to store relevant function parameters.
 
@@ -75,29 +77,22 @@ def _p_value_calc(
     pval_z_sim
         p-values based on standard normal approximation from permutations
     """
-    p_norm, var_norm = _analytic_pval(score, weights, params)
+    p_norm, var_norm = _analytic_pval(score, n_obs, moments, params)
     results = {"pval_norm": p_norm, "var_norm": var_norm}
 
-    if sims is None:
+    if sim_stats is None:
         return results
 
-    n_perms = sims.shape[0]
-    large_perm = (sims >= score).sum(axis=0)
-    # subtract total perm for negative values
-    large_perm[(n_perms - large_perm) < large_perm] = n_perms - large_perm[(n_perms - large_perm) < large_perm]
+    large_perm, mean_change, var_sim = sim_stats
+    assert n_perms is not None
+    large_perm = np.minimum(large_perm, n_perms - large_perm)
     # get p-value based on permutation
     p_sim: np.ndarray = (large_perm + 1) / (n_perms + 1)
 
     # get p-value based on standard normal approximation from permutations
-    e_score_sim = sims.sum(axis=0) / n_perms
-    se_score_sim = sims.std(axis=0)
-    z_sim = (score - e_score_sim) / se_score_sim
-    p_z_sim = np.empty(z_sim.shape)
-
-    p_z_sim[z_sim > 0] = stats.norm.sf(z_sim[z_sim > 0])
-    p_z_sim[z_sim <= 0] = stats.norm.cdf(z_sim[z_sim <= 0])
-
-    var_sim = np.var(sims, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z_sim = -mean_change / np.sqrt(var_sim)
+    p_z_sim = stats.norm.sf(np.abs(z_sim))
 
     results["pval_z_sim"] = p_z_sim
     results["pval_sim"] = p_sim
@@ -106,14 +101,13 @@ def _p_value_calc(
     return results
 
 
-def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str, Any]):
+def _analytic_pval(score: np.ndarray, n: int, moments: tuple[float, float, float], params: dict[str, Any]):
     """Analytic p-value computation.
 
     See `Moran's I <https://pysal.org/esda/_modules/esda/moran.html#Moran>`_ and
     `Geary's C <https://pysal.org/esda/_modules/esda/geary.html#Geary>`_ implementation.
     """
-    s0, s1, s2 = _g_moments(g)
-    n = g.shape[0]
+    s0, s1, s2 = moments
     s02 = s0 * s0
     if params["mode"] == "gearyC":
         # Geary's C has its own normality variance (Cliff & Ord 1981; esda ``Geary``)
@@ -126,9 +120,7 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
     seScore_norm = Vscore_norm ** (1 / 2.0)
 
     z_norm = (score - params["expected"]) / seScore_norm
-    p_norm = np.empty(score.shape)
-    p_norm[z_norm > 0] = stats.norm.sf(z_norm[z_norm > 0])
-    p_norm[z_norm <= 0] = stats.norm.cdf(z_norm[z_norm <= 0])
+    p_norm = stats.norm.sf(np.abs(z_norm))
 
     if params["two_tailed"]:
         p_norm *= 2.0
@@ -136,39 +128,31 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
     return p_norm, Vscore_norm
 
 
-def _g_moments(w: spmatrix | np.ndarray):
-    """Compute moments of adjacency matrix for analytic p-value calculation.
+def _g_moments(w):
+    """Compute row sums, column sums, and the three moments for analytic p-values.
 
     See `pysal <https://pysal.org/libpysal/_modules/libpysal/weights/weights.html#W>`_ implementation.
     """
-    if not cpx_sparse.isspmatrix(w):
-        w = cpx_sparse.csr_matrix(w)
-    w = w.tocsr()
-    rows = cp.searchsorted(w.indptr[1:], cp.arange(w.nnz), side="right")
-    # canonical (sorted, unique columns per row) unless a row's columns do not increase
-    if bool(((w.indices[1:] <= w.indices[:-1]) & (rows[1:] == rows[:-1])).any()):
-        w.sum_duplicates()
-        rows = cp.searchsorted(w.indptr[1:], cp.arange(w.nnz), side="right")
     from rapids_singlecell._cuda import _autocorr_cuda as _ac
 
-    sums = cp.zeros(3)
+    dtype = w.dtype if w.dtype in (np.float32, np.float64) else np.float64
+    if not cpx_sparse.isspmatrix_csr(w) or w.dtype != dtype:
+        if not (issparse(w) or cpx_sparse.issparse(w)):
+            w = cp.asarray(w, dtype=dtype)
+        w = cpx_sparse.csr_matrix(w, dtype=dtype)
+    if not w.has_canonical_format:
+        w = w.astype(cp.float64, copy=True)
+        w.sum_duplicates()
+    row = cp.empty(w.shape[0], dtype=cp.float64)
+    col = cp.zeros_like(row)
+    sums = cp.zeros(4, dtype=cp.float64)
     indices = w.indices.astype(cp.int32, copy=False)
-    _ac.moments(
-        w.indptr, indices, w.data, out=sums, stream=cp.cuda.get_current_stream().ptr
-    )
-    s0, sum_w2, mirror = (float(v) for v in sums.get())
-    # s1 = sum((w + w^T)^2) / 2 = sum(w^2) + sum_ij w_ij w_ji
-    s1 = sum_w2 + mirror
-
-    # s2
-    data = w.data.astype(cp.float64)
-    n = w.shape[0]
-    degree = cp.bincount(rows, data, minlength=n) + cp.bincount(
-        indices, data, minlength=n
-    )
-    s2 = float((degree * degree).sum())
-
-    return s0, s1, s2
+    _ac.moments(w.indptr, indices, w.data, row=row, col=col, out=sums[:3], stream=cp.cuda.get_current_stream().ptr)
+    degree = row + col
+    cp.square(degree, out=degree)
+    sums[3] = degree.sum()
+    s0, sum_w2, mirror, s2 = sums.get()
+    return row, col, (s0, sum_w2 + mirror, s2)
 
 
 def _create_sparse_df(

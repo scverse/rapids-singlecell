@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from itertools import batched
 from typing import (
     TYPE_CHECKING,
     Literal,
@@ -18,7 +19,7 @@ from rapids_singlecell._cuda import _autocorr_cuda as _ac
 from rapids_singlecell._utils import _array_to_device, _copy_to_device, parse_device_ids
 
 from ._spatial_data import _extract_adata
-from ._utils import _check_precision_issues, _p_value_calc
+from ._utils import _check_precision_issues, _g_moments, _p_value_calc
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -32,130 +33,200 @@ _BLOCK_FRACTION = 0.5
 
 
 # Bytes of the source matrix uploaded at a time while selecting genes.
-_CHUNK_BYTES = 1 << 30
+_CHUNK_BYTES = 128 << 20
 
 
-def _select(chunk, lut: cp.ndarray, start: int, dtype):
-    """Entries of a chunk of observations in the selected genes: (rows, slots, values)."""
-    if not (sparse.issparse(chunk) or sparse_gpu.issparse(chunk)):
-        chunk = sparse_gpu.csr_matrix(cp.asarray(chunk))
-    chunk = chunk.tocsr()
-    slots = lut[cp.asarray(chunk.indices)]
-    kept = cp.flatnonzero(slots >= 0)
-    rows = cp.searchsorted(cp.asarray(chunk.indptr)[1:], kept, side="right")
-    return (
-        (rows + start).astype(cp.int32),
-        slots[kept],
-        cp.asarray(chunk.data)[kept].astype(dtype, copy=False),
+def _csr_chunks(matrix, size):
+    """Row views limited by both entry and row-pointer bytes, apart from a single oversized row."""
+    rows = max(1, size // matrix.indptr.itemsize)
+    entries = max(1, size // (matrix.data.itemsize + matrix.indices.itemsize))
+    start = 0
+    while start < matrix.shape[0]:
+        lo = int(matrix.indptr[start])
+        stop = int(matrix.indptr.searchsorted(lo + entries, side="right")) - 1
+        stop = min(start + rows, max(start + 1, stop), matrix.shape[0])
+        hi = matrix.indptr[stop]
+        # SciPy prunes small NumPy views into large base arrays by copying them.
+        chunk = sparse.csr_matrix(
+            (memoryview(matrix.data)[lo:hi], memoryview(matrix.indices)[lo:hi], matrix.indptr[start : stop + 1] - lo),
+            shape=(stop - start, matrix.shape[1]),
+        )
+        if getattr(matrix, "_has_canonical_format", False):
+            chunk.has_canonical_format = True
+        yield start, chunk
+        start = stop
+
+
+def _to_gpu_csr(matrix, dtype):
+    if not sparse.issparse(matrix):
+        if isinstance(matrix, np.ndarray):
+            matrix = cp.asarray(matrix, dtype=dtype)
+        return sparse_gpu.csr_matrix(matrix, dtype=dtype)
+    host = matrix.tocsr()
+    result = sparse_gpu.csr_matrix(
+        (_array_to_device(host.data, dtype), _array_to_device(host.indices), cp.asarray(host.indptr)),
+        shape=host.shape,
     )
+    if getattr(host, "_has_canonical_format", False):
+        result.has_canonical_format = True
+    return result
 
 
-def _gene_source(source, cols: np.ndarray, dtype):
-    """The genes ``cols`` of every observation, selected on the GPU.
+def _select(chunk, lut, *, start, width, n_genes, n_cells, dtype):
+    """Pack selected entries by gene block, keeping one flat index and value per entry."""
+    if sparse.issparse(chunk) or sparse_gpu.issparse(chunk):
+        chunk = _to_gpu_csr(chunk, dtype)
+        if not chunk.has_canonical_format:
+            chunk = chunk.copy()
+            chunk.sum_duplicates()
+        slots = lut[cp.asarray(chunk.indices)]
+        kept = cp.flatnonzero(slots >= 0)
+        rows = cp.searchsorted(cp.asarray(chunk.indptr)[1:], kept, side="right")
+        slots = slots[kept]
+        values = cp.asarray(chunk.data)[kept]
+        del chunk, kept
+    else:
+        columns = cp.flatnonzero(lut >= 0)
+        dense = cp.asarray(chunk)[:, columns]
+        rows, local_cols = cp.nonzero(dense)
+        slots = lut[columns][local_cols]
+        values = dense[rows, local_cols]
+    block = slots // width
+    stride = cp.minimum(width, n_genes - block * width)
+    index_dtype = cp.int64 if n_cells * width > np.iinfo(np.int32).max else cp.int32
+    indices = (rows.astype(index_dtype) + start) * stride + (slots % width)
+    del rows, slots, stride
+    values = values.astype(dtype, copy=False)
+    if n_genes <= width:
+        return indices, values, (0, len(values))
+    order = cp.argsort(block)
+    bounds = cp.searchsorted(block[order], cp.arange((n_genes + width - 1) // width + 1)).get()
+    return indices[order], values[order], bounds
 
-    Sparse, host and Dask matrices (e.g. from :func:`rapids_singlecell.io.read_lazy`)
-    are read in chunks of observations; only the selected genes' entries stay,
-    as (rows, slots, values) on the GPU, or on the host if they would take
-    more than half the GPU's free memory. Dense GPU matrices are kept as they are.
-    """
-    if isinstance(source, cp.ndarray):
+
+def _gene_source(source, cols, width, dtype):
+    """Index sparse input once. Keep selected entries on the GPU while space permits."""
+    if not len(cols) or isinstance(source, (np.ndarray, cp.ndarray)):
         return source
-    lut = cp.full(source.shape[1], -1, dtype=cp.int32)
+    n, n_vars = source.shape
+    lut = cp.full(n_vars, -1, dtype=cp.int32)
     lut[cp.asarray(cols)] = cp.arange(len(cols), dtype=cp.int32)
-    n = source.shape[0]
-    parts = []
+    blocks = [[] for _ in range(0, len(cols), width)]
+    free = cp.cuda.Device().mem_info[0]
+    budget = free // 4
+    chunk_bytes = min(_CHUNK_BYTES, max(1, free // 32))
 
-    def chunk_rows(nbytes):  # observations per upload of about _CHUNK_BYTES
-        return max(1, int(_CHUNK_BYTES * n // max(nbytes, 1)))
+    def pack(chunk, start, lookup):
+        nonlocal budget
+        indices, values, bounds = _select(
+            chunk,
+            lookup,
+            start=start,
+            width=width,
+            n_genes=len(cols),
+            n_cells=n,
+            dtype=dtype,
+        )
+        size = indices.nbytes + values.nbytes
+        if size > budget:
+            indices, values = indices.get(), values.get()
+        else:
+            budget -= size
+        for block, lo, hi in zip(blocks, bounds[:-1], bounds[1:], strict=True):
+            if lo < hi:
+                block.append((indices[lo:hi], values[lo:hi]))
+
+    def pack_rows(matrix, row_offset, col_start):
+        lookup = lut[col_start : col_start + matrix.shape[1]]
+        if sparse.issparse(matrix):
+            first, last = cols.searchsorted([col_start, col_start + matrix.shape[1]])
+            local_cols = cols[first:last] - col_start
+            if 8 * len(local_cols) < matrix.shape[1]:
+                # Select small panels before upload. SciPy releases the GIL in its CSR column scan.
+                lookup = cp.arange(first, last, dtype=cp.int32)
+                if matrix.format == "csc":
+                    for start, chunk in _csr_chunks(matrix[:, local_cols].tocsr(), chunk_bytes):
+                        pack(chunk, row_offset + start, lookup)
+                    return
+                chunks = _csr_chunks(matrix.tocsr(), min(chunk_bytes, 32 << 20))
+                with ThreadPoolExecutor(max_workers=16) as pool:
+                    for batch in batched(chunks, 16, strict=False):
+                        selected = pool.map(lambda piece: piece[1][:, local_cols], batch)
+                        joined = sparse.vstack(list(selected), format="csr")
+                        for start, chunk in _csr_chunks(joined, chunk_bytes):
+                            pack(chunk, row_offset + batch[0][0] + start, lookup)
+            else:
+                for start, chunk in _csr_chunks(matrix.tocsr(), chunk_bytes):
+                    pack(chunk, row_offset + start, lookup)
+            return
+        if sparse_gpu.issparse(matrix):
+            matrix = matrix.tocsr()
+            nbytes = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+        else:
+            nbytes = matrix.shape[0] * matrix.shape[1] * matrix.dtype.itemsize
+        rows = max(1, int(chunk_bytes * matrix.shape[0] // max(nbytes, 1)))
+        for start in range(0, matrix.shape[0], rows):
+            chunk = matrix if sparse_gpu.issparse(matrix) and rows >= matrix.shape[0] else matrix[start : start + rows]
+            pack(chunk, row_offset + start, lookup)
 
     if isinstance(source, DaskArray):
-        start = 0
-        for block in source.blocks.ravel():
-            chunk = block.compute()
-            parts.append(_select(chunk, lut, start, dtype))
-            start += chunk.shape[0]
-    elif sparse.issparse(source):
-        source = source.tocsr()
-        rows = chunk_rows(source.data.nbytes + source.indices.nbytes)
-        for start in range(0, n, rows):
-            stop = min(start + rows, n)
-            # upload views of the rows' entries; rebase the offsets on the GPU
-            lo, hi = int(source.indptr[start]), int(source.indptr[stop])
-            chunk = sparse_gpu.csr_matrix(
-                (
-                    _array_to_device(source.data[lo:hi]),
-                    _array_to_device(source.indices[lo:hi]),
-                    cp.asarray(source.indptr[start : stop + 1] - lo),
-                ),
-                shape=(stop - start, source.shape[1]),
-            )
-            parts.append(_select(chunk, lut, start, dtype))
-    else:  # GPU sparse or host dense
-        rows = chunk_rows(
-            source.data.nbytes if sparse_gpu.issparse(source) else source.nbytes
-        )
-        for start in range(0, n, rows):
-            parts.append(_select(source[start : start + rows], lut, start, dtype))
-    entries = tuple(cp.concatenate(p) for p in zip(*parts, strict=True))
-    if sum(e.nbytes for e in entries) > cp.cuda.Device().mem_info[0] // 2:
-        return tuple(e.get() for e in entries)
-    return entries
+        col_start = 0
+        for j, chunk_width in enumerate(source.chunks[1]):
+            col_stop = col_start + chunk_width
+            if np.any((cols >= col_start) & (cols < col_stop)):
+                row_start = 0
+                for i, height in enumerate(source.chunks[0]):
+                    pack_rows(source.blocks[i, j].compute(), row_start, col_start)
+                    row_start += height
+            col_start = col_stop
+    else:
+        pack_rows(source, 0, 0)
+    return blocks
 
 
-def _gene_block(vals, cols: np.ndarray, dtype, n: int) -> cp.ndarray:
-    """Dense C-ordered ``(n_cells, len(cols))`` block of the selected genes ``cols``."""
-    if isinstance(vals, cp.ndarray):
-        return cp.ascontiguousarray(vals[:, cp.asarray(cols)], dtype=dtype)
-    rows, slots, values = vals
-    lo, hi = int(cols[0]), int(cols[-1]) + 1  # blocks are contiguous slots
-    keep = (slots >= lo) & (slots < hi)
-    rows, slots, values = (cp.asarray(e[keep]) for e in (rows, slots, values))
-    block = cp.zeros((n, hi - lo), dtype=dtype)
-    block[rows, slots - lo] = values
+def _gene_block(source, cols, block_id, *, dtype, n, device_id):
+    """Materialize only this device's selected columns in C order."""
+    if isinstance(source, (np.ndarray, cp.ndarray)):
+        selection = slice(cols[0], cols[-1] + 1) if cols[-1] - cols[0] + 1 == len(cols) else cols
+        if isinstance(source, cp.ndarray):
+            with cp.cuda.Device(source.device.id):
+                x = cp.ascontiguousarray(source[:, selection], dtype=dtype)
+            return _copy_to_device(x, device_id)
+        return _array_to_device(np.asarray(source[:, selection], order="C", dtype=dtype))
+    block = cp.zeros((n, len(cols)), dtype=dtype)
+    for indices, values in source[block_id]:
+        if isinstance(indices, cp.ndarray):
+            indices = _copy_to_device(indices, device_id)
+            values = _copy_to_device(values, device_id)
+        else:
+            indices, values = _array_to_device(indices), _array_to_device(values)
+        block.ravel()[indices] = values
     return block
 
 
-def _block_scores(x, adj, row_sums, col_sums, keys, *, geary: bool):
-    """Observed and permuted scores of one dense gene block, ``(n_genes,)`` and ``(n_perms, n_genes)``."""
+def _block_scores(x, graph, row, col, keys, *, total, uniform, geary):
+    """Return the observed scores and the change under each permutation of graph rows."""
     n, n_genes = x.shape
     stream = cp.cuda.get_current_stream().ptr
-    z = cp.empty_like(x)
-    _ac.lag(adj.indptr, adj.indices, adj.data, x, z=z, stream=stream)
+    z = None if keys is None else cp.empty_like(x)
     stats = cp.zeros((4, n_genes))
-    _ac.colstats(x, col_sums, out=stats, stream=stream)
-    sum_x, sum_x2, cx, cx2 = stats
+    _ac.observed(*graph, x, row, col, lag=z, stats=stats, geary=geary, stream=stream)
+    sum_x, sum_x2, weighted_x, numerator = stats
     mean = sum_x / n
-    ss = sum_x2 - n * mean * mean  # sum of squared deviations
-    total = float(row_sums.sum(dtype=cp.float64))
-
-    # row-normalized weights without isolated cells: B does not depend on pi
-    uniform = float(row_sums.min()) == float(row_sums.max())
-
-    def score(batch_keys):
-        out = cp.zeros((1 if batch_keys is None else len(batch_keys), 2, n_genes))
-        _ac.sums(
-            x,
-            z,
-            row_sums,
-            batch_keys,
-            out=out,
-            geary=geary,
-            uniform=uniform,
-            stream=stream,
-        )
-        a, b = out[:, 0], out[:, 1]
-        if uniform:
-            b = float(row_sums[0]) * (sum_x2 if geary else sum_x)
-        if geary:  # sum_ij w_pi(i)j (x_i - x_j)^2, over the weights' sum
-            return (n - 1) * (b - 2 * a + cx2) / (2 * total * ss)
-        # sum_i (x_i - m) (W (x - m))_pi(i), over the squared deviations
-        return (a - mean * b - mean * cx + mean * mean * total) / ss
-
-    observed = score(None)[0]
+    ss = sum_x2 - mean * sum_x
+    if geary:
+        scale = (n - 1) / (2 * total * ss)
+        observed = numerator * scale
+    else:
+        observed = (numerator + mean * (mean * total - weighted_x)) / ss
     if keys is None:
         return observed, None
-    perms = [score(keys[i : i + _ac.BATCH]) for i in range(0, len(keys), _ac.BATCH)]
-    return observed, cp.concatenate(perms)
+    out = cp.zeros((len(keys), 1 if uniform else 2, n_genes))
+    _ac.sums(x, z, row, keys, out=out, geary=geary, uniform=uniform, stream=stream)
+    a = out[:, 0]
+    b = 0 if uniform else out[:, 1]
+    change = (b - 2 * a) * scale if geary else (a - mean * b) / ss
+    return observed, change
 
 
 def spatial_autocorr(
@@ -214,7 +285,7 @@ def spatial_autocorr(
         use_raw
             If True, use the raw data in the AnnData object, by default False.
         use_sparse
-            Ignored; kept for compatibility. Genes are processed in dense blocks of up to 32.
+            Retained for compatibility. Sparse input is processed in blocks of up to 32 genes.
         dtype
             Data type for computation. If None, uses input data dtype.
             For best numerical stability, especially with genes having low variance, use `np.float64`.
@@ -226,7 +297,7 @@ def spatial_autocorr(
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
         seed
-            Random seed for the permutations. Results do not depend on the GPUs used.
+            Seed for the keyed permutations of the graph rows, shared across genes and GPUs.
         copy
             If True, return the results as a DataFrame instead of storing them in `adata.uns`, by default False.
 
@@ -246,7 +317,7 @@ def spatial_autocorr(
     if use_raw:
         if adata.raw is None:
             raise AttributeError("No `.raw` attribute found. Try specifying `use_raw=False`.")
-        genes = list(set(genes) & set(adata.raw.var_names))
+        genes = [gene for gene in genes if gene in adata.raw.var_names]
         source, var_names = adata.raw.X, adata.raw.var_names
     else:
         source = adata.layers[layer] if layer is not None else adata.X
@@ -262,96 +333,79 @@ def spatial_autocorr(
     if compute_dtype not in (np.float32, np.float64):
         compute_dtype = np.dtype(np.float32)
 
-    # create Adj-Matrix
-    adj = adata.obsp[connectivity_key]
-    if sparse.issparse(adj):  # page-locked uploads of the large arrays
-        adj = adj.tocsr()
-        adj = sparse_gpu.csr_matrix(
-            (
-                _array_to_device(adj.data),
-                _array_to_device(adj.indices),
-                cp.asarray(adj.indptr),
-            ),
-            shape=adj.shape,
-        )
-    adj = sparse_gpu.csr_matrix(adj, dtype=compute_dtype)
-    if transformation:  # row-normalize
-        row_sums = adj.sum(axis=1).reshape(-1, 1)
-        non_zero_rows = row_sums != 0
-        row_sums[non_zero_rows] = 1.0 / row_sums[non_zero_rows]
-        adj = adj.multiply(sparse_gpu.csr_matrix(row_sums)).tocsr()
-    n = adj.shape[0]
-    # int32 columns; int64 row offsets only past 2^31 edges
-    adj = sparse_gpu.csr_matrix(
-        (
-            adj.data,
-            adj.indices.astype(cp.int32, copy=False),
-            adj.indptr.astype(cp.int64 if adj.nnz >= 2**31 else cp.int32, copy=False),
-        ),
-        shape=adj.shape,
-    )
-    if n < 2:
-        raise ValueError("Spatial autocorrelation needs at least two observations.")
+    n = adata.n_obs
+    if not 2 <= n <= np.iinfo(np.int32).max:
+        raise ValueError("Spatial autocorrelation needs between 2 and 2**31 - 1 observations.")
+    adj = _to_gpu_csr(adata.obsp[connectivity_key], compute_dtype)
+    if transformation:
+        normalized = cp.empty_like(adj.data)
+        _ac.normalize(adj.indptr, adj.data, out=normalized, stream=cp.cuda.get_current_stream().ptr)
+        # The wrapper owns its data attribute even when the original CSR storage is shared.
+        adj.data = normalized
+    row, col, moments = _g_moments(adj)
+    uniform = bool(n_perms) and bool(cp.all(row == row[0]))
+    graph = (adj.indptr, adj.indices.astype(cp.int32, copy=False), adj.data)
+    del adj
 
     # Six Feistel round keys per permutation; a permutation moves the rows of the weights.
     keys = None
     if n_perms:
-        keys = np.random.default_rng(seed).integers(
-            0, 2**32, size=(n_perms, _ac.ROUNDS), dtype=np.uint32
-        )
+        keys = np.random.default_rng(seed).integers(0, 2**32, size=(n_perms, _ac.ROUNDS), dtype=np.uint32)
 
-    vals = _gene_source(source, cols, compute_dtype)
-    n_genes = len(genes)
+    cols, gene_order = np.unique(cols, return_inverse=True)
+    n_genes = len(cols)
     itemsize = compute_dtype.itemsize
     free = cp.cuda.Device().mem_info[0]
     width = int(max(1, min(32, _BLOCK_FRACTION * free // (2 * n * itemsize))))
-    blocks = [np.arange(i, min(i + width, n_genes)) for i in range(0, n_genes, width)]
+    vals = _gene_source(source, cols, width, compute_dtype)
+    blocks = range((n_genes + width - 1) // width)
     devices = parse_device_ids(multi_gpu=multi_gpu)[: len(blocks)]
 
-    def run(device_id: int, mine: list[np.ndarray]):
-        """Scores of this device's gene blocks, on the host."""
+    results = np.empty((1 if keys is None else 4, n_genes), dtype=np.float64)
+
+    def run(device_id: int, mine: range):
         with cp.cuda.Device(device_id):
-            w = adj
-            if device_id != adj.data.device.id:
-                parts = (adj.data, adj.indices, adj.indptr)
-                w = sparse_gpu.csr_matrix(
-                    tuple(_copy_to_device(a, device_id) for a in parts), shape=adj.shape
-                )
-            row = cp.ascontiguousarray(w.sum(axis=1).ravel(), dtype=compute_dtype)
-            col = cp.ascontiguousarray(w.sum(axis=0).ravel(), dtype=cp.float64)
+            w = tuple(_copy_to_device(a, device_id) for a in graph)
+            r, c = _copy_to_device(row, device_id), _copy_to_device(col, device_id)
             k = None if keys is None else cp.asarray(keys)
-            local = vals
-            if isinstance(vals, cp.ndarray) and vals.device.id != device_id:
-                local = _copy_to_device(vals, device_id)
-            elif isinstance(vals, tuple) and isinstance(vals[0], cp.ndarray):
-                if vals[0].device.id != device_id:
-                    local = tuple(_copy_to_device(e, device_id) for e in vals)
-            out = []
-            for cols in mine:
-                x = _gene_block(local, cols, compute_dtype, n)
-                observed, perms = _block_scores(
-                    x, w, row, col, k, geary=mode == "geary"
+            for block_id in mine:
+                slots = slice(block_id * width, (block_id + 1) * width)
+                x = _gene_block(vals, cols[slots], block_id, dtype=compute_dtype, n=n, device_id=device_id)
+                observed, change = _block_scores(
+                    x,
+                    w,
+                    r,
+                    c,
+                    k,
+                    total=moments[0],
+                    uniform=uniform,
+                    geary=mode == "geary",
                 )
-                out.append(
-                    (cols, observed.get(), None if perms is None else perms.get())
-                )
-            return out
+                del x  # Release this dense block before allocating the next one.
+                if change is None:
+                    results[0, slots] = observed.get()
+                else:
+                    results[:, slots] = cp.stack(
+                        (
+                            observed,
+                            ((observed + change) >= observed).sum(axis=0),
+                            change.mean(axis=0),
+                            change.var(axis=0),
+                        )
+                    ).get()
 
     if len(devices) > 1:
+        # Worker threads have their own current streams. Finish preparing the
+        # shared graph and expression before either device starts reading them.
+        cp.cuda.get_current_stream().synchronize()
         with ThreadPoolExecutor(len(devices)) as pool:
-            parts = pool.map(
-                lambda d: run(d, blocks[devices.index(d) :: len(devices)]), devices
-            )
-            results = [r for part in parts for r in part]
-    else:
-        results = run(devices[0] if devices else cp.cuda.Device().id, blocks)
-    score = np.empty(n_genes)
-    score_perms = None if keys is None else np.empty((len(keys), n_genes))
-    for cols, observed, perms in results:
-        score[cols] = observed
-        if perms is not None:
-            score_perms[:, cols] = perms
-    _check_precision_issues(cp.asarray(score), compute_dtype)
+            futures = [pool.submit(run, device, blocks[i :: len(devices)]) for i, device in enumerate(devices)]
+            for future in futures:
+                future.result()
+    elif devices:
+        run(devices[0], blocks)
+    score = results[0]
+    _check_precision_issues(score, compute_dtype)
 
     params = {"two_tailed": two_tailed}
     # Set mode-specific params
@@ -368,12 +422,18 @@ def spatial_autocorr(
 
     with np.errstate(divide="ignore"):
         pval_results = _p_value_calc(
-            score, sims=score_perms, weights=adj, params=params
+            score,
+            sim_stats=None if keys is None else results[1:],
+            n_perms=n_perms,
+            n_obs=n,
+            moments=moments,
+            params=params,
         )
 
-    df = pd.DataFrame({params["stat"]: score, **pval_results}, index=genes)
+    df = pd.DataFrame({params["stat"]: score, **pval_results}).iloc[gene_order]
+    df.index = genes
 
-    if corr_method is not None:
+    if corr_method is not None and len(df):
         for pv in filter(lambda x: "pval" in x, df.columns):
             _, pvals_adj, _, _ = multipletests(df[pv].values, alpha=0.05, method=corr_method)
             df[f"{pv}_{corr_method}"] = pvals_adj

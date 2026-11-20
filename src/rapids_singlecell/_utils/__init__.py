@@ -38,22 +38,20 @@ _PIN_BYTES = 1 << 26
 
 
 def _array_to_device(x: np.ndarray, dtype=None) -> cp.ndarray:
-    """Copy a host array to the GPU, ~10x faster than ``cp.asarray`` for large arrays.
-
-    Large contiguous arrays are page-locked in place for the copy, which then
-    runs at the bus's speed instead of through the driver's staging buffers.
-    """
+    """Page-lock large host arrays for the transfer to the current CUDA stream."""
     x = np.ascontiguousarray(x)
     if x.nbytes < _PIN_BYTES:
         return cp.asarray(x, dtype=dtype)
-    out = cp.empty(x.shape, x.dtype)
     rt = cp.cuda.runtime
     try:
         rt.hostRegister(x.ctypes.data, x.nbytes, 0)
     except cp.cuda.runtime.CUDARuntimeError:
         return cp.asarray(x, dtype=dtype)
     try:
-        rt.memcpy(out.data.ptr, x.ctypes.data, x.nbytes, rt.memcpyHostToDevice)
+        out = cp.empty(x.shape, x.dtype)
+        stream = cp.cuda.get_current_stream()
+        rt.memcpyAsync(out.data.ptr, x.ctypes.data, x.nbytes, rt.memcpyHostToDevice, stream.ptr)
+        stream.synchronize()
     finally:
         rt.hostUnregister(x.ctypes.data)
     return out if dtype is None else out.astype(dtype, copy=False)

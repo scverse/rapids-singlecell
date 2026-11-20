@@ -2,11 +2,10 @@
 
 #include <cuda_runtime.h>
 
-// Spatial autocorrelation of a block of up to 32 genes (one per lane) under a
-// batch of permutations. A permutation pi moves the rows of the weights W, so
-// with z = W x and r = W 1 each permuted statistic needs only
-//     A = sum_i x_i z_pi(i)    and    B = sum_i x_i^e r_pi(i)
-// (e = 1 for Moran's I, 2 for Geary's C); the rest does not depend on pi.
+// Permuting the rows of W permutes its spatial lag z = W x and row sums r.
+// With x translated by a per-gene offset, the change from the observed score
+// needs only sum_i x_i (z_pi(i) - z_i) and sum_i x_i^e (r_pi(i) - r_i),
+// where e is one for Moran and two for Geary.
 
 constexpr int AUTOCORR_ROUNDS = 6;
 constexpr int AUTOCORR_BATCH = 16;
@@ -52,112 +51,119 @@ __global__ void autocorr_permutation_kernel(const unsigned int* keys, int n,
     if (i < n) out[i] = autocorr_permute(i, n, keys);
 }
 
-// out[p, 0, g] += A, out[p, 1, g] += B for the permutations [0, n_perms) with
-// round keys keys[p * AUTOCORR_ROUNDS ...]; n_perms == 0 means the identity.
-// x and z are (n, n_genes) row-major. A warp handles one cell at a time; rows
-// without expression in the block are skipped.
-// With UNIFORM row sums, B is left to the caller (it does not depend on pi).
+// Each grid row scores up to BATCH permutations with their own round keys.
 template <typename T, bool GEARY, bool UNIFORM>
 __global__ void autocorr_sums_kernel(const T* __restrict__ x,
                                      const T* __restrict__ z,
-                                     const T* __restrict__ r, int n,
+                                     const double* __restrict__ r, int n,
                                      int n_genes, const unsigned int* keys,
-                                     int n_perms, double* __restrict__ out) {
-    __shared__ double block_sums[AUTOCORR_BATCH * 2 * 32];
-    for (int t = threadIdx.x; t < AUTOCORR_BATCH * 2 * 32; t += blockDim.x)
+                                     int n_scores, int start,
+                                     double* __restrict__ out) {
+    constexpr int terms = UNIFORM ? 1 : 2;
+    constexpr int stride = terms * 32;
+    __shared__ double block_sums[AUTOCORR_BATCH * stride];
+    const int first = start + blockIdx.y * AUTOCORR_BATCH;
+    const int batch = min(n_scores - first, AUTOCORR_BATCH);
+    for (int t = threadIdx.x; t < batch * stride; t += blockDim.x)
         block_sums[t] = 0.0;
     __syncthreads();
     const int lane = threadIdx.x & 31;
-    const int batch = n_perms ? n_perms : 1;
-    double a[AUTOCORR_BATCH], b[AUTOCORR_BATCH];
-#pragma unroll
-    for (int p = 0; p < AUTOCORR_BATCH; ++p) a[p] = b[p] = 0.0;
+    const double offset = lane < n_genes ? x[lane] : 0;
+    double a[AUTOCORR_BATCH] = {}, b[AUTOCORR_BATCH] = {};
     const int warps = (gridDim.x * blockDim.x) >> 5;
-    for (int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
+    for (long long i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
          i += warps) {
-        const T xv = lane < n_genes ? x[(long long)i * n_genes + lane] : T(0);
-        if (!__any_sync(0xFFFFFFFFu, xv != T(0))) continue;
-        // lane p finds permutation p's source row, shared by every lane
-        const int mine =
-            !n_perms ? i
-            : lane < n_perms
-                ? (int)autocorr_permute(i, n, keys + lane * AUTOCORR_ROUNDS)
-                : 0;
+        const double xv = lane < n_genes ? x[i * n_genes + lane] - offset : 0;
+        if (!__any_sync(0xFFFFFFFFu, xv != 0)) continue;
+        const double zi = xv != 0 ? z[i * n_genes + lane] : 0;
+        const double ri = UNIFORM ? 0 : r[i];
+        // Lane p computes a source row shared by every gene in the warp.
+        const long long score = (long long)first + lane;
+        int mine = i;
+        if (lane < batch)
+            mine = autocorr_permute(i, n, keys + score * AUTOCORR_ROUNDS);
 #pragma unroll
         for (int p = 0; p < AUTOCORR_BATCH; ++p) {
             const int j = __shfl_sync(0xFFFFFFFFu, mine, p);
-            if (p < batch && xv != T(0)) {
-                a[p] += (double)xv * (double)z[(long long)j * n_genes + lane];
-                if constexpr (!UNIFORM) {
-                    b[p] += (double)(GEARY ? xv * xv : xv) * (double)r[j];
-                }
+            if (p < batch && xv != 0) {
+                a[p] += xv * (z[(long long)j * n_genes + lane] - zi);
+                if constexpr (!UNIFORM)
+                    b[p] += (GEARY ? xv * xv : xv) * (r[j] - ri);
             }
         }
     }
 #pragma unroll
     for (int p = 0; p < AUTOCORR_BATCH; ++p) {
         if (p < batch && lane < n_genes) {
-            atomicAdd(&block_sums[(2 * p) * 32 + lane], a[p]);
-            atomicAdd(&block_sums[(2 * p + 1) * 32 + lane], b[p]);
+            atomicAdd(&block_sums[p * stride + lane], a[p]);
+            if constexpr (!UNIFORM)
+                atomicAdd(&block_sums[p * stride + 32 + lane], b[p]);
         }
     }
     __syncthreads();
-    for (int t = threadIdx.x; t < batch * 2 * 32; t += blockDim.x) {
-        const int lane_t = t % 32;
-        if (lane_t < n_genes)
-            atomicAdd(&out[(long long)(t / 32) * n_genes + lane_t],
+    for (int t = threadIdx.x; t < batch * stride; t += blockDim.x) {
+        const int g = t % 32;
+        if (g < n_genes)
+            atomicAdd(&out[((long long)first * terms + t / 32) * n_genes + g],
                       block_sums[t]);
     }
 }
 
-// z = W x for row-major x and z with up to 32 columns: a warp per row, lane g
-// accumulating column g over the row's neighbours (coalesced row reads).
 template <typename T, typename P>
-__global__ void autocorr_lag_kernel(const P* __restrict__ indptr,
-                                    const int* __restrict__ indices,
-                                    const T* __restrict__ weights,
-                                    const T* __restrict__ x, int n, int n_genes,
-                                    T* __restrict__ z) {
-    const int lane = threadIdx.x & 31;
-    const int warps = (gridDim.x * blockDim.x) >> 5;
-    for (int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
-         i += warps) {
-        T acc = 0;
-        if (lane < n_genes)
-            for (P e = indptr[i]; e < indptr[i + 1]; ++e)
-                acc += weights[e] * x[(long long)indices[e] * n_genes + lane];
-        if (lane < n_genes) z[(long long)i * n_genes + lane] = acc;
+__global__ void autocorr_normalize_kernel(const P* indptr, const T* weights,
+                                          int n, T* normalized) {
+    for (long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        const P begin = indptr[i], end = indptr[i + 1];
+        double sum = 0;
+        for (P e = begin; e < end; ++e) sum += weights[e];
+        const double scale = sum == 0 ? 0 : 1.0 / sum;
+        for (P e = begin; e < end; ++e) normalized[e] = weights[e] * scale;
     }
 }
 
-// Per gene: sum x, sum x^2, sum c x, sum c x^2 (double), for row-major x with
-// up to 32 columns; out is (4, n_genes).
-template <typename T>
-__global__ void autocorr_colstats_kernel(const T* __restrict__ x,
-                                         const double* __restrict__ c, int n,
-                                         int n_genes,
-                                         double* __restrict__ out) {
-    __shared__ double block_sums[4 * 32];
-    for (int t = threadIdx.x; t < 4 * 32; t += blockDim.x) block_sums[t] = 0.0;
-    __syncthreads();
+// One warp per cell, one lane per gene. Compute the observed numerator
+// directly from the edges. Only permutation tests need a stored spatial lag.
+template <typename T, typename P, bool GEARY, bool SAVE_LAG>
+__global__ void autocorr_observed_kernel(
+    const P* __restrict__ indptr, const int* __restrict__ indices,
+    const T* __restrict__ weights, const T* __restrict__ x,
+    const double* __restrict__ row, const double* __restrict__ col, int n,
+    int n_genes, T* __restrict__ z, double* __restrict__ stats) {
     const int lane = threadIdx.x & 31;
-    double s[4] = {0.0, 0.0, 0.0, 0.0};
     const int warps = (gridDim.x * blockDim.x) >> 5;
-    if (lane < n_genes)
-        for (int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
+    double s[4] = {};
+    if (lane < n_genes) {
+        const double offset = x[lane];
+        for (long long i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
              i += warps) {
-            const double v = x[(long long)i * n_genes + lane];
+            const double v = x[i * n_genes + lane] - offset;
+            double lag = 0;
+            for (P e = indptr[i]; e < indptr[i + 1]; ++e) {
+                const double other =
+                    x[(long long)indices[e] * n_genes + lane] - offset;
+                const double w = weights[e];
+                if constexpr (SAVE_LAG || !GEARY) lag += w * other;
+                if constexpr (GEARY) s[3] += w * ((v - other) * (v - other));
+            }
+            if constexpr (SAVE_LAG) z[i * n_genes + lane] = lag;
             s[0] += v;
             s[1] += v * v;
-            s[2] += c[i] * v;
-            s[3] += c[i] * v * v;
+            if constexpr (!GEARY) {
+                s[2] += (row[i] + col[i]) * v;
+                s[3] += v * lag;
+            }
         }
+    }
+    __shared__ double block_sums[4 * 32];
+    if (threadIdx.x < 4 * 32) block_sums[threadIdx.x] = 0.0;
+    __syncthreads();
     if (lane < n_genes)
         for (int t = 0; t < 4; ++t) atomicAdd(&block_sums[t * 32 + lane], s[t]);
     __syncthreads();
-    for (int t = threadIdx.x; t < 4 * 32; t += blockDim.x)
-        if (t % 32 < n_genes)
-            atomicAdd(&out[(t / 32) * n_genes + t % 32], block_sums[t]);
+    if (threadIdx.x < 4 * 32 && lane < n_genes)
+        atomicAdd(&stats[(threadIdx.x / 32) * n_genes + lane],
+                  block_sums[threadIdx.x]);
 }
 
 // sum w, sum w^2 and sum_ij w_ij w_ji of a canonical CSR matrix (sorted,
@@ -166,14 +172,18 @@ template <typename T, typename P>
 __global__ void autocorr_moments_kernel(const P* __restrict__ indptr,
                                         const int* __restrict__ indices,
                                         const T* __restrict__ data, int n,
+                                        double* __restrict__ row,
+                                        double* __restrict__ col,
                                         double* __restrict__ out) {
     double s[3] = {0.0, 0.0, 0.0};
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+    for (long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += gridDim.x * blockDim.x) {
+        double sum = 0.0;
         for (P e = indptr[i]; e < indptr[i + 1]; ++e) {
             const double w = data[e];
             const int j = indices[e];
-            s[0] += w;
+            sum += w;
+            atomicAdd(&col[j], w);
             s[1] += w * w;
             P lo = indptr[j], hi = indptr[j + 1];
             while (lo < hi) {  // first column >= i in row j
@@ -185,6 +195,8 @@ __global__ void autocorr_moments_kernel(const P* __restrict__ indptr,
             }
             if (lo < indptr[j + 1] && indices[lo] == i) s[2] += w * data[lo];
         }
+        row[i] = sum;
+        s[0] += sum;
     }
     for (int t = 0; t < 3; ++t) {
         double v = s[t];

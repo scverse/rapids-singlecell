@@ -278,27 +278,28 @@ def test_block_scores_match_reference(mode, n_perms, density):
     if n_perms:
         keys = rng.integers(0, 2**32, (n_perms, _ac.ROUNDS), dtype=np.uint32)
     adj = sparse_gpu.csr_matrix(w)
-    observed, perms = _block_scores(
+    observed, changes = _block_scores(
         cp.asarray(x),
-        adj,
+        (adj.indptr, adj.indices, adj.data),
         cp.asarray(np.asarray(w.sum(1)).ravel()),
         cp.asarray(np.asarray(w.sum(0)).ravel()),
         None if keys is None else cp.asarray(keys),
+        total=w.sum(),
+        uniform=False,
         geary=mode == "geary",
     )
     np.testing.assert_allclose(observed.get(), _reference(x, w, mode), rtol=1e-10)
     if n_perms is None:
-        assert perms is None
+        assert changes is None
         return
+    perms = observed + changes
     assert perms.shape == (n_perms, n_genes)
     for p in range(n_perms):
         pi = cp.empty(n, dtype=cp.int32)
         _ac.permutation(cp.asarray(keys[p]), out=pi)
         pi = pi.get()
         assert np.array_equal(np.sort(pi), np.arange(n))
-        np.testing.assert_allclose(
-            perms[p].get(), _reference(x, w[pi], mode), rtol=1e-10, atol=1e-12
-        )
+        np.testing.assert_allclose(perms[p].get(), _reference(x, w[pi], mode), rtol=1e-10, atol=1e-12)
 
 
 @pytest.mark.parametrize("mode", ["moran", "geary"])
@@ -334,6 +335,38 @@ def test_autocorr_seed_blocks_and_dask(mode):
     pd.testing.assert_frame_equal(df1, spatial_autocorr(lazy, **kw))
 
 
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+def test_autocorr_permutation_ties(mode):
+    # Every row of W is the same. Permuting rows leaves every score unchanged.
+    rng = np.random.default_rng(41)
+    x = rng.normal(size=(25, 9)).astype(np.float32)
+    w = np.tile(rng.random(len(x)).astype(np.float32), (len(x), 1))
+    adata = AnnData(x)
+    adata.obsp["spatial_connectivities"] = w
+    df = spatial_autocorr(adata, mode=mode, n_perms=63, seed=17, copy=True)
+    np.testing.assert_array_equal(df["pval_sim"], np.full(x.shape[1], 1 / 64))
+    np.testing.assert_allclose(df["var_sim"], 0, atol=1e-29)
+
+
+@pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_autocorr_large_offset(mode, stat, dtype):
+    rng = np.random.default_rng(17)
+    x = rng.integers(-4, 5, (251, 3)).astype(dtype)
+    shifted = x + dtype(2**23 if dtype == np.float32 else 2**50)
+    w = sparse.random(len(x), len(x), density=0.04, format="csr", random_state=7).astype(dtype)
+    adata = AnnData(shifted)
+    adata.obsp["spatial_connectivities"] = w
+    result = spatial_autocorr(adata, mode=mode, copy=True, transformation=False)
+    np.testing.assert_allclose(
+        result.loc[adata.var_names, stat],
+        _reference(x.astype(np.float64), w.astype(np.float64), mode),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_array_equal(adata.X, shifted)
+
+
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
 def test_autocorr_analytic_variance(mode, stat):
     """Analytic variance follows Cliff & Ord 1981 for each statistic (esda Moran/Geary)."""
@@ -353,3 +386,40 @@ def test_autocorr_analytic_variance(mode, stat):
     expected = -1 / (n - 1) if mode == "moran" else 1.0
     z = (df[stat] - expected) / np.sqrt(var)
     np.testing.assert_allclose(df["pval_norm"], stats.norm.sf(np.abs(z)), rtol=1e-6)
+
+
+@pytest.mark.parametrize("source", ["cupy", "csr", "dask"])
+def test_autocorr_selected_genes(source, monkeypatch):
+    import dask.array as da
+
+    rng = np.random.default_rng(41)
+    shape = (71, 323)
+    x = rng.normal(size=shape) * (rng.random(shape) < 0.4)
+    monkeypatch.setattr("rapids_singlecell.squidpy_gpu._autocorr._CHUNK_BYTES", 4096)
+    if source == "cupy":
+        values = cp.asarray(x)
+    else:
+        csr = sparse.csr_matrix(x)
+        fraction = rng.uniform(size=csr.nnz)
+        entries = np.column_stack((fraction * csr.data, (1 - fraction) * csr.data))
+        values = sparse.csr_matrix((entries.ravel(), csr.indices.repeat(2), csr.indptr * 2), shape=x.shape)
+        if source == "dask":
+            values = da.from_array(values, chunks=(20, 23))
+    adata = AnnData(values)
+    w = sparse.diags(np.ones(x.shape[0] - 1), offsets=1, format="csr")
+    adata.obsp["spatial_connectivities"] = w
+    cols = [*range(99, 65, -1), 2, 87]
+    genes = adata.var_names[cols]
+    result = spatial_autocorr(adata, genes=genes, copy=True, transformation=False, multi_gpu=False)
+    expected = pd.Series(_reference(x[:, cols], w, "moran"), index=genes, name="I")
+    pd.testing.assert_series_equal(result["I"].sort_index(), expected.sort_index(), rtol=1e-10, atol=1e-12)
+
+
+def test_host_csr_chunks_share_entries():
+    from rapids_singlecell.squidpy_gpu._autocorr import _csr_chunks
+
+    x = sparse.csr_matrix(np.ones((80, 40), dtype=np.float32))
+    for start, chunk in _csr_chunks(x, 4096):
+        assert np.shares_memory(chunk.data, x.data)
+        assert np.shares_memory(chunk.indices, x.indices)
+        np.testing.assert_array_equal(chunk.toarray(), x[start : start + chunk.shape[0]].toarray())
