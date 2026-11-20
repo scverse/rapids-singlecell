@@ -9,9 +9,6 @@
 //     CC-piece last resort), AGGREGATE stage 2; projection to level 0 with
 //     V-cycle UP sweeps, the CC split and, with replicas, the best slice
 //   exact Q, size-ordered labels
-// With several partitions (multi_gpu), level 0 is split by rows
-// (partition.cuh); levels >= 1 run on partition 0.
-
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -92,7 +89,7 @@ struct DriverParams {
 
 // The level loop's next step after local moving at level lvl (n vertices) gave
 // C communities; n_next: communities after refinement and pieces: CC pieces of
-// the move partition (-1 while unknown). One rule for every driver.
+// the move partition (-1 while unknown).
 enum class LevelStep {
     kVerifyTop,     // C == n after DOWN: certify with all-active TOP sweeps
     kCertified,     // C == n after TOP: the level loop ends at this level
@@ -120,11 +117,12 @@ inline LevelStep level_step(u32 phase, i64 C, i64 n, i64 n_next, i64 pieces,
                                     : LevelStep::kAggregate;
 }
 
-// The replicas fit the vertex ids and CUB item counts: R * n <= 2^30 - 2.
-inline int n_replicas(i64 nnz_counted, i64 n, int max_replicas, i64 budget) {
-    if (nnz_counted <= 0) return 1;
-    const i64 r = std::min(budget / nnz_counted,
-                           (kMaxVertices - 2) / std::max<i64>(n, 1));
+// Bound both the union's edge storage and its per-vertex phase buffers.
+inline int n_replicas(i64 entries, i64 n, int max_replicas, i64 budget) {
+    if (entries <= 0) return 1;
+    constexpr i64 vertex_budget = 1ll << 17;
+    const i64 r =
+        std::min(budget / entries, vertex_budget / std::max<i64>(n, 1));
     return static_cast<int>(std::min<i64>(max_replicas, std::max<i64>(1, r)));
 }
 
@@ -414,6 +412,7 @@ class LeidenDriver {
         g.khat = L_.uni.khat;
         g.n = static_cast<i64>(R) * n_;
         g.nnz = static_cast<i64>(R) * nnz_;
+        g.hub_ints = R * g0_.hub_ints;
         for (int c = 0; c < kNumClasses; ++c) g.cls[c] = R * g0_.cls[c];
         return g;
     }
@@ -470,7 +469,7 @@ class LeidenDriver {
     // PLEIDEN_R + AGGREGATE stage 1 of level l (C on the device; SL2 next).
     void launch_refine_begin(const LevelGraph& g, const int* P, int l, u32 it,
                              int* cmap, const AggregateOptions& opt,
-                             AggregatePlan<>& plan,
+                             AggregatePlan& plan,
                              std::vector<KernelCall> pre = {}) {
         RefineParams rp;
         rp.lam = lam_;
@@ -548,31 +547,11 @@ class LeidenDriver {
         i64 idb = id_bound;
         level_loop(G, lvl, idb, uit, moved, stat);
         i64 Ccur = idb;
-        project(G, lvl, 0, vcycle, uit, Ccur, moved);
+        project(G, lvl, vcycle, uit, Ccur, moved);
         stat.moved = moved;
         C_out = Ccur;
     }
 
-   public:
-    // Levels >= 1 of an iteration whose level 0 ran partitioned: the level
-    // loop from level 1 (G = {g0, g1}, g0.cmap = its cmap, P_1 in
-    // level_partition(1), the arena holding both) and the projection down to
-    // level 1.
-    void upper_levels(const LevelGraph& g0, const LevelGraph& g1, i64 idb,
-                      int it, bool vcycle, IterationStat& stat, i64& Ccur,
-                      bool& moved) {
-        std::vector<LevelGraph> G;
-        G.reserve(static_cast<std::size_t>(dp_.max_levels) + 1);
-        G.push_back(g0);
-        G.push_back(g1);
-        const u32 uit = static_cast<u32>(it);
-        int lvl = 1;
-        level_loop(G, lvl, idb, uit, moved, stat);
-        Ccur = idb;
-        project(G, lvl, 1, vcycle, uit, Ccur, moved);
-    }
-
-   private:
     // The levels from G[lvl] up (lvl, idb: the last level and its id bound).
     void level_loop(std::vector<LevelGraph>& G, int& lvl, i64& idb, u32 uit,
                     bool& moved, IterationStat& stat) {
@@ -601,7 +580,7 @@ class LeidenDriver {
                 speculate
                     ? arena.push_bottom<int>(static_cast<std::size_t>(g.n))
                     : nullptr;
-            AggregatePlan<> plan;
+            AggregatePlan plan;
             if (cmap) {  // COMPACT runs in refinement's graph
                 launch_refine_begin(g, P, lvl, uit, cmap, opt, plan,
                                     std::move(compact));
@@ -714,11 +693,11 @@ class LeidenDriver {
         }
     }
 
-    // Projection from level lvl down to level lp_end, with the V-cycle's UP
+    // Projection from level lvl down to level 0, with the V-cycle's UP
     // sweeps (Ccur: the id bound of the current level's partition).
-    void project(std::vector<LevelGraph>& G, int lvl, int lp_end, bool vcycle,
-                 u32 uit, i64& Ccur, bool& moved) {
-        for (int lp = lvl - 1; lp >= lp_end; --lp) {
+    void project(std::vector<LevelGraph>& G, int lvl, bool vcycle, u32 uit,
+                 i64& Ccur, bool& moved) {
+        for (int lp = lvl - 1; lp >= 0; --lp) {
             const LevelGraph& g = G[lp];
             int* P = level_partition(lp);
             run_project(level_partition(lp + 1), g.cmap, g.n, P, s_);
@@ -765,8 +744,8 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
     p.wkind = call_wkind(in.info, in.use_weights, data_f32, in.gammas);
     p.idx64_input = idx64_input;
     p.host_input = host_input;
-    const int R = n_replicas(in.info.n_counted, in.n, dp.max_replicas,
-                             dp.replica_nnz_budget);
+    const int R = n_replicas(in.info.n_counted ? in.nnz : 0, in.n,
+                             dp.max_replicas, dp.replica_nnz_budget);
     p.replicas = R;
     p.subrounds = dp.subrounds;
     Layout L = make_layout(p, in.workspace);
@@ -814,26 +793,16 @@ using host_labels = std::optional<
 
 // Arena blocks from Python: alloc(nbytes, device) -> pointer, free(pointer),
 // called with the GIL; their exceptions (MemoryError, KeyboardInterrupt)
-// propagate unchanged. `sync`: a stream of `device` to finish before a block
-// goes back (the multi-GPU driver's own streams; null: the caller's stream,
-// which the allocator orders). The caller keeps both alive for the call.
-inline ArenaGrower python_grower(nb::handle alloc, nb::handle free, int device,
-                                 cudaStream_t sync = nullptr) {
+// propagate unchanged. The caller keeps both callbacks alive for the call.
+inline ArenaGrower python_grower(nb::handle alloc, nb::handle free,
+                                 int device) {
     ArenaGrower g;
     g.alloc = [alloc, device](std::size_t bytes) -> void* {
         nb::gil_scoped_acquire gil;
         return reinterpret_cast<void*>(
             nb::cast<std::uintptr_t>(alloc(bytes, device)));
     };
-    g.free = [free, device, sync](void* p) {
-        if (sync) {  // on its own device, which compute-sanitizer requires
-            int prev = 0;
-            cuda_check(cudaGetDevice(&prev), "leiden: cudaGetDevice");
-            cuda_check(cudaSetDevice(device), "leiden: cudaSetDevice");
-            const cudaError_t err = cudaStreamSynchronize(sync);
-            cudaSetDevice(prev);
-            cuda_check(err, "leiden: arena release");
-        }
+    g.free = [free](void* p) {
         nb::gil_scoped_acquire gil;
         free(reinterpret_cast<std::uintptr_t>(p));
     };

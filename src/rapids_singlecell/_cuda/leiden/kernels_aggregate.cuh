@@ -48,19 +48,6 @@ __device__ __forceinline__ int agg_pow2(i64 x) {
     return x <= 1 ? 1 : 1 << (32 - __clz(static_cast<int>(x - 1)));
 }
 
-// Output weight of a coarse entry from its exact int64 sum: fp32 (one rounding)
-// or, for the partial rows of a partitioned level 0, the sum itself.
-template <typename OW>
-__device__ __forceinline__ OW agg_weight(i64 x);
-template <>
-__device__ __forceinline__ float agg_weight<float>(i64 x) {
-    return __ll2float_rn(x);
-}
-template <>
-__device__ __forceinline__ i64 agg_weight<i64>(i64 x) {
-    return x;
-}
-
 // agg_drop_entry: whether the entry (v, u) of a member v of coarse vertex c,
 // with cu = cmap[u], is left out of the coarse row of c. Coarse node weights
 // are carried separately (khat_next[c] = the summed k_hat of c's members).
@@ -153,15 +140,15 @@ __global__ void agg_scatter_kernel(const int* __restrict__ cmap, i64 n,
 
 // Warp per coarse vertex: members flattened into 32-edge chunks; match_any
 // pre-aggregates equal coarse neighbours, the group leader inserts.
-template <WKind K, int kSlots, int kWarps, typename OW = float>
+template <WKind K, int kSlots, int kWarps>
 __global__ void __launch_bounds__(kWarps* kWarp) agg_gather_warp_kernel(
     const i64* __restrict__ indptr, const int* __restrict__ indices, EdgeW<K> w,
     const i64* __restrict__ khat, const int* __restrict__ cmap,
     const i64* __restrict__ mstart, const int* __restrict__ members,
     const i64* __restrict__ woff, const int* __restrict__ list, int list_class,
     const i64* __restrict__ out_off, int* __restrict__ out_idx,
-    OW* __restrict__ out_w, i64* __restrict__ cdeg, i64* __restrict__ khat_next,
-    Control* ctl) {
+    float* __restrict__ out_w, i64* __restrict__ cdeg,
+    i64* __restrict__ khat_next, Control* ctl) {
     // int keys (-1 = free, restored by the output scan): 12 B per slot
     __shared__ int tkey[kWarps][kSlots];
     __shared__ i64 tval[kWarps][kSlots];
@@ -249,7 +236,7 @@ __global__ void __launch_bounds__(kWarps* kWarp) agg_gather_warp_kernel(
             if (f) {
                 const i64 o = ob + out + __popc(bm & ((1u << lane) - 1u));
                 out_idx[o] = kk;
-                out_w[o] = agg_weight<OW>(tval[wib][s]);
+                out_w[o] = __ll2float_rn(tval[wib][s]);
                 vkey[s] = -1;  // the next coarse vertex starts empty
             }
             out += __popc(bm);
@@ -399,16 +386,16 @@ __device__ const i64* agg_hub_buckets(
 // hash-range passes (table_pass(key, npass) == p), npass doubling; a hub
 // window (numerics.cuh) is bucketed at its first overflow, its passes then
 // reading their bucket only (the same rows, in hash-slot order).
-template <WKind K, typename OW = float>
+template <WKind K>
 __global__ void __launch_bounds__(kBlock, 4) agg_gather_block_kernel(
     const i64* __restrict__ indptr, const int* __restrict__ indices, EdgeW<K> w,
     const i64* __restrict__ khat, const int* __restrict__ cmap,
     const i64* __restrict__ mstart, const int* __restrict__ members,
     const i64* __restrict__ woff, const int* __restrict__ clist, i64 n_list,
     GatherClasses gc, const i64* __restrict__ out_off,
-    int* __restrict__ out_idx, OW* __restrict__ out_w, i64* __restrict__ cdeg,
-    i64* __restrict__ khat_next, Control* ctl, int slots, i64 win_lo,
-    i64 win_hi, HubScratch hs) {
+    int* __restrict__ out_idx, float* __restrict__ out_w,
+    i64* __restrict__ cdeg, i64* __restrict__ khat_next, Control* ctl,
+    int slots, i64 win_lo, i64 win_hi, HubScratch hs) {
     // `slots` entries; this launch takes the windows in [win_lo, win_hi]
     extern __shared__ __align__(16) unsigned char agg_smem[];
     u64* tv = reinterpret_cast<u64*>(agg_smem);
@@ -516,7 +503,7 @@ __global__ void __launch_bounds__(kBlock, 4) agg_gather_block_kernel(
                         const i64 o =
                             ob + base + __popc(bm & ((1u << lane) - 1u));
                         out_idx[o] = tk[s];
-                        out_w[o] = agg_weight<OW>(static_cast<i64>(tv[s]));
+                        out_w[o] = __ll2float_rn(static_cast<i64>(tv[s]));
                     }
                 }
                 __syncthreads();
@@ -587,13 +574,13 @@ __global__ void agg_stats_kernel(const i64* __restrict__ cdeg,
 }
 
 // Holey rows (window offsets, arena top) -> compacted rows (arena bottom).
-template <typename W = float>
 __global__ void agg_compact_kernel(const i64* __restrict__ woff,
                                    const i64* __restrict__ cdeg,
                                    const i64* __restrict__ indptr_next, i64 nn,
                                    const int* __restrict__ h_idx,
-                                   const W* __restrict__ h_w,
-                                   int* __restrict__ idx, W* __restrict__ wt) {
+                                   const float* __restrict__ h_w,
+                                   int* __restrict__ idx,
+                                   float* __restrict__ wt) {
     const int lane = threadIdx.x & (kWarp - 1);
     const i64 warp0 =
         static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
@@ -650,10 +637,9 @@ inline std::size_t agg_bottom_end(std::size_t bottom,
     return b;
 }
 
-template <typename OW = float>
 struct AggregatePlan {
     int* h_idx = nullptr;  // holey rows at the arena top (nnz_l entries)
-    OW* h_w = nullptr;
+    float* h_w = nullptr;
 };
 
 struct CoarseLevel {
@@ -667,9 +653,9 @@ struct CoarseLevel {
 };
 
 // at every use: a device reset drops the opt-in (CUDA 12)
-template <WKind K, typename OW>
+template <WKind K>
 inline void agg_block_smem_optin() {
-    cuda_check(cudaFuncSetAttribute(agg_gather_block_kernel<K, OW>,
+    cuda_check(cudaFuncSetAttribute(agg_gather_block_kernel<K>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     static_cast<int>(kAggBlockSmem)),
                "leiden: gather block shared memory");
@@ -680,70 +666,68 @@ inline void agg_block_smem_optin() {
 constexpr int kAggSmallSlots = 1024;
 constexpr i64 kAggSmallWindow = kAggSmallSlots - 1;  // nextpow2(win + 1) fits
 
-template <WKind K, typename OW = float>
+template <WKind K>
 void gather_calls(KernelCall* c, bool on, const i64* indptr, const int* indices,
                   EdgeW<K> w, const i64* khat, i64 n, const int* cmap,
                   const AggregateBufs& ab, const GatherClasses& gc,
-                  const i64* out_off, int* out_idx, OW* out_w, Control* ctl,
+                  const i64* out_off, int* out_idx, float* out_w, Control* ctl,
                   const HubScratch& hs) {
-    c[0].set(on, agg_gather_warp_kernel<K, kAggWarpSlots, kWarpsPerBlock, OW>,
-             dim3(grid_occ(
-                 agg_gather_warp_kernel<K, kAggWarpSlots, kWarpsPerBlock, OW>,
-                 n, kWarpsPerBlock)),
-             dim3(kBlock), 0, indptr, indices, w, khat, cmap, ab.member_start,
-             ab.members, ab.window_offset, ab.clist,
-             static_cast<int>(kGatherWarp), out_off, out_idx, out_w, ab.cdeg,
-             ab.khat_next, ctl);
+    c[0].set(
+        on, agg_gather_warp_kernel<K, kAggWarpSlots, kWarpsPerBlock>,
+        dim3(grid_occ(agg_gather_warp_kernel<K, kAggWarpSlots, kWarpsPerBlock>,
+                      n, kWarpsPerBlock)),
+        dim3(kBlock), 0, indptr, indices, w, khat, cmap, ab.member_start,
+        ab.members, ab.window_offset, ab.clist, static_cast<int>(kGatherWarp),
+        out_off, out_idx, out_w, ab.cdeg, ab.khat_next, ctl);
     // windows > gc.warp are known on the device only: all resident warps run
-    c[1].set(on && gc.wide > gc.warp,
-             agg_gather_warp_kernel<K, kAggWideSlots, kAggWideWarps, OW>,
-             dim3(grid_occ(
-                 agg_gather_warp_kernel<K, kAggWideSlots, kAggWideWarps, OW>, n,
-                 kAggWideWarps, kAggWideWarps * kWarp)),
-             dim3(kAggWideWarps * kWarp), 0, indptr, indices, w, khat, cmap,
-             ab.member_start, ab.members, ab.window_offset, ab.clist_wide,
-             static_cast<int>(kGatherWide), out_off, out_idx, out_w, ab.cdeg,
-             ab.khat_next, ctl);
-    agg_block_smem_optin<K, OW>();
+    c[1].set(
+        on && gc.wide > gc.warp,
+        agg_gather_warp_kernel<K, kAggWideSlots, kAggWideWarps>,
+        dim3(grid_occ(agg_gather_warp_kernel<K, kAggWideSlots, kAggWideWarps>,
+                      n, kAggWideWarps, kAggWideWarps * kWarp)),
+        dim3(kAggWideWarps * kWarp), 0, indptr, indices, w, khat, cmap,
+        ab.member_start, ab.members, ab.window_offset, ab.clist_wide,
+        static_cast<int>(kGatherWide), out_off, out_idx, out_w, ab.cdeg,
+        ab.khat_next, ctl);
+    agg_block_smem_optin<K>();
     const i64 small_hi =
         std::min<i64>(kAggSmallWindow, static_cast<i64>(gc.block));
     const std::size_t small_smem = kAggSmallSlots * (sizeof(u64) + sizeof(int));
     const i64 gs =
-        grid_occ(agg_gather_block_kernel<K, OW>, n, 1, kBlock, small_smem);
+        grid_occ(agg_gather_block_kernel<K>, n, 1, kBlock, small_smem);
     const i64 gb =
-        grid_occ(agg_gather_block_kernel<K, OW>, n, 1, kBlock, kAggBlockSmem);
+        grid_occ(agg_gather_block_kernel<K>, n, 1, kBlock, kAggBlockSmem);
     c[2].set(
-        on, agg_gather_block_kernel<K, OW>, dim3(static_cast<unsigned>(gs)),
+        on, agg_gather_block_kernel<K>, dim3(static_cast<unsigned>(gs)),
         dim3(kBlock),
         static_cast<unsigned>(kAggSmallSlots * (sizeof(u64) + sizeof(int))),
         indptr, indices, w, khat, cmap, ab.member_start, ab.members,
         ab.window_offset, ab.clist, n, gc, out_off, out_idx, out_w, ab.cdeg,
         ab.khat_next, ctl, kAggSmallSlots, i64{0}, small_hi, HubScratch{});
-    c[3].set(on, agg_gather_block_kernel<K, OW>,
-             dim3(static_cast<unsigned>(gb)), dim3(kBlock),
-             static_cast<unsigned>(kAggBlockSmem), indptr, indices, w, khat,
-             cmap, ab.member_start, ab.members, ab.window_offset, ab.clist, n,
-             gc, out_off, out_idx, out_w, ab.cdeg, ab.khat_next, ctl,
-             kAggBlockSlots, small_hi + 1, i64{LLONG_MAX}, hs);
+    c[3].set(on, agg_gather_block_kernel<K>, dim3(static_cast<unsigned>(gb)),
+             dim3(kBlock), static_cast<unsigned>(kAggBlockSmem), indptr,
+             indices, w, khat, cmap, ab.member_start, ab.members,
+             ab.window_offset, ab.clist, n, gc, out_off, out_idx, out_w,
+             ab.cdeg, ab.khat_next, ctl, kAggBlockSlots, small_hi + 1,
+             i64{LLONG_MAX}, hs);
 }
 
 // Stage 1 (A1-A4a): level l is gathered into the arena top. One call list
 // after `pre` (R9); the caller reads n_next, nnz_next and the classes at SL2.
-template <WKind K, typename OW = float>
-AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
-                                  EdgeW<K> w, const i64* khat, i64 n, i64 nnz,
-                                  const int* cmap, const AggregateOptions& opt,
-                                  const AggregateBufs& ab, LevelArena& arena,
-                                  void* cub, std::size_t cub_bytes,
-                                  Control* ctl, cudaStream_t s,
-                                  const HubScratch& hub = {},
-                                  std::vector<KernelCall> pre = {}) {
-    AggregatePlan<OW> plan;
+template <WKind K>
+AggregatePlan aggregate_begin(const i64* indptr, const int* indices, EdgeW<K> w,
+                              const i64* khat, i64 n, i64 nnz, const int* cmap,
+                              const AggregateOptions& opt,
+                              const AggregateBufs& ab, LevelArena& arena,
+                              void* cub, std::size_t cub_bytes, Control* ctl,
+                              cudaStream_t s, const HubScratch& hub = {},
+                              std::vector<KernelCall> pre = {}) {
+    AggregatePlan plan;
     const std::size_t ne = static_cast<std::size_t>(nnz);
     arena.reserve_top(align_up(4 * ne) +
-                      align_up(sizeof(OW) * ne));  // one block
+                      align_up(sizeof(float) * ne));  // one block
     plan.h_idx = arena.push_top<int>(ne);
-    plan.h_w = arena.push_top<OW>(ne);
+    plan.h_w = arena.push_top<float>(ne);
     arena.reserve_top(0);
     std::vector<KernelCall> c = std::move(pre);
     std::size_t k = c.size();
@@ -762,9 +746,9 @@ AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
     c[k++].set(on, agg_scatter_kernel, dim3(grid_items(n)), dim3(kBlock), 0,
                cmap, n, ab.member_start, ab.member_count, ab.members,
                ab.window_offset, opt.gather, ab.clist, ab.clist_wide, ctl);
-    gather_calls<K, OW>(&c[k], on, indptr, indices, w, khat, n, cmap, ab,
-                        opt.gather, ab.window_offset, plan.h_idx, plan.h_w, ctl,
-                        HubScratch{hub.base, hub.cap, &ctl->hub_next});
+    gather_calls<K>(&c[k], on, indptr, indices, w, khat, n, cmap, ab,
+                    opt.gather, ab.window_offset, plan.h_idx, plan.h_w, ctl,
+                    HubScratch{hub.base, hub.cap, &ctl->hub_next});
     k += 4;
     scan_calls(&c[k], ScanArray<i64, i64>{ab.cdeg}, ab.indptr_next, n + 1, cub,
                cub_bytes);
@@ -780,7 +764,7 @@ AggregatePlan<OW> aggregate_begin(const i64* indptr, const int* indices,
 // block with the level's hub scratch and room for its cmap), then P_{l+1} if
 // P is given.
 inline CoarseLevel aggregate_finish(i64 n, const int* cmap,
-                                    const AggregatePlan<>& plan, i64 n_next,
+                                    const AggregatePlan& plan, i64 n_next,
                                     i64 nnz_next, i64 hub_ints,
                                     const AggregateBufs& ab, LevelArena& arena,
                                     const int* P, int* P_next, cudaStream_t s) {

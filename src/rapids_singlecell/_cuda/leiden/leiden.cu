@@ -6,10 +6,9 @@
 #define CUB_DISABLE_CDP
 #endif
 
-#include "driver_mg.cuh"
+#include "driver.cuh"
 
 NB_MODULE(_leiden_cuda, m) {
     m.doc() = "Native bitwise-reproducible Leiden (rapids-singlecell)";
     leiden::register_api(m);
-    leiden::register_mg(m);
 }

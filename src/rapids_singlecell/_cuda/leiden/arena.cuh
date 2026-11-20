@@ -73,17 +73,6 @@ struct alignas(16) Control {
 };
 static_assert(sizeof(Control) <= 4096, "Control block must fit in 4 KB");
 constexpr std::size_t kControlBytes = 4096;
-// The rest of the control region: small i64 values a partitioned run reads
-// back (partition.cuh).
-constexpr std::size_t kScratchOffset = 2048;
-constexpr int kScratchValues = (kControlBytes - kScratchOffset) / 8;
-static_assert(sizeof(Control) <= kScratchOffset,
-              "Control overlaps the scratch");
-
-inline i64* ctl_scratch(Control* ctl) {
-    return reinterpret_cast<i64*>(reinterpret_cast<char*>(ctl) +
-                                  kScratchOffset);
-}
 
 // Python passes a pinned buffer of PINNED_BYTES (null: pageable, slower).
 constexpr std::size_t kPinnedBytes = 4096;
@@ -205,9 +194,6 @@ struct MoveBufs {
     int* bucket_count = nullptr;    // [S * kNumClasses * 4]
     int* movers = nullptr;          // [n_U]
     unsigned char* desc = nullptr;  // MoveState
-    // [n_U + 32] exchange buffer of a partitioned run (partition.cuh): move
-    // lists, OR-reduced bitmaps; within the phase region of the Refine group
-    u64* xbuf = nullptr;
 
     void carve(Carver& c, i64 n_u, int S) {
         K = c.take<i64>(2 * n_u);
@@ -220,7 +206,6 @@ struct MoveBufs {
             c.take<int>(static_cast<std::size_t>(S) * kNumClasses * 4);
         movers = c.take<int>(n_u);
         desc = c.take<unsigned char>(kMoveStateBytes);
-        xbuf = c.take<u64>(n_u + 32);
     }
 };
 
@@ -422,7 +407,7 @@ struct LevelArena {
         }
     }
     void reserve_bottom(std::size_t bytes) {
-        bnext = bytes;
+        bnext = bytes ? align_up(bottom) + bytes : 0;
     }
     void reserve_top(std::size_t bytes) {
         tnext = bytes;
@@ -446,7 +431,8 @@ struct LevelArena {
         if (!bblocks.empty())
             at =
                 std::max(at, align_up(bblocks.back().at + bblocks.back().size));
-        const std::size_t size = std::max({nb, bnext, kAlign});
+        const std::size_t size =
+            std::max({nb, bnext > b ? bnext - b : 0, kAlign});
         bnext = 0;
         bblocks.push_back({at, size, block(size)});
         bottom = at + nb;

@@ -98,9 +98,7 @@ def test_wnn(managed_memory):
 
 
 def test_leiden(managed_memory, monkeypatch):
-    """The native Leiden bindings take one memory kind per call: device input
-    and a workspace cached before the switch, a split run with an empty
-    partition and an edgeless graph all run, with the bits of CUDA memory."""
+    """Device input and a cached CUDA workspace give the same results under managed memory."""
     from scanpy.datasets import pbmc68k_reduced
 
     from rapids_singlecell.tools import _leiden
@@ -119,11 +117,7 @@ def test_leiden(managed_memory, monkeypatch):
         expected = [run(a), run(a, initial_membership=start)]
         _leiden._WORKSPACE_CACHE[cp.cuda.Device().id] = cp.empty(1 << 24, dtype=cp.uint8)
     results = [run(device_input), run(a, initial_membership=start)]
-    monkeypatch.setattr(_leiden, "_N_PARTITIONS", 2)
-    monkeypatch.setattr(_leiden, "_MAX_REPLICAS", 1)
-    monkeypatch.setattr(_leiden, "_row_bounds", lambda indptr, n_parts: [0, 0, n])
-    results.append(run(a))
-    for got, want in zip(results, [*expected, expected[0]], strict=True):
+    for got, want in zip(results, expected, strict=True):
         assert got.membership.tobytes() == want.membership.tobytes()
         assert float.hex(got.modularity) == float.hex(want.modularity)
     assert run(csr_matrix((5, 5), dtype=np.float32)).n_clusters == 5

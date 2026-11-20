@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import _warnings
-import contextlib
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 
 import cupy as cp
@@ -80,13 +81,6 @@ def _graph(name):
         rows = [0] * 3000 + list(range(1, n - 1))
         cols = list(range(1, n)) + list(range(2, n))
         a = sparse.coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
-        a = a + a.T
-    elif name == "hubs":  # 32 hubs (rows 0-31) linked to all other cells, plus a random 10-neighbour chain
-        n, rng = 2000, np.random.default_rng(0)
-        order = rng.permutation(n)
-        rows = np.concatenate([*(order[:-d] for d in range(1, 11)), np.repeat(np.arange(32), n - 32)])
-        cols = np.concatenate([*(order[d:] for d in range(1, 11)), np.tile(np.arange(32, n), 32)])
-        a = sparse.coo_matrix((rng.uniform(0.5, 1.0, rows.size), (rows, cols)), shape=(n, n))
         a = a + a.T
     elif name == "components":  # blocks plus isolated vertices
         rng = np.random.default_rng(2)
@@ -170,6 +164,128 @@ def _with_index_dtypes(a, indptr_dtype, indices_dtype):
 
 
 # ---------- API: ports of scanpy's and rsc's leiden tests ----------
+
+
+def test_resolution_column_names(adata_neighbors, monkeypatch):
+    calls = _record_flavor_calls(monkeypatch)
+    res = np.float32(0.1)
+    with pytest.raises(ValueError, match="repeat"):
+        rsc.tl.leiden(adata_neighbors, resolution=[res, float(res)])
+    assert not calls
+    rsc.tl.leiden(adata_neighbors, resolution=[res, 0.1])
+    assert {f"leiden_{res}", "leiden_0.1"} <= set(adata_neighbors.obs)
+
+
+@needs_native
+def test_integer_duplicate_edges():
+    a = sparse.csr_matrix(([1, 3, 2, 4, 1, 1], [1, 1, 0, 0, 2, 1], [0, 2, 5, 6]), shape=(3, 3))
+    counted = sparse.csr_matrix([[0, 2, 0], [2, 0, 1], [0, 1, 0]], dtype=np.float32)
+    assert_same(native(a, [4], use_weights=False), native(counted, [4]))
+    a.data[0] = -1
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        native(a)
+
+
+@needs_native
+def test_integer_csr_rebuild_checks_storage():
+    bad = sparse.eye(3, dtype=np.int32, format="csr")
+    bad.indptr[-1] -= 1
+    with pytest.raises(ValueError, match="indptr must end at nnz"):
+        native(bad)
+
+
+@needs_native
+@pytest.mark.parametrize("layout", ["strided", "mixed"])
+def test_device_csr_layout(layout):
+    a = _graph("rings")
+    with cp.cuda.using_allocator(cp.get_default_memory_pool().malloc):
+        dev = cpx_sparse.csr_matrix(a)
+        if layout == "strided":
+            dev.data = cp.repeat(dev.data, 2)[::2]
+        else:
+            with cp.cuda.using_allocator(cp.cuda.malloc_managed):
+                dev.data = dev.data.copy()
+        assert_same(native(dev), native(a))
+
+
+@needs_native
+@pytest.mark.two_gpus
+def test_device_input_on_another_gpu(peer):
+    a = _graph("rings")
+    with cp.cuda.Device(0):
+        coo = cpx_sparse.coo_matrix(a)
+    with cp.cuda.Device(1):
+        assert_same(native(coo), native(a))
+
+
+@needs_native
+@pytest.mark.parametrize("device", [False, True])
+@pytest.mark.parametrize("loop", [False, True])
+def test_symmetrize_large_weights(device, loop):
+    big = np.finfo(np.float32).max
+    edge = 2 if loop else big
+    a = sparse.csr_matrix([[big if loop else 0, edge, 0], [edge, 0, edge], [0, edge / 2, 0]], dtype=np.float32)
+    wide = a.astype(np.float64)
+    with pytest.warns(UserWarning, match="not symmetric"):
+        parts = native(cpx_sparse.csr_matrix(a) if device else a)
+    assert_same(parts, native(wide + wide.T))
+
+
+@needs_native
+def test_short_copy_staging(monkeypatch):
+    sizes = []
+    alloc = cp.cuda.alloc_pinned_memory
+
+    def pinned(size):
+        sizes.append(size)
+        return alloc(size)
+
+    monkeypatch.setattr(cp.cuda, "alloc_pinned_memory", pinned)
+    src = np.arange(5, dtype=np.int64)
+    dst = cp.empty(src.size, dtype=cp.int32)
+    _leiden._copy_to_device(src, dst, narrow_n=src.size)
+    assert sizes == [src.nbytes]
+    np.testing.assert_array_equal(dst.get(), src)
+
+
+def test_rmm_reinitialize_drops_workspace(monkeypatch):
+    import rmm.rmm
+
+    # Run the real hooks without replacing the test session's device resources.
+    monkeypatch.setattr(rmm.rmm, "_initialize", lambda **kwargs: None)
+    cache = _leiden._WORKSPACE_CACHE
+    cache[cp.cuda.Device().id] = cp.empty(1)
+    rmm.reinitialize()
+    assert not cache
+
+
+def test_overlapping_managed_memory():
+    import rmm
+
+    device = cp.cuda.Device()
+    original = rmm.mr.get_current_device_resource()
+    entered, release = Event(), Event()
+
+    def other():
+        with cp.cuda.Device(device.id):
+            with _leiden._managed_memory():
+                entered.set()
+                assert release.wait(5)
+
+    try:
+        with ThreadPoolExecutor(1) as executor:
+            try:
+                with _leiden._managed_memory():
+                    managed = rmm.mr.get_current_device_resource()
+                    future = executor.submit(other)
+                    assert entered.wait(5)
+                assert rmm.mr.get_current_device_resource() is managed
+            finally:
+                release.set()
+            future.result(timeout=5)
+        assert rmm.mr.get_current_device_resource() is original
+    finally:
+        rmm.mr.set_current_device_resource(original)
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
@@ -620,10 +736,32 @@ def test_explicit_zeros_self_loops_and_unweighted():
 
 
 @needs_native
-def test_bucketed_hub_rows(partitions):
-    """A row longer than 32 hash passes (49152 entries) is bucketed by pass:
-    stored zeros that make the hub's row one give the bits of its 40000
-    nonzeros read pass by pass, in one partition and in two."""
+def test_sparse_replica_budget(monkeypatch):
+    assert _leiden._ld.n_replicas(2, 65536) == 2
+    assert _leiden._ld.n_replicas(2, 65537) == 1
+    plain = _graph("sbm")
+    n = 1025  # more than one chunk of explicitly stored zeros
+    plain.resize((n, n))
+    values = plain.toarray()
+    np.fill_diagonal(values, 1)
+    padded = sparse.csr_matrix(
+        (values.ravel(), np.tile(np.arange(n, dtype=np.int32), n), np.arange(n + 1, dtype=np.int32) * n),
+        shape=(n, n),
+    )
+    assert _leiden._ld.n_replicas(padded.nnz, n) == 1 < _leiden._ld.n_replicas(plain.nnz, n)
+    single = _leiden._leiden_single
+
+    def check(graph, args, n):
+        assert graph.nnz == plain.nnz
+        return single(graph, args, n)
+
+    monkeypatch.setattr(_leiden, "_leiden_single", check)
+    assert_same(native(padded), native(plain))
+
+
+@needs_native
+def test_bucketed_hub_rows(monkeypatch):
+    """Bucketing the padded hub preserves its partition and modularity."""
     p, z = 20000, 20000  # leaf pairs under the hub; cells linked to it by stored zeros
     rng = np.random.default_rng(0)
     leaves, pad = np.arange(1, 2 * p + 1), np.arange(2 * p + 1, 2 * p + z + 1)
@@ -635,9 +773,22 @@ def test_bucketed_hub_rows(partitions):
     plain = padded.copy()
     plain.eliminate_zeros()
     assert padded.indptr[1] > 32 * 1536 > plain.indptr[1]
-    for n_parts in (None, 2):
-        partitions(n_parts)
-        assert_same(native(padded, [0.5, 1.0, 2.0]), native(plain, [0.5, 1.0, 2.0]))
+    sizes = []
+    alloc = _leiden._ArenaBlocks.alloc
+
+    def tracked(self, nbytes, device):
+        sizes.append(nbytes)
+        return alloc(self, nbytes, device)
+
+    monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", tracked)
+    assert_same(native(padded, 1.0), native(plain, 1.0))
+    degree = int(padded.indptr[1])
+    assert sizes[0] == 2 * (3 * degree + (degree + 1535) // 1536 + 1) * 4
+
+    # With enough isolated vertices the same hub runs without replicas.
+    for graph in (padded, plain):
+        graph.resize((65537, 65537))
+    assert_same(native(padded, [0.5, 1.0, 2.0]), native(plain, [0.5, 1.0, 2.0]))
 
 
 @needs_native
@@ -672,6 +823,16 @@ def test_initial_membership(adata_neighbors):
     assert warm(codes)[0].modularity >= start.modularity
     assert_same(warm(codes), warm(start.membership))
     assert_same(warm(codes), warm(cp.asarray(start.membership)))
+
+
+@needs_native
+def test_binding_rejects_invalid_initial_membership(monkeypatch):
+    a = _graph("pbmc68k")
+    n = a.shape[0]
+    monkeypatch.setattr(_leiden, "_compact_initial_membership", lambda ids, n: ids)
+    for bad in (-1, n, 2**29):
+        with pytest.raises(ValueError, match=r"initial_membership ids must lie in \[0, n\)"):
+            native(a, 1.0, initial_membership=cp.full(n, bad, dtype=cp.int32))
 
 
 @needs_native
@@ -804,16 +965,13 @@ def test_workspace_cache(monkeypatch):
 
 
 @needs_native
-@pytest.mark.parametrize("n_parts", [None, 3])
-def test_arena_blocks(partitions, monkeypatch, request, n_parts):
+def test_arena_blocks(monkeypatch, request):
     """The coarser levels live in blocks of the current allocator, freed as
     they end; an error in an allocation (MemoryError, Ctrl-C) reaches the
-    caller unchanged, after the call's stream has finished (one GPU), and a
+    caller unchanged, after the call's stream has finished, and a
     kept traceback holds no device memory."""
     a, sizes, made, freed = _graph("pbmc68k"), [], [], []
-    partitions(None)
     expected = native(a, [0.5, 1.0])
-    partitions(n_parts)
     alloc, free = _leiden._ArenaBlocks.alloc, _leiden._ArenaBlocks.free
 
     def tracked(self, nbytes, device):
@@ -848,11 +1006,24 @@ def test_arena_blocks(partitions, monkeypatch, request, n_parts):
         monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", failing)
         with pytest.raises(type(error), match="test") as info:
             rsc.tl.leiden(adata, adjacency=a, resolution=[0.5, 1.0])
-        if n_parts is None:  # one GPU: the call's stream (the caller's)
-            assert queued[0].done
+        assert queued[0].done
         assert pool.used_bytes() == 0, info
     monkeypatch.setattr(_leiden._ArenaBlocks, "alloc", tracked)
     assert_same(native(a, [0.5, 1.0]), expected)
+
+
+@needs_native
+def test_native_out_of_memory(monkeypatch):
+    leiden = _leiden._ld.leiden
+
+    def full(*args, **kwargs):
+        if "workspace" in kwargs:
+            raise RuntimeError("leiden: graph instantiate failed: out of memory")
+        return leiden(*args, **kwargs)
+
+    monkeypatch.setattr(_leiden._ld, "leiden", full)
+    with pytest.raises(MemoryError, match="out of memory"):
+        native(_graph("pbmc3k"))
 
 
 @needs_native
@@ -870,222 +1041,6 @@ def test_streams_and_allocators():
         assert_same(native(a, [0.5, 1.0]), expected)
     finally:
         cp.cuda.set_allocator(allocator)
-
-
-# ---------- multi-GPU: level 0 split into row partitions ----------
-
-
-@pytest.fixture
-def partitions(monkeypatch):
-    """Sets the number of row partitions (round-robin over the GPUs, so several share
-    one; None: one); no replicas, so the small fixtures split."""
-    monkeypatch.setattr(_leiden, "_MAX_REPLICAS", 1)
-
-    def use(n_parts):
-        monkeypatch.setattr(_leiden, "_N_PARTITIONS", n_parts)
-
-    return use
-
-
-class _SpyLd:
-    """The native module, recording the status and root GPU of every `leiden_mg` run."""
-
-    def __init__(self, module):
-        self.module, self.runs, self.roots = module, [], []
-
-    def __getattr__(self, name):
-        return getattr(self.module, name)
-
-    def leiden_mg(self, *args, **kwargs):
-        out = self.module.leiden_mg(*args, **kwargs)
-        if kwargs["workspaces"]:  # a run, not a sizing call
-            self.runs.append(out["status"])
-            self.roots.append(kwargs["devices"][0])
-        return out
-
-
-@needs_native
-@pytest.mark.parametrize("name", ["pbmc3k", "pairs", "star", "components"])
-def test_partitions_bitwise(partitions, name):
-    """2, 3 and 4 partitions (pairs: some empty; star: a hub; components:
-    isolated cells) give the bits of one, also with n_iterations=-1."""
-    a = _graph(name)
-    for n_iterations in (2, -1):
-        partitions(None)
-        expected = native(a, [0.5, 1.0, 2.0], n_iterations=n_iterations)
-        for n_parts in (2, 3, 4):
-            partitions(n_parts)
-            assert_same(native(a, [0.5, 1.0, 2.0], n_iterations=n_iterations), expected)
-
-
-@needs_native
-def test_partitions_options(partitions, monkeypatch):
-    """2, 3 and 4 partitions with use_weights=False (n_iterations=-1),
-    initial_membership (n_iterations=1), a re-quantisation (gamma = 20),
-    device input (CSR and COO), and the exchange through the host (no peer
-    copies, also between partitions on one GPU)."""
-    a = _graph("pbmc68k")
-    start = native(a, 1.0, seed=1)[0].membership
-    cases = [
-        ({"use_weights": False, "n_iterations": -1}, a),
-        ({"initial_membership": start, "n_iterations": 1}, a),
-        ({}, cpx_sparse.csr_matrix(a)),
-        ({}, cpx_sparse.coo_matrix(a)),
-    ]
-    for kwargs, adjacency in cases:
-        partitions(None)
-        expected = native(adjacency, [0.5, 20.0], **kwargs)
-        for n_parts in (2, 3, 4):
-            partitions(n_parts)
-            assert_same(native(adjacency, [0.5, 20.0], **kwargs), expected)
-    monkeypatch.setattr(_leiden, "_peer_copies_work", lambda devices: False)
-    assert_same(native(a, [0.5, 20.0]), expected)
-
-
-@needs_native
-def test_partitions_empty(partitions, monkeypatch):
-    """Empty and small partitions merge their share of the coarse rows: a
-    32-row block of hubs (the default split leaves partition 1 empty) and
-    forced bounds (also the first partition empty) run once, with the bits of
-    one partition."""
-    spy = _SpyLd(_leiden._ld)
-    monkeypatch.setattr(_leiden, "_ld", spy)
-    a = _graph("hubs")
-    assert _leiden._row_bounds(a.indptr.astype(np.int64), 6)[:3] == [0, 32, 32]
-    b = _graph("pbmc3k")
-    n = b.shape[0]
-    forced = ([0, 64, 64, 1024, n], [0, 1312, 1344, n], [0, 1312, n, n, n], [0, 0, 0, 32, n])
-    for adjacency, splits in ((a, [None]), (b, forced)):
-        partitions(None)
-        expected = native(adjacency, [0.5, 1.0])
-        for bounds in splits:
-            if bounds is None:
-                partitions(6)
-            else:
-                monkeypatch.setattr(_leiden, "_row_bounds", lambda indptr, n_parts, bounds=bounds: bounds)
-                partitions(len(bounds) - 1)
-            spy.runs.clear()
-            assert_same(native(adjacency, [0.5, 1.0]), expected)
-            assert spy.runs == ["ok"]
-
-
-@needs_native
-def test_bindings_reject_malformed_input(partitions, monkeypatch):
-    """The bindings check what Python prepares before running: initial ids
-    in [0, n), and partitions holding their rows only."""
-    a = _graph("pbmc68k")
-    n = a.shape[0]
-    monkeypatch.setattr(_leiden, "_compact_initial_membership", lambda ids, n: ids)
-    for bad in (-1, n, 2**29):
-        with pytest.raises(ValueError, match=r"initial_membership ids must lie in \[0, n\)"):
-            native(a, 1.0, initial_membership=cp.full(n, bad, dtype=cp.int32))
-
-    class WholeGraph(_SpyLd):  # partition 0 claims every row
-        def leiden_mg(self, indptrs, **kwargs):
-            if kwargs["workspaces"]:
-                indptrs = [cp.asarray(a.indptr, dtype=cp.int64), *indptrs[1:]]
-            return self.module.leiden_mg(indptrs, **kwargs)
-
-    monkeypatch.setattr(_leiden, "_ld", WholeGraph(_leiden._ld))
-    partitions(2)
-    with pytest.raises(ValueError, match=r"indptrs\[p\] must hold the rows"):
-        native(a, 1.0)
-
-
-@needs_native
-@pytest.mark.parametrize("pooled", [False, True])
-def test_partitions_workspace(partitions, monkeypatch, request, pooled):
-    """Workspaces and arena blocks filled with garbage by work still queued on
-    the caller's stream (which the partitions' streams must wait for) give the
-    bits of one partition, also from a pool on a non-blocking stream (a freed
-    block goes straight to the next partition)."""
-    a = _graph("pbmc3k")
-    partitions(None)
-    expected = native(a, [0.5, 1.0, 2.0])
-    partitions(3)
-    if pooled:
-        request.getfixturevalue("cupy_pool")
-    empty = cp.empty
-
-    def dirty(*args, **kwargs):
-        out = empty(*args, **kwargs)
-        for _ in range(100):  # long enough to race unordered streams
-            out.view(cp.uint8)[...] = 0xA5
-        return out
-
-    monkeypatch.setattr(cp, "empty", dirty)
-    with cp.cuda.Stream(non_blocking=True) if pooled else contextlib.nullcontext():
-        assert_same(native(a, [0.5, 1.0, 2.0]), expected)
-
-
-@needs_native
-def test_multi_gpu_argument(adata_neighbors, monkeypatch):
-    n_gpus = cp.cuda.runtime.getDeviceCount()
-    for bad in ("x", [n_gpus], [], 1.5, [0.5], 0):
-        with pytest.raises(ValueError, match=r"multi_gpu|GPU|literal"):
-            rsc.tl.leiden(adata_neighbors, multi_gpu=bad)
-    for kwargs in ({"flavor": "cugraph"}, {"use_dask": True}):
-        for multi_gpu in (True, 0, [0]):
-            with pytest.raises(ValueError, match=r"multi_gpu is supported by flavor='rapids'"):
-                rsc.tl.leiden(adata_neighbors, multi_gpu=multi_gpu, **kwargs)
-    assert "leiden" not in adata_neighbors.obs
-    # a graph that fits runs on the current GPU; a device list is split
-    rsc.tl.leiden(adata_neighbors, key_added="one")
-    for key, multi_gpu in (("all", True), ("list", [0]), ("str", "0")):
-        rsc.tl.leiden(adata_neighbors, multi_gpu=multi_gpu, key_added=key)
-        pd.testing.assert_series_equal(adata_neighbors.obs[key], adata_neighbors.obs["one"], check_names=False)
-    # graphs small enough for replicas are not split
-    monkeypatch.setattr(_leiden, "_N_PARTITIONS", 2)
-    with pytest.warns(UserWarning, match="replicas"):
-        rsc.tl.leiden(adata_neighbors, key_added="replicas")
-    pd.testing.assert_series_equal(adata_neighbors.obs["replicas"], adata_neighbors.obs["one"], check_names=False)
-
-
-@needs_native
-@pytest.mark.two_gpus
-def test_multi_gpu_devices(partitions, peer, monkeypatch):
-    """Partitions on two GPUs (peer copies or through the host; host and device input) give the bits of one;
-    the coarser levels avoid the first GPU when it holds the CuPy adjacency."""
-    a = _graph("pbmc3k")
-    partitions(None)
-    expected = native(a, [0.5, 1.0, 2.0])
-    assert_same(native(a, [0.5, 1.0, 2.0], multi_gpu=[0, 1]), expected)
-    spy = _SpyLd(_leiden._ld)
-    monkeypatch.setattr(_leiden, "_ld", spy)
-    with cp.cuda.Device(0):
-        coo = cpx_sparse.coo_matrix(a)
-    assert_same(native(coo, [0.5, 1.0, 2.0], multi_gpu=[0, 1]), expected)
-    assert spy.roots == [1]
-    partitions(3)
-    assert_same(native(cpx_sparse.csr_matrix(a), [0.5, 1.0, 2.0], multi_gpu=[1, 0]), expected)
-
-
-@needs_native
-@pytest.mark.two_gpus
-def test_multi_gpu_true_splits_out_of_memory(partitions, monkeypatch):
-    """multi_gpu=True splits a graph that runs out of memory on one GPU (also
-    inside the native engine, which raises MemoryError), with the bits of one
-    GPU; a single GPU, or a graph one GPU runs as replicas, raises."""
-    a = _graph("pbmc3k")
-    partitions(None)
-    expected = native(a, [0.5, 1.0])
-
-    class FullGpu(_SpyLd):
-        def leiden(self, *args, **kwargs):
-            if "workspace" in kwargs:  # a run, not a sizing call
-                raise RuntimeError("leiden: graph instantiate failed: out of memory")
-            return self.module.leiden(*args, **kwargs)
-
-    spy = FullGpu(_leiden._ld)
-    monkeypatch.setattr(_leiden, "_ld", spy)
-    assert_same(native(a, [0.5, 1.0], multi_gpu=True), expected)
-    assert spy.runs == ["ok"]
-    for multi_gpu in (None, [0]):
-        with pytest.raises(MemoryError, match="out of memory"):
-            native(a, [0.5, 1.0], multi_gpu=multi_gpu)
-    monkeypatch.setattr(_leiden, "_MAX_REPLICAS", None)  # split runs have no replicas
-    with pytest.raises(MemoryError, match="out of memory"):
-        native(a, [0.5, 1.0], multi_gpu=True)
 
 
 # ---------- quality ----------
