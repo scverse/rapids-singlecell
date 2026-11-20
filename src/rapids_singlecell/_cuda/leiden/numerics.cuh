@@ -369,7 +369,7 @@ struct DeviceInfo {
     bool pageable_access = false;
 };
 
-// Cache the hardware properties of each CUDA device.
+// Cached per device (a partitioned run alternates between devices).
 inline const DeviceInfo& device_info() {
     constexpr int kCachedDevices = 64;
     static thread_local DeviceInfo cache[kCachedDevices];

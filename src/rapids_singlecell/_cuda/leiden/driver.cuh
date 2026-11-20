@@ -9,6 +9,9 @@
 //     CC-piece last resort), AGGREGATE stage 2; projection to level 0 with
 //     V-cycle UP sweeps, the CC split and, with replicas, the best slice
 //   exact Q, size-ordered labels
+// With several partitions (multi_gpu), level 0 is split by rows
+// (partition.cuh); levels >= 1 run on partition 0.
+
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
@@ -81,6 +84,7 @@ struct DriverParams {
     int max_iter_until_stable = 20;
     int max_replicas = kMaxReplicas;
     i64 replica_nnz_budget = 1ll << 19;
+    bool low_memory = false;
     int graph_mode = 2;  // 0: launches, 1: sweep graph replays, 2: WHILE node
     ClassThresholds th{};
     GatherClasses gather{};
@@ -89,7 +93,7 @@ struct DriverParams {
 
 // The level loop's next step after local moving at level lvl (n vertices) gave
 // C communities; n_next: communities after refinement and pieces: CC pieces of
-// the move partition (-1 while unknown).
+// the move partition (-1 while unknown). One rule for every driver.
 enum class LevelStep {
     kVerifyTop,     // C == n after DOWN: certify with all-active TOP sweeps
     kCertified,     // C == n after TOP: the level loop ends at this level
@@ -469,7 +473,7 @@ class LeidenDriver {
     // PLEIDEN_R + AGGREGATE stage 1 of level l (C on the device; SL2 next).
     void launch_refine_begin(const LevelGraph& g, const int* P, int l, u32 it,
                              int* cmap, const AggregateOptions& opt,
-                             AggregatePlan& plan,
+                             AggregatePlan<>& plan,
                              std::vector<KernelCall> pre = {}) {
         RefineParams rp;
         rp.lam = lam_;
@@ -547,11 +551,31 @@ class LeidenDriver {
         i64 idb = id_bound;
         level_loop(G, lvl, idb, uit, moved, stat);
         i64 Ccur = idb;
-        project(G, lvl, vcycle, uit, Ccur, moved);
+        project(G, lvl, 0, vcycle, uit, Ccur, moved);
         stat.moved = moved;
         C_out = Ccur;
     }
 
+   public:
+    // Levels >= 1 of an iteration whose level 0 ran partitioned: the level
+    // loop from level 1 (G = {g0, g1}, g0.cmap = its cmap, P_1 in
+    // level_partition(1), the arena holding both) and the projection down to
+    // level 1.
+    void upper_levels(const LevelGraph& g0, const LevelGraph& g1, i64 idb,
+                      int it, bool vcycle, IterationStat& stat, i64& Ccur,
+                      bool& moved) {
+        std::vector<LevelGraph> G;
+        G.reserve(static_cast<std::size_t>(dp_.max_levels) + 1);
+        G.push_back(g0);
+        G.push_back(g1);
+        const u32 uit = static_cast<u32>(it);
+        int lvl = 1;
+        level_loop(G, lvl, idb, uit, moved, stat);
+        Ccur = idb;
+        project(G, lvl, 1, vcycle, uit, Ccur, moved);
+    }
+
+   private:
     // The levels from G[lvl] up (lvl, idb: the last level and its id bound).
     void level_loop(std::vector<LevelGraph>& G, int& lvl, i64& idb, u32 uit,
                     bool& moved, IterationStat& stat) {
@@ -563,6 +587,7 @@ class LeidenDriver {
         opt.gather = dp_.gather;
         opt.move = dp_.th;
         opt.stage1 = dp_.graph_mode > 0 ? &stage1_graph_ : nullptr;
+        opt.low_memory = dp_.low_memory;
         while (true) {
             LevelGraph& g = G[lvl];
             int* P = level_partition(lvl);
@@ -580,7 +605,7 @@ class LeidenDriver {
                 speculate
                     ? arena.push_bottom<int>(static_cast<std::size_t>(g.n))
                     : nullptr;
-            AggregatePlan plan;
+            AggregatePlan<> plan;
             if (cmap) {  // COMPACT runs in refinement's graph
                 launch_refine_begin(g, P, lvl, uit, cmap, opt, plan,
                                     std::move(compact));
@@ -693,11 +718,11 @@ class LeidenDriver {
         }
     }
 
-    // Projection from level lvl down to level 0, with the V-cycle's UP
+    // Projection from level lvl down to level lp_end, with the V-cycle's UP
     // sweeps (Ccur: the id bound of the current level's partition).
-    void project(std::vector<LevelGraph>& G, int lvl, bool vcycle, u32 uit,
-                 i64& Ccur, bool& moved) {
-        for (int lp = lvl - 1; lp >= 0; --lp) {
+    void project(std::vector<LevelGraph>& G, int lvl, int lp_end, bool vcycle,
+                 u32 uit, i64& Ccur, bool& moved) {
+        for (int lp = lvl - 1; lp >= lp_end; --lp) {
             const LevelGraph& g = G[lp];
             int* P = level_partition(lp);
             run_project(level_partition(lp + 1), g.cmap, g.n, P, s_);
@@ -793,16 +818,26 @@ using host_labels = std::optional<
 
 // Arena blocks from Python: alloc(nbytes, device) -> pointer, free(pointer),
 // called with the GIL; their exceptions (MemoryError, KeyboardInterrupt)
-// propagate unchanged. The caller keeps both callbacks alive for the call.
-inline ArenaGrower python_grower(nb::handle alloc, nb::handle free,
-                                 int device) {
+// propagate unchanged. `sync`: a stream of `device` to finish before a block
+// goes back (the multi-GPU driver's own streams; null: the caller's stream,
+// which the allocator orders). The caller keeps both alive for the call.
+inline ArenaGrower python_grower(nb::handle alloc, nb::handle free, int device,
+                                 cudaStream_t sync = nullptr) {
     ArenaGrower g;
     g.alloc = [alloc, device](std::size_t bytes) -> void* {
         nb::gil_scoped_acquire gil;
         return reinterpret_cast<void*>(
             nb::cast<std::uintptr_t>(alloc(bytes, device)));
     };
-    g.free = [free](void* p) {
+    g.free = [free, device, sync](void* p) {
+        if (sync) {  // on its own device, which compute-sanitizer requires
+            int prev = 0;
+            cuda_check(cudaGetDevice(&prev), "leiden: cudaGetDevice");
+            cuda_check(cudaSetDevice(device), "leiden: cudaSetDevice");
+            const cudaError_t err = cudaStreamSynchronize(sync);
+            cudaSetDevice(prev);
+            cuda_check(err, "leiden: arena release");
+        }
         nb::gil_scoped_acquire gil;
         free(reinterpret_cast<std::uintptr_t>(p));
     };
