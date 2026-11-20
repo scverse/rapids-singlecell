@@ -146,6 +146,37 @@ void def_moments(nb::module_& m) {
         "out"_a.noconvert(), "stream"_a = 0);
 }
 
+template <typename T, typename Device>
+void def_sparse_observed(nb::module_& m) {
+    m.def(
+        "sparse_observed",
+        [](gpu_array_c<const int, Device> colptr,
+           gpu_array_c<const int, Device> rows,
+           gpu_array_c<const T, Device> values,
+           gpu_array_c<const int, Device> rowptr,
+           gpu_array_c<const int, Device> neighbors,
+           gpu_array_c<const double, Device> weights,
+           gpu_array_c<const double, Device> degree, double total, bool geary,
+           gpu_array_c<double, Device> out, std::uintptr_t stream) {
+            nb_require(colptr.size() == out.size() + 1 &&
+                           rows.size() == values.size() &&
+                           rowptr.size() == degree.size() + 1 &&
+                           neighbors.size() == weights.size(),
+                       "sparse_observed: incompatible CSC expression and CSR "
+                       "weight buffers");
+            autocorr_sparse_observed_kernel<<<out.size(), AUTOCORR_SPARSE_BLOCK,
+                                              0, (cudaStream_t)stream>>>(
+                colptr.data(), rows.data(), values.data(), rowptr.data(),
+                neighbors.data(), weights.data(), degree.data(), degree.size(),
+                total, geary, out.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_sparse_observed_kernel);
+        },
+        "colptr"_a.noconvert(), "rows"_a.noconvert(), "values"_a.noconvert(),
+        "rowptr"_a.noconvert(), "neighbors"_a.noconvert(),
+        "weights"_a.noconvert(), "degree"_a.noconvert(), nb::kw_only(),
+        "total"_a, "geary"_a, "out"_a.noconvert(), "stream"_a = 0);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
     def_moments<float, int, Device>(m);
@@ -154,6 +185,8 @@ void register_bindings(nb::module_& m) {
     def_moments<double, long long, Device>(m);
     def_sums<float, Device>(m);
     def_sums<double, Device>(m);
+    def_sparse_observed<float, Device>(m);
+    def_sparse_observed<double, Device>(m);
     def_graph_ops<float, int, Device>(m);
     def_graph_ops<double, int, Device>(m);
     def_graph_ops<float, long long, Device>(m);

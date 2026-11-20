@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 // Permuting the rows of W permutes its spatial lag z = W x and row sums r.
 // With x translated by a per-gene offset, the change from the observed score
@@ -164,6 +165,70 @@ __global__ void autocorr_observed_kernel(
     if (threadIdx.x < 4 * 32 && lane < n_genes)
         atomicAdd(&stats[(threadIdx.x / 32) * n_genes + lane],
                   block_sums[threadIdx.x]);
+}
+
+// Both observed statistics depend only on W + W^T. Visit the edges incident
+// to this gene's stored cells: a stored-stored edge is visited from both ends,
+// a stored-zero edge once. Zero-zero edges contribute no squared difference.
+constexpr int AUTOCORR_SPARSE_BLOCK = 128;
+
+template <typename T>
+__global__ void autocorr_sparse_observed_kernel(
+    const int* colptr, const int* rows, const T* values, const int* rowptr,
+    const int* neighbors, const double* weights, const double* degree, int n,
+    double total, bool geary, double* out) {
+    using Reduce = cub::BlockReduce<double, AUTOCORR_SPARSE_BLOCK>;
+    __shared__ typename Reduce::TempStorage scratch;
+    __shared__ double mean;
+    auto sum = [&](double value) {
+        __syncthreads();
+        return Reduce(scratch).Sum(value);
+    };
+    const int g = blockIdx.x, begin = colptr[g], end = colptr[g + 1];
+    const int missing = n - (end - begin);
+    const double offset = missing ? 0.0 : values[begin];
+    double sx = 0.0;
+    for (long long k = (long long)begin + threadIdx.x; k < end; k += blockDim.x)
+        sx += values[k] - offset;
+    sx = sum(sx);
+    if (threadIdx.x == 0) mean = sx / n;
+    __syncthreads();
+
+    double ss = 0.0, weighted_ss = 0.0, stored_degree = 0.0, diff2 = 0.0;
+    for (long long k = (long long)begin + threadIdx.x; k < end;
+         k += blockDim.x) {
+        const int i = rows[k];
+        const double v = values[k], centered = (v - offset) - mean;
+        ss += centered * centered;
+        if (!geary) {
+            weighted_ss += degree[i] * centered * centered;
+            stored_degree += degree[i];
+        }
+        for (int edge = rowptr[i]; edge < rowptr[i + 1]; ++edge) {
+            const int j = neighbors[edge];
+            int lo = begin, hi = end;
+            while (lo < hi) {
+                const int mid = lo + (hi - lo) / 2;
+                if (rows[mid] < j)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            const bool stored = lo < end && rows[lo] == j;
+            const double d = stored ? v - values[lo] : v;
+            diff2 += weights[edge] * (stored ? 0.5 : 1.0) * (d * d);
+        }
+    }
+    ss = sum(ss) + missing * mean * mean;
+    diff2 = sum(diff2);
+    if (!geary) {
+        weighted_ss = sum(weighted_ss);
+        stored_degree = sum(stored_degree);
+        if (missing) weighted_ss += (2 * total - stored_degree) * mean * mean;
+    }
+    if (threadIdx.x == 0)
+        out[g] = geary ? (n - 1) * diff2 / (2 * total * ss)
+                       : (weighted_ss - diff2) / (2 * ss);
 }
 
 // sum w, sum w^2 and sum_ij w_ij w_ji of a canonical CSR matrix (sorted,

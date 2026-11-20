@@ -285,7 +285,7 @@ def spatial_autocorr(
         use_raw
             If True, use the raw data in the AnnData object, by default False.
         use_sparse
-            Retained for compatibility. Sparse input is processed in blocks of up to 32 genes.
+            Retained for compatibility. Sparse input is processed in gene blocks.
         dtype
             Data type for computation. If None, uses input data dtype.
             For best numerical stability, especially with genes having low variance, use `np.float64`.
@@ -345,7 +345,6 @@ def spatial_autocorr(
     row, col, moments = _g_moments(adj)
     uniform = bool(n_perms) and bool(cp.all(row == row[0]))
     graph = (adj.indptr, adj.indices.astype(cp.int32, copy=False), adj.data)
-    del adj
 
     # Six Feistel round keys per permutation; a permutation moves the rows of the weights.
     keys = None
@@ -357,16 +356,79 @@ def spatial_autocorr(
     itemsize = compute_dtype.itemsize
     free = cp.cuda.Device().mem_info[0]
     width = int(max(1, min(32, _BLOCK_FRACTION * free // (2 * n * itemsize))))
-    vals = _gene_source(source, cols, width, compute_dtype)
     blocks = range((n_genes + width - 1) // width)
     devices = parse_device_ids(multi_gpu=multi_gpu)[: len(blocks)]
+    owner = cp.cuda.Device().id
+    if isinstance(source, cp.ndarray):
+        owner = source.device.id
+    elif sparse_gpu.issparse(source):
+        owner = source.data.device.id
+    # For wide, resident sparse panels the analytic score can walk only expressed cells.
+    # CSC conversion and symmetrizing the weights need scratch proportional to their nonzeros.
+    wide_sparse = (
+        keys is None
+        and n_genes >= 256
+        and 4 * n_genes >= source.shape[1]
+        and (sparse.issparse(source) or sparse_gpu.issparse(source))
+        and source.format in ("csr", "csc")
+        and source.nnz <= 0.2 * n * source.shape[1]
+        and max(source.nnz, source.shape[1], 2 * adj.nnz) < 2**31
+        and 64 * (max(source.shape) + source.nnz + adj.nnz)
+        < min(cp.cuda.Device(d).mem_info[0] for d in {*devices, owner, cp.cuda.Device().id}) // 2
+    )
+    if wide_sparse:
+        weights = adj.astype(cp.float64, copy=False)
+        symmetric = (weights + weights.T).tocsr()
+        graph = (
+            symmetric.indptr.astype(cp.int32, copy=False),
+            symmetric.indices.astype(cp.int32, copy=False),
+            symmetric.data,
+        )
+        row = row + col
+        with cp.cuda.Device(owner):
+            # Compressed rows of the transpose are contiguous genes, ready to shard.
+            vals = source.astype(compute_dtype, copy=False).tocsc().T
+            if n_genes != source.shape[1]:
+                vals = vals[cols]
+            if not vals.has_canonical_format:
+                vals = vals.copy()
+                vals.sum_duplicates()
+        del weights, symmetric
+    else:
+        with cp.cuda.Device(owner):
+            vals = _gene_source(source, cols, width, compute_dtype)
+    del adj
 
     results = np.empty((1 if keys is None else 4, n_genes), dtype=np.float64)
 
     def run(device_id: int, mine: range):
         with cp.cuda.Device(device_id):
             w = tuple(_copy_to_device(a, device_id) for a in graph)
-            r, c = _copy_to_device(row, device_id), _copy_to_device(col, device_id)
+            r = _copy_to_device(row, device_id)
+            if wide_sparse:
+                slots = slice(mine.start * width, min(mine.stop * width, n_genes))
+                with cp.cuda.Device(owner if sparse_gpu.issparse(vals) else device_id):
+                    local = vals if slots.stop - slots.start == n_genes else vals[slots]
+                    local = _to_gpu_csr(local, compute_dtype)
+                    arrays = (
+                        local.indptr.astype(cp.int32, copy=False),
+                        local.indices.astype(cp.int32, copy=False),
+                        local.data,
+                    )
+                out = cp.empty(slots.stop - slots.start, dtype=cp.float64)
+                arrays = tuple(_copy_to_device(a, device_id) for a in arrays)
+                _ac.sparse_observed(
+                    *arrays,
+                    *w,
+                    r,
+                    total=moments[0],
+                    geary=mode == "geary",
+                    out=out,
+                    stream=cp.cuda.get_current_stream().ptr,
+                )
+                results[0, slots] = out.get()
+                return
+            c = _copy_to_device(col, device_id)
             k = None if keys is None else cp.asarray(keys)
             for block_id in mine:
                 slots = slice(block_id * width, (block_id + 1) * width)
@@ -398,8 +460,16 @@ def spatial_autocorr(
         # Worker threads have their own current streams. Finish preparing the
         # shared graph and expression before either device starts reading them.
         cp.cuda.get_current_stream().synchronize()
+        if owner != cp.cuda.Device().id:
+            with cp.cuda.Device(owner):
+                cp.cuda.get_current_stream().synchronize()
         with ThreadPoolExecutor(len(devices)) as pool:
-            futures = [pool.submit(run, device, blocks[i :: len(devices)]) for i, device in enumerate(devices)]
+            futures = [
+                pool.submit(
+                    run, device, blocks[i * len(blocks) // len(devices) : (i + 1) * len(blocks) // len(devices)]
+                )
+                for i, device in enumerate(devices)
+            ]
             for future in futures:
                 future.result()
     elif devices:

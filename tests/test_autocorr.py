@@ -368,6 +368,28 @@ def test_autocorr_large_offset(mode, stat, dtype):
 
 
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
+def test_autocorr_wide_sparse(mode, stat):
+    # A sparse matrix can have dense, nearly constant columns. Within each
+    # connected component gene 1 differs only in its least significant bits.
+    n, n_genes = 256, 1025
+    rng = np.random.default_rng(52)
+    x = rng.normal(size=(n, n_genes)) * (rng.random((n, n_genes)) < 0.04)
+    x[:, 0] = 2**50 + rng.integers(-4, 5, n)
+    x[: n // 2, 1] = x[: n // 2, 0]
+    x[n // 2 :, 1] = 0
+    cells = np.arange(n)
+    neighbor = (cells + 1) % (n // 2) + cells // (n // 2) * (n // 2)
+    w = sparse.csr_matrix((rng.uniform(0.1, 2, n), (cells, neighbor)), shape=(n, n))
+    adata = AnnData(sparse.csr_matrix(x))
+    adata.obsp["spatial_connectivities"] = w
+    df = spatial_autocorr(adata, mode=mode, transformation=False, multi_gpu=False, copy=True)
+    x[:, 0] -= x[0, 0]
+    expected = _reference(x, w, mode)
+    np.testing.assert_allclose(df.loc[adata.var_names, stat], expected, atol=1e-12, rtol=1e-10)
+    np.testing.assert_allclose(df.loc[adata.var_names[1], stat], expected[1], atol=0, rtol=1e-10)
+
+
+@pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
 def test_autocorr_analytic_variance(mode, stat):
     """Analytic variance follows Cliff & Ord 1981 for each statistic (esda Moran/Geary)."""
     adata = read_h5ad(Path(__file__).parent / Path("_data/dummy.h5ad"))
