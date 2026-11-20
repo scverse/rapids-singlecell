@@ -26,6 +26,8 @@ DATA = Path(__file__).parent / "_data" / "dummy.h5ad"
 SPATIAL_CONNECTIVITIES_KEY = "spatial_connectivities"
 GROUPS = "cluster"
 
+pytestmark = pytest.mark.filterwarnings("ignore:The function calculate_niche is deprecated:FutureWarning")
+
 
 @pytest.fixture
 def adata():
@@ -265,8 +267,8 @@ def test_determinism_same_seed(adata):
 
 def test_determinism_utag_same_seed(adata):
     a1, a2 = adata.copy(), adata.copy()
-    calculate_niche(a1, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7)
-    calculate_niche(a2, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7)
+    calculate_niche(a1, flavor="utag", n_neighbors=10, resolutions=0.5)
+    calculate_niche(a2, flavor="utag", n_neighbors=10, resolutions=0.5)
     np.testing.assert_array_equal(
         a1.obs["utag_niche_res=0.5"].astype(str).values,
         a2.obs["utag_niche_res=0.5"].astype(str).values,
@@ -282,7 +284,7 @@ def test_utag_unexpressed_gene(adata, to_sparse):
     a1.X = X[:, 1:]
     a2.X = sparse.csr_matrix(X) if to_sparse else X
     for a in (a1, a2):
-        calculate_niche(a, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7)
+        calculate_niche(a, flavor="utag", n_neighbors=10, resolutions=0.5)
     np.testing.assert_array_equal(
         a1.obs["utag_niche_res=0.5"].astype(str).values,
         a2.obs["utag_niche_res=0.5"].astype(str).values,

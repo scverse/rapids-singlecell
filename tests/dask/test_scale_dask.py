@@ -40,8 +40,8 @@ def test_scale(client, data_kind, zero_center):
     else:
         raise ValueError(f"Unknown data_kind {data_kind}")
 
-    rsc.pp.scale(adata, zero_center=zero_center, mask_obs=mask, max_value=10)
-    rsc.pp.scale(dask_data, zero_center=zero_center, mask_obs=mask, max_value=10)
+    rsc.pp.scale(adata, zero_center=zero_center, mask=mask, max_value=10)
+    rsc.pp.scale(dask_data, zero_center=zero_center, mask=mask, max_value=10)
     if data_kind == "sparse" and not zero_center:
         adata_X = adata.X.toarray()
         dask_X = dask_data.X.compute().toarray()

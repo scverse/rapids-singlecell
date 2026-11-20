@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import cupy as cp
@@ -11,6 +12,9 @@ from anndata import AnnData, read_h5ad
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wnn_cuda
 from rapids_singlecell.preprocessing._neighbors import _wnn
+from testing.rapids_singlecell._helper import sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 
 def _ref_jaccard(nn, prune=0.0):  # Seurat's ComputeSNN
@@ -142,8 +146,10 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
     adata = _multimodal_adata()
     adata.X = None  # the layout must use an existing reduction
     use_rep = {"RNA": "X_pca", "ADT": "X_apca"}
-    out = rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, key_added="wnn", copy=True)
+    out = adata.copy()
+    rsc.pp.wnn(out, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, out=A.obsp["wnn"])
     assert "wnn" not in adata.uns
+    assert out.uns["wnn"].keys() >= {"connectivities_key", "distances_key", "snn_key"}
     params = out.uns["wnn"]["params"]
     assert (params["use_rep"], params["n_pcs"]) == ("X_pca", 10)
     assert params["modalities"] == {"RNA": {"use_rep": "X_pca", "n_pcs": 10}, "ADT": {"use_rep": "X_apca", "n_pcs": 8}}
@@ -151,18 +157,23 @@ def test_wnn_outputs_h5ad_and_downstream(tmp_path):
     np.testing.assert_allclose(w.sum(axis=1), 1, rtol=1e-6)
     # the RNA-like modality separates more groups, so it should dominate
     assert w[:, 0].mean() > w[:, 1].mean()
-    C = out.obsp["wnn_connectivities"]
+    C = out.obsp["wnn"]
     assert abs(C - C.T).max() < 1e-6
     assert C.diagonal().max() == 0
     out.write_h5ad(tmp_path / "wnn.h5ad")
     loaded = read_h5ad(tmp_path / "wnn.h5ad")
     assert loaded.uns["wnn"]["params"]["modalities"] == params["modalities"]
-    for key in ("wnn_distances", "wnn_connectivities", "wnn_snn"):
+    for key in ("wnn_distances", "wnn", "wnn_snn"):
         assert (loaded.obsp[key] != out.obsp[key]).nnz == 0
-    rsc.tl.leiden(out, neighbors_key="wnn")
-    rsc.tl.leiden(out, obsp="wnn_snn", key_added="leiden_snn")
-    rsc.tl.umap(out, neighbors_key="wnn")
-    sc.tl.umap(loaded, neighbors_key="wnn", maxiter=10, random_state=0)
+    rsc.tl.leiden(out, use=A.obsp["wnn"])
+    rsc.tl.leiden(out, use=A.obsp["wnn_snn"], out=A.obs["leiden_snn"])
+    rsc.tl.umap(out, use=A.obsp["wnn"])
+    res = rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, out=True)
+    assert (res.connectivities != C).nnz == 0
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.pp.wnn(adata, use_rep, n_pcs=[10, None], n_neighbors=15, knn_range=50, key_added="k")
+    assert {"k_connectivities", "k_distances", "k_snn"} <= adata.obsp.keys()
+    sc.tl.umap(loaded, **sc_use(A.obsp["wnn"], neighbors_key="wnn"), maxiter=10, random_state=0)
     assert np.isfinite(loaded.obsm["X_umap"]).all()
     # ingest would silently map through the first modality only
     with pytest.raises(NotImplementedError, match="multimodal"):
@@ -175,8 +186,9 @@ def test_wnn_connectivity_methods(method):
     keys = ["X_pca", "X_apca"]
     # NumPy scalars broadcast; only the UMAP connectivities use the seed
     kw = {"n_pcs": np.int64(5), "cross_constant": np.float32(1e-4), "random_state": 5}
-    with pytest.warns(UserWarning, match="ignored"):
+    with pytest.warns(UserWarning, match="ignored") as record:
         rsc.pp.wnn(adata, keys, knn_range=50, method=method, weight_key=None, **kw)
+    assert record[0].filename == __file__  # the caller, not wnn's decorators
     params = adata.uns["neighbors"]["params"]
     assert (params["method"], params["modalities"]["X_apca"]["n_pcs"]) == (method, 5)
     assert "random_state" not in params
@@ -239,11 +251,19 @@ def test_wnn_rejects_invalid_neighbors(monkeypatch, bad_id, bad_dist):
         return idx, dist
 
     adata = _multimodal_adata(n=40)
-    monkeypatch.setitem(_wnn.KNN_ALGORITHMS, "brute", incomplete_knn)
+    monkeypatch.setitem(_wnn.KNN_ALGORITHMS, "ivfflat", incomplete_knn)
     monkeypatch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
     with pytest.raises(ValueError, match="incomplete"):
-        rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24)
+        rsc.pp.wnn(adata, ["X_pca", "X_apca"], n_neighbors=4, knn_range=24, algorithm="ivfflat")
     assert not adata.obsp and "neighbors" not in adata.uns
+
+
+def test_wnn_missing_extension(monkeypatch):
+    # a missing extension fails before any work
+    monkeypatch.setitem(sys.modules, "rapids_singlecell._cuda._wnn_cuda", None)
+    monkeypatch.setattr(_wnn, "_get_reps", lambda *args, **kwargs: pytest.fail("wnn started without its extension"))
+    with pytest.raises(ModuleNotFoundError):
+        rsc.pp.wnn(_multimodal_adata(n=40), ["X_pca", "X_apca"])
 
 
 def test_wnn_approximate_searches(monkeypatch):
@@ -251,11 +271,12 @@ def test_wnn_approximate_searches(monkeypatch):
     kwargs = {"use_rep": ["X_pca", "X_apca"], "knn_range": 100}
     with monkeypatch.context() as patch:
         patch.setattr(_wnn_cuda, "impute_dist", _no_kernel)
-        with pytest.raises(ValueError, match="n_probes"):
+        with pytest.raises(ValueError, match="n_probes") as err:
             rsc.pp.wnn(adata, **kwargs, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+        assert "knn_range" in err.value.__notes__[0]
     # searching all IVF lists repairs the candidates in the same CUDA context;
-    # nn_descent needs a graph degree beyond its default
-    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {})):
+    # nn_descent and cagra need a graph degree and search width beyond cuVS's defaults
+    for algorithm, kwds in (("ivfflat", {"n_lists": 64, "n_probes": 64}), ("nn_descent", {}), ("cagra", {})):
         rsc.pp.wnn(adata, **kwargs, algorithm=algorithm, algorithm_kwds=kwds)
         D = adata.obsp["distances"]
         assert np.all(np.diff(D.indptr) == 20)
@@ -274,7 +295,6 @@ def test_wnn_approximate_searches(monkeypatch):
         ({"algorithm": "kd_tree"}, "Invalid algorithm"),
         ({"use_rep": ["X_pca", "X_pca"]}, "unique strings"),
         ({"weight_key": "weight"}, "distinct column"),
-        ({"algorithm": "cagra", "knn_range": 100}, "up to 64"),
     ],
 )
 def test_wnn_errors(kwargs, match):

@@ -171,9 +171,35 @@ def test_resolution_column_names(adata_neighbors, monkeypatch):
     res = np.float32(0.1)
     with pytest.raises(ValueError, match="repeat"):
         rsc.tl.leiden(adata_neighbors, resolution=[res, float(res)])
+    with pytest.raises(ValueError, match="distinct numeric resolutions"):
+        rsc.tl.leiden(adata_neighbors, resolution=[1, 1.0], out=True)
     assert not calls
     rsc.tl.leiden(adata_neighbors, resolution=[res, 0.1])
     assert {f"leiden_{res}", "leiden_0.1"} <= set(adata_neighbors.obs)
+
+
+def test_return_labels(adata_neighbors, monkeypatch):
+    _record_flavor_calls(monkeypatch)
+    single = rsc.tl.leiden(adata_neighbors, resolution=[0.5], out=True)
+    several = rsc.tl.leiden(adata_neighbors, resolution=[0.5, 1.0], out=True)
+    assert isinstance(single, pd.Categorical)
+    assert list(several) == [0.5, 1.0]
+    for labels in several.values():
+        pd.testing.assert_extension_array_equal(labels, single)
+    assert {"leiden", "leiden_0.5", "leiden_1.0"}.isdisjoint(adata_neighbors.obs)
+    assert "leiden" not in adata_neighbors.uns
+
+
+def test_restricted_output_key_is_literal(adata_neighbors, monkeypatch):
+    pytest.importorskip("anndata.acc")
+    _record_flavor_calls(monkeypatch)
+    even = np.arange(adata_neighbors.n_obs) % 2 == 0
+    adata_neighbors.obs["parent"] = pd.Categorical(np.where(even, "a", "b"))
+    rsc.tl.leiden(adata_neighbors, restrict_to=("parent", ["a"]), out="obs.leiden")
+    np.testing.assert_array_equal(adata_neighbors.obs["leiden"], np.where(even, "a,0", "b"))
+    assert "leiden" in adata_neighbors.uns
+    assert "leiden_R" not in adata_neighbors.obs
+    assert "leiden_R" not in adata_neighbors.uns
 
 
 @needs_native
@@ -698,12 +724,12 @@ def test_dense_input():
 
 
 @needs_native
-def test_asymmetric_input_warns(unpatched_warn):
+def test_asymmetric_input_warns(adata_neighbors, unpatched_warn):
     a = _graph("pbmc68k")
     directed = sparse.triu(a, k=1, format="csr")
-    adata = AnnData(obs=pd.DataFrame(index=[str(i) for i in range(a.shape[0])]))
+    adata_neighbors.obsp["connectivities"] = directed
     with pytest.warns(UserWarning, match=r"not symmetric; clustering A \+ A.T") as rec:
-        rsc.tl.leiden(adata, adjacency=directed)
+        rsc.tl.leiden(adata_neighbors)
     assert rec[0].filename == __file__
     with pytest.warns(UserWarning, match="not symmetric"):
         parts = native(directed)

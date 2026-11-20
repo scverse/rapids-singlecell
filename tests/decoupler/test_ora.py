@@ -19,6 +19,11 @@ from rapids_singlecell.decoupler_gpu._method_ora import (
     _ora_tables,
 )
 
+# decoupler's CPU reference compiles numba code that uses reflected sets
+pytestmark = pytest.mark.filterwarnings(
+    r"ignore:\s*Encountered the use of a type that is scheduled for deprecation:numba.NumbaPendingDeprecationWarning"
+)
+
 
 @pytest.fixture(scope="module")
 def cpu_ora():

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
 import numpy as np
+import pandas as pd
+from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._keys import _harmony_obsm_key, _resolve_obsm_key
 from rapids_singlecell._utils._random import (
@@ -12,20 +14,27 @@ from rapids_singlecell._utils._random import (
     SeedLike,
     _accepts_legacy_random_state,
 )
+from rapids_singlecell.get._out import DEPR_KEY_ADDED, DEPR_USE, _dest, _out_key, _resolve_obs
+from rapids_singlecell.get._utils import AdRef, MultiAcc, _get_vec, _resolve_ref, _to_numpy_1d
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from anndata import AnnData
 
     from ._harmony import COLSUM_ALGO
 
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("key", Deprecation("0.19.0", "Use `batch` instead."))
+@deprecated_arg("basis", DEPR_USE)
+@deprecated_arg("adjusted_basis", DEPR_KEY_ADDED)
 def harmony_integrate(
     adata: AnnData,
-    key: str | list[str],
+    batch: AdRef | str | Sequence[AdRef | str] | None = None,
     *,
-    basis: str = "X_pca",
-    adjusted_basis: str | None = None,
+    use: MultiAcc | str | None = None,
+    out: MultiAcc | str | bool = False,
     dtype: type | str = np.float32,
     flavor: Literal["harmony2", "harmony1"] = "harmony2",
     n_clusters: int | None = None,
@@ -45,7 +54,11 @@ def harmony_integrate(
     rng: SeedLike | RNGLike | None = None,
     multi_gpu: bool | list[int] | str | None = False,
     verbose: bool = False,
-) -> None:
+    # deprecated
+    key: str | list[str] | None = None,
+    basis: str | None = None,
+    adjusted_basis: str | None = None,
+) -> np.ndarray | None:
     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
 
     This GPU-accelerated implementation was originally based on the
@@ -61,28 +74,28 @@ def harmony_integrate(
     and automatic batch pruning.
     To revert to the original Harmony behavior::
 
-        rsc.pp.harmony_integrate(adata, key, flavor="harmony1")
+        rsc.pp.harmony_integrate(adata, batch, flavor="harmony1")
 
     Parameters
     ----------
     adata
         The annotated data matrix.
-    key
-        The key(s) of the column(s) in ``adata.obs`` that differentiate(s) among experiments/batches.
-        Multiple keys are modeled as separate batch variables, with one active
+    batch
+        The annotation(s) that differentiate(s) among experiments/batches,
+        e.g. `A.obs['batch']` or `[A.obs['batch'], A.obs['donor']]`.
+        Strings name `.obs` columns, or are resolved by :meth:`anndata.acc.AdAcc.resolve`
+        (e.g. `'obs.batch'`) if :attr:`rapids_singlecell.settings.preset` is `ScanpyV2Preview`.
+        Multiple batch variables are modeled separately, with one active
         categorical level per variable and cell.
         To retain the joint-combination behavior of earlier releases, combine
-        the desired columns into one categorical column and pass that single key.
-    basis
-        The name of the field in ``adata.obsm`` where the PCA table is stored.
-        Either spelling of the PCA key resolves to whichever one the data
-        actually uses, so the default works under any
-        ``rapids_singlecell.settings.preset``.
-    adjusted_basis
-        The name of the field in ``adata.obsm`` where the adjusted PCA table will be
-        stored. Defaults to ``basis`` suffixed with ``"_harmony"``, so it follows
-        the naming of the basis it corrected (``"X_pca"`` gives
-        ``"X_pca_harmony"``, ``"pca"`` gives ``"pca_harmony"``).
+        the desired columns into one categorical column and pass that.
+    use
+        Which embedding to adjust, e.g. `A.obsm['X_pca']` (or `'obsm.X_pca'`).
+        By default, the one :func:`~rapids_singlecell.pp.pca` wrote under either preset's name.
+    out
+        Where to write the adjusted embedding, e.g. `A.obsm['pca_harmony']`.
+        If `True`, it is returned instead.
+        If `False`, it is written to `.obsm[k + '_harmony']` for `use=A.obsm[k]`.
     dtype
         The data type used for initialization and Harmony computation.
         Defaults to ``numpy.float32``. Use ``numpy.float64`` when additional
@@ -205,8 +218,8 @@ def harmony_integrate(
 
     Returns
     -------
-    Updates adata with the field ``adata.obsm[adjusted_basis]``,
-    containing principal components adjusted by Harmony
+    The adjusted embedding if `out=True`, else `None`.
+    It contains the principal components adjusted by Harmony,
     such that different experiments are integrated.
     """
     rng = np.random.default_rng(rng)
@@ -223,7 +236,7 @@ def harmony_integrate(
 
     from rapids_singlecell._utils._multi_gpu import resolve_stream_devices
 
-    from ._harmony import harmonize
+    from ._harmony import _SKIP, harmonize
 
     # Resolve flavor into internal flags
     if flavor not in {"harmony1", "harmony2"}:
@@ -236,25 +249,35 @@ def harmony_integrate(
         warnings.warn(
             "ridge_lambda is ignored when flavor='harmony2'; use alpha to control regularization strength.",
             UserWarning,
-            stacklevel=3,
+            skip_file_prefixes=_SKIP,
         )
     if flavor == "harmony1":
         if alpha != 0.2:
             warnings.warn(
                 "alpha is ignored when flavor='harmony1'; use ridge_lambda instead.",
                 UserWarning,
-                stacklevel=3,
+                skip_file_prefixes=_SKIP,
             )
         if batch_prune_threshold != 1e-5:
             warnings.warn(
                 "batch_prune_threshold is ignored when flavor='harmony1'.",
                 UserWarning,
-                stacklevel=3,
+                skip_file_prefixes=_SKIP,
             )
 
-    basis = _resolve_obsm_key(adata, basis)
-    if adjusted_basis is None:
-        adjusted_basis = _harmony_obsm_key(basis)
+    if key is not None:
+        if batch is not None:
+            raise TypeError("Pass either `batch` or `key`, not both.")
+        batch = key
+    if batch is None:
+        raise TypeError("harmony_integrate() missing required argument: 'batch'")
+    if use is not None:
+        if basis is not None:
+            raise TypeError("Pass either `use` or `basis`, not both.")
+        basis = _dest(_resolve_obs(use, kinds=(MultiAcc,)))["obsm"]
+    else:
+        basis = _resolve_obsm_key(adata, basis or "X_pca")
+    dest = _out_key(out, adjusted_basis, kind="obsm", default=_harmony_obsm_key(basis))
 
     # Ensure the basis exists in adata.obsm
     if basis not in adata.obsm:
@@ -296,13 +319,21 @@ def harmony_integrate(
     except Exception as e:
         raise RuntimeError(f"Error preparing data for Harmony: {str(e)}") from e
 
+    refs = _resolve_ref([batch] if isinstance(batch, AdRef | str) else batch)
+    batch_df = pd.DataFrame(
+        {
+            str(r): v.array if isinstance(v, pd.Series) else _to_numpy_1d(v)
+            for r, v in zip(refs, _get_vec(adata, refs, dim="obs"), strict=True)
+        },
+        index=adata.obs_names,
+    )
     devices = resolve_stream_devices(multi_gpu=multi_gpu)
     host_out = np.empty(X.shape, dtype=dtype)
     with cp.cuda.Device(devices[0]):
         harmonize(
             X,
-            adata.obs,
-            key,
+            batch_df,
+            list(batch_df.columns),
             n_clusters=n_clusters,
             max_iter_harmony=max_iter_harmony,
             max_iter_clustering=max_iter_clustering,
@@ -326,4 +357,7 @@ def harmony_integrate(
             devices=devices,
             out=host_out,
         )
-    adata.obsm[adjusted_basis] = host_out
+    if dest is True:
+        return host_out
+    adata.obsm[dest] = host_out
+    return None

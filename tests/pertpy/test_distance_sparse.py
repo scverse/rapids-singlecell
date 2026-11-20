@@ -35,7 +35,7 @@ def _make_matrix(n_features: int, dtype, *, seed: int = 0) -> np.ndarray:
 def _obs() -> pd.DataFrame:
     labels = [f"g{i}" for i in range(N_GROUPS) for _ in range(CELLS_PER_GROUP)]
     cats = [f"g{i}" for i in range(N_GROUPS)]
-    return pd.DataFrame({"group": pd.Categorical(labels, categories=cats)})
+    return pd.DataFrame({"group": pd.Categorical(labels, categories=cats)}).rename(str)
 
 
 def _dense_adata(X: np.ndarray) -> AnnData:

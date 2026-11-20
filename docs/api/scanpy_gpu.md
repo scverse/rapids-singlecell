@@ -70,6 +70,31 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
    pp.wnn
 ```
 
+### Output types
+
+Functions with several outputs return a `…Result` if passed `out=True`,
+and take a `…Out` mapping as `out` to write each output to a place of choice.
+
+```{eval-rst}
+.. autosummary::
+   :nosignatures:
+   :toctree: generated/
+
+   pp.NeighborsResult
+   pp.NeighborsOut
+   pp.NormalizeTotalResult
+   pp.NormalizeTotalOut
+   pp.PcaResult
+   pp.PcaOut
+   pp.QcMetricsResult
+   pp.QcMetricsOut
+   pp.ScaleResult
+   pp.ScaleOut
+   pp.ScrubletResult
+   pp.ScrubletOut
+   pp.WnnResult
+```
+
 ## Tools: `tl`
 
 `tools` offers tools for the accelerated processing of {class}`~anndata.AnnData`. For visualization use {mod}`scanpy.pl`.
@@ -88,11 +113,11 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 .. autosummary::
    :toctree: generated/
 
-    tl.umap
-    tl.tsne
-    tl.diffmap
-    tl.draw_graph
-    tl.embedding_density
+   tl.umap
+   tl.tsne
+   tl.diffmap
+   tl.draw_graph
+   tl.embedding_density
 ```
 
 ### Data integration
@@ -101,7 +126,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 .. autosummary::
    :toctree: generated/
 
-    tl.ingest
+   tl.ingest
 ```
 
 ### Clustering
@@ -110,7 +135,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 .. autosummary::
    :toctree: generated/
 
-    tl.leiden
+   tl.leiden
 ```
 
 ### Gene scores, Cell cycle
@@ -119,8 +144,8 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 .. autosummary::
    :toctree: generated/
 
-    tl.score_genes
-    tl.score_genes_cell_cycle
+   tl.score_genes
+   tl.score_genes_cell_cycle
 ```
 
 ### Marker genes
@@ -129,9 +154,20 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
 .. autosummary::
    :toctree: generated/
 
-    tl.rank_genes_groups
+   tl.rank_genes_groups
+```
+
+### Output types
+
+```{eval-rst}
+.. autosummary::
+   :nosignatures:
+   :toctree: generated/
+
+   tl.CellCycleResult
+   tl.CellCycleOut
 ```
 
 ## Plotting
 
-For plotting please use scanpy's plotting API {mod}`scanpy.pl`.
+For plotting please use scanpy’s plotting API {mod}`scanpy.pl`.

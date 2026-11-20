@@ -7,11 +7,14 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
 import numpy as np
+import scverse_misc
 
+import rapids_singlecell
 from rapids_singlecell._cuda import _harmony_clustering_cuda as _clustering_cuda
 from rapids_singlecell._cuda import (
     _harmony_correction_batched_cuda as _correction_batched_cuda,
@@ -58,6 +61,9 @@ _SEGMENT = 2048  # cells per segment of the exact sums (see _segments)
 # harmony-pytorch. Keys are (max_iter_clustering, tol_clustering, tol_harmony).
 _STOPPING_HARMONY2 = (4, 1e-3, 1e-2)
 _STOPPING_HARMONY1 = (200, 1e-5, 1e-4)
+
+# warnings point at the first frame outside rsc and its deprecation wrappers
+_SKIP = tuple(str(Path(m.__file__).parent) for m in (rapids_singlecell, scverse_misc))
 
 
 def _touch_pages(out: np.ndarray) -> None:
@@ -312,7 +318,7 @@ def harmonize(
             warnings.warn(
                 f"dtype='bfloat16' needs one batch key and the batched correction; using {dtype} assignments instead.",
                 UserWarning,
-                stacklevel=4,
+                skip_file_prefixes=_SKIP,
             )
             bfloat16 = False
         # Each block's counts are kept (on every GPU) unless they would outgrow
@@ -326,7 +332,7 @@ def harmonize(
                 "The fast correction runs on one GPU (it is also chosen when one "
                 "cluster's batched correction workspace would exceed 1 GiB).",
                 UserWarning,
-                stacklevel=4,
+                skip_file_prefixes=_SKIP,
             )
             devices = devices[:1]
         # Shards: contiguous runs of the sorted cells, one per GPU, cut at
@@ -337,7 +343,7 @@ def harmonize(
             warnings.warn(
                 f"Using {n_cells // unit} of {len(devices)} GPUs: {n_cells} cells split into at most that many shards.",
                 UserWarning,
-                stacklevel=4,
+                skip_file_prefixes=_SKIP,
             )
             devices = devices[: max(1, n_cells // unit)]
         if len(devices) > 1 and out is None:
@@ -535,7 +541,7 @@ def harmonize(
         if not is_converged:
             warnings.warn(
                 "Harmony did not converge. Consider increasing the number of iterations",
-                stacklevel=4,
+                skip_file_prefixes=_SKIP,
             )
         if out is None:  # one GPU: the result in input order, on its GPU
             with cp.cuda.Device(devices[0]):
@@ -605,7 +611,7 @@ def _choose_method(
                 "correction_method='batched' for the exact general-design solve."
             ),
             FutureWarning,
-            stacklevel=5,
+            skip_file_prefixes=_SKIP,
         )
     if n_covariates > 1:
         if correction_method == "fast":
@@ -613,7 +619,7 @@ def _choose_method(
                 f"correction_method={correction_method!r} is ignored when multiple "
                 "batch keys are provided; using the exact general-design correction.",
                 UserWarning,
-                stacklevel=5,
+                skip_file_prefixes=_SKIP,
             )
         correction_method = "batched"  # several keys: the multi-key solve
     # One key: the batched correction unless one cluster's workspace is too large.

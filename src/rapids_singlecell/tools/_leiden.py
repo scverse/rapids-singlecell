@@ -5,6 +5,7 @@ import traceback
 import warnings
 from contextlib import contextmanager, suppress
 from numbers import Integral, Real
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
@@ -12,13 +13,15 @@ from typing import TYPE_CHECKING, Literal
 import cupy as cp
 import numpy as np
 import pandas as pd
+import scverse_misc
 from cupyx.scipy import sparse as cpx_sparse
 from natsort import natsorted
 from scanpy import logging as logg
-from scanpy.tools._utils import _choose_graph
-from scanpy.tools._utils_clustering import rename_groups, restrict_adjacency
+from scanpy.tools._utils_clustering import restrict_adjacency
 from scipy import sparse
+from scverse_misc import deprecated_arg
 
+import rapids_singlecell
 from rapids_singlecell._cuda import _leiden_cuda as _ld
 from rapids_singlecell._utils._multi_gpu import _copy_to_device as _copy_to_gpu
 from rapids_singlecell._utils._random import (
@@ -26,8 +29,17 @@ from rapids_singlecell._utils._random import (
     _LegacyRng,
     _seed_from_rng,
 )
+from rapids_singlecell.get._out import DEPR_KEY_ADDED, DEPR_NEIGHBORS_KEY, DEPR_OBSP, _out_key, deprecated_copy
 
-from ._clustering import _check_dtype, _create_graph, _create_graph_dask
+from ._clustering import (
+    _DEPR_ADJACENCY,
+    _check_dtype,
+    _cluster_labels,
+    _create_graph,
+    _create_graph_dask,
+    _rename_groups,
+)
+from ._utils import _use_graph
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -35,6 +47,7 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
+    from rapids_singlecell.get._utils import AdRef, GraphAcc
 
 # Host input is read in place on GPUs with ATS (e.g. GB10); elsewhere it is
 # copied to the device in chunks through pinned buffers.
@@ -50,6 +63,9 @@ _CUGRAPH_MAX_ITER = 100
 # of flavor="cugraph" and use_dask (FutureWarning).
 _DEFAULT_FLAVOR: Literal["rapids", "cugraph"] = "rapids"
 
+# Point warnings at the caller outside the public API's deprecation wrappers.
+_SKIP = tuple(str(Path(m.__file__).parent) for m in (rapids_singlecell, scverse_misc))
+
 _CLUSTERING_ARGS = {
     "rapids": frozenset({"beta", "initial_membership", "objective_function"}),
     "cugraph": frozenset({"max_iter", "objective_function"}),
@@ -57,26 +73,34 @@ _CLUSTERING_ARGS = {
 
 
 @_accepts_legacy_random_state(0)
+@deprecated_arg("key_added", DEPR_KEY_ADDED)
+@deprecated_arg("adjacency", _DEPR_ADJACENCY)
+@deprecated_arg("neighbors_key", DEPR_NEIGHBORS_KEY)
+@deprecated_arg("obsp", DEPR_OBSP)
+@deprecated_copy
 def leiden(
     adata: AnnData,
     resolution: float | Sequence[float] = 1.0,
     *,
     restrict_to: tuple[str, Sequence[str]] | None = None,
     rng: SeedLike | RNGLike | None = None,
-    key_added: str = "leiden",
-    adjacency: sparse.spmatrix | sparse.sparray | cpx_sparse.spmatrix | None = None,
     directed: bool | None = None,
     use_weights: bool = True,
     n_iterations: int = 2,
-    neighbors_key: str | None = None,
-    obsp: str | None = None,
     flavor: Literal["rapids", "cugraph"] = _DEFAULT_FLAVOR,
-    copy: bool = False,
     theta: float | None = None,
     dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
+    use: GraphAcc | str | None = None,
+    out: AdRef | str | bool = False,
+    # deprecated
+    key_added: str | None = None,
+    adjacency: sparse.spmatrix | sparse.sparray | cpx_sparse.spmatrix | None = None,
+    neighbors_key: str | None = None,
+    obsp: str | None = None,
+    copy: bool = False,
     **clustering_args,
-) -> AnnData | None:
+) -> AnnData | pd.Categorical | dict[float, pd.Categorical] | None:
     """Cluster cells into subgroups using the Leiden algorithm :cite:p:`Traag2019`.
 
     Leiden is an improved version of the Louvain algorithm :cite:p:`Blondel2008`
@@ -100,11 +124,10 @@ def leiden(
         Random seed or :class:`~numpy.random.Generator` changing the
         initialization of the optimization. Defaults to 0.
         The superseded ``random_state`` argument is still accepted.
-    key_added
-        ``adata.obs`` key under which to add the cluster labels.
-    adjacency
-        Sparse adjacency matrix of the graph, defaults to neighbors
-        connectivities. ``flavor='rapids'`` sums duplicate entries, clusters
+    use
+        Neighborhood graph to cluster, e.g. ``A.obsp['k']`` or ``'obsp.k'``.
+        Defaults to the connectivities written by :func:`~rapids_singlecell.pp.neighbors`.
+        ``flavor='rapids'`` sums duplicate entries, clusters
         an asymmetric matrix as A + A.T (with a warning) and ignores the
         diagonal (self-loops); every stored weight must be finite and
         non-negative.
@@ -121,14 +144,6 @@ def leiden(
         a last one (at most 20 in all). Values above 20 behave like ``-1``,
         with a warning.
         ``flavor='cugraph'`` ignores it and runs up to 100 levels.
-    neighbors_key
-        If not specified, ``leiden`` looks at ``.obsp['connectivities']`` for
-        neighbors connectivities. If specified, ``leiden`` looks at
-        ``.obsp[.uns[neighbors_key]['connectivities_key']]`` for neighbors
-        connectivities.
-    obsp
-        Use ``.obsp[obsp]`` as adjacency. You can't specify both ``obsp`` and
-        ``neighbors_key`` at the same time.
     flavor
         Which implementation to use. ``'rapids'`` (default) is the native CUDA
         implementation of rapids-singlecell, bitwise reproducible for a given
@@ -143,8 +158,12 @@ def leiden(
         GPU). Under an allocator that does not pool (the default of
         rapids-singlecell), it keeps the per-cell workspace for the next call
         if it is at most 2 GiB and 1/16 of the GPU memory.
-    copy
-        Whether to copy ``adata`` or modify it in place.
+    out
+        Where to write the cluster labels, e.g. ``A.obs['clusters']``. The
+        parameters and modularity go to ``.uns`` under the same key.
+        ``False`` writes to the default key ``'leiden'`` (``'leiden_R'`` with
+        ``restrict_to``). ``True`` returns the labels, as a dict keyed by
+        numeric resolution when several are requested.
     theta
         Deprecated. cuGraph's refinement randomness, only used by
         ``flavor='cugraph'`` (``None`` means 1.0). ``flavor='rapids'`` ignores
@@ -167,8 +186,9 @@ def leiden(
 
     Returns
     -------
-    Returns ``None`` if ``copy=False``, else returns an ``AnnData`` object. Sets
-    the following fields:
+    With ``out=True``, returns the categorical labels or a dict of them by
+    resolution. Otherwise writes the following fields and returns ``None``
+    (``copy=True`` returns a copy of ``adata``):
 
     ``adata.obs['leiden' | key_added]`` : :class:`pandas.Series` (dtype ``category``)
         Array of dim (number of samples) that stores the subgroup id
@@ -200,14 +220,17 @@ def leiden(
     use_weights = bool(use_weights)  # the bindings take a Python bool
     _validate_n_iterations(n_iterations, flavor=flavor)
     resolutions = _validate_resolutions(resolution)
+    if out is True and len(set(resolutions)) != len(resolutions):
+        msg = "out=True requires distinct numeric resolutions for the returned dict."
+        raise ValueError(msg)
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
     start = logg.info("running Leiden clustering")
-    adata = adata.copy() if copy else adata
-    # are we clustering a user-provided graph or the default AnnData one?
-    if adjacency is None:
-        adjacency = _choose_graph(adata, obsp, neighbors_key)
+    key = _out_key(out, key_added, kind="obs", default="leiden")
+    if restrict_to is not None and out is False and key == "leiden":
+        key = "leiden_R"
+    adjacency = _use_graph(adata, use, adjacency=adjacency, obsp=obsp, neighbors_key=neighbors_key)
     if restrict_to is not None:
         restrict_key, restrict_categories = restrict_to
         adjacency, restrict_indices = restrict_adjacency(
@@ -241,49 +264,33 @@ def leiden(
         traceback.clear_frames(err.__traceback__)
         del adjacency
         raise
-    # store output into adata.obs
-    if restrict_to is not None and key_added == "leiden":
-        key_added += "_R"
+    labels = {}
     for res, part in zip(resolutions, parts, strict=True):
-        key = key_added if len(resolutions) == 1 else f"{key_added}_{res}"
         if restrict_to is not None:
-            groups = rename_groups(
+            groups = _rename_groups(
                 adata,
-                restrict_key,
-                key_added=key,
+                restrict_key=restrict_key,
                 restrict_categories=restrict_categories,
                 restrict_indices=restrict_indices,
                 groups=part.membership,
             )
-            adata.obs[key] = pd.Categorical(
-                values=groups.astype("U"),
-                categories=natsorted(map(str, np.unique(groups))),
-            )
+            cat = pd.Categorical(values=groups.astype("U"), categories=natsorted(map(str, np.unique(groups))))
         else:
-            # the codes are size-ordered, so this equals the natsorted strings
-            adata.obs[key] = pd.Categorical.from_codes(
-                part.membership,
-                categories=[str(i) for i in range(part.n_clusters)],
-            )
-    # store information on the clustering parameters
-    adata.uns[key_added] = {}
-    adata.uns[key_added]["params"] = {
-        "resolution": resolutions[0] if len(resolutions) == 1 else resolutions,
-        "n_iterations": n_iterations,
-        **meta_random_state,
-    }
-    if flavor == "cugraph":  # what cuGraph ran instead of n_iterations
-        adata.uns[key_added]["params"]["max_iter"] = clustering_args.get("max_iter", _CUGRAPH_MAX_ITER)
-    adata.uns[key_added]["modularity"] = parts[0].modularity if len(parts) == 1 else [p.modularity for p in parts]
+            # The codes are size-ordered, so this equals the natsorted strings.
+            cat = pd.Categorical.from_codes(part.membership, categories=[str(i) for i in range(part.n_clusters)])
+        # Column names preserve the spelling of a resolution (e.g. 1 and 1.0).
+        labels[res if out is True else f"{res}"] = cat
+    params = {"n_iterations": n_iterations, **meta_random_state}
+    if flavor == "cugraph":
+        params["max_iter"] = clustering_args.get("max_iter", _CUGRAPH_MAX_ITER)
     logg.info(
         "    finished",
         time=start,
-        deep=(
-            f"found {', '.join(str(p.n_clusters) for p in parts)} clusters and added\n"
-            f"    {key_added!r}, the cluster labels (adata.obs, categorical)"
-        ),
+        deep=f"found {', '.join(str(p.n_clusters) for p in parts)} clusters",
     )
-    return adata if copy else None
+    return _cluster_labels(
+        (key, key), resolutions, labels, out=out, adata=adata, params=params, modularities=[p.modularity for p in parts]
+    )
 
 
 def _validate_flavor(
@@ -294,22 +301,21 @@ def _validate_flavor(
     theta: float | None,
     clustering_args: dict,
 ) -> Literal["rapids", "cugraph"]:
-    # stacklevel 4: this helper, `leiden`, the legacy random_state wrapper
     deprecate_cugraph = _DEFAULT_FLAVOR == "rapids"
     match flavor:
         case "rapids" | "cugraph" if use_dask:
             if deprecate_cugraph or flavor == "rapids":
                 msg = "use_dask is deprecated and runs the legacy cuGraph implementation, which will be removed in 0.20; use flavor='rapids' instead."
-                warnings.warn(msg, FutureWarning, stacklevel=4)
+                warnings.warn(msg, FutureWarning, skip_file_prefixes=_SKIP)
             flavor = "cugraph"
         case "cugraph":
             if deprecate_cugraph:
                 msg = "flavor='cugraph' is deprecated and will be removed in 0.20."
-                warnings.warn(msg, FutureWarning, stacklevel=4)
+                warnings.warn(msg, FutureWarning, skip_file_prefixes=_SKIP)
         case "rapids":
             if theta is not None:
                 msg = "theta is a deprecated cuGraph parameter (it had no effect there) and is ignored by flavor='rapids'; see beta."
-                warnings.warn(msg, FutureWarning, stacklevel=4)
+                warnings.warn(msg, FutureWarning, skip_file_prefixes=_SKIP)
         case _:
             msg = f"flavor must be either 'rapids' or 'cugraph', but {flavor!r} was passed."
             raise ValueError(msg)
@@ -340,7 +346,7 @@ def _validate_n_iterations(n_iterations: int, *, flavor: Literal["rapids", "cugr
     # flavor="cugraph" ignores n_iterations (see _CUGRAPH_MAX_ITER)
     if flavor == "rapids" and n_iterations > _N_ITER_WARN:
         msg = f"n_iterations counts Leiden iterations, not cuGraph levels; values above {_N_ITER_WARN} run until stable (as -1); 2 is recommended."
-        warnings.warn(msg, UserWarning, stacklevel=4)
+        warnings.warn(msg, UserWarning, skip_file_prefixes=_SKIP)
 
 
 def _validate_resolutions(resolution: float | Sequence[float]) -> list[float]:
@@ -586,7 +592,7 @@ def _ingest(csr, *, use_weights: bool, host_input: bool):
             graph = _canonicalize(graph, n)
         else:
             msg = "adjacency is not symmetric; clustering A + A.T instead."
-            warnings.warn(msg, UserWarning, stacklevel=5)
+            warnings.warn(msg, UserWarning, skip_file_prefixes=_SKIP)
             # The ingest maximum excludes diagonal entries; a large loop can overflow too.
             max_weight = info["wmax"] if info["nnz_counted"] == graph.nnz else None
             graph = _symmetrize(graph, n, max_weight)
@@ -830,7 +836,7 @@ def _leiden_cugraph(
             groups = None  # the retry starts after the failed call has been freed
         if groups is None:
             msg = "cuGraph ran out of GPU memory; retrying in CUDA managed memory (slower)."
-            warnings.warn(msg, UserWarning, stacklevel=4)
+            warnings.warn(msg, UserWarning, skip_file_prefixes=_SKIP)
             with _managed_memory():
                 groups = _cugraph_groups(adjacency, resolutions, **kw, use_dask=False)
     parts = []

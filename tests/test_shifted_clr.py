@@ -200,7 +200,8 @@ def test_sparse_matches_dense(array_type, n_vars):
 def test_inplace_false():
     adata = AnnData(csr_matrix(cp.asarray(X_clr_estimated)))
     x_before = _dense(adata.X).copy()
-    out = rsc.pp.normalize_shifted_clr(adata, inplace=False)
+    with pytest.warns(FutureWarning, match="inplace"):
+        out = rsc.pp.normalize_shifted_clr(adata, inplace=False)
 
     assert isinstance(out, dict)
     assert set(out) == {"X"}
@@ -210,9 +211,25 @@ def test_inplace_false():
     np.testing.assert_array_equal(_dense(adata.X), x_before)
 
 
+def test_inplace_false_out_error():
+    A = pytest.importorskip("anndata.acc").A
+    adata = AnnData(cp.asarray(X_clr))
+    with pytest.raises(TypeError, match="either `out` or `inplace`"), pytest.warns(FutureWarning, match="inplace"):
+        rsc.pp.normalize_shifted_clr(adata, inplace=False, out=A.layers["clr"])
+    assert "clr" not in adata.layers
+
+
+def test_out_true():
+    adata = AnnData(csr_matrix(cp.asarray(X_clr_estimated)))
+    out = rsc.pp.normalize_shifted_clr(adata, out=True)
+    np.testing.assert_allclose(cp.asnumpy(out), X_clr_estimated_expected, rtol=1e-5, atol=1e-6)
+    assert isinstance(adata.X, csr_matrix)
+
+
 def test_copy():
     adata = AnnData(csr_matrix(cp.asarray(X_clr_estimated)))
-    returned = rsc.pp.normalize_shifted_clr(adata, copy=True)
+    with pytest.warns(FutureWarning, match="copy"):
+        returned = rsc.pp.normalize_shifted_clr(adata, copy=True)
 
     assert isinstance(returned, AnnData)
     assert returned is not adata
@@ -222,18 +239,19 @@ def test_copy():
 
 def test_copy_inplace_error():
     adata = AnnData(csr_matrix(cp.asarray(X_clr)))
-    with pytest.raises(ValueError, match="`copy=True` cannot be used with `inplace=False`"):
+    with pytest.raises(ValueError, match="`copy=True` cannot be used"), pytest.warns(FutureWarning):
         rsc.pp.normalize_shifted_clr(adata, copy=True, inplace=False)
 
 
-def test_layer():
-    """`layer` selects the input layer and leaves `X` untouched."""
+def test_use():
+    """`use` selects the input layer and leaves `X` untouched."""
+    A = pytest.importorskip("anndata.acc").A
     adata = AnnData(
         csr_matrix(cp.asarray(X_clr_estimated)),
         layers={"counts": csr_matrix(cp.asarray(X_clr_estimated))},
     )
     x_before = _dense(adata.X).copy()
-    rsc.pp.normalize_shifted_clr(adata, layer="counts")
+    rsc.pp.normalize_shifted_clr(adata, use=A.layers["counts"])
 
     np.testing.assert_array_equal(_dense(adata.X), x_before)
     assert isinstance(adata.layers["counts"], cp.ndarray)

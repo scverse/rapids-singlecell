@@ -90,7 +90,6 @@ To achieve optimal memory management in rapids-singlecell, consider the followin
 
 For a more in-depth understanding of rmm and its functionalities, refer to the [NVIDIA RMM documentation](https://docs.rapids.ai/api/rmm/stable/python/).
 
-
 ## System requirements and limits
 
 rapids-singlecell performs most computations on the GPU.

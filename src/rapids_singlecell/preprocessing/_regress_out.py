@@ -1,32 +1,59 @@
 from __future__ import annotations
 
 import math
-from typing import Literal, Union
+from collections.abc import Collection
+from typing import TYPE_CHECKING, Literal, Union
 
 import cupy as cp
 import dask.array as da
 import numpy as np
-from anndata import AnnData
+import pandas as pd
 from cuml.linear_model import LinearRegression
 from cupyx.scipy import sparse
 from pandas.api.types import CategoricalDtype
 from scanpy._utils import view_to_actual
+from scverse_misc import Deprecation, deprecated_arg
 
 from rapids_singlecell._compat import DaskArray, _meta_dense
-from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
+from rapids_singlecell.get import _get_arr, _get_vec
+from rapids_singlecell.get._out import (
+    DEPR_INPLACE,
+    DEPR_USE,
+    _legacy_out,
+    _use_args,
+    _write_out,
+    deprecated_copy,
+)
+from rapids_singlecell.get._utils import AdRef, _to_numpy_1d
 
 from ._utils import _check_gpu_X, _sparse_to_dense
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
+    from anndata import AnnData
+
+    from rapids_singlecell.get._utils import LayerAcc, MultiAcc
+
+
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("keys", Deprecation("0.19.0", "Use `covariates` instead."))
+@deprecated_arg("inplace", DEPR_INPLACE)
+@deprecated_copy
 def regress_out(
     adata: AnnData,
-    keys: str | list,
+    covariates: AdRef | str | Sequence[AdRef | str] | None = None,
     *,
-    layer: str | None = None,
-    inplace: bool = True,
+    use: LayerAcc | MultiAcc | str | None = None,
+    out: LayerAcc | MultiAcc | str | bool = False,
     batchsize: int | Literal["all"] | None = None,
     verbose: bool = False,
-) -> Union[cp.ndarray, None]:  # noqa: UP007
+    # deprecated
+    layer: str | None = None,
+    inplace: bool = True,
+    copy: bool = False,
+    keys: str | Sequence[str] | None = None,
+) -> Union[AnnData, cp.ndarray, None]:  # noqa: UP007
     """Use linear regression to adjust for the effects of unwanted noise and variation.
 
     Parameters
@@ -34,15 +61,19 @@ def regress_out(
         adata
             AnnData object
 
-        keys
-            Keys for observation annotation on which to regress on.
-            Supports both numerical and single categorical covariates.
+        covariates
+            Observation annotation(s) to regress on, e.g. `A.obs['n_counts']`.
+            Strings name `.obs` columns (resolved by :meth:`anndata.acc.AdAcc.resolve` with the
+            `scanpy-v2-preview` preset). Supports both numerical and single categorical covariates.
 
-        layer
-            Layer to regress instead of `X`. If `None`, `X` is regressed.
+        use
+            Which matrix to regress, e.g. `A.X` or `A.layers['counts']`.
+            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'layers.counts'`.
 
-        inplace
-            Whether to update `adata` or return the corrected matrix of `adata.X` and `adata.layers`.
+        out
+            Where to write the result, e.g. `A.layers['k']` (or `'layers.k'`).
+            If `True`, the result is returned instead of written.
+            If `False`, it is written to the place `use` reads from.
 
         batchsize
             Number of genes that should be processed together. \
@@ -55,47 +86,46 @@ def regress_out(
 
     Returns
     -------
-    Returns a corrected copy or  updates `adata` with a corrected version of the \
-    original `adata.X` and `adata.layers['layer']`, depending on `inplace`.
+    The corrected matrix if `out=True`, else `None`.
     """
     if batchsize != "all" and type(batchsize) not in [int, type(None)]:
         raise ValueError("batchsize must be `int`, `None` or `'all'`")
 
-    if isinstance(adata, AnnData):
-        view_to_actual(adata)
+    if keys is not None:
+        if covariates is not None:
+            raise TypeError("Pass either `covariates` or `keys`, not both.")
+        covariates = keys
+    if covariates is None:
+        raise TypeError("regress_out() missing required argument: 'covariates'")
+    out = _legacy_out(out, "inplace", None if inplace else True)
+    src = _use_args(use, layer=layer)
+    view_to_actual(adata)
 
-    X = _get_obs_rep(adata, layer=layer)
+    X = _get_arr(adata, dim="obs", **src)
 
     _check_gpu_X(X, allow_dask=True)
 
-    if not sparse.issparse(X) and not isinstance(X, DaskArray) and inplace is False:
+    if not sparse.issparse(X) and not isinstance(X, DaskArray) and out is not False:
         X = cp.array(X)
 
-    # Normalize keys to list
-    if isinstance(keys, str):
-        keys = [keys]
+    if isinstance(covariates, AdRef | str) or not isinstance(covariates, Collection):
+        covariates = [covariates]
+    cov = pd.DataFrame({str(c): _to_numpy_1d(_get_vec(adata, c, dim="obs")) for c in covariates}, index=adata.obs_names)
 
-    # Check for categorical covariates
-    categorical = any(isinstance(adata.obs[key].dtype, CategoricalDtype) for key in keys)
-
-    if categorical:
-        if len(keys) > 1:
+    if any(isinstance(dtype, CategoricalDtype) for dtype in cov.dtypes):
+        if cov.shape[1] > 1:
             raise ValueError("Only a single categorical variable is supported for regress_out.")
         if isinstance(X, DaskArray):
-            X = _regress_out_categorical_dask(X, adata.obs[keys[0]])
+            X = _regress_out_categorical_dask(X, cov.iloc[:, 0])
         else:
-            X = _regress_out_categorical(X, adata.obs[keys[0]])
+            X = _regress_out_categorical(X, cov.iloc[:, 0])
     else:
         if isinstance(X, DaskArray):
-            X = _regress_out_continuous_dask(X, adata, keys)
+            X = _regress_out_continuous_dask(X, cov)
         else:
-            X = _regress_out_continuous(X, adata, keys, batchsize)
+            X = _regress_out_continuous(X, cov, batchsize)
 
-    if inplace:
-        _set_obs_rep(adata, X, layer=layer)
-    else:
-        return X
-    return None
+    return _write_out(adata, X, out=out, dest=src)
 
 
 def _regress_out_categorical(X, categorical_series):
@@ -119,7 +149,7 @@ def _regress_out_categorical(X, categorical_series):
     return X
 
 
-def _prepare_regressors(adata, keys, *, n_obs, dtype, order):
+def _prepare_regressors(cov, *, n_obs, dtype, order):
     """Build the design matrix ``[1, *keys]`` and its Gram matrix.
 
     Centring the columns and scaling them to unit length leaves the column
@@ -127,10 +157,10 @@ def _prepare_regressors(adata, keys, *, n_obs, dtype, order):
     O(1) rather than the ~1e11 that covariates on very different scales give,
     which float32 cannot carry. The Gram matrix is accumulated in float64 too.
     """
-    dim_regressor = len(keys) + 1
+    dim_regressor = cov.shape[1] + 1
     regressors = cp.ones((n_obs, dim_regressor), dtype=cp.float64, order=order)
-    for i, key in enumerate(keys):
-        regressors[:, i + 1] = cp.array(adata.obs[key]).ravel()
+    for i, (_, col) in enumerate(cov.items()):
+        regressors[:, i + 1] = cp.array(col).ravel()
     regressors[:, 1:] -= regressors[:, 1:].mean(axis=0)
     norms = cp.linalg.norm(regressors, axis=0)
     regressors /= cp.where(norms > 0, norms, 1.0)  # a constant covariate stays 0
@@ -141,9 +171,9 @@ def _prepare_regressors(adata, keys, *, n_obs, dtype, order):
     return regressors.astype(dtype, order=order, copy=False), gram
 
 
-def _regress_out_continuous(X, adata, keys, batchsize):
+def _regress_out_continuous(X, cov, batchsize):
     """Regress out continuous variables using linear regression."""
-    regressors, gram = _prepare_regressors(adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="F")
+    regressors, gram = _prepare_regressors(cov, n_obs=X.shape[0], dtype=X.dtype, order="F")
 
     # Set default batch size based on the number of samples in X
     DEFAULT_GENE_BATCH = 100
@@ -239,15 +269,15 @@ def _regress_out_categorical_dask(X, categorical_series):
     )
 
 
-def _regress_out_continuous_dask(X, adata, keys):
+def _regress_out_continuous_dask(X, cov):
     """Regress out continuous variables from a dask array using linear regression."""
     X = _maybe_densify(X)
 
-    dim_regressor = len(keys) + 1
+    dim_regressor = cov.shape[1] + 1
     n_genes = X.shape[1]
 
     # Build full regressors array on GPU (matching the non-dask path)
-    regressors, gram = _prepare_regressors(adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="C")
+    regressors, gram = _prepare_regressors(cov, n_obs=X.shape[0], dtype=X.dtype, order="C")
 
     # Check Gram matrix is invertible
     if np.linalg.det(cp.asnumpy(gram)) == 0:

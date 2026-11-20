@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 from anndata import AnnData
+from scverse_misc import deprecated_arg
+
+from rapids_singlecell.get._out import DEPR_INPLACE, _legacy_out, _out_key
 
 from ._qc import _basic_qc
 from ._utils import _check_gpu_X
@@ -12,6 +15,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from rapids_singlecell._utils import ArrayTypesDask
+    from rapids_singlecell.get._utils import AdRef
 
 
 def flag_gene_family(
@@ -50,6 +54,7 @@ def flag_gene_family(
         adata.var[gene_family_name] = cp.asnumpy(adata.var.index.isin(gene_list)).ravel()
 
 
+@deprecated_arg("inplace", DEPR_INPLACE)
 def filter_genes(
     data: AnnData | ArrayTypesDask,
     *,
@@ -57,9 +62,12 @@ def filter_genes(
     min_cells: int | None = None,
     max_counts: int | None = None,
     max_cells: int | None = None,
-    inplace: bool = True,
+    out: AdRef | str | bool = False,
+    copy: bool = False,
     verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray] | None:
+    # deprecated
+    inplace: bool = True,
+) -> AnnData | tuple[np.ndarray, np.ndarray] | None:
     """Filter genes based on number of cells or counts.
 
     Keep genes that have at least `min_counts` counts or are expressed in at
@@ -82,14 +90,19 @@ def filter_genes(
         Maximum number of counts required for a gene to pass filtering.
     max_cells
         Maximum number of cells expressed required for a gene to pass filtering.
-    inplace
-        Perform computation inplace or return result.
+    out
+        Where to write the counts per gene, e.g. `A.var['n_cells']`.
+        If `True`, return the mask and counts instead of subsetting `data` and writing them.
+        If `False`, they are written to `.var['n_counts']` or `.var['n_cells']`,
+        depending on what was thresholded.
+    copy
+        Whether to subset and return a copy of `data` instead of modifying it.
     verbose
         Print number of discarded genes
 
     Returns
     -------
-    Depending on `inplace`, returns the following arrays or directly subsets
+    With `out=True` or array input, returns the following arrays, else subsets
     and annotates the data matrix
 
     gene_subset
@@ -99,6 +112,7 @@ def filter_genes(
         Depending on what was thresholded (`counts` or `cells`), the array stores
         `n_counts` or `n_cells` per gene.
     """
+    out = _legacy_out(out, "inplace", None if inplace else True)
     n_given_options = sum(option is not None for option in [min_cells, min_counts, max_cells, max_counts])
     if n_given_options != 1:
         msg = (
@@ -133,15 +147,18 @@ def filter_genes(
                 msg += f"{max_cells} cells" if max_counts is None else f"{max_counts} counts"
             print(msg)
 
-    if isinstance(data, AnnData) and inplace:
-        col = "n_counts" if (min_cells is None and max_cells is None) else "n_cells"
-        data.var[col] = number_per_gene.get()
-        data._inplace_subset_var(gene_subset.get())
-    else:
+    if not isinstance(data, AnnData):
         return gene_subset.get(), number_per_gene.get()
-    return None
+    col = "n_counts" if (min_cells is None and max_cells is None) else "n_cells"
+    if (key := _out_key(out, None, kind="var", default=col)) is True:
+        return gene_subset.get(), number_per_gene.get()
+    adata = data.copy() if copy else data
+    adata.var[key] = number_per_gene.get()
+    adata._inplace_subset_var(gene_subset.get())
+    return adata if copy else None
 
 
+@deprecated_arg("inplace", DEPR_INPLACE)
 def filter_cells(
     data: AnnData | ArrayTypesDask,
     *,
@@ -149,9 +166,12 @@ def filter_cells(
     min_genes: int | None = None,
     max_counts: int | None = None,
     max_genes: int | None = None,
-    inplace: bool = True,
+    out: AdRef | str | bool = False,
+    copy: bool = False,
     verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray] | None:
+    # deprecated
+    inplace: bool = True,
+) -> AnnData | tuple[np.ndarray, np.ndarray] | None:
     """Filter cell outliers based on counts and numbers of genes expressed.
 
     For instance, only keep cells with at least `min_counts` counts or
@@ -174,14 +194,19 @@ def filter_cells(
         Maximum number of counts required for a cell to pass filtering.
     max_genes
         Maximum number of genes expressed required for a cell to pass filtering.
-    inplace
-        Perform computation inplace or return result.
+    out
+        Where to write the counts per cell, e.g. `A.obs['n_genes']`.
+        If `True`, return the mask and counts instead of subsetting `data` and writing them.
+        If `False`, they are written to `.obs['n_counts']` or `.obs['n_genes']`,
+        depending on what was thresholded.
+    copy
+        Whether to subset and return a copy of `data` instead of modifying it.
     verbose
         Print number of discarded cells
 
     Returns
     -------
-    Depending on `inplace`, returns the following arrays or directly subsets
+    With `out=True` or array input, returns the following arrays, else subsets
     and annotates the data matrix:
 
     cells_subset
@@ -224,6 +249,7 @@ def filter_cells(
     >>> int(adata.obs["n_genes"].min())
     3
     """
+    out = _legacy_out(out, "inplace", None if inplace else True)
     n_given_options = sum(option is not None for option in [min_genes, min_counts, max_genes, max_counts])
     if n_given_options != 1:
         msg = (
@@ -258,13 +284,15 @@ def filter_cells(
                 msg += f"{max_genes} genes expressed" if max_counts is None else f"{max_counts} counts"
             print(msg)
 
-    if isinstance(data, AnnData) and inplace:
-        col = "n_counts" if (min_genes is None and max_genes is None) else "n_genes"
-        data.obs[col] = number_per_cell.get()
-        data._inplace_subset_obs(cell_subset.get())
-    else:
+    if not isinstance(data, AnnData):
         return cell_subset.get(), number_per_cell.get()
-    return None
+    col = "n_counts" if (min_genes is None and max_genes is None) else "n_genes"
+    if (key := _out_key(out, None, kind="obs", default=col)) is True:
+        return cell_subset.get(), number_per_cell.get()
+    adata = data.copy() if copy else data
+    adata.obs[key] = number_per_cell.get()
+    adata._inplace_subset_obs(cell_subset.get())
+    return adata if copy else None
 
 
 def filter_highly_variable(adata: AnnData) -> None:

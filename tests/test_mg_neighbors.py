@@ -10,6 +10,8 @@ from scanpy.datasets import pbmc68k_reduced
 
 import rapids_singlecell as rsc
 
+A = pytest.importorskip("anndata.acc").A
+
 
 def _calc_recall(distances, reference_distances, tolerance=0.9):
     hits = 0
@@ -190,6 +192,16 @@ def test_all_neighbors_inner_product(n_clusters):
     _calc_recall(distances, adata.obsp["distances"], tolerance=0.9)
 
 
+def test_all_neighbors_ivfpq_small_clusters_are_exact():
+    # clusters too small to train the PQ codebooks (cuVS >= 26.12 aborts): searched by brute force
+    adata = pbmc68k_reduced()
+    kwds = {"algo": "ivf_pq", "n_clusters": 4}
+    rsc.pp.neighbors(adata, n_pcs=50, n_neighbors=15, algorithm="all_neighbors", algorithm_kwds=kwds)
+    distances = adata.obsp["distances"].copy()
+    rsc.pp.neighbors(adata, n_pcs=50, n_neighbors=15, algorithm="brute")
+    assert (distances != adata.obsp["distances"]).nnz == 0
+
+
 @pytest.mark.parametrize("algo", ["mg_ivfflat", "mg_ivfpq"])
 def test_mg_bbknn(algo):
     if parse_version(cuvs.__version__) <= parse_version("25.08"):
@@ -202,11 +214,11 @@ def test_mg_bbknn(algo):
 
     adata = pbmc68k_reduced()
     n_rows = adata.shape[0]
-    rsc.pp.bbknn(adata, algorithm=algo, batch_key="phase")
+    rsc.pp.bbknn(adata, algorithm=algo, batches=A.obs["phase"])
 
     assert adata.obsp["distances"].shape == (n_rows, n_rows)
     assert adata.obsp["connectivities"].shape == (n_rows, n_rows)
     distances = adata.obsp["distances"].copy()
-    rsc.pp.bbknn(adata, batch_key="phase", algorithm=other_algo)
+    rsc.pp.bbknn(adata, batches=A.obs["phase"], algorithm=other_algo)
     np.testing.assert_array_equal(adata.obsp["distances"].indptr, distances.indptr)
     _calc_recall(distances, adata.obsp["distances"])

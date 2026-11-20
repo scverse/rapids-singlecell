@@ -73,11 +73,37 @@ def test_groupby(adata_grouped):
 
 
 def test_key_added(adata_grid):
-    """Custom key_added is respected."""
-    rsc.tl.embedding_density(adata_grid, "test", key_added="my_density")
+    """Deprecated `key_added` still names the outputs."""
+    with pytest.warns(FutureWarning, match="key_added"):
+        rsc.tl.embedding_density(adata_grid, "test", key_added="my_density")
 
     assert "my_density" in adata_grid.obs.columns
     assert "my_density_params" in adata_grid.uns
+
+
+def test_use_out(adata_grouped):
+    """`use`/`groupby` take accessors, `out` names the column or returns the densities."""
+    A = pytest.importorskip("anndata.acc").A
+
+    rsc.tl.embedding_density(adata_grouped, A.obsm["X_umap"], groupby=A.obs["group"], out=A.obs["dens"])
+    assert "dens_params" in adata_grouped.uns
+    res = rsc.tl.embedding_density(adata_grouped, "umap", groupby="group", out=True)
+    np.testing.assert_array_equal(res, adata_grouped.obs["dens"].to_numpy())
+    with pytest.warns(FutureWarning, match="basis"):
+        rsc.tl.embedding_density(adata_grouped, basis="umap")
+    assert "umap_density" in adata_grouped.obs
+
+
+def test_use_outside_obsm_rejected(adata_grouped):
+    A = pytest.importorskip("anndata.acc").A
+    with pytest.raises(TypeError, match="`use` must be one of"):
+        rsc.tl.embedding_density(adata_grouped, A.layers["x"])
+
+
+def test_out_true_rejects_numeric_groupby(adata_grouped):
+    adata_grouped.obs["num"] = 1.0
+    with pytest.raises(ValueError, match="does not contain categorical data"):
+        rsc.tl.embedding_density(adata_grouped, "umap", groupby="num", out=True)
 
 
 def test_custom_components(adata_grouped):

@@ -62,7 +62,7 @@ def test_cpu_sparse_dtypes_preserve_ulm(adata, net, dtype):
 @pytest.mark.parametrize("kind", ["dataframe", "sparse", "gpu", "dask", "backed", "backed_sparse"])
 @pytest.mark.filterwarnings("ignore:Variable names are not unique")
 def test_extract_rejects_nonadjacent_duplicate_names(kind, tmp_path):
-    frame = pd.DataFrame([[1, 2, 3]], columns=["a", "b", "a"])
+    frame = pd.DataFrame([[1, 2, 3]], index=["0"], columns=["a", "b", "a"])
     data = frame if kind == "dataframe" else ad.AnnData(frame)
     if kind in ("sparse", "backed_sparse"):
         data.X = sps.csr_matrix(data.X)

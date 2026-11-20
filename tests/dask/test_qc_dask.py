@@ -27,8 +27,8 @@ def test_qc_metrics(client, data_kind):
     else:
         raise ValueError(f"Unknown data_kind {data_kind}")
 
-    rsc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], log1p=True)
-    rsc.pp.calculate_qc_metrics(dask_data, qc_vars=["mt"], log1p=True)
+    rsc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], log1p=True, out=False)
+    rsc.pp.calculate_qc_metrics(dask_data, qc_vars=["mt"], log1p=True, out=False)
     np.testing.assert_allclose(adata.obs["n_genes_by_counts"], dask_data.obs["n_genes_by_counts"])
     np.testing.assert_allclose(adata.obs["total_counts"], dask_data.obs["total_counts"])
     np.testing.assert_allclose(adata.obs["log1p_n_genes_by_counts"], dask_data.obs["log1p_n_genes_by_counts"])
