@@ -136,16 +136,6 @@ def _close(a, b):
         cp.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-12)
 
 
-def _close_morans_i(a, b):
-    """Sparse Moran's I has many float32 atomic adds into small numerators.
-    Turing/T4 can reorder the int32 and int64 instantiations enough to exceed
-    the generic atomic tolerance without indicating a dispatch regression."""
-    if a.dtype == cp.float32:
-        cp.testing.assert_allclose(a, b, rtol=1e-4, atol=5e-6)
-    else:
-        cp.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-12)
-
-
 # ----------------------------- _qc_cuda -------------------------------------
 
 
@@ -919,75 +909,28 @@ def test_mean_sparse(dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_morans_sparse(dtype):
-    mean_array = cp.full(N_COLS, 0.3, dtype=dtype)
-    outs = {}
-    for idx_dtype in (np.int32, np.int64):
-        A = _make_csr(dtype, idx_dtype)
-        adj = _make_adjacency(dtype, idx_dtype)
-        num = cp.zeros(N_COLS, dtype=dtype)
-        _ac.morans_sparse(
-            adj.indptr,
-            adj.indices,
-            adj.data,
-            data_row_ptr=A.indptr,
-            data_col_ind=A.indices,
-            data_values=A.data,
-            n_samples=N_ROWS,
-            n_features=N_COLS,
-            mean_array=mean_array,
-            num=num,
-            stream=_stream(),
-        )
-        outs[idx_dtype] = num
-    _close_morans_i(outs[np.int32], outs[np.int64])
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_gearys_sparse(dtype):
-    outs = {}
-    for idx_dtype in (np.int32, np.int64):
-        A = _make_csr(dtype, idx_dtype)
-        adj = _make_adjacency(dtype, idx_dtype)
-        num = cp.zeros(N_COLS, dtype=dtype)
-        _ac.gearys_sparse(
-            adj.indptr,
-            adj.indices,
-            adj.data,
-            data_row_ptr=A.indptr,
-            data_col_ind=A.indices,
-            data_values=A.data,
-            n_samples=N_ROWS,
-            n_features=N_COLS,
-            num=num,
-            stream=_stream(),
-        )
-        outs[idx_dtype] = num
-    _close(outs[np.int32], outs[np.int64])
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_pre_den_sparse(dtype):
-    # Uses atomicAdd on a float accumulator: int32/int64 paths can reorder
-    # adds at the ULP level. counter is integer → bit-exact.
-    mean_array = cp.full(N_COLS, 0.3, dtype=dtype)
-    outs = {}
-    for idx_dtype in (np.int32, np.int64):
-        A = _make_csr(dtype, idx_dtype)
-        den = cp.zeros(N_COLS, dtype=dtype)
-        counter = cp.zeros(N_COLS, dtype=cp.int32)
-        _ac.pre_den_sparse(
-            A.indices,
-            A.data,
-            nnz=A.nnz,
-            mean_array=mean_array,
-            den=den,
-            counter=counter,
-            stream=_stream(),
-        )
-        outs[idx_dtype] = (den, counter)
-    _close(outs[np.int32][0], outs[np.int64][0])
-    _eq(outs[np.int32][1], outs[np.int64][1])
+@pytest.mark.parametrize("idx_dtype", [np.int32, np.int64])
+def test_autocorr_graph_kernels(dtype, idx_dtype):
+    # Row offsets can exceed int32 even when observation IDs still fit.
+    adj = _make_adjacency(dtype, idx_dtype)
+    indices = adj.indices.astype(cp.int32)
+    normalized = cp.empty_like(adj.data)
+    _ac.normalize(adj.indptr, adj.data, out=normalized, stream=_stream())
+    _eq(normalized, cp.full_like(adj.data, 0.5))
+    x = cp.asarray(_make_dense_cpu(dtype, cols=7))
+    z = cp.empty_like(x)
+    row = cp.empty(N_ROWS, cp.float64)
+    col = cp.zeros_like(row)
+    moments = cp.zeros(3, cp.float64)
+    _ac.moments(adj.indptr, indices, normalized, row=row, col=col, out=moments, stream=_stream())
+    _eq(row, cp.ones_like(row))
+    _eq(col, row)
+    _eq(moments, cp.array([N_ROWS, N_ROWS / 2, N_ROWS / 2]))
+    stats = cp.zeros((4, x.shape[1]), cp.float64)
+    _ac.observed(adj.indptr, indices, normalized, x, row, col, lag=z, stats=stats, geary=False, stream=_stream())
+    x = x - x[0]
+    _close(z, (cp.roll(x, 1, axis=0) + cp.roll(x, -1, axis=0)) * 0.5)
+    _close(stats[3], (x * z).sum(axis=0))
 
 
 # ----------------------------- _wilcoxon_binned -----------------------------
@@ -1047,91 +990,6 @@ def test_csc_hist(dtype):
         )
         outs[idx_dtype] = hist
     _eq(outs[np.int32], outs[np.int64])
-
-
-# ---------- mixed-precision morans/gearys (AdjIdxT != DataIdxT) -------------
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_morans_sparse_mixed_indices(dtype):
-    """Exercise the cross-typed (AdjIdxT, DataIdxT) instantiations registered
-    in autocorr.cu — the same-dtype tests above don't reach them."""
-    mean_array = cp.full(N_COLS, 0.3, dtype=dtype)
-
-    A32 = _make_csr(dtype, np.int32)
-    adj32 = _make_adjacency(dtype, np.int32)
-    num_ref = cp.zeros(N_COLS, dtype=dtype)
-    _ac.morans_sparse(
-        adj32.indptr,
-        adj32.indices,
-        adj32.data,
-        data_row_ptr=A32.indptr,
-        data_col_ind=A32.indices,
-        data_values=A32.data,
-        n_samples=N_ROWS,
-        n_features=N_COLS,
-        mean_array=mean_array,
-        num=num_ref,
-        stream=_stream(),
-    )
-
-    for adj_dtype, data_dtype in [(np.int32, np.int64), (np.int64, np.int32)]:
-        A = _make_csr(dtype, data_dtype)
-        adj = _make_adjacency(dtype, adj_dtype)
-        num = cp.zeros(N_COLS, dtype=dtype)
-        _ac.morans_sparse(
-            adj.indptr,
-            adj.indices,
-            adj.data,
-            data_row_ptr=A.indptr,
-            data_col_ind=A.indices,
-            data_values=A.data,
-            n_samples=N_ROWS,
-            n_features=N_COLS,
-            mean_array=mean_array,
-            num=num,
-            stream=_stream(),
-        )
-        _close_morans_i(num_ref, num)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_gearys_sparse_mixed_indices(dtype):
-    """Exercise the cross-typed (AdjIdxT, DataIdxT) instantiations registered
-    in autocorr.cu — the same-dtype tests above don't reach them."""
-    A32 = _make_csr(dtype, np.int32)
-    adj32 = _make_adjacency(dtype, np.int32)
-    num_ref = cp.zeros(N_COLS, dtype=dtype)
-    _ac.gearys_sparse(
-        adj32.indptr,
-        adj32.indices,
-        adj32.data,
-        data_row_ptr=A32.indptr,
-        data_col_ind=A32.indices,
-        data_values=A32.data,
-        n_samples=N_ROWS,
-        n_features=N_COLS,
-        num=num_ref,
-        stream=_stream(),
-    )
-
-    for adj_dtype, data_dtype in [(np.int32, np.int64), (np.int64, np.int32)]:
-        A = _make_csr(dtype, data_dtype)
-        adj = _make_adjacency(dtype, adj_dtype)
-        num = cp.zeros(N_COLS, dtype=dtype)
-        _ac.gearys_sparse(
-            adj.indptr,
-            adj.indices,
-            adj.data,
-            data_row_ptr=A.indptr,
-            data_col_ind=A.indices,
-            data_values=A.data,
-            n_samples=N_ROWS,
-            n_features=N_COLS,
-            num=num,
-            stream=_stream(),
-        )
-        _close(num_ref, num)
 
 
 # ---------- long-long parameter ABI smoke test ------------------------------
