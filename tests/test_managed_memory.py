@@ -95,3 +95,29 @@ def test_wnn(managed_memory):
     rsc.pp.wnn(adata, ["A", "B"], knn_range=40)
     assert adata.obsp["snn"].nnz > 0
     np.testing.assert_allclose(adata.obs[["A_weight", "B_weight"]].sum(axis=1), 1)
+
+
+def test_leiden(managed_memory, monkeypatch):
+    """Device input and a cached CUDA workspace give the same results under managed memory."""
+    from scanpy.datasets import pbmc68k_reduced
+
+    from rapids_singlecell.tools import _leiden
+
+    a = pbmc68k_reduced().obsp["connectivities"]
+    n = a.shape[0]
+    start = np.arange(n) % 7
+
+    def run(adjacency, **kwargs):
+        rng = np.random.default_rng(0)
+        return _leiden._leiden_rapids(adjacency, [1.0], rng=rng, n_iterations=2, use_weights=True, **kwargs)[0]
+
+    monkeypatch.setattr(_leiden, "_WORKSPACE_CACHE", {})
+    with cp.cuda.using_allocator(cp.get_default_memory_pool().malloc):  # CUDA, not managed, memory
+        device_input = csr_matrix(a)
+        expected = [run(a), run(a, initial_membership=start)]
+        _leiden._WORKSPACE_CACHE[cp.cuda.Device().id] = cp.empty(1 << 24, dtype=cp.uint8)
+    results = [run(device_input), run(a, initial_membership=start)]
+    for got, want in zip(results, expected, strict=True):
+        assert got.membership.tobytes() == want.membership.tobytes()
+        assert float.hex(got.modularity) == float.hex(want.modularity)
+    assert run(csr_matrix((5, 5), dtype=np.float32)).n_clusters == 5

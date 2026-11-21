@@ -15,7 +15,9 @@ pytestmark = pytest.mark.filterwarnings("ignore:The function louvain is deprecat
 def test_dask_clustering(dist_client, clustering_function):
     adata = pbmc3k_processed()
     clustering_function(adata, use_dask=True, out=A.obs["test_dask"])
-    clustering_function(adata, out=A.obs["test_no_dask"])
+    # Both sides of this comparison use cuGraph.
+    kwargs = {"flavor": "cugraph"} if clustering_function is rsc.tl.leiden else {}
+    clustering_function(adata, out=A.obs["test_no_dask"], **kwargs)
 
     assert adjusted_rand_score(adata.obs["test_dask"], adata.obs["test_no_dask"]) > 0.9
     assert normalized_mutual_info_score(adata.obs["test_dask"], adata.obs["test_no_dask"]) > 0.9

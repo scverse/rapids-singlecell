@@ -42,7 +42,7 @@ rsc.get.anndata_to_GPU(adata)
 ## Supported steps
 
 - Dask-capable: `calculate_qc_metrics`, `filter_cells`, `filter_genes`, `normalize_total` (without `exclude_highly_expressed`), `log1p`, `highly_variable_genes` (not `pearson_residuals`), `scale`, `pca` (`covariance_eigh` only), `score_genes`, `rank_genes_groups` (`wilcoxon_binned` or t-test, not exact `wilcoxon`), `rsc.get.aggregate` and every `rsc.dcg` method except `gsva`, which computes Dask input into memory.
-- `rsc.tl.leiden(..., use_dask=True)` distributes clustering, but it only pays off above about 10 million cells.
+- `rsc.tl.leiden(..., use_dask=True)` selects the deprecated cuGraph backend. Native Leiden runs on one GPU and supports RMM managed memory for larger graphs.
 - After PCA the embedding is small: `.compute()` it if `obsm["X_pca"]` is a Dask array, then run neighbors, Leiden and UMAP in memory.
 - Stop and reduce the data for steps without Dask support.
   Never materialize the full matrix or fall back to CPU silently.
