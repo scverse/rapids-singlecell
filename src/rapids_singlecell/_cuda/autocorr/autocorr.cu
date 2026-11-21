@@ -22,6 +22,14 @@ static void moments_launch(const P* indptr, const int* indices, const T* data,
     CUDA_CHECK_LAST_ERROR(autocorr_moments_kernel);
 }
 
+template <typename T, int BATCH>
+static auto sums_kernel(bool geary, bool uniform) {
+    return geary ? (uniform ? autocorr_sums_kernel<T, true, true, BATCH>
+                            : autocorr_sums_kernel<T, true, false, BATCH>)
+                 : (uniform ? autocorr_sums_kernel<T, false, true, BATCH>
+                            : autocorr_sums_kernel<T, false, false, BATCH>);
+}
+
 template <typename T, typename Device>
 void def_sums(nb::module_& m) {
     m.def(
@@ -30,7 +38,8 @@ void def_sums(nb::module_& m) {
            gpu_array_c<const double, Device> r,
            gpu_array_c<const unsigned int, Device> keys,
            gpu_array_c<double, Device> out, bool geary, bool uniform,
-           std::uintptr_t stream) {
+           std::uintptr_t stream,
+           std::optional<gpu_array_c<const int, Device>> permutation) {
             const int n = x.shape(0), n_genes = x.shape(1);
             const int n_perms = keys.shape(0);
             nb_require(n_genes <= 32 && z.shape(0) == (size_t)n &&
@@ -39,6 +48,10 @@ void def_sums(nb::module_& m) {
                        "sums: x, z (n, <= 32 genes) and r (n) must match");
             nb_require(keys.shape(1) == AUTOCORR_ROUNDS,
                        "sums: each permutation needs six round keys");
+            nb_require(
+                !permutation || (n_perms == 1 && permutation->ndim() == 1 &&
+                                 permutation->size() == (size_t)n),
+                "sums: expected a single permutation of n rows");
             nb_require(out.shape(0) == (size_t)n_perms &&
                            out.shape(1) == (size_t)(uniform ? 1 : 2) &&
                            out.shape(2) == (size_t)n_genes,
@@ -47,27 +60,49 @@ void def_sums(nb::module_& m) {
             const int grid = std::min<long long>(
                 strided_grid((long long)n * 32, AUTOCORR_BLOCK), 8LL * n_sm);
             const auto kernel =
-                geary ? (uniform ? autocorr_sums_kernel<T, true, true>
-                                 : autocorr_sums_kernel<T, true, false>)
-                      : (uniform ? autocorr_sums_kernel<T, false, true>
-                                 : autocorr_sums_kernel<T, false, false>);
+                permutation ? sums_kernel<T, 1>(geary, uniform)
+                            : sums_kernel<T, AUTOCORR_BATCH>(geary, uniform);
             const long long step = (long long)max_grid_dim_y() * AUTOCORR_BATCH;
             for (long long first = 0; first < n_perms; first += step) {
                 dim3 blocks(grid,
                             strided_grid_y(n_perms - first, AUTOCORR_BATCH));
                 kernel<<<blocks, AUTOCORR_BLOCK, 0, (cudaStream_t)stream>>>(
                     x.data(), z.data(), r.data(), n, n_genes, keys.data(),
-                    n_perms, first, out.data());
+                    permutation ? permutation->data() : nullptr, n_perms, first,
+                    out.data());
                 CUDA_CHECK_LAST_ERROR(autocorr_sums_kernel);
             }
         },
         "x"_a.noconvert(), "z"_a.noconvert(), "r"_a.noconvert(),
         "keys"_a.noconvert(), nb::kw_only(), "out"_a.noconvert(), "geary"_a,
-        "uniform"_a = false, "stream"_a = 0);
+        "uniform"_a = false, "stream"_a = 0,
+        "permutation"_a.noconvert().none() = nb::none());
 }
 
 template <typename T, typename P, typename Device>
 void def_graph_ops(nb::module_& m) {
+    m.def(
+        "csr_blocks",
+        [](gpu_array_c<const P, Device> indptr,
+           gpu_array_c<const int, Device> indices,
+           gpu_array_c<const T, Device> data, int first,
+           gpu_array_c<T, Device> out, std::uintptr_t stream) {
+            nb_require(out.ndim() == 3 && out.shape(1) + 1 == indptr.size() &&
+                           indices.size() == data.size() && first >= 0 &&
+                           out.shape(2) >= 1 && out.shape(2) <= 32,
+                       "csr_blocks: expected CSR and (blocks, cells, <= 32 "
+                       "genes) output");
+            if (!out.size()) return;
+            const int n = out.shape(1);
+            autocorr_csr_blocks_kernel<<<
+                strided_grid((long long)n * 32, AUTOCORR_BLOCK), AUTOCORR_BLOCK,
+                0, (cudaStream_t)stream>>>(indptr.data(), indices.data(),
+                                           data.data(), n, first, out.shape(0),
+                                           out.shape(2), out.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_csr_blocks_kernel);
+        },
+        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
+        nb::kw_only(), "first"_a, "out"_a.noconvert(), "stream"_a = 0);
     m.def(
         "normalize",
         [](gpu_array_c<const P, Device> indptr,

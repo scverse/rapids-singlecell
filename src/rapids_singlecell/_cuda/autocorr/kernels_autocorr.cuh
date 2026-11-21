@@ -53,24 +53,24 @@ __global__ void autocorr_permutation_kernel(const unsigned int* keys, int n,
 }
 
 // Each grid row scores up to BATCH permutations with their own round keys.
-template <typename T, bool GEARY, bool UNIFORM>
+template <typename T, bool GEARY, bool UNIFORM, int BATCH>
 __global__ void autocorr_sums_kernel(const T* __restrict__ x,
                                      const T* __restrict__ z,
                                      const double* __restrict__ r, int n,
                                      int n_genes, const unsigned int* keys,
-                                     int n_scores, int start,
-                                     double* __restrict__ out) {
+                                     const int* permutation, int n_scores,
+                                     int start, double* __restrict__ out) {
     constexpr int terms = UNIFORM ? 1 : 2;
     constexpr int stride = terms * 32;
-    __shared__ double block_sums[AUTOCORR_BATCH * stride];
-    const int first = start + blockIdx.y * AUTOCORR_BATCH;
-    const int batch = min(n_scores - first, AUTOCORR_BATCH);
+    __shared__ double block_sums[BATCH * stride];
+    const int first = start + blockIdx.y * BATCH;
+    const int batch = BATCH == 1 ? 1 : min(n_scores - first, BATCH);
     for (int t = threadIdx.x; t < batch * stride; t += blockDim.x)
         block_sums[t] = 0.0;
     __syncthreads();
     const int lane = threadIdx.x & 31;
     const double offset = lane < n_genes ? x[lane] : 0;
-    double a[AUTOCORR_BATCH] = {}, b[AUTOCORR_BATCH] = {};
+    double a[BATCH] = {}, b[BATCH] = {};
     const int warps = (gridDim.x * blockDim.x) >> 5;
     for (long long i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
          i += warps) {
@@ -78,14 +78,17 @@ __global__ void autocorr_sums_kernel(const T* __restrict__ x,
         if (!__any_sync(0xFFFFFFFFu, xv != 0)) continue;
         const double zi = xv != 0 ? z[i * n_genes + lane] : 0;
         const double ri = UNIFORM ? 0 : r[i];
-        // Lane p computes a source row shared by every gene in the warp.
-        const long long score = (long long)first + lane;
         int mine = i;
-        if (lane < batch)
+        if constexpr (BATCH == 1) {
+            mine = permutation[i];
+        } else if (lane < batch) {
+            // Lane p computes a source row shared by every gene in the warp.
+            const long long score = (long long)first + lane;
             mine = autocorr_permute(i, n, keys + score * AUTOCORR_ROUNDS);
+        }
 #pragma unroll
-        for (int p = 0; p < AUTOCORR_BATCH; ++p) {
-            const int j = __shfl_sync(0xFFFFFFFFu, mine, p);
+        for (int p = 0; p < BATCH; ++p) {
+            const int j = BATCH == 1 ? mine : __shfl_sync(0xFFFFFFFFu, mine, p);
             if (p < batch && xv != 0) {
                 a[p] += xv * (z[(long long)j * n_genes + lane] - zi);
                 if constexpr (!UNIFORM)
@@ -94,7 +97,7 @@ __global__ void autocorr_sums_kernel(const T* __restrict__ x,
         }
     }
 #pragma unroll
-    for (int p = 0; p < AUTOCORR_BATCH; ++p) {
+    for (int p = 0; p < BATCH; ++p) {
         if (p < batch && lane < n_genes) {
             atomicAdd(&block_sums[p * stride + lane], a[p]);
             if constexpr (!UNIFORM)
@@ -107,6 +110,37 @@ __global__ void autocorr_sums_kernel(const T* __restrict__ x,
         if (g < n_genes)
             atomicAdd(&out[((long long)first * terms + t / 32) * n_genes + g],
                       block_sums[t]);
+    }
+}
+
+// A warp scatters one sorted CSR row into the requested contiguous gene blocks.
+template <typename T, typename P>
+__global__ void autocorr_csr_blocks_kernel(const P* indptr, const int* indices,
+                                           const T* data, int n, int first,
+                                           int blocks, int width, T* out) {
+    const long long row =
+        ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (row >= n) return;
+    const int lane = threadIdx.x & 31;
+    const P end = indptr[row + 1];
+    P lo = indptr[row];
+    if (lane == 0 && first) {
+        P hi = end;
+        while (lo < hi) {
+            const P mid = lo + (hi - lo) / 2;
+            if (indices[mid] < first)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+    }
+    lo = __shfl_sync(0xFFFFFFFFu, lo, 0);
+    for (long long k = (long long)lo + lane; k < end; k += 32) {
+        const int g = indices[k] - first;
+        if (g >= (long long)blocks * width) break;
+        const int block = width == 32 ? g >> 5 : g / width;
+        out[((long long)block * n + row) * width + (g - block * width)] =
+            data[k];
     }
 }
 

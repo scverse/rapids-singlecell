@@ -349,6 +349,39 @@ def test_autocorr_permutation_ties(mode):
 
 
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
+def test_autocorr_one_permutation_sparse(mode, stat, monkeypatch):
+    from rapids_singlecell._cuda import _autocorr_cuda as _ac
+
+    rng = np.random.default_rng(12)
+    n, n_genes = 128, 321
+    monkeypatch.setattr("rapids_singlecell.squidpy_gpu._autocorr._CHUNK_BYTES", 32 << 10)
+    x = rng.integers(1, 12, (n, n_genes)) * (rng.random((n, n_genes)) < 0.12)
+    x[:, 0] = 0
+    x[-1, 0] = 1  # No edge points to this cell. Gene 0 ties under the shuffle.
+    csr = sparse.csr_matrix(x, dtype=np.float32)
+    parts = np.column_stack((0.25 * csr.data, 0.75 * csr.data))
+    adata = AnnData(sparse.csr_matrix((parts.ravel(), csr.indices.repeat(2), csr.indptr * 2), shape=x.shape))
+    cells = np.arange(n)
+    w = sparse.csr_matrix((np.ones(n), (cells, cells // 2)), shape=(n, n))
+    adata.obsp["spatial_connectivities"] = w
+    keys = np.random.default_rng(17).integers(0, 2**32, _ac.ROUNDS, dtype=np.uint32)
+    pi = cp.empty(n, dtype=cp.int32)
+    _ac.permutation(cp.asarray(keys), out=pi)
+    observed = _reference(x, w, mode)
+    tied = _reference(x, w[pi.get()], mode) == observed
+    assert tied[0] and not tied.all()
+
+    for cols in (np.arange(n_genes), np.arange(0, n_genes, 7)[::-1]):
+        genes = adata.var_names[cols]
+        result = spatial_autocorr(adata, genes=genes, mode=mode, n_perms=1, seed=17, multi_gpu=False, copy=True)
+        result = result.loc[genes]
+        np.testing.assert_allclose(result[stat], observed[cols], atol=1e-12)
+        np.testing.assert_array_equal(result["var_sim"], 0)
+        np.testing.assert_array_equal(result["pval_sim"], 0.5)
+        np.testing.assert_equal(result["pval_z_sim"].to_numpy(), np.where(tied[cols], np.nan, 0.0))
+
+
+@pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_autocorr_large_offset(mode, stat, dtype):
     rng = np.random.default_rng(17)

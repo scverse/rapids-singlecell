@@ -16,7 +16,7 @@ from scipy import sparse
 from statsmodels.stats.multitest import multipletests
 
 from rapids_singlecell._cuda import _autocorr_cuda as _ac
-from rapids_singlecell._utils import _array_to_device, _copy_to_device, parse_device_ids
+from rapids_singlecell._utils import _copy_to_device, parse_device_ids
 
 from ._spatial_data import _extract_adata
 from ._utils import _check_precision_issues, _g_moments, _p_value_calc
@@ -64,7 +64,7 @@ def _to_gpu_csr(matrix, dtype):
         return sparse_gpu.csr_matrix(matrix, dtype=dtype)
     host = matrix.tocsr()
     result = sparse_gpu.csr_matrix(
-        (_array_to_device(host.data, dtype), _array_to_device(host.indices), cp.asarray(host.indptr)),
+        (cp.asarray(host.data, dtype=dtype), cp.asarray(host.indices), cp.asarray(host.indptr)),
         shape=host.shape,
     )
     if getattr(host, "_has_canonical_format", False):
@@ -192,19 +192,34 @@ def _gene_block(source, cols, block_id, *, dtype, n, device_id):
             with cp.cuda.Device(source.device.id):
                 x = cp.ascontiguousarray(source[:, selection], dtype=dtype)
             return _copy_to_device(x, device_id)
-        return _array_to_device(np.asarray(source[:, selection], order="C", dtype=dtype))
+        return cp.asarray(source[:, selection], order="C", dtype=dtype)
     block = cp.zeros((n, len(cols)), dtype=dtype)
     for indices, values in source[block_id]:
         if isinstance(indices, cp.ndarray):
             indices = _copy_to_device(indices, device_id)
             values = _copy_to_device(values, device_id)
         else:
-            indices, values = _array_to_device(indices), _array_to_device(values)
+            indices, values = cp.asarray(indices), cp.asarray(values)
         block.ravel()[indices] = values
     return block
 
 
-def _block_scores(x, graph, row, col, keys, *, total, uniform, geary):
+def _csr_gene_blocks(matrix, first, count, width):
+    """Expand contiguous genes in bounded tiles laid out for the scoring kernels."""
+    n = matrix.shape[0]
+    tile_blocks = max(1, _CHUNK_BYTES // (n * width * matrix.dtype.itemsize))
+    indices = matrix.indices.astype(cp.int32, copy=False)
+    for start in range(0, count, tile_blocks * width):
+        remaining = min(count - start, tile_blocks * width)
+        tile = cp.zeros(((remaining + width - 1) // width, n, width), dtype=matrix.dtype)
+        _ac.csr_blocks(
+            matrix.indptr, indices, matrix.data, first=first + start, out=tile, stream=cp.cuda.get_current_stream().ptr
+        )
+        for offset, block in enumerate(tile):
+            yield cp.ascontiguousarray(block[:, : remaining - offset * width])
+
+
+def _block_scores(x, graph, row, col, keys, *, total, uniform, geary, permutation=None):
     """Return the observed scores and the change under each permutation of graph rows."""
     n, n_genes = x.shape
     stream = cp.cuda.get_current_stream().ptr
@@ -222,7 +237,7 @@ def _block_scores(x, graph, row, col, keys, *, total, uniform, geary):
     if keys is None:
         return observed, None
     out = cp.zeros((len(keys), 1 if uniform else 2, n_genes))
-    _ac.sums(x, z, row, keys, out=out, geary=geary, uniform=uniform, stream=stream)
+    _ac.sums(x, z, row, keys, out=out, geary=geary, uniform=uniform, stream=stream, permutation=permutation)
     a = out[:, 0]
     b = 0 if uniform else out[:, 1]
     change = (b - 2 * a) * scale if geary else (a - mean * b) / ss
@@ -363,6 +378,19 @@ def spatial_autocorr(
         owner = source.device.id
     elif sparse_gpu.issparse(source):
         owner = source.data.device.id
+    # A single device can read contiguous genes directly from resident CSR in scoring order.
+    tiled_csr = (
+        keys is not None
+        and len(devices) == 1
+        and devices[0] == owner
+        and n_genes > width
+        and 8 * n_genes >= source.shape[1]
+        and cols[-1] - cols[0] + 1 == n_genes
+        and getattr(source, "format", None) == "csr"
+        and source.shape[1] < 2**31
+        and source.nnz * (itemsize + source.indices.itemsize) + source.indptr.nbytes + 2 * _CHUNK_BYTES
+        < cp.cuda.Device(owner).mem_info[0] // 4
+    )
     # For wide, resident sparse panels the analytic score can walk only expressed cells.
     # CSC conversion and symmetrizing the weights need scratch proportional to their nonzeros.
     wide_sparse = (
@@ -396,7 +424,13 @@ def spatial_autocorr(
         del weights, symmetric
     else:
         with cp.cuda.Device(owner):
-            vals = _gene_source(source, cols, width, compute_dtype)
+            if tiled_csr:
+                vals = _to_gpu_csr(source, compute_dtype)
+                if not vals.has_canonical_format:
+                    vals = vals.copy()
+                    vals.sum_duplicates()
+            else:
+                vals = _gene_source(source, cols, width, compute_dtype)
     del adj
 
     results = np.empty((1 if keys is None else 4, n_genes), dtype=np.float64)
@@ -430,9 +464,19 @@ def spatial_autocorr(
                 return
             c = _copy_to_device(col, device_id)
             k = None if keys is None else cp.asarray(keys)
+            permutation = None
+            if n_perms == 1 and n * np.dtype(np.int32).itemsize < cp.cuda.Device(device_id).mem_info[0] // 4:
+                permutation = cp.empty(n, dtype=cp.int32)
+                _ac.permutation(k[0], out=permutation, stream=cp.cuda.get_current_stream().ptr)
+            if tiled_csr:
+                tiles = _csr_gene_blocks(vals, int(cols[0]), n_genes, width)
             for block_id in mine:
                 slots = slice(block_id * width, (block_id + 1) * width)
-                x = _gene_block(vals, cols[slots], block_id, dtype=compute_dtype, n=n, device_id=device_id)
+                x = (
+                    next(tiles)
+                    if tiled_csr
+                    else _gene_block(vals, cols[slots], block_id, dtype=compute_dtype, n=n, device_id=device_id)
+                )
                 observed, change = _block_scores(
                     x,
                     w,
@@ -442,10 +486,13 @@ def spatial_autocorr(
                     total=moments[0],
                     uniform=uniform,
                     geary=mode == "geary",
+                    permutation=permutation,
                 )
                 del x  # Release this dense block before allocating the next one.
                 if change is None:
                     results[0, slots] = observed.get()
+                elif n_perms == 1:
+                    results[[0, 2], slots] = cp.stack((observed, change[0])).get()
                 else:
                     results[:, slots] = cp.stack(
                         (
@@ -474,6 +521,11 @@ def spatial_autocorr(
                 future.result()
     elif devices:
         run(devices[0], blocks)
+    if n_perms == 1:
+        change = results[2]
+        results[1] = results[0] + change >= results[0]
+        with np.errstate(invalid="ignore"):
+            results[3] = change - change
     score = results[0]
     _check_precision_issues(score, compute_dtype)
 
