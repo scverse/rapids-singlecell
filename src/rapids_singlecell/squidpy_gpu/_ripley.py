@@ -8,9 +8,8 @@ import pandas as pd
 from scipy.spatial import ConvexHull
 
 from rapids_singlecell._cuda import _spatial_cuda
-from rapids_singlecell._utils import _create_category_index_mapping
 
-from ._co_oc import _co_occurrence_gpu
+from ._co_oc import _count_spatial_tiles
 from ._spatial_data import _extract_adata
 from ._spatial_neighbors_backend import _build_kdtree
 from ._utils import _assert_categorical_obs, _assert_spatial_basis
@@ -18,9 +17,6 @@ from ._utils import _assert_categorical_obs, _assert_spatial_basis
 if TYPE_CHECKING:
     from anndata import AnnData
     from spatialdata import SpatialData
-
-# Libraries per pair-count launch; its counts buffer grows with the square.
-_PAIR_CHUNK = 128
 
 
 def ripley(
@@ -267,30 +263,9 @@ def _pair_counts(points: cp.ndarray, codes: cp.ndarray, n_libraries: int, suppor
     # Centering keeps more float32 bits; distances do not change.
     points = (points - points.mean(axis=0)).astype(cp.float32)
     thresholds = cp.asarray(support**2, dtype=cp.float32)
-    device = cp.cuda.Device().id
-    counts = np.empty((n_libraries, len(support)), dtype=np.int64)
-    for start in range(0, n_libraries, _PAIR_CHUNK):
-        stop = min(start + _PAIR_CHUNK, n_libraries)
-        in_chunk = (codes >= start) & (codes < stop)
-        chunk_points = cp.ascontiguousarray(points[in_chunk])
-        cat_offsets, cell_indices = _create_category_index_mapping(codes[in_chunk] - start, stop - start)
-        diagonal = cp.arange(stop - start, dtype=cp.int32)
-        chunk, ok = _co_occurrence_gpu(
-            spatial=chunk_points,
-            thresholds=thresholds,
-            cat_offsets=cat_offsets,
-            cell_indices=cell_indices,
-            pair_left=diagonal,
-            pair_right=diagonal,
-            n_cells=len(chunk_points),
-            k=stop - start,
-            l_val=len(support),
-            device_ids=[device],
-        )
-        if not ok:
-            raise ValueError(f"`n_steps={len(support)}` needs more shared memory than the GPU provides for Ripley's L.")
-        counts[start:stop] = chunk[diagonal, diagonal].get()
-    return counts
+    return _count_spatial_tiles(
+        points, codes, thresholds, n_libraries, [points.device.id], within_categories=True
+    ).get()
 
 
 def _reshape_res(results: np.ndarray, columns: np.ndarray, index: np.ndarray, var_name: str) -> pd.DataFrame:

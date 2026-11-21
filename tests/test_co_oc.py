@@ -4,11 +4,14 @@ from pathlib import Path
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import pytest
 from anndata import AnnData, read_h5ad
 
+from rapids_singlecell._cuda import _cooc_cuda
+from rapids_singlecell.squidpy_gpu import _co_oc
 from rapids_singlecell.squidpy_gpu._co_oc import (
-    _co_occurrence_helper,
+    _count_spatial_tiles,
     _find_min_max,
     co_occurrence,
 )
@@ -64,85 +67,221 @@ def test_co_occurrence_explicit_interval(adata: AnnData, size: int):
         cp.testing.assert_allclose(interval, interval_1)  # allclose because in the func, we use f32
 
 
-def test_co_occurrence_fast_kernel():
-    n = 100  # number of points
-    k = 5  # number of labels
-    # Generate random data
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    thresholds = cp.asarray(np.array([0.1, 0.2, 0.3], dtype=np.float32))
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
-    occ_prob_fast = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True)
-    cp.cuda.Stream.null.synchronize()
-    occ_prob_slow = _co_occurrence_helper(spatial, thresholds, label_idx, fast=False)
-    cp.testing.assert_allclose(occ_prob_fast, occ_prob_slow)
+@pytest.mark.parametrize("n", [1, 2])
+def test_co_occurrence_smallest_inputs(n):
+    adata = AnnData(shape=(n, 0))
+    adata.obsm["spatial"] = np.arange(n, dtype=np.float32)[:, None]
+    adata.obs["cluster"] = pd.Categorical(np.zeros(n, dtype=int))
+    occ, interval = co_occurrence(adata, "cluster", interval=3, multi_gpu=False, copy=True)
+
+    expected = (interval[1:] >= 1).astype(np.float32) if n == 2 else np.zeros(2)
+    np.testing.assert_array_equal(occ[0, 0], expected)
+
+
+@pytest.mark.parametrize(
+    ("spatial", "labels", "lower", "upper", "keys"),
+    [
+        ((0, 3), 0, 3, 3, 0),
+        ((2, 0), 2, 0, 0, 2),
+        ((2, 3), 1, 3, 3, 2),
+        ((2, 3), 2, 2, 3, 2),
+        ((2, 3), 2, 3, 2, 2),
+        ((2, 3), 2, 3, 3, 1),
+    ],
+)
+def test_spatial_keys_rejects_inconsistent_shapes(spatial, labels, lower, upper, keys):
+    with pytest.raises(ValueError, match="spatial_keys"):
+        _cooc_cuda.spatial_keys(
+            cp.zeros(spatial, cp.float32),
+            cp.zeros(labels, cp.int32),
+            cp.zeros(lower, cp.float32),
+            cp.ones(upper, cp.float32),
+            cp.empty(keys, cp.uint64),
+            cp.cuda.get_current_stream().ptr,
+        )
+
+
+@pytest.fixture
+def tile_inputs():
+    points = cp.zeros((1, 3), cp.float32)
+    offsets = cp.asarray([0, 1], cp.int32)
+    tiles = cp.empty((1, _cooc_cuda.TILE_BYTES), cp.uint8)
+    bounds = cp.empty((1, 3, 2), cp.float32)
+    return points, offsets, tiles, bounds, cp.cuda.get_current_stream().ptr
+
+
+def test_build_tiles_rejects_inconsistent_shapes(tile_inputs):
+    points, offsets, tiles, bounds, stream = tile_inputs
+    with pytest.raises(ValueError, match="build_tiles"):
+        _cooc_cuda.build_tiles(points, offsets, offsets, tiles[:, :-1], bounds, stream)
+    with pytest.raises(ValueError, match="build_tiles"):
+        _cooc_cuda.build_tiles(points, offsets, offsets, tiles, bounds.reshape(1, 2, 3), stream)
+
+
+@pytest.mark.parametrize(
+    ("bins", "count_shape"),
+    [(0, (2, 0)), (3, (2, 2)), (3, (2, 2, 2)), (3, (2, 1, 3)), (3, (6,))],
+)
+def test_count_tiles_rejects_inconsistent_shapes(tile_inputs, bins, count_shape):
+    points, offsets, tiles, bounds, stream = tile_inputs
+    _cooc_cuda.build_tiles(points, offsets, offsets, tiles, bounds, stream)
+    thresholds = cp.zeros(bins, cp.float32)
+    counts = cp.zeros(count_shape, cp.uint64)
+    with pytest.raises(ValueError, match="count_tiles"):
+        _cooc_cuda.count_tiles(points, tiles, bounds, thresholds, counts, 0, 1, stream)
+
+
+@pytest.mark.parametrize(
+    ("buffer", "shape"),
+    [
+        ("counts", (4, 3)),
+        ("counts", (2, 1, 3)),
+        ("counts", (2, 2, 1)),
+        ("order", (2,)),
+        ("order", (1, 3)),
+        ("marginals", (6,)),
+        ("marginals", (2, 3)),
+        ("out", (4, 3)),
+        ("out", (3, 2, 2)),
+    ],
+)
+def test_normalize_rejects_inconsistent_shapes(buffer, shape):
+    shapes = {"counts": (2, 2, 3), "order": (3,), "marginals": (3, 2), "out": (2, 2, 3)}
+    shapes[buffer] = shape
+    with pytest.raises(ValueError, match="normalize"):
+        _cooc_cuda.normalize(
+            cp.zeros(shapes["counts"], cp.uint64),
+            cp.arange(np.prod(shapes["order"]), dtype=cp.int64).reshape(shapes["order"]),
+            cp.empty(shapes["marginals"], cp.float32),
+            cp.empty(shapes["out"], cp.float32),
+            cp.cuda.get_current_stream().ptr,
+        )
+
+
+def _reference_counts(points, labels, thresholds):
+    i, j = np.triu_indices(len(points), k=1)
+    with np.errstate(invalid="ignore"):
+        distances = np.square(points[i] - points[j]).sum(axis=1)
+    k = int(labels.max()) + 1
+    pairs = np.minimum(labels[i], labels[j]) * k + np.maximum(labels[i], labels[j])
+    counts = [np.bincount(pairs[distances <= threshold], minlength=k * k) for threshold in thresholds]
+    return np.stack(counts, axis=-1).reshape(k, k, len(thresholds))
+
+
+@pytest.mark.parametrize("dims", [1, 2, 3, 7])
+def test_spatial_tiles_count_partial_and_empty_categories(dims):
+    rng = np.random.default_rng(42)
+    points = rng.integers(0, 32, size=(75, dims)).astype(np.float32)
+    labels = rng.permutation(np.repeat([0, 2], [34, 41])).astype(np.int32)
+    thresholds = np.arange(513, dtype=np.float32)
+    counts = _count_spatial_tiles(cp.asarray(points), cp.asarray(labels), cp.asarray(thresholds), 3, [0]).get()
+
+    np.testing.assert_array_equal(counts, _reference_counts(points, labels, thresholds))
+
+
+def test_spatial_tiles_scan_with_one_count_buffer(cupy_pool):
+    k = 64
+    thresholds = cp.arange(1024, dtype=cp.float32)
+    points = cp.arange(3, dtype=cp.float32)[:, None]
+    labels = cp.asarray([0, k - 1, k - 1], dtype=cp.int32)
+    count_bytes = k * k * len(thresholds) * np.dtype(np.uint64).itemsize
+    cupy_pool.set_limit(size=count_bytes * 3 // 2)
+
+    counts = _count_spatial_tiles(points, labels, thresholds, k, [points.device.id])
+
+    expected = np.searchsorted([1, 4], np.arange(len(thresholds)), side="right")
+    np.testing.assert_array_equal(counts[0, -1].get(), expected)
+
+
+@pytest.mark.parametrize("scan_limit", [512, 1026])
+def test_spatial_tiles_scan_in_batches(monkeypatch, scan_limit):
+    thresholds = np.arange(513, dtype=np.float32)
+    points = np.arange(6, dtype=np.float32)[:, None]
+    labels = np.repeat(np.arange(3, dtype=np.int32), 2)
+    monkeypatch.setattr(_co_oc, "_MAX_SCAN_ELEMENTS", scan_limit)
+    cumsum = cp.cumsum
+
+    def bounded_cumsum(a, axis=None, out=None):
+        if a.dtype == cp.uint64:
+            assert out.data.ptr == a.data.ptr
+            if axis is not None:
+                assert a.size <= scan_limit
+        return cumsum(a, axis=axis, out=out)
+
+    monkeypatch.setattr(cp, "cumsum", bounded_cumsum)
+    counts = _count_spatial_tiles(cp.asarray(points), cp.asarray(labels), cp.asarray(thresholds), 3, [0])
+    np.testing.assert_array_equal(counts.get(), _reference_counts(points, labels, thresholds))
+
+
+def test_spatial_tiles_skip_idle_devices(monkeypatch):
+    points = cp.zeros((2, 2), dtype=cp.float32)
+    labels = cp.zeros(2, dtype=cp.int32)
+    source = points.device.id
+    copy_inputs = _co_oc._copies_on_device
+
+    def copy_to_active_device(arrays, device):
+        assert device == source, "copied inputs to a GPU with no tile rows"
+        return copy_inputs(arrays, device)
+
+    monkeypatch.setattr(_co_oc, "_copies_on_device", copy_to_active_device)
+    counts = _count_spatial_tiles(points, labels, cp.zeros(1, dtype=cp.float32), 1, [source, source + 1])
+
+    np.testing.assert_array_equal(counts.get(), [[[1]]])
+
+
+@pytest.mark.parametrize("dims", [2, 3])
+def test_co_occurrence_nonfinite_coordinates_and_signed_radii(dims):
+    points = np.zeros((9, dims), dtype=np.float32)
+    points[:, -1] = [0, 0, 1, 2, 4, np.inf, np.inf, -np.inf, np.nan]
+    labels = np.array([0, 1, 1, 0, 128, 0, 128, 1, 128], dtype=np.int32)
+    radii = np.array([-8, -4, -1, 0, 1, np.inf, np.nan], dtype=np.float32)
+    adata = AnnData(shape=(len(points), 0))
+    adata.obsm["spatial"] = points
+    adata.obs["cluster"] = pd.Categorical.from_codes(labels, categories=range(labels.max() + 1))
+    occ, interval = co_occurrence(adata, "cluster", interval=radii, multi_gpu=False, copy=True)
+
+    np.testing.assert_array_equal(interval, radii)
+    counts = _reference_counts(points, labels, radii[1:] ** 2).astype(np.float64)
+    directed = counts + counts.swapaxes(0, 1)
+    marginal = directed.sum(axis=0)
+    denominator = marginal[:, None, :] * marginal[None, :, :]
+    expected = np.divide(
+        directed * directed.sum(axis=(0, 1)), denominator, out=np.zeros_like(directed), where=denominator != 0
+    )
+    np.testing.assert_allclose(occ, expected, rtol=1e-6)
+
+
+def test_co_occurrence_coincident_cells_and_radius_ties():
+    # The first cluster contributes more than 2**32 unordered pairs at radius zero.
+    n = 100_001
+    spatial = cp.zeros((n + 2, 2), dtype=cp.float32)
+    spatial[n:] = cp.asarray([3, 4])
+    labels = cp.zeros(n + 2, dtype=cp.int32)
+    labels[n:] = 1
+    below_five = np.nextafter(np.float32(5), np.float32(0))
+    radii = cp.asarray([0, 0, below_five, 5, 5], dtype=cp.float32)
+    counts = _count_spatial_tiles(spatial, labels, radii[1:] ** 2, 2, [0]).get()
+    for i, cross_pairs in enumerate([0, 0, 2 * n, 2 * n]):
+        expected = np.array([[n * (n - 1) // 2, cross_pairs], [0, 1]], dtype=np.uint64)
+        np.testing.assert_array_equal(counts[:, :, i], expected)
 
 
 @pytest.mark.two_gpus
-def test_co_occurrence_multi_gpu_matches_single_gpu():
-    """Multi-GPU results should match single GPU with large dataset (>=100k cells)."""
-    n = 100_000  # Must be >= 100k to trigger multi-GPU dispatch
-    k = 6  # number of labels
-    # Generate random data
-    np.random.seed(42)
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    thresholds = cp.asarray(np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32))
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
+@pytest.mark.parametrize("devices", [[1], [1, 0]])
+def test_co_occurrence_uses_requested_devices(adata: AnnData, devices, monkeypatch):
+    single, _ = co_occurrence(adata, "leiden", copy=True, multi_gpu=False)
+    count_tiles = _cooc_cuda.count_tiles
+    launched = []
 
-    # Single GPU result (explicitly request 1 GPU)
-    occ_prob_single = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=[0])
-    cp.cuda.Stream.null.synchronize()
+    def record_device(*args):
+        launched.append(cp.cuda.Device().id)
+        return count_tiles(*args)
 
-    # Multi-GPU result (uses all available GPUs)
-    n_gpus = cp.cuda.runtime.getDeviceCount()
-    device_ids = list(range(n_gpus))
-    occ_prob_multi = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=device_ids)
-    cp.cuda.Stream.null.synchronize()
+    monkeypatch.setattr(_cooc_cuda, "count_tiles", record_device)
+    actual, _ = co_occurrence(adata, "leiden", copy=True, multi_gpu=devices)
 
-    cp.testing.assert_allclose(occ_prob_multi, occ_prob_single)
-
-
-@pytest.mark.two_gpus
-def test_co_occurrence_multi_gpu_with_device_list():
-    """Test with specific device IDs on large dataset."""
-    n = 100_000  # Must be >= 100k to trigger multi-GPU dispatch
-    k = 4  # number of labels
-    np.random.seed(123)
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    thresholds = cp.asarray(np.array([0.15, 0.25, 0.35], dtype=np.float32))
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
-
-    # Use multiple GPUs with explicit device list
-    n_gpus = cp.cuda.runtime.getDeviceCount()
-    device_ids = list(range(n_gpus))
-    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=device_ids)
-    cp.cuda.Stream.null.synchronize()
-
-    # Verify output shape
-    assert occ_prob.shape == (k, k, len(thresholds) - 1)
-
-    # Verify results are finite
-    assert cp.all(cp.isfinite(occ_prob))
-
-
-def test_co_occurrence_small_dataset_uses_single_gpu():
-    """Test that small datasets (<100k cells) use single GPU path."""
-    n = 1000  # Small dataset
-    k = 5
-    np.random.seed(456)
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    thresholds = cp.asarray(np.array([0.1, 0.2, 0.3], dtype=np.float32))
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
-
-    # Even with multiple GPUs requested, small dataset should work correctly
-    n_gpus = cp.cuda.runtime.getDeviceCount()
-    device_ids = list(range(n_gpus))
-    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=device_ids)
-    cp.cuda.Stream.null.synchronize()
-
-    # Verify output shape
-    assert occ_prob.shape == (k, k, len(thresholds) - 1)
-    # Verify results are finite
-    assert cp.all(cp.isfinite(occ_prob))
+    assert sorted(launched) == sorted(devices)
+    np.testing.assert_array_equal(actual, single)
 
 
 def test_co_occurrence_with_multi_gpu_param(adata: AnnData):
@@ -150,7 +289,6 @@ def test_co_occurrence_with_multi_gpu_param(adata: AnnData):
     # Test with multi_gpu=False (single GPU)
     arr_single, interval_single = co_occurrence(adata, cluster_key="leiden", copy=True, multi_gpu=False)
 
-    # Test with multi_gpu=True (all GPUs - but small dataset so uses single GPU path)
     arr_multi, interval_multi = co_occurrence(adata, cluster_key="leiden", copy=True, multi_gpu=True)
 
     # Results should match
@@ -173,85 +311,3 @@ def test_find_min_max():
     # thresh_max is half the max pairwise distance
     assert np.isfinite(float(thresh_min))
     assert np.isfinite(float(thresh_max))
-
-
-def test_co_occurrence_large_interval():
-    """Test co_occurrence with large interval (many bins) to test kernel adaptation."""
-    n = 500
-    k = 3
-    np.random.seed(789)
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    # Large number of bins - kernel should adapt or fallback gracefully
-    thresholds = cp.linspace(0.05, 0.95, 200, dtype=np.float32)
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
-
-    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True)
-    cp.cuda.Stream.null.synchronize()
-
-    # Verify output shape (l_val = len(thresholds) - 1 = 199)
-    assert occ_prob.shape == (k, k, len(thresholds) - 1)
-    # Verify results are finite
-    assert cp.all(cp.isfinite(occ_prob))
-
-
-def test_co_occurrence_single_gpu_large_dataset():
-    """Test single GPU path with large dataset (>=100k cells)."""
-    n = 100_000
-    k = 5
-    np.random.seed(999)
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    thresholds = cp.asarray(np.array([0.1, 0.2, 0.3], dtype=np.float32))
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
-
-    # Explicitly use single GPU
-    occ_prob = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=[0])
-    cp.cuda.Stream.null.synchronize()
-
-    # Verify output shape
-    assert occ_prob.shape == (k, k, len(thresholds) - 1)
-    # Verify results are finite
-    assert cp.all(cp.isfinite(occ_prob))
-
-
-@pytest.mark.parametrize(
-    "n,k,expected_block_size",
-    [
-        # <2.5k cells/cat → 128 threads
-        (500, 5, 128),
-        # ~3k cells/cat → 256 threads
-        (15000, 5, 256),
-        # ~6k cells/cat → 512 threads
-        (30000, 5, 512),
-        # ~20k cells/cat → 1024 threads
-        (100000, 5, 1024),
-    ],
-)
-def test_co_occurrence_block_sizes(n, k, expected_block_size):
-    """Test kernel works correctly with different block sizes.
-
-    Block size is determined by cells per category:
-    - >=10k cells/cat -> 1024 threads
-    - >=5k cells/cat -> 512 threads
-    - >=2.5k cells/cat -> 256 threads
-    - <2.5k cells/cat -> 128 threads
-    """
-    np.random.seed(42)
-    spatial = cp.asarray(np.random.rand(n, 2).astype(np.float32))
-    thresholds = cp.asarray(np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32))
-    label_idx = cp.asarray(np.random.randint(0, k, size=n, dtype=np.int32))
-
-    # Run fast kernel
-    occ_prob_fast = _co_occurrence_helper(spatial, thresholds, label_idx, fast=True, device_ids=[0])
-    cp.cuda.Stream.null.synchronize()
-
-    # Run slow (pairwise) kernel as reference
-    occ_prob_slow = _co_occurrence_helper(spatial, thresholds, label_idx, fast=False, device_ids=[0])
-    cp.cuda.Stream.null.synchronize()
-
-    # Verify results match
-    cp.testing.assert_allclose(occ_prob_fast, occ_prob_slow, rtol=1e-5, atol=1e-5)
-
-    # Verify output shape
-    assert occ_prob_fast.shape == (k, k, len(thresholds) - 1)
-    # Verify results are finite
-    assert cp.all(cp.isfinite(occ_prob_fast))
