@@ -150,6 +150,41 @@ def test_in_memory_sparse_covariance_reproducible(dtype):
     np.testing.assert_allclose(scores, dense @ components.T, rtol=tol, atol=tol)
 
 
+def test_sparse_pca_binding_dimensions():
+    from rapids_singlecell._cuda import _spca_cuda as kernels
+
+    ptr = cp.asarray([0, 1], dtype=cp.int32)
+    cols = cp.zeros(1, dtype=cp.int32)
+    data = cp.ones(1, dtype=cp.float32)
+    stream = cp.cuda.get_current_stream().ptr
+    tile = data.reshape(1, 1)
+    with pytest.raises(ValueError, match="pca_project_csr"):
+        kernels.pca_project_csr(ptr, cols, data, cp.empty((1, 2), data.dtype), data, tile, stream)
+    with pytest.raises(ValueError, match="pca_column_sums"):
+        kernels.pca_column_sums(ptr, cols, data, cp.empty(1, dtype=cp.float64), stream)
+    with pytest.raises(ValueError, match="pca_center_csr"):
+        kernels.pca_center_csr(ptr[:1], cols, data, data.astype(cp.float64), tile, stream)
+    with pytest.raises(ValueError, match="ordered_gram"):
+        kernels.ordered_gram(ptr, cols, data, ptr, cols, data, cp.empty((1, 0, 1), data.dtype), stream)
+
+
+def test_sparse_pca_empty_kernel_inputs():
+    from rapids_singlecell._cuda import _spca_cuda as kernels
+
+    ptr = cp.zeros(1, dtype=cp.int32)
+    cols = cp.empty(0, dtype=cp.int32)
+    data = cp.empty(0, dtype=cp.float32)
+    stream = cp.cuda.get_current_stream().ptr
+    limits = cp.zeros(2, dtype=cp.uint32)
+    kernels.gram_bounds(data, limits, stream)
+    cp.testing.assert_array_equal(limits, [0, 0])
+    gram = cp.full((2, 2), cp.nan, dtype=cp.float32)
+    kernels.integer_gram(ptr, cols, data, cp.zeros((1, 3), dtype=cp.int64), gram, 0, 0, stream)
+    cp.testing.assert_array_equal(gram, cp.zeros_like(gram))
+    kernels.pca_column_sums(ptr, cols, data, cp.empty((0, 2), dtype=cp.float64), stream)
+    kernels.pca_center_csr(ptr, cols, data, cp.zeros(2, dtype=cp.float64), cp.empty((0, 2), data.dtype), stream)
+
+
 def test_tiled_pca_csr_centering():
     from rapids_singlecell._cuda import _spca_cuda
 
@@ -173,21 +208,22 @@ def test_tiled_pca_csr_centering():
     np.testing.assert_array_equal(tile.get(), expected.astype(x.dtype))
 
 
-def test_tiled_pca_csr_duplicates():
+@pytest.mark.parametrize("column_offset", [0, 2**31])
+def test_tiled_pca_csr_duplicates(column_offset):
     from rapids_singlecell.preprocessing._sparse_pca._helper import _canonical_csr
 
     # Duplicate summation must retain the unit between opposite large entries.
     values = cp.asarray([2**30, 4, 1, 3, -(2**30), 0.125, 2**60, 0.125], dtype=cp.float32)
-    cols = cp.asarray([2, 1, 2, 0, 2, 1, 0, 1])
+    cols = cp.asarray([2, 1, 2, 0, 2, 1, 0, 1], dtype=cp.int64) + column_offset
     ptr = cp.asarray([0, 5, 5, 8, 8])
-    x = cusparse.csr_matrix((values, cols, ptr), shape=(4, 3))
+    x = cusparse.csr_matrix((values, cols, ptr), shape=(4, column_offset + 3))
     x.indices, x.indptr = cols.astype(cp.int64), ptr.astype(cp.int64)
     for _ in range(2):
         canonical = _canonical_csr(x)
         indptr, indices, data = canonical.indptr, canonical.indices, canonical.data
         assert indptr.dtype == indices.dtype == cp.int64
         np.testing.assert_array_equal(indptr.get(), [0, 3, 3, 5, 5])
-        np.testing.assert_array_equal(indices.get(), [0, 1, 2, 0, 1])
+        np.testing.assert_array_equal(indices.get(), np.array([0, 1, 2, 0, 1]) + column_offset)
         np.testing.assert_array_equal(data.get(), [3, 4, 1, 2**60, 0.25])
     np.testing.assert_array_equal(x.indices.get(), cols.get())
     np.testing.assert_array_equal(x.indptr.get(), ptr.get())
@@ -214,6 +250,23 @@ def test_sparse_pca_fixed_projection(dtype, index_dtype, pcs):
     np.testing.assert_allclose(
         scores, (x.astype(np.float64) - mean) @ weights, atol=5e-5 if dtype == np.float32 else 1e-12
     )
+
+
+def test_tensorcore_gram_small_slabs_and_cancellation():
+    from rapids_singlecell._cuda import _spca_cuda
+
+    x = np.tile(np.array([[3.75], [-3.75]], dtype=np.float32), (2048, 3))
+    x[:32] = np.tile([[16384], [-16384]], (16, 3))
+    # The first feature's small slabs each contribute less than half an ULP
+    # of its first slab. The other two features also cancel a large cross term.
+    x[-32:, 1] = x[:32, 1]
+    x[-32:, 2] = -x[:32, 2]
+    reference = x.astype(np.float64)
+    planes = cp.empty((2, 4096, 64), dtype=cp.uint16)
+    ranges = cp.empty((2, 3), dtype=cp.uint32)
+    gram = cp.zeros((3, 3), dtype=cp.float64)
+    _spca_cuda.gram_tensorcore(cp.asarray(x), planes, ranges, gram, cp.cuda.get_current_stream().ptr)
+    np.testing.assert_array_equal(gram.get(), np.triu(reference.T @ reference))
 
 
 def test_tensorcore_gram_partial_tiles_and_exceptional_features():
@@ -305,6 +358,9 @@ def test_sparse_gram_wide_range(dtype):
     gpu_x = cusparse.csr_matrix(cp.asarray(x))
     assert _integer_scale(gpu_x, cp.cuda.get_current_stream().ptr) is None
     expected = np.triu(x.T @ x)
+    np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), expected)
+    gpu_x.indices = gpu_x.indices.astype(cp.int64)
+    gpu_x.indptr = gpu_x.indptr.astype(cp.int64)
     np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), expected)
     # The integer conversion must also exclude a product overflowing the input dtype.
     limit = 2.0 ** (np.finfo(dtype).maxexp // 2)
@@ -547,6 +603,23 @@ def test_pca_shapes(solver):
 
     with pytest.raises(ValueError):
         rsc.pp.pca(adata, n_comps=100, svd_solver=solver)
+
+
+@pytest.mark.parametrize("use_csr", [False, True], ids=["dense", "csr"])
+def test_fp64_covariance_overflow_before_normalization(use_csr):
+    n = 4096
+    magnitude = 2.0**507
+    x = np.tile([[1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]], (n // 4, 1))
+    x[:, 0] *= magnitude
+    data = sparse.csr_matrix(x) if use_csr else x
+    scores, components, ratio, variance = rsc.pp.pca(
+        data, n_comps=2, svd_solver="covariance_eigh", dtype="float64", return_info=True
+    )
+    correction = n / (n if use_csr else n - 1)
+    np.testing.assert_allclose(variance[0] / magnitude**2, correction, rtol=1e-12)
+    np.testing.assert_allclose(variance[1], correction, rtol=1e-12)
+    np.testing.assert_allclose(ratio[0], 1.0, rtol=1e-12)
+    np.testing.assert_allclose(scores, x @ components.T, rtol=1e-12)
 
 
 def test_dense_covariance_input():

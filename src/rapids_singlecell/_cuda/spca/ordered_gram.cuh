@@ -192,6 +192,10 @@ void bind(nb::module_& m) {
         m.def("gram_bounds",
               [](gpu_array_c<const T, Device> data,
                  gpu_array_c<unsigned, Device> limits, std::uintptr_t stream) {
+                  nb_require(limits.ndim() == 1 && limits.size() == 2,
+                             "gram_bounds: expected two exponent limits");
+                  // The kernel updates the caller's zero-initialized maxima.
+                  if (!data.size()) return;
                   int grid = min((data.size() + 255) / 256, size_t(2048));
                   bounds<<<grid, 256, 0, (cudaStream_t)stream>>>(
                       data.data(), data.size(), limits.data());
@@ -204,15 +208,28 @@ void bind(nb::module_& m) {
            gpu_array_c<const T, Device> data,
            gpu_array_c<long long, Device> bins, gpu_array_c<T, Device> gram,
            int unit, int bits, std::uintptr_t stream) {
+            nb_require(ptr.ndim() == 1 && ptr.size() > 0 && col.ndim() == 1 &&
+                           data.ndim() == 1 && col.size() == data.size() &&
+                           gram.ndim() == 2 && gram.shape(0) == gram.shape(1),
+                       "integer_gram: invalid CSR arrays or Gram matrix");
             size_t n = ptr.size() - 1;
             int p = gram.shape(0);
+            nb_require(bins.ndim() == 2 && bins.shape(0) == 1 + (bits != 0) &&
+                           bins.shape(1) == size_t(p) * (p + 1) / 2,
+                       "integer_gram: incompatible packed triangle bins");
+            auto s = (cudaStream_t)stream;
+            if (!p) return;
+            if (!n) {
+                cuda_check(cudaMemsetAsync(gram.data(), 0, gram.nbytes(), s),
+                           "zero empty-row Gram matrix");
+                return;
+            }
             dim3 block = data.size() / n < 64 ? dim3(32, 4) : dim3(128);
             int grid = min((n + block.y - 1) / block.y, size_t(65535));
             int low_bits = bits == 64 ? 0 : bits;
             T scale = std::ldexp(1.0, -unit - low_bits),
               radix = std::ldexp(1.0, low_bits);
             auto counters = reinterpret_cast<unsigned long long*>(bins.data());
-            auto s = (cudaStream_t)stream;
             auto launch = [&](auto mode) {
                 accumulate<T, I, decltype(mode)::value>
                     <<<grid, block, 0, s>>>(ptr.data(), col.data(), data.data(),
@@ -230,23 +247,37 @@ void bind(nb::module_& m) {
                 bins.data(), gram.data(), p, T(std::ldexp(1.0, unit)), bits);
             CUDA_CHECK_LAST_ERROR(unpack);
         });
-    m.def("ordered_gram",
-          [](gpu_array_c<const I, Device> row_ptr,
-             gpu_array_c<const I, Device> cols,
-             gpu_array_c<const T, Device> values,
-             gpu_array_c<const I, Device> col_ptr,
-             gpu_array_c<const I, Device> rows,
-             gpu_array_c<const T, Device> transposed,
-             gpu_array_c<T, Device> partial, std::uintptr_t stream) {
-              int p = col_ptr.size() - 1;
-              if (!p) return;
-              int width = min(p, max_columns);
-              dim3 grid(p, partial.shape(0), (p + width - 1) / width);
-              upper<<<grid, warps * 32, width * warps * sizeof(T),
-                      (cudaStream_t)stream>>>(
-                  row_ptr.data(), cols.data(), values.data(), col_ptr.data(),
-                  rows.data(), transposed.data(), partial.data(), p, width);
-              CUDA_CHECK_LAST_ERROR(upper);
-          });
+    m.def("ordered_gram", [](gpu_array_c<const I, Device> row_ptr,
+                             gpu_array_c<const I, Device> cols,
+                             gpu_array_c<const T, Device> values,
+                             gpu_array_c<const I, Device> col_ptr,
+                             gpu_array_c<const I, Device> rows,
+                             gpu_array_c<const T, Device> transposed,
+                             gpu_array_c<T, Device> partial,
+                             std::uintptr_t stream) {
+        nb_require(
+            row_ptr.ndim() == 1 && row_ptr.size() > 0 && col_ptr.ndim() == 1 &&
+                col_ptr.size() > 0 && cols.ndim() == 1 && rows.ndim() == 1 &&
+                values.ndim() == 1 && transposed.ndim() == 1 &&
+                cols.size() == values.size() && rows.size() == values.size() &&
+                transposed.size() == values.size(),
+            "ordered_gram: incompatible CSR and CSC arrays");
+        int p = col_ptr.size() - 1;
+        nb_require(
+            partial.ndim() == 3 && partial.shape(0) > 0 &&
+                partial.shape(1) == p && partial.shape(2) == p,
+            "ordered_gram: expected a nonempty stack of square Gram matrices");
+        if (!p) return;
+        int width = min(p, max_columns);
+        int shared_bytes = width * warps * sizeof(T);
+        nb_require(shared_bytes <=
+                       device_attribute(cudaDevAttrMaxSharedMemoryPerBlock),
+                   "ordered_gram: shared memory exceeds the device limit");
+        dim3 grid(p, partial.shape(0), (p + width - 1) / width);
+        upper<<<grid, warps * 32, shared_bytes, (cudaStream_t)stream>>>(
+            row_ptr.data(), cols.data(), values.data(), col_ptr.data(),
+            rows.data(), transposed.data(), partial.data(), p, width);
+        CUDA_CHECK_LAST_ERROR(upper);
+    });
 }
 }  // namespace ordered_gram

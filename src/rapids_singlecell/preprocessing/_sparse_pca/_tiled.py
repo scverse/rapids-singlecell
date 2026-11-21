@@ -29,8 +29,8 @@ def _centered_tiles(X, mean):
         yield start, tile
 
 
-def _centered_gram(X, mean):
-    """Accumulate the upper triangle of the centered Gram matrix in row order."""
+def _centered_covariance(X, mean, divisor):
+    """Accumulate the upper covariance triangle in row order."""
     n_cols = X.shape[1]
     # Delegate explicit math settings such as strict FP32 to CuPy's matmul.
     tensor_gram = (
@@ -54,4 +54,18 @@ def _centered_gram(X, mean):
                 cublas.syrk("T", tile, out=gram, beta=1)
             else:
                 gram += tile.T @ tile
-    return gram
+        if X.dtype == cp.float64:
+            overflow = ~cp.isfinite(gram.diagonal())
+            if bool(overflow.any()):
+                # Divide overflowing columns by a power of two >= sqrt(divisor).
+                # Undo that scaling when normalizing each covariance entry.
+                shift = ((divisor - 1).bit_length() + 1) // 2
+                scale = cp.where(overflow, 2.0**-shift, 1.0)
+                gram.fill(0)
+                for _, tile in _centered_tiles(X, mean):
+                    tile *= scale
+                    cublas.syrk("T", tile, out=gram, beta=1)
+                gram *= 1 / (divisor * scale[:, None] * scale[None, :])
+                return gram
+    gram /= divisor
+    return gram.astype(X.dtype, copy=False)

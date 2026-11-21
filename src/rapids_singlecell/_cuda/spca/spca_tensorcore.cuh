@@ -9,6 +9,8 @@ namespace tensor_gram {
 constexpr int features = 64;
 constexpr int slab = 32;
 constexpr int threads = 128;
+constexpr int split_block_rows = 8;
+static_assert(slab % split_block_rows == 0);
 
 __global__ void feature_range(const float* x, unsigned* ranges, int n, int p) {
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -88,7 +90,7 @@ __global__ void upper(const float* x, const __half* hi, const __half* lo,
 
     __shared__ __align__(32) union {
         Panels panel;
-        float out[features][features];
+        float out[2][features][features];
         double partial[threads];
     } shared;
 #if __CUDA_ARCH__ >= 700
@@ -96,10 +98,13 @@ __global__ void upper(const float* x, const __half* hi, const __half* lo,
     using A = fragment<matrix_a, 16, 16, 16, __half, col_major>;
     using B = fragment<matrix_b, 16, 16, 16, __half, row_major>;
     using C = fragment<accumulator, 16, 16, 16, float>;
-    C sum[2][2];
+    C sum[2][2], error[2][2];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
-        for (int j = 0; j < 2; ++j) fill_fragment(sum[i][j], 0.f);
+        for (int j = 0; j < 2; ++j) {
+            fill_fragment(sum[i][j], 0.f);
+            fill_fragment(error[i][j], 0.f);
+        }
 
     for (int k = 0; k < n; k += slab) {
 #pragma unroll
@@ -147,16 +152,26 @@ __global__ void upper(const float* x, const __half* hi, const __half* lo,
 #pragma unroll
         for (int i = 0; i < 2; ++i)
             for (int j = 0; j < 2; ++j)
-                for (int f = 0; f < C::num_elements; ++f)
-                    sum[i][j].x[f] +=
+                for (int f = 0; f < C::num_elements; ++f) {
+                    // TwoSum keeps slab contributions below an ULP of the
+                    // running sum, including when later slabs cancel it.
+                    float a = sum[i][j].x[f];
+                    float b =
                         fmaf(residual[i][j].x[f], 0x1p-12f, main[i][j].x[f]);
+                    float s = a + b, b_round = s - a;
+                    error[i][j].x[f] += (a - (s - b_round)) + (b - b_round);
+                    sum[i][j].x[f] = s;
+                }
         __syncthreads();
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i)
-        for (int j = 0; j < 2; ++j)
-            store_matrix_sync(&shared.out[wy + i * 16][wz + j * 16], sum[i][j],
-                              features, mem_row_major);
+        for (int j = 0; j < 2; ++j) {
+            store_matrix_sync(&shared.out[0][wy + i * 16][wz + j * 16],
+                              sum[i][j], features, mem_row_major);
+            store_matrix_sync(&shared.out[1][wy + i * 16][wz + j * 16],
+                              error[i][j], features, mem_row_major);
+        }
     __syncthreads();
     for (int i = t; i < features * features; i += threads) {
         int a = y + i / features, b = z + i % features;
@@ -165,8 +180,9 @@ __global__ void upper(const float* x, const __half* hi, const __half* lo,
             (masks[2 + (i % features) / 32] & (1u << (i % 32)));
         if (a <= b && b < p && !exact) {
             int scale = scale_exponent(ranges[a]) + scale_exponent(ranges[b]);
-            gram[size_t(a) * p + b] +=
-                scalbn(double(shared.out[i / features][i % features]), scale);
+            double value = double(shared.out[0][i / features][i % features]) +
+                           shared.out[1][i / features][i % features];
+            gram[size_t(a) * p + b] += scalbn(value, scale);
         }
     }
 #endif
@@ -226,8 +242,9 @@ void bind(nb::module_& m) {
         CUDA_CHECK_LAST_ERROR(feature_range);
         __half* hi = reinterpret_cast<__half*>(planes.data());
         __half* lo = hi + planes.shape(1) * ld;
-        split<<<dim3((ld + 31) / 32, nr / 8), dim3(32, 8), 0, s>>>(
-            x.data(), ranges.data(), hi, lo, n, p, ld);
+        split<<<dim3((ld + 31) / 32, nr / split_block_rows),
+                dim3(32, split_block_rows), 0, s>>>(x.data(), ranges.data(), hi,
+                                                    lo, n, p, ld);
         CUDA_CHECK_LAST_ERROR(split);
         upper<<<dim3(ld / features, ld / features), threads, 0, s>>>(
             x.data(), hi, lo, ranges.data(), gram.data(), n, p, ld);

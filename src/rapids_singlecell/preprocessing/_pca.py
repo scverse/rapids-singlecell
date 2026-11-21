@@ -143,7 +143,8 @@ def pca(
             Choose automatically based on data type (see table above).
         `'covariance_eigh'`
             Eigendecomposition of the covariance matrix for dense, sparse, or Dask
-            input. In-memory inputs use deterministic covariance reductions.
+            input. In-memory dense input requires `zero_center=True`. For uncentered
+            dense input, use the default solver. In-memory covariance reductions are deterministic.
         `'lanczos'`
             Lanczos bidiagonalization with implicit restarts. Memory efficient for
             large sparse matrices (>8,000 features). Best singular value accuracy.

@@ -92,50 +92,70 @@ __global__ void pca_project_csr(const I* indptr, const I* columns,
 
 template <typename T, typename I, typename Device>
 void register_pca_tiles(nb::module_& m) {
-    m.def("pca_project_csr",
-          [](gpu_array_c<const I, Device> indptr,
-             gpu_array_c<const I, Device> columns,
-             gpu_array_c<const T, Device> data,
-             gpu_array_c<const T, Device> weights,
-             gpu_array_c<const T, Device> offset, gpu_array_c<T, Device> scores,
-             std::uintptr_t stream) {
-              size_t rows = scores.shape(0);
-              int pcs = scores.shape(1);
-              if (!rows || !pcs) return;
-              int width = pcs == 1 ? 1 : pcs <= 8 ? 4 : pcs <= 32 ? 8 : 16;
-              dim3 block(width, 32 / width, 8);
-              dim3 grid((rows + 7) / 8, (pcs + width - 1) / width);
-              pca_project_csr<<<grid, block, 0,
-                                reinterpret_cast<cudaStream_t>(stream)>>>(
-                  indptr.data(), columns.data(), data.data(), weights.data(),
-                  offset.data(), scores.data(), rows, pcs);
-              CUDA_CHECK_LAST_ERROR(pca_project_csr);
-          });
-    m.def("pca_column_sums",
-          [](gpu_array_c<const I, Device> indptr,
-             gpu_array_c<const I, Device> columns,
-             gpu_array_c<const T, Device> data,
-             gpu_array_c<double, Device> partial, std::uintptr_t stream) {
-              size_t n = indptr.size() - 1;
-              int genes = partial.shape(1);
-              dim3 grid(partial.shape(0),
-                        (genes + PCA_COL_BLOCK - 1) / PCA_COL_BLOCK);
-              pca_column_sums<<<grid, 128, 0,
-                                reinterpret_cast<cudaStream_t>(stream)>>>(
-                  indptr.data(), columns.data(), data.data(), partial.data(),
-                  genes, n);
-              CUDA_CHECK_LAST_ERROR(pca_column_sums);
-          });
-    m.def("pca_center_csr",
-          [](gpu_array_c<const I, Device> indptr,
-             gpu_array_c<const I, Device> columns,
-             gpu_array_c<const T, Device> data,
-             gpu_array_c<const double, Device> mean, gpu_array_c<T, Device> out,
-             std::uintptr_t stream) {
-              pca_center_csr<<<out.shape(0), 128, 0,
-                               reinterpret_cast<cudaStream_t>(stream)>>>(
-                  indptr.data(), columns.data(), data.data(), mean.data(),
-                  out.data(), out.shape(1));
-              CUDA_CHECK_LAST_ERROR(pca_center_csr);
-          });
+    m.def("pca_project_csr", [](gpu_array_c<const I, Device> indptr,
+                                gpu_array_c<const I, Device> columns,
+                                gpu_array_c<const T, Device> data,
+                                gpu_array_c<const T, Device> weights,
+                                gpu_array_c<const T, Device> offset,
+                                gpu_array_c<T, Device> scores,
+                                std::uintptr_t stream) {
+        nb_require(indptr.ndim() == 1 && columns.ndim() == 1 &&
+                       data.ndim() == 1 && columns.size() == data.size() &&
+                       scores.ndim() == 2 && weights.ndim() == 2 &&
+                       offset.ndim() == 1 &&
+                       indptr.size() == scores.shape(0) + 1 &&
+                       weights.shape(1) == scores.shape(1) &&
+                       offset.size() == scores.shape(1),
+                   "pca_project_csr: incompatible input and score dimensions");
+        size_t rows = scores.shape(0);
+        int pcs = scores.shape(1);
+        if (!rows || !pcs) return;
+        int width = pcs == 1 ? 1 : pcs <= 8 ? 4 : pcs <= 32 ? 8 : 16;
+        dim3 block(width, 32 / width, 8);
+        dim3 grid((rows + 7) / 8, (pcs + width - 1) / width);
+        pca_project_csr<<<grid, block, 0,
+                          reinterpret_cast<cudaStream_t>(stream)>>>(
+            indptr.data(), columns.data(), data.data(), weights.data(),
+            offset.data(), scores.data(), rows, pcs);
+        CUDA_CHECK_LAST_ERROR(pca_project_csr);
+    });
+    m.def("pca_column_sums", [](gpu_array_c<const I, Device> indptr,
+                                gpu_array_c<const I, Device> columns,
+                                gpu_array_c<const T, Device> data,
+                                gpu_array_c<double, Device> partial,
+                                std::uintptr_t stream) {
+        nb_require(indptr.ndim() == 1 && indptr.size() > 0 &&
+                       columns.ndim() == 1 && data.ndim() == 1 &&
+                       columns.size() == data.size() && partial.ndim() == 2,
+                   "pca_column_sums: invalid CSR arrays or workspace");
+        if (!partial.size()) return;
+        size_t n = indptr.size() - 1;
+        int genes = partial.shape(1);
+        dim3 grid(partial.shape(0),
+                  (genes + PCA_COL_BLOCK - 1) / PCA_COL_BLOCK);
+        pca_column_sums<<<grid, 128, 0,
+                          reinterpret_cast<cudaStream_t>(stream)>>>(
+            indptr.data(), columns.data(), data.data(), partial.data(), genes,
+            n);
+        CUDA_CHECK_LAST_ERROR(pca_column_sums);
+    });
+    m.def("pca_center_csr", [](gpu_array_c<const I, Device> indptr,
+                               gpu_array_c<const I, Device> columns,
+                               gpu_array_c<const T, Device> data,
+                               gpu_array_c<const double, Device> mean,
+                               gpu_array_c<T, Device> out,
+                               std::uintptr_t stream) {
+        nb_require(indptr.ndim() == 1 && columns.ndim() == 1 &&
+                       data.ndim() == 1 && columns.size() == data.size() &&
+                       mean.ndim() == 1 && out.ndim() == 2 &&
+                       indptr.size() == out.shape(0) + 1 &&
+                       mean.size() == out.shape(1),
+                   "pca_center_csr: incompatible input and tile dimensions");
+        if (!out.size()) return;
+        pca_center_csr<<<out.shape(0), 128, 0,
+                         reinterpret_cast<cudaStream_t>(stream)>>>(
+            indptr.data(), columns.data(), data.data(), mean.data(), out.data(),
+            out.shape(1));
+        CUDA_CHECK_LAST_ERROR(pca_center_csr);
+    });
 }

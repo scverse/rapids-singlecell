@@ -13,7 +13,7 @@ from rapids_singlecell.preprocessing._utils import _get_mean_var
 
 from ._helper import _canonical_csr, _check_matrix_for_zero_genes, _compute_cov, _copy_gram, _csr_mean
 from ._ordered import _needs_centered_gram, _ordered_gram
-from ._tiled import _centered_gram, _centered_tiles
+from ._tiled import _centered_covariance, _centered_tiles
 
 
 class CovariancePCA:
@@ -80,9 +80,7 @@ class CovariancePCA:
             if not cp.all(cp.isfinite(self.mean_)):
                 raise ValueError("Dense PCA requires finite input.")
         self._project_centered_tiles = True
-        gram = _centered_gram(x, self.mean_)
-        gram /= n_rows if sparse else n_rows - 1
-        return gram.astype(x.dtype, copy=False)
+        return _centered_covariance(x, self.mean_, n_rows if sparse else n_rows - 1)
 
     def _transform_cupy(self, X):
         if X.shape[1] != self.components_.shape[1]:

@@ -62,8 +62,10 @@ def _canonical_csr(X):
         return X
     # Stable sorting keeps repeated entries in input order. CuPy's
     # sum_duplicates uses floating-point atomics for this reduction.
-    keys = X.tocoo(copy=False).row.astype(cp.int64) * X.shape[1] + X.indices
-    order = cp.argsort(keys)
+    keys = cp.searchsorted(X.indptr[1:], cp.arange(X.nnz, dtype=X.indptr.dtype), side="right")
+    keys *= X.shape[1]
+    keys += X.indices
+    order = cp.argsort(keys, kind="stable")
     bounds = cp.flatnonzero(cp.diff(keys[order], prepend=-1, append=-1))
     starts = bounds[:-1]
     data = _sum_csr_duplicates(starts, bounds[1:], order, X.data)

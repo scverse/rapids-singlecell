@@ -54,16 +54,24 @@ def _ordered_gram(x):
         return gram
     parts = min(8, max(1, (64 << 20) // max(1, p * p * x.dtype.itemsize)))
     partial = cp.zeros((parts, p, p), dtype=x.dtype)
-    by_column = x.tocsc()
-    by_column.sort_indices()
-    index_dtype = x.indptr.dtype
+    if x.indices.dtype == x.indptr.dtype == cp.int32 and max(*x.shape, x.nnz) <= cp.iinfo(cp.int32).max:
+        by_column = x.tocsc()
+        by_column.sort_indices()
+        col_ptr, rows, values = by_column.indptr, by_column.indices, by_column.data
+    else:
+        # Older cuSPARSE conversions read 64-bit buffers as int32. Stable
+        # grouping by column preserves the row order of the original CSR.
+        order = cp.argsort(x.indices, kind="stable")
+        col_ptr = cp.searchsorted(x.indices[order], cp.arange(p + 1, dtype=cp.int64))
+        rows = cp.searchsorted(x.indptr[1:], order, side="right")
+        values = x.data[order]
     _spca.ordered_gram(
-        x.indptr,
-        x.indices,
+        x.indptr.astype(col_ptr.dtype, copy=False),
+        x.indices.astype(col_ptr.dtype, copy=False),
         x.data,
-        by_column.indptr.astype(index_dtype, copy=False),
-        by_column.indices.astype(index_dtype, copy=False),
-        by_column.data,
+        col_ptr,
+        rows,
+        values,
         partial,
         stream,
     )
