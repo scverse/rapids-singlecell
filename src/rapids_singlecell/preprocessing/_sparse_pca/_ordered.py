@@ -5,6 +5,14 @@ import cupy as cp
 from rapids_singlecell._cuda import _spca_cuda as _spca
 
 
+def _needs_centered_gram(gram, mean):
+    second_moment = gram.diagonal()
+    # Recompute explicitly if subtracting the squared mean would lose over
+    # half the working precision of any feature variance.
+    margin = cp.finfo(gram.dtype).eps ** 0.5
+    return bool(cp.any(~cp.isfinite(second_moment) | ((mean != 0) & (mean**2 >= (1 - margin) * second_moment))))
+
+
 def _integer_scale(x, stream):
     limits = cp.zeros(2, dtype=cp.uint32)
     _spca.gram_bounds(x.data, limits, stream)

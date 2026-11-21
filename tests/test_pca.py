@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import cupy as cp
 import numpy as np
 import pytest
@@ -130,7 +132,10 @@ def test_in_memory_sparse_covariance_reproducible(dtype):
     x = sparse.random(8193, 97, density=0.13, format="csr", dtype=dtype, random_state=rng)
     x.data *= (1 + x.indices % 17).astype(dtype)
     x_gpu = cusparse.csr_matrix(x)
-    results = [rsc.pp.pca(x_gpu, n_comps=9, dtype=dtype, return_info=True) for _ in range(3)]
+    results = [
+        rsc.pp.pca(x_gpu, n_comps=9, svd_solver=solver, dtype=dtype, return_info=True)
+        for solver in (None, "covariance_eigh", "covariance_eigh")
+    ]
     scores, components, ratio, variance = results[0]
     for repeated in results[1:]:
         for original, actual in zip(results[0], repeated, strict=True):
@@ -190,7 +195,7 @@ def test_tiled_pca_csr_duplicates():
 
 @pytest.mark.parametrize(("dtype", "index_dtype", "pcs"), [(np.float32, cp.int32, 1), (np.float64, cp.int64, 17)])
 def test_sparse_pca_fixed_projection(dtype, index_dtype, pcs):
-    from rapids_singlecell.preprocessing._sparse_pca._sparse_pca import PCA_sparse
+    from rapids_singlecell.preprocessing._sparse_pca._sparse_pca import CovariancePCA
 
     rng = np.random.default_rng(81)
     x = rng.normal(size=(257, 513)).astype(dtype)
@@ -202,7 +207,7 @@ def test_sparse_pca_fixed_projection(dtype, index_dtype, pcs):
     gpu.indptr = gpu.indptr.astype(index_dtype)
     weights = rng.normal(size=(x.shape[1], pcs)).astype(dtype)
     mean = x.mean(axis=0, dtype=np.float64).astype(dtype)
-    pca = PCA_sparse(n_components=pcs)
+    pca = CovariancePCA(n_components=pcs)
     pca.mean_, pca.components_ = cp.asarray(mean), cp.asarray(weights.T)
     scores = pca._transform_cupy(gpu)
     np.testing.assert_array_equal(scores, pca._transform_cupy(gpu))
@@ -308,30 +313,28 @@ def test_sparse_gram_wide_range(dtype):
     np.testing.assert_array_equal(_ordered_gram(overflowing).get(), [[np.inf, 0], [0, 1]])
 
 
-def test_tiled_covariance_dispatch(monkeypatch):
-    from rapids_singlecell.preprocessing._pca import _use_tiled_covariance
+@pytest.mark.parametrize("solver", [None, "auto", "full", "jacobi"])
+def test_dense_solver_dispatch(solver):
+    # The broadcast input also covers matrices large enough for multiple covariance tiles.
+    x = np.broadcast_to(np.float32(1), (32_768, 2_000))
+    scores = np.empty((len(x), 1), dtype=x.dtype)
+    with patch("cuml.decomposition.PCA") as estimator:
+        estimator.return_value.fit_transform.return_value = scores
+        assert rsc.pp.pca(x, n_comps=1, svd_solver=solver) is scores
+    assert estimator.call_args.kwargs["svd_solver"] == (solver or "auto")
 
-    shape = (100_000, 2_000)
-    dense = np.broadcast_to(np.float32(1), shape)
-    assert _use_tiled_covariance(dense, 50)
-    assert not _use_tiled_covariance(dense[:128, :64], 50)
-    assert not _use_tiled_covariance(sparse.csr_matrix(shape, dtype=np.float32), 50)
 
-    # Use one set of CSR indices to check dtype dispatch on the same sparsity pattern.
-    n, p, occupied = 32_768, 1_000, 350
-    indices = np.tile(np.arange(occupied, dtype=np.int32), n)
-    indptr = np.arange(n + 1, dtype=np.int32) * occupied
-    monkeypatch.delenv("CUBLAS_EMULATE_DOUBLE_PRECISION", raising=False)
-    for dtype in (np.float32, np.float64):
-        data = np.broadcast_to(dtype(1), indices.shape)
-        x = sparse.csr_matrix((data, indices, indptr), shape=(n, p))
-        assert _use_tiled_covariance(x, 50) == (dtype == np.float32)
+def test_wide_sparse_solver_dispatch():
+    x = sparse.csr_matrix((4, 8_001), dtype=np.float32)
+    scores = np.empty((x.shape[0], 1), dtype=x.dtype)
+    with patch("rapids_singlecell.preprocessing._pca._run_sparse_svd_pca", return_value=(None, scores)) as run:
+        assert rsc.pp.pca(x, n_comps=1) is scores
+    assert run.call_args.args[2] == "lanczos"
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("use_csr", [False, True], ids=["dense", "csr"])
-def test_tiled_covariance_pca(monkeypatch, dtype, use_csr):
-    monkeypatch.setattr("rapids_singlecell.preprocessing._pca._use_tiled_covariance", lambda *_: True)
+def test_covariance_pca(dtype, use_csr):
     rng = np.random.default_rng(42)
     # Exercise accumulation across tile boundaries and a partial final tile.
     X = (rng.normal(size=(4101, 8)) * np.arange(1, 9) + 2).astype(dtype)
@@ -344,8 +347,7 @@ def test_tiled_covariance_pca(monkeypatch, dtype, use_csr):
         X += 2**20  # Center before forming the dense Gram matrix to avoid cancellation.
         x = cp.asfortranarray(cp.asarray(X))
     adata = AnnData(x)
-    solver = "covariance_eigh" if use_csr else None
-    rsc.pp.pca(adata, n_comps=4, svd_solver=solver, dtype=dtype)
+    rsc.pp.pca(adata, n_comps=4, svd_solver="covariance_eigh", dtype=dtype)
     scores, axes = adata.obsm["X_pca"], adata.varm["PCs"].T
     ratios, variances = adata.uns["pca"]["variance_ratio"], adata.uns["pca"]["variance"]
     assert adata.uns["pca"]["params"] == {"zero_center": True, "mask_var": None}
@@ -362,8 +364,8 @@ def test_tiled_covariance_pca(monkeypatch, dtype, use_csr):
     np.testing.assert_allclose(ratios, energy[:4] / energy.sum(), rtol=tol)
     np.testing.assert_allclose(variances, energy[:4] / (len(X) if use_csr else len(X) - 1), rtol=tol)
     assert all(a.dtype == dtype for a in (scores, axes, variances, ratios))
-    if use_csr and dtype == np.float32:
-        rsc.pp.pca(adata, n_comps=4, svd_solver=solver, dtype=dtype)
+    if dtype == np.float32:
+        rsc.pp.pca(adata, n_comps=4, svd_solver="covariance_eigh", dtype=dtype)
         for first, second in zip(
             (scores, axes, variances, ratios),
             (
@@ -378,8 +380,7 @@ def test_tiled_covariance_pca(monkeypatch, dtype, use_csr):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_tiled_sparse_pca_large_offset(monkeypatch, dtype):
-    monkeypatch.setattr("rapids_singlecell.preprocessing._pca._use_tiled_covariance", lambda *_: True)
+def test_sparse_covariance_large_offset(dtype):
     rng = np.random.default_rng(18)
     X = np.zeros((103, 3), dtype=dtype)
     X[:, 0] = (2**20 if dtype == np.float32 else 2**40) + rng.choice([-0.125, 0.0, 0.25], len(X))
@@ -388,7 +389,7 @@ def test_tiled_sparse_pca_large_offset(monkeypatch, dtype):
     x = cusparse.csr_matrix(cp.asarray(X))
     x.indices = x.indices.astype(cp.int64)
     x.indptr = x.indptr.astype(cp.int64)
-    scores, axes, _, variance = rsc.pp.pca(x, n_comps=3, dtype=dtype, return_info=True)
+    scores, axes, _, variance = rsc.pp.pca(x, n_comps=3, svd_solver="covariance_eigh", dtype=dtype, return_info=True)
     centered = X.astype(np.float64) - X.mean(axis=0, dtype=np.float64)
     expected_variance = np.linalg.svd(centered, compute_uv=False) ** 2 / len(X)
     tol = 2e-5 if dtype == np.float32 else 1e-10
@@ -533,18 +534,36 @@ def test_cupy_sparse_input_correctness(svd_solver):
 # =============================================================================
 
 
-def test_pca_shapes():
+@pytest.mark.parametrize("solver", [None, "covariance_eigh"])
+def test_pca_shapes(solver):
     """Test PCA output shapes."""
     adata = AnnData(np.random.randn(30, 20))
-    rsc.pp.pca(adata)
+    rsc.pp.pca(adata, svd_solver=solver)
     assert adata.obsm["X_pca"].shape == (30, 19)
 
     adata = AnnData(np.random.randn(20, 30))
-    rsc.pp.pca(adata)
+    rsc.pp.pca(adata, svd_solver=solver)
     assert adata.obsm["X_pca"].shape == (20, 19)
 
     with pytest.raises(ValueError):
-        rsc.pp.pca(adata, n_comps=100)
+        rsc.pp.pca(adata, n_comps=100, svd_solver=solver)
+
+
+def test_dense_covariance_input():
+    x = np.array(A_list, dtype=np.int32).T
+    scores, components, ratio, variance = rsc.pp.pca(x, n_comps=6, svd_solver="covariance_eigh", return_info=True)
+    assert scores.shape == (5, 6)
+    assert components.shape == (6, 6)
+    assert all(a.dtype == np.float32 for a in (scores, components, ratio, variance))
+
+    with pytest.raises(ValueError):
+        rsc.pp.pca(x[:1], svd_solver="covariance_eigh")
+    with pytest.raises(ValueError):
+        rsc.pp.pca(x, n_comps=0, svd_solver="covariance_eigh")
+    invalid = x.astype(float)
+    invalid[0, 0] = np.nan
+    with pytest.raises(ValueError):
+        rsc.pp.pca(invalid, svd_solver="covariance_eigh")
 
 
 def test_pca_chunked():
