@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import cupy as cp
 import dask
 from cupyx.scipy.sparse import csr_matrix
@@ -69,9 +67,8 @@ class CovariancePCA:
                 return _ordered_gram(x)
             self.mean_ = _csr_mean(x)
             # Sparse pair accumulation wins at low occupancy. Its measured
-            # crossover with tiled SYRK is higher for native FP64.
-            native_fp64 = x.dtype == cp.float64 and os.environ.get("CUBLAS_EMULATE_DOUBLE_PRECISION") != "1"
-            if (2 if native_fp64 else 6) * x.nnz < n_rows * n_cols:
+            # crossover with tiled SYRK is higher for FP64.
+            if (2 if x.dtype == cp.float64 else 6) * x.nnz < n_rows * n_cols:
                 gram = _ordered_gram(x)
                 gram *= 1 / n_rows
                 if not _needs_centered_gram(gram, self.mean_):

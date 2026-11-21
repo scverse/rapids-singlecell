@@ -32,6 +32,7 @@ def _centered_tiles(X, mean):
 def _centered_gram(X, mean):
     """Accumulate the upper triangle of the centered Gram matrix in row order."""
     n_cols = X.shape[1]
+    # Delegate explicit math settings such as strict FP32 to CuPy's matmul.
     tensor_gram = (
         X.dtype == cp.float32
         and int(cp.cuda.Device().compute_capability) >= 80
