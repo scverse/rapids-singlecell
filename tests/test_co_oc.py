@@ -78,6 +78,86 @@ def test_co_occurrence_smallest_inputs(n):
     np.testing.assert_array_equal(occ[0, 0], expected)
 
 
+@pytest.mark.parametrize(
+    ("spatial", "labels", "lower", "upper", "keys"),
+    [
+        ((0, 3), 0, 3, 3, 0),
+        ((2, 0), 2, 0, 0, 2),
+        ((2, 3), 1, 3, 3, 2),
+        ((2, 3), 2, 2, 3, 2),
+        ((2, 3), 2, 3, 2, 2),
+        ((2, 3), 2, 3, 3, 1),
+    ],
+)
+def test_spatial_keys_rejects_inconsistent_shapes(spatial, labels, lower, upper, keys):
+    with pytest.raises(ValueError, match="spatial_keys"):
+        _cooc_cuda.spatial_keys(
+            cp.zeros(spatial, cp.float32),
+            cp.zeros(labels, cp.int32),
+            cp.zeros(lower, cp.float32),
+            cp.ones(upper, cp.float32),
+            cp.empty(keys, cp.uint64),
+            cp.cuda.get_current_stream().ptr,
+        )
+
+
+@pytest.fixture
+def tile_inputs():
+    points = cp.zeros((1, 3), cp.float32)
+    offsets = cp.asarray([0, 1], cp.int32)
+    tiles = cp.empty((1, _cooc_cuda.TILE_BYTES), cp.uint8)
+    bounds = cp.empty((1, 3, 2), cp.float32)
+    return points, offsets, tiles, bounds, cp.cuda.get_current_stream().ptr
+
+
+def test_build_tiles_rejects_inconsistent_shapes(tile_inputs):
+    points, offsets, tiles, bounds, stream = tile_inputs
+    with pytest.raises(ValueError, match="build_tiles"):
+        _cooc_cuda.build_tiles(points, offsets, offsets, tiles[:, :-1], bounds, stream)
+    with pytest.raises(ValueError, match="build_tiles"):
+        _cooc_cuda.build_tiles(points, offsets, offsets, tiles, bounds.reshape(1, 2, 3), stream)
+
+
+@pytest.mark.parametrize(
+    ("bins", "count_shape"),
+    [(0, (2, 0)), (3, (2, 2)), (3, (2, 2, 2)), (3, (2, 1, 3)), (3, (6,))],
+)
+def test_count_tiles_rejects_inconsistent_shapes(tile_inputs, bins, count_shape):
+    points, offsets, tiles, bounds, stream = tile_inputs
+    _cooc_cuda.build_tiles(points, offsets, offsets, tiles, bounds, stream)
+    thresholds = cp.zeros(bins, cp.float32)
+    counts = cp.zeros(count_shape, cp.uint64)
+    with pytest.raises(ValueError, match="count_tiles"):
+        _cooc_cuda.count_tiles(points, tiles, bounds, thresholds, counts, 0, 1, stream)
+
+
+@pytest.mark.parametrize(
+    ("buffer", "shape"),
+    [
+        ("counts", (4, 3)),
+        ("counts", (2, 1, 3)),
+        ("counts", (2, 2, 1)),
+        ("order", (2,)),
+        ("order", (1, 3)),
+        ("marginals", (6,)),
+        ("marginals", (2, 3)),
+        ("out", (4, 3)),
+        ("out", (3, 2, 2)),
+    ],
+)
+def test_normalize_rejects_inconsistent_shapes(buffer, shape):
+    shapes = {"counts": (2, 2, 3), "order": (3,), "marginals": (3, 2), "out": (2, 2, 3)}
+    shapes[buffer] = shape
+    with pytest.raises(ValueError, match="normalize"):
+        _cooc_cuda.normalize(
+            cp.zeros(shapes["counts"], cp.uint64),
+            cp.arange(np.prod(shapes["order"]), dtype=cp.int64).reshape(shapes["order"]),
+            cp.empty(shapes["marginals"], cp.float32),
+            cp.empty(shapes["out"], cp.float32),
+            cp.cuda.get_current_stream().ptr,
+        )
+
+
 def _reference_counts(points, labels, thresholds):
     i, j = np.triu_indices(len(points), k=1)
     with np.errstate(invalid="ignore"):
