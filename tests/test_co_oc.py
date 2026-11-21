@@ -113,6 +113,26 @@ def test_spatial_tiles_scan_with_one_count_buffer(cupy_pool):
     np.testing.assert_array_equal(counts[0, -1].get(), expected)
 
 
+@pytest.mark.parametrize("scan_limit", [512, 1026])
+def test_spatial_tiles_scan_in_batches(monkeypatch, scan_limit):
+    thresholds = np.arange(513, dtype=np.float32)
+    points = np.arange(6, dtype=np.float32)[:, None]
+    labels = np.repeat(np.arange(3, dtype=np.int32), 2)
+    monkeypatch.setattr(_co_oc, "_MAX_SCAN_ELEMENTS", scan_limit)
+    cumsum = cp.cumsum
+
+    def bounded_cumsum(a, axis=None, out=None):
+        if a.dtype == cp.uint64:
+            assert out.data.ptr == a.data.ptr
+            if axis is not None:
+                assert a.size <= scan_limit
+        return cumsum(a, axis=axis, out=out)
+
+    monkeypatch.setattr(cp, "cumsum", bounded_cumsum)
+    counts = _count_spatial_tiles(cp.asarray(points), cp.asarray(labels), cp.asarray(thresholds), 3, [0])
+    np.testing.assert_array_equal(counts.get(), _reference_counts(points, labels, thresholds))
+
+
 def test_spatial_tiles_skip_idle_devices(monkeypatch):
     points = cp.zeros((2, 2), dtype=cp.float32)
     labels = cp.zeros(2, dtype=cp.int32)

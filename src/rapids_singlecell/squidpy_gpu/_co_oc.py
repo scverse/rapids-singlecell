@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from spatialdata import SpatialData
 
 
+# CuPy's batched scan uses 32-bit indices and can pad each row to twice its width.
+_MAX_SCAN_ELEMENTS = 1 << 30
+
+
 def co_occurrence(
     adata: AnnData | SpatialData,
     cluster_key: str,
@@ -156,4 +160,13 @@ def _count_spatial_tiles(
                 _co.count_tiles(*replica, counts, rank, len(device_ids), cp.cuda.get_current_stream().ptr)
                 parts.append(counts)
     counts = _sum_on_device(parts, spatial.device.id)
-    return cp.cumsum(counts, axis=-1, out=counts)
+    rows = counts.reshape(-1, len(thresholds))
+    rows_per_batch = max(1, _MAX_SCAN_ELEMENTS // len(thresholds))
+    for start in range(0, len(rows), rows_per_batch):
+        batch = rows[start : start + rows_per_batch]
+        if rows_per_batch == 1:
+            row = batch[0]
+            cp.cumsum(row, out=row)
+        else:
+            cp.cumsum(batch, axis=-1, out=batch)
+    return counts
