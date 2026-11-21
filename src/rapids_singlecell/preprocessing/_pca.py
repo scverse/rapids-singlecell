@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 
 import cupy as cp
 import numpy as np
@@ -38,6 +38,7 @@ from ._utils import _check_gpu_X
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+    from scipy.sparse import csr_array, csr_matrix
 
     from rapids_singlecell._utils import ArrayTypesDask
     from rapids_singlecell.get._utils import AdRef, LayerAcc, MultiAcc
@@ -72,12 +73,13 @@ def _pca_dests(key: str | Default | None, *, multi: bool) -> PcaResult:
 @deprecated_arg("key_added", DEPR_KEY_ADDED)
 @deprecated_copy
 def pca(
-    data: AnnData | ArrayTypesDask,
+    data: AnnData | ArrayTypesDask | NDArray | csr_array | csr_matrix,
     n_comps: int | None = None,
     *,
     use: LayerAcc | MultiAcc | str | None = None,
     zero_center: bool = True,
     svd_solver: str | None = None,
+    compute_precision: Literal["float32", "tf32", "float64", "ozaki"] | None = None,
     rng: SeedLike | RNGLike | None = None,
     mask: NDArray[np.bool] | AdRef | str | Default | None = _empty,
     dtype: str = "float32",
@@ -144,6 +146,12 @@ def pca(
         `'covariance_eigh'`
             Eigendecomposition of the covariance matrix. Fast for sparse matrices
             with fewer than ~8,000 features. Works with Dask arrays.
+        `'covariance_eigh_tiled'`
+            Centered PCA for in-memory NumPy or CuPy arrays and SciPy or CuPy CSR matrices.
+            Streams rows through dense GPU tiles to form the covariance matrix and project
+            the data. The dense covariance matrix has shape `n_vars` × `n_vars`. The
+            variance denominator is `n_obs - 1` for dense input and `n_obs` for CSR
+            input, as in the existing dense and sparse solvers.
         `'lanczos'`
             Lanczos bidiagonalization with implicit restarts. Memory efficient for
             large sparse matrices (>8,000 features). Best singular value accuracy.
@@ -156,6 +164,17 @@ def pca(
             cuML: Full eigendecomposition of covariance matrix. For dense arrays only.
         `'jacobi'`
             cuML: Jacobi iterative solver. Faster but less accurate. For dense arrays only.
+
+    compute_precision
+        Arithmetic for `svd_solver='covariance_eigh_tiled'`. Defaults to the input's
+        native `'float32'` or `'float64'` precision. For float32 input, `'tf32'` permits
+        TensorFloat-32 matrix products with FP32 accumulation on Ampere or newer GPUs.
+        For float64 input, `'ozaki'` enables cuBLAS fixed-point FP64 emulation on Ampere
+        or newer GPUs with cuBLAS 13.10 or later. For well-conditioned CSR input,
+        the solver selects a 64- to 96-bit fixed-point mantissa when the operands fit
+        losslessly. Other Ozaki products use cuBLAS automatic precision.
+        The eigensolve uses the input precision. Set `dtype='float64'` to retain FP64
+        scores in the output.
 
     rng
         Random seed or :class:`~numpy.random.Generator` for initialization.
@@ -172,7 +191,8 @@ def pca(
     chunked
         If `True`, perform an incremental PCA on segments of `chunk_size`.
         The incremental PCA automatically zero centers and ignores settings of
-        `rng` and `svd_solver`. If `False`, perform a full PCA.
+        `rng` and `svd_solver`. The tiled covariance solver requires `chunked=False`.
+        If `False`, perform a full PCA.
 
     chunk_size
         Number of observations to include in each chunk.
@@ -234,6 +254,7 @@ def pca(
             n_comps,
             zero_center=zero_center,
             svd_solver=svd_solver,
+            compute_precision=compute_precision,
             rng=rng,
             chunked=chunked,
             chunk_size=chunk_size,
@@ -277,6 +298,7 @@ def pca(
         n_comps,
         zero_center=zero_center,
         svd_solver=svd_solver,
+        compute_precision=compute_precision,
         rng=rng,
         chunked=chunked,
         chunk_size=chunk_size,
@@ -295,6 +317,11 @@ def pca(
     adata.uns[_embedding_keys("pca", key).uns] = {
         "params": {
             "zero_center": zero_center,
+            **(
+                {"svd_solver": svd_solver, "compute_precision": compute_precision or X.dtype.name}
+                if svd_solver == "covariance_eigh_tiled"
+                else {}
+            ),
             "mask_var": mask_param,
             **({"layer": layer} if layer is not None else {}),
             **_use_to_uns(use, rep=False),
@@ -313,12 +340,16 @@ def _pca_compute(
     *,
     zero_center: bool,
     svd_solver: str | None,
+    compute_precision: str | None,
     rng: np.random.Generator,
     chunked: bool,
     chunk_size: int | None,
     dtype: str,
     kwargs: dict,
 ):
+    if compute_precision is not None and svd_solver != "covariance_eigh_tiled":
+        raise ValueError("compute_precision requires svd_solver='covariance_eigh_tiled'.")
+
     if n_comps is None:
         min_dim = min(X.shape[0], X.shape[1])
         if settings.N_PCS >= min_dim:
@@ -336,7 +367,26 @@ def _pca_compute(
         else:
             svd_solver = "covariance_eigh"
 
-    if isinstance(X, DaskArray):
+    if svd_solver == "covariance_eigh_tiled":
+        if chunked or not zero_center:
+            raise ValueError("The tiled PCA solver requires zero_center=True and chunked=False.")
+        if not isinstance(X, np.ndarray | cp.ndarray) and not ((issparse(X) or cpissparse(X)) and X.format == "csr"):
+            raise ValueError("The tiled PCA solver requires an in-memory dense array or CSR matrix.")
+        if X.dtype not in (np.float32, np.float64):
+            raise ValueError("The tiled PCA solver requires float32 or float64 input.")
+        precision = X.dtype.name if compute_precision is None else compute_precision
+        if precision not in ("float32", "tf32", "float64", "ozaki"):
+            raise ValueError("Tiled PCA compute_precision must be 'float32', 'tf32', 'float64', or 'ozaki'.")
+        input_dtype = np.float32 if precision in ("float32", "tf32") else np.float64
+        if X.dtype != input_dtype:
+            raise ValueError(f"compute_precision={precision!r} requires {np.dtype(input_dtype).name} input.")
+        from ._sparse_pca._tiled import _run_tiled_pca
+
+        X = X_to_GPU(X)
+        with X.data.device if isspmatrix_csr(X) else X.device:
+            pca_func, X_pca = _run_tiled_pca(X, n_comps, precision)
+
+    elif isinstance(X, DaskArray):
         if chunked:
             raise ValueError("Dask arrays are not supported for chunked PCA computation.")
         _check_gpu_X(X, allow_dask=True)

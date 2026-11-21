@@ -124,6 +124,105 @@ def test_pca_correctness_no_center(use_sparse):
 # =============================================================================
 
 
+@pytest.fixture(params=["float32", "tf32", "float64", "ozaki"])
+def precision(request):
+    if request.param in ("tf32", "ozaki") and int(cp.cuda.Device().compute_capability) < 80:
+        pytest.skip("requires Ampere or newer")
+    if request.param == "ozaki" and cp.cuda.cublas.getVersion(cp.cuda.device.get_cublas_handle()) < 131000:
+        pytest.skip("requires cuBLAS 13.10 or later")
+    return request.param
+
+
+@pytest.mark.parametrize("use_csr", [False, True], ids=["dense", "csr"])
+def test_tiled_covariance_pca(precision, use_csr):
+    dtype = np.float32 if precision in ("float32", "tf32") else np.float64
+    rng = np.random.default_rng(42)
+    # Exercise accumulation across tile boundaries and a partial final tile.
+    X = (rng.normal(size=(4101, 8)) * np.arange(1, 9) + 2).astype(dtype)
+    X = np.copysign(np.maximum(np.abs(X), 0.25), X)  # Fixed-mantissa Ozaki range for CSR.
+    X[rng.random(X.shape) < 0.6] = 0
+    if use_csr:
+        x = sparse.csr_matrix(X)
+        # Two entries per stored position exercise noncanonical CSR input.
+        x = sparse.csr_matrix((np.repeat(x.data / 2, 2), np.repeat(x.indices, 2), 2 * x.indptr), shape=x.shape)
+    else:
+        X += 2**20  # Center before forming the dense Gram matrix to avoid cancellation.
+        x = cp.asfortranarray(cp.asarray(X))
+    scores, axes, ratios, variances = rsc.pp.pca(
+        x, n_comps=4, svd_solver="covariance_eigh_tiled", compute_precision=precision, dtype=dtype, return_info=True
+    )
+    data = X.astype(np.float64) - X[0].astype(np.float64)
+    centered = data - data.mean(axis=0)
+    _, singular, vt = np.linalg.svd(centered, full_matrices=False)
+    signs = np.sign((axes * vt[:4]).sum(axis=1))
+    tol = {"tf32": 3e-3, "float32": 2e-5}.get(precision, 1e-10)
+    energy = singular**2
+    np.testing.assert_allclose(axes * signs[:, None], vt[:4], atol=tol, rtol=tol)
+    np.testing.assert_allclose(scores * signs, centered @ vt[:4].T, atol=10 * tol, rtol=tol)
+    np.testing.assert_allclose(ratios, energy[:4] / energy.sum(), rtol=tol)
+    np.testing.assert_allclose(variances, energy[:4] / (len(X) if use_csr else len(X) - 1), rtol=tol)
+    assert all(a.dtype == dtype for a in (scores, axes, variances, ratios))
+
+
+def test_tiled_sparse_pca_large_offset(precision):
+    rng = np.random.default_rng(18)
+    dtype = np.float32 if precision in ("float32", "tf32") else np.float64
+    X = np.zeros((103, 3), dtype=dtype)
+    X[:, 0] = (2**20 if dtype == np.float32 else 2**40) + rng.choice([-0.125, 0.0, 0.25], len(X))
+    X[::7, 1] = 2
+    X[::3, 2] = -4
+    x = cusparse.csr_matrix(cp.asarray(X))
+    x.indices = x.indices.astype(cp.int64)
+    x.indptr = x.indptr.astype(cp.int64)
+    scores, axes, _, variance = rsc.pp.pca(
+        x, n_comps=3, svd_solver="covariance_eigh_tiled", compute_precision=precision, dtype=dtype, return_info=True
+    )
+    centered = X.astype(np.float64) - X.mean(axis=0, dtype=np.float64)
+    expected_variance = np.linalg.svd(centered, compute_uv=False) ** 2 / len(X)
+    tol = {"tf32": 2e-3, "float32": 2e-5}.get(precision, 1e-10)
+    np.testing.assert_allclose(variance, expected_variance, rtol=tol)
+    np.testing.assert_allclose(scores, centered @ axes.T, rtol=tol, atol=tol)
+
+
+@pytest.mark.two_gpus
+@pytest.mark.parametrize("use_csr", [False, True], ids=["dense", "csr"])
+def test_tiled_covariance_pca_input_device(use_csr):
+    with cp.cuda.Device(1):
+        x = cp.asarray(A_list, dtype=np.float64)
+        if use_csr:
+            x = cusparse.csr_matrix(x)
+    with cp.cuda.Device(0):
+        scores = rsc.pp.pca(x, n_comps=2, svd_solver="covariance_eigh_tiled")
+        assert cp.cuda.runtime.getDevice() == 0
+    np.testing.assert_allclose(np.abs(scores), np.abs(A_pca[:, :2]), atol=1e-6)
+
+
+def test_tiled_covariance_pca_anndata():
+    adata = AnnData(np.asarray(A_list, dtype=np.float64))
+    rsc.pp.pca(adata, n_comps=2, svd_solver="covariance_eigh_tiled")
+    assert adata.obsm["X_pca"].dtype == np.float32
+    assert adata.varm["PCs"].dtype == np.float64
+    assert adata.uns["pca"]["params"]["compute_precision"] == "float64"
+    np.testing.assert_allclose(np.abs(adata.obsm["X_pca"]), np.abs(A_pca[:, :2]), atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("x", "kwargs", "error"),
+    [
+        (np.eye(3), {"zero_center": False}, "zero_center=True"),
+        (np.eye(3), {"chunked": True}, "chunked=False"),
+        (sparse.eye(3, format="csc"), {}, "dense array or CSR"),
+        (np.eye(3, dtype=np.int32), {}, "float32 or float64 input"),
+        (np.eye(3), {"compute_precision": "tf32"}, "requires float32 input"),
+        (np.eye(3), {"compute_precision": "half"}, "compute_precision must be"),
+        (np.eye(3), {"svd_solver": "full", "compute_precision": "float64"}, "requires svd_solver"),
+    ],
+)
+def test_tiled_covariance_pca_invalid_input(x, kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        rsc.pp.pca(x, **({"svd_solver": "covariance_eigh_tiled"} | kwargs))
+
+
 @pytest.mark.parametrize("svd_solver", ["lanczos", "randomized", "covariance_eigh"])
 @pytest.mark.parametrize("zero_center", [True, False])
 def test_sparse_solver_correctness(svd_solver, zero_center):
