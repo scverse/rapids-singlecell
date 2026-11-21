@@ -419,6 +419,7 @@ def test_modularity_is_exact(adata_neighbors, resolution, use_weights):
     assert q == pytest.approx(expected, rel=0, abs=1e-9)
 
 
+@needs_native
 def test_modularity_matches_networkx(adata_neighbors):
     nx = pytest.importorskip("networkx")
     adjacency = adata_neighbors.obsp["connectivities"]
@@ -451,7 +452,8 @@ def test_isolated_vertices(adata_neighbors, flavor):
     _assert_size_ordered(labels)
 
 
-def test_copy(adata_neighbors):
+def test_copy(adata_neighbors, monkeypatch):
+    _record_flavor_calls(monkeypatch)
     result = rsc.tl.leiden(adata_neighbors, copy=True)
     assert "leiden" not in adata_neighbors.obs
     assert "leiden" in result.obs
