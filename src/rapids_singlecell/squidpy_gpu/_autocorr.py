@@ -204,16 +204,29 @@ def _gene_block(source, cols, block_id, *, dtype, n, device_id):
     return block
 
 
-def _csr_gene_blocks(matrix, first, count, width):
+def _csr_gene_blocks(matrix, cols, width, dtype):
     """Expand contiguous genes in bounded tiles laid out for the scoring kernels."""
-    n = matrix.shape[0]
-    tile_blocks = max(1, _CHUNK_BYTES // (n * width * matrix.dtype.itemsize))
-    indices = matrix.indices.astype(cp.int32, copy=False)
+    device = cp.cuda.Device().id
+    if sparse_gpu.issparse(matrix) and matrix.data.device.id != device:
+        # Transfer the three CSR arrays once, before expanding any tiles.
+        arrays = tuple(_copy_to_device(a, device) for a in (matrix.data, matrix.indices, matrix.indptr))
+        local = sparse_gpu.csr_matrix(arrays, shape=matrix.shape, dtype=dtype)
+        if getattr(matrix, "_has_canonical_format", False):
+            local.has_canonical_format = True
+    else:
+        local = _to_gpu_csr(matrix, dtype)
+    if not local.has_canonical_format:
+        local = local.copy()
+        local.sum_duplicates()
+    first, count = int(cols[0]), len(cols)
+    n = local.shape[0]
+    tile_blocks = max(1, _CHUNK_BYTES // (n * width * local.dtype.itemsize))
+    indices = local.indices.astype(cp.int32, copy=False)
     for start in range(0, count, tile_blocks * width):
         remaining = min(count - start, tile_blocks * width)
-        tile = cp.zeros(((remaining + width - 1) // width, n, width), dtype=matrix.dtype)
+        tile = cp.zeros(((remaining + width - 1) // width, n, width), dtype=local.dtype)
         _ac.csr_blocks(
-            matrix.indptr, indices, matrix.data, first=first + start, out=tile, stream=cp.cuda.get_current_stream().ptr
+            local.indptr, indices, local.data, first=first + start, out=tile, stream=cp.cuda.get_current_stream().ptr
         )
         for offset, block in enumerate(tile):
             yield cp.ascontiguousarray(block[:, : remaining - offset * width])
@@ -244,6 +257,23 @@ def _block_scores(x, graph, row, col, keys, *, total, uniform, geary, permutatio
     return observed, change
 
 
+def _permutation_counts(percentages: Sequence[float], n_perms: int | None, n_devices: int) -> list[int]:
+    if n_perms is None or n_perms < 1:
+        raise ValueError("permutation_percentages requires a positive n_perms.")
+    weights = np.asarray(percentages, dtype=np.float64)
+    if weights.shape != (n_devices,):
+        raise ValueError("permutation_percentages must have one percentage per selected GPU.")
+    total = weights.sum()
+    if not np.all(np.isfinite(weights) & (weights >= 0)) or not np.isclose(total, 100, rtol=0, atol=1e-6):
+        raise ValueError("permutation_percentages must contain finite, nonnegative percentages that sum to 100.")
+    quotas = n_perms * (weights / total)
+    counts = np.floor(quotas).astype(np.int64)
+    # Assign the remaining draws by fractional remainder, breaking ties in device order.
+    order = np.argsort(counts - quotas, kind="stable")
+    counts[order[: n_perms - counts.sum()]] += 1
+    return counts.tolist()
+
+
 def spatial_autocorr(
     adata: AnnData | SpatialData,
     *,
@@ -260,6 +290,7 @@ def spatial_autocorr(
     use_sparse: bool = True,
     dtype: np.dtype | None = None,
     multi_gpu: bool | list[int] | str | None = None,
+    permutation_percentages: Sequence[float] | None = None,
     seed: int | None = None,
     copy: bool = False,
 ) -> pd.DataFrame | None:
@@ -305,12 +336,19 @@ def spatial_autocorr(
             Data type for computation. If None, uses input data dtype.
             For best numerical stability, especially with genes having low variance, use `np.float64`.
         multi_gpu
-            GPUs that share the blocks of genes:
+            GPUs that share the calculation. By default, each GPU scores a separate block of genes.
             - None: Use all GPUs if available (default)
             - True: Use all available GPUs
             - False: Use only the current GPU
             - list[int]: Use specific GPU IDs (e.g., [0, 2])
             - str: Comma-separated GPU IDs (e.g., "0,2")
+        permutation_percentages
+            Split permutations across GPUs in the order selected by `multi_gpu`.
+            For example, `multi_gpu=[0, 1], permutation_percentages=[60, 40]` assigns
+            60% of permutations to GPU 0 and 40% to GPU 1. Each active GPU scores all
+            selected genes. Percentages must be nonnegative and sum to 100, and `n_perms`
+            must be positive. Extra draws go to the largest fractional remainders, with
+            ties resolved in device order. A GPU assigned zero draws skips scoring.
         seed
             Seed for the keyed permutations of the graph rows, shared across genes and GPUs.
         copy
@@ -351,6 +389,12 @@ def spatial_autocorr(
     n = adata.n_obs
     if not 2 <= n <= np.iinfo(np.int32).max:
         raise ValueError("Spatial autocorrelation needs between 2 and 2**31 - 1 observations.")
+    devices = parse_device_ids(multi_gpu=multi_gpu)
+    perm_counts = None
+    if permutation_percentages is not None:
+        counts = _permutation_counts(permutation_percentages, n_perms, len(devices))
+        devices = [d for d, count in zip(devices, counts, strict=True) if count and len(cols)]
+        perm_counts = [count for count in counts if count and len(cols)]
     adj = _to_gpu_csr(adata.obsp[connectivity_key], compute_dtype)
     if transformation:
         normalized = cp.empty_like(adj.data)
@@ -369,27 +413,25 @@ def spatial_autocorr(
     cols, gene_order = np.unique(cols, return_inverse=True)
     n_genes = len(cols)
     itemsize = compute_dtype.itemsize
-    free = cp.cuda.Device().mem_info[0]
+    free = min((cp.cuda.Device(d).mem_info[0] for d in devices), default=0)
     width = int(max(1, min(32, _BLOCK_FRACTION * free // (2 * n * itemsize))))
     blocks = range((n_genes + width - 1) // width)
-    devices = parse_device_ids(multi_gpu=multi_gpu)[: len(blocks)]
+    if perm_counts is None:
+        devices = devices[: len(blocks)]
     owner = cp.cuda.Device().id
     if isinstance(source, cp.ndarray):
         owner = source.device.id
     elif sparse_gpu.issparse(source):
         owner = source.data.device.id
-    # A single device can read contiguous genes directly from resident CSR in scoring order.
+    # Each device can expand its assigned contiguous genes from a local copy of the CSR.
     tiled_csr = (
         keys is not None
-        and len(devices) == 1
-        and devices[0] == owner
         and n_genes > width
         and 8 * n_genes >= source.shape[1]
         and cols[-1] - cols[0] + 1 == n_genes
         and getattr(source, "format", None) == "csr"
         and source.shape[1] < 2**31
-        and source.nnz * (itemsize + source.indices.itemsize) + source.indptr.nbytes + 2 * _CHUNK_BYTES
-        < cp.cuda.Device(owner).mem_info[0] // 4
+        and source.nnz * (itemsize + source.indices.itemsize) + source.indptr.nbytes + 2 * _CHUNK_BYTES < free // 4
     )
     # For wide, resident sparse panels the analytic score can walk only expressed cells.
     # CSC conversion and symmetrizing the weights need scratch proportional to their nonzeros.
@@ -422,20 +464,27 @@ def spatial_autocorr(
                 vals = vals.copy()
                 vals.sum_duplicates()
         del weights, symmetric
+    elif tiled_csr or sparse.issparse(source):
+        vals = source
     else:
         with cp.cuda.Device(owner):
-            if tiled_csr:
-                vals = _to_gpu_csr(source, compute_dtype)
-                if not vals.has_canonical_format:
-                    vals = vals.copy()
-                    vals.sum_duplicates()
-            else:
-                vals = _gene_source(source, cols, width, compute_dtype)
+            vals = _gene_source(source, cols, width, compute_dtype)
     del adj
 
     results = np.empty((1 if keys is None else 4, n_genes), dtype=np.float64)
 
-    def run(device_id: int, mine: range):
+    def run(index: int, device_id: int):
+        draws = keys
+        partial = results
+        if perm_counts is None:
+            mine = blocks[index * len(blocks) // len(devices) : (index + 1) * len(blocks) // len(devices)]
+        else:
+            assert keys is not None
+            start = sum(perm_counts[:index])
+            draws = keys[start : start + perm_counts[index]]
+            mine = blocks
+            if index:
+                partial = np.empty_like(results)
         with cp.cuda.Device(device_id):
             w = tuple(_copy_to_device(a, device_id) for a in graph)
             r = _copy_to_device(row, device_id)
@@ -460,22 +509,30 @@ def spatial_autocorr(
                     out=out,
                     stream=cp.cuda.get_current_stream().ptr,
                 )
-                results[0, slots] = out.get()
-                return
+                partial[0, slots] = out.get()
+                return partial
             c = _copy_to_device(col, device_id)
-            k = None if keys is None else cp.asarray(keys)
+            k = None if draws is None else cp.asarray(draws)
+            single = k is not None and len(k) == 1
             permutation = None
-            if n_perms == 1 and n * np.dtype(np.int32).itemsize < cp.cuda.Device(device_id).mem_info[0] // 4:
+            if single and n * np.dtype(np.int32).itemsize < cp.cuda.Device(device_id).mem_info[0] // 4:
                 permutation = cp.empty(n, dtype=cp.int32)
                 _ac.permutation(k[0], out=permutation, stream=cp.cuda.get_current_stream().ptr)
+            mine_cols = cols[mine.start * width : mine.stop * width]
             if tiled_csr:
-                tiles = _csr_gene_blocks(vals, int(cols[0]), n_genes, width)
+                tiles = _csr_gene_blocks(source, mine_cols, width, compute_dtype)
+            else:
+                # Pack host sparse input directly on the consuming GPU, even when it needs chunks.
+                local = _gene_source(source, mine_cols, width, compute_dtype) if sparse.issparse(source) else vals
+                first_block = mine.start if sparse.issparse(source) else 0
             for block_id in mine:
                 slots = slice(block_id * width, (block_id + 1) * width)
                 x = (
                     next(tiles)
                     if tiled_csr
-                    else _gene_block(vals, cols[slots], block_id, dtype=compute_dtype, n=n, device_id=device_id)
+                    else _gene_block(
+                        local, cols[slots], block_id - first_block, dtype=compute_dtype, n=n, device_id=device_id
+                    )
                 )
                 observed, change = _block_scores(
                     x,
@@ -490,11 +547,11 @@ def spatial_autocorr(
                 )
                 del x  # Release this dense block before allocating the next one.
                 if change is None:
-                    results[0, slots] = observed.get()
-                elif n_perms == 1:
-                    results[[0, 2], slots] = cp.stack((observed, change[0])).get()
+                    partial[0, slots] = observed.get()
+                elif single:
+                    partial[[0, 2], slots] = cp.stack((observed, change[0])).get()
                 else:
-                    results[:, slots] = cp.stack(
+                    partial[:, slots] = cp.stack(
                         (
                             observed,
                             ((observed + change) >= observed).sum(axis=0),
@@ -502,6 +559,13 @@ def spatial_autocorr(
                             change.var(axis=0),
                         )
                     ).get()
+            if single:
+                slots = slice(mine.start * width, mine.stop * width)
+                observed, change = partial[0, slots], partial[2, slots]
+                partial[1, slots] = observed + change >= observed
+                with np.errstate(invalid="ignore"):
+                    partial[3, slots] = change - change
+        return partial
 
     if len(devices) > 1:
         # Worker threads have their own current streams. Finish preparing the
@@ -511,21 +575,20 @@ def spatial_autocorr(
             with cp.cuda.Device(owner):
                 cp.cuda.get_current_stream().synchronize()
         with ThreadPoolExecutor(len(devices)) as pool:
-            futures = [
-                pool.submit(
-                    run, device, blocks[i * len(blocks) // len(devices) : (i + 1) * len(blocks) // len(devices)]
-                )
-                for i, device in enumerate(devices)
-            ]
-            for future in futures:
-                future.result()
+            futures = [pool.submit(run, i, device) for i, device in enumerate(devices)]
+            for i, future in enumerate(futures):
+                part = future.result()
+                if perm_counts is not None and i:
+                    # Pool the population variances including the between-shard difference in means.
+                    previous, size = sum(perm_counts[:i]), perm_counts[i]
+                    fraction = size / (previous + size)
+                    delta = part[2] - results[2]
+                    results[1] += part[1]
+                    results[2] += fraction * delta
+                    results[3] = (previous * results[3] + size * part[3]) / (previous + size)
+                    results[3] += delta**2 * (previous / (previous + size)) * fraction
     elif devices:
-        run(devices[0], blocks)
-    if n_perms == 1:
-        change = results[2]
-        results[1] = results[0] + change >= results[0]
-        with np.errstate(invalid="ignore"):
-            results[3] = change - change
+        run(0, devices[0])
     score = results[0]
     _check_precision_issues(score, compute_dtype)
 

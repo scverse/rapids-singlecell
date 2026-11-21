@@ -246,6 +246,52 @@ def test_autocorr_multi_gpu_odd_perms(mode, n_perms):
     assert "pval_sim" in df.columns
 
 
+@pytest.mark.parametrize(
+    ("percentages", "n_perms", "n_devices"),
+    [([50, 50], None, 2), ([100], 0, 1), ([100], 9, 2), ([-10, 110], 9, 2), ([45, 45], 9, 2), ([np.nan], 9, 1)],
+)
+def test_invalid_permutation_percentages(percentages, n_perms, n_devices):
+    from rapids_singlecell.squidpy_gpu._autocorr import _permutation_counts
+
+    with pytest.raises(ValueError, match="permutation_percentages"):
+        _permutation_counts(percentages, n_perms, n_devices)
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="Requires >= 2 GPUs")
+@pytest.mark.parametrize("mode", ["moran", "geary"])
+@pytest.mark.parametrize(
+    ("draws", "percentages", "counts"), [(1, [0, 100], [0, 1]), (3, [50, 50], [2, 1]), (17, [60, 40], [10, 7])]
+)
+def test_autocorr_permutation_percentages(mode, draws, percentages, counts, monkeypatch):
+    from rapids_singlecell.squidpy_gpu import _autocorr
+
+    rng = np.random.default_rng(11)
+    adata = AnnData(rng.normal(size=(61, 7)))
+    adata.obsp["spatial_connectivities"] = sparse.random(61, 61, density=0.1, format="csr", random_state=3)
+    kwargs = {"mode": mode, "n_perms": draws, "seed": 13, "transformation": False, "two_tailed": True, "copy": True}
+    expected = spatial_autocorr(adata, multi_gpu=False, **kwargs)
+    keys_by_device = {}
+    score = _autocorr._block_scores
+
+    def record_keys(x, graph, row, col, keys, **options):
+        keys_by_device[x.device.id] = keys.get()
+        return score(x, graph, row, col, keys, **options)
+
+    monkeypatch.setattr(_autocorr, "_block_scores", record_keys)
+    devices = [1, 0]
+    actual = spatial_autocorr(adata, multi_gpu=devices, permutation_percentages=percentages, **kwargs)
+    pd.testing.assert_frame_equal(actual, expected, rtol=1e-10, atol=1e-12)
+    np.testing.assert_array_equal(actual["pval_sim"], expected["pval_sim"])
+    keys = np.random.default_rng(13).integers(0, 2**32, size=(draws, _autocorr._ac.ROUNDS), dtype=np.uint32)
+    start = 0
+    for device, count in zip(devices, counts, strict=True):
+        if count:
+            np.testing.assert_array_equal(keys_by_device[device], keys[start : start + count])
+            start += count
+        else:
+            assert device not in keys_by_device
+
+
 def _reference(x, w, mode):
     """Moran's I / Geary's C of every column of x under weights w (NumPy, float64)."""
     n = x.shape[0]
@@ -478,3 +524,38 @@ def test_host_csr_chunks_share_entries():
         assert np.shares_memory(chunk.data, x.data)
         assert np.shares_memory(chunk.indices, x.indices)
         np.testing.assert_array_equal(chunk.toarray(), x[start : start + chunk.shape[0]].toarray())
+
+
+@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="Requires >= 2 GPUs")
+@pytest.mark.parametrize("gpu_csr", [False, True])
+def test_autocorr_independent_gene_shards(gpu_csr, monkeypatch):
+    from rapids_singlecell.squidpy_gpu import _autocorr
+
+    rng = np.random.default_rng(41)
+    x = sparse.random(128, 161, density=0.25, format="csr", dtype=np.float64, random_state=rng)
+    adata = AnnData(x.toarray())
+    adata.obsp["spatial_connectivities"] = sparse.eye(x.shape[0], k=1, format="csr")
+    cols = np.arange(3, 102) if gpu_csr else np.arange(2, 161, 2)
+    kwargs = {"genes": adata.var_names[cols], "n_perms": 13, "seed": 17, "copy": True}
+    expected = spatial_autocorr(adata, multi_gpu=False, **kwargs)
+
+    # Duplicate entries exercise canonicalization before expanding or packing each shard.
+    data = np.repeat(x.data / 2, 2)
+    csr = sparse.csr_matrix((data, x.indices.repeat(2), x.indptr * 2), shape=x.shape)
+    if gpu_csr:
+        with cp.cuda.Device(1):
+            adata.X = sparse_gpu.csr_matrix(csr)
+    else:
+        adata.X = csr
+    name = "_csr_gene_blocks" if gpu_csr else "_gene_source"
+    prepare = getattr(_autocorr, name)
+    assignments = {}
+
+    def record(source, cols, width, dtype):
+        assignments[cp.cuda.Device().id] = cols
+        return prepare(source, cols, width, dtype)
+
+    monkeypatch.setattr(_autocorr, name, record)
+    result = spatial_autocorr(adata, multi_gpu=[0, 1], **kwargs)
+    np.testing.assert_array_equal(np.concatenate([assignments[0], assignments[1]]), cols)
+    pd.testing.assert_frame_equal(result, expected, rtol=1e-10, atol=1e-12)
