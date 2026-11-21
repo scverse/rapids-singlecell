@@ -16,7 +16,7 @@ from cupyx.scipy.sparse.linalg import LinearOperator
 
 from rapids_singlecell._utils._random import _seed_from_rng
 
-from ._operators import mean_centered_operator
+from ._operators import _svd_flip, mean_centered_operator
 
 if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -56,8 +56,9 @@ def _cgs2_orth(
     coeffs = coeffs_buf[:n_valid]
 
     target = cp.ascontiguousarray(target)
+    trans = "H" if basis_view.dtype.kind == "c" else "T"
     for _ in range(2):
-        cp.cublas.gemv("T", 1, basis_view, target, 0, coeffs)
+        cp.cublas.gemv(trans, 1, basis_view, target, 0, coeffs)
         cp.cublas.gemv("N", -1, basis_view, coeffs, 1, target)
 
     return target
@@ -149,15 +150,15 @@ def _lanczos_bidiag(
     """
     m, n = A.shape
     dtype = A.dtype
-    # For real operators the adjoint already computes A.T @ u directly.
-    transpose_dot = A.rmatvec if isinstance(A, LinearOperator) and dtype.kind == "f" else A.T.dot
+    adjoint_dot = A.rmatvec if isinstance(A, LinearOperator) else A.T.conj().dot
 
     # Breakdown decisions already need the norms on the host. Keep the small
     # bidiagonal there until the projected SVD and normalize straight into the basis.
+    norm_out = np.empty((), dtype=dtype).real
+    # AXPY takes scalars of the vector dtype. The projected bidiagonal is real.
     alphas = np.empty(ncv, dtype=dtype)
     betas = np.empty(ncv + 1, dtype=dtype)
     betas[0] = 0
-    norm_out = np.empty((), dtype=dtype).real
 
     def norm(x):
         return cp.cublas.nrm2(cp.ascontiguousarray(x), out=norm_out)[()]
@@ -210,9 +211,9 @@ def _lanczos_bidiag(
             scale = max(scale, alpha_val)
         u = cp.divide(u, alpha_val, out=U_full[:, idx_u])
 
-        # v = A.T @ u
+        # v = A.H @ u
         if i < ncv:
-            v = transpose_dot(u)
+            v = adjoint_dot(u)
             _kernel_axpy(alphas[i], V_full[:, idx_v], v)
 
             # Ortho V against all valid V
@@ -231,11 +232,11 @@ def _lanczos_bidiag(
 
         steps = i + 1
         if steps in checkpoints and steps < ncv:
-            a, b = cp.asarray(alphas[:steps]), cp.asarray(betas[: steps + 1])
+            a, b = cp.asarray(alphas[:steps].real), cp.asarray(betas[: steps + 1].real)
             if _restart_converged(a, b, remaining):
                 return a, b
 
-    return cp.asarray(alphas), cp.asarray(betas)
+    return cp.asarray(alphas.real), cp.asarray(betas.real)
 
 
 def lanczos_svd(
@@ -315,7 +316,7 @@ def lanczos_svd(
     total_capacity = k + ncv + 2
     U_full = cp.zeros((m, total_capacity), dtype=dtype, order="F")
     V_full = cp.zeros((n, total_capacity), dtype=dtype, order="F")
-    locked_S = cp.zeros(k, dtype=dtype)
+    locked_S = cp.zeros(k, dtype=U_full.real.dtype)
     ortho_buf = cp.zeros(total_capacity, dtype=dtype)
 
     n_locked = 0
@@ -389,10 +390,10 @@ def lanczos_svd(
         total_iter += 1
 
     # Final extraction
-    final_Vt = V_full[:, :k].T.copy()
+    final_V = V_full[:, :k].copy(order="F")
     if refine_results:
         del U_full, V_full
-        final_U = A.dot(final_Vt.T)
+        final_U = A.dot(final_V)
         final_S = cp.linalg.norm(final_U, axis=0)
         if not _return_scores:
             final_U /= final_S[None, :]
@@ -406,13 +407,7 @@ def lanczos_svd(
     sort_idx = cp.argsort(final_S)[::-1]
     final_S = final_S[sort_idx]
     final_U = final_U[:, sort_idx]
-    final_Vt = final_Vt[sort_idx, :]
-
-    # Deterministic signs
-    max_abs_cols = cp.argmax(cp.abs(final_U), axis=0)
-    signs = cp.sign(final_U[max_abs_cols, cp.arange(final_U.shape[1])])
-    signs[signs == 0] = 1
-    final_U *= signs
-    final_Vt *= signs[:, None]
+    final_Vt = final_V.T[sort_idx, :].conj()
+    _svd_flip(final_U, final_Vt)
 
     return final_U, final_S, final_Vt

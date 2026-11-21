@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+import cupy as cp
 from cupyx.scipy.sparse import issparse
 
 from ._block_lanczos import randomized_svd
@@ -19,7 +20,6 @@ from ._svd_lanczos import lanczos_svd
 if TYPE_CHECKING:
     from typing import Self
 
-    import cupy as cp
     from cupyx.scipy.sparse import spmatrix
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -111,13 +111,16 @@ class PCA_sparse_svd:
         if self.zero_center:
             if X.dtype.kind == "c":
                 raise TypeError("Centered sparse PCA requires real-valued input.")
-            sums, squares = adjoint.moments()
-            mean = sums / self.n_samples_
-            self.mean_ = mean.astype(X.dtype)
-            total_variance = (squares - sums * mean).sum() / (self.n_samples_ - 1)
+            mean, centered_energy = adjoint.centered_stats()
+            self.mean_ = mean.astype(X.dtype, copy=False)
+            total_variance = centered_energy / (self.n_samples_ - 1)
         else:
             self.mean_ = None
-            total_variance = _sum_squares(X.data) / (self.n_samples_ - 1)
+            values = X.data
+            if values.dtype.kind == "c":
+                # Sum real and imaginary squares with the same real-valued reduction.
+                values = cp.ascontiguousarray(values).view(values.real.dtype)
+            total_variance = _sum_squares(values) / (self.n_samples_ - 1)
 
         X_op = mean_centered_operator(X, self.mean_, adjoint=adjoint)
         left, S, Vt = self._run_svd(X_op)
@@ -128,7 +131,7 @@ class PCA_sparse_svd:
 
         self.explained_variance_ratio_ = self.explained_variance_ / total_variance
 
-        # Lanczos refinement already computed X_op @ Vt.T.
+        # Lanczos refinement already computed the projected scores.
         return left if self.svd_solver == "lanczos" else None
 
     def _run_svd(self, X_op):
@@ -166,7 +169,7 @@ class PCA_sparse_svd:
         X_new
             Transformed data of shape (n_samples, n_components).
         """
-        V = self.components_.T
+        V = self.components_.T.conj()
         X_transformed = _csr_dot(_canonical_csr(X), V) if issparse(X) else X.dot(V)
         if self.mean_ is not None:
             X_transformed -= self.mean_ @ V

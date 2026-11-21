@@ -173,6 +173,8 @@ def pca(
 
     dtype
         Numpy data type string to which to convert the result.
+        For uncentered complex sparse SVD, use `"complex64"` or `"complex128"`
+        to retain the imaginary part of the scores.
 
     chunked
         If `True`, perform an incremental PCA on segments of `chunk_size`.
@@ -290,9 +292,12 @@ def pca(
     )
 
     loadings = _as_numpy(pca_func.components_.T)
+    if loadings.dtype.kind == "c":
+        loadings = loadings.conj()
     if mask_var is not None:
-        loadings = np.zeros(shape=(adata.n_vars, n_comps))
-        loadings[mask_var] = _as_numpy(pca_func.components_.T)
+        padded = np.zeros((adata.n_vars, n_comps), dtype=np.result_type(loadings.dtype, np.float64))
+        padded[mask_var] = loadings
+        loadings = padded
     vals = PcaResult(X_pca, loadings)
     if dests is True:
         return vals

@@ -204,17 +204,50 @@ def test_sparse_solver_reproducibility(svd_solver, zero_center, dtype):
 
 
 @pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
-def test_sparse_solver_complex_variance(svd_solver):
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+def test_sparse_solver_complex_projection_and_variance(svd_solver, dtype):
     rng = np.random.default_rng(4510)
-    X = sparse.random(54, 24, density=0.5, random_state=rng, format="csr").astype(np.complex128)
-    X.data *= 1 + 0.1j * rng.standard_normal(X.nnz)
-    _, _, ratio, variance = rsc.pp.pca(
-        X, n_comps=5, svd_solver=svd_solver, zero_center=False, dtype=X.dtype, rng=42, return_info=True
-    )
-    total_variance = np.square(X.data).sum() / (X.shape[0] - 1)
-    np.testing.assert_allclose(cp.asnumpy(ratio), cp.asnumpy(variance) / total_variance)
+    X = sparse.random(54, 24, density=0.5, random_state=rng, format="csr").astype(dtype)
+    X.data += 1j * rng.standard_normal(X.nnz)
+    mask = np.arange(X.shape[1]) % 3 != 1
+    selected = X[:, mask]
+    kwargs = {"n_comps": 5, "svd_solver": svd_solver, "zero_center": False, "dtype": X.dtype, "rng": 42}
+    scores, components, ratio, variance = map(cp.asnumpy, rsc.pp.pca(selected, return_info=True, **kwargs))
+    tol = 64 * np.finfo(dtype).eps
+    np.testing.assert_allclose(scores, selected @ components.conj().T, rtol=tol, atol=tol)
+    assert np.isrealobj(ratio)
+    values = selected.data.astype(np.complex128, copy=False)
+    total_variance = np.vdot(values, values).real / (X.shape[0] - 1)
+    np.testing.assert_allclose(ratio, variance / total_variance, rtol=tol)
+
+    adata = AnnData(X)
+    rsc.pp.pca(adata, mask=mask, **kwargs)
+    loadings = cp.asnumpy(adata.varm["PCs"])
+    masked_scores = cp.asnumpy(adata.obsm["X_pca"])
+    assert loadings.dtype == np.result_type(dtype, np.float64)
+    np.testing.assert_array_equal(loadings[~mask], 0)
+    np.testing.assert_allclose(X @ loadings, masked_scores, rtol=tol, atol=tol)
+    assert masked_scores.tobytes() == scores.tobytes()
+    assert loadings[mask].tobytes() == components.conj().T.astype(loadings.dtype, copy=False).tobytes()
+    assert adata.uns["pca"]["variance_ratio"].tobytes() == ratio.tobytes()
+    assert adata.uns["pca"]["variance"].tobytes() == variance.tobytes()
+
     with pytest.raises(TypeError, match="real-valued"):
         rsc.pp.pca(X, n_comps=5, svd_solver=svd_solver, zero_center=True, rng=42)
+
+
+@pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
+def test_centered_sparse_solver_variance_large_offset(svd_solver):
+    rng = np.random.default_rng(43)
+    X = rng.binomial(1, 0.25, (48, 16)).astype(np.float64)
+    X[:, 0] = 1e10 + np.tile([-1, 0, 1], 16)
+    X[:, 1] = 1e10
+    csr = sparse.csr_matrix(X)
+    _, _, ratio, variance = rsc.pp.pca(csr, n_comps=4, svd_solver=svd_solver, dtype=X.dtype, rng=42, return_info=True)
+    total_variance = X.var(axis=0, ddof=1).sum()
+    variance = cp.asnumpy(variance)
+    assert np.all(np.isfinite(variance) & (variance > 0))
+    np.testing.assert_allclose(cp.asnumpy(ratio), variance / total_variance, rtol=1e-12)
 
 
 # =============================================================================
@@ -767,7 +800,8 @@ class TestSVDSolvers:
         assert pca.explained_variance_.shape == (k,)
 
     @pytest.mark.parametrize("svd_func", [lanczos_svd, randomized_svd], ids=["lanczos", "randomized"])
-    def test_svd_low_rank_reconstruction(self, svd_func):
+    @pytest.mark.parametrize("dtype", [np.float64, np.complex128])
+    def test_svd_low_rank_reconstruction(self, svd_func, dtype):
         """Test that SVD can reconstruct a low-rank matrix.
 
         Following sklearn's test_randomized_svd_low_rank_all_dtypes.
@@ -778,10 +812,13 @@ class TestSVDSolvers:
         U_true = rng.randn(100, rank)
         s_true = np.array([10.0, 5.0, 2.0, 1.0, 0.5])
         Vt_true = rng.randn(rank, 50)
+        if dtype == np.complex128:
+            U_true = U_true + 1j * rng.randn(*U_true.shape)
+            Vt_true = Vt_true + 1j * rng.randn(*Vt_true.shape)
         # Orthogonalize
         U_true, _ = np.linalg.qr(U_true)
         Vt_true, _ = np.linalg.qr(Vt_true.T)
-        Vt_true = Vt_true.T
+        Vt_true = Vt_true.conj().T
 
         A = U_true @ np.diag(s_true) @ Vt_true
         A_gpu = cp.asarray(A)
@@ -799,6 +836,8 @@ class TestSVDSolvers:
         # Check reconstruction
         A_reconstructed = U @ np.diag(s) @ Vt
         np.testing.assert_allclose(A_reconstructed, A, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(A @ Vt.conj().T, U * s, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(A.conj().T @ U, Vt.conj().T * s, rtol=1e-5, atol=1e-6)
 
     def test_svd_residual_norm(self):
         """Test the fundamental SVD property: Av = σu and A^T u = σv.
@@ -1035,9 +1074,10 @@ class TestSVDSolvers:
         rhs = rng.standard_normal((X.shape[0], 7))
         for v in (rhs[:, 0], rhs):
             np.testing.assert_allclose(adjoint.dot(cp.asarray(v)).get(), X.T @ v, atol=1e-12)
-        sums, squares = adjoint.moments()
-        np.testing.assert_allclose(sums.get(), np.asarray(X.sum(axis=0)).ravel(), atol=1e-12)
-        np.testing.assert_allclose(squares.get(), np.asarray(X.power(2).sum(axis=0)).ravel(), atol=1e-12)
+        mean, centered_ss = adjoint.centered_stats()
+        dense = X.toarray()
+        np.testing.assert_allclose(mean.get(), dense.mean(axis=0), atol=1e-12)
+        np.testing.assert_allclose(centered_ss.get(), np.square(dense - dense.mean(axis=0)).sum(), rtol=1e-12)
 
     @pytest.mark.parametrize(
         ("width", "rhs_dtype", "order"), [(24, np.float32, "C"), (71, np.float32, "C"), (71, np.float64, "F")]
@@ -1081,9 +1121,10 @@ class TestSVDSolvers:
             result = adjoint.dot(operand).get()
             np.testing.assert_allclose(result, X.T @ v, rtol=1e-12, atol=1e-12)
             assert result.tobytes() == adjoint.dot(operand).get().tobytes()
-        sums, squares = adjoint.moments()
-        np.testing.assert_allclose(sums.get(), np.asarray(X.sum(axis=0)).ravel(), atol=1e-12)
-        np.testing.assert_allclose(squares.get(), np.asarray(X.power(2).sum(axis=0)).ravel(), atol=1e-12)
+        mean, centered_ss = adjoint.centered_stats()
+        expected_mean = np.asarray(X.mean(axis=0)).ravel()
+        np.testing.assert_allclose(mean.get(), expected_mean, atol=1e-12)
+        np.testing.assert_allclose(centered_ss.get(), X.power(2).sum() - X.shape[0] * (expected_mean @ expected_mean))
 
     @pytest.mark.parametrize("svd_func", [lanczos_svd, randomized_svd], ids=["lanczos", "randomized"])
     @pytest.mark.parametrize("dtype", [np.float32, np.float64])

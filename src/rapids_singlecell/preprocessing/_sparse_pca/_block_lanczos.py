@@ -18,10 +18,11 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import cupyx.scipy.linalg as cpla
 from cupyx.scipy.sparse import issparse
+from cupyx.scipy.sparse.linalg import LinearOperator
 
 from rapids_singlecell._utils._random import _seed_from_rng
 
-from ._operators import mean_centered_operator
+from ._operators import _svd_flip, mean_centered_operator
 
 if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -32,14 +33,14 @@ def _cholesky_qr2(Q: cp.ndarray) -> cp.ndarray:
     tol = cp.finfo(Q.dtype).eps * max(Q.shape) * 100
     for _ in range(2):
         try:
-            L = cp.linalg.cholesky(Q.T @ Q)
+            L = cp.linalg.cholesky(Q.T.conj() @ Q)
         except cp.linalg.LinAlgError:
             return cp.linalg.qr(Q, mode="reduced")[0]
         # A failed potrf can return a NaN or nonpositive pivot with CuPy's
         # default error mode. Check all pivots with one host synchronization.
-        if not cp.all(L.diagonal() >= tol):
+        if not cp.all(L.diagonal().real >= tol):
             return cp.linalg.qr(Q, mode="reduced")[0]
-        Q = cpla.solve_triangular(L, Q.T, lower=True, overwrite_b=True).T
+        Q = cpla.solve_triangular(L.conj(), Q.T, lower=True, overwrite_b=True).T
     return Q
 
 
@@ -92,9 +93,9 @@ def randomized_svd(
     """
     if issparse(A):
         A = mean_centered_operator(A)
-    AT = A.T
+    AH = A.H if isinstance(A, LinearOperator) else A.T.conj()
     dot = A.dot if hasattr(A, "dot") else A.__matmul__
-    dot_t = AT.dot if hasattr(AT, "dot") else AT.__matmul__
+    dot_h = AH.dot if hasattr(AH, "dot") else AH.__matmul__
     m, n = A.shape
     dtype = A.dtype
     # CuPy generators are seeded, so this is where the host generator
@@ -112,19 +113,17 @@ def randomized_svd(
     Y = dot(Omega)
     Y = _cholesky_qr2(Y)
 
-    # Power iterations: Y = (A @ A.T)^n_iter @ Y
+    # Power iterations: Y = (A @ A.H)^n_iter @ Y
     for _ in range(n_iter):
-        # Z = A.T @ Y
-        Z = dot_t(Y)
+        Z = dot_h(Y)
         Z = _cholesky_qr2(Z)
         # Y = A @ Z
         Y = dot(Z)
         Y = _cholesky_qr2(Y)
 
-    # Y now spans approximate range of A
-    # Compute B = Y.T @ A
+    # Y now spans the approximate range of A.
     Q = Y
-    B = dot_t(Q).T  # B = Q.T @ A = (A.T @ Q).T
+    B = dot_h(Q).T.conj()  # Q.H @ A
 
     # SVD of the small matrix B
     Uhat, s, Vt = cp.linalg.svd(B, full_matrices=False)
@@ -136,11 +135,6 @@ def randomized_svd(
     s = s[:k]
     Vt = Vt[:k, :]
 
-    # Sign correction for deterministic output
-    max_abs_cols = cp.argmax(cp.abs(U), axis=0)
-    signs = cp.sign(U[max_abs_cols, cp.arange(k)])
-    signs[signs == 0] = 1
-    U *= signs
-    Vt *= signs[:, cp.newaxis]
+    _svd_flip(U, Vt)
 
     return U, s, Vt

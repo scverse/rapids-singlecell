@@ -88,6 +88,47 @@ _bounds_kernel = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stu
 )
 
 
+_first_row = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
+    "raw I rows, raw J cols, raw X data",
+    "X reference",
+    """
+    const I stop = rows[1], j = gene_lower_bound(cols, I(0), stop, i);
+    reference = j < stop && cols[j] == i ? data[j] : X(0);
+    """,
+    "svd_csr_first_row",
+    preamble=_lower_bound,
+)
+
+_column_mean = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
+    "float64 shifted_sum, float64 count, X reference, int64 nrows",
+    "float64 mean, float64 offset, float64 zero_energy",
+    """
+    const double missing = nrows - count;
+    offset = (shifted_sum - missing * double(reference)) / nrows;
+    mean = missing > count ? (shifted_sum + count * double(reference)) / nrows : double(reference) + offset;
+    zero_energy = (missing * mean) * mean;
+    """,
+    "svd_csr_column_mean",
+)
+
+_centered_energy = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
+    "raw X data, raw I cols, raw X reference, raw float64 offset, raw float64 zeros, "
+    "int64 nnz, int64 ncols, int64 stride",
+    "float64 partial",
+    """
+    double energy = 0;
+    for (ptrdiff_t col = i; col < ncols; col += stride) energy += zeros[col];
+    for (ptrdiff_t j = i; j < nnz; j += stride) {
+        const I col = cols[j];
+        const double delta = (double(data[j]) - double(reference[col])) - offset[col];
+        energy += delta * delta;
+    }
+    partial = energy;
+    """,
+    "svd_csr_centered_energy",
+)
+
+
 # Each warp owns its counters. When lanes handle different rows, they take
 # turns updating a shared column in ascending lane order.
 @cache
@@ -123,8 +164,8 @@ def _adjoint_kernel(width, lanes, *, moments, packed, wide_block):
                         weights[k] = rhs_start+k < rhs_width ? A(rhs[(first+slot)*rhs_width+rhs_start+k]) : A(0);
                 auto add = [&](int f, A value) {
                     #if MOMENTS
-                    sums[warp][f][0] += value;
-                    sums[warp][f][1] += value * value;
+                    sums[warp][f][0] += value - A(rhs[col0 + f]);
+                    sums[warp][f][1] += A(1);
                     #else
                     #pragma unroll
                     for (int k = 0; k < WIDTH; ++k)
@@ -261,6 +302,17 @@ class _CSRAdjoint:
             out = self._run(V, moments=False)
         return out[:, 0] if V.ndim == 1 else out
 
-    def moments(self):
-        sums = self._run(self.X.data[:0], moments=True)
-        return sums[:, 0], sums[:, 1]
+    def centered_stats(self):
+        X = self.X
+        nrows, ncols = X.shape
+        if not nrows:
+            return cp.full(ncols, cp.nan, dtype=cp.float64), cp.asarray(0, dtype=cp.float64)
+        # Center relative to an observed row to retain small differences even
+        # when a column's mean lies between two representable values.
+        reference = _first_row(X.indptr, X.indices, X.data, size=ncols)
+        sums, counts = self._run(reference, moments=True).T
+        mean, offset, zeros = _column_mean(sums, counts, reference, nrows)
+        # Coalesced partial sums bound the reduction workspace to 2 MiB.
+        stride = min(1 << 18, (max(X.nnz, ncols) + 15) // 16)
+        energy = _centered_energy(X.data, X.indices, reference, offset, zeros, X.nnz, ncols, stride, size=stride)
+        return mean, energy.sum()

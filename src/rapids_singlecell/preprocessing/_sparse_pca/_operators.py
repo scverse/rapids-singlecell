@@ -27,6 +27,16 @@ _sum_squares = cp.ReductionKernel(
     preamble=_accumulator,
 )
 
+
+def _svd_flip(U, Vh):
+    """Make the largest entry in each left singular vector real and nonnegative."""
+    pivots = U[cp.argmax(cp.abs(U), axis=0), cp.arange(U.shape[1])]
+    pivots[pivots == 0] = 1
+    phases = pivots / cp.abs(pivots) if U.dtype.kind == "c" else cp.sign(pivots)
+    U *= phases.conj()
+    Vh *= phases[:, None]
+
+
 # Each row uses a warp, or a full block for matrices with long rows.
 _csr_matvec = cp.ElementwiseKernel(
     "raw I indptr, raw J indices, raw X data, raw V rhs, int32 threads",
