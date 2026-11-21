@@ -145,6 +145,7 @@ def _count_spatial_tiles(
     bounds = cp.empty((n_tiles, spatial.shape[1], 2), dtype=cp.float32)
     _co.build_tiles(points, offsets, tile_offsets, tiles, bounds, stream)
 
+    device_ids = device_ids[:n_tiles]
     parts = []
     with ExitStack() as stack:
         inputs = (points, tiles, bounds, thresholds)
@@ -154,4 +155,5 @@ def _count_spatial_tiles(
                 counts = cp.zeros(shape, dtype=cp.uint64)
                 _co.count_tiles(*replica, counts, rank, len(device_ids), cp.cuda.get_current_stream().ptr)
                 parts.append(counts)
-    return cp.cumsum(_sum_on_device(parts, spatial.device.id), axis=-1)
+    counts = _sum_on_device(parts, spatial.device.id)
+    return cp.cumsum(counts, axis=-1, out=counts)

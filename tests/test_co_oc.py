@@ -9,6 +9,7 @@ import pytest
 from anndata import AnnData, read_h5ad
 
 from rapids_singlecell._cuda import _cooc_cuda
+from rapids_singlecell.squidpy_gpu import _co_oc
 from rapids_singlecell.squidpy_gpu._co_oc import (
     _count_spatial_tiles,
     _find_min_max,
@@ -96,6 +97,36 @@ def test_spatial_tiles_count_partial_and_empty_categories(dims):
     counts = _count_spatial_tiles(cp.asarray(points), cp.asarray(labels), cp.asarray(thresholds), 3, [0]).get()
 
     np.testing.assert_array_equal(counts, _reference_counts(points, labels, thresholds))
+
+
+def test_spatial_tiles_scan_with_one_count_buffer(cupy_pool):
+    k = 64
+    thresholds = cp.arange(1024, dtype=cp.float32)
+    points = cp.arange(3, dtype=cp.float32)[:, None]
+    labels = cp.asarray([0, k - 1, k - 1], dtype=cp.int32)
+    count_bytes = k * k * len(thresholds) * np.dtype(np.uint64).itemsize
+    cupy_pool.set_limit(size=count_bytes * 3 // 2)
+
+    counts = _count_spatial_tiles(points, labels, thresholds, k, [points.device.id])
+
+    expected = np.searchsorted([1, 4], np.arange(len(thresholds)), side="right")
+    np.testing.assert_array_equal(counts[0, -1].get(), expected)
+
+
+def test_spatial_tiles_skip_idle_devices(monkeypatch):
+    points = cp.zeros((2, 2), dtype=cp.float32)
+    labels = cp.zeros(2, dtype=cp.int32)
+    source = points.device.id
+    copy_inputs = _co_oc._copies_on_device
+
+    def copy_to_active_device(arrays, device):
+        assert device == source, "copied inputs to a GPU with no tile rows"
+        return copy_inputs(arrays, device)
+
+    monkeypatch.setattr(_co_oc, "_copies_on_device", copy_to_active_device)
+    counts = _count_spatial_tiles(points, labels, cp.zeros(1, dtype=cp.float32), 1, [source, source + 1])
+
+    np.testing.assert_array_equal(counts.get(), [[[1]]])
 
 
 @pytest.mark.parametrize("dims", [2, 3])
