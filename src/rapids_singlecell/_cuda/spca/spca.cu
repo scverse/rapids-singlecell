@@ -2,6 +2,7 @@
 #include "../nb_types.h"
 
 #include "kernels_spca.cuh"
+#include "ordered_gram.cuh"
 #include "spca_tensorcore.cuh"
 #include "csr_pca_tiles.cuh"
 
@@ -117,6 +118,10 @@ void def_check_zero_genes(nb::module_& m) {
 template <typename Device>
 void register_bindings(nb::module_& m) {
     tensor_gram::bind<Device>(m);
+    ordered_gram::bind<float, int, Device>(m);
+    ordered_gram::bind<float, long long, Device>(m);
+    ordered_gram::bind<double, int, Device>(m);
+    ordered_gram::bind<double, long long, Device>(m);
     def_gram_csr_upper<float, int, Device>(m);
     def_gram_csr_upper<float, long long, Device>(m);
     def_gram_csr_upper<double, int, Device>(m);

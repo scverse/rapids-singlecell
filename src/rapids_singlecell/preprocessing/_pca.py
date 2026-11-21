@@ -445,8 +445,6 @@ def _run_covariance_pca(X, n_comps, zero_center):
 
     if not isspmatrix_csr(X) and not isinstance(X, DaskArray):
         X = X.tocsr()
-    if issparse_cupy(X):
-        X.sort_indices()
 
     pca_func = PCA_sparse(n_components=n_comps, zero_center=zero_center)
     X_pca = pca_func.fit_transform(X)

@@ -15,7 +15,7 @@ from rapids_singlecell._compat import (
 from rapids_singlecell._cuda import _spca_cuda as _spca
 from rapids_singlecell.preprocessing._utils import _get_mean_var
 
-from ._helper import _check_matrix_for_zero_genes, _compute_cov, _copy_gram
+from ._helper import _canonical_csr, _check_matrix_for_zero_genes, _compute_cov, _copy_gram, _csr_mean
 
 
 class PCA_sparse:
@@ -79,15 +79,24 @@ class PCA_sparse:
         return X_pca
 
     def _transform_cupy(self, X: spmatrix) -> spmatrix:
-        if self.zero_center:
-            precomputed_mean_impact = self.mean_ @ self.components_.T
-            mean_impact = cp.ones((X.shape[0], 1), dtype=cp.float32) @ precomputed_mean_impact.reshape(1, -1)
-            X_transformed = X.dot(self.components_.T) - mean_impact
-        else:
-            # Uncentered projection for truncated SVD
-            X_transformed = X.dot(self.components_.T)
-
-        return X_transformed.get()
+        if X.shape[1] != self.components_.shape[1]:
+            raise ValueError("PCA input and loadings have different numbers of features")
+        X = _canonical_csr(X.tocsr())
+        dtype = cp.result_type(X.dtype, self.components_.dtype)
+        weights = cp.ascontiguousarray(self.components_.T, dtype=dtype)
+        pcs = weights.shape[1]
+        offset = self.mean_ @ weights if self.zero_center else cp.zeros(pcs, dtype=dtype)
+        scores = cp.empty((X.shape[0], pcs), dtype=dtype)
+        _spca.pca_project_csr(
+            X.indptr,
+            X.indices,
+            X.data.astype(dtype, copy=False),
+            weights,
+            offset,
+            scores,
+            cp.cuda.get_current_stream().ptr,
+        )
+        return scores.get()
 
     def _transform_dask(self, X: DaskArray) -> DaskArray:
         if self.zero_center:
@@ -115,6 +124,8 @@ class PCA_sparse:
         return X_pca
 
     def fit_transform(self, X, y=None):
+        if isinstance(X, csr_matrix):
+            X = _canonical_csr(X)
         return self.fit(X).transform(X)
 
 
@@ -157,6 +168,8 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.nda
             cov(X, X), gram(X, X), mean(X), mean(X)
             when return_gram is True and return_mean is True
     """
+    if isinstance(x, csr_matrix):
+        x = _canonical_csr(x)
     gram_matrix = _create_gram_matrix(x)
 
     if return_gram:
@@ -167,9 +180,11 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.nda
         else:
             return gram_matrix
     else:
-        mean_x, _ = _get_mean_var(x, axis=0)
         if isinstance(x, DaskArray):
+            mean_x, _ = _get_mean_var(x, axis=0)
             gram_matrix, mean_x = dask.compute(gram_matrix, mean_x)
+        else:
+            mean_x = _csr_mean(x)
         if _check_csr_meta(x) or isinstance(x, csr_matrix):
             gram_matrix = _copy_gram(gram_matrix, x.shape[1])
 
@@ -183,16 +198,9 @@ def _cov_sparse(x: spmatrix | DaskArray, *, return_gram: bool = False) -> cp.nda
 
 def _create_gram_matrix(x):
     if isinstance(x, csr_matrix):
-        gram_matrix = cp.zeros((x.shape[1], x.shape[1]), dtype=x.data.dtype)
-        _spca.gram_csr_upper(
-            x.indptr,
-            x.indices,
-            x.data,
-            nrows=x.shape[0],
-            ncols=x.shape[1],
-            out=gram_matrix,
-            stream=cp.cuda.get_current_stream().ptr,
-        )
+        from ._ordered import _ordered_gram
+
+        gram_matrix = _ordered_gram(x)
     elif isinstance(x, DaskArray):
         n_cols = x.shape[1]
         if isinstance(x._meta, csr_matrix):

@@ -66,8 +66,51 @@ __global__ void pca_center_csr(const I* indptr, const I* columns, const T* data,
     }
 }
 
+// A warp projects one row onto a group of PCs. Lanes assigned to the same
+// PC visit disjoint entries and combine them in a fixed order.
+template <typename T, typename I>
+__global__ void pca_project_csr(const I* indptr, const I* columns,
+                                const T* data, const T* weights,
+                                const T* offset, T* scores, size_t nrows,
+                                int pcs) {
+    size_t row = static_cast<size_t>(blockIdx.x) * blockDim.z + threadIdx.z;
+    if (row >= nrows) return;
+    unsigned pc = blockIdx.y * blockDim.x + threadIdx.x;
+    T sum = 0;
+    if (pc < pcs) {
+        size_t end = indptr[row + 1];
+        for (size_t i = static_cast<size_t>(indptr[row]) + threadIdx.y; i < end;
+             i += blockDim.y) {
+            sum = fma(data[i],
+                      weights[static_cast<size_t>(columns[i]) * pcs + pc], sum);
+        }
+    }
+    for (int stride = 16; stride >= static_cast<int>(blockDim.x); stride /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, stride);
+    if (threadIdx.y == 0 && pc < pcs) scores[row * pcs + pc] = sum - offset[pc];
+}
+
 template <typename T, typename I, typename Device>
 void register_pca_tiles(nb::module_& m) {
+    m.def("pca_project_csr",
+          [](gpu_array_c<const I, Device> indptr,
+             gpu_array_c<const I, Device> columns,
+             gpu_array_c<const T, Device> data,
+             gpu_array_c<const T, Device> weights,
+             gpu_array_c<const T, Device> offset, gpu_array_c<T, Device> scores,
+             std::uintptr_t stream) {
+              size_t rows = scores.shape(0);
+              int pcs = scores.shape(1);
+              if (!rows || !pcs) return;
+              int width = pcs == 1 ? 1 : pcs <= 8 ? 4 : pcs <= 32 ? 8 : 16;
+              dim3 block(width, 32 / width, 8);
+              dim3 grid((rows + 7) / 8, (pcs + width - 1) / width);
+              pca_project_csr<<<grid, block, 0,
+                                reinterpret_cast<cudaStream_t>(stream)>>>(
+                  indptr.data(), columns.data(), data.data(), weights.data(),
+                  offset.data(), scores.data(), rows, pcs);
+              CUDA_CHECK_LAST_ERROR(pca_project_csr);
+          });
     m.def("pca_column_sums",
           [](gpu_array_c<const I, Device> indptr,
              gpu_array_c<const I, Device> columns,

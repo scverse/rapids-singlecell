@@ -124,6 +124,27 @@ def test_pca_correctness_no_center(use_sparse):
 # =============================================================================
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_in_memory_sparse_covariance_reproducible(dtype):
+    rng = np.random.default_rng(91)
+    x = sparse.random(8193, 97, density=0.13, format="csr", dtype=dtype, random_state=rng)
+    x.data *= (1 + x.indices % 17).astype(dtype)
+    x_gpu = cusparse.csr_matrix(x)
+    results = [rsc.pp.pca(x_gpu, n_comps=9, dtype=dtype, return_info=True) for _ in range(3)]
+    scores, components, ratio, variance = results[0]
+    for repeated in results[1:]:
+        for original, actual in zip(results[0], repeated, strict=True):
+            assert actual.tobytes() == original.tobytes()
+
+    dense = x.toarray().astype(np.float64)
+    dense -= dense.mean(axis=0)
+    eigen = np.linalg.eigvalsh(dense.T @ dense / len(dense))[::-1]
+    tol = 2e-5 if dtype == np.float32 else 1e-11
+    np.testing.assert_allclose(variance, eigen[:9], rtol=tol)
+    np.testing.assert_allclose(ratio, eigen[:9] / eigen.sum(), rtol=tol)
+    np.testing.assert_allclose(scores, dense @ components.T, rtol=tol, atol=tol)
+
+
 def test_tiled_pca_csr_centering():
     from rapids_singlecell._cuda import _spca_cuda
 
@@ -148,7 +169,7 @@ def test_tiled_pca_csr_centering():
 
 
 def test_tiled_pca_csr_duplicates():
-    from rapids_singlecell.preprocessing._sparse_pca._tiled import _canonical_csr_arrays
+    from rapids_singlecell.preprocessing._sparse_pca._helper import _canonical_csr
 
     # Duplicate summation must retain the unit between opposite large entries.
     values = cp.asarray([2**30, 4, 1, 3, -(2**30), 0.125, 2**60, 0.125], dtype=cp.float32)
@@ -157,13 +178,37 @@ def test_tiled_pca_csr_duplicates():
     x = cusparse.csr_matrix((values, cols, ptr), shape=(4, 3))
     x.indices, x.indptr = cols.astype(cp.int64), ptr.astype(cp.int64)
     for _ in range(2):
-        indptr, indices, data = _canonical_csr_arrays(x)
+        canonical = _canonical_csr(x)
+        indptr, indices, data = canonical.indptr, canonical.indices, canonical.data
         assert indptr.dtype == indices.dtype == cp.int64
         np.testing.assert_array_equal(indptr.get(), [0, 3, 3, 5, 5])
         np.testing.assert_array_equal(indices.get(), [0, 1, 2, 0, 1])
         np.testing.assert_array_equal(data.get(), [3, 4, 1, 2**60, 0.25])
     np.testing.assert_array_equal(x.indices.get(), cols.get())
     np.testing.assert_array_equal(x.indptr.get(), ptr.get())
+
+
+@pytest.mark.parametrize(("dtype", "index_dtype", "pcs"), [(np.float32, cp.int32, 1), (np.float64, cp.int64, 17)])
+def test_sparse_pca_fixed_projection(dtype, index_dtype, pcs):
+    from rapids_singlecell.preprocessing._sparse_pca._sparse_pca import PCA_sparse
+
+    rng = np.random.default_rng(81)
+    x = rng.normal(size=(257, 513)).astype(dtype)
+    x[rng.random(x.shape) < 0.95] = 0
+    x[::13] = 0
+    x[1] = rng.normal(size=x.shape[1])
+    gpu = cusparse.csr_matrix(sparse.csr_matrix(x))
+    gpu.indices = gpu.indices.astype(index_dtype)
+    gpu.indptr = gpu.indptr.astype(index_dtype)
+    weights = rng.normal(size=(x.shape[1], pcs)).astype(dtype)
+    mean = x.mean(axis=0, dtype=np.float64).astype(dtype)
+    pca = PCA_sparse(n_components=pcs)
+    pca.mean_, pca.components_ = cp.asarray(mean), cp.asarray(weights.T)
+    scores = pca._transform_cupy(gpu)
+    np.testing.assert_array_equal(scores, pca._transform_cupy(gpu))
+    np.testing.assert_allclose(
+        scores, (x.astype(np.float64) - mean) @ weights, atol=5e-5 if dtype == np.float32 else 1e-12
+    )
 
 
 def test_tensorcore_gram_partial_tiles_and_exceptional_features():
@@ -206,6 +251,61 @@ def test_tensorcore_gram_partial_tiles_and_exceptional_features():
     scale = np.sqrt(reference.diagonal())
     error = np.abs(actual - np.triu(reference))
     assert np.all(error <= 2e-6 * scale[:, None] * scale[None, :])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "exponent", "two_bins"), [(np.float32, 3, False), (np.float32, 12, True), (np.float64, 12, True)]
+)
+def test_sparse_gram_exact_products(dtype, exponent, two_bins):
+    import math
+
+    from rapids_singlecell.preprocessing._sparse_pca._ordered import _integer_scale, _ordered_gram
+
+    big, small = 2.0**exponent, 2.0**-exponent
+    # The cross term cancels to a value much smaller than either large product.
+    near = np.nextafter(dtype(1), dtype(2))
+    x = np.array([[big, big], [small, small], [big, -big], [near, near], [near, -near]], dtype=dtype)
+    gpu_x = cusparse.csr_matrix(cp.asarray(x))
+    _, bits = _integer_scale(gpu_x, cp.cuda.get_current_stream().ptr)
+    assert bool(bits) == two_bins
+    reference = np.zeros((2, 2), dtype=dtype)
+    for i, j in zip(*np.triu_indices(2), strict=True):
+        reference[i, j] = math.fsum(x[:, i] * x[:, j])
+    np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), reference)
+    np.testing.assert_array_equal(_ordered_gram(gpu_x[::-1].copy()).get(), reference)
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+def test_sparse_gram_carry_rounding(extra):
+    from rapids_singlecell.preprocessing._sparse_pca._ordered import _integer_scale, _ordered_gram
+
+    # Integer carries and borrows leave 256 plus a half ULP (or just above).
+    count = 128 + extra
+    near = np.nextafter(1.0, 2.0)
+    x = np.array([[16, 16]] * 32 + [[16, -16]] * 31 + [[near, 1], [1, -1]] * count)
+    gpu_x = cusparse.csr_matrix(cp.asarray(x))
+    _, bits = _integer_scale(gpu_x, cp.cuda.get_current_stream().ptr)
+    assert bits == 64
+    expected = np.nextafter(256.0, np.inf) if extra else 256.0
+    assert _ordered_gram(gpu_x)[0, 1].item() == expected
+    assert _ordered_gram(gpu_x[::-1].copy())[0, 1].item() == expected
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_sparse_gram_wide_range(dtype):
+    from rapids_singlecell.preprocessing._sparse_pca._ordered import _integer_scale, _ordered_gram
+
+    # The only overlapping values in the two columns have a tiny product.
+    x = np.array([[2.0**40, 0], [0, -(2.0**40)], [2.0**-40, -(2.0**-40)]], dtype=dtype)
+    gpu_x = cusparse.csr_matrix(cp.asarray(x))
+    assert _integer_scale(gpu_x, cp.cuda.get_current_stream().ptr) is None
+    expected = np.triu(x.T @ x)
+    np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), expected)
+    # The integer conversion must also exclude a product overflowing the input dtype.
+    limit = 2.0 ** (np.finfo(dtype).maxexp // 2)
+    overflowing = cusparse.csr_matrix(cp.asarray([[limit, 0], [0, 1]], dtype=dtype))
+    assert _integer_scale(overflowing, cp.cuda.get_current_stream().ptr) is None
+    np.testing.assert_array_equal(_ordered_gram(overflowing).get(), [[np.inf, 0], [0, 1]])
 
 
 def test_tiled_covariance_dispatch(monkeypatch):

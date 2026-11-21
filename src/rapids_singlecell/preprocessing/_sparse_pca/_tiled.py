@@ -9,32 +9,7 @@ from cupyx.scipy.sparse import isspmatrix_csr
 
 from rapids_singlecell._cuda import _spca_cuda as _spca
 
-from ._helper import _check_matrix_for_zero_genes
-
-_sum_csr_duplicates = cp.ElementwiseKernel(  # type: ignore[attr-defined]
-    "int64 start, int64 stop, raw int64 order, raw T data",
-    "T total",
-    """
-    double sum = 0;
-    for (long long j = start; j < stop; ++j) sum += data[order[j]];
-    total = sum;
-    """,
-    "pca_sum_csr_duplicates",
-)
-
-
-def _canonical_csr_arrays(X):
-    if X.has_canonical_format or not X.nnz:
-        return X.indptr, X.indices, X.data
-    # Stable sorting keeps repeated entries in input order. CuPy's
-    # sum_duplicates uses floating-point atomics for this reduction.
-    keys = X.tocoo(copy=False).row.astype(cp.int64) * X.shape[1] + X.indices
-    order = cp.argsort(keys)
-    bounds = cp.flatnonzero(cp.diff(keys[order], prepend=-1, append=-1))
-    starts = bounds[:-1]
-    data = _sum_csr_duplicates(starts, bounds[1:], order, X.data)
-    indptr = cp.searchsorted(starts, X.indptr).astype(X.indptr.dtype, copy=False)
-    return indptr, X.indices[order[starts]], data
+from ._helper import _canonical_csr, _check_matrix_for_zero_genes, _csr_mean
 
 
 def _run_tiled_pca(X, n_comps):
@@ -43,11 +18,8 @@ def _run_tiled_pca(X, n_comps):
     sparse = isspmatrix_csr(X)
     if sparse:
         _check_matrix_for_zero_genes(X)
-        indptr, indices, data = _canonical_csr_arrays(X)
-        partial = cp.empty((min(1024, n_rows), n_cols), dtype=cp.float64)
-        _spca.pca_column_sums(indptr, indices, data, partial, cp.cuda.get_current_stream().ptr)
-        mean = partial.sum(axis=0) / n_rows
-        del partial
+        X = _canonical_csr(X)
+        mean = _csr_mean(X)
     else:
         mean = X.mean(axis=0, dtype=cp.float64)
 
@@ -60,7 +32,7 @@ def _run_tiled_pca(X, n_comps):
             tile = buffer[: stop - start]
             if sparse:
                 _spca.pca_center_csr(
-                    indptr[start : stop + 1], indices, data, mean, tile, cp.cuda.get_current_stream().ptr
+                    X.indptr[start : stop + 1], X.indices, X.data, mean, tile, cp.cuda.get_current_stream().ptr
                 )
             else:
                 cp.subtract(X[start:stop], mean, out=tile)
