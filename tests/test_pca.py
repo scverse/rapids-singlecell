@@ -126,7 +126,7 @@ def test_pca_correctness_no_center(use_sparse):
 
 @pytest.mark.parametrize("svd_solver", ["lanczos", "randomized", "covariance_eigh"])
 @pytest.mark.parametrize("zero_center", [True, False])
-def test_sparse_solver_correctness(svd_solver, zero_center):
+def test_sparse_solver_correctness(svd_solver, zero_center, monkeypatch):
     """Test sparse solvers produce correct results compared to covariance_eigh."""
     rng = np.random.RandomState(42)
     X = sparse.random(200, 50, density=0.2, random_state=rng, format="csr")
@@ -135,6 +135,14 @@ def test_sparse_solver_correctness(svd_solver, zero_center):
     # Reference: covariance_eigh (exact method)
     ref = AnnData(X.copy())
     rsc.pp.pca(ref, n_comps=10, svd_solver="covariance_eigh", zero_center=zero_center)
+
+    if svd_solver in ("lanczos", "randomized"):
+
+        def reject_conversion(*args, **kwargs):
+            pytest.fail("Sparse SVD materialized the transpose of its CSR input")
+
+        monkeypatch.setattr(cusparse.csr_matrix, "tocsc", reject_conversion)
+        monkeypatch.setattr(cusparse.csc_matrix, "tocsr", reject_conversion)
 
     # Test solver
     test = AnnData(X.copy())
@@ -168,32 +176,45 @@ def test_sparse_solver_correctness(svd_solver, zero_center):
 
 
 @pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
-def test_sparse_solver_reproducibility(svd_solver):
-    """Test sparse solvers are reproducible with same random_state."""
-    rng = np.random.RandomState(42)
-    X = sparse.random(200, 50, density=0.2, random_state=rng, format="csr")
-    X = X.astype(np.float64)
+@pytest.mark.parametrize("zero_center", [True, False])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_sparse_solver_reproducibility(svd_solver, zero_center, dtype):
+    X = sparse.random(200, 50, density=0.2, random_state=42, format="csr", dtype=dtype)
+    # Duplicate coordinates must be combined before computing column variances.
+    values = np.stack((X.data, X.data * 0.5, X.data * -0.25), axis=1).ravel()
+    X = sparse.csr_matrix((values, X.indices.repeat(3), X.indptr * 3), shape=X.shape)
 
-    adata1 = AnnData(X.copy())
-    adata2 = AnnData(X.copy())
+    def run():
+        return rsc.pp.pca(
+            X, n_comps=10, svd_solver=svd_solver, zero_center=zero_center, dtype=dtype, rng=42, return_info=True
+        )
 
-    rsc.pp.pca(adata1, n_comps=10, svd_solver=svd_solver, random_state=42)
-    rsc.pp.pca(adata2, n_comps=10, svd_solver=svd_solver, random_state=42)
+    first = run()
+    for a, b in zip(first, run(), strict=True):
+        assert cp.asnumpy(a).tobytes() == cp.asnumpy(b).tobytes()
 
-    X_pca1 = adata1.obsm["X_pca"]
-    X_pca2 = adata2.obsm["X_pca"]
-    if hasattr(X_pca1, "get"):
-        X_pca1 = X_pca1.get()
-    if hasattr(X_pca2, "get"):
-        X_pca2 = X_pca2.get()
+    scores, components, variance_ratio, variance = first
+    dense = X.toarray()
+    if zero_center:
+        dense -= dense.mean(axis=0)
+    tol = 64 * np.finfo(dtype).eps
+    np.testing.assert_allclose(cp.asnumpy(scores), dense @ cp.asnumpy(components).T, rtol=tol, atol=tol)
+    total_variance = np.square(dense).sum() / (X.shape[0] - 1)
+    np.testing.assert_allclose(cp.asnumpy(variance_ratio), cp.asnumpy(variance) / total_variance, rtol=tol)
 
-    np.testing.assert_allclose(X_pca1, X_pca2, rtol=1e-10, atol=1e-10)
-    np.testing.assert_allclose(
-        adata1.uns["pca"]["variance"],
-        adata2.uns["pca"]["variance"],
-        rtol=1e-10,
-        atol=1e-10,
+
+@pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
+def test_sparse_solver_complex_variance(svd_solver):
+    rng = np.random.default_rng(4510)
+    X = sparse.random(54, 24, density=0.5, random_state=rng, format="csr").astype(np.complex128)
+    X.data *= 1 + 0.1j * rng.standard_normal(X.nnz)
+    _, _, ratio, variance = rsc.pp.pca(
+        X, n_comps=5, svd_solver=svd_solver, zero_center=False, dtype=X.dtype, rng=42, return_info=True
     )
+    total_variance = np.square(X.data).sum() / (X.shape[0] - 1)
+    np.testing.assert_allclose(cp.asnumpy(ratio), cp.asnumpy(variance) / total_variance)
+    with pytest.raises(TypeError, match="real-valued"):
+        rsc.pp.pca(X, n_comps=5, svd_solver=svd_solver, zero_center=True, rng=42)
 
 
 # =============================================================================
@@ -584,7 +605,8 @@ def test_pca_out():
 @pytest.mark.filterwarnings("ignore:Some cells have zero counts:UserWarning")
 @pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in divide:RuntimeWarning")
-def test_pca_layer_mask():
+@pytest.mark.parametrize("svd_solver", [None, "lanczos", "randomized"])
+def test_pca_layer_mask(svd_solver):
     """Test error when layer has zero-expression genes."""
     adata = sc.datasets.pbmc3k()[:, 1000].copy()
     sc.pp.normalize_total(adata)
@@ -593,7 +615,7 @@ def test_pca_layer_mask():
         ValueError,
         match="There are genes with zero expression. Please remove them before running PCA.",
     ):
-        rsc.pp.pca(adata)
+        rsc.pp.pca(adata, svd_solver=svd_solver)
 
 
 # =============================================================================
@@ -944,13 +966,8 @@ class TestSVDSolvers:
         U1, s1, Vt1 = svd_func(X_gpu, k=k, rng=0)
         U2, s2, Vt2 = svd_func(X_gpu, k=k, rng=0)
 
-        # Results should be identical up to cuSPARSE noise: A.T @ u SpMV uses
-        # atomics with no bitwise-determinism guarantee, and Lanczos restarts
-        # amplify the ULP differences to ~1e-9 rel / ~5e-14 abs (measured on
-        # T4 and Blackwell), so tolerances sit 10-20x above that noise floor.
-        np.testing.assert_allclose(U1.get(), U2.get(), rtol=1e-8, atol=1e-12)
-        np.testing.assert_allclose(s1.get(), s2.get(), rtol=1e-8, atol=1e-12)
-        np.testing.assert_allclose(Vt1.get(), Vt2.get(), rtol=1e-8, atol=1e-12)
+        for a, b in ((U1, U2), (s1, s2), (Vt1, Vt2)):
+            assert a.get().tobytes() == b.get().tobytes()
 
     def test_mean_centered_operator(self):
         """Test that the mean-centered operator works correctly."""
@@ -979,11 +996,94 @@ class TestSVDSolvers:
         np.testing.assert_allclose(result_op.get(), expected.get(), rtol=1e-10)
 
         # Test matmat
-        V = cp.random.randn(50, 10)
+        V = cp.asarray(rng.standard_normal((50, 69)))
         result_op = op.dot(V)
         expected = X_dense @ V - cp.outer(cp.ones(100), mean @ V)
 
         np.testing.assert_allclose(result_op.get(), expected.get(), rtol=1e-10)
+
+    @pytest.mark.parametrize("width", [1, 35])
+    def test_centered_adjoint_long_column(self, width):
+        from rapids_singlecell.preprocessing._sparse_pca._operators import mean_centered_operator
+
+        n = 100_000
+        X = cusparse.csr_matrix(cp.ones((n, 1), dtype=cp.float32))
+        op = mean_centered_operator(X, cp.ones(1, dtype=cp.float32))
+        rhs = cp.full((n, width), 1 / np.sqrt(n), dtype=cp.float32)
+        result = op.T @ (rhs[:, 0] if width == 1 else rhs)
+        atol = 4 * np.spacing(np.float32(np.sqrt(n)))
+        np.testing.assert_allclose(result.get(), 0, atol=atol)
+
+    def test_csr_adjoint_int64(self):
+        from rapids_singlecell.preprocessing._sparse_pca._csr_adjoint import _CSRAdjoint
+
+        rng = np.random.default_rng(18)
+        X = sparse.vstack(
+            (
+                sparse.random(193, 777, density=0.125, random_state=rng),
+                sparse.csr_matrix((71, 777)),
+                sparse.random(1, 777, density=0.95, random_state=rng),
+            ),
+            format="csr",
+        )
+        X = sparse.hstack((X, sparse.csr_matrix((X.shape[0], 3))), format="csr")
+        X_gpu = cusparse.csr_matrix(X)
+        X_gpu.indptr = X_gpu.indptr.astype(cp.int64)
+        X_gpu.indices = X_gpu.indices.astype(cp.int64)
+        adjoint = _CSRAdjoint(X_gpu)
+
+        rhs = rng.standard_normal((X.shape[0], 7))
+        for v in (rhs[:, 0], rhs):
+            np.testing.assert_allclose(adjoint.dot(cp.asarray(v)).get(), X.T @ v, atol=1e-12)
+        sums, squares = adjoint.moments()
+        np.testing.assert_allclose(sums.get(), np.asarray(X.sum(axis=0)).ravel(), atol=1e-12)
+        np.testing.assert_allclose(squares.get(), np.asarray(X.power(2).sum(axis=0)).ravel(), atol=1e-12)
+
+    @pytest.mark.parametrize(
+        ("width", "rhs_dtype", "order"), [(24, np.float32, "C"), (71, np.float32, "C"), (71, np.float64, "F")]
+    )
+    def test_wide_csr_adjoint(self, width, rhs_dtype, order):
+        from rapids_singlecell.preprocessing._sparse_pca._csr_adjoint import _CSRAdjoint
+
+        rng = np.random.default_rng(63)
+        X = sparse.random(193, 778, density=0.007, format="csr", random_state=rng, dtype=np.float32)
+        X = sparse.hstack((np.ones((193, 1), dtype=np.float32), X), format="csr")
+        X_gpu = cusparse.csr_matrix(X)
+        X_gpu.indptr = X_gpu.indptr.astype(cp.int64)
+        X_gpu.indices = X_gpu.indices.astype(cp.int64)
+        adjoint = _CSRAdjoint(X_gpu)
+
+        rhs = rng.standard_normal((193, width)).astype(rhs_dtype, order=order)
+        operand = cp.array(rhs, order=order)
+        result = adjoint.dot(operand).get()
+        expected = X.astype(np.float64).T @ rhs
+        np.testing.assert_allclose(result, expected, rtol=4 * np.finfo(rhs_dtype).eps, atol=1e-12)
+        assert result.tobytes() == adjoint.dot(operand).get().tobytes()
+
+    @pytest.mark.parametrize("dense_row", [False, True])
+    def test_csr_adjoint_shared_peaks(self, dense_row):
+        from rapids_singlecell.preprocessing._sparse_pca._csr_adjoint import _CSRAdjoint
+
+        rng = np.random.default_rng(31)
+        peaks = 131_073
+        X = sparse.random(97, peaks, density=0.009, random_state=rng, format="csr")
+        if dense_row:
+            # A row offset can exceed uint16 even when most cells have few peaks.
+            X = sparse.vstack((X, np.ones((1, peaks))), format="csr")
+        # Shared peaks exceed the packed prefix limit in the first tile.
+        X = sparse.hstack((np.ones((X.shape[0], 64)), X), format="csr")
+        X.sort_indices()
+        adjoint = _CSRAdjoint(cusparse.csr_matrix(X))
+
+        rhs = rng.standard_normal((X.shape[0], 7))
+        for v in (rhs[:, 0], rhs):
+            operand = cp.asarray(v)
+            result = adjoint.dot(operand).get()
+            np.testing.assert_allclose(result, X.T @ v, rtol=1e-12, atol=1e-12)
+            assert result.tobytes() == adjoint.dot(operand).get().tobytes()
+        sums, squares = adjoint.moments()
+        np.testing.assert_allclose(sums.get(), np.asarray(X.sum(axis=0)).ravel(), atol=1e-12)
+        np.testing.assert_allclose(squares.get(), np.asarray(X.power(2).sum(axis=0)).ravel(), atol=1e-12)
 
     @pytest.mark.parametrize("svd_func", [lanczos_svd, randomized_svd], ids=["lanczos", "randomized"])
     @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -1093,6 +1193,49 @@ def _largest_principal_angle(V_ref, V):
     return float(np.arccos(np.clip(s.min(), -1.0, 1.0)))
 
 
+@pytest.mark.parametrize("separated", [False, True])
+def test_lanczos_restart_checkpoint(*, separated):
+    from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import _lanczos_bidiag
+
+    n, ncv = 144, 80
+    values = cp.linspace(1, 0.01, n, dtype=cp.float32)
+    values[:2] = cp.asarray([20, 19])
+    if separated:
+        values[2:6] = cp.asarray([8, 6, 4, 2])
+
+    # Start a restart with the two largest singular vectors already locked.
+    U = cp.zeros((n, ncv + 3), dtype=values.dtype, order="F")
+    U[:, :2] = cp.eye(n, 2, dtype=values.dtype)
+    rng = cp.random.default_rng(2)
+    a, b = _lanczos_bidiag(
+        cp.diag(values),
+        ncv=ncv,
+        v_start=rng.standard_normal(n).astype(values.dtype),
+        U_full=U,
+        V_full=U.copy(order="F"),
+        n_locked=2,
+        rng=rng,
+        ortho_buf=cp.empty(ncv + 3, dtype=values.dtype),
+        remaining=2,
+    )
+    assert (a.size < ncv) == separated
+    projected = np.diag(a.get()) + np.diag(b[1:-1].get(), 1)
+    np.testing.assert_allclose(np.linalg.svd(projected, compute_uv=False)[:2], values[2:4].get(), rtol=1e-5)
+
+
+def test_lanczos_restart_convergence_guard():
+    from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import _restart_converged
+
+    alphas = cp.linspace(8, 1, 48, dtype=cp.float32)
+    betas = cp.full(49, 1e-12, dtype=cp.float32)
+    betas[-1] = 1
+    tied = alphas.copy()
+    tied[2] = tied[1]
+    assert not _restart_converged(tied, betas, 2)
+    betas[20] = 0
+    assert not _restart_converged(alphas, betas, 2)
+
+
 @pytest.mark.parametrize(
     "dtype,tol,sv_rtol,angle_tol,resid_tol,orth_tol",
     [
@@ -1102,28 +1245,11 @@ def _largest_principal_angle(V_ref, V):
     ids=["float64", "float32"],
 )
 def test_lanczos_multilock_restart(dtype, *, tol, sv_rtol, angle_tol, resid_tol, orth_tol, monkeypatch):
-    """Exercise the restart path when more than one Ritz pair is locked per sweep.
-
-    ``lanczos_svd`` builds its restart vector from ``V_full[:, n_locked:]`` *after*
-    ``n_locked`` has already been advanced by the number of newly locked vectors ``d``,
-    so when ``d >= 2`` the read is both reindexed and runs ``d - 1`` columns past the
-    bidiagonalization write frontier (which ``cp.zeros`` makes deterministically zero).
-    This test pins that path so it stays covered.
-
-    The spectrum is a slowly decaying geometric one rather than a plateau-then-gap with a
-    tight cluster: neighbouring wanted values differ by only 3%, which forces the wanted
-    block to be locked in groups over several restarts, without the float32 breakdown
-    that tightly clustered spectra provoke here (measured: with a tight cluster, float32
-    either converges in one sweep, exercising nothing, or restarts and returns a wrong
-    spectrum).
-
-    Mirrors ``LanczosHardening{F,D}.MultiLockRestart`` in RAFT
-    (cpp/tests/sparse/solver/lanczos_svds.cu).
-    """
+    """Check the leading unlocked Ritz vector seeds the next sweep after multi-vector locking."""
     from rapids_singlecell.preprocessing._sparse_pca import _svd_lanczos
 
     m, n, k = 96, 64, 20
-    ncv = k + 10  # explicit, and well below min(m, n) so restarts are required
+    ncv = 32
     assert ncv < min(m, n)
 
     spectrum = 20.0 * 0.97 ** np.arange(n)
@@ -1133,11 +1259,25 @@ def test_lanczos_multilock_restart(dtype, *, tol, sv_rtol, angle_tol, resid_tol,
     # `_lanczos_bidiag` is called once per sweep with the *pre-lock* n_locked, so the
     # diffs of that sequence are exactly the per-restart d (num_found).
     n_locked_seq = []
+    ritz = None
     original = _svd_lanczos._lanczos_bidiag
 
     def recording_bidiag(*args, **kwargs):
-        n_locked_seq.append(kwargs["n_locked"])
-        return original(*args, **kwargs)
+        nonlocal ritz
+        start = kwargs["n_locked"]
+        basis = kwargs["V_full"]
+        if n_locked_seq and start > n_locked_seq[-1]:
+            locked = basis[:, n_locked_seq[-1] : start].get()
+            locked_indices = np.abs(ritz @ locked).argmax(axis=0)
+            best = next(i for i in range(ncv) if i not in locked_indices)
+            alignment = np.abs(ritz[best] @ kwargs["v_start"].get())
+            np.testing.assert_allclose(alignment, 1, atol=orth_tol, rtol=0)
+        n_locked_seq.append(start)
+        a, b = original(*args, **kwargs)
+        projected = np.diag(a.get()) + np.diag(b[1:-1].get(), 1)
+        _, _, vt = np.linalg.svd(projected)
+        ritz = vt @ basis[:, start : start + a.size].get().T
+        return a, b
 
     monkeypatch.setattr(_svd_lanczos, "_lanczos_bidiag", recording_bidiag)
 

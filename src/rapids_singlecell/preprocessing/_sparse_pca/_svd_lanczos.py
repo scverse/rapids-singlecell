@@ -10,8 +10,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import numpy as np
+from cupyx.scipy.sparse import issparse
+from cupyx.scipy.sparse.linalg import LinearOperator
 
 from rapids_singlecell._utils._random import _seed_from_rng
+
+from ._operators import mean_centered_operator
 
 if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -50,13 +55,10 @@ def _cgs2_orth(
     basis_view = basis_matrix[:, :n_valid]
     coeffs = coeffs_buf[:n_valid]
 
-    # --- Pass 1 ---
-    cp.dot(basis_view.T, target, out=coeffs)
-    target -= cp.dot(basis_view, coeffs)
-
-    # --- Pass 2 (for stability) ---
-    cp.dot(basis_view.T, target, out=coeffs)
-    target -= cp.dot(basis_view, coeffs)
+    target = cp.ascontiguousarray(target)
+    for _ in range(2):
+        cp.cublas.gemv("T", 1, basis_view, target, 0, coeffs)
+        cp.cublas.gemv("N", -1, basis_view, coeffs, 1, target)
 
     return target
 
@@ -81,6 +83,30 @@ def _breakdown_threshold(scale: float, dtype) -> float:
     return max(float(finfo.eps) * float(scale), float(finfo.tiny))
 
 
+def _projected_svd(alphas, betas):
+    steps = alphas.size
+    B = cp.zeros((steps, steps), dtype=alphas.dtype)
+    cp.fill_diagonal(B, alphas)
+    cp.fill_diagonal(B[:-1, 1:], betas[1:steps])
+    return cp.linalg.svd(B)
+
+
+def _restart_converged(alphas, betas, remaining):
+    # Inspect the projected problem in double precision; its trailing Ritz
+    # entries can be much smaller than the single-precision SVD can resolve.
+    left, values, _ = _projected_svd(alphas.astype(cp.float64, copy=False), betas.astype(cp.float64, copy=False))
+    residual = abs(betas[-1] * left[-1, : remaining + 2]).max()
+    gap = values[remaining - 1] - values[remaining]
+    eps = cp.finfo(alphas.dtype).eps
+    # Require two guard pairs, a resolved cutoff gap, and an unbroken recurrence.
+    return (
+        (gap > 8 * eps * values[0])
+        & (residual < cp.minimum(eps * values[0], eps**0.5 * gap))
+        & (alphas != 0).all()
+        & (betas[1:] != 0).all()
+    )
+
+
 def _lanczos_bidiag(
     A,
     *,
@@ -91,6 +117,7 @@ def _lanczos_bidiag(
     n_locked: int,
     rng: cp.random.Generator,
     ortho_buf: cp.ndarray,
+    remaining: int = 0,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """
     Lanczos bidiagonalization step.
@@ -113,6 +140,8 @@ def _lanczos_bidiag(
         Random number generator for restarting.
     ortho_buf
         Pre-allocated buffer for orthogonalization coefficients.
+    remaining
+        Number of leading Ritz pairs to check during a restart. Zero uses the full sweep.
 
     Returns
     -------
@@ -120,10 +149,18 @@ def _lanczos_bidiag(
     """
     m, n = A.shape
     dtype = A.dtype
+    # For real operators the adjoint already computes A.T @ u directly.
+    transpose_dot = A.rmatvec if isinstance(A, LinearOperator) and dtype.kind == "f" else A.T.dot
 
-    # Pre-allocate GPU arrays for bidiagonal entries
-    alphas = cp.zeros(ncv, dtype=dtype)
-    betas = cp.zeros(ncv + 1, dtype=dtype)
+    # Breakdown decisions already need the norms on the host. Keep the small
+    # bidiagonal there until the projected SVD and normalize straight into the basis.
+    alphas = np.empty(ncv, dtype=dtype)
+    betas = np.empty(ncv + 1, dtype=dtype)
+    betas[0] = 0
+    norm_out = np.empty((), dtype=dtype).real
+
+    def norm(x):
+        return cp.cublas.nrm2(cp.ascontiguousarray(x), out=norm_out)[()]
 
     # Running estimate of ||A||_2 used to scale the breakdown checks below.
     scale = 0.0
@@ -136,14 +173,16 @@ def _lanczos_bidiag(
 
     # v_start is unit-scale by construction (a normalized restart vector or a standard
     # normal vector), so its breakdown check is relative to unit scale.
-    beta_val = cp.linalg.norm(v)
-    if float(beta_val) < _breakdown_threshold(1.0, dtype):
+    beta_val = norm(v)
+    if beta_val < _breakdown_threshold(1.0, dtype):
         v = rng.standard_normal(n).astype(dtype)
         v = _cgs2_orth(v, V_full, n_locked, ortho_buf)
-        beta_val = cp.linalg.norm(v)
+        beta_val = norm(v)
 
-    v /= beta_val
-    V_full[:, n_locked] = v
+    cp.divide(v, beta_val, out=V_full[:, n_locked])
+
+    # Small remaining subspaces can converge early in a restart.
+    checkpoints = (max(40, 2 * remaining + 16), max(48, 2 * remaining + 16)) if remaining else ()
 
     # --- LANCZOS LOOP ---
     for i in range(ncv):
@@ -160,39 +199,43 @@ def _lanczos_bidiag(
         # Ortho U against all valid U
         u = _cgs2_orth(u, U_full, idx_u, ortho_buf)
 
-        alpha_val = cp.linalg.norm(u)
-        if float(alpha_val) < _breakdown_threshold(scale, dtype):
+        alpha_val = norm(u)
+        if alpha_val < _breakdown_threshold(scale, dtype):
             u = rng.standard_normal(m).astype(dtype)
             u = _cgs2_orth(u, U_full, idx_u, ortho_buf)
-            alpha_val = cp.linalg.norm(u)
+            alpha_val = norm(u)
             alphas[i] = 0.0
         else:
             alphas[i] = alpha_val
-            scale = max(scale, float(alpha_val))
-        u /= alpha_val
-        U_full[:, idx_u] = u
+            scale = max(scale, alpha_val)
+        u = cp.divide(u, alpha_val, out=U_full[:, idx_u])
 
         # v = A.T @ u
         if i < ncv:
-            v = A.T.dot(u)
+            v = transpose_dot(u)
             _kernel_axpy(alphas[i], V_full[:, idx_v], v)
 
             # Ortho V against all valid V
             v = _cgs2_orth(v, V_full, idx_v + 1, ortho_buf)
 
-            beta_val = cp.linalg.norm(v)
-            if float(beta_val) < _breakdown_threshold(scale, dtype):
+            beta_val = norm(v)
+            if beta_val < _breakdown_threshold(scale, dtype):
                 v = rng.standard_normal(n).astype(dtype)
                 v = _cgs2_orth(v, V_full, idx_v + 1, ortho_buf)
-                beta_val = cp.linalg.norm(v)
+                beta_val = norm(v)
                 betas[i + 1] = 0.0
             else:
                 betas[i + 1] = beta_val
-                scale = max(scale, float(beta_val))
-            v /= beta_val
-            V_full[:, idx_v + 1] = v
+                scale = max(scale, beta_val)
+            cp.divide(v, beta_val, out=V_full[:, idx_v + 1])
 
-    return alphas, betas
+        steps = i + 1
+        if steps in checkpoints and steps < ncv:
+            a, b = cp.asarray(alphas[:steps]), cp.asarray(betas[: steps + 1])
+            if _restart_converged(a, b, remaining):
+                return a, b
+
+    return cp.asarray(alphas), cp.asarray(betas)
 
 
 def lanczos_svd(
@@ -204,6 +247,7 @@ def lanczos_svd(
     max_iter: int = 100,
     rng: SeedLike | RNGLike | None = None,
     refine_results: bool = True,
+    _return_scores: bool = False,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """
     Compute the largest k singular values and vectors for a sparse matrix.
@@ -229,6 +273,8 @@ def lanczos_svd(
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
     refine_results
         If True, refine the singular vectors after convergence.
+    _return_scores
+        Return the projected scores in place of normalized left singular vectors for PCA.
 
     Returns
     -------
@@ -239,9 +285,12 @@ def lanczos_svd(
     Vt : cp.ndarray
         Right singular vectors of shape (k, n).
     """
+    if issparse(A):
+        A = mean_centered_operator(A)
     m, n = A.shape
     dtype = A.dtype
 
+    automatic_sweep = ncv is None and m > 100000 and dtype.kind == "f" and tol >= cp.finfo(dtype).eps
     if ncv is None:
         # Balance between restart cost and per-iteration cost
         # Larger ncv = fewer restarts but more orthogonalization work per iteration
@@ -283,14 +332,12 @@ def lanczos_svd(
             n_locked=n_locked,
             rng=rng,
             ortho_buf=ortho_buf,
+            remaining=k - n_locked if automatic_sweep and n_locked else 0,
         )
 
         # SVD of Bidiagonal Matrix
-        B = cp.zeros((ncv, ncv), dtype=dtype)
-        cp.fill_diagonal(B, alphas)
-        cp.fill_diagonal(B[:-1, 1:], betas[1:ncv])
-
-        p, s, qt = cp.linalg.svd(B)
+        steps = alphas.size
+        p, s, qt = _projected_svd(alphas, betas)
 
         # Sort descending
         idx = cp.argsort(s)[::-1]
@@ -299,13 +346,12 @@ def lanczos_svd(
         qt = qt[idx, :]
 
         # Error estimates
-        resid = betas[ncv] * cp.abs(p[ncv - 1, :])
+        resid = betas[-1] * cp.abs(p[-1, :])
         max_s = s[0] if s.shape[0] > 0 else 1.0
 
-        converged_indices = []
-        for i in range(min(k - n_locked + 2, ncv)):
-            if resid[i] < tol * max_s:
-                converged_indices.append(i)
+        # Transfer all convergence decisions in one synchronization per sweep.
+        converged = (resid[: k - n_locked + 2] < tol * max_s).get()
+        converged_indices = converged.nonzero()[0].tolist()
 
         if converged_indices:
             num_found = len(converged_indices)
@@ -315,15 +361,16 @@ def lanczos_svd(
 
             good_idx = cp.array(converged_indices)
 
-            # Compute Ritz vectors
-            u_ritz = cp.dot(U_full[:, n_locked : n_locked + ncv], p[:, good_idx])
-            v_ritz = cp.dot(qt[good_idx, :], V_full[:, n_locked : n_locked + ncv].T).T
-
-            # Store locked vectors
             start = n_locked
             end = n_locked + num_found
-            U_full[:, start:end] = u_ritz
-            V_full[:, start:end] = v_ritz
+            if end < k:
+                # The restart coefficients refer to the basis before locking.
+                best_nc = next(i for i in range(steps) if i not in converged_indices)
+                v_start = V_full[:, start : start + steps] @ qt[best_nc, :]
+            # Refinement reconstructs U from the final right singular vectors.
+            if end < k or not refine_results:
+                U_full[:, start:end] = cp.dot(U_full[:, start : start + steps], p[:, good_idx])
+            V_full[:, start:end] = cp.dot(qt[good_idx, :], V_full[:, start : start + steps].T).T
             locked_S[start:end] = s[good_idx]
 
             n_locked += num_found
@@ -331,34 +378,29 @@ def lanczos_svd(
             if n_locked >= k:
                 break
 
-            # Restart from best non-converged
-            best_nc = 0
-            for i in range(ncv):
-                if i not in converged_indices:
-                    best_nc = i
-                    break
-
-            v_start = cp.dot(V_full[:, n_locked : n_locked + ncv], qt[best_nc, :].T)
         else:
             # Thick restart
-            k_mix = min(k - n_locked, ncv)
+            k_mix = min(k - n_locked, steps)
             weights = cp.ones(k_mix, dtype=dtype)
             combo_small = cp.dot(qt[:k_mix, :].T, weights)
-            v_start = cp.dot(V_full[:, n_locked : n_locked + ncv], combo_small)
+            v_start = cp.dot(V_full[:, n_locked : n_locked + steps], combo_small)
 
         v_start /= cp.linalg.norm(v_start)
         total_iter += 1
 
     # Final extraction
-    final_U = U_full[:, :k].copy()
     final_Vt = V_full[:, :k].T.copy()
-    final_S = locked_S.copy()
-
-    # Refinement
     if refine_results:
+        del U_full, V_full
         final_U = A.dot(final_Vt.T)
         final_S = cp.linalg.norm(final_U, axis=0)
-        final_U /= final_S[None, :]
+        if not _return_scores:
+            final_U /= final_S[None, :]
+    else:
+        final_U = U_full[:, :k].copy()
+        final_S = locked_S
+        if _return_scores:
+            final_U *= final_S[None, :]
 
     # Sort by singular value
     sort_idx = cp.argsort(final_S)[::-1]
