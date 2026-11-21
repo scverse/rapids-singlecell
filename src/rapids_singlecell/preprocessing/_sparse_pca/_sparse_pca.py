@@ -68,11 +68,10 @@ class CovariancePCA:
                 self.mean_ = None
                 return _ordered_gram(x)
             self.mean_ = _csr_mean(x)
-            # A sparse product visits stored pairs and avoids expanding mostly
-            # empty tiles. Native double-precision products also favor CSR.
-            if 6 * x.nnz < n_rows * n_cols or (
-                x.dtype == cp.float64 and os.environ.get("CUBLAS_EMULATE_DOUBLE_PRECISION") != "1"
-            ):
+            # Sparse pair accumulation wins at low occupancy. Its measured
+            # crossover with tiled SYRK is higher for native FP64.
+            native_fp64 = x.dtype == cp.float64 and os.environ.get("CUBLAS_EMULATE_DOUBLE_PRECISION") != "1"
+            if (2 if native_fp64 else 6) * x.nnz < n_rows * n_cols:
                 gram = _ordered_gram(x)
                 gram *= 1 / n_rows
                 if not _needs_centered_gram(gram, self.mean_):

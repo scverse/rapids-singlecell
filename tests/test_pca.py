@@ -338,7 +338,7 @@ def test_covariance_pca(dtype, use_csr):
     rng = np.random.default_rng(42)
     # Exercise accumulation across tile boundaries and a partial final tile.
     X = (rng.normal(size=(4101, 8)) * np.arange(1, 9) + 2).astype(dtype)
-    X[rng.random(X.shape) < 0.6] = 0
+    X[rng.random(X.shape) < (0.25 if use_csr and dtype == np.float64 else 0.6)] = 0
     if use_csr:
         x = sparse.csr_matrix(X)
         # Two entries per stored position exercise noncanonical CSR input.
