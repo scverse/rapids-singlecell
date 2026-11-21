@@ -498,11 +498,13 @@ BOTH = ("rapids", "cugraph")
         (("cugraph",), {"initial_membership": [0, 1]}, TypeError, _UNKNOWN_MSG),
     ],
 )
-def test_invalid_arguments(adata_neighbors, flavors, kwargs, error, match):
+def test_invalid_arguments(adata_neighbors, monkeypatch, *, flavors, kwargs, error, match):
+    calls = _record_flavor_calls(monkeypatch)
     for flavor in flavors:
         with pytest.raises(error, match=match):
             rsc.tl.leiden(adata_neighbors, flavor=flavor, **kwargs)
         assert "leiden" not in adata_neighbors.obs
+    assert not calls
 
 
 @needs_native
