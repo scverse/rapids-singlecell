@@ -9,6 +9,7 @@ from anndata import AnnData, read_h5ad
 
 from rapids_singlecell.squidpy_gpu._co_oc import (
     _co_occurrence_helper,
+    _count_spatial_tiles,
     _find_min_max,
     co_occurrence,
 )
@@ -75,6 +76,41 @@ def test_co_occurrence_fast_kernel():
     cp.cuda.Stream.null.synchronize()
     occ_prob_slow = _co_occurrence_helper(spatial, thresholds, label_idx, fast=False)
     cp.testing.assert_allclose(occ_prob_fast, occ_prob_slow)
+
+
+def test_spatial_tiles_count_partial_and_empty_categories():
+    rng = np.random.default_rng(42)
+    points = rng.integers(0, 8, size=(75, 2)).astype(np.float32)
+    labels = rng.permutation(np.repeat([0, 2], [34, 41])).astype(np.int32)
+    thresholds = np.array([0, 1, 4, 4, 25], dtype=np.float32)
+    counts = _count_spatial_tiles(cp.asarray(points), cp.asarray(labels), cp.asarray(thresholds), 3, [0]).get()
+
+    i, j = np.triu_indices(len(points), k=1)
+    distances = np.square(points[i] - points[j]).sum(axis=1)
+    lo, hi = np.minimum(labels[i], labels[j]), np.maximum(labels[i], labels[j])
+    for index, threshold in enumerate(thresholds):
+        keep = distances <= threshold
+        expected = np.zeros((3, 3), dtype=np.uint64)
+        np.add.at(expected, (lo[keep], hi[keep]), 1)
+        np.testing.assert_array_equal(counts[:, :, index], expected)
+
+
+def test_co_occurrence_coincident_cells_and_radius_ties():
+    # The first cluster contributes more than 2**32 unordered pairs at radius zero.
+    n = 100_001
+    spatial = cp.zeros((n + 2, 2), dtype=cp.float32)
+    spatial[n:] = cp.asarray([3, 4])
+    labels = cp.zeros(n + 2, dtype=cp.int32)
+    labels[n:] = 1
+    below_five = np.nextafter(np.float32(5), np.float32(0))
+    radii = cp.asarray([0, 0, below_five, 5, 5], dtype=cp.float32)
+    occ = _co_occurrence_helper(spatial, radii, labels).get()
+
+    for i, cross_pairs in enumerate([0, 0, 2 * n, 2 * n]):
+        counts = np.array([[n * (n - 1), cross_pairs], [cross_pairs, 2]], dtype=np.float64)
+        marginals = counts.sum(axis=0)
+        expected = counts * counts.sum() / np.outer(marginals, marginals)
+        np.testing.assert_allclose(occ[:, :, i], expected, rtol=1e-6)
 
 
 @pytest.mark.two_gpus

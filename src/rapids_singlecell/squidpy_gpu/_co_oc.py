@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -9,6 +10,7 @@ from cuml.metrics import pairwise_distances
 from rapids_singlecell._cuda import _cooc_cuda as _co
 from rapids_singlecell._utils import (
     _calculate_blocks_per_pair,
+    _copies_on_device,
     _copy_to_device,
     _create_category_index_mapping,
     _split_pairs,
@@ -76,10 +78,11 @@ def co_occurrence(
 
     _assert_categorical_obs(adata, key=cluster_key)
     _assert_spatial_basis(adata, key=spatial_key)
-    spatial = cp.array(adata.obsm[spatial_key]).astype(np.float32)
-    original_clust = adata.obs[cluster_key]
-    clust_map = {v: i for i, v in enumerate(original_clust.cat.categories.values)}
-    labs = cp.array([clust_map[c] for c in original_clust], dtype=np.int32)
+    spatial = cp.array(adata.obsm[spatial_key], dtype=cp.float32, order="C")
+    clusters = adata.obs[cluster_key]
+    if clusters.hasnans:
+        raise KeyError(f"Missing cluster label in adata.obs[{cluster_key!r}]")
+    labs = cp.asarray(clusters.cat.codes.to_numpy(), dtype=cp.int32)
     # create intervals thresholds
     if isinstance(interval, int):
         thresh_min, thresh_max = _find_min_max(spatial)
@@ -128,7 +131,7 @@ def _co_occurrence_helper(
     labs
         Cluster labels (as integers).
     fast
-        Whether to use the fast CSR-based kernel.
+        Whether to use spatial tiles or the category-based counting kernel when available.
     device_ids
         List of GPU device IDs to use. If None, uses GPU 0.
 
@@ -146,16 +149,23 @@ def _co_occurrence_helper(
     k = int(cp.asnumpy(labs.max())) + 1
     l_val = len(v_radium) - 1
     thresholds = (v_radium[1:]) ** 2
-    use_fast_kernel = False  # Flag to track which kernel path was taken
+    use_fast_kernel = False
 
-    if fast:
-        # Early check: can we use the fast kernel with available shared memory?
-        kernel_config = _co.get_kernel_config(l_val, n, k)
-        if kernel_config is None:
-            # Shared memory insufficient, skip CSR prep and use pairwise kernel
-            fast = False
+    if n < 100_000:
+        device_ids = device_ids[:1]
 
-    if fast:
+    # Sorting pays off on larger point clouds. Bounding boxes require ordered
+    # thresholds and finite coordinates. The per-warp histogram fits in 4 KiB.
+    if (
+        fast
+        and n >= 16_384
+        and l_val <= 256
+        and spatial.shape[1] == 2
+        and bool(cp.isfinite(spatial).all() & cp.isfinite(thresholds).all() & (thresholds[1:] >= thresholds[:-1]).all())
+    ):
+        counts = _count_spatial_tiles(spatial, labs, thresholds, k, device_ids)
+        use_fast_kernel = True
+    elif fast and _co.get_kernel_config(l_val, n, k) is not None:
         # Prepare category CSR structures
         cat_offsets, cell_indices = _create_category_index_mapping(labs, k)
 
@@ -169,12 +179,6 @@ def _co_occurrence_helper(
         pair_left = cp.asarray(pair_left, dtype=cp.int32)
         pair_right = cp.asarray(pair_right, dtype=cp.int32)
 
-        # Use single GPU for small workloads
-        MIN_CELLS_FOR_MULTI_GPU = 100_000
-        n_devices = len(device_ids)
-        if n_devices > 1 and n < MIN_CELLS_FOR_MULTI_GPU:
-            device_ids = [device_ids[0]]
-
         counts, use_fast_kernel = _co_occurrence_gpu(
             spatial=spatial,
             thresholds=thresholds,
@@ -187,8 +191,6 @@ def _co_occurrence_helper(
             l_val=l_val,
             device_ids=device_ids,
         )
-        if use_fast_kernel:
-            reader = 1
 
     # Fallback to the standard kernel if fast=False or shared memory was insufficient
     if not use_fast_kernel:
@@ -203,9 +205,9 @@ def _co_occurrence_helper(
             l_val=l_val,
             stream=cp.cuda.get_current_stream().ptr,
         )
-        reader = 0
 
     occ_prob = cp.empty((k, k, l_val), dtype=np.float32)
+    reader = int(use_fast_kernel)
     ok = False
     if use_fast_kernel:
         ok = _co.reduce_shared(
@@ -229,6 +231,34 @@ def _co_occurrence_helper(
         )
 
     return occ_prob
+
+
+def _count_spatial_tiles(
+    spatial: cp.ndarray, labs: cp.ndarray, thresholds: cp.ndarray, k: int, device_ids: list[int]
+) -> cp.ndarray:
+    """Count all unordered cell pairs by processing one triangle of spatially sorted tiles."""
+    n = len(labs)
+    keys = cp.empty(n, dtype=cp.uint64)
+    stream = cp.cuda.get_current_stream().ptr
+    _co.spatial_keys(spatial, labs, spatial.min(axis=0), spatial.max(axis=0), keys, stream)
+    order = cp.argsort(keys)
+    points = cp.ascontiguousarray(spatial[order])
+    offsets = cp.searchsorted(keys[order], cp.arange(k + 1, dtype=cp.uint64) << 32).astype(cp.int32)
+    tile_offsets = cp.zeros(k + 1, dtype=cp.int32)
+    cp.cumsum((cp.diff(offsets).astype(cp.int64) + 31) // 32, out=tile_offsets[1:])
+    # Reserve the maximum number of tiles without synchronizing to read tile_offsets[-1].
+    tiles = cp.empty(((n + 31 * k) // 32, _co.TILE_BYTES), dtype=cp.uint8)
+    _co.build_tiles(points, offsets, tile_offsets, tiles, stream)
+
+    parts = []
+    with ExitStack() as stack:
+        replicas = [stack.enter_context(_copies_on_device((points, tiles, thresholds), dev)) for dev in device_ids]
+        for rank, (device, inputs) in enumerate(zip(device_ids, replicas, strict=True)):
+            with cp.cuda.Device(device):
+                counts = cp.zeros((k, k, len(thresholds)), dtype=cp.uint64)
+                _co.count_tiles(*inputs, counts, rank, len(device_ids), cp.cuda.get_current_stream().ptr)
+                parts.append(counts)
+    return cp.cumsum(_sum_on_device(parts, spatial.device.id), axis=2)
 
 
 def _co_occurrence_gpu(
