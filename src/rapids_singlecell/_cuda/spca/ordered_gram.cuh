@@ -38,10 +38,11 @@ __global__ void upper(const I* row_ptr, const I* cols, const T* values,
     I length = count / segments, extra = count % segments;
     I first = begin + segment * length + min(I(segment), extra);
     I last = first + length + (segment < extra);
-    for (I page = first; page < last; page += 32) {
+    using U = std::make_unsigned_t<I>;
+    for (U page = first; page < U(last); page += 32) {
         I left = 0, right = 0;
         T value = 0;
-        if (page + lane < last) {
+        if (page + lane < U(last)) {
             I r = rows[page + lane];
             left = row_ptr[r];
             right = row_ptr[r + 1];
@@ -51,11 +52,11 @@ __global__ void upper(const I* row_ptr, const I* cols, const T* values,
                 right = lower_bound(cols, left, right, high);
             }
         }
-        for (int q = 0; q < min(I(32), last - page); ++q) {
+        for (int q = 0; q < min(U(32), U(last) - page); ++q) {
             I a = __shfl_sync(0xffffffff, left, q);
             I b = __shfl_sync(0xffffffff, right, q);
             T factor = __shfl_sync(0xffffffff, value, q);
-            for (I k = a + lane; k < b; k += 32) {
+            for (U k = U(a) + lane; k < U(b); k += 32) {
                 int j = cols[k];
                 if (j >= low)
                     own[j - panel] = fma(factor, values[k], own[j - panel]);
@@ -122,7 +123,8 @@ __global__ void accumulate(const I* ptr, const I* col, const T* data, size_t n,
         for (I a = ptr[row]; a < end; ++a) {
             size_t base = upper_offset(col[a], p);
             T x = data[a];
-            for (I b = a + threadIdx.x; b < end; b += blockDim.x) {
+            using U = std::make_unsigned_t<I>;
+            for (U b = U(a) + threadIdx.x; b < U(end); b += blockDim.x) {
                 T product = x * data[b];
                 T scaled = product * scale;
                 size_t j = base + col[b];
