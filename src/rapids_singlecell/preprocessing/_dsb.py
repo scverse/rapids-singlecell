@@ -524,6 +524,6 @@ def _first_pc_scores(A: cp.ndarray) -> cp.ndarray:
 
     A = A.astype(np.float64)
     mean, var = _get_mean_var(A)
-    pca_func, scores = _run_cuml_pca((A - mean) / cp.sqrt(var), 1, svd_solver="covariance_eigh")
+    pca_func, scores = _run_cuml_pca((A - mean) / cp.sqrt(var), 1, svd_solver="auto")
     scores = cp.asarray(scores[:, 0])
     return scores if float(pca_func.components_[0, -1]) >= 0 else -scores
