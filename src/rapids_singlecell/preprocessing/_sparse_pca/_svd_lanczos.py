@@ -25,65 +25,6 @@ if TYPE_CHECKING:
 _kernel_axpy = cp.ElementwiseKernel("T alpha, T y", "T x", "x -= alpha * y", "lanczos_axpy")
 
 
-def _cgs2_orth(
-    target: cp.ndarray,
-    basis_matrix: cp.ndarray,
-    n_valid: int,
-    coeffs_buf: cp.ndarray,
-) -> cp.ndarray:
-    """
-    Orthogonalize 'target' against the first 'n_valid' columns of 'basis_matrix' using CGS2.
-
-    Parameters
-    ----------
-    target
-        Vector to orthogonalize (modified in-place).
-    basis_matrix
-        Matrix containing orthonormal basis vectors as columns.
-    n_valid
-        Number of valid basis vectors (columns) to orthogonalize against.
-    coeffs_buf
-        Pre-allocated buffer for storing projection coefficients.
-
-    Returns
-    -------
-    The orthogonalized target vector.
-    """
-    if n_valid == 0:
-        return target
-
-    basis_view = basis_matrix[:, :n_valid]
-    coeffs = coeffs_buf[:n_valid]
-
-    target = cp.ascontiguousarray(target)
-    trans = "H" if basis_view.dtype.kind == "c" else "T"
-    for _ in range(2):
-        cp.cublas.gemv(trans, 1, basis_view, target, 0, coeffs)
-        cp.cublas.gemv("N", -1, basis_view, coeffs, 1, target)
-
-    return target
-
-
-def _breakdown_threshold(scale: float, dtype) -> float:
-    """
-    Scale- and precision-aware breakdown criterion.
-
-    A candidate Lanczos vector counts as numerically zero when its norm is negligible
-    relative to ``scale``, the largest bidiagonal entry produced so far (a running lower
-    bound on ``||A||_2``). Until scale information exists, only norms below the smallest
-    normal number are treated as zero, so the solver behaves identically for ``A`` and
-    ``c * A`` for any ``c > 0``.
-
-    This replaces a hardcoded ``1e-9``, which was effectively dead in float32: the
-    smallest genuine Lanczos vector norms sit around ``sqrt(eps_f32) ~= 3.4e-4``, five
-    orders of magnitude above the old threshold, so breakdown was never detected and the
-    random-restart path that recovers repeated singular values never engaged. Matches
-    ``breakdown_threshold`` in RAFT's ``lanczos_svds.cuh``.
-    """
-    finfo = cp.finfo(dtype)
-    return max(float(finfo.eps) * float(scale), float(finfo.tiny))
-
-
 def _projected_svd(alphas, betas):
     steps = alphas.size
     B = cp.zeros((steps, steps), dtype=alphas.dtype)
@@ -160,24 +101,42 @@ def _lanczos_bidiag(
     betas = np.empty(ncv + 1, dtype=dtype)
     betas[0] = 0
 
+    trans = "H" if dtype.kind == "c" else "T"
+    # cuBLAS accepts typed host scalars directly. Reuse them for every projection.
+    minus_one, zero, one = (np.asarray(i, dtype=dtype) for i in (-1, 0, 1))
+    finfo = np.finfo(dtype)
+    eps, tiny = float(finfo.eps), float(finfo.tiny)
+
+    def orthogonalize(target, basis, n_valid):
+        """Apply two passes of classical Gram-Schmidt against the active basis."""
+        if n_valid == 0:
+            return target
+        basis = basis[:, :n_valid]
+        coeffs = ortho_buf[:n_valid]
+        target = cp.ascontiguousarray(target)
+        for _ in range(2):
+            cp.cublas.gemv(trans, one, basis, target, zero, coeffs)
+            cp.cublas.gemv("N", minus_one, basis, coeffs, one, target)
+        return target
+
     def norm(x):
         return cp.cublas.nrm2(cp.ascontiguousarray(x), out=norm_out)[()]
 
-    # Running estimate of ||A||_2 used to scale the breakdown checks below.
+    # Scale breakdown checks to the largest bidiagonal entry seen so far.
     scale = 0.0
 
     # Initialize v_start
     v = v_start
 
     # Ortho against locked V vectors
-    v = _cgs2_orth(v, V_full, n_locked, ortho_buf)
+    v = orthogonalize(v, V_full, n_locked)
 
     # v_start is unit-scale by construction (a normalized restart vector or a standard
     # normal vector), so its breakdown check is relative to unit scale.
     beta_val = norm(v)
-    if beta_val < _breakdown_threshold(1.0, dtype):
+    if beta_val < eps:
         v = rng.standard_normal(n).astype(dtype)
-        v = _cgs2_orth(v, V_full, n_locked, ortho_buf)
+        v = orthogonalize(v, V_full, n_locked)
         beta_val = norm(v)
 
     cp.divide(v, beta_val, out=V_full[:, n_locked])
@@ -198,12 +157,12 @@ def _lanczos_bidiag(
             _kernel_axpy(betas[i], U_full[:, idx_u - 1], u)
 
         # Ortho U against all valid U
-        u = _cgs2_orth(u, U_full, idx_u, ortho_buf)
+        u = orthogonalize(u, U_full, idx_u)
 
         alpha_val = norm(u)
-        if alpha_val < _breakdown_threshold(scale, dtype):
+        if alpha_val < max(eps * float(scale), tiny):
             u = rng.standard_normal(m).astype(dtype)
-            u = _cgs2_orth(u, U_full, idx_u, ortho_buf)
+            u = orthogonalize(u, U_full, idx_u)
             alpha_val = norm(u)
             alphas[i] = 0.0
         else:
@@ -217,12 +176,12 @@ def _lanczos_bidiag(
             _kernel_axpy(alphas[i], V_full[:, idx_v], v)
 
             # Ortho V against all valid V
-            v = _cgs2_orth(v, V_full, idx_v + 1, ortho_buf)
+            v = orthogonalize(v, V_full, idx_v + 1)
 
             beta_val = norm(v)
-            if beta_val < _breakdown_threshold(scale, dtype):
+            if beta_val < max(eps * float(scale), tiny):
                 v = rng.standard_normal(n).astype(dtype)
-                v = _cgs2_orth(v, V_full, idx_v + 1, ortho_buf)
+                v = orthogonalize(v, V_full, idx_v + 1)
                 beta_val = norm(v)
                 betas[i + 1] = 0.0
             else:
