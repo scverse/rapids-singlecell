@@ -124,6 +124,90 @@ def test_pca_correctness_no_center(use_sparse):
 # =============================================================================
 
 
+def test_tiled_pca_csr_centering():
+    from rapids_singlecell._cuda import _spca_cuda
+
+    rng = np.random.default_rng(7)
+    # Cross two 512-column histogram boundaries, with empty rows in every block.
+    dense = rng.integers(-8, 9, size=(73, 1025)).astype(np.float32)
+    dense[rng.random(dense.shape) < 0.85] = 0
+    dense[::4] = 0
+    x = cusparse.csr_matrix(cp.asarray(dense))
+    x.sort_indices()
+    partial = cp.empty((3, x.shape[1]), dtype=cp.float64)
+    stream = cp.cuda.get_current_stream().ptr
+    _spca_cuda.pca_column_sums(x.indptr, x.indices, x.data, partial, stream)
+    total = partial.sum(axis=0)
+    np.testing.assert_array_equal(total.get(), dense.sum(axis=0, dtype=np.float64))
+
+    mean = total / len(dense)
+    tile = cp.empty((17, x.shape[1]), dtype=x.dtype)
+    _spca_cuda.pca_center_csr(x.indptr[11:29], x.indices, x.data, mean, tile, stream)
+    expected = dense[11:28] - dense.mean(axis=0, dtype=np.float64)
+    np.testing.assert_array_equal(tile.get(), expected.astype(x.dtype))
+
+
+def test_tiled_pca_csr_duplicates():
+    from rapids_singlecell.preprocessing._sparse_pca._tiled import _canonical_csr_arrays
+
+    # Duplicate summation must retain the unit between opposite large entries.
+    values = cp.asarray([2**30, 4, 1, 3, -(2**30), 0.125, 2**60, 0.125], dtype=cp.float32)
+    cols = cp.asarray([2, 1, 2, 0, 2, 1, 0, 1])
+    ptr = cp.asarray([0, 5, 5, 8, 8])
+    x = cusparse.csr_matrix((values, cols, ptr), shape=(4, 3))
+    x.indices, x.indptr = cols.astype(cp.int64), ptr.astype(cp.int64)
+    for _ in range(2):
+        indptr, indices, data = _canonical_csr_arrays(x)
+        assert indptr.dtype == indices.dtype == cp.int64
+        np.testing.assert_array_equal(indptr.get(), [0, 3, 3, 5, 5])
+        np.testing.assert_array_equal(indices.get(), [0, 1, 2, 0, 1])
+        np.testing.assert_array_equal(data.get(), [3, 4, 1, 2**60, 0.25])
+    np.testing.assert_array_equal(x.indices.get(), cols.get())
+    np.testing.assert_array_equal(x.indptr.get(), ptr.get())
+
+
+def test_tensorcore_gram_partial_tiles_and_exceptional_features():
+    from rapids_singlecell._cuda import _spca_cuda
+
+    rng = np.random.default_rng(8)
+    # Odd dimensions, a zero column, and two wide-range columns in different panels.
+    x = rng.standard_normal((113, 131)).astype(np.float32)
+    x[:, [0, 64, 130]] = 0
+    x[0, 0] = 2.0**66
+    x[1, 0] = 2.0**-45
+    x[1, 64] = 1
+    x[2, 64] = -(2.0**80)
+    # The only overlap between the last two columns is below the high plane's range.
+    x[:, 127:129] = 0
+    x[[0, 1], 127] = [2.0**35, -(2.0**35)]
+    x[[2, 3], 128] = [2.0**35, -(2.0**35)]
+    x[4:6, 127:129] = [[1, 1], [-1, -1]]
+    x[:, 65:67] = 0
+    x[[0, 1], 65] = [2.0**26, -(2.0**26)]
+    x[[2, 3], 66] = [2.0**26, -(2.0**26)]
+    x[4:6, 65:67] = [[1.13, 1.13], [-1.13, -1.13]]
+    reference = x.astype(np.float64).T @ x.astype(np.float64)
+    gpu_x = cp.asarray(x)
+    planes = cp.empty((2, 128, 192), dtype=cp.uint16)
+    ranges = cp.empty((2, x.shape[1]), dtype=cp.uint32)
+    stream = cp.cuda.get_current_stream().ptr
+
+    def run():
+        gram = cp.zeros(reference.shape, dtype=cp.float64)
+        # Reuse the same workspace for a smaller final tile.
+        for tile in (gpu_x[:101], gpu_x[101:]):
+            _spca_cuda.gram_tensorcore(tile, planes, ranges, gram, stream)
+        return gram.get()
+
+    actual = run()
+    np.testing.assert_array_equal(actual, run())
+    np.testing.assert_array_equal(actual[[0, 127], [64, 128]], [2.0**-45, 2.0])
+    np.testing.assert_allclose(actual[65, 66], reference[65, 66], rtol=2e-6)
+    scale = np.sqrt(reference.diagonal())
+    error = np.abs(actual - np.triu(reference))
+    assert np.all(error <= 2e-6 * scale[:, None] * scale[None, :])
+
+
 def test_tiled_covariance_dispatch(monkeypatch):
     from rapids_singlecell.preprocessing._pca import _use_tiled_covariance
 
@@ -178,6 +262,19 @@ def test_tiled_covariance_pca(monkeypatch, dtype, use_csr):
     np.testing.assert_allclose(ratios, energy[:4] / energy.sum(), rtol=tol)
     np.testing.assert_allclose(variances, energy[:4] / (len(X) if use_csr else len(X) - 1), rtol=tol)
     assert all(a.dtype == dtype for a in (scores, axes, variances, ratios))
+    if use_csr and dtype == np.float32:
+        rsc.pp.pca(adata, n_comps=4, svd_solver=solver, dtype=dtype)
+        for first, second in zip(
+            (scores, axes, variances, ratios),
+            (
+                adata.obsm["X_pca"],
+                adata.varm["PCs"].T,
+                adata.uns["pca"]["variance"],
+                adata.uns["pca"]["variance_ratio"],
+            ),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(first, second)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
