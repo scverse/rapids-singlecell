@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import zarr
+from zarr.storage import LocalStore
+
+from ._config import zarr_kvikio_or_none
 
 if TYPE_CHECKING:
     from zarr.storage import StoreLike
@@ -14,9 +17,10 @@ def check(path: StoreLike | None = None, *, verbose: bool = True) -> dict[str, A
     """Check whether zarr data can be read straight into GPU memory, and how fast.
 
     Reports the installed KvikIO and nvCOMP versions, whether GPUDirect Storage is active
-    (from ``gdscheck``), and, given a store, whether its ``X`` can be decoded on the GPU
+    (from ``gdscheck`` and KvikIO's compatibility mode), and, given a store, whether its ``X`` can be decoded on the GPU
     and how to improve its layout (see :func:`~rapids_singlecell.io.convert_zarr`).
-    Checking a store's layout needs zarr-kvikio (the `io` extra).
+    Checking a store's layout needs `zarr-kvikio <https://github.com/scverse/zarr-kvikio>`_
+    (without its CUDA extra on the CPU).
 
     Parameters
     ----------
@@ -29,18 +33,17 @@ def check(path: StoreLike | None = None, *, verbose: bool = True) -> dict[str, A
     -------
     The report as a dictionary.
     """
-    system = (
-        _zarr_kvikio().check()
-        if find_spec("zarr_kvikio") is not None
-        else {"available": False, "versions": {}, "gds": {"status": "unknown"}}
+    zk = zarr_kvikio_or_none()
+    system: dict[str, Any] = (
+        zk.check() if zk is not None else {"available": False, "versions": {}, "gds": {"status": "unknown"}}
     )
     report: dict[str, Any] = {
         "gpu_io_available": system["available"],
-        "versions": system["versions"],
+        "versions": {"zarr-kvikio": None if zk is None else zk.__version__, **system["versions"]},
         "gds": system["gds"],
     }
     if path is not None:
-        report["store"] = check_store(path) if find_spec("zarr_kvikio") is not None else None
+        report["store"] = check_store(path) if zk is not None else None
     if verbose:
         _print(report)
     return report
@@ -67,20 +70,18 @@ def check_store(path: StoreLike) -> dict[str, Any]:
             and n_vars <= np.iinfo(np.uint16).max + 1
         ):
             problems.append(f"`indices`: stored as {desc['dtype']}, but uint16 suffices for {n_vars:,} columns")
-    info["gpu_readable"] = all(d["gpu_readable"] for d in info["arrays"].values())
+    # (the GPU decodes chunks from local files only)
+    info["gpu_readable"] = type(g.store) is LocalStore and all(d["gpu_readable"] for d in info["arrays"].values())
     info["problems"] = problems
     return info
 
 
 def _zarr_kvikio() -> Any:
-    try:
-        import zarr_kvikio
-    except ImportError as e:
-        msg = (
-            "This needs zarr-kvikio: `pip install 'rapids-singlecell[io-cu13]'` (or `[io-cu12]`), "
-            "or just `pip install zarr-kvikio` where only the CPU is used."
-        )
-        raise ImportError(msg) from e
+    if find_spec("zarr_kvikio") is None:
+        msg = "This needs zarr-kvikio: `pip install zarr-kvikio` (with its `cuda13` or `cuda12` extra for GPU reads)."
+        raise ImportError(msg)
+    import zarr_kvikio  # (raises its own error if it fails to import, e.g. with an untested zarr)
+
     return zarr_kvikio
 
 
@@ -95,7 +96,13 @@ def _print(report: dict[str, Any]) -> None:
     versions = ", ".join(f"{k} {v}" for k, v in report["versions"].items() if v)
     if versions:
         print(f"Versions: {versions}")
-    print("GPU reads (KvikIO + nvCOMP): " + ("available" if report["gpu_io_available"] else "not installed"))
+    if report["gpu_io_available"]:
+        status = "available"
+    elif report["versions"]["zarr-kvikio"] is None:
+        status = "zarr-kvikio not installed" if find_spec("zarr_kvikio") is None else "zarr-kvikio failed to import"
+    else:
+        status = "KvikIO or nvCOMP not installed"
+    print(f"GPU reads (zarr-kvikio, KvikIO + nvCOMP): {status}")
     gds = report["gds"]
     note = (
         ""
@@ -106,7 +113,7 @@ def _print(report: dict[str, Any]) -> None:
     if "store" not in report:
         return
     if (store := report["store"]) is None:
-        print("Checking the store's layout needs zarr-kvikio (the `io` extra).")
+        print("Checking the store's layout needs zarr-kvikio.")
         return
     print(f"X ({store['encoding']}):")
     for name, d in store["arrays"].items():

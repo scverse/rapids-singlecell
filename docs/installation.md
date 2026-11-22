@@ -123,16 +123,6 @@ You can select CUDA-X Data Science dependencies with the `rapids-cu12` or `rapid
 [uv] pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
 ```
 
-#### Reading data straight into GPU memory (optional)
-
-For out-of-core analysis, {mod}`rapids_singlecell.io` can read zarr data straight into GPU memory and decompress it there,
-using KvikIO and nvCOMP (see {doc}`out_of_core`). Install them with the `io` extra:
-
-```bash
-[uv] pip install 'rapids-singlecell-cu13[io]'  # CUDA wheels
-[uv] pip install 'rapids-singlecell[io-cu13]'  # or [io-cu12]
-```
-
 ```{note}
 Building from source requires the CUDA toolkit (nvcc) and CMake >= 3.24 to be available in your environment.
 The nvcc/CUDAToolkit found during the build should match the CUDA major runtime version used by CUDA-X Data Science and CuPy in or linked to the environment.
@@ -140,6 +130,20 @@ The nvcc/CUDAToolkit found during the build should match the CUDA major runtime 
 No CUDA-X Data Science C++ package is needed at build time, so the default isolated build works
 on both CUDA 12 and CUDA 13 without `--no-build-isolation`.
 ```
+
+### Reading data straight into GPU memory (optional)
+
+For out-of-core analysis, {mod}`rapids_singlecell.io` can read zarr data straight into GPU memory and decompress it there,
+with [zarr-kvikio](https://github.com/scverse/zarr-kvikio), KvikIO and nvCOMP (see {doc}`out_of_core`).
+Install them with the `io` extra, or zarr-kvikio with its CUDA extra:
+
+```bash
+[uv] pip install 'rapids-singlecell-cu13[io]'  # or rapids-singlecell-cu12[io]: CUDA wheels
+[uv] pip install 'rapids-singlecell[io-cu13]'  # or [io-cu12]: source distribution
+[uv] pip install 'zarr-kvikio[cuda13]'  # or [cuda12]
+```
+
+With pip-installed CUDA-X Data Science, this needs version 26.06 or newer (for nvCOMP ≥ 5.2).
 
 ### Install from GitHub
 

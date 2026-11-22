@@ -1,7 +1,8 @@
 """Reading data for out-of-core analysis on the GPU.
 
-With zarr-kvikio, KvikIO and nvCOMP installed (``pip install 'rapids-singlecell[io-cu13]'``),
-zarr chunks are read straight into GPU memory and decompressed there.
+With `zarr-kvikio <https://github.com/scverse/zarr-kvikio>`_, KvikIO and nvCOMP installed
+(``pip install 'zarr-kvikio[cuda13]'``, or the `io` extra), zarr chunks are read straight into GPU memory
+and decompressed there.
 """
 
 from __future__ import annotations

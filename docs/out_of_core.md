@@ -56,17 +56,18 @@ The rest of this page shows how to set up the same things yourself.
 ## Reading data straight into GPU memory
 
 By default, the compressed chunks of `X` are decompressed on the CPU and then copied to the GPU.
-With zarr-kvikio, [KvikIO](https://docs.rapids.ai/api/kvikio/stable/) and [nvCOMP](https://developer.nvidia.com/nvcomp) installed (`io` extra),
-they are read straight into GPU memory and decompressed there:
+With [zarr-kvikio](https://github.com/scverse/zarr-kvikio), [KvikIO](https://docs.rapids.ai/api/kvikio/stable/) and
+[nvCOMP](https://developer.nvidia.com/nvcomp) installed, they are read straight into GPU memory and decompressed there:
 
 ```bash
-pip install 'rapids-singlecell[io-cu13]'  # or [io-cu12]; `rapids-singlecell-cu13[io]` for the CUDA wheels
+pip install 'zarr-kvikio[cuda13]'  # or [cuda12]; or the `io` extra: rapids-singlecell-cu13[io], rapids-singlecell[io-cu13]
 ```
 
 zarr then finds a codec pipeline that reads into GPU memory, zarr-kvikio's `zarr_kvikio.KvikioCodecPipeline`,
-which {func}`~rapids_singlecell.io.enable` switches on. It works with any store, and the GPU decodes chunks that are
-zstd-compressed (or uncompressed), ideally small (nvCOMP decodes every chunk with one thread block) and in shards
-(few files per read). Other chunks, e.g. blosc-compressed ones like in most existing stores, are decompressed on the CPU
+which {func}`~rapids_singlecell.io.enable` switches on. It works with any store, and the GPU decodes chunks read from
+local files (zarr's `LocalStore`) that are zstd-compressed (or uncompressed), ideally small (nvCOMP decodes every chunk
+with one thread block) and in shards (few files per read). Other chunks, e.g. blosc-compressed ones like in most
+existing stores, are decompressed on the CPU
 and copied to the GPU, with the codec pipeline zarr was configured with before (e.g. [zarrs](https://zarrs-python.readthedocs.io)),
 or else zarr's fast fused pipeline.
 {func}`~rapids_singlecell.io.check` tells you whether a store is ready,
@@ -83,13 +84,20 @@ rsc.io.convert_zarr("data.zarr", "data_gpu.zarr")
 With your own cluster, call `rsc.io.enable(client)`, and everything else stays plain Dask and anndata:
 
 ```python
+import anndata as ad
+import zarr
+from anndata.experimental import read_elem_lazy
+from dask_cuda import LocalCUDACluster
+from distributed import Client
+import rapids_singlecell as rsc
+
 cluster = LocalCUDACluster(...)
 client = Client(cluster)
 rsc.io.enable(client)  # the workers read zarr chunks into GPU memory
 
 f = zarr.open_group("data_gpu.zarr", mode="r")
 adata = ad.AnnData(
-    X=read_elem_lazy(f["X"], chunks=(100_000, -1), meta=cpx.csr_matrix((0, 0))),
+    X=rsc.get.X_to_GPU(read_elem_lazy(f["X"], chunks=(100_000, -1))),
     obs=ad.io.read_elem(f["obs"]),
     var=ad.io.read_elem(f["var"]),
 )
@@ -98,9 +106,15 @@ adata = ad.AnnData(
 Without a cluster, `rsc.io.enable()` switches GPU reads on for this process.
 Both take effect right away; used as a context manager (`with rsc.io.enable(client): ...`),
 they are undone at the end of the block, on the workers too.
+Like [zarrs](https://zarrs-python.readthedocs.io), zarr-kvikio is set up through zarr's config, so any code can switch it on
+with `zarr.config.set({"codec_pipeline.path": "zarr_kvikio.KvikioCodecPipeline"})` and `zarr.config.enable_gpu()`,
+and tune it with `kvikio.*` keys, e.g. `zarr.config.set({"kvikio.num_threads": 16})`
+(for a cluster, before `rsc.io.enable(client)` or {func}`~rapids_singlecell.dask.start_cluster`, which pass them on to the workers).
 
 GPU reads work with or without [GPUDirect Storage](https://docs.nvidia.com/gpudirect-storage/) (GDS):
 without it, KvikIO reads through the page cache and a bounce buffer, which is still fast for cached data.
+A sparse `X` (sharded zstd 1-D arrays) is read into pinned host memory and copied to the GPU by default, which is
+fastest from the page cache; `zarr.config.set({"kvikio.fetch": "kvikio"})` reads it with KvikIO, e.g. for GDS.
 
 For example, on an 11.4 million cell atlas (19.5 billion non-zeros) on two GPUs, the steps from
 {func}`~rapids_singlecell.pp.calculate_qc_metrics` to {func}`~rapids_singlecell.pp.pca` above took 26 s with GPU reads

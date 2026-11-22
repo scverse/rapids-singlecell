@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import zarr
 from anndata.experimental import read_elem_lazy
+from zarr.buffer import gpu
+from zarr.registry import get_ndbuffer_class
 
 from ._check import check_store
 from ._config import PIPELINE_PATH
@@ -41,7 +43,8 @@ def read_lazy(path: StoreLike, *, chunks: int | Literal["auto"] = "auto") -> ad.
     chunks
         Observations per chunk. `"auto"` picks a size that worked best in benchmarks:
         ~55 chunks per GPU (Dask worker, else visible GPU; 20,000 to 200,000 observations) for GPU reads,
-        20,000 observations otherwise.
+        20,000 observations otherwise. It assumes GPU reads for a store that allows them
+        if zarr-kvikio's pipeline is selected here, with GPU buffers or a Dask client.
 
     Returns
     -------
@@ -59,24 +62,34 @@ def read_lazy(path: StoreLike, *, chunks: int | Literal["auto"] = "auto") -> ad.
         msg = f"`X` must be a CSR matrix or a dense array to be chunked by observations, got {encoding}."
         raise ValueError(msg)
 
-    gpu_reads = zarr.config.get("codec_pipeline.path") == PIPELINE_PATH and check_store(path)["gpu_readable"]
+    gpu_reads = (
+        zarr.config.get("codec_pipeline.path") == PIPELINE_PATH
+        # (into GPU buffers here, or on the workers of a Dask cluster)
+        and (issubclass(get_ndbuffer_class(), gpu.NDBuffer) or _client() is not None)
+        and check_store(path)["gpu_readable"]
+    )
     rows = _chunk_size(len(obs), chunks, gpu_reads=gpu_reads, n_gpus=_n_gpus())
     # chunks read into GPU memory already stay as they are
     X = X_to_GPU(read_elem_lazy(x, chunks=(rows, -1)))
     return ad.AnnData(X=X, obs=obs, var=var)
 
 
+def _client() -> Any:
+    """The current Dask client, if any."""
+    try:
+        from distributed import get_client
+
+        return get_client()
+    except (ImportError, ValueError):  # no distributed, or no client
+        return None
+
+
 def _n_gpus() -> int:
     """GPUs computing the chunks: the workers of the current Dask cluster, else the visible GPUs."""
     import cupy as cp
 
-    try:
-        from distributed import get_client
-
-        return max(1, len(get_client().nthreads()))
-    except (ImportError, ValueError):  # no distributed, or no client
-        pass
-
+    if (client := _client()) is not None:
+        return max(1, len(client.nthreads()))
     return max(1, cp.cuda.runtime.getDeviceCount())  # type: ignore[attr-defined]  # cupy-stubs lacks cuda.runtime
 
 

@@ -53,7 +53,8 @@ def start_cluster(
     * UCX for communication between workers if available (`protocol="auto"`), else TCP.
       With CUDA managed memory (`rmm_managed_memory=True`), which UCX does not support, TCP.
     * If zarr-kvikio, KvikIO and nvCOMP are installed (`io` extra), the workers read zarr chunks straight into
-      GPU memory (see :func:`rapids_singlecell.io.enable`).
+      GPU memory (see :func:`rapids_singlecell.io.enable`). This process keeps zarr-kvikio's codec pipeline
+      selected (for the arrays opened here), with host buffers, also after the cluster closes.
 
     Parameters
     ----------
