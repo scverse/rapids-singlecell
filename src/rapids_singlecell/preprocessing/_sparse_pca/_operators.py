@@ -13,6 +13,8 @@ from ._csr_adjoint import _centered_panel, _CSRAdjoint, _screen_centered, _selec
 _accumulator = """
 template <typename T> struct SvdAccumulator { using type = T; };
 template <> struct SvdAccumulator<float> { using type = double; };
+template <typename T> __device__ bool needs_wide_sum(T) { return false; }
+__device__ bool needs_wide_sum(float x) { return !isfinite(x); }
 """
 
 _squared_magnitude = """
@@ -125,6 +127,12 @@ def _csr_matmat(columns_per_lane):
                 if (col + 32 * c < width) {
                     Acc total = 0;
                     for (int w = 0; w < warps; ++w) total += partial[c][w][lane];
+                    // A float32 group can overflow before opposite-signed terms cancel.
+                    if (needs_wide_sum(T(total))) {
+                        total = 0;
+                        for (ptrdiff_t j = indptr[row]; j < stop; ++j)
+                            total += Acc(data[j]) * Acc(rhs[ptrdiff_t(indices[j]) * width + col + 32 * c]);
+                    }
                     out[row * width + col + 32 * c] = total;
                 }
             }

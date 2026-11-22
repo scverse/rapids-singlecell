@@ -232,7 +232,7 @@ def lanczos_svd(
     tol
         Tolerance for convergence.
     max_iter
-        Maximum number of restart iterations.
+        Maximum number of sweeps. Return the best available Ritz pairs if reached.
     rng
         Random seed or :class:`~numpy.random.Generator` for reproducibility.
     refine_results
@@ -255,6 +255,8 @@ def lanczos_svd(
     dtype = A.dtype
     if not 1 <= k <= min(m, n):
         raise ValueError("k must be between 1 and the smaller matrix dimension.")
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1.")
 
     automatic_sweep = ncv is None and m > 100000 and dtype.kind == "f" and tol >= cp.finfo(dtype).eps
     if ncv is None:
@@ -285,10 +287,9 @@ def lanczos_svd(
     ortho_buf = cp.zeros(total_capacity, dtype=dtype)
 
     n_locked = 0
-    total_iter = 0
     v_start = rng.standard_normal(n).astype(dtype)
 
-    while n_locked < k and total_iter < max_iter:
+    for sweep in range(1, max_iter + 1):
         alphas, betas = _lanczos_bidiag(
             A,
             ncv=min(ncv, m - n_locked, n - n_locked),
@@ -303,40 +304,32 @@ def lanczos_svd(
 
         # cuSOLVER returns the singular values in descending order.
         steps = alphas.size
+        # The exact projection spanning a wide matrix's left space has one more right vector.
         extra_right = m < n and n_locked + steps == m
         p, s, qt = _projected_svd(alphas, betas, extra_right=extra_right)
         right_basis = V_full[:, n_locked : n_locked + qt.shape[1]]
-        if extra_right:
-            # After exhausting the left space, the trailing beta belongs to
-            # the exact rectangular projection onto one more right vector.
-            converged_indices = list(range(k - n_locked))
+        remaining = k - n_locked
+        if extra_right or sweep == max_iter:
+            n_keep = remaining
         else:
-            resid = betas[-1] * cp.abs(p[-1, :])
-            # Transfer all convergence decisions in one synchronization per sweep.
-            converged = (resid[: k - n_locked + 2] < tol * s[0]).get()
-            converged_indices = converged.nonzero()[0].tolist()
+            resid = betas[-1] * cp.abs(p[-1, :remaining])
+            converged = (resid < tol * s[0]).get()
+            # Deflate only the leading prefix so lower pairs cannot displace a missing one.
+            n_keep = remaining if converged.all() else int(converged.argmin())
 
-        if converged_indices:
-            num_found = len(converged_indices)
-            if n_locked + num_found > k:
-                num_found = k - n_locked
-                converged_indices = converged_indices[:num_found]
-
-            good_idx = cp.array(converged_indices)
-
+        if n_keep:
             start = n_locked
-            end = n_locked + num_found
+            end = n_locked + n_keep
             if end < k:
                 # The restart coefficients refer to the basis before locking.
-                best_nc = next(i for i in range(steps) if i not in converged_indices)
-                v_start = right_basis @ qt[best_nc, :]
+                v_start = right_basis @ qt[n_keep, :]
             # Refinement reconstructs U from the final right singular vectors.
             if end < k or not refine_results:
-                U_full[:, start:end] = cp.dot(U_full[:, start : start + steps], p[:, good_idx])
-            V_full[:, start:end] = cp.dot(qt[good_idx, :], right_basis.T).T
-            locked_S[start:end] = s[good_idx]
+                U_full[:, start:end] = cp.dot(U_full[:, start : start + steps], p[:, :n_keep])
+            V_full[:, start:end] = cp.dot(qt[:n_keep, :], right_basis.T).T
+            locked_S[start:end] = s[:n_keep]
 
-            n_locked += num_found
+            n_locked = end
 
             if n_locked >= k:
                 break
@@ -349,7 +342,6 @@ def lanczos_svd(
             v_start = cp.dot(right_basis, combo_small)
 
         v_start /= cp.linalg.norm(v_start)
-        total_iter += 1
 
     # Final extraction
     final_V = V_full[:, :k].copy(order="F")

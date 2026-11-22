@@ -1113,6 +1113,20 @@ class TestSVDSolvers:
 
         np.testing.assert_allclose(result_op.get(), expected.get(), rtol=1e-10)
 
+    @pytest.mark.parametrize("width", [3, 33])
+    def test_float32_block_product_cancellation(self, width):
+        from rapids_singlecell.preprocessing._sparse_pca._operators import mean_centered_operator
+
+        X = np.ones((2, 64), dtype=np.float32)
+        X[0, :32], X[0, 32:] = 2.0**127, -(2.0**127)
+        rhs = np.ones((64, width), dtype=np.float32)
+        rhs[:, 1] = 2  # Individual products also overflow before cancellation.
+        rhs[-1, -1] = 0  # Leave one large, representable result.
+        op = mean_centered_operator(cusparse.csr_matrix(cp.asarray(X)))
+        result = op.dot(cp.asarray(rhs))
+        assert result.dtype == np.float32
+        np.testing.assert_array_equal(result.get(), X.astype(np.float64) @ rhs)
+
     @pytest.mark.parametrize("width", [1, 35])
     def test_centered_adjoint_long_column(self, width):
         from rapids_singlecell.preprocessing._sparse_pca._operators import mean_centered_operator
@@ -1334,6 +1348,34 @@ def test_lanczos_restart_checkpoint(*, separated):
     assert (a.size < ncv) == separated
     projected = np.diag(a.get()) + np.diag(b[1:-1].get(), 1)
     np.testing.assert_allclose(np.linalg.svd(projected, compute_uv=False)[:2], values[2:4].get(), rtol=1e-5)
+
+
+@pytest.mark.parametrize("max_iter", [1, 2])
+@pytest.mark.parametrize("refine_results", [False, True])
+def test_lanczos_unconverged_leading_pair(monkeypatch, max_iter, *, refine_results):
+    from rapids_singlecell.preprocessing._sparse_pca import _svd_lanczos
+
+    ncv = 12
+    X = np.diag(np.r_[np.arange(1, ncv + 1), 1]) + np.diag(np.r_[np.full(ncv - 1, 1e-4), 3.0], 1)
+    # Starting on the first axis projects onto the leading 12 columns. Ritz
+    # values 11 and 10 meet tolerance on this sweep while 12 has residual 3.
+    starts = iter([cp.eye(1, ncv + 1).ravel()])
+    bidiag = _svd_lanczos._lanczos_bidiag
+
+    def fixed_first_start(A, **kwargs):
+        kwargs["v_start"] = next(starts, kwargs["v_start"])
+        return bidiag(A, **kwargs)
+
+    monkeypatch.setattr(_svd_lanczos, "_lanczos_bidiag", fixed_first_start)
+    X_gpu = cusparse.csr_matrix(cp.asarray(X))
+    result = lanczos_svd(X_gpu, k=2, ncv=ncv, max_iter=max_iter, refine_results=refine_results, tol=1e-4, rng=0)
+    U, s, Vt = map(cp.asnumpy, result)
+    reference = X[:, :ncv] if max_iter == 1 else X
+    _, expected_s, expected_vt = np.linalg.svd(reference, full_matrices=False)
+    np.testing.assert_allclose(s, expected_s[:2], rtol=1e-10)
+    alignment = Vt[:, : reference.shape[1]] @ expected_vt[:2].T
+    np.testing.assert_allclose(np.abs(alignment), np.eye(2), atol=1e-8)
+    np.testing.assert_allclose(U * s, X @ Vt.T, atol=1e-8)
 
 
 def test_lanczos_restart_convergence_guard():
