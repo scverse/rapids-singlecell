@@ -158,6 +158,20 @@ __global__ void autocorr_normalize_kernel(const P* indptr, const T* weights,
     }
 }
 
+// Preserve structural zeros. Fully nonzero genes use the first value as
+// origin to retain small variations on large expression offsets.
+template <typename T>
+__global__ void autocorr_offsets_kernel(const T* x, int n, int n_genes,
+                                        T* out) {
+    const int g = blockIdx.x;
+    T offset = x[g];
+    for (long long start = 0; offset != 0 && start < n; start += blockDim.x) {
+        const long long i = start + threadIdx.x;
+        if (__syncthreads_or(i < n && x[i * n_genes + g] == 0)) offset = 0;
+    }
+    if (threadIdx.x == 0) out[g] = offset;
+}
+
 // One warp per cell, one lane per gene. Compute the observed numerator
 // directly from the edges. Only permutation tests need a stored spatial lag.
 template <typename T, typename P, bool GEARY, bool SAVE_LAG>

@@ -927,10 +927,12 @@ def test_autocorr_graph_kernels(dtype, idx_dtype):
     _eq(col, row)
     _eq(moments, cp.array([N_ROWS, N_ROWS / 2, N_ROWS / 2]))
     stats = cp.zeros((4, x.shape[1]), cp.float64)
+    offsets = cp.empty(x.shape[1], dtype=x.dtype)
     _ac.observed(
-        adj.indptr, indices, normalized, x, row, col, offsets=x[0], lag=z, stats=stats, geary=False, stream=_stream()
+        adj.indptr, indices, normalized, x, row, col, offsets=offsets, lag=z, stats=stats, geary=False, stream=_stream()
     )
-    x = x - x[0]
+    _eq(offsets, cp.where(cp.all(x, axis=0), x[0], 0))
+    x = x - offsets
     _close(z, (cp.roll(x, 1, axis=0) + cp.roll(x, -1, axis=0)) * 0.5)
     _close(stats[3], (x * z).sum(axis=0))
 

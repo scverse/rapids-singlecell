@@ -252,9 +252,7 @@ def _block_scores(x, graph, row, col, keys, *, total, uniform, geary, permutatio
     # Keep the accumulated lag in float64 so rounding does not break permutation ties.
     z = None if keys is None else cp.empty(x.shape, dtype=cp.float64)
     stats = cp.zeros((4, n_genes))
-    # Preserve structural zeros in sparse genes. Fully nonzero genes use a data
-    # value as origin to retain small variations on large expression offsets.
-    offsets = cp.where(cp.all(x, axis=0), x[0], 0)
+    offsets = cp.empty(n_genes, dtype=x.dtype)
     _ac.observed(*graph, x, row, col, offsets=offsets, lag=z, stats=stats, geary=geary, stream=stream)
     sum_x, sum_x2, weighted_x, numerator = stats
     mean = sum_x / n

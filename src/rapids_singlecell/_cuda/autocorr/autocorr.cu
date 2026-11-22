@@ -128,12 +128,13 @@ void def_graph_ops(nb::module_& m) {
            gpu_array_c<const T, Device> weights, gpu_array_c<const T, Device> x,
            gpu_array_c<const double, Device> row,
            gpu_array_c<const double, Device> col,
-           gpu_array_c<const T, Device> offsets,
+           gpu_array_c<T, Device> offsets,
            std::optional<gpu_array_c<double, Device>> lag,
            gpu_array_c<double, Device> stats, bool geary,
            std::uintptr_t stream) {
             const int n = x.shape(0), n_genes = x.shape(1);
-            nb_require(n_genes <= 32 && indptr.size() == (size_t)n + 1 &&
+            nb_require(n > 0 && n_genes > 0 && n_genes <= 32 &&
+                           indptr.size() == (size_t)n + 1 &&
                            indices.size() == weights.size() &&
                            row.size() == (size_t)n && col.size() == (size_t)n &&
                            offsets.size() == (size_t)n_genes &&
@@ -145,6 +146,10 @@ void def_graph_ops(nb::module_& m) {
             const int n_sm = device_attribute(cudaDevAttrMultiProcessorCount);
             const int grid = std::min<long long>(
                 strided_grid((long long)n * 32, AUTOCORR_BLOCK), 16LL * n_sm);
+            autocorr_offsets_kernel<<<n_genes, AUTOCORR_BLOCK, 0,
+                                      (cudaStream_t)stream>>>(
+                x.data(), n, n_genes, offsets.data());
+            CUDA_CHECK_LAST_ERROR(autocorr_offsets_kernel);
             const auto kernel =
                 geary ? (lag ? autocorr_observed_kernel<T, P, true, true>
                              : autocorr_observed_kernel<T, P, true, false>)
