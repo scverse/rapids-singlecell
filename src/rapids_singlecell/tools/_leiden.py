@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import traceback
 import warnings
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
 from numbers import Integral, Real
 from pathlib import Path
@@ -42,9 +43,8 @@ from ._clustering import (
 from ._utils import _use_graph
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from anndata import AnnData
+    from mudata import MuData
 
     from rapids_singlecell._utils._random import RNGLike, SeedLike
     from rapids_singlecell.get._utils import AdRef, GraphAcc
@@ -79,8 +79,8 @@ _CLUSTERING_ARGS = {
 @deprecated_arg("obsp", DEPR_OBSP)
 @deprecated_copy
 def leiden(
-    adata: AnnData,
-    resolution: float | Sequence[float] = 1.0,
+    adata: AnnData | MuData,
+    resolution: float | Sequence[float] | Mapping[str, float] = 1.0,
     *,
     restrict_to: tuple[str, Sequence[str]] | None = None,
     rng: SeedLike | RNGLike | None = None,
@@ -91,7 +91,8 @@ def leiden(
     theta: float | None = None,
     dtype: str | np.dtype = np.float32,
     use_dask: bool = False,
-    use: GraphAcc | str | None = None,
+    use: GraphAcc | str | Sequence[GraphAcc | str] | Mapping[str, GraphAcc | str | None] | None = None,
+    layer_weights: Sequence[float] | Mapping[str, float] | None = None,
     out: AdRef | str | bool = False,
     # deprecated
     key_added: str | None = None,
@@ -100,7 +101,7 @@ def leiden(
     obsp: str | None = None,
     copy: bool = False,
     **clustering_args,
-) -> AnnData | pd.Categorical | dict[float, pd.Categorical] | None:
+) -> AnnData | MuData | pd.Categorical | dict[float, pd.Categorical] | None:
     """Cluster cells into subgroups using the Leiden algorithm :cite:p:`Traag2019`.
 
     Leiden is an improved version of the Louvain algorithm :cite:p:`Blondel2008`
@@ -110,13 +111,15 @@ def leiden(
     Parameters
     ----------
     adata
-        Annotated data matrix.
+        Annotated data matrix, or a MuData object whose selected modalities share the same cells in the same order.
     resolution
         A parameter value controlling the coarseness of the clustering (called
         gamma in the modularity formula). Higher values lead to more clusters.
-        If a list of values is given, the clustering runs for each of them and
-        writes one column per value. Each value must be finite and in
-        ``[0, 2**20]``, and no two values may name the same column.
+        On one graph a list runs a separate clustering for each value and writes
+        one column per value. With multiple graphs, a scalar applies to every
+        layer and a sequence supplies one value per layer for a single partition.
+        For MuData, a mapping may give each modality's resolution by name.
+        Each value must be finite and in ``[0, 2**20]``.
     restrict_to
         Restrict the clustering to the categories within the key for sample
         annotation, tuple needs to contain ``(obs_key, list_of_categories)``.
@@ -129,7 +132,18 @@ def leiden(
         Defaults to the connectivities written by :func:`~rapids_singlecell.pp.neighbors`.
         ``flavor='rapids'`` sums duplicate entries, clusters
         an asymmetric matrix as A + A.T (with a warning) and ignores the
-        diagonal (self-loops).
+        diagonal (self-loops). For multiplex Leiden, pass a sequence of at
+        least two graph accessors or paths, e.g. ``["obsp.expression", "obsp.spatial"]``.
+        With MuData, a mapping selects each modality's graph by accessor or
+        ``.obsp`` key, e.g.
+        ``use={"rna": None, "atac": None}`` uses their default connectivities.
+        Omitting ``use`` clusters the joint graph of the MuData object.
+    layer_weights
+        Multipliers for the graphs in ``use``, in the same order or keyed by
+        modality. Defaults to one per graph. Multiplex Leiden finds one partition
+        by maximizing the weighted sum of the layers' unnormalized modularity
+        objectives, using each graph's own strengths and resolution. Weights
+        must be finite and non-negative, with at least one positive weight.
     directed
         Must not be ``True``: the graph is treated as undirected.
     use_weights
@@ -149,7 +163,7 @@ def leiden(
         implementation of rapids-singlecell, bitwise reproducible for a given
         seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden` and,
         if it runs out of memory on one GPU, reruns in CUDA managed memory
-        (slower, with a warning). ``'rapids'`` needs about 140 bytes of
+        (slower, with a warning). On a single graph, ``'rapids'`` needs about 140 bytes of
         device memory per cell plus what its coarser levels hold, allocated
         as they need it: on k-NN graphs 14-18 bytes per stored entry at the
         peak (about 22 at 100M cells), in all 2.5-3.5x the float32 CSR.
@@ -172,8 +186,8 @@ def leiden(
     dtype
         Weight dtype of the cuGraph graph (``'float32'`` or ``'float64'``).
         Only used by the deprecated ``flavor='cugraph'``; the native
-        implementation reads float32 or float64 weights and rounds them to one
-        64-bit fixed-point grid.
+        implementation reads float32 or float64 weights. On a single graph,
+        it rounds them to one 64-bit fixed-point grid.
     use_dask
         Deprecated. If ``True``, run cuGraph's Dask implementation on all GPUs
         (this implies ``flavor='cugraph'``).
@@ -202,13 +216,15 @@ def leiden(
         ``n_iterations``, and ``random_state`` (if applicable).
     ``adata.uns['leiden' | key_added]['modularity']`` : :class:`float`
         The modularity of the returned clustering with the resolution as
-        gamma (a list for several resolutions), computed exactly without
+        gamma (a list for several resolutions). On one graph it is computed exactly without
         self-loops and with the weights rounded to one 64-bit fixed-point
         grid, which differs from float64 sums only for weights spanning many
         orders of magnitude or a resolution near ``2**20``
         (``flavor='cugraph'``: cuGraph's value). Use
         :func:`scanpy.metrics.modularity` for the score with gamma = 1 (it
-        counts self-loops).
+        counts self-loops). For multiplex Leiden this is a list of per-layer
+        modularities in input order. The unnormalized weighted sum optimized by
+        the algorithm is recorded in ``adata.uns[key_added]['quality']``.
     """
     flavor = _validate_flavor(
         flavor,
@@ -220,10 +236,6 @@ def leiden(
     dtype = _check_dtype(dtype)
     use_weights = bool(use_weights)  # the bindings take a Python bool
     _validate_n_iterations(n_iterations, flavor=flavor)
-    resolutions = _validate_resolutions(resolution)
-    if out is True and len(set(resolutions)) != len(resolutions):
-        msg = "out=True requires distinct numeric resolutions for the returned dict."
-        raise ValueError(msg)
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
@@ -231,6 +243,34 @@ def leiden(
     key = _out_key(out, key_added, kind="obs", default="leiden")
     if restrict_to is not None and out is False and key == "leiden":
         key = "leiden_R"
+    if isinstance(use, Mapping | Sequence) and not isinstance(use, str):
+        if flavor != "rapids":
+            raise ValueError("Multiplex Leiden requires flavor='rapids' on one GPU.")
+        if adjacency is not None or obsp is not None or neighbors_key is not None:
+            raise TypeError("Pass multiplex graphs through `use` alone.")
+        return _leiden_layers(
+            adata,
+            use,
+            resolution,
+            layer_weights,
+            use_weights=use_weights,
+            restrict_to=restrict_to,
+            key=key,
+            out=out,
+            rng=rng,
+            n_iterations=n_iterations,
+            meta_random_state=meta_random_state,
+            **clustering_args,
+        )
+    if layer_weights is not None:
+        raise ValueError("`layer_weights` requires multiple graphs in `use`.")
+    if isinstance(resolution, Mapping):
+        raise ValueError("A resolution mapping requires a mapping of modalities in `use`.")
+    resolutions = _validate_resolutions(resolution)
+    if out is True and len(set(resolutions)) != len(resolutions):
+        msg = "out=True requires distinct numeric resolutions for the returned dict."
+        raise ValueError(msg)
+    restrict_indices = None
     adjacency = _use_graph(adata, use, adjacency=adjacency, obsp=obsp, neighbors_key=neighbors_key)
     if restrict_to is not None:
         restrict_key, restrict_categories = restrict_to
@@ -267,18 +307,7 @@ def leiden(
         raise
     labels = {}
     for res, part in zip(resolutions, parts, strict=True):
-        if restrict_to is not None:
-            groups = _rename_groups(
-                adata,
-                restrict_key=restrict_key,
-                restrict_categories=restrict_categories,
-                restrict_indices=restrict_indices,
-                groups=part.membership,
-            )
-            cat = pd.Categorical(values=groups.astype("U"), categories=natsorted(map(str, np.unique(groups))))
-        else:
-            # The codes are size-ordered, so this equals the natsorted strings.
-            cat = pd.Categorical.from_codes(part.membership, categories=[str(i) for i in range(part.n_clusters)])
+        cat = _leiden_labels(adata, part, restrict_to, restrict_indices)
         # Column names preserve the spelling of a resolution (e.g. 1 and 1.0).
         labels[res if out is True else f"{res}"] = cat
     params = {"n_iterations": n_iterations, **meta_random_state}
@@ -292,6 +321,122 @@ def leiden(
     return _cluster_labels(
         (key, key), resolutions, labels, out=out, adata=adata, params=params, modularities=[p.modularity for p in parts]
     )
+
+
+def _leiden_labels(adata, part, restrict_to, indices):
+    if restrict_to is None:
+        return pd.Categorical.from_codes(part.membership, categories=[str(i) for i in range(part.n_clusters)])
+    groups = _rename_groups(
+        adata,
+        restrict_key=restrict_to[0],
+        restrict_categories=restrict_to[1],
+        restrict_indices=indices,
+        groups=part.membership,
+    )
+    return pd.Categorical(values=groups.astype("U"), categories=natsorted(map(str, np.unique(groups))))
+
+
+def _layer_values(value, use, name):
+    if isinstance(value, Mapping):
+        if not isinstance(use, Mapping) or value.keys() != use.keys():
+            raise ValueError(f"`{name}` must have the same modality keys as `use`.")
+        return [value[k] for k in use]
+    values = [value] * len(use) if isinstance(value, Real) else list(value)
+    if len(values) != len(use):
+        raise ValueError(f"`{name}` needs one value per layer ({len(use)} layers).")
+    return values
+
+
+def _leiden_layers(
+    adata,
+    use,
+    resolution,
+    layer_weights,
+    *,
+    use_weights,
+    restrict_to,
+    key,
+    out,
+    rng,
+    n_iterations,
+    meta_random_state,
+    beta=0.0,
+    initial_membership=None,
+    objective_function="modularity",
+):
+    from rapids_singlecell.get._out import _resolve_obs
+    from rapids_singlecell.get._utils import GraphAcc
+
+    from ._leiden_multiplex import leiden_multiplex
+
+    if len(use) < 2:
+        raise ValueError("Multiplex Leiden needs at least two graphs in `use`.")
+    _validate_rapids_options(beta, objective_function)
+    resolutions = _validate_resolutions(_layer_values(resolution, use, "resolution"), multiplex=True)
+    weights = _layer_values(1.0 if layer_weights is None else layer_weights, use, "layer_weights")
+    if not all(
+        isinstance(w, Real) and not isinstance(w, bool) and math.isfinite(w) and w >= 0 for w in weights
+    ) or not any(weights):
+        raise ValueError("`layer_weights` must be finite and non-negative, with at least one positive value.")
+    names, graphs = [], []
+    if isinstance(use, Mapping):
+        if not hasattr(adata, "mod"):
+            raise TypeError("A mapping in `use` requires a MuData object.")
+        for name, graph in use.items():
+            mod = adata.mod[name]
+            if not mod.obs_names.equals(adata.obs_names):
+                raise ValueError(
+                    f"Modality {name!r} must contain the same cells in the same order as the MuData object."
+                )
+            names.append(name)
+            if graph is None and "neighbors" not in mod.uns and "connectivities" in mod.obsp:
+                graph = "connectivities"
+            graphs.append(mod.obsp[graph] if isinstance(graph, str) and graph in mod.obsp else _use_graph(mod, graph))
+    else:
+        for graph in use:
+            if graph is None:
+                raise TypeError("Each graph in a multiplex sequence must be an `obsp` accessor or path.")
+            acc = _resolve_obs(graph, kinds=(GraphAcc,))
+            names.append(acc.k)
+            graphs.append(_use_graph(adata, acc))
+
+    indices = None
+    if restrict_to is not None:
+        graphs[0], indices = restrict_adjacency(
+            adata, restrict_to[0], restrict_categories=restrict_to[1], adjacency=graphs[0]
+        )
+        graphs[1:] = [g[indices, :][:, indices] for g in graphs[1:]]
+    try:
+        part = leiden_multiplex(
+            graphs,
+            resolutions,
+            weights,
+            use_weights=use_weights,
+            n_iterations=-1 if n_iterations > _N_ITER_WARN else n_iterations,
+            rng=rng,
+            initial_membership=initial_membership,
+        )
+    except BaseException as err:
+        traceback.clear_frames(err.__traceback__)
+        del graphs
+        raise
+    labels = _leiden_labels(adata, part, restrict_to, indices)
+    logg.info(f"    finished multiplex Leiden with {part.n_clusters} clusters")
+    if out is True:
+        return labels
+    adata.obs[key] = labels
+    adata.uns[key] = {
+        "params": {
+            "layers": names,
+            "resolution": resolutions,
+            "layer_weights": weights,
+            "n_iterations": n_iterations,
+            **meta_random_state,
+        },
+        "modularity": part.modularity,
+        "quality": part.quality,
+    }
+    return None
 
 
 def _validate_flavor(
@@ -350,7 +495,7 @@ def _validate_n_iterations(n_iterations: int, *, flavor: Literal["rapids", "cugr
         warnings.warn(msg, UserWarning, skip_file_prefixes=_SKIP)
 
 
-def _validate_resolutions(resolution: float | Sequence[float]) -> list[float]:
+def _validate_resolutions(resolution: float | Sequence[float], *, multiplex: bool = False) -> list[float]:
     resolutions = [resolution] if isinstance(resolution, Real) else list(resolution)
     if not resolutions:
         msg = "resolution must be a number or a non-empty sequence of numbers."
@@ -361,10 +506,24 @@ def _validate_resolutions(resolution: float | Sequence[float]) -> list[float]:
     ):
         msg = f"resolution must be finite and in [0, 2**20], but {resolution!r} was passed."
         raise ValueError(msg)
-    if len({f"{res}" for res in resolutions}) < len(resolutions):  # each writes the obs column f"{key}_{res}"
+    if not multiplex and len({f"{res}" for res in resolutions}) < len(
+        resolutions
+    ):  # each writes the obs column f"{key}_{res}"
         msg = f"resolution must not repeat a value, but {resolution!r} was passed."
         raise ValueError(msg)
     return resolutions
+
+
+def _validate_rapids_options(beta, objective_function):
+    if objective_function.lower() != "modularity":
+        msg = "flavor='rapids' supports objective_function='modularity' (CPM: planned)."
+        raise NotImplementedError(msg)
+    if not (math.isfinite(beta) and beta >= 0):
+        msg = f"beta must be finite and >= 0, but {beta!r} was passed."
+        raise ValueError(msg)
+    if beta > 0:
+        msg = "flavor='rapids' merges along the best edge (beta=0); randomized refinement (beta > 0) is planned."
+        raise NotImplementedError(msg)
 
 
 def _leiden_rapids(
@@ -379,15 +538,7 @@ def _leiden_rapids(
     objective_function: str = "modularity",
 ) -> list[SimpleNamespace]:
     """Run every resolution in one native call (`_leiden_cuda.leiden`)."""
-    if objective_function.lower() != "modularity":
-        msg = "flavor='rapids' supports objective_function='modularity' (CPM: planned)."
-        raise NotImplementedError(msg)
-    if not (math.isfinite(beta) and beta >= 0):
-        msg = f"beta must be finite and >= 0, but {beta!r} was passed."
-        raise ValueError(msg)
-    if beta > 0:
-        msg = "flavor='rapids' merges along the best edge (beta=0); randomized refinement (beta > 0) is planned."
-        raise NotImplementedError(msg)
+    _validate_rapids_options(beta, objective_function)
     if n_iterations > _N_ITER_WARN:  # warned about in `leiden`
         n_iterations = -1
     home = cp.cuda.Device().id
