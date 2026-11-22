@@ -119,6 +119,7 @@ struct LayoutParams {
     i64 n = 0;    // level-0 vertices (one copy)
     i64 nnz = 0;  // stored entries of the input
     WKind wkind = WKind::F32;
+    bool directed = false;
     bool host_input = false;   // host arrays: level-0 device copies
     bool idx64_input = false;  // int64 indices: int32 level-0 copy
     int replicas = 1;
@@ -186,6 +187,7 @@ inline std::size_t cub_temp_bytes(i64 n_u) {
 // LOCAL_MOVE + COMPACT; community ids lie in [0, 2 n_U).
 struct MoveBufs {
     i64* K = nullptr;           // [2 n_U] community volumes
+    i64* Kout = nullptr;        // [2 n_U] outgoing strengths in directed mode
     int* csize = nullptr;       // [2 n_U] vertices per community
     int* rank = nullptr;        // [2 n_U + 2] COMPACT ranks / activity bitmaps
     int* defer_slot = nullptr;  // [n_U] deferred activation target
@@ -195,8 +197,9 @@ struct MoveBufs {
     int* movers = nullptr;          // [n_U]
     unsigned char* desc = nullptr;  // MoveState
 
-    void carve(Carver& c, i64 n_u, int S) {
+    void carve(Carver& c, i64 n_u, int S, bool directed) {
         K = c.take<i64>(2 * n_u);
+        if (directed) Kout = c.take<i64>(2 * n_u);
         csize = c.take<int>(2 * n_u);
         rank = c.take<int>(2 * n_u + 2);
         defer_slot = c.take<int>(n_u);
@@ -313,13 +316,15 @@ struct PersistBufs {
     int* P0 = nullptr;  // [n_U] partition carried across iterations
     int* Pa = nullptr;  // [n_U] ping-pong partitions of the levels
     int* Pb = nullptr;
-    i64* KS = nullptr;  // [n_U] K_S after COMPACT
+    i64* KS = nullptr;     // [n_U] K_S after COMPACT
+    i64* KSout = nullptr;  // [n_U] outgoing strengths after COMPACT
 
-    void carve(Carver& c, i64 n_u) {
+    void carve(Carver& c, i64 n_u, bool directed) {
         P0 = c.take<int>(n_u);
         Pa = c.take<int>(n_u);
         Pb = c.take<int>(n_u);
         KS = c.take<i64>(n_u);
+        if (directed) KSout = c.take<i64>(n_u);
     }
 };
 
@@ -329,6 +334,7 @@ struct Level0Bufs {
     float* wf32 = nullptr;   // [nnz] fp32 copy of host input
     i64* wq = nullptr;       // [nnz] W0q
     i64* khat = nullptr;     // [n]
+    i64* kout = nullptr;     // [n] in directed mode
 
     void carve(Carver& c, const LayoutParams& p) {
         const bool need_idx = p.idx64_input || p.host_input;
@@ -338,6 +344,7 @@ struct Level0Bufs {
                                                        : nullptr;
         wq = p.wkind == WKind::I64 ? c.take<i64>(p.nnz) : nullptr;
         khat = c.take<i64>(p.n);
+        if (p.directed) kout = c.take<i64>(p.n);
     }
 };
 
@@ -349,6 +356,7 @@ struct UnionBufs {
     float* wf32 = nullptr;   // [R nnz]
     i64* wq = nullptr;       // [R nnz]
     i64* khat = nullptr;     // [R n]
+    i64* kout = nullptr;     // [R n] in directed mode
 
     void carve(Carver& c, const LayoutParams& p) {
         if (p.replicas <= 1) return;
@@ -356,9 +364,11 @@ struct UnionBufs {
         const bool i64w = p.wkind == WKind::I64;
         indptr = c.take<i64>(nu + 1);
         indices = c.take<int>(eu);
-        wf32 = (i64w || p.wkind == WKind::F32) ? c.take<float>(eu) : nullptr;
+        if (!p.directed && (i64w || p.wkind == WKind::F32))
+            wf32 = c.take<float>(eu);
         wq = i64w ? c.take<i64>(eu) : nullptr;
         khat = c.take<i64>(nu);
+        if (p.directed) kout = c.take<i64>(nu);
     }
 };
 
@@ -494,7 +504,7 @@ inline void carve_prefix(Layout& L, Carver& c, i64 n_u, int S) {
         fn(g);
         phase = std::max(phase, g.used() - start);
     };
-    group([&](Carver& g) { L.move.carve(g, n_u, S); });
+    group([&](Carver& g) { L.move.carve(g, n_u, S, L.p.directed); });
     group([&](Carver& g) { L.refine.carve(g, n_u); });
     group([&](Carver& g) { L.aggregate.carve(g, n_u); });
     group([&](Carver& g) { L.final_.carve(g, n_u); });
@@ -507,7 +517,7 @@ inline Layout make_layout(const LayoutParams& p, void* base) {
     L.p = p;
     Carver c{static_cast<char*>(base), 0};
     carve_prefix(L, c, p.n_union(), p.subrounds);
-    L.persist.carve(c, p.n_union());
+    L.persist.carve(c, p.n_union(), p.directed);
     L.l0.carve(c, p);
     L.uni.carve(c, p);
     const std::size_t ab = arena_bytes(p);

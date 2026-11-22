@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "../nb_types.h"
@@ -168,6 +169,57 @@ __host__ __device__ __forceinline__ i64 pen(i64 b, Mult m) {
     const u64 lo = ub * m.M;
     const int l = -m.sh;  // 0 < l < 64 by the headroom bound
     return static_cast<i64>((hi << l) | (lo >> (64 - l)));
+}
+
+// A directed vertex contributes its outgoing strength against incoming
+// community strength, and vice versa. The traversed CSR holds A + A.T,
+// so lam = gamma / (2m) while each cross term uses gamma / m.
+struct DirectedMult {
+    Mult out, in;
+};
+
+__device__ __forceinline__ Mult warp_broadcast(Mult m, int lane) {
+    return {__shfl_sync(kFullMask, m.M, lane),
+            __shfl_sync(kFullMask, m.sh, lane)};
+}
+
+__device__ __forceinline__ DirectedMult warp_broadcast(DirectedMult m,
+                                                       int lane) {
+    return {warp_broadcast(m.out, lane), warp_broadcast(m.in, lane)};
+}
+
+struct Strength {
+    i64 total, out;
+
+    __device__ Strength operator-(Strength b) const {
+        return {total - b.total, out - b.out};
+    }
+};
+
+template <bool Directed>
+__device__ __forceinline__ Strength load_strength(const i64* k, const i64* kout,
+                                                  i64 i) {
+    return {k[i], Directed ? kout[i] : 0};
+}
+
+template <bool Directed>
+using PenaltyMult = std::conditional_t<Directed, DirectedMult, Mult>;
+
+template <bool Directed>
+__device__ __forceinline__ PenaltyMult<Directed> make_mult(Strength a,
+                                                           double lam) {
+    if constexpr (Directed)
+        return {make_mult(a.out, 2 * lam), make_mult(a.total - a.out, 2 * lam)};
+    else
+        return make_mult(a.total, lam);
+}
+
+__device__ __forceinline__ i64 pen(Strength b, DirectedMult mu) {
+    return pen(b.total - b.out, mu.out) + pen(b.out, mu.in);
+}
+
+__device__ __forceinline__ i64 pen(Strength b, Mult mu) {
+    return pen(b.total, mu);
 }
 
 __host__ __device__ __forceinline__ u64 mix64(u64 x) {

@@ -84,9 +84,9 @@ constexpr u32 kMoveIdMask = 0x7fffffffu;
 
 // Fixed point (numerics.cuh): node weights k_hat are exact int64 counts, and
 // so are the edge weights of level 0 (coarse levels read each edge weight as
-// one fp32 rounding of its exact sum); with Mult mu = make_mult(k_hat_v,
-// lambda_hat), pen(K, mu) is lambda_hat * k_hat_v * K in the same units,
-// exactly. Every decision compares int64 values only.
+// one fp32 rounding of its exact sum); for the undirected score with Mult mu =
+// make_mult(k_hat_v, lambda_hat), pen(K, mu) is lambda_hat * k_hat_v * K in the
+// same units, exactly. Every decision compares int64 values only.
 
 // move_score: the local-moving score of moving v into a community c != d (v's
 // current community), from w_vc = W(v, c) (the summed weight between v and the
@@ -100,15 +100,12 @@ constexpr u32 kMoveIdMask = 0x7fffffffu;
 // gamma * degreeV * volD / vol(V)). Staying in d scores move_score(W(v, d),
 // K_d - k_v, mu) (ParallelLeiden.hpp:36-37, modularityThreshold) and an empty
 // community move_score(0, 0, mu) = 0, so Delta H(v -> c) = score(c) - stay.
-__device__ __forceinline__ i64 move_score(i64 w_vc, i64 K_c, Mult mu) {
-    return w_vc - pen(K_c, mu);
-}
+// For directed modularity the penalty pairs outgoing vertex strength with
+// incoming community strength and vice versa.
 
 // move_decide_final: DECIDE(v), the local-moving decision for vertex v in
 // community d. Inputs:
-//   own   = W(v, d), the weight between v and the other members of d;
-//   Kd    = the summed node weight of d (v included); kv = v's node weight;
-//   mu    = make_mult(kv, lambda_hat);
+//   stay  = score of v in its current community with v excluded;
 //   bg/bc = the best move_score over the neighbouring communities c != d and
 //           its id; among equal scores bc is the smallest id; (kNoScore,
 //           INT_MAX) if v has no neighbouring community other than d;
@@ -126,9 +123,8 @@ __device__ __forceinline__ i64 move_score(i64 w_vc, i64 K_c, Mult mu) {
 // || maxDelta > modThreshold)", "if (0 > maxDelta) // move node to empty
 // community"). Ties depend on the inputs only.
 __device__ __forceinline__ u32
-move_decide_final(int v, int d, i64 n, i64 own, i64 Kd, i64 kv, Mult mu, i64 bg,
-                  int bc, const int* __restrict__ csize) {
-    const i64 stay = move_score(own, Kd - kv, mu);
+move_decide_final(int v, int d, i64 n, i64 stay, i64 bg, int bc,
+                  const int* __restrict__ csize) {
     if (bg < 0 && stay < 0) {  // an empty community (score 0) is the best
         const int s0 = csize[v], s1 = csize[n + v];
         if (s0 == 0) return static_cast<u32>(v) | kMoveFreshBit;
@@ -209,13 +205,14 @@ __device__ __forceinline__ void move_list_append(int* list, int* count, bool mv,
 
 // M0: K[c] = sum of k_hat, csize[c] = |{v : P[v] == c}| for c < id_bound
 // (zeroed by the caller); resets the other csize and the deferred slots.
-template <bool kSmem>
+template <bool kSmem, bool kDirected>
 __global__ void __launch_bounds__(kBlock)
     move_level_init_kernel(const int* __restrict__ P,
                            const i64* __restrict__ khat, i64 n, i64 id_bound,
                            i64* __restrict__ Kc, int* __restrict__ csize,
-                           int* __restrict__ defer_slot,
-                           int* __restrict__ err) {
+                           int* __restrict__ defer_slot, int* __restrict__ err,
+                           const i64* __restrict__ kout,
+                           i64* __restrict__ Kout) {
     extern __shared__ __align__(16) unsigned char move_init_smem[];
     i64* sK = reinterpret_cast<i64*>(move_init_smem);
     int* sC = reinterpret_cast<int*>(sK + (kSmem ? id_bound : 0));
@@ -248,6 +245,12 @@ __global__ void __launch_bounds__(kBlock)
         }
         const unsigned m = __match_any_sync(kFullMask, c);
         const i64 sum = move_group_sum(k, m);
+        if constexpr (kDirected) {
+            const i64 out = move_group_sum(v < n ? kout[v] : 0, m);
+            if (c >= 0 && lane == __ffs(m) - 1)
+                atomicAdd(reinterpret_cast<u64*>(&Kout[c]),
+                          static_cast<u64>(out));
+        }
         if (c >= 0 && lane == __ffs(m) - 1) {
             if constexpr (kSmem) {
                 atomicAdd(reinterpret_cast<u64*>(&sK[c]),
@@ -476,6 +479,40 @@ struct MoveEval {
     int* movers;
     i64 n;
     double lam;
+    const i64* kout;
+    const i64* Kout;
+};
+
+// Fixed-point insertion score W(v, c) minus its modularity penalty. The
+// home community is scored after removing v. Both null models have a
+// nonnegative penalty, so weight outside the home community bounds every
+// competing score and the same pruning test applies.
+template <bool kDirected>
+struct MoveScore {
+    PenaltyMult<kDirected> mu;
+    Strength remaining;  // home community excluding this vertex
+
+    template <WKind K>
+    __device__ __forceinline__ void load(const MoveEval<K>& a, int v, int d) {
+        const auto kv = load_strength<kDirected>(a.khat, a.kout, v);
+        remaining = load_strength<kDirected>(a.Kc, a.Kout, d) - kv;
+        mu = make_mult<kDirected>(kv, a.lam);
+    }
+
+    // Each lane evaluates a different candidate; only src scores staying.
+    __device__ __forceinline__ void broadcast(int src) {
+        mu = warp_broadcast(mu, src);
+    }
+
+    template <WKind K>
+    __device__ __forceinline__ i64 target(i64 weight, const MoveEval<K>& a,
+                                          int c) const {
+        return weight - pen(load_strength<kDirected>(a.Kc, a.Kout, c), mu);
+    }
+
+    __device__ __forceinline__ i64 stay(i64 own) const {
+        return own - pen(remaining, mu);
+    }
 };
 
 // Vertices per warp of a group prefetch (layout only).
@@ -484,21 +521,6 @@ __device__ __forceinline__ int move_vpw(i64 cnt, i64 nwarps) {
     if (rounds < 1) return 1;
     const i64 v = (cnt + nwarps * rounds - 1) / (nwarps * rounds);
     return v < 1 ? 1 : (v > kWarp ? kWarp : static_cast<int>(v));
-}
-
-// move_stays: exact pruning for the common case. Given own = W(v, d),
-// oth = W(v, V \ d) (v's total weight to vertices outside d), Kd and kv, return
-// true only if move_decide_final would return d whatever the neighbouring
-// communities' weights and sizes are (it runs before the per-community sums
-// exist). Returning false is always correct, only slower.
-// Implemented: move_score(own, Kd - kv, mu) >= oth. Every other option scores
-// at most oth: move_score(w_vc, K_c, mu) <= w_vc <= oth (pen >= 0) and an
-// empty community 0 <= oth, and DECIDE leaves d only for a strictly higher
-// score (Traag et al. 2019, Algorithm A.2 line 18; NetworKit
-// ParallelLeiden.cpp:237). The bound is attained (w_vc = oth, K_c = 0).
-__device__ __forceinline__ bool move_stays(i64 own, i64 oth, i64 Kd, i64 kv,
-                                           Mult mu) {
-    return move_score(own, Kd - kv, mu) >= oth;
 }
 
 template <WKind K>
@@ -522,22 +544,19 @@ __device__ __forceinline__ void move_light_entry(const MoveEval<K>& a, int v,
     }
 }
 
-// DECIDE of the vertex held by lane `src` (pk, pKd: its k_hat and K_d) from
-// every lane's row entry (c, x); lane src updates res.
-template <WKind K, bool kPrune>
+// DECIDE of the vertex held by lane src from the row entries (c, x).
+template <WKind K, bool kPrune, bool kDirected>
 __device__ __forceinline__ void move_light_decide(const MoveEval<K>& a,
                                                   i64* s_w, int lane, int src,
                                                   int v, int d, int c, i64 x,
-                                                  Mult pm, i64 pk, i64 pKd,
+                                                  MoveScore<kDirected> score,
                                                   u32& res) {
-    Mult mu;
-    mu.M = __shfl_sync(kFullMask, pm.M, src);
-    mu.sh = __shfl_sync(kFullMask, pm.sh, src);
+    score.broadcast(src);
     if constexpr (kPrune) {
         const i64 own = warp_sum(c == d ? x : 0ll);
         const i64 oth = warp_sum(c != d ? x : 0ll);  // x = 0 if c < 0
         bool stays = false;
-        if (lane == src) stays = move_stays(own, oth, pKd, pk, mu);
+        if (lane == src) stays = score.stay(own) >= oth;
         if (__shfl_sync(kFullMask, stays, src)) return;  // res = d
     }
     const unsigned m = __match_any_sync(kFullMask, c);
@@ -551,7 +570,7 @@ __device__ __forceinline__ void move_light_decide(const MoveEval<K>& a,
         if (c == d) {
             own = sum;
         } else {
-            bg = move_score(sum, a.Kc[c], mu);
+            bg = score.target(sum, a, c);
             bc = c;
         }
     }
@@ -559,12 +578,12 @@ __device__ __forceinline__ void move_light_decide(const MoveEval<K>& a,
     own = warp_sum(own);
     move_warp_argmax(bg, bc);
     if (lane == src)
-        res = move_decide_final(v, d, a.n, own, pKd, pk, mu, bg, bc, a.csize);
+        res = move_decide_final(v, d, a.n, score.stay(own), bg, bc, a.csize);
 }
 
 // light: warp per vertex, one entry per lane, match_any groups and a group
 // prefetch; two vertices per step keep both rows' dependent loads in flight.
-template <WKind K, bool kPrune>
+template <WKind K, bool kPrune, bool kDirected>
 __global__ void __launch_bounds__(kBlock, kMoveLightBlocksPerSm)
     move_eval_light_kernel(MoveEval<K> a, const int* __restrict__ list,
                            const int* __restrict__ count, int cap, MoveAct t) {
@@ -578,16 +597,14 @@ __global__ void __launch_bounds__(kBlock, kMoveLightBlocksPerSm)
     const int vpw = move_vpw(cnt, nw);
     for (i64 base = gw * vpw; base < cnt; base += nw * vpw) {
         int pv = -1, pd = 0;
-        i64 pb = 0, pe = 0, pk = 0, pKd = 0;
-        Mult pm{0ull, 0};
+        i64 pb = 0, pe = 0;
+        MoveScore<kDirected> prefetched{};
         if (lane < vpw && base + lane < cnt) {
             pv = list[base + lane];
             pb = a.indptr[pv];
             pe = a.indptr[pv + 1];
             pd = a.P[pv];
-            pk = a.khat[pv];
-            pKd = a.Kc[pd];
-            pm = make_mult(pk, a.lam);
+            prefetched.load(a, pv, pd);
         }
         u32 res = static_cast<u32>(pd);
         unsigned todo = __ballot_sync(kFullMask, pv >= 0);
@@ -609,11 +626,11 @@ __global__ void __launch_bounds__(kBlock, kMoveLightBlocksPerSm)
             i64 x1, x2;
             move_light_entry(a, v1, b1, e1, lane, u1, c1, x1);
             move_light_entry(a, v2, b2, e2, lane, u2, c2, x2);
-            move_light_decide<K, kPrune>(a, s_w[wib], lane, s1, v1, d1, c1, x1,
-                                         pm, pk, pKd, res);
+            move_light_decide<K, kPrune, kDirected>(
+                a, s_w[wib], lane, s1, v1, d1, c1, x1, prefetched, res);
             if (s2 >= 0)
-                move_light_decide<K, kPrune>(a, s_w[wib], lane, s2, v2, d2, c2,
-                                             x2, pm, pk, pKd, res);
+                move_light_decide<K, kPrune, kDirected>(
+                    a, s_w[wib], lane, s2, v2, d2, c2, x2, prefetched, res);
             if (act) {  // activation by the movers (rows in registers)
                 const u32 r1 = __shfl_sync(kFullMask, res, s1);
                 if (r1 != static_cast<u32>(d1))  // warp-uniform
@@ -636,7 +653,7 @@ __global__ void __launch_bounds__(kBlock, kMoveLightBlocksPerSm)
 }
 
 // mid: warp per vertex, 256-slot table per warp.
-template <WKind K, bool kPrune>
+template <WKind K, bool kPrune, bool kDirected>
 __global__ void __launch_bounds__(kMoveMidBlock, 7)
     move_eval_mid_kernel(MoveEval<K> a, const int* __restrict__ list,
                          const int* __restrict__ count, int cap, MoveAct t) {
@@ -660,16 +677,14 @@ __global__ void __launch_bounds__(kMoveMidBlock, 7)
     const int vpw = move_vpw(cnt, nw);
     for (i64 base = gw * vpw; base < cnt; base += nw * vpw) {
         int pv = -1, pd = 0;
-        i64 pb = 0, pe = 0, pk = 0, pKd = 0;
-        Mult pm{0ull, 0};
+        i64 pb = 0, pe = 0;
+        MoveScore<kDirected> prefetched{};
         if (lane < vpw && base + lane < cnt) {
             pv = list[base + lane];
             pb = a.indptr[pv];
             pe = a.indptr[pv + 1];
             pd = a.P[pv];
-            pk = a.khat[pv];
-            pKd = a.Kc[pd];
-            pm = make_mult(pk, a.lam);
+            prefetched.load(a, pv, pd);
         }
         u32 res = static_cast<u32>(pd);
         unsigned todo = __ballot_sync(kFullMask, pv >= 0);
@@ -680,9 +695,8 @@ __global__ void __launch_bounds__(kMoveMidBlock, 7)
             const i64 b = __shfl_sync(kFullMask, pb, src);
             const i64 e = __shfl_sync(kFullMask, pe, src);
             const int d = __shfl_sync(kFullMask, pd, src);
-            Mult mu;
-            mu.M = __shfl_sync(kFullMask, pm.M, src);
-            mu.sh = __shfl_sync(kFullMask, pm.sh, src);
+            auto score = prefetched;
+            score.broadcast(src);
             if constexpr (kPrune) {  // first pass: own / oth only
                 i64 own = 0, oth = 0;
                 for (i64 j = b + lane; j < e; j += kWarp) {
@@ -698,7 +712,7 @@ __global__ void __launch_bounds__(kMoveMidBlock, 7)
                 own = warp_sum(own);
                 oth = warp_sum(oth);
                 bool stays = false;
-                if (lane == src) stays = move_stays(own, oth, pKd, pk, mu);
+                if (lane == src) stays = score.stay(own) >= oth;
                 if (__shfl_sync(kFullMask, stays, src)) continue;  // res = d
             }
             const int tsize = move_table_size(e - b, kMoveMidSlots);
@@ -738,7 +752,7 @@ __global__ void __launch_bounds__(kMoveMidBlock, 7)
                 if (c == d) {
                     own = sum;
                 } else {
-                    const i64 g = move_score(sum, a.Kc[c], mu);
+                    const i64 g = score.target(sum, a, c);
                     if (move_better(g, c, bg, bc)) {
                         bg = g;
                         bc = c;
@@ -748,7 +762,7 @@ __global__ void __launch_bounds__(kMoveMidBlock, 7)
             own = warp_sum(own);
             move_warp_argmax(bg, bc);
             if (lane == src)
-                res = move_decide_final(v, d, a.n, own, pKd, pk, mu, bg, bc,
+                res = move_decide_final(v, d, a.n, score.stay(own), bg, bc,
                                         a.csize);
             __syncwarp();  // the scan finishes before the next claims
             if (act) {     // activation by a mover (its row is cached)
@@ -861,7 +875,7 @@ __device__ const int* move_hub_buckets(const MoveEval<K>& a, int v, i64 b,
 // (numerics.cuh) is bucketed instead at its first overflow, its passes then
 // reading their bucket only. The argmax and W(v, d) carry across passes, so
 // npass and the buckets never change the result.
-template <WKind K, bool kPrune>
+template <WKind K, bool kPrune, bool kDirected>
 __global__ void __launch_bounds__(kBlock, 3)
     move_eval_block_kernel(MoveEval<K> a, const int* __restrict__ list,
                            const int* __restrict__ count, int cap, int pass_cap,
@@ -891,8 +905,8 @@ __global__ void __launch_bounds__(kBlock, 3)
         const int v = list[i];
         const i64 b = a.indptr[v], e = a.indptr[v + 1];
         const int d = a.P[v];
-        const i64 kv = a.khat[v];
-        const Mult mu = make_mult(kv, a.lam);
+        MoveScore<kDirected> score;
+        score.load(a, v, d);
         const i64 deg = e - b;
         const int tsize = move_table_size(
             deg < pass_cap ? deg : static_cast<i64>(pass_cap), kMoveBlockSlots);
@@ -925,7 +939,7 @@ __global__ void __launch_bounds__(kBlock, 3)
                     o += s_g[q];
                     t += s_w[q][0];
                 }
-                stays = move_stays(o, t, a.Kc[d], kv, mu);
+                stays = score.stay(o) >= t;
                 s_ovf = stays ? 1 : 0;
             }
             __syncthreads();
@@ -1022,7 +1036,7 @@ __global__ void __launch_bounds__(kBlock, 3)
                 if (c == d) {
                     s_own = sum;
                 } else {
-                    const i64 sc = move_score(sum, a.Kc[c], mu);
+                    const i64 sc = score.target(sum, a, c);
                     if (move_better(sc, c, g, cc)) {
                         g = sc;
                         cc = c;
@@ -1048,8 +1062,8 @@ __global__ void __launch_bounds__(kBlock, 3)
             ++p;
         }
         if (tid == 0) {
-            const u32 res = move_decide_final(v, d, a.n, s_own, a.Kc[d], kv, mu,
-                                              rg, rc, a.csize);
+            const u32 res = move_decide_final(v, d, a.n, score.stay(s_own), rg,
+                                              rc, a.csize);
             a.dest[v] = t.stamp_hi(k) | static_cast<u64>(res);
             if (res != static_cast<u32>(d))
                 a.movers[atomicAdd(t.mover_count(k), 1)] = v;
@@ -1079,12 +1093,13 @@ __global__ void __launch_bounds__(kBlock, 3)
 
 // M3, thread per mover: K_hat / csize moves aggregated per source and target
 // (match_any); a move into an empty community stores (k_v, 1). P[v] <- c_v.
+template <bool kDirected>
 __global__ void __launch_bounds__(kBlock)
     move_apply_kernel(const i64* __restrict__ khat, int* __restrict__ P,
                       i64* __restrict__ Kc, int* __restrict__ csize,
                       const i64* __restrict__ dest,
-                      const int* __restrict__ movers, MoveAct t,
-                      int mover_cap) {
+                      const int* __restrict__ movers, MoveAct t, int mover_cap,
+                      const i64* __restrict__ kout, i64* __restrict__ Kout) {
     const int* __restrict__ mover_count = t.mover_count(t.sweep());
     const int lane = threadIdx.x & (kWarp - 1);
     const i64 cnt = min(*mover_count, mover_cap);
@@ -1095,7 +1110,7 @@ __global__ void __launch_bounds__(kBlock)
         const i64 i = base + lane;
         int v = -1, d = -1, c = -1;
         bool fresh = false;
-        i64 k = 0;
+        i64 k = 0, out = 0;
         if (i < cnt) {
             v = movers[i];
             d = P[v];
@@ -1103,10 +1118,17 @@ __global__ void __launch_bounds__(kBlock)
             c = static_cast<int>(code & kMoveIdMask);
             fresh = (code & kMoveFreshBit) != 0;
             k = khat[v];
+            if constexpr (kDirected) out = kout[v];
         }
         {
             const unsigned m = __match_any_sync(kFullMask, d);
             const i64 s = move_group_sum(k, m);
+            if constexpr (kDirected) {
+                const i64 so = move_group_sum(out, m);
+                if (d >= 0 && lane == __ffs(m) - 1)
+                    atomicAdd(reinterpret_cast<u64*>(&Kout[d]),
+                              static_cast<u64>(-so));
+            }
             if (d >= 0 && lane == __ffs(m) - 1) {
                 atomicAdd(reinterpret_cast<u64*>(&Kc[d]), static_cast<u64>(-s));
                 atomicSub(&csize[d], __popc(m));
@@ -1116,6 +1138,12 @@ __global__ void __launch_bounds__(kBlock)
             const int ca = fresh ? -1 : c;
             const unsigned m = __match_any_sync(kFullMask, ca);
             const i64 s = move_group_sum(k, m);
+            if constexpr (kDirected) {
+                const i64 so = move_group_sum(out, m);
+                if (ca >= 0 && lane == __ffs(m) - 1)
+                    atomicAdd(reinterpret_cast<u64*>(&Kout[ca]),
+                              static_cast<u64>(so));
+            }
             if (ca >= 0 && lane == __ffs(m) - 1) {
                 atomicAdd(reinterpret_cast<u64*>(&Kc[ca]), static_cast<u64>(s));
                 atomicAdd(&csize[ca], __popc(m));
@@ -1123,6 +1151,7 @@ __global__ void __launch_bounds__(kBlock)
         }
         if (fresh) {
             Kc[c] = k;
+            if constexpr (kDirected) Kout[c] = out;
             csize[c] = 1;
         }
         if (v >= 0) P[v] = c;
@@ -1135,7 +1164,9 @@ __global__ void move_compact_kernel(const int* __restrict__ rank,
                                     const int* __restrict__ csize,
                                     const i64* __restrict__ Kc, i64 n,
                                     int* __restrict__ P, i64* __restrict__ KS,
-                                    Control* ctl, MovePhaseGate gate) {
+                                    Control* ctl, MovePhaseGate gate,
+                                    const i64* __restrict__ Kout,
+                                    i64* __restrict__ KSout) {
     if (gate.st) {  // uniform over the grid
         __shared__ int done;
         if (threadIdx.x == 0) done = move_phase_done(gate, ctl);
@@ -1148,7 +1179,10 @@ __global__ void move_compact_kernel(const int* __restrict__ rank,
     const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
     for (i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < 2 * n; i += stride) {
-        if (csize[i] > 0) KS[rank[i]] = Kc[i];
+        if (csize[i] > 0) {
+            KS[rank[i]] = Kc[i];
+            if (KSout) KSout[rank[i]] = Kout[i];
+        }
         if (i < n) P[i] = rank[P[i]];
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) ctl->move_C = rank[2 * n];
@@ -1202,6 +1236,7 @@ __global__ void move_project_kernel(const int* __restrict__ Pc,
 }
 
 struct MoveParams {
+    const i64* kout = nullptr;
     double lam = 0.0;  // lam_hat = gamma / 2m_hat (one host division)
     u32 seed = 0;
     u32 it = 0;
@@ -1275,21 +1310,28 @@ inline void finish_local_move(MoveRun& mr, const Control& h) {
     if (mr.len > 0) move_fold_chunk(mr, h);
 }
 
-inline void run_level_init(const int* P, const i64* khat, i64 n, i64 id_bound,
-                           const MoveBufs& mb, int* err, cudaStream_t s) {
+template <bool kDirected>
+inline void run_level_init(const int* P, const i64* khat, const i64* kout,
+                           i64 n, i64 id_bound, const MoveBufs& mb, int* err,
+                           cudaStream_t s) {
     cuda_check(cudaMemsetAsync(mb.K, 0, id_bound * sizeof(i64), s),
                "leiden: clear K_hat");
+    if constexpr (kDirected)
+        cuda_check(cudaMemsetAsync(mb.Kout, 0, id_bound * sizeof(i64), s),
+                   "leiden: clear outgoing strength");
     cuda_check(cudaMemsetAsync(mb.csize, 0, id_bound * sizeof(int), s),
                "leiden: clear csize");
     const unsigned g = grid_items(n);
     if (id_bound <= kMoveSmemIds) {
         const std::size_t smem =
             static_cast<std::size_t>(id_bound) * (sizeof(i64) + sizeof(int));
-        move_level_init_kernel<true><<<g, kBlock, smem, s>>>(
-            P, khat, n, id_bound, mb.K, mb.csize, mb.defer_slot, err);
+        move_level_init_kernel<true, kDirected>
+            <<<g, kBlock, smem, s>>>(P, khat, n, id_bound, mb.K, mb.csize,
+                                     mb.defer_slot, err, kout, mb.Kout);
     } else {
-        move_level_init_kernel<false><<<g, kBlock, 0, s>>>(
-            P, khat, n, id_bound, mb.K, mb.csize, mb.defer_slot, err);
+        move_level_init_kernel<false, kDirected>
+            <<<g, kBlock, 0, s>>>(P, khat, n, id_bound, mb.K, mb.csize,
+                                  mb.defer_slot, err, kout, mb.Kout);
     }
     CUDA_CHECK_LAST_ERROR(move_level_init_kernel);
 }
@@ -1312,36 +1354,37 @@ inline MoveBuckets move_buckets(const MoveBufs& mb, const MoveCounters& ctr,
 }
 
 // M2 calls for sub-round r, one per class (absent classes disabled).
-template <WKind K, bool kPrune>
+template <WKind K, bool kPrune, bool kDirected>
 void move_eval_calls_t(KernelCall* c, const MoveEval<K>& a,
                        const MoveBuckets& B, int r,
                        const i64 (&cc)[kNumClasses], int xl_cap,
                        const MoveAct& t, const HubScratch& hs) {
-    c[0].set(cc[kClassLight] > 0, move_eval_light_kernel<K, kPrune>,
-             dim3(grid_occ(move_eval_light_kernel<K, kPrune>, cc[kClassLight],
-                           kWarpsPerBlock)),
+    c[0].set(cc[kClassLight] > 0, move_eval_light_kernel<K, kPrune, kDirected>,
+             dim3(grid_occ(move_eval_light_kernel<K, kPrune, kDirected>,
+                           cc[kClassLight], kWarpsPerBlock)),
              dim3(kBlock), 0, a, B.list(r, kClassLight),
              B.count(r, kClassLight), B.cap[kClassLight], t);
-    c[1].set(cc[kClassMid] > 0, move_eval_mid_kernel<K, kPrune>,
-             dim3(grid_occ(move_eval_mid_kernel<K, kPrune>, cc[kClassMid],
-                           kMoveMidBlock / kWarp, kMoveMidBlock)),
-             dim3(kMoveMidBlock), 0, a, B.list(r, kClassMid),
-             B.count(r, kClassMid), B.cap[kClassMid], t);
-    c[2].set(
-        cc[kClassBlock] > 0, move_eval_block_kernel<K, kPrune>,
-        dim3(grid_occ(move_eval_block_kernel<K, kPrune>, cc[kClassBlock], 1)),
-        dim3(kBlock), 0, a, B.list(r, kClassBlock), B.count(r, kClassBlock),
-        B.cap[kClassBlock], xl_cap, t, hs);
+    c[1].set(
+        cc[kClassMid] > 0, move_eval_mid_kernel<K, kPrune, kDirected>,
+        dim3(grid_occ(move_eval_mid_kernel<K, kPrune, kDirected>, cc[kClassMid],
+                      kMoveMidBlock / kWarp, kMoveMidBlock)),
+        dim3(kMoveMidBlock), 0, a, B.list(r, kClassMid), B.count(r, kClassMid),
+        B.cap[kClassMid], t);
+    c[2].set(cc[kClassBlock] > 0, move_eval_block_kernel<K, kPrune, kDirected>,
+             dim3(grid_occ(move_eval_block_kernel<K, kPrune, kDirected>,
+                           cc[kClassBlock], 1)),
+             dim3(kBlock), 0, a, B.list(r, kClassBlock),
+             B.count(r, kClassBlock), B.cap[kClassBlock], xl_cap, t, hs);
 }
 
-template <WKind K>
+template <WKind K, bool kDirected>
 void move_eval_calls(KernelCall* c, const MoveEval<K>& a, const MoveBuckets& B,
                      int r, const i64 (&cc)[kNumClasses], int xl_cap,
                      bool prune, const MoveAct& t, const HubScratch& hs) {
     if (prune) {
-        move_eval_calls_t<K, true>(c, a, B, r, cc, xl_cap, t, hs);
+        move_eval_calls_t<K, true, kDirected>(c, a, B, r, cc, xl_cap, t, hs);
     } else {
-        move_eval_calls_t<K, false>(c, a, B, r, cc, xl_cap, t, hs);
+        move_eval_calls_t<K, false, kDirected>(c, a, B, r, cc, xl_cap, t, hs);
     }
 }
 
@@ -1431,11 +1474,14 @@ MoveRun run_local_move(const i64* indptr, const int* indices, EdgeW<K> w,
     const MoveBuckets B = move_buckets(mb, ctr, n, class_count);
     cuda_check(cudaMemsetAsync(ctr.err(), 0, sizeof(int), s),
                "leiden: clear move errors");
-    run_level_init(P, khat, n, id_bound, mb, ctr.err(), s);  // M0
+    if (prm.kout)
+        run_level_init<true>(P, khat, prm.kout, n, id_bound, mb, ctr.err(), s);
+    else
+        run_level_init<false>(P, khat, nullptr, n, id_bound, mb, ctr.err(), s);
 
     const unsigned g_items = grid_items(n);
-    MoveEval<K> a{indptr,   indices, w,         khat, P,      mb.K,
-                  mb.csize, mb.dest, mb.movers, n,    prm.lam};
+    MoveEval<K> a{indptr,  indices,   w, khat,    P,        mb.K,   mb.csize,
+                  mb.dest, mb.movers, n, prm.lam, prm.kout, mb.Kout};
     // activity bitmaps in the rank buffer: R(s) = bm[s % 2], A(s) = R(s - 1)
     const i64 words = (n + 31) / 32;
     MoveState* st = reinterpret_cast<MoveState*>(mb.desc);
@@ -1468,10 +1514,16 @@ MoveRun run_local_move(const i64* indptr, const int* indices, EdgeW<K> w,
     for (int r = 0; r < S; ++r) {
         KernelCall* cr = c + kSweepHead + kSweepPerRound * r;
         t.r = r;
-        move_eval_calls<K>(cr, a, B, r, class_count, prm.xl_cap, prune, t, hs);
-        cr[3].set(true, move_apply_kernel, dim3(g_items), dim3(kBlock), 0, khat,
-                  P, mb.K, mb.csize, mb.dest, mb.movers, t,
-                  static_cast<int>(n));
+        if (prm.kout)
+            move_eval_calls<K, true>(cr, a, B, r, class_count, prm.xl_cap,
+                                     prune, t, hs);
+        else
+            move_eval_calls<K, false>(cr, a, B, r, class_count, prm.xl_cap,
+                                      prune, t, hs);
+        cr[3].set(
+            true, prm.kout ? move_apply_kernel<true> : move_apply_kernel<false>,
+            dim3(g_items), dim3(kBlock), 0, khat, P, mb.K, mb.csize, mb.dest,
+            mb.movers, t, static_cast<int>(n), prm.kout, mb.Kout);
     }
 #if LEIDEN_GRAPH_LOOP
     if (ml.graph && ml.loop)
@@ -1506,7 +1558,7 @@ inline void launch_compact(int* P, i64 n, const MoveBufs& mb, i64* KS,
                            void* cub, std::size_t cub_bytes, Control* ctl,
                            cudaStream_t s,
                            std::vector<KernelCall>* defer = nullptr,
-                           MovePhaseGate gate = {}) {
+                           MovePhaseGate gate = {}, i64* KSout = nullptr) {
     if (n == 0) {
         cuda_check(cudaMemsetAsync(&ctl->move_C, 0, sizeof(i64), s),
                    "leiden: compact empty");
@@ -1518,7 +1570,7 @@ inline void launch_compact(int* P, i64 n, const MoveBufs& mb, i64* KS,
     scan_calls(c.data(), ScanUsed{mb.csize, n2}, mb.rank, n2 + 1, cub,
                cub_bytes);
     c[3].set(true, move_compact_kernel, dim3(grid_items(n2)), dim3(kBlock), 0,
-             mb.rank, mb.csize, mb.K, n, P, KS, ctl, gate);
+             mb.rank, mb.csize, mb.K, n, P, KS, ctl, gate, mb.Kout, KSout);
     if (defer) {
         defer->insert(defer->end(), c.begin(), c.end());
     } else {

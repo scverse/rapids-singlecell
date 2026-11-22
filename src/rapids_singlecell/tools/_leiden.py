@@ -128,11 +128,14 @@ def leiden(
     use
         Neighborhood graph to cluster, e.g. ``A.obsp['k']`` or ``'obsp.k'``.
         Defaults to the connectivities written by :func:`~rapids_singlecell.pp.neighbors`.
-        ``flavor='rapids'`` sums duplicate entries, clusters
-        an asymmetric matrix as A + A.T (with a warning) and ignores the
-        diagonal (self-loops).
+        ``flavor='rapids'`` sums duplicate entries and ignores the diagonal
+        (self-loops).
     directed
-        Must not be ``True``: the graph is treated as undirected.
+        With ``True``, native Leiden optimizes directed modularity using each
+        cell's incoming and outgoing strengths. The resulting communities are
+        weakly connected. With ``False`` or ``None`` (default), native Leiden
+        clusters an asymmetric matrix as A + A.T and issues a warning.
+        ``flavor='cugraph'`` supports only undirected graphs.
     use_weights
         If ``True``, use the graph's edge weights. Native Leiden requires every
         stored weight to be finite and non-negative in this mode. If ``False``,
@@ -150,12 +153,15 @@ def leiden(
         implementation of rapids-singlecell, bitwise reproducible for a given
         seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden` and,
         if it runs out of memory on one GPU, reruns in CUDA managed memory
-        (slower, with a warning). ``'rapids'`` needs about 140 bytes of
-        device memory per cell plus what its coarser levels hold, allocated
-        as they need it: on k-NN graphs 14-18 bytes per stored entry at the
-        peak (about 22 at 100M cells), in all 2.5-3.5x the float32 CSR.
-        GPUs that cannot read host memory directly also need a device copy
-        of host input. If that does not fit,
+        (slower, with a warning). On symmetric k-NN graphs, ``'rapids'`` needs
+        about 140 bytes of device memory per cell plus space for coarser
+        levels as they are built. Peak usage is about 2.5-3.5 times the size
+        of the float32 CSR, including 14-18 bytes of workspace per stored
+        entry (about 22 at 100M cells). GPUs that cannot read host memory
+        directly also need a device copy of host input.
+        With ``directed=True``, asymmetric input can expand to two traversal
+        entries per arc and requires additional storage for incoming and
+        outgoing weights and strengths. If the graph and workspace do not fit,
         it raises :class:`MemoryError` (RMM managed memory can exceed the
         GPU). Under an allocator that does not pool (the default of
         rapids-singlecell), it keeps the per-cell workspace for the next call
@@ -200,7 +206,8 @@ def leiden(
         ``restrict_to`` and the default key, the key is ``'leiden_R'``.
     ``adata.uns['leiden' | key_added]['params']`` : :class:`dict`
         A dict with the values for the parameters ``resolution``,
-        ``n_iterations``, and ``random_state`` (if applicable).
+        ``n_iterations``, and ``random_state`` (if applicable). Directed runs
+        also record ``directed=True``.
     ``adata.uns['leiden' | key_added]['modularity']`` : :class:`float`
         The modularity of the returned clustering with the resolution as
         gamma (a list for several resolutions), computed exactly without
@@ -209,7 +216,8 @@ def leiden(
         orders of magnitude or a resolution near ``2**20``
         (``flavor='cugraph'``: cuGraph's value). Use
         :func:`scanpy.metrics.modularity` for the score with gamma = 1 (it
-        counts self-loops).
+        counts self-loops). For a directed graph, pass the adjacency matrix,
+        labels, and ``is_directed=True``.
     """
     flavor = _validate_flavor(
         flavor,
@@ -249,6 +257,7 @@ def leiden(
                 rng=rng,
                 n_iterations=n_iterations,
                 use_weights=use_weights,
+                directed=bool(directed),
                 **clustering_args,
             )
         else:
@@ -283,6 +292,8 @@ def leiden(
         # Column names preserve the spelling of a resolution (e.g. 1 and 1.0).
         labels[res if out is True else f"{res}"] = cat
     params = {"n_iterations": n_iterations, **meta_random_state}
+    if directed:
+        params["directed"] = True
     if flavor == "cugraph":
         params["max_iter"] = clustering_args.get("max_iter", _CUGRAPH_MAX_ITER)
     logg.info(
@@ -321,7 +332,7 @@ def _validate_flavor(
         case _:
             msg = f"flavor must be either 'rapids' or 'cugraph', but {flavor!r} was passed."
             raise ValueError(msg)
-    if directed:
+    if directed and flavor == "cugraph":
         msg = f"Cannot use flavor={flavor!r} with a directed graph."
         raise ValueError(msg)
     if "partition_type" in clustering_args:
@@ -375,6 +386,7 @@ def _leiden_rapids(
     rng: np.random.Generator,
     n_iterations: int,
     use_weights: bool,
+    directed: bool = False,
     beta: float = 0.0,
     initial_membership=None,
     objective_function: str = "modularity",
@@ -404,7 +416,7 @@ def _leiden_rapids(
         graph, info = None, {"nnz_counted": 0}
         if csr.nnz:
             host_input = _HOST_ZERO_COPY and source is None and _reads_host_memory(home)
-            graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input)
+            graph, info, use_weights = _ingest(csr, use_weights=use_weights, host_input=host_input, directed=directed)
         del csr
         membership = _compact_initial_membership(initial_membership, n)
     if info["nnz_counted"] == 0:
@@ -421,6 +433,8 @@ def _leiden_rapids(
         "initial_membership": membership,
         "stream": cp.cuda.get_current_stream().ptr,
     }
+    if hasattr(graph, "incoming"):
+        args["incoming"] = graph.incoming
     return _leiden_single(graph, args, n)
 
 
@@ -547,7 +561,7 @@ def _as_csr(adjacency):
     return csr
 
 
-def _ingest(csr, *, use_weights: bool, host_input: bool):
+def _ingest(csr, *, use_weights: bool, host_input: bool, directed: bool = False):
     """Check the input natively and fix it up (before sizing the workspace).
 
     Returns the arrays the driver reads, their ingest check and the weight mode.
@@ -595,10 +609,17 @@ def _ingest(csr, *, use_weights: bool, host_input: bool):
         if not use_weights:
             # Duplicates and A + A.T must add up unit weights (multiplicities),
             # so the fix-ups and the driver read the unit values as weights.
-            graph.data = (graph.data != 0).astype(np.float32)
+            graph.data = _nonzero_weights(graph.data).astype(np.float32)
             use_weights = True
         if problem == "canonical":
             graph = _canonicalize(graph, n)
+        elif directed:
+            if info["nnz_counted"] < graph.nnz:
+                graph = _drop_ignored_entries(graph)
+                graph.nnz = graph.indices.size
+            # Each arc contributes twice to the traversal volume (outgoing and incoming).
+            info["nnz_counted"] *= 2
+            return _symmetrize(graph, n, info["wmax"], directed=True), info, True
         else:
             msg = "adjacency is not symmetric; clustering A + A.T instead."
             warnings.warn(msg, UserWarning, skip_file_prefixes=_SKIP)
@@ -607,13 +628,22 @@ def _ingest(csr, *, use_weights: bool, host_input: bool):
             graph = _symmetrize(graph, n, max_weight)
 
 
+def _nonzero_weights(data):
+    if isinstance(data, cp.ndarray) and data.dtype == np.float32:
+        # CuPy's fp32 comparisons can flush subnormal weights to zero.
+        return (data.view(cp.uint32) & 0x7FFF_FFFF) != 0
+    return data != 0
+
+
 def _drop_ignored_entries(graph: SimpleNamespace) -> SimpleNamespace:
     """Keep replica selection independent of padding without copying the padding into each replica."""
     xp = np if graph.host else cp
     # The graph is canonical, so at most nnz_counted + n entries are nonzero.
     # Bound the temporary scan of the original (possibly much larger) data.
     step = 1 << 20
-    keep = xp.concatenate([xp.flatnonzero(graph.data[i : i + step]) + i for i in range(0, graph.nnz, step)])
+    keep = xp.concatenate(
+        [xp.flatnonzero(_nonzero_weights(graph.data[i : i + step])) + i for i in range(0, graph.nnz, step)]
+    )
     keep = keep[graph.indices[keep] != xp.searchsorted(graph.indptr, keep, side="right") - 1]
     return SimpleNamespace(
         indptr=xp.searchsorted(keep, graph.indptr).astype(graph.indptr.dtype, copy=False),
@@ -697,8 +727,8 @@ def _canonicalize(graph: SimpleNamespace, n: int) -> SimpleNamespace:
     return SimpleNamespace(indptr=indptr, indices=indices[:nnz], data=data, host=False)
 
 
-def _symmetrize(graph: SimpleNamespace, n: int, max_weight: float | None) -> SimpleNamespace:
-    """A + A.T (two-operand sums: deterministic) on the device, or on the host for host input and graphs too large for cupyx."""
+def _symmetrize(graph: SimpleNamespace, n: int, max_weight: float | None, *, directed: bool = False) -> SimpleNamespace:
+    """Build a symmetric CSR for traversal, retaining both arc weights for directed modularity."""
     host = graph.host or 2 * graph.nnz >= 2**31  # cupyx indexes up to 2 * nnz entries with int32
     if host:
         xp, sp = np, sparse
@@ -707,21 +737,37 @@ def _symmetrize(graph: SimpleNamespace, n: int, max_weight: float | None) -> Sim
         xp, sp = cp, cpx_sparse
         data = graph.data
         indices, indptr = (x.astype(cp.int32, copy=False) for x in (graph.indices, graph.indptr))
-    if data.dtype == np.float32:
+    if not directed and data.dtype == np.float32:
         if max_weight is None:
             max_weight = float(data.max())
         if max_weight > np.finfo(np.float32).max / 2:
             data = data.astype(np.float64)
     a = sp.csr_matrix((data, indices, indptr), shape=(n, n))
-    a = (a + a.T).tocsr()
+    # Packing A and A.T into separate components gives both directions the
+    # same CSR offsets. Even reciprocal float64 maxima stay representable.
+    if directed:
+        reverse = xp.zeros(data.shape, dtype=xp.result_type(data.dtype, np.complex64))
+        reverse.imag = data  # a copy preserves fp32 subnormals, unlike multiplication by 1j
+        a = (a + sp.csr_matrix((reverse, indices, indptr), shape=a.shape).T).tocsr()
+        a.sort_indices()
+        incoming = xp.ascontiguousarray(a.data.imag)
+        a.data = xp.ascontiguousarray(a.data.real)
+    else:
+        a = (a + a.T).tocsr()
     if host and not graph.host:
-        return _to_device(a)
-    return SimpleNamespace(
-        indptr=xp.ascontiguousarray(a.indptr),
-        indices=xp.ascontiguousarray(a.indices),
-        data=xp.ascontiguousarray(a.data),
-        host=graph.host,
-    )
+        result = _to_device(a)
+        if directed:
+            incoming = cp.asarray(incoming)
+    else:
+        result = SimpleNamespace(
+            indptr=xp.ascontiguousarray(a.indptr),
+            indices=xp.ascontiguousarray(a.indices),
+            data=xp.ascontiguousarray(a.data),
+            host=graph.host,
+        )
+    if directed:
+        result.incoming = incoming
+    return result
 
 
 # One workspace buffer per device, kept between calls. Under an allocator that

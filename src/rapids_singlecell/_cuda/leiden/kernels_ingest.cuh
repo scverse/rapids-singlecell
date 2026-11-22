@@ -469,14 +469,33 @@ struct QSrcUnit {
     }
 };
 
+template <typename WI>
+struct QSrcDirected {
+    const WI* out;
+    const WI* in;
+    int scale;
+    i64* weights;
+
+    __device__ __forceinline__ i64 operator()(i64 j, bool off,
+                                              i64& kout) const {
+        const i64 qout = off ? quantize_scaled(out[j], scale) : 0;
+        const i64 qin = off ? quantize_scaled(in[j], scale) : 0;
+        kout += qout;
+        const i64 q = qout + qin;
+        weights[j] = q;
+        return q;
+    }
+};
+
 // I2, warp per row; also writes the int64 offsets and int32 indices copies.
-template <typename IP, typename IX, typename Src>
+template <typename IP, typename IX, typename Src, bool Directed>
 __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
                                         const IX* __restrict__ indices, Src src,
                                         i64 n, ClassThresholds th,
                                         i64* __restrict__ indptr64,
                                         int* __restrict__ idx32,
-                                        i64* __restrict__ khat, Control* ctl) {
+                                        i64* __restrict__ khat,
+                                        i64* __restrict__ kout, Control* ctl) {
     __shared__ i64 s_two_m[kWarpsPerBlock];
     __shared__ i64 s_hub[kWarpsPerBlock];
     __shared__ i64 s_cls[kWarpsPerBlock][kNumClasses];
@@ -488,18 +507,23 @@ __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
     for (i64 v = warp0; v < n; v += nwarps) {
         const i64 b = static_cast<i64>(indptr[v]);
         const i64 e = static_cast<i64>(indptr[v + 1]);
-        i64 k = 0;
+        i64 k = 0, ko = 0;
         for (i64 j = b + lane; j < e; j += kWarp) {
             const i64 u = static_cast<i64>(indices[j]);
             if (idx32) idx32[j] = static_cast<int>(u);
-            k += src(j, u != v);
+            if constexpr (Directed)
+                k += src(j, u != v, ko);
+            else
+                k += src(j, u != v);
         }
         k = warp_sum(k);
+        if constexpr (Directed) ko = warp_sum(ko);
         if (lane == 0) {
             const int c = degree_class(e - b, th);
             indptr64[v] = b;
             if (v == n - 1) indptr64[n] = e;
             khat[v] = k;
+            if constexpr (Directed) kout[v] = ko;
             two_m += k;
             hub += hub_ints(e - b);
             ++cls[c];
@@ -534,7 +558,8 @@ __global__ void replicate_union_kernel(
     const float* __restrict__ wf0, const i64* __restrict__ wq0,
     const i64* __restrict__ khat0, i64 n, int R, i64* __restrict__ indptr_u,
     int* __restrict__ idx_u, float* __restrict__ wf_u, i64* __restrict__ wq_u,
-    i64* __restrict__ khat_u) {
+    i64* __restrict__ khat_u, const i64* __restrict__ kout0,
+    i64* __restrict__ kout_u) {
     const int lane = threadIdx.x & (kWarp - 1);
     const i64 warp0 =
         static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
@@ -548,6 +573,7 @@ __global__ void replicate_union_kernel(
             indptr_u[x] = shift + b;
             if (x == rows - 1) indptr_u[rows] = static_cast<i64>(R) * nnz0;
             khat_u[x] = khat0[v];
+            if (kout_u) kout_u[x] = kout0[v];
         }
         for (i64 j = b + lane; j < e; j += kWarp) {
             idx_u[shift + j] = static_cast<int>(r * n) + idx0[j];
@@ -588,9 +614,11 @@ template <typename IP, typename IX, typename WI>
 QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
                             i64 n, i64 nnz, bool use_weights, double gamma,
                             const IngestInfo& info, Layout& L,
-                            const ClassThresholds& th, cudaStream_t stream) {
+                            const ClassThresholds& th, cudaStream_t stream,
+                            const WI* incoming = nullptr) {
     check_gamma(gamma);
-    if (info.flags & (kFlagNonCanonical | kFlagAsymmetric))
+    if ((info.flags & kFlagNonCanonical) ||
+        (!incoming && (info.flags & kFlagAsymmetric)))
         throw std::invalid_argument(
             "leiden: input must be canonical and symmetric (run canonicalize / "
             "A + A.T first)");
@@ -608,8 +636,9 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
     const EntryValue<WI> val{data, weighted};
     res.s = scale_for_gamma(scale_s0(info.n_counted, info.wmax), gamma);
     res.unit_q = weighted ? 0 : unit_weight(res.s);
-    res.wkind =
-        level0_kind(info.flags, weighted, std::is_same_v<WI, float>, res.s);
+    res.wkind = incoming ? WKind::I64
+                         : level0_kind(info.flags, weighted,
+                                       std::is_same_v<WI, float>, res.s);
     // fp32 host input with resolutions of both kinds has an I64 layout without
     // an fp32 copy: its F32 resolutions read the identical W0q
     if (host && res.wkind == WKind::F32 && L.l0.wf32 == nullptr &&
@@ -634,14 +663,19 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
     if (n > 0) {
         auto launch = [&](auto src) {
             using Src = decltype(src);
-            const unsigned g = grid_occ(quantize_degrees_kernel<IP, IX, Src>, n,
-                                        kWarpsPerBlock);
-            quantize_degrees_kernel<IP, IX, Src>
+            constexpr bool directed = std::is_same_v<Src, QSrcDirected<WI>>;
+            const unsigned g =
+                grid_occ(quantize_degrees_kernel<IP, IX, Src, directed>, n,
+                         kWarpsPerBlock);
+            quantize_degrees_kernel<IP, IX, Src, directed>
                 <<<g, kBlock, 0, stream>>>(indptr, indices, src, n, th,
-                                           L.l0.indptr, idx32, L.l0.khat, ctl);
+                                           L.l0.indptr, idx32, L.l0.khat,
+                                           L.l0.kout, ctl);
             CUDA_CHECK_LAST_ERROR(quantize_degrees_kernel);
         };
-        if (res.wkind == WKind::UNIT) {
+        if (incoming) {
+            launch(QSrcDirected<WI>{data, incoming, res.s, L.l0.wq});
+        } else if (res.wkind == WKind::UNIT) {
             launch(QSrcUnit{res.unit_q});
         } else if (res.wkind == WKind::I64) {
             launch(QSrcMat<WI>{val, res.s, L.l0.wq});
@@ -662,7 +696,8 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
             L.l0.indptr, res.indices, res.wf32, res.wq, L.l0.khat, n,
             L.p.replicas, L.uni.indptr, L.uni.indices,
             res.wkind == WKind::F32 ? L.uni.wf32 : nullptr,
-            res.wkind == WKind::I64 ? L.uni.wq : nullptr, L.uni.khat);
+            res.wkind == WKind::I64 ? L.uni.wq : nullptr, L.uni.khat, L.l0.kout,
+            L.uni.kout);
         CUDA_CHECK_LAST_ERROR(replicate_union_kernel);
     }
 

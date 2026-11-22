@@ -251,6 +251,7 @@ struct LevelGraph {
     i64 unit = 1;               // UNIT kind: the quantised unit weight
     double scale = 1.0;
     const i64* khat = nullptr;
+    const i64* kout = nullptr;
     i64 n = 0, nnz = 0;
     i64 cls[kNumClasses] = {};  // vertices per degree class
     int* cmap = nullptr;        // to level l + 1 (arena bottom)
@@ -281,6 +282,7 @@ class LeidenDriver {
         g0_.unit = q.wkind == WKind::UNIT ? q.unit_q : 1;
         g0_.scale = std::ldexp(1.0, q.s);
         g0_.khat = L_.l0.khat;
+        g0_.kout = L_.l0.kout;
         g0_.n = n;
         g0_.nnz = nnz;
         for (int c = 0; c < kNumClasses; ++c) g0_.cls[c] = q.class_count[c];
@@ -337,7 +339,8 @@ class LeidenDriver {
                 // Q_r of each replica with one copy's 2m_hat
                 g0_.with_w([&](auto w) {
                     run_quality(g0_.indptr, g0_.indices, w, g0_.khat, P0, n, R,
-                                Cu, two_m, gamma, L_.final_, L_.ctl, s_);
+                                Cu, two_m, gamma, L_.final_, L_.ctl, s_,
+                                g0_.kout);
                 });
                 const Control c = readback();
                 int best = 0;
@@ -410,6 +413,7 @@ class LeidenDriver {
         g.unit = g0_.unit;
         g.scale = g0_.scale;
         g.khat = L_.uni.khat;
+        g.kout = L_.uni.kout;
         g.n = static_cast<i64>(R) * n_;
         g.nnz = static_cast<i64>(R) * nnz_;
         g.hub_ints = R * g0_.hub_ints;
@@ -424,6 +428,7 @@ class LeidenDriver {
                         std::vector<KernelCall>& compact) {
         MoveParams prm;
         prm.lam = lam_;
+        prm.kout = g.kout;
         prm.seed = seed_;
         prm.it = it;
         prm.level = static_cast<u32>(l);
@@ -449,7 +454,7 @@ class LeidenDriver {
                                 prm, L_.move, L_.ctl, ml_, L_.pinned, s_);
         });
         launch_compact(P, g.n, L_.move, L_.persist.KS, L_.cub, L_.cub_bytes,
-                       L_.ctl, s_, &compact, mr.gate());
+                       L_.ctl, s_, &compact, mr.gate(), L_.persist.KSout);
         return mr;
     }
 
@@ -458,7 +463,7 @@ class LeidenDriver {
         continue_local_move(mr, ml_, L_.ctl, L_.pinned, s_);
         std::vector<KernelCall> compact;
         launch_compact(P, g.n, L_.move, L_.persist.KS, L_.cub, L_.cub_bytes,
-                       L_.ctl, s_, &compact);
+                       L_.ctl, s_, &compact, {}, L_.persist.KSout);
         launch_chain(compact, dp_.graph_mode > 0 ? &compact_graph_ : nullptr,
                      s_);
         const Control c = readback();  // SL1
@@ -473,6 +478,8 @@ class LeidenDriver {
                              std::vector<KernelCall> pre = {}) {
         RefineParams rp;
         rp.lam = lam_;
+        rp.kout = g.kout;
+        rp.KSout = L_.persist.KSout;
         rp.ctx_order = ctx(s64_, kTagOrder, it, static_cast<u32>(l), 0, 0);
         rp.trees = dp_.trees;
         g.with_w([&](auto w) {
@@ -481,9 +488,11 @@ class LeidenDriver {
                                  ? &refine_graphs_[static_cast<int>(KW)]
                                  : nullptr;
             std::vector<KernelCall> r9;  // runs with AGGREGATE stage 1
-            run_refine(g.indptr, g.indices, w, g.khat, P, L_.persist.KS, g.n,
-                       g.n, rp, L_.refine, cmap, L_.cub, L_.cub_bytes, L_.ctl,
-                       s_, &L_.ctl->move_C, rg, &r9, std::move(pre));
+            const auto refine =
+                g.kout ? run_refine<true, KW> : run_refine<false, KW>;
+            refine(g.indptr, g.indices, w, g.khat, P, L_.persist.KS, g.n, g.n,
+                   rp, L_.refine, cmap, L_.cub, L_.cub_bytes, L_.ctl, s_,
+                   &L_.ctl->move_C, rg, &r9, std::move(pre));
             plan =
                 aggregate_begin(g.indptr, g.indices, w, g.khat, g.n, g.nnz,
                                 cmap, opt, L_.aggregate, L_.arena, L_.cub,
@@ -502,7 +511,7 @@ class LeidenDriver {
     void launch_quality(const int* P, i64 C) {
         g0_.with_w([&](auto w) {
             run_quality(g0_.indptr, g0_.indices, w, g0_.khat, P, n_, 1, C,
-                        q_.two_m_hat, gamma_, L_.final_, L_.ctl, s_);
+                        q_.two_m_hat, gamma_, L_.final_, L_.ctl, s_, g0_.kout);
         });
     }
     Control quality(const int* P, i64 C) {
@@ -668,7 +677,7 @@ class LeidenDriver {
             }
             const CoarseLevel lv = aggregate_finish(
                 g.n, cmap, plan, c.n_next, c.nnz_next, c.coarse_hub_ints,
-                L_.aggregate, arena, P, level_partition(lvl + 1), s_);
+                L_.aggregate, arena, P, level_partition(lvl + 1), s_, g.kout);
             g.cmap = cmap;
             ++stat.levels;
             LevelGraph ng;
@@ -676,6 +685,7 @@ class LeidenDriver {
             ng.indices = lv.indices;
             ng.wf = lv.weights;
             ng.khat = lv.khat;
+            ng.kout = lv.kout;
             ng.hub = lv.hub;
             ng.n = lv.n;
             ng.nnz = lv.nnz;
@@ -720,6 +730,7 @@ class LeidenDriver {
 struct DriverInput {
     i64 n = 0, nnz = 0;
     bool use_weights = true;
+    bool directed = false;
     IngestInfo info;
     std::vector<double> gammas;
     std::vector<u32> seeds;
@@ -741,7 +752,10 @@ DriverResult run_leiden(const DriverInput& in, const DriverParams& dp,
     LayoutParams p;
     p.n = in.n;
     p.nnz = in.nnz;
-    p.wkind = call_wkind(in.info, in.use_weights, data_f32, in.gammas);
+    p.directed = in.directed;
+    p.wkind = in.directed
+                  ? WKind::I64
+                  : call_wkind(in.info, in.use_weights, data_f32, in.gammas);
     p.idx64_input = idx64_input;
     p.host_input = host_input;
     const int R = n_replicas(in.info.n_counted ? in.nnz : 0, in.n,
@@ -829,13 +843,22 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
                          const optional_array<const int, Device>& init,
                          const DriverParams& dp, std::uintptr_t stream,
                          const nb::object& arena_alloc,
-                         const nb::object& arena_free) {
+                         const nb::object& arena_free,
+                         const optional_array<const WI, InDevice>& incoming) {
     if (indptr.ndim() != 1 || indptr.size() < 1)
         throw std::invalid_argument("indptr must be 1-D with n + 1 entries");
     const i64 n = static_cast<i64>(indptr.size()) - 1;
     const i64 nnz = static_cast<i64>(indices.size());
     if (static_cast<i64>(data.size()) != nnz)
         throw std::invalid_argument("data and indices must have equal length");
+    if (incoming && !use_weights)
+        throw std::invalid_argument(
+            "directed inputs require explicit arc weights");
+    if (incoming &&
+        (incoming->ndim() != 1 || incoming->size() != indices.size() ||
+         incoming->device_id() != data.device_id()))
+        throw std::invalid_argument(
+            "incoming must match the shape and device of data");
     if (n >= kMaxVertices - 1)
         throw std::invalid_argument("leiden: n must be < 2^30 - 1");
     if constexpr (host_input_v<InDevice>) require_pageable_access();
@@ -861,6 +884,7 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
     in.n = n;
     in.nnz = nnz;
     in.use_weights = use_weights;
+    in.directed = incoming.has_value();
     in.info = info_from_dict(check);
     in.gammas = resolutions;
     in.seeds.assign(seeds.begin(), seeds.end());
@@ -878,12 +902,13 @@ DriverResult call_leiden(const input_array<const IP, InDevice>& indptr,
     const IP* ip = indptr.data();
     const IX* ix = indices.data();
     const WI* wd = data.data();
+    const WI* rev = incoming ? incoming->data() : nullptr;
     nb::gil_scoped_release release;
     const auto s = (cudaStream_t)stream;
     return run_synced(s, [&] {
         auto quantize = [&](double gamma, Layout& L) {
             return run_quantize<IP, IX, WI>(ip, ix, wd, n, nnz, use_weights,
-                                            gamma, in.info, L, dp.th, s);
+                                            gamma, in.info, L, dp.th, s, rev);
         };
         DriverResult r = run_leiden(in, dp, !std::is_same_v<IX, int>,
                                     std::is_same_v<WI, float>,
@@ -929,14 +954,14 @@ void register_driver_typed(nb::module_& m) {
            int n_iterations,
            optional_array<const int, Device> initial_membership,
            int max_replicas, std::uintptr_t stream, nb::object arena_alloc,
-           nb::object arena_free) {
+           nb::object arena_free, optional_array<const WI, InDevice> incoming) {
             DriverParams dp;
             dp.n_iterations = n_iterations;
             dp.max_replicas = check_max_replicas(max_replicas);
             return result_dict(call_leiden<IP, IX, WI, InDevice, Device>(
                 indptr, indices, data, use_weights, check, workspace, pinned,
                 labels_out, resolutions, seeds, initial_membership, dp, stream,
-                arena_alloc, arena_free));
+                arena_alloc, arena_free, incoming));
         },
         "indptr"_a.noconvert(), nb::kw_only(), "indices"_a.noconvert(),
         "data"_a.noconvert(), "use_weights"_a, "check"_a,
@@ -945,7 +970,8 @@ void register_driver_typed(nb::module_& m) {
         "seeds"_a, "n_iterations"_a,
         "initial_membership"_a.noconvert().none() = nb::none(),
         "max_replicas"_a = kMaxReplicas, "stream"_a = 0,
-        "arena_alloc"_a = nb::none(), "arena_free"_a = nb::none());
+        "arena_alloc"_a = nb::none(), "arena_free"_a = nb::none(),
+        "incoming"_a.noconvert().none() = nb::none());
 }
 
 template <typename InDevice, typename Device>
