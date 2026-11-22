@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import cupy as cp
 import numpy as np
 import pytest
 from anndata import AnnData
+from cupyx.scipy import sparse as gpu_sparse
 from scipy import sparse
 
 import rapids_singlecell as rsc
@@ -77,6 +79,50 @@ def test_multiplex_empty_and_zero_weight_layers(layers):
     assert result.quality == 0
     expected = [0, *(_rb_quality(g, result.membership, 1) / g.sum() for g in (rna, atac))]
     np.testing.assert_allclose(result.modularity, expected)
+
+
+def test_multiplex_connected_across_layers():
+    from rapids_singlecell.tools._leiden_multiplex import leiden_multiplex
+
+    # The path 0--1--2 spans both layers. The other pair and the isolate must
+    # separate even when the initial partition puts every cell together.
+    rna = sparse.csr_matrix(([1, 1], ([0, 3], [1, 4])), shape=(6, 6))
+    atac = sparse.csr_matrix(([1], ([1], [2])), shape=(6, 6))
+    result = leiden_multiplex(
+        [rna + rna.T, atac + atac.T],
+        [0, 0],
+        [1, 1],
+        use_weights=True,
+        n_iterations=-1,
+        rng=np.random.default_rng(4),
+        initial_membership=np.zeros(6, dtype=int),
+    )
+    np.testing.assert_array_equal(result.membership, [0, 0, 0, 1, 1, 2])
+    np.testing.assert_allclose(result.modularity, [1, 1])
+
+
+def test_positive_layer_cannot_silently_underflow(layers):
+    from rapids_singlecell.tools._leiden_multiplex import leiden_multiplex
+
+    rna, atac = layers
+    with pytest.raises(ValueError, match="Rescale"):
+        leiden_multiplex(
+            [rna * 1e200, atac * 1e-200], [1, 1], [1, 1], use_weights=True, n_iterations=2, rng=np.random.default_rng(0)
+        )
+
+
+@pytest.mark.parametrize("use_weights", [True, False])
+def test_subnormal_edge_with_self_loop(use_weights):
+    from rapids_singlecell.tools._leiden_multiplex import leiden_multiplex
+
+    tiny = np.nextafter(np.float32(0), np.float32(1))
+    host = sparse.csr_matrix(np.array([[0, tiny, 0], [tiny, 1, 0], [0, 0, 0]], dtype=np.float32))
+    device = gpu_sparse.csr_matrix(host)
+    result = leiden_multiplex(
+        [host, device], [1, 1], [1, 1], use_weights=use_weights, n_iterations=2, rng=np.random.default_rng(0)
+    )
+    np.testing.assert_array_equal(result.membership, [0, 0, 1])
+    np.testing.assert_array_equal(cp.asnumpy(device.data), host.data)
 
 
 @pytest.mark.parametrize(

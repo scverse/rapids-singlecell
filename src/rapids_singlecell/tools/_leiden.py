@@ -156,7 +156,8 @@ def leiden(
         previous one :cite:p:`Traag2019`. ``-1`` iterates until an iteration
         moves no cell or improves the modularity by less than 1e-6, then runs
         a last one (at most 20 in all). Values above 20 behave like ``-1``,
-        with a warning.
+        with a warning. On multiple layers, ``-1`` stops when the joint quality
+        stops improving or after 20 iterations.
         ``flavor='cugraph'`` ignores it and runs up to 100 levels.
     flavor
         Which implementation to use. ``'rapids'`` (default) is the native CUDA
@@ -244,8 +245,8 @@ def leiden(
     if restrict_to is not None and out is False and key == "leiden":
         key = "leiden_R"
     if isinstance(use, Mapping | Sequence) and not isinstance(use, str):
-        if flavor != "rapids":
-            raise ValueError("Multiplex Leiden requires flavor='rapids' on one GPU.")
+        if flavor != "rapids" or directed:
+            raise ValueError("Multiplex Leiden requires undirected graphs and flavor='rapids' on one GPU.")
         if adjacency is not None or obsp is not None or neighbors_key is not None:
             raise TypeError("Pass multiplex graphs through `use` alone.")
         return _leiden_layers(

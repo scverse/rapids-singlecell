@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from copy import copy
 from types import SimpleNamespace
 
 import cupy as cp
@@ -8,14 +9,21 @@ import numpy as np
 from cupyx.scipy import sparse
 
 from ._leiden import (
+    _N_ITER_WARN,
     _as_csr,
     _compact_initial_membership,
     _cuda_memory_errors,
     _drop_ignored_entries,
     _ingest,
     _input_device,
+    _workspace_cache_applies,
 )
 from ._leiden_multiplex_moves import _group_sum, move
+
+# An explicit non-flushing conversion keeps float32 subnormal edges in both weight modes.
+_to_float64 = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # missing from cupy-stubs
+    "float32 x", "float64 y", 'asm("cvt.f64.f32 %0, %1;" : "=d"(y) : "f"(x));', "multiplex_float64"
+)
 
 
 def _layer(adjacency, use_weights):
@@ -29,11 +37,16 @@ def _layer(adjacency, use_weights):
 
         csr = _copy_device_sparse_to_device(csr, device)
     if csr.nnz:
+        if csr.dtype == np.float32:
+            csr = copy(csr)
+            csr.data = _to_float64(csr.data) if isinstance(csr.data, cp.ndarray) else csr.data.astype(np.float64)
         graph, info, weighted = _ingest(csr, use_weights=use_weights, host_input=False)
         if info["nnz_counted"]:
             if info["nnz_counted"] < graph.indices.size:
                 graph = _drop_ignored_entries(graph)
-            data = graph.data.astype(cp.float64) if weighted else cp.ones(graph.indices.size, dtype=cp.float64)
+            data = (
+                graph.data.astype(cp.float64, copy=False) if weighted else cp.ones(graph.indices.size, dtype=cp.float64)
+            )
             return sparse.csr_matrix((data, graph.indices, graph.indptr), shape=csr.shape)
     return sparse.csr_matrix(csr.shape, dtype=cp.float64)
 
@@ -115,27 +128,35 @@ def leiden_multiplex(graphs, resolutions, weights, *, use_weights, n_iterations,
         raise ValueError("Multiplex layer volumes must be finite. Rescale the input weights.")
     for layer, volume in zip(layers, volumes, strict=True):
         if volume:
-            layer.data /= volume
+            layer.data = layer.data / volume
     modularity = [0.0] * len(layers)
     active = np.flatnonzero(masses)
     if active.size:
         level = [layers[i] for i in active]
         gamma = [resolutions[i] for i in active]
         factors = np.asarray(masses[active] / max(masses), dtype=np.float64)
+        if any(
+            float(layer.data.min()) * w < np.finfo(np.float64).tiny for layer, w in zip(level, factors, strict=True)
+        ):
+            raise ValueError("Multiplex edge weights span too wide a range for float64. Rescale the layers or weights.")
         previous = -math.inf
-        iteration = 0
-        while n_iterations == -1 or iteration < n_iterations:
-            candidate = _iteration(level, labels, factors, gamma, rng)
-            if iteration and cp.array_equal(candidate, labels):
-                break
-            scores = [_modularity(layer, candidate, res) for layer, res in zip(level, gamma, strict=True)]
-            score = math.fsum(factors * scores)
-            if score <= previous:
-                break
-            labels, previous = candidate, score
-            for i, value in zip(active, scores, strict=True):
-                modularity[i] = value
-            iteration += 1
+        # Reuse the short-lived move and refinement buffers within this call when RMM
+        # would otherwise synchronize on each free. The caller supplies the memory.
+        allocator = cp.cuda.get_allocator()
+        if _workspace_cache_applies():
+            allocator = cp.cuda.MemoryPool(allocator).malloc
+        with cp.cuda.using_allocator(allocator):
+            for iteration in range(_N_ITER_WARN if n_iterations == -1 else n_iterations):
+                candidate = _iteration(level, labels, factors, gamma, rng)
+                if iteration and cp.array_equal(candidate, labels):
+                    break
+                scores = [_modularity(layer, candidate, res) for layer, res in zip(level, gamma, strict=True)]
+                score = math.fsum(factors * scores)
+                if score <= previous:
+                    break
+                labels, previous = candidate, score
+                for i, value in zip(active, scores, strict=True):
+                    modularity[i] = value
     else:
         labels = cp.arange(n, dtype=cp.int32)
 

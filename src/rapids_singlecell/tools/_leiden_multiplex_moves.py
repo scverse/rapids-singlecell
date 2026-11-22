@@ -105,6 +105,30 @@ def move(layers, labels, weights, resolutions, *, parent=None, rng):
         owner = cp.full(n + 1, n, dtype=cp.int32)
         cp.minimum.at(owner, source, rank)
         leads = owner[source] == rank
+        # When most proposals share sources, matching alone serializes their moves.
+        if parent is None and v.size > 1 and 2 * int(cp.count_nonzero(leads)) < v.size:
+            # Bound the loss in this proposal's gain under any ordering of the other
+            # moves: neighbors can leave its target or enter its source, and source
+            # volume can decrease while target volume increases.
+            proposal = labels.copy()
+            proposal[v] = target
+            loss_edges = ((labels[col] == proposal[row]) & (proposal[col] != proposal[row])).astype(cp.float64)
+            loss_edges += (proposal[col] == labels[row]) & (labels[col] != labels[row])
+            loss = _totals(row, value * loss_edges, n)[v]
+            for degree, penalty in null:
+                outgoing = _totals(labels[v], degree[v], n)[labels[v]] - degree[v]
+                incoming = _totals(target, degree[v], n + 1)[target] - degree[v]
+                loss += penalty[v] * (outgoing + cp.where(target == n, 0.0, incoming))
+            safe = gain > loss * (1 + eps)
+            if bool(safe.any()):
+                moving, dest = v[safe], target[safe]
+                if bool((dest == n).any()):
+                    trial = labels.astype(cp.int64)
+                    trial[moving] = cp.where(dest == n, n + moving.astype(cp.int64), dest)
+                    labels = cp.unique(trial, return_inverse=True)[1].astype(cp.int32)
+                else:
+                    labels[moving] = dest
+                continue
         cp.minimum.at(owner, target, rank)
         seed = (owner[source] == rank) & ((target == n) | (owner[target] == rank))
         receives = cp.zeros(n + 1, dtype=cp.bool_)
@@ -128,8 +152,11 @@ def move(layers, labels, weights, resolutions, *, parent=None, rng):
             starts = cp.concatenate((cp.zeros(1, dtype=cp.int64), cp.flatnonzero(t[1:] != t[:-1]) + 1))
             lengths = cp.diff(cp.append(starts, t.size))
             position = cp.arange(t.size) - cp.repeat(starts, lengths)
-            max_charge = cp.repeat(cp.maximum.reduceat(charge[by_target], starts), lengths)
-            commit[by_target] &= cut[t] + eps * (cut[t] + bound[t]) >= bound[t] + position * max_charge
+            max_charge = cp.zeros(n, dtype=cp.uint64)
+            cp.maximum.at(max_charge, target, charge.view(cp.uint64))  # nonnegative floats have ordered bits
+            commit[by_target] &= (
+                cut[t] + eps * (cut[t] + bound[t]) >= bound[t] + position * max_charge.view(cp.float64)[t]
+            )
         v, target = v[commit], target[commit]
         singleton = cp.flatnonzero(target == n)
         if singleton.size:
