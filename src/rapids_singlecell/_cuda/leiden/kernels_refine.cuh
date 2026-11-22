@@ -52,26 +52,14 @@ __device__ __forceinline__ int refine_rows_per_warp(i64 n, i64 nwarps) {
     return r < 1 ? 1 : (r > kWarp ? kWarp : static_cast<int>(r));
 }
 
-// refine_vertex_ok: whether v, in move community S, may be merged by the
-// refinement (the vertex condition of the refinement). ext_v = W(v, S - v)
-// (exact int64), K_S = the summed node weight of S (v included), k_v = v's node
-// weight, lam = lambda_hat (pen(K, make_mult(k, lam)) = lambda_hat * k * K).
-// Implemented: ext_v >= pen(K_S - k_v, make_mult(k_v, lam)), the set R of
-// Traag et al. 2019, Algorithm A.2 line 34 (MergeNodesSubset: E(v, S - v) >=
-// gamma ||v|| (||S|| - ||v||), for modularity ||v|| = k_v and gamma rescaled
-// by 2m, Appendix A eq. (A5)), as NetworKit ParallelLeiden.cpp:435-436
-// (R-Set Condition).
-__device__ __forceinline__ bool refine_vertex_ok(i64 ext_v, i64 K_S, i64 k_v,
-                                                 double lam) {
-    return ext_v >= pen(K_S - k_v, make_mult(k_v, lam));
-}
-
-// R1: ext_v and the vertex test U_v (refine_vertex_ok).
-template <WKind K>
+// R1: ext_v = W(v, S - v). The vertex may merge when its edges to the
+// rest of S meet the null-model expectation (Traag et al., Algorithm A.2).
+template <WKind K, bool Directed>
 __global__ void refine_ext_u_kernel(
     const i64* __restrict__ indptr, const int* __restrict__ indices, EdgeW<K> w,
     const i64* __restrict__ khat, const int* __restrict__ S,
-    const i64* __restrict__ KS, i64 n, i64 C_host,
+    const i64* __restrict__ KS, const i64* __restrict__ kout,
+    const i64* __restrict__ KSout, i64 n, i64 C_host,
     const i64* __restrict__ C_dev, double lam, i64* __restrict__ ext,
     unsigned char* __restrict__ U, int* __restrict__ SU, Control* ctl) {
     const i64 C = C_dev ? *C_dev : C_host;
@@ -117,8 +105,9 @@ __global__ void refine_ext_u_kernel(
             ext[v] = mine;
             bool u_ok = false;
             if (s >= 0) {
-                const i64 kv = khat[v];
-                u_ok = refine_vertex_ok(mine, KS[s], kv, lam);
+                const auto kv = load_strength<Directed>(khat, kout, v);
+                const auto ks = load_strength<Directed>(KS, KSout, s);
+                u_ok = mine >= pen(ks - kv, make_mult<Directed>(kv, lam));
             }
             U[v] = u_ok ? 1 : 0;
             SU[v] = u_ok ? s : -1;  // R2's neighbour test in one gather
@@ -128,12 +117,13 @@ __global__ void refine_ext_u_kernel(
 
 // R2: hn_v = argmax of (key, -u), key = w_vu - pen_v(k_u) >= 0, over counted U
 // neighbours u in S_v (SU = U_u ? S_u : -1); v if U_v fails or there is none.
-template <WKind K>
+template <WKind K, bool Directed>
 __global__ void refine_choose_kernel(
     const i64* __restrict__ indptr, const int* __restrict__ indices, EdgeW<K> w,
-    const i64* __restrict__ khat, const int* __restrict__ S,
-    const unsigned char* __restrict__ U, const int* __restrict__ SU, i64 n,
-    double lam, int* __restrict__ hn, int* __restrict__ root) {
+    const i64* __restrict__ khat, const i64* __restrict__ kout,
+    const int* __restrict__ S, const unsigned char* __restrict__ U,
+    const int* __restrict__ SU, i64 n, double lam, int* __restrict__ hn,
+    int* __restrict__ root) {
     const int lane = threadIdx.x & (kWarp - 1);
     const i64 warp0 =
         static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
@@ -144,12 +134,13 @@ __global__ void refine_choose_kernel(
         const bool own = lane < rpw && v < n;
         i64 b = 0, e = 0;
         int s = -1;  // -1: v fails the R-test (no edge choice)
-        Mult mv{0ull, 0};
+        PenaltyMult<Directed> mv{};
         if (own && U[v]) {
             b = indptr[v];
             e = indptr[v + 1];
             s = S[v];
-            mv = make_mult(khat[v], lam);
+            mv = make_mult<Directed>(load_strength<Directed>(khat, kout, v),
+                                     lam);
         }
         const int rows = n - base < rpw ? static_cast<int>(n - base) : rpw;
         int mine = -1;
@@ -158,8 +149,7 @@ __global__ void refine_choose_kernel(
             if (sq < 0) continue;  // warp-uniform
             const i64 bq = __shfl_sync(kFullMask, b, q);
             const i64 eq = __shfl_sync(kFullMask, e, q);
-            const Mult mq{__shfl_sync(kFullMask, mv.M, q),
-                          __shfl_sync(kFullMask, mv.sh, q)};
+            const auto mq = warp_broadcast(mv, q);
             const i64 vq = base + q;
             i64 bk = -1;       // best key (valid keys are >= 0)
             int bv = INT_MAX;  // its vertex
@@ -168,7 +158,8 @@ __global__ void refine_choose_kernel(
                 if (u == vq || SU[u] != sq) continue;  // S_u == S_v, U_u
                 const i64 x = w.cs(j);
                 if (x <= 0) continue;  // not counted
-                const i64 key = x - pen(khat[u], mq);
+                const i64 key =
+                    x - pen(load_strength<Directed>(khat, kout, u), mq);
                 if (key > bk || (key == bk && u < bv)) {
                     bk = key;
                     bv = u;
@@ -378,16 +369,16 @@ __global__ void tree_scatter_kernel(
 // extpre = W(prefix, S - prefix) (exact; the exclusive prefix sum of
 // ext - 2 inner, with inner_x = W(x, members before x) and inner_root = 0),
 // ks = K_S, kx = k_x, ix = inner_x = W(x, prefix), lam = lambda_hat.
-// Implemented: ix >= pen(kpre, make_mult(kx, lam)) (Delta H(x -> prefix) >= 0,
-// Traag et al. 2019, Algorithm A.2 line 38) and extpre >= pen(ks - kpre,
-// make_mult(kpre, lam)) (the prefix C is in T: E(C, S - C) >= gamma ||C||
-// (||S|| - ||C||), line 37), the two checks of the proof of Lemma 1 of pLeiden
-// (Gilbert & Madduri, IPDPS 2026, arXiv:2608.01503: "it verifies w'(v, Cx) >=
-// 0 and w'(Cx, B[Cx]) >= 0"); NetworKit ParallelLeiden.cpp:457 and 462-464.
-__device__ __forceinline__ bool refine_commit_ok(i64 kpre, i64 extpre, i64 ks,
-                                                 i64 kx, i64 ix, double lam) {
-    const bool gain = ix >= pen(kpre, make_mult(kx, lam));
-    const bool well = extpre >= pen(ks - kpre, make_mult(kpre, lam));
+// The gain of joining the prefix must be nonnegative, and the prefix must
+// remain sufficiently connected to the rest of S (Traag et al. 2019,
+// Algorithm A.2 lines 37-38; pLeiden, Lemma 1). For a directed graph the
+// expected edge mass across each cut uses the strengths in both directions.
+template <bool Directed>
+__device__ __forceinline__ bool refine_commit_ok(Strength kpre, i64 extpre,
+                                                 Strength ks, Strength kx,
+                                                 i64 ix, double lam) {
+    const bool gain = ix >= pen(kpre, make_mult<Directed>(kx, lam));
+    const bool well = extpre >= pen(ks - kpre, make_mult<Directed>(kpre, lam));
     return gain & well;
 }
 
@@ -422,13 +413,15 @@ __device__ __forceinline__ void refine_warp_sort(u64& key, int& val) {
 }
 
 // Thread per tree of <= 8 members: odd-even sort in registers, prefix walk.
+template <bool Directed>
 __global__ void tree_commit_thread_kernel(
     const int* __restrict__ tree_list, const int* __restrict__ tree_offset,
     const int* __restrict__ members, const unsigned char* __restrict__ flipped,
     const i64* __restrict__ khat, const i64* __restrict__ ext,
     const i64* __restrict__ inner, const int* __restrict__ S,
-    const i64* __restrict__ KS, double lam, u64 ctx_order, int* __restrict__ r,
-    Control* ctl) {
+    const i64* __restrict__ KS, const i64* __restrict__ kout,
+    const i64* __restrict__ KSout, double lam, u64 ctx_order,
+    int* __restrict__ r, Control* ctl) {
     const i64 count = ctl->tree_list_count[kTreeThread];
     const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
     for (i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -463,18 +456,20 @@ __global__ void tree_commit_thread_kernel(
             }
         }
         const int x0 = x[0];
-        const i64 ks = KS[S[x0]];
-        i64 kpre = khat[x0];
+        const auto ks = load_strength<Directed>(KS, KSout, S[x0]);
+        auto kpre = load_strength<Directed>(khat, kout, x0);
         i64 extpre = ext[x0] - 2 * inner[x0];
         bool open = true;
 #pragma unroll
         for (int k = 1; k < kTinyTree; ++k) {
             if (open && k < size) {
                 const int xk = x[k];
-                const i64 kx = khat[xk], ix = inner[xk];
-                if (refine_commit_ok(kpre, extpre, ks, kx, ix, lam)) {
+                const auto kx = load_strength<Directed>(khat, kout, xk);
+                const i64 ix = inner[xk];
+                if (refine_commit_ok<Directed>(kpre, extpre, ks, kx, ix, lam)) {
                     r[xk] = x0;
-                    kpre += kx;
+                    kpre.total += kx.total;
+                    kpre.out += kx.out;
                     extpre += ext[xk] - 2 * ix;
                 } else {
                     open = false;
@@ -485,12 +480,14 @@ __global__ void tree_commit_thread_kernel(
     }
 }
 
+template <bool Directed>
 __global__ void tree_commit_warp_kernel(
     const int* __restrict__ tree_list, i64 n,
     const int* __restrict__ tree_offset, const int* __restrict__ members,
     const unsigned char* __restrict__ flipped, const i64* __restrict__ khat,
     const i64* __restrict__ ext, const i64* __restrict__ inner,
-    const int* __restrict__ S, const i64* __restrict__ KS, double lam,
+    const int* __restrict__ S, const i64* __restrict__ KS,
+    const i64* __restrict__ kout, const i64* __restrict__ KSout, double lam,
     u64 ctx_order, int* __restrict__ r, Control* ctl) {
     const int lane = threadIdx.x & (kWarp - 1);
     const i64 warp0 =
@@ -509,18 +506,21 @@ __global__ void tree_commit_warp_kernel(
         }
         refine_warp_sort(key, x);
         const bool valid = lane < size;
-        i64 kx = 0, dx = 0, ix = 0;
+        Strength kx{};
+        i64 dx = 0, ix = 0;
         if (valid) {
-            kx = khat[x];
+            kx = load_strength<Directed>(khat, kout, x);
             ix = inner[x];
             dx = ext[x] - 2 * ix;
         }
-        const i64 kpre = refine_warp_scan(kx);
+        Strength kpre{refine_warp_scan(kx.total), 0};
+        if constexpr (Directed) kpre.out = refine_warp_scan(kx.out);
         const i64 extpre = refine_warp_scan(dx);
         const int x0 = __shfl_sync(kFullMask, x, 0);
-        const i64 ks = KS[S[x0]];
-        const bool ok = !valid || lane == 0 ||
-                        refine_commit_ok(kpre, extpre, ks, kx, ix, lam);
+        const auto ks = load_strength<Directed>(KS, KSout, S[x0]);
+        const bool ok =
+            !valid || lane == 0 ||
+            refine_commit_ok<Directed>(kpre, extpre, ks, kx, ix, lam);
         const unsigned fail = __ballot_sync(kFullMask, !ok);
         const int p = fail ? __ffs(fail) - 1 : size;
         if (valid && lane >= 1 && lane < p) r[x] = x0;
@@ -529,11 +529,13 @@ __global__ void tree_commit_warp_kernel(
 }
 
 // Block per large tree (members sorted by ord): chunks with carried prefixes.
+template <bool Directed>
 __global__ void __launch_bounds__(kCommitBlock) tree_commit_large_kernel(
     const int* __restrict__ large_list, const int* __restrict__ tree_offset,
     const int* __restrict__ sorted_vals, const i64* __restrict__ khat,
     const i64* __restrict__ ext, const i64* __restrict__ inner,
-    const int* __restrict__ S, const i64* __restrict__ KS, double lam,
+    const int* __restrict__ S, const i64* __restrict__ KS,
+    const i64* __restrict__ kout, const i64* __restrict__ KSout, double lam,
     int* __restrict__ r, Control* ctl) {
     using Scan = cub::BlockScan<i64, kCommitBlock>;
     __shared__ typename Scan::TempStorage tmp;
@@ -545,34 +547,43 @@ __global__ void __launch_bounds__(kCommitBlock) tree_commit_large_kernel(
         const int o = tree_offset[t];
         const int size = tree_offset[t + 1] - o;
         const int x0 = sorted_vals[o];
-        const i64 ks = KS[S[x0]];
-        i64 carry_k = 0, carry_d = 0;
+        const auto ks = load_strength<Directed>(KS, KSout, S[x0]);
+        Strength carry{};
+        i64 carry_d = 0;
         for (int c0 = 0; c0 < size; c0 += kCommitBlock) {
             const int j = c0 + tid;
             const bool valid = j < size;
             int x = -1;
-            i64 kx = 0, dx = 0, ix = 0;
+            Strength kx{};
+            i64 dx = 0, ix = 0;
             if (valid) {
                 x = sorted_vals[o + j];
-                kx = khat[x];
+                kx = load_strength<Directed>(khat, kout, x);
                 ix = inner[x];
                 dx = ext[x] - 2 * ix;
             }
             if (tid == 0) s_fail = INT_MAX;
-            i64 ek, ed, tk, td;
-            Scan(tmp).ExclusiveSum(kx, ek, tk);
+            Strength es{}, ts{};
+            i64 ed, td;
+            Scan(tmp).ExclusiveSum(kx.total, es.total, ts.total);
+            if constexpr (Directed) {
+                __syncthreads();
+                Scan(tmp).ExclusiveSum(kx.out, es.out, ts.out);
+            }
             __syncthreads();
             Scan(tmp).ExclusiveSum(dx, ed, td);
-            const i64 kpre = carry_k + ek, extpre = carry_d + ed;
+            const Strength kpre{carry.total + es.total, carry.out + es.out};
+            const i64 extpre = carry_d + ed;
             if (valid && j >= 1 &&
-                !refine_commit_ok(kpre, extpre, ks, kx, ix, lam))
+                !refine_commit_ok<Directed>(kpre, extpre, ks, kx, ix, lam))
                 atomicMin(&s_fail, j);
             __syncthreads();
             const int f = s_fail;
             if (valid && j >= 1 && j < f) r[x] = x0;
             __syncthreads();
             if (f != INT_MAX) break;  // block-uniform
-            carry_k += tk;
+            carry.total += ts.total;
+            carry.out += ts.out;
             carry_d += td;
         }
         if (tid == 0 && x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
@@ -621,6 +632,8 @@ struct RefineParams {
     double lam = 0.0;   // lambda_hat = gamma / 2m_hat
     u64 ctx_order = 0;  // ctx(seed64, ORDER, it, l, 0, 0)
     TreeClasses trees;
+    const i64* kout = nullptr;
+    const i64* KSout = nullptr;
 };
 
 inline void refine_check_cub(std::size_t need, std::size_t have,
@@ -633,7 +646,7 @@ inline void refine_check_cub(std::size_t need, std::size_t have,
 // PLEIDEN_R of a level with move partition S (ids < C) and volumes KS: cmap
 // and ctl->n_next without a host sync. `pre` (COMPACT) and R1-R8 run as one
 // call list, R9's calls go to `tail` (AGGREGATE stage 1) or launch.
-template <WKind K>
+template <bool Directed, WKind K>
 void run_refine(const i64* indptr, const int* indices, EdgeW<K> w,
                 const i64* khat, const int* S, const i64* KS, i64 n, i64 C,
                 const RefineParams& rp, const RefineBufs& rb, int* cmap,
@@ -653,14 +666,16 @@ void run_refine(const i64* indptr, const int* indices, EdgeW<K> w,
     std::size_t k = c.size();
     c.resize(k + 16);
     // rb.cid (free until R9) carries SU from R1 to R2 and rf from R5 to R7
-    c[k++].set(true, refine_ext_u_kernel<K>,
-               dim3(grid_occ(refine_ext_u_kernel<K>, n, kWarpsPerBlock)),
-               dim3(kBlock), 0, indptr, indices, w, khat, S, KS, n, C, C_dev,
-               rp.lam, rb.ext, rb.U, rb.cid, ctl);
-    c[k++].set(true, refine_choose_kernel<K>,
-               dim3(grid_occ(refine_choose_kernel<K>, n, kWarpsPerBlock)),
-               dim3(kBlock), 0, indptr, indices, w, khat, S, rb.U, rb.cid, n,
-               rp.lam, rb.hn, rb.root);
+    c[k++].set(
+        true, refine_ext_u_kernel<K, Directed>,
+        dim3(grid_occ(refine_ext_u_kernel<K, Directed>, n, kWarpsPerBlock)),
+        dim3(kBlock), 0, indptr, indices, w, khat, S, KS, rp.kout, rp.KSout, n,
+        C, C_dev, rp.lam, rb.ext, rb.U, rb.cid, ctl);
+    c[k++].set(
+        true, refine_choose_kernel<K, Directed>,
+        dim3(grid_occ(refine_choose_kernel<K, Directed>, n, kWarpsPerBlock)),
+        dim3(kBlock), 0, indptr, indices, w, khat, rp.kout, S, rb.U, rb.cid, n,
+        rp.lam, rb.hn, rb.root);
     c[k++].set(true, forest_chase1_kernel, dim3(gi), dim3(kBlock), 0, rb.hn, n,
                rp.ctx_order, rb.root);
     c[k++].set(true, forest_flip_kernel, dim3(grid_items(n + 1)), dim3(kBlock),
@@ -679,15 +694,17 @@ void run_refine(const i64* indptr, const int* indices, EdgeW<K> w,
                dim3(kBlock), 0, indptr, indices, w, rb.root, rb.flipped, rb.cid,
                rb.tree_offset, n, rp.ctx_order, rb.inner);
     // R8 classes over device-resident counts (impossible classes disabled)
-    c[k++].set(n >= 2, tree_commit_thread_kernel,
-               dim3(grid_occ(tree_commit_thread_kernel, n / 2 + 1, kBlock)),
-               dim3(kBlock), 0, rb.tree_list, rb.tree_offset, rb.members,
-               rb.flipped, khat, rb.ext, rb.inner, S, KS, rp.lam, rp.ctx_order,
-               rb.r, ctl);
-    c[k++].set(n > tc.thread, tree_commit_warp_kernel,
+    c[k++].set(
+        n >= 2, tree_commit_thread_kernel<Directed>,
+        dim3(grid_occ(tree_commit_thread_kernel<Directed>, n / 2 + 1, kBlock)),
+        dim3(kBlock), 0, rb.tree_list, rb.tree_offset, rb.members, rb.flipped,
+        khat, rb.ext, rb.inner, S, KS, rp.kout, rp.KSout, rp.lam, rp.ctx_order,
+        rb.r, ctl);
+    c[k++].set(n > tc.thread, tree_commit_warp_kernel<Directed>,
                dim3(grid_rows(n / (tc.thread + 1) + 1)), dim3(kBlock), 0,
                rb.tree_list, n, rb.tree_offset, rb.members, rb.flipped, khat,
-               rb.ext, rb.inner, S, KS, rp.lam, rp.ctx_order, rb.r, ctl);
+               rb.ext, rb.inner, S, KS, rp.kout, rp.KSout, rp.lam, rp.ctx_order,
+               rb.r, ctl);
     c.resize(static_cast<std::size_t>(k));
     launch_chain(c, graph, s);
     if (n > tc.warp) {  // trees larger than a warp can exist
@@ -713,10 +730,10 @@ void run_refine(const i64* indptr, const int* indices, EdgeW<K> w,
                        cub, tb, rb.sort_keys_a, rb.sort_keys_b, rb.sort_vals_a,
                        rb.sort_vals_b, items, max_large, begin, end, s),
                    "leiden: large-tree sort");
-        tree_commit_large_kernel<<<grid_for(max_large, 1, kCommitBlock),
-                                   kCommitBlock, 0, s>>>(
-            rb.large_list, rb.tree_offset, rb.sort_vals_b, khat, rb.ext,
-            rb.inner, S, KS, rp.lam, rb.r, ctl);
+        tree_commit_large_kernel<Directed>
+            <<<grid_for(max_large, 1, kCommitBlock), kCommitBlock, 0, s>>>(
+                rb.large_list, rb.tree_offset, rb.sort_vals_b, khat, rb.ext,
+                rb.inner, S, KS, rp.kout, rp.KSout, rp.lam, rb.r, ctl);
         CUDA_CHECK_LAST_ERROR(tree_commit_large_kernel);
     }
     // R9 (the host flags reuse tree_count)

@@ -626,6 +626,25 @@ __global__ void agg_finish_kernel(i64 n, i64 nn, const int* __restrict__ cmap,
     }
 }
 
+// The topology drops internal edges, so carry the original outgoing strengths
+// to each coarse vertex, including mass on arcs that became internal.
+__global__ void agg_kout_kernel(const i64* __restrict__ starts,
+                                const int* __restrict__ members,
+                                const i64* __restrict__ kout, i64 n_next,
+                                i64* __restrict__ next) {
+    const int lane = threadIdx.x & (kWarp - 1);
+    const i64 warp =
+        (static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x) / kWarp;
+    for (i64 c = warp; c < n_next;
+         c += static_cast<i64>(gridDim.x) * kWarpsPerBlock) {
+        i64 total = 0;
+        for (i64 j = starts[c] + lane; j < starts[c + 1]; j += kWarp)
+            total += kout[members[j]];
+        total = warp_sum(total);
+        if (lane == 0) next[c] = total;
+    }
+}
+
 __global__ void agg_set_n_next_kernel(Control* ctl, i64 n_next) {
     ctl->n_next = n_next;
 }
@@ -645,6 +664,7 @@ struct AggregatePlan {
 struct CoarseLevel {
     i64* indptr = nullptr;   // [n + 1]
     i64* khat = nullptr;     // [n]
+    i64* kout = nullptr;     // [n] in directed mode
     int* indices = nullptr;  // [nnz]
     float* weights = nullptr;
     HubScratch hub;  // of its hub rows (numerics.cuh)
@@ -767,7 +787,8 @@ inline CoarseLevel aggregate_finish(i64 n, const int* cmap,
                                     const AggregatePlan& plan, i64 n_next,
                                     i64 nnz_next, i64 hub_ints,
                                     const AggregateBufs& ab, LevelArena& arena,
-                                    const int* P, int* P_next, cudaStream_t s) {
+                                    const int* P, int* P_next, cudaStream_t s,
+                                    const i64* kout) {
     CoarseLevel lv;
     lv.n = n_next;
     lv.nnz = nnz_next;
@@ -775,16 +796,23 @@ inline CoarseLevel aggregate_finish(i64 n, const int* cmap,
     const std::size_t ne = static_cast<std::size_t>(nnz_next);
     const std::size_t nh = static_cast<std::size_t>(hub_ints);
     const std::size_t end = agg_bottom_end(
-        arena.bottom, {8 * (nn + 1), 8 * nn, 4 * ne, 4 * ne, 4 * nh});
+        arena.bottom,
+        {8 * (nn + 1), 8 * nn, kout ? 8 * nn : 0, 4 * ne, 4 * ne, 4 * nh});
     arena.reserve_bottom(end - align_up(arena.bottom) + align_up(4 * nn) +
                          kAlign);
     lv.indptr = arena.push_bottom<i64>(nn + 1);
     lv.khat = arena.push_bottom<i64>(nn);
+    if (kout) lv.kout = arena.push_bottom<i64>(nn);
     lv.indices = arena.push_bottom<int>(ne);
     lv.weights = arena.push_bottom<float>(ne);
     if (nh) lv.hub = HubScratch{arena.push_bottom<int>(nh), hub_ints};
     arena.reserve_bottom(0);
     if (n_next > 0) {
+        if (kout) {
+            agg_kout_kernel<<<grid_rows(n_next), kBlock, 0, s>>>(
+                ab.member_start, ab.members, kout, n_next, lv.kout);
+            CUDA_CHECK_LAST_ERROR(agg_kout_kernel);
+        }
         agg_compact_kernel<<<grid_rows(n_next), kBlock, 0, s>>>(
             ab.window_offset, ab.cdeg, ab.indptr_next, n_next, plan.h_idx,
             plan.h_w, lv.indices, lv.weights);

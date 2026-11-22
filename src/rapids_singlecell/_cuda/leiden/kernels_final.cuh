@@ -253,13 +253,39 @@ __global__ void quality_rows_kernel(const i64* __restrict__ indptr,
     }
 }
 
-// t_c = (K_c / 2m)^2, grid-wide (the divisions stay off the tree block).
+__global__ void quality_out_volumes_kernel(const i64* __restrict__ kout,
+                                           const int* __restrict__ P, i64 n,
+                                           int R, i64 C, u64* Kout) {
+    const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
+    for (i64 v = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; v < n;
+         v += stride) {
+        const u64 out = static_cast<u64>(kout[v]);
+        for (int r = 0; r < R; ++r) {
+            const int c = P[r * n + v];
+            if (c >= 0 && c < C) atomicAdd(Kout + c, out);
+        }
+    }
+}
+
+// Compute the null-model term of each community outside the reduction block.
+template <bool Directed>
 __global__ void volume_terms_kernel(const i64* __restrict__ Kc, i64 C,
-                                    i64 two_m, double* __restrict__ t) {
+                                    i64 two_m, const u64* __restrict__ Kout,
+                                    double* __restrict__ t) {
     const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
     for (i64 c = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; c < C;
-         c += stride)
-        t[c] = volume_term(Kc[c], two_m);
+         c += stride) {
+        if constexpr (Directed) {
+            // B = A + A.T has total strength two_m, twice the original arc
+            // mass.
+            const double mass = __ll2double_rn(two_m / 2);
+            const i64 out = static_cast<i64>(Kout[c]);
+            t[c] = __dmul_rn(__ddiv_rn(__ll2double_rn(out), mass),
+                             __ddiv_rn(__ll2double_rn(Kc[c] - out), mass));
+        } else {
+            t[c] = volume_term(Kc[c], two_m);
+        }
+    }
 }
 
 // A block per replica: TREE1024 over its communities' t_c, ascending ids.
@@ -316,7 +342,7 @@ template <WKind K>
 void run_quality(const i64* indptr, const int* indices, EdgeW<K> w,
                  const i64* khat, const int* P, i64 n, int R, i64 C, i64 two_m,
                  double gamma, const FinalBufs& fb, Control* ctl,
-                 cudaStream_t s) {
+                 cudaStream_t s, const i64* kout = nullptr) {
     cuda_check(cudaMemsetAsync(ctl->l_hat, 0, sizeof(ctl->l_hat), s),
                "leiden: clear L_hat");
     if (C > 0) {
@@ -344,8 +370,20 @@ void run_quality(const i64* indptr, const int* indices, EdgeW<K> w,
         CUDA_CHECK_LAST_ERROR(quality_rows_kernel);
     }
     if (C > 0 && two_m > 0) {
-        volume_terms_kernel<<<grid_items(C), kBlock, 0, s>>>(fb.K, C, two_m,
-                                                             fb.t);
+        if (kout) {
+            // Label sorting runs after scoring, so its input keys can hold
+            // Kout.
+            cuda_check(cudaMemsetAsync(fb.keys_in, 0, C * sizeof(u64), s),
+                       "leiden: clear outgoing community strengths");
+            quality_out_volumes_kernel<<<grid_items(n), kBlock, 0, s>>>(
+                kout, P, n, R, C, fb.keys_in);
+            CUDA_CHECK_LAST_ERROR(quality_out_volumes_kernel);
+            volume_terms_kernel<true><<<grid_items(C), kBlock, 0, s>>>(
+                fb.K, C, two_m, fb.keys_in, fb.t);
+        } else {
+            volume_terms_kernel<false><<<grid_items(C), kBlock, 0, s>>>(
+                fb.K, C, two_m, nullptr, fb.t);
+        }
         CUDA_CHECK_LAST_ERROR(volume_terms_kernel);
     }
     quality_tree_kernel<<<R, kTreeThreads, 0, s>>>(fb.t, fb.rep, C, R, two_m,

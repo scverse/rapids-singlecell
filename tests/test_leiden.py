@@ -117,7 +117,7 @@ def assert_same(a, b):
         assert x.n_clusters == y.n_clusters
 
 
-def _fp64_modularity(adjacency, labels, resolution, *, use_weights=True):
+def _fp64_modularity(adjacency, labels, resolution, *, use_weights=True, directed=False):
     """Q with resolution, float64 on the host; diagonal and non-positive entries ignored."""
     m = sparse.coo_matrix(adjacency)
     w = m.data.astype(np.float64)
@@ -128,7 +128,8 @@ def _fp64_modularity(adjacency, labels, resolution, *, use_weights=True):
     two_m = w.sum()
     inner = w[labels[row] == labels[col]].sum()
     volumes = np.bincount(labels, weights=np.bincount(row, w, m.shape[0]))
-    return inner / two_m - resolution * ((volumes / two_m) ** 2).sum()
+    incoming = np.bincount(labels, weights=np.bincount(col, w, m.shape[0])) if directed else volumes
+    return inner / two_m - resolution * ((volumes / two_m) * (incoming / two_m)).sum()
 
 
 def _disconnected(adjacency, labels):
@@ -473,7 +474,7 @@ BOTH = ("rapids", "cugraph")
 @pytest.mark.parametrize(
     ("flavors", "kwargs", "error", "match"),
     [
-        (BOTH, {"directed": True}, ValueError, r"Cannot use flavor=.*directed"),
+        (("cugraph",), {"directed": True}, ValueError, r"Cannot use flavor=.*directed"),
         (BOTH, {"partition_type": object}, ValueError, "Do not pass in partition_type"),
         (("foo",), {}, ValueError, _FLAVOR_MSG),
         (("foo",), {"use_dask": True}, ValueError, _FLAVOR_MSG),
@@ -738,6 +739,68 @@ def test_asymmetric_input_warns(adata_neighbors, unpatched_warn):
     with pytest.warns(UserWarning, match="not symmetric"):
         parts = native(directed)
     assert_same(parts, native((directed + directed.T).tocsr()))
+
+
+@needs_native
+@pytest.mark.parametrize("reverse", [False, True])
+def test_directed_orientation(reverse):
+    # Reversing two of these arcs leaves an identical undirected cycle.
+    rows, cols = ([0, 0, 3, 2], [1, 2, 1, 3]) if reverse else ([0, 0, 1, 3], [1, 2, 3, 2])
+    a = sparse.csr_matrix((np.ones(4), (rows, cols)), shape=(4, 4))
+    adata = AnnData(shape=(4, 0))
+    adata.obsp["connectivities"] = a
+    adata.uns["neighbors"] = {"connectivities_key": "connectivities", "params": {}}
+    rsc.tl.leiden(adata, directed=True, rng=0)
+    expected = [0, 1, 0, 1] if reverse else [0, 0, 1, 1]
+    np.testing.assert_array_equal(adata.obs["leiden"].cat.codes, expected)
+    assert adata.uns["leiden"]["modularity"] == pytest.approx(1 / 8)
+    assert adata.uns["leiden"]["params"]["directed"] is True
+
+
+@needs_native
+@pytest.mark.parametrize("use_weights", [True, False])
+def test_directed_modularity(use_weights):
+    a = _graph("pbmc68k")
+    back = sparse.tril(a, k=-1, format="csr")
+    back.data[::3] = 0
+    back.eliminate_zeros()
+    arcs = sparse.triu(a, k=1, format="csr") + back.multiply(0.125)
+    arcs.setdiag(4)
+    resolutions = [0.5, 1.5]
+    parts = native(arcs, resolutions, directed=True, use_weights=use_weights)
+    assert_same(parts, native(cpx_sparse.csr_matrix(arcs), resolutions, directed=True, use_weights=use_weights))
+    for res, part in zip(resolutions, parts, strict=True):
+        expected = _fp64_modularity(arcs, part.membership, res, directed=True, use_weights=use_weights)
+        assert part.modularity == pytest.approx(expected, rel=0, abs=1e-9)
+        assert _disconnected(arcs, part.membership) == 0
+
+
+@needs_native
+@pytest.mark.parametrize("use_weights", [True, False])
+def test_directed_subnormal_weights(use_weights):
+    a = sparse.csr_matrix(np.array([[0, 1, 0, 0], [0, 0, 0, 3], [2, 0, 0, 0], [0, 0, 4, 0]], dtype=np.float32))
+    tiny = a * np.finfo(np.float32).smallest_subnormal
+    tiny.setdiag(-0.0)
+    expected = native(a, directed=True, use_weights=use_weights)
+    assert_same(native(tiny, directed=True, use_weights=use_weights), expected)
+    assert_same(native(cpx_sparse.csr_matrix(tiny), directed=True, use_weights=use_weights), expected)
+
+
+@needs_native
+def test_directed_symmetric_graph():
+    a = _graph("rings")
+    assert_same(native(a, directed=True), native(a))
+
+
+@needs_native
+def test_directed_reciprocal_weights_at_float64_limit():
+    a = sparse.csr_matrix([[0, 1.0, 0], [0.75, 0, 0.5], [0.25, 0, 0]])
+    # Both orientations fit in float64 individually. Adding the reciprocal
+    # weights before quantizing would overflow.
+    large = a * np.finfo(np.float64).max
+    expected = native(a, [1, 32], directed=True)
+    assert_same(native(large, [1, 32], directed=True), expected)
+    assert_same(native(cpx_sparse.csr_matrix(large), [1, 32], directed=True), expected)
 
 
 @needs_native
