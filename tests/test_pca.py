@@ -464,6 +464,18 @@ def test_dense_solver_dispatch(solver):
     assert estimator.call_args.kwargs["svd_solver"] == (solver or "auto")
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("nnz", [40, 41])
+def test_centered_csr_density_cutoff(dtype, nnz):
+    from rapids_singlecell.preprocessing._sparse_pca import _sparse_pca as solver
+
+    x = np.zeros((10, 10), dtype=dtype)
+    x.flat[:nnz] = np.arange(1, nnz + 1)
+    with patch.object(solver, "_centered_covariance", wraps=solver._centered_covariance) as tiled:
+        rsc.pp.pca(cusparse.csr_matrix(cp.asarray(x)), n_comps=2, svd_solver="covariance_eigh")
+    assert tiled.called == (nnz > 40)
+
+
 def test_wide_sparse_solver_dispatch():
     x = sparse.csr_matrix((4, 8_001), dtype=np.float32)
     scores = np.empty((x.shape[0], 1), dtype=x.dtype)

@@ -66,9 +66,8 @@ class CovariancePCA:
                 self.mean_ = None
                 return _ordered_gram(x)
             self.mean_ = _csr_mean(x)
-            # Centered tiles win sooner in FP32, where they use Tensor Cores.
-            density_cutoff = 0.8 if x.dtype == cp.float64 else 1 / 6
-            if x.nnz < density_cutoff * n_rows * n_cols:
+            # Above 40% occupancy, treat centered CSR input as dense row tiles.
+            if x.nnz <= 0.4 * n_rows * n_cols:
                 gram = _ordered_gram(x)
                 gram *= 1 / n_rows
                 if not _needs_centered_gram(gram, self.mean_):
