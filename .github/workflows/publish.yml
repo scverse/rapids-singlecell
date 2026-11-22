@@ -105,9 +105,11 @@ jobs:
               f'version = "{version}"',
           )
 
-          # Rename matching extra to "rapids", remove the other
-          text = text.replace(f'rapids-cu{cuda} = [', 'rapids = [')
-          text = remove_toml_array(text, f"rapids-cu{other}")
+          # Expose only the extras for this wheel's CUDA version.
+          for extra in ("rapids", "cugraph"):
+              key = f"optional-dependencies.{extra}"
+              text = text.replace(f"{key}-cu{cuda} = [", f"{key} = [")
+              text = remove_toml_array(text, f"{key}-cu{other}")
 
           # Set CUDA architectures (replace "native" with CI target archs)
           text = text.replace(
