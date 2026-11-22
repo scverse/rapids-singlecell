@@ -38,6 +38,7 @@ from ._clustering import (
     _cluster_labels,
     _create_graph,
     _create_graph_dask,
+    _import_cugraph,
     _rename_groups,
 )
 from ._utils import _use_graph
@@ -484,7 +485,7 @@ def _validate_flavor(
         msg = f"leiden() got unexpected keyword arguments {sorted(unknown)} for flavor={flavor!r}."
         raise TypeError(msg)
     if flavor == "rapids" and (_ld is None or not hasattr(_ld, "leiden")):
-        msg = "flavor='rapids' is not available: this build of rapids-singlecell does not include the native Leiden extension (`_leiden_cuda`). Use flavor='cugraph'."
+        msg = "flavor='rapids' is not available: this build of rapids-singlecell does not include the native Leiden extension (`_leiden_cuda`). To use flavor='cugraph', install the optional cuGraph dependency."
         raise NotImplementedError(msg)
     return flavor
 
@@ -1019,14 +1020,9 @@ def _cugraph_groups(
     adjacency, resolutions, *, seeds, theta, dtype, use_weights, max_iter, use_dask
 ) -> list[tuple[np.ndarray, float]]:
     """Communities and cuGraph's modularity of every resolution; cuGraph's graph is freed on return."""
-    if use_dask:
-        from cugraph.dask import leiden as culeiden
-
-        g = _create_graph_dask(adjacency, dtype, use_weights=use_weights)
-    else:
-        from cugraph import leiden as culeiden
-
-        g = _create_graph(adjacency, dtype, use_weights=use_weights)
+    culeiden = _import_cugraph(use_dask=use_dask).leiden
+    create_graph = _create_graph_dask if use_dask else _create_graph
+    g = create_graph(adjacency, dtype, use_weights=use_weights)
     groups = []
     try:
         for resolution, seed in zip(resolutions, seeds, strict=True):
