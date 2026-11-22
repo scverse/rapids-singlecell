@@ -76,6 +76,11 @@ rsc.io.check("data.zarr")
 rsc.io.convert_zarr("data.zarr", "data_gpu.zarr")
 ```
 
+With AnnData 0.13.4, computing a one-row CSR chunk on a GPU worker can raise a `TypeError`.
+For example, `chunks=3` leaves one row in the last chunk of a four-row matrix. Choose a chunk size that
+avoids one-row chunks (`chunks=2` in this example), or start the cluster with `gpu_reads=False` to decode on the CPU.
+The upstream fix is in [anndata#2676](https://github.com/scverse/anndata/pull/2676).
+
 {func}`~rapids_singlecell.dask.start_cluster` switches GPU reads on for its workers.
 With your own cluster, call `rsc.io.enable(client)`, and everything else stays plain Dask and anndata:
 
