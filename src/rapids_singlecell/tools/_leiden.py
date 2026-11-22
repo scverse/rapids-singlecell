@@ -156,7 +156,8 @@ def leiden(
         about 140 bytes of device memory per cell plus space for coarser
         levels as they are built. Peak usage is about 2.5-3.5 times the size
         of the float32 CSR, including 14-18 bytes of workspace per stored
-        entry (about 22 at 100M cells). Host input also needs a copy on the GPU.
+        entry (about 22 at 100M cells). GPUs that cannot read host memory
+        directly also need a device copy of host input.
         With ``directed=True``, asymmetric input can expand to two traversal
         entries per arc and requires additional storage for incoming and
         outgoing weights and strengths. If the graph and workspace do not fit,
