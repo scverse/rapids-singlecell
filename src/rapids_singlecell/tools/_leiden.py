@@ -525,6 +525,13 @@ def _as_csr(adjacency):
     if csr.shape[0] != csr.shape[1]:
         msg = f"adjacency must be square, but has shape {csr.shape}."
         raise ValueError(msg)
+    # SciPy takes nnz from the last row pointer, even if the backing arrays disagree.
+    if csr.indptr.shape != (csr.shape[0] + 1,) or csr.nnz != csr.indices.size:
+        msg = "leiden: indptr must end at nnz and have n + 1 entries"
+        raise ValueError(msg)
+    if not csr.indices.size and (csr.data.size or csr.indptr.any()):
+        msg = "leiden: an empty CSR must have no stored entries and an all-zero indptr"
+        raise ValueError(msg)
     if csr.dtype not in (np.float32, np.float64):
         # Sparse astype may coalesce duplicates before we validate or count them.
         _check_csr_storage(csr)
