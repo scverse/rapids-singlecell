@@ -497,8 +497,10 @@ __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
         k = warp_sum(k);
         if (lane == 0) {
             const int c = degree_class(e - b, th);
-            indptr64[v] = b;
-            if (v == n - 1) indptr64[n] = e;
+            if (indptr64) {
+                indptr64[v] = b;
+                if (v == n - 1) indptr64[n] = e;
+            }
             khat[v] = k;
             two_m += k;
             hub += hub_ints(e - b);
@@ -624,6 +626,8 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
     int* idx32 = idx_is_32 && !host ? nullptr : L.l0.indices;
     float* wf32_copy = host ? L.l0.wf32 : nullptr;
     res.indptr = L.l0.indptr;
+    if constexpr (std::is_same_v<IP, i64>)
+        if (L.p.borrow_indptr) res.indptr = indptr;
     res.indices =
         idx32 != nullptr ? idx32 : reinterpret_cast<const int*>(indices);
     res.wf32 = res.wkind != WKind::F32 ? nullptr
@@ -651,7 +655,7 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
             else
                 launch(QSrcF32{data, std::ldexp(1.0f, res.s)});
         }
-    } else {
+    } else if (L.l0.indptr) {
         cuda_check(cudaMemsetAsync(L.l0.indptr, 0, sizeof(i64), stream),
                    "leiden: empty indptr");
     }
@@ -659,7 +663,7 @@ QuantizeResult run_quantize(const IP* indptr, const IX* indices, const WI* data,
     // I4: replica union (iteration 1; rebuilt when s changes)
     if (L.p.replicas > 1 && n > 0) {
         replicate_union_kernel<<<grid_rows(L.p.n_union()), kBlock, 0, stream>>>(
-            L.l0.indptr, res.indices, res.wf32, res.wq, L.l0.khat, n,
+            res.indptr, res.indices, res.wf32, res.wq, L.l0.khat, n,
             L.p.replicas, L.uni.indptr, L.uni.indices,
             res.wkind == WKind::F32 ? L.uni.wf32 : nullptr,
             res.wkind == WKind::I64 ? L.uni.wq : nullptr, L.uni.khat);
@@ -878,6 +882,27 @@ void register_narrow_indices(nb::module_& m) {
 inline void register_ingest(nb::module_& m) {
     REGISTER_GPU_BINDINGS(register_ingest_bindings, m);
     REGISTER_GPU_BINDINGS(register_narrow_indices, m);
+
+    m.def("merge_ingest_checks", [](const nb::list& checks) {
+        IngestInfo all;
+        for (const auto item : checks) {
+            const auto d = nb::cast<nb::dict>(item);
+            const auto part = info_from_dict(d);
+            all.flags |= part.flags & ~kFlagAsymmetric;
+            all.wmax = std::max(all.wmax, part.wmax);
+            all.wmax_bits =
+                std::max(all.wmax_bits, nb::cast<u64>(d["wmax_bits"]));
+            all.n_counted += part.n_counted;
+            all.h_fwd += nb::cast<u64>(d["h_fwd"]);
+            all.h_rev += nb::cast<u64>(d["h_rev"]);
+        }
+        if (all.n_counted >= kMaxCountedEntries)
+            throw std::invalid_argument(
+                "leiden: graphs with >= 2^40 counted entries are not "
+                "supported");
+        if (all.h_fwd != all.h_rev) all.flags |= kFlagAsymmetric;
+        return info_dict(all, false);  // partition column indices are int32
+    });
 
     m.def(
         "canonicalize_scratch_bytes",

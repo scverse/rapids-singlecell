@@ -73,6 +73,17 @@ struct alignas(16) Control {
 };
 static_assert(sizeof(Control) <= 4096, "Control block must fit in 4 KB");
 constexpr std::size_t kControlBytes = 4096;
+// The rest of the control region: small i64 values a partitioned run reads
+// back (partition.cuh).
+constexpr std::size_t kScratchOffset = 2048;
+constexpr int kScratchValues = (kControlBytes - kScratchOffset) / 8;
+static_assert(sizeof(Control) <= kScratchOffset,
+              "Control overlaps the scratch");
+
+inline i64* ctl_scratch(Control* ctl) {
+    return reinterpret_cast<i64*>(reinterpret_cast<char*>(ctl) +
+                                  kScratchOffset);
+}
 
 // Python passes a pinned buffer of PINNED_BYTES (null: pageable, slower).
 constexpr std::size_t kPinnedBytes = 4096;
@@ -119,8 +130,9 @@ struct LayoutParams {
     i64 n = 0;    // level-0 vertices (one copy)
     i64 nnz = 0;  // stored entries of the input
     WKind wkind = WKind::F32;
-    bool host_input = false;   // host arrays: level-0 device copies
-    bool idx64_input = false;  // int64 indices: int32 level-0 copy
+    bool host_input = false;     // host arrays: level-0 device copies
+    bool idx64_input = false;    // int64 indices: int32 level-0 copy
+    bool borrow_indptr = false;  // the input already owns device int64 offsets
     int replicas = 1;
     int subrounds = kNumSubrounds;
 
@@ -194,6 +206,9 @@ struct MoveBufs {
     int* bucket_count = nullptr;    // [S * kNumClasses * 4]
     int* movers = nullptr;          // [n_U]
     unsigned char* desc = nullptr;  // MoveState
+    // [n_U + 32] exchange buffer of a partitioned run (partition.cuh): move
+    // lists, OR-reduced bitmaps; within the phase region of the Refine group
+    u64* xbuf = nullptr;
 
     void carve(Carver& c, i64 n_u, int S) {
         K = c.take<i64>(2 * n_u);
@@ -206,6 +221,7 @@ struct MoveBufs {
             c.take<int>(static_cast<std::size_t>(S) * kNumClasses * 4);
         movers = c.take<int>(n_u);
         desc = c.take<unsigned char>(kMoveStateBytes);
+        xbuf = c.take<u64>(n_u + 32);
     }
 };
 
@@ -332,7 +348,7 @@ struct Level0Bufs {
 
     void carve(Carver& c, const LayoutParams& p) {
         const bool need_idx = p.idx64_input || p.host_input;
-        indptr = c.take<i64>(p.n + 1);
+        indptr = p.borrow_indptr ? nullptr : c.take<i64>(p.n + 1);
         indices = need_idx ? c.take<int>(p.nnz) : nullptr;
         wf32 = (p.host_input && p.wkind == WKind::F32) ? c.take<float>(p.nnz)
                                                        : nullptr;
@@ -482,11 +498,7 @@ struct Layout {
     std::size_t total = 0;
 };
 
-// The prefix of every layout (control, cub, phase) for n_u = R * n vertices.
-inline void carve_prefix(Layout& L, Carver& c, i64 n_u, int S) {
-    L.ctl = reinterpret_cast<Control*>(c.bytes(kControlBytes));
-    L.cub_bytes = cub_temp_bytes(n_u);
-    L.cub = c.bytes(L.cub_bytes);
+inline void carve_phase(Layout& L, Carver& c, i64 n_u, int S) {
     const std::size_t start = c.used();
     std::size_t phase = 0;
     auto group = [&](auto&& fn) {
@@ -499,6 +511,14 @@ inline void carve_prefix(Layout& L, Carver& c, i64 n_u, int S) {
     group([&](Carver& g) { L.aggregate.carve(g, n_u); });
     group([&](Carver& g) { L.final_.carve(g, n_u); });
     c.off = start + phase;
+}
+
+// The prefix of every layout (control, cub, phase) for n_u = R * n vertices.
+inline void carve_prefix(Layout& L, Carver& c, i64 n_u, int S) {
+    L.ctl = reinterpret_cast<Control*>(c.bytes(kControlBytes));
+    L.cub_bytes = cub_temp_bytes(n_u);
+    L.cub = c.bytes(L.cub_bytes);
+    carve_phase(L, c, n_u, S);
 }
 
 inline Layout make_layout(const LayoutParams& p, void* base) {
