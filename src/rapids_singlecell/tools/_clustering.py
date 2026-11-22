@@ -77,7 +77,7 @@ def _import_cugraph(*, use_dask=False):
     except ModuleNotFoundError as exc:
         if exc.name != "cugraph":
             raise
-        msg = "Install the optional cuGraph dependency for your CUDA version: rapids-singlecell-cu12[cugraph] or rapids-singlecell-cu13[cugraph]."
+        msg = "Install the optional cuGraph package for your CUDA version (cugraph-cu12 or cugraph-cu13)."
         raise ModuleNotFoundError(msg, name="cugraph") from exc
     if use_dask:
         from cugraph import dask
