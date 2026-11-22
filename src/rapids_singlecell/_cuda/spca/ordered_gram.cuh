@@ -19,10 +19,21 @@ __device__ I lower_bound(const I* col, I left, I right, int k) {
     return left;
 }
 
+template <typename I>
+__global__ void mark_rows(const I* ptr, const I* cols, size_t n,
+                          unsigned* masks, int stride) {
+    using U = std::make_unsigned_t<I>;
+    for (size_t row = size_t(blockIdx.x) * blockDim.y + threadIdx.y; row < n;
+         row += size_t(gridDim.x) * blockDim.y)
+        for (U k = U(ptr[row]) + threadIdx.x; k < U(ptr[row + 1]); k += 32)
+            atomicOr(masks + size_t(cols[k]) * stride + row / 32,
+                     1u << (row % 32));
+}
+
 template <typename T, typename I>
 __global__ void upper(const I* row_ptr, const I* cols, const T* values,
-                      const I* col_ptr, const I* rows, const T* transposed,
-                      T* out, int p, int width) {
+                      const unsigned* masks, int stride, int words, T* out,
+                      int p, int width, bool accumulate) {
     extern __shared__ double workspace[];
     auto* sums = reinterpret_cast<T*>(workspace);
     int anchor = blockIdx.x, part = blockIdx.y, panel = blockIdx.z * width;
@@ -33,44 +44,53 @@ __global__ void upper(const I* row_ptr, const I* cols, const T* values,
     for (int j = low + lane; j < high; j += 32) own[j - panel] = 0;
     __syncwarp();
 
-    I begin = col_ptr[anchor], count = col_ptr[anchor + 1] - begin;
     int segments = gridDim.y * warps, segment = part * warps + warp;
-    I length = count / segments, extra = count % segments;
-    I first = begin + segment * length + min(I(segment), extra);
-    I last = first + length + (segment < extra);
+    int first = (size_t(words) * segment) / segments;
+    int last = (size_t(words) * (segment + 1)) / segments;
     using U = std::make_unsigned_t<I>;
-    for (U page = first; page < U(last); page += 32) {
-        I left = 0, right = 0;
-        T value = 0;
-        if (page + lane < U(last)) {
-            I r = rows[page + lane];
-            left = row_ptr[r];
-            right = row_ptr[r + 1];
-            value = transposed[page + lane];
-            if (width < p) {
-                left = lower_bound(cols, left, right, low);
-                right = lower_bound(cols, left, right, high);
+    // Each bit identifies a CSR row that contains this anchor. Visit set
+    // bits from low to high so every warp sums its rows in a fixed order.
+    masks += size_t(anchor) * stride;
+    for (int page = first; page < last; page += 32) {
+        int word_index = page + lane;
+        unsigned word = word_index < last ? masks[word_index] : 0u;
+        unsigned nonempty = __ballot_sync(0xffffffff, word != 0);
+        while (nonempty) {
+            int owner = __ffs(nonempty) - 1;
+            nonempty &= nonempty - 1;
+            unsigned hits = __shfl_sync(0xffffffff, word, owner);
+            I left = 0, right = 0;
+            T value = 0;
+            if (hits & (1u << lane)) {
+                size_t row = size_t(page + owner) * 32 + lane;
+                right = row_ptr[row + 1];
+                left = lower_bound(cols, row_ptr[row], right, anchor);
+                value = values[left];
+                if (width < p) {
+                    left = lower_bound(cols, left, right, low);
+                    right = lower_bound(cols, left, right, high);
+                }
             }
-        }
-        for (int q = 0; q < min(U(32), U(last) - page); ++q) {
-            I a = __shfl_sync(0xffffffff, left, q);
-            I b = __shfl_sync(0xffffffff, right, q);
-            T factor = __shfl_sync(0xffffffff, value, q);
-            for (U k = U(a) + lane; k < U(b); k += 32) {
-                int j = cols[k];
-                if (j >= low)
+            while (hits) {
+                int source = __ffs(hits) - 1;
+                hits &= hits - 1;
+                I a = __shfl_sync(0xffffffff, left, source);
+                I b = __shfl_sync(0xffffffff, right, source);
+                T factor = __shfl_sync(0xffffffff, value, source);
+                for (U k = U(a) + lane; k < U(b); k += 32) {
+                    int j = cols[k];
                     own[j - panel] = fma(factor, values[k], own[j - panel]);
+                }
+                // Canonical CSR gives one writer per feature within a row.
+                __syncwarp();
             }
-            // A canonical CSR row has one writer per feature. Finish its
-            // updates before the next row, which may assign that feature to
-            // another lane.
-            __syncwarp();
         }
     }
     __syncthreads();
     for (int j = low + threadIdx.x; j < high; j += blockDim.x) {
-        out[(size_t(part) * p + anchor) * p + j] =
-            sums[j - panel] + sums[width + j - panel];
+        size_t pos = (size_t(part) * p + anchor) * p + j;
+        T sum = sums[j - panel] + sums[width + j - panel];
+        out[pos] = accumulate ? out[pos] + sum : sum;
     }
 }
 
@@ -250,34 +270,52 @@ void bind(nb::module_& m) {
     m.def("ordered_gram", [](gpu_array_c<const I, Device> row_ptr,
                              gpu_array_c<const I, Device> cols,
                              gpu_array_c<const T, Device> values,
-                             gpu_array_c<const I, Device> col_ptr,
-                             gpu_array_c<const I, Device> rows,
-                             gpu_array_c<const T, Device> transposed,
+                             gpu_array_c<unsigned, Device> masks,
                              gpu_array_c<T, Device> partial,
                              std::uintptr_t stream) {
+        nb_require(row_ptr.ndim() == 1 && row_ptr.size() && cols.ndim() == 1 &&
+                       values.ndim() == 1 && cols.size() == values.size(),
+                   "ordered_gram: incompatible CSR arrays");
         nb_require(
-            row_ptr.ndim() == 1 && row_ptr.size() > 0 && col_ptr.ndim() == 1 &&
-                col_ptr.size() > 0 && cols.ndim() == 1 && rows.ndim() == 1 &&
-                values.ndim() == 1 && transposed.ndim() == 1 &&
-                cols.size() == values.size() && rows.size() == values.size() &&
-                transposed.size() == values.size(),
-            "ordered_gram: incompatible CSR and CSC arrays");
-        int p = col_ptr.size() - 1;
-        nb_require(
-            partial.ndim() == 3 && partial.shape(0) > 0 &&
-                partial.shape(1) == p && partial.shape(2) == p,
+            partial.ndim() == 3 && partial.shape(0) &&
+                partial.shape(1) == partial.shape(2),
             "ordered_gram: expected a nonempty stack of square Gram matrices");
+        size_t n = row_ptr.size() - 1;
+        int p = partial.shape(1);
         if (!p) return;
+        if (!n) {
+            cuda_check(cudaMemsetAsync(partial.data(), 0, partial.nbytes(),
+                                       (cudaStream_t)stream),
+                       "zero empty-row Gram matrix");
+            return;
+        }
+        nb_require(masks.ndim() == 2 && masks.shape(0) == size_t(p) &&
+                       masks.shape(1) > 0 &&
+                       masks.shape(1) <= size_t(INT_MAX - 31),
+                   "ordered_gram: incompatible row-presence masks");
+        int stride = masks.shape(1);
         int width = min(p, max_columns);
         int shared_bytes = width * warps * sizeof(T);
         nb_require(shared_bytes <=
                        device_attribute(cudaDevAttrMaxSharedMemoryPerBlock),
                    "ordered_gram: shared memory exceeds the device limit");
         dim3 grid(p, partial.shape(0), (p + width - 1) / width);
-        upper<<<grid, warps * 32, shared_bytes, (cudaStream_t)stream>>>(
-            row_ptr.data(), cols.data(), values.data(), col_ptr.data(),
-            rows.data(), transposed.data(), partial.data(), p, width);
-        CUDA_CHECK_LAST_ERROR(upper);
+        auto s = (cudaStream_t)stream;
+        for (size_t start = 0; start < n; start += size_t(stride) * 32) {
+            size_t count = min(n - start, size_t(stride) * 32);
+            int words = (count + 31) / 32;
+            cuda_check(cudaMemsetAsync(masks.data(), 0, masks.nbytes(), s),
+                       "clear row-presence masks");
+            mark_rows<<<strided_grid(count, 8), dim3(32, 8), 0, s>>>(
+                row_ptr.data() + start, cols.data(), count, masks.data(),
+                stride);
+            CUDA_CHECK_LAST_ERROR(mark_rows);
+            upper<<<grid, warps * 32, shared_bytes, s>>>(
+                row_ptr.data() + start, cols.data(), values.data(),
+                masks.data(), stride, words, partial.data(), p, width,
+                start != 0);
+            CUDA_CHECK_LAST_ERROR(upper);
+        }
     });
 }
 }  // namespace ordered_gram

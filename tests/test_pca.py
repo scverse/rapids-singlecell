@@ -164,8 +164,11 @@ def test_sparse_pca_binding_dimensions():
         kernels.pca_column_sums(ptr, cols, data, cp.empty(1, dtype=cp.float64), stream)
     with pytest.raises(ValueError, match="pca_center_csr"):
         kernels.pca_center_csr(ptr[:1], cols, data, data.astype(cp.float64), tile, stream)
+    mask = cp.empty((1, 1), dtype=cp.uint32)
     with pytest.raises(ValueError, match="ordered_gram"):
-        kernels.ordered_gram(ptr, cols, data, ptr, cols, data, cp.empty((1, 0, 1), data.dtype), stream)
+        kernels.ordered_gram(ptr, cols, data, mask, cp.empty((1, 0, 1), data.dtype), stream)
+    with pytest.raises(ValueError, match="ordered_gram"):
+        kernels.ordered_gram(ptr, cols, data, mask[:, :0], tile[None], stream)
 
 
 def test_sparse_pca_empty_kernel_inputs():
@@ -180,6 +183,9 @@ def test_sparse_pca_empty_kernel_inputs():
     cp.testing.assert_array_equal(limits, [0, 0])
     gram = cp.full((2, 2), cp.nan, dtype=cp.float32)
     kernels.integer_gram(ptr, cols, data, cp.zeros((1, 3), dtype=cp.int64), gram, 0, 0, stream)
+    cp.testing.assert_array_equal(gram, cp.zeros_like(gram))
+    gram.fill(cp.nan)
+    kernels.ordered_gram(ptr, cols, data, cp.empty((2, 1), dtype=cp.uint32), gram[None], stream)
     cp.testing.assert_array_equal(gram, cp.zeros_like(gram))
     kernels.pca_column_sums(ptr, cols, data, cp.empty((0, 2), dtype=cp.float64), stream)
     kernels.pca_center_csr(ptr, cols, data, cp.zeros(2, dtype=cp.float64), cp.empty((0, 2), data.dtype), stream)
@@ -360,6 +366,7 @@ def test_sparse_gram_wide_range(dtype):
     expected = np.triu(x.T @ x)
     np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), expected)
     gpu_x.indices = gpu_x.indices.astype(cp.int64)
+    np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), expected)
     gpu_x.indptr = gpu_x.indptr.astype(cp.int64)
     np.testing.assert_array_equal(_ordered_gram(gpu_x).get(), expected)
     # The integer conversion must also exclude a product overflowing the input dtype.
@@ -367,6 +374,37 @@ def test_sparse_gram_wide_range(dtype):
     overflowing = cusparse.csr_matrix(cp.asarray([[limit, 0], [0, 1]], dtype=dtype))
     assert _integer_scale(overflowing, cp.cuda.get_current_stream().ptr) is None
     np.testing.assert_array_equal(_ordered_gram(overflowing).get(), [[np.inf, 0], [0, 1]])
+
+
+@pytest.mark.parametrize("index_dtype", [cp.int32, cp.int64])
+def test_sparse_gram_csr_fallback(index_dtype):
+    from rapids_singlecell._cuda import _spca_cuda as kernels
+    from rapids_singlecell.preprocessing._sparse_pca._ordered import _integer_scale, _ordered_gram
+
+    rng = np.random.default_rng(17)
+    # Long, short and empty rows, including products across the 2048-column panel boundary.
+    x = np.zeros((137, 2051), dtype=np.float32)
+    x[:, ::32] = rng.normal(size=x[:, ::32].shape)
+    x[::3, -40:] = rng.normal(size=x[::3, -40:].shape)
+    x[1::3, :1984] = 0
+    x[::7] = 0
+    x[1, 0], x[2, -1] = 2.0**40, 2.0**-40
+    host = sparse.csr_matrix(x)
+    gpu = cusparse.csr_matrix(host)
+    gpu.indices = gpu.indices.astype(index_dtype, copy=False)
+    gpu.indptr = gpu.indptr.astype(index_dtype, copy=False)
+    assert _integer_scale(gpu, cp.cuda.get_current_stream().ptr) is None
+
+    with patch.object(cusparse.csr_matrix, "tocsc", side_effect=AssertionError("expected direct CSR accumulation")):
+        gram = _ordered_gram(gpu).get()
+        np.testing.assert_array_equal(_ordered_gram(gpu).get(), gram)
+    expected = np.triu((host.T @ host).toarray())
+    np.testing.assert_allclose(gram, expected, rtol=2e-5, atol=2e-5)
+    # One mask word per column forces five consecutive batches through the same buffer.
+    mask = cp.empty((x.shape[1], 1), dtype=cp.uint32)
+    partial = cp.zeros((1, x.shape[1], x.shape[1]), dtype=gpu.dtype)
+    kernels.ordered_gram(gpu.indptr, gpu.indices, gpu.data, mask, partial, cp.cuda.get_current_stream().ptr)
+    np.testing.assert_allclose(partial[0].get(), expected, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.parametrize("solver", [None, "auto", "full", "jacobi"])
