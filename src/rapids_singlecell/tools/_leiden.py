@@ -128,7 +128,7 @@ def leiden(
         Neighborhood graph to cluster, e.g. ``A.obsp['k']`` or ``'obsp.k'``.
         Defaults to the connectivities written by :func:`~rapids_singlecell.pp.neighbors`.
         ``flavor='rapids'`` sums duplicate entries and ignores the diagonal
-        (self-loops). Every stored weight must be finite and non-negative.
+        (self-loops).
     directed
         With ``True``, native Leiden optimizes directed modularity using each
         cell's incoming and outgoing strengths. The resulting communities are
@@ -136,8 +136,9 @@ def leiden(
         clusters an asymmetric matrix as A + A.T and issues a warning.
         ``flavor='cugraph'`` supports only undirected graphs.
     use_weights
-        If ``True``, edge weights from the graph are used in the computation
-        (placing more emphasis on stronger edges).
+        If ``True``, use the graph's edge weights. Native Leiden requires every
+        stored weight to be finite and non-negative in this mode. If ``False``,
+        native Leiden counts each nonzero off-diagonal entry as a unit-weight edge.
     n_iterations
         How many iterations of the Leiden algorithm to perform, as in
         ``scanpy.tl.leiden``; each iteration restarts from the partition of the
@@ -151,11 +152,14 @@ def leiden(
         implementation of rapids-singlecell, bitwise reproducible for a given
         seed; ``'cugraph'`` (deprecated) uses :func:`cugraph.leiden` and,
         if it runs out of memory on one GPU, reruns in CUDA managed memory
-        (slower, with a warning). ``'rapids'`` needs about 140 bytes of
-        device memory per cell plus what its coarser levels hold, allocated
-        as they need it: on k-NN graphs 14-18 bytes per stored entry at the
-        peak (about 22 at 100M cells), in all 2.5-3.5x the float32 CSR, which
-        is also copied to the GPU if it is on the host. If that does not fit,
+        (slower, with a warning). On symmetric k-NN graphs, ``'rapids'`` needs
+        about 140 bytes of device memory per cell plus space for coarser
+        levels as they are built. Peak usage is about 2.5-3.5 times the size
+        of the float32 CSR, including 14-18 bytes of workspace per stored
+        entry (about 22 at 100M cells). Host input also needs a copy on the GPU.
+        With ``directed=True``, asymmetric input can expand to two traversal
+        entries per arc and requires additional storage for incoming and
+        outgoing weights and strengths. If the graph and workspace do not fit,
         it raises :class:`MemoryError` (RMM managed memory can exceed the
         GPU). Under an allocator that does not pool (the default of
         rapids-singlecell), it keeps the per-cell workspace for the next call
