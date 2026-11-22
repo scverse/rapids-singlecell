@@ -3,8 +3,7 @@ name: Submit question
 about: Ask a general question about rapids-singlecell
 title: "[QST]"
 labels: question
-assignees: ''
-
+assignees: ""
 ---
 
 **What is your question?**

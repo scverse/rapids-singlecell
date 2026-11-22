@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
-from rapids_singlecell.preprocessing._neighbors._helper import _compute_nlist
+from rapids_singlecell.preprocessing._neighbors._algorithms._brute import _brute_knn
+from rapids_singlecell.preprocessing._neighbors._helper import _IVF_PQ_MIN_ROWS, _compute_nlist
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -23,6 +24,10 @@ def _mg_ivf_pq_knn(
     metric_kwds: Mapping,
     algorithm_kwds: Mapping,
 ) -> tuple[cp.ndarray, cp.ndarray]:
+    if X.shape[0] < _IVF_PQ_MIN_ROWS:  # too few rows to train the PQ codebooks
+        return _brute_knn(
+            cp.asarray(X), cp.asarray(Y), k, metric=metric, metric_kwds=metric_kwds, algorithm_kwds=algorithm_kwds
+        )
     try:
         from cuvs.neighbors.mg import ivf_pq as mg_ivf_pq
     except ImportError as e:

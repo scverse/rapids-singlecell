@@ -72,7 +72,8 @@ def test_dask_aggr_masked_mean_var(client, as_dask_array):
         {
             "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
             "mask": [True, True, False, True, True, False],
-        }
+        },
+        index=[str(i) for i in range(6)],
     )
     adata = AnnData(X=as_dask_array(X), obs=obs)
 

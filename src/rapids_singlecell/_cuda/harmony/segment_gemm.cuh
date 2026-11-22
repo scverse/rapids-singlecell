@@ -45,6 +45,17 @@ struct Plan {
     int sa, sr, stage_a, stage, smem;  // smem layout, set per launch
 };
 
+constexpr int kMaxGroupings = 8;
+constexpr int kStaticSmem = kMaxGroupings * (int)sizeof(int);  // segment_kernel
+
+// A segment's groups under several groupings j < n at once: seg_group[j][s]
+// (null: 0) + offset[j], rows of the same acc and bound_exp.
+struct Groupings {
+    const int* seg_group[kMaxGroupings];
+    int offset[kMaxGroupings];
+    int n;
+};
+
 // Pure function of (D, K, sizeof(T), sizeof(RT)). fp32: least issue cost of a
 // row (FMAs + smem loads of the active warps), one tile if possible ({10, 8}
 // only if nothing else fits); fp64 (FMA bound): fewest padded FMAs.
@@ -168,8 +179,7 @@ template <typename T, typename RT, int TD, int TK>
 __global__ void __launch_bounds__(kThreads, 2)
     segment_kernel(const T* __restrict__ A, const RT* __restrict__ R, int D,
                    int K, int ldr, const int* __restrict__ seg_start,
-                   const int* __restrict__ seg_group, int n_seg,
-                   const short* __restrict__ bound_exp,
+                   Groupings gs, int n_seg, const short* __restrict__ bound_exp,
                    unsigned long long* __restrict__ acc, int limbs, Plan p) {
     extern __shared__ __align__(16) char smem[];
     const int d0 = blockIdx.y / p.n_ky * p.dgt * TD;
@@ -238,17 +248,31 @@ __global__ void __launch_bounds__(kThreads, 2)
             rows(std::false_type{}, a, r, n);
     }
     __pipeline_wait_prior(0);
+    // The segment's row under every grouping: thread 0 resolves them with
+    // constant indices into the parameter (a runtime index would copy it to
+    // local memory) and the barrier publishes them; rows rather than pointers
+    // keep the loads below in their address spaces.
+    __shared__ int srow[kMaxGroupings];
+    const int ng = gs.n;
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < kMaxGroupings; ++j)
+            if (j < ng)
+                srow[j] = (gs.seg_group[j] ? gs.seg_group[j][blockIdx.x] : 0) +
+                          gs.offset[j];
+    }
     __syncthreads();
 
-    const int g = seg_group ? seg_group[blockIdx.x] : 0;
-    const short* bg = bound_exp + (size_t)g * D + d0;  // this tile's columns
-    const size_t ls = (size_t)K * D;
-    unsigned long long* out =
-        acc + (size_t)g * limbs * ls + (size_t)k0 * D + d0;
+    const size_t ls = (size_t)K * D;  // this tile's columns: + k0 D + d0
     auto put = [&](T v, int d, int k) {
         if (d < dv && k < kv)
-            emit(v, scale_exp(bg[d], limbs), out + (size_t)k * D + d, ls,
-                 limbs);
+#pragma unroll 1
+            for (int j = 0; j < ng; ++j) {
+                const size_t g = srow[j];
+                emit(v, scale_exp(bound_exp[g * D + d0 + d], limbs),
+                     acc + g * limbs * ls + ((size_t)k0 + k) * D + d0 + d, ls,
+                     limbs);
+            }
     };
     if (p.nsplit == 1 && sp == 0)
 #pragma unroll
@@ -299,15 +323,18 @@ __global__ void finalize_kernel(const long long* __restrict__ acc, int n_groups,
 // shards; value = sum_l acc[g][l][k][d] 2^(30 (limbs - 1 - l)) /
 // 2^scale_exp(bound_exp[g][d]). A, R: rows seg_start[0] .. seg_start[n_seg] of
 // this shard; R(i, k) = R[i ldr + k] (ldr >= K, the bytes between rows
-// readable). seg_start (n_seg + 1, local rows), seg_group (n_seg; null: group
-// 0), bound_exp (n_groups x D): device pointers. Sums in T (R converted to T),
-// finite inputs, limbs in [1, 3]. Stream-ordered, no allocation, no sync.
+// readable). seg_start (n_seg + 1, local rows), the groupings' seg_group
+// (n_seg; null: group 0), bound_exp (n_groups x D): device pointers. Several
+// groupings add each segment's partials, rounded for each, to every one's
+// rows. Sums in T (R converted to T), finite inputs, limbs in [1, 3].
+// Stream-ordered, no allocation, no sync.
 template <typename T, typename RT>
 cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
-                        const int* seg_start, const int* seg_group, int n_seg,
-                        const short* bound_exp, long long* acc, int limbs,
-                        cudaStream_t s) {
-    if (D < 1 || K < 1 || ldr < K || limbs < 1 || limbs > 3)
+                        const int* seg_start, const Groupings& groups,
+                        int n_seg, const short* bound_exp, long long* acc,
+                        int limbs, cudaStream_t s) {
+    if (D < 1 || K < 1 || ldr < K || limbs < 1 || limbs > 3 || groups.n < 1 ||
+        groups.n > kMaxGroupings)
         return cudaErrorInvalidValue;
     if (n_seg <= 0) return cudaSuccess;
     Plan p = make_plan(D, K, sizeof(T), sizeof(RT));
@@ -324,11 +351,12 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
     const int red = p.nsplit * p.dgt * p.kgt * p.td * p.tk * sizeof(T);
     p.smem = std::max(2 * p.stage, p.nsplit > 1 ? red : 0);
     auto launch = [&](auto kernel) {
-        if (p.smem > kSmemBudget)  // strided R rows only
+        if (p.smem + kStaticSmem >
+            kSmemBudget)  // strided R rows, or at the budget
             cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, p.smem);
         kernel<<<dim3(n_seg, p.n_dy * p.n_ky), kThreads, p.smem, s>>>(
-            A, R, D, K, ldr, seg_start, seg_group, n_seg, bound_exp,
+            A, R, D, K, ldr, seg_start, groups, n_seg, bound_exp,
             reinterpret_cast<unsigned long long*>(acc), limbs, p);
         return cudaGetLastError();
     };
@@ -342,6 +370,17 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
     }
 #undef HS_CASE
     return cudaErrorInvalidConfiguration;
+}
+
+// One grouping.
+template <typename T, typename RT>
+cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
+                        const int* seg_start, const int* seg_group, int n_seg,
+                        const short* bound_exp, long long* acc, int limbs,
+                        cudaStream_t s) {
+    return segment_rtz(A, R, D, K, ldr, seg_start,
+                       Groupings{{seg_group}, {0}, 1}, n_seg, bound_exp, acc,
+                       limbs, s);
 }
 
 // out[g out_group_stride + k ld_out + d] = acc value of (g, k, d) as T. For the

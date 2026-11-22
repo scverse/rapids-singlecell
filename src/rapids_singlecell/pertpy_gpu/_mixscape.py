@@ -40,6 +40,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         new_class_name: str = "mixscape_class",
         layer: str | None = None,
         min_de_genes: int = 5,
+        min_cells: int = 5,
         logfc_threshold: float = 0.25,
         de_layer: str | None = None,
         test_method: str = "wilcoxon",
@@ -74,6 +75,9 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         min_de_genes
             Minimum number of differentially expressed genes required to test a
             gene for perturbation.
+        min_cells
+            Minimum number of cells that must stay classified as perturbed for a
+            gene; if fewer remain, all of its cells are assigned NP.
         logfc_threshold
             Minimum absolute log fold change for a gene to count as
             differentially expressed.
@@ -229,7 +233,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
             self._fit_genes_batched(
                 gene_jobs,
                 iter_num=iter_num,
-                min_de_genes=min_de_genes,
+                min_cells=min_cells,
                 perturbation_type=perturbation_type,
                 pert_key=pert_key,
                 control=control,
@@ -383,7 +387,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         gene_jobs: list[dict],
         *,
         iter_num: int,
-        min_de_genes: int,
+        min_cells: int,
         perturbation_type: str,
         pert_key: str,
         control: str,
@@ -495,7 +499,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
                 post = post_all[orig_seg[gi] : orig_seg[gi + 1]]
                 ko = post > _KO_POSTERIOR_CUTOFF
                 post_final[gi] = post
-                if int(ko.sum()) < min_de_genes:
+                if int(ko.sum()) < min_cells:
                     np_collapse[gi] = True
                     converged[gi] = True
                 elif np.array_equal(ko, prev_ko[gi]):

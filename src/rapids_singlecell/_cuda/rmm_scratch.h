@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -11,6 +12,8 @@
 // temporaries on the caller's current device resource (RMM pool / UVM aware)
 // without linking librmm's per-release-versioned C++ ABI.
 void* rmm_allocate(size_t bytes);
+// rmm_allocate, but nullptr where the allocator raises MemoryError.
+void* rmm_try_allocate(size_t bytes);
 void rmm_deallocate(void* ptr, size_t bytes);
 
 // Register the _set_scratch_allocator binding on a module (call from
@@ -39,9 +42,40 @@ struct RmmScratchPool {
         }
     }
 
+    // Carve the following alloc() calls (256-byte aligned) out of one
+    // allocation of about `bytes`: with a non-pooled allocator every
+    // allocation is a cudaMalloc and a device-syncing cudaFree (~0.1 ms,
+    // serialized across GPUs). What no longer fits allocates on its own.
+    void reserve(size_t bytes) {
+        arena_left = 0;
+        bytes += ARENA_SLACK;
+        arena = alloc<char>(bytes);
+        arena_left = bytes;
+    }
+
+    // reserve(), or false (nothing allocated) if the allocator is out of
+    // memory.
+    bool try_reserve(size_t bytes) {
+        arena_left = 0;
+        bytes += ARENA_SLACK;
+        void* ptr = rmm_try_allocate(bytes);
+        if (!ptr) return false;
+        bufs.push_back({ptr, bytes});
+        arena = static_cast<char*>(ptr);
+        arena_left = bytes;
+        return true;
+    }
+
     template <typename T>
     T* alloc(size_t count) {
         size_t bytes = size_of<T>(count);
+        if (bytes <= arena_left) {
+            T* ptr = reinterpret_cast<T*>(arena);
+            size_t step = std::min(arena_left, (bytes + 255) / 256 * 256);
+            arena += step;
+            arena_left -= step;
+            return ptr;
+        }
         void* ptr = rmm_allocate(bytes);
         bufs.push_back({ptr, bytes});
         return static_cast<T*>(ptr);
@@ -57,6 +91,11 @@ struct RmmScratchPool {
     }
 
    private:
+    static constexpr size_t ARENA_SLACK =
+        64 * 1024;  // carved arrays' alignment
+    char* arena = nullptr;
+    size_t arena_left = 0;
+
     template <typename T>
     static size_t size_of(size_t count) {
         if (count == 0) count = 1;

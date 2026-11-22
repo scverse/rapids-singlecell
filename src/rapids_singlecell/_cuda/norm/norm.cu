@@ -96,6 +96,29 @@ static inline void launch_prescaled_mul_dense(T* data, const T* scales,
     CUDA_CHECK_LAST_ERROR(prescaled_mul_dense_kernel);
 }
 
+template <typename T, typename IdxT>
+static inline void launch_shifted_clr_csr(const IdxT* indptr,
+                                          const IdxT* indices, const T* data,
+                                          T* out, int nrows, int ncols, T scale,
+                                          cudaStream_t stream) {
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(nrows);
+    shifted_clr_csr_kernel<T, IdxT><<<grid, block, 0, stream>>>(
+        indptr, indices, data, out, nrows, ncols, scale);
+    CUDA_CHECK_LAST_ERROR(shifted_clr_csr_kernel);
+}
+
+template <typename T>
+static inline void launch_shifted_clr_dense(const T* data, T* out, int nrows,
+                                            int ncols, T scale,
+                                            cudaStream_t stream) {
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(nrows);
+    shifted_clr_dense_kernel<T>
+        <<<grid, block, 0, stream>>>(data, out, nrows, ncols, scale);
+    CUDA_CHECK_LAST_ERROR(shifted_clr_dense_kernel);
+}
+
 template <typename T, typename IdxT, typename Device>
 void def_mul_csr(nb::module_& m) {
     m.def(
@@ -215,6 +238,35 @@ void def_prescaled_mul_dense(nb::module_& m) {
         "stream"_a = 0);
 }
 
+template <typename T, typename IdxT, typename Device>
+void def_shifted_clr_csr(nb::module_& m) {
+    m.def(
+        "shifted_clr_csr",
+        [](gpu_array_c<const IdxT, Device> indptr,
+           gpu_array_c<const IdxT, Device> indices,
+           gpu_array_c<const T, Device> data, gpu_array_c<T, Device> out,
+           int nrows, int ncols, T scale, std::uintptr_t stream) {
+            launch_shifted_clr_csr<T, IdxT>(indptr.data(), indices.data(),
+                                            data.data(), out.data(), nrows,
+                                            ncols, scale, (cudaStream_t)stream);
+        },
+        "indptr"_a, "indices"_a, "data"_a, nb::kw_only(), "out"_a, "nrows"_a,
+        "ncols"_a, "scale"_a, "stream"_a = 0);
+}
+
+template <typename T, typename Device>
+void def_shifted_clr_dense(nb::module_& m) {
+    m.def(
+        "shifted_clr_dense",
+        [](gpu_array_c<const T, Device> data, gpu_array_c<T, Device> out,
+           int nrows, int ncols, T scale, std::uintptr_t stream) {
+            launch_shifted_clr_dense<T>(data.data(), out.data(), nrows, ncols,
+                                        scale, (cudaStream_t)stream);
+        },
+        "data"_a, nb::kw_only(), "out"_a, "nrows"_a, "ncols"_a, "scale"_a,
+        "stream"_a = 0);
+}
+
 template <typename Device>
 void register_bindings(nb::module_& m) {
     def_mul_dense<float, Device>(m);
@@ -252,6 +304,14 @@ void register_bindings(nb::module_& m) {
 
     def_prescaled_mul_dense<float, Device>(m);
     def_prescaled_mul_dense<double, Device>(m);
+
+    def_shifted_clr_csr<float, int, Device>(m);
+    def_shifted_clr_csr<float, long long, Device>(m);
+    def_shifted_clr_csr<double, int, Device>(m);
+    def_shifted_clr_csr<double, long long, Device>(m);
+
+    def_shifted_clr_dense<float, Device>(m);
+    def_shifted_clr_dense<double, Device>(m);
 }
 
 NB_MODULE(_norm_cuda, m) {

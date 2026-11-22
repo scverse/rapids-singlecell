@@ -17,6 +17,7 @@
 ## CRITICAL Issues (Always Comment)
 
 ### GPU/CUDA Errors
+
 - Race conditions in GPU kernels (shared memory, atomics)
 - Invalid memory access (out-of-bounds, host/device confusion)
 - **Missing `cudaGetLastError()` after kernel launches**: Every kernel launch (`<<<grid, block, shared, stream>>>`) MUST be followed by `cudaGetLastError()` to detect launch failures (invalid config, shared memory overflow, etc.). Without this, errors are silently deferred and may corrupt later operations or produce garbage results.
@@ -25,6 +26,7 @@
 - **Shared memory overflow**: exceeding device shared memory limit (varies by GPU, e.g. T4 = 64KB)
 
 ### Algorithm Correctness
+
 - Logic errors in kernel implementations
 - Incorrect reduction patterns (partial sums, atomics)
 - Numerical instability causing wrong results
@@ -32,17 +34,20 @@
 - Incorrect sparse format handling (CSR indptr/indices/data interpretation)
 
 ### Resource Management
+
 - GPU memory leaks (device allocations without cleanup)
 - Missing error handling on CUDA API calls
 - Resource exhaustion from unbounded allocations
 
 ### Nanobind Binding Errors
+
 - Incorrect type mapping between Python (CuPy) and C++ (raw pointers)
 - Incorrect pointer casts from nanobind DLPack/array interface
 
 ## HIGH Issues (Comment if Substantial)
 
 ### Performance Issues
+
 - Poor memory access patterns (non-coalesced, strided)
 - Warp divergence in compute-heavy kernels
 - Shared memory bank conflicts
@@ -51,18 +56,21 @@
 - **L2 cache inefficiency**: pair/index ordering that destroys locality (e.g., sorting by packed keys instead of grouping shared indices)
 
 ### Numerical Stability
+
 - Division by zero or near-zero without epsilon checks
 - Accumulation errors in reductions
 - Unsafe casting between numeric types (double→float precision loss)
 - Missing handling of NaN/Inf in input data
 
 ### Concurrency & Thread Safety
+
 - Race conditions in multi-GPU operations
 - Missing `__syncthreads()` between shared memory write and read
 - Incorrect atomicAdd usage (wrong memory scope)
 
 ### Scalability
-**Kernels must handle datasets with millions of cells and thousands of groups.** Review every kernel with the question: "What happens at 2M cells × 10,000 groups?"
+
+**Kernels must handle datasets with millions of cells and thousands of groups.** Review every kernel with the question: “What happens at 2M cells × 10,000 groups?”
 
 - Grid dimensions that overflow `int` (2M cells × 10K groups = 20B, exceeds INT_MAX)
 - Shared memory per-group allocations that exceed limits at high group counts
@@ -71,11 +79,13 @@
 - Accumulator overflow: summing millions of float32 values without compensation or float64
 
 ### Kernel Configuration
+
 - Hard-coded shared memory sizes that may exceed device limits
 - Fixed tile sizes that don't adapt to device capabilities
 - **Magic numbers**: all numeric literals for block sizes, tile dimensions, shared memory sizes, and heuristic thresholds MUST use named constants. `dim3 block(256)` is not acceptable — use `constexpr int BLOCK_SIZE = 256; dim3 block(BLOCK_SIZE);`
 
 ### Test Quality
+
 - Missing validation of numerical correctness against CPU reference
 - Missing edge case coverage (single row, empty input, max-size input)
 - Tests that only check "runs without error"
@@ -111,6 +121,7 @@ Before commenting, understand **what the PR is trying to achieve** and evaluate 
 ## Quality Threshold
 
 Before commenting, ask:
+
 1. Is this actually wrong/risky, or just different?
 2. Would this cause a real problem (crash, wrong results, OOM)?
 3. Does this comment add unique value?
@@ -128,6 +139,7 @@ Before commenting, ask:
 ## Examples to Follow
 
 **CRITICAL** (shared memory overflow):
+
 ```text
 CRITICAL: Shared memory may exceed device limit
 
@@ -142,6 +154,7 @@ int tile = select_tile(max_shared, dtype_size);
 ```
 
 **CRITICAL** (missing cudaGetLastError):
+
 ```text
 CRITICAL: Missing cudaGetLastError() after kernel launch
 
@@ -161,6 +174,7 @@ if (err != cudaSuccess) {
 ```
 
 **HIGH** (magic numbers):
+
 ```text
 HIGH: Magic numbers in kernel configuration
 
@@ -179,6 +193,7 @@ dim3 grid((n + BLOCK_SIZE - 1) / BLOCK_SIZE);
 ```
 
 **CRITICAL** (missing syncthreads):
+
 ```text
 CRITICAL: Missing __syncthreads() between shared memory write and read
 
@@ -193,6 +208,7 @@ result = shared_data[other_tid];
 ```
 
 **HIGH** (L2 cache locality):
+
 ```text
 HIGH: Pair ordering destroys L2 cache locality
 
@@ -206,20 +222,23 @@ Consider: Group pairs so consecutive pairs share a common index
 ## Examples to Avoid
 
 **Boilerplate** (avoid):
+
 - "CUDA Best Practices: Coalesced memory access improves bandwidth..."
 - "Shared Memory: Using shared memory reduces global memory traffic..."
 
 **Subjective style** (ignore):
+
 - "Consider using auto here instead of explicit type"
 - "This could use a more descriptive variable name"
 
----
+--------------------------------------------------------------------------------
 
 ## Project-Specific Architecture
 
 ### Nanobind Module Structure
 
 Each kernel module in `_cuda/` follows this pattern:
+
 ```text
 module_name/
 ├── module_name.cu      # nanobind bindings + kernel launch wrappers
@@ -227,6 +246,7 @@ module_name/
 ```
 
 **Shared headers:**
+
 - `nb_types.h` - Type aliases for all modules
 - `cublas_helpers.cuh` - cuBLAS wrapper utilities
 
@@ -244,55 +264,66 @@ module_name/
 - **Tile sizes defined as constants**: `TILE_SIZES = [32, 50, 64]` with runtime selection based on device limits
 - **Separable compilation + LTO**: used for multi-arch support, causes cold-start overhead but subsequent calls are fast
 
----
+--------------------------------------------------------------------------------
 
 ## Common Bug Patterns
 
 ### 1. Template Type Mismatch
+
 **Pattern**: Python passes float64 array but kernel is templated on float32
 
 **Red flags**:
+
 - No dtype check in the nanobind wrapper before calling kernel
 - `nb::ndarray<float, ...>` binding that silently reinterprets double data
 - Missing `.astype(cp.float32)` on the Python side
 
 ### 2. Shared Memory Overflow
+
 **Pattern**: Fixed shared memory allocation that exceeds some GPU limits
 
 **Red flags**:
+
 - Hard-coded tile sizes without device query
 - `__shared__ float smem[FIXED_SIZE]` where FIXED_SIZE * sizeof(float) approaches 48KB+
 - No fallback for GPUs with smaller shared memory
 
 ### 3. Missing Synchronization
+
 **Pattern**: Shared memory accessed without proper barriers
 
 **Red flags**:
+
 - Write to `__shared__` followed by read from different index without `__syncthreads()`
 - `atomicAdd` to shared memory without subsequent barrier before reading result
 - Loop-carried dependencies through shared memory
 
 ### 4. L2 Cache Thrashing
+
 **Pattern**: Index ordering that destroys cache locality
 
 **Red flags**:
+
 - Sorting pair indices by arbitrary key (e.g., `cp.unique` on packed keys)
 - Processing pairs where consecutive pairs share no common data
 - Random access patterns to large arrays in global memory
 
 ### 5. Sparse Format Confusion
+
 **Pattern**: Kernel assumes CSR but receives CSC (or vice versa)
 
 **Red flags**:
+
 - Using `indptr` without checking if matrix is CSR or CSC
 - Row-wise kernel applied to column-major sparse matrix
 - Missing `.tocsr()` / `.tocsc()` conversion (or unnecessary conversion when kernel supports both)
 
----
+--------------------------------------------------------------------------------
 
 ## Code Review Checklists
 
 ### When Reviewing CUDA Kernels (.cuh files)
+
 - [ ] Is shared memory usage within device limits (checked at runtime)?
 - [ ] Are `__syncthreads()` calls placed correctly?
 - [ ] Is memory access coalesced (consecutive threads access consecutive memory)?
@@ -301,6 +332,7 @@ module_name/
 - [ ] Are edge cases handled (partial tiles, last block)?
 
 ### When Reviewing Nanobind Bindings (.cu files)
+
 - [ ] Is the template type `T` dispatched correctly based on array dtype?
 - [ ] Are array dimensions validated before kernel launch?
 - [ ] Is `cudaGetLastError()` called after every kernel launch to catch launch failures?
@@ -308,17 +340,19 @@ module_name/
 - [ ] Are all numeric literals for block sizes, tile sizes, and thresholds defined as named constants?
 
 ### When Reviewing CuPy RawKernels (_kernels/*.py)
+
 - [ ] Is the kernel string syntactically correct CUDA C?
 - [ ] Are launch configurations (grid, block, shared_mem) computed correctly?
 - [ ] Is the dtype consistent between Python arrays and kernel parameters?
 - [ ] Is `--use_fast_math` appropriate (no precision-sensitive operations)?
 
 ### When Reviewing Multi-GPU Kernels
+
 - [ ] Are chunks processed per-device (not interleaved)?
 - [ ] Is `cp.cuda.Device(device_id)` set before each device's operations?
 - [ ] Are streams isolated per device?
 - [ ] Does single-GPU path work (early return)?
 
----
+--------------------------------------------------------------------------------
 
 **Remember**: Focus on correctness and performance. Catch real bugs (crashes, wrong results, shared memory overflow), ignore style preferences. For rapids_singlecell CUDA: template type safety, shared memory bounds, and cache locality are paramount.

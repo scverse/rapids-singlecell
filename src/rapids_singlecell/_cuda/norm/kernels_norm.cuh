@@ -300,3 +300,75 @@ __global__ void prescaled_mul_dense_kernel(T* __restrict__ data,
     for (int i = threadIdx.x; i < ncols; i += blockDim.x)
         data[row_offset + i] *= scale;
 }
+
+// Block-wide sum of a double, returned to every thread of the block.
+__device__ __forceinline__ double block_sum_broadcast(double val) {
+    __shared__ double warp_sums[32];
+    int laneIdx = threadIdx.x & 31;
+    int warpIdx = threadIdx.x >> 5;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    if (laneIdx == 0) warp_sums[warpIdx] = val;
+    __syncthreads();
+
+    if (warpIdx == 0) {
+        int nWarps = (blockDim.x + 31) >> 5;
+        val = (laneIdx < nWarps) ? warp_sums[laneIdx] : 0.0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        if (laneIdx == 0) warp_sums[0] = val;
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
+// ---------- shifted_clr_csr ----------
+// One block per row. Writes the dense row log1p(scale * x) minus its mean over
+// all ncols columns (the shifted CLR); the row sum is accumulated in double.
+template <typename T, typename IdxT>
+__global__ void shifted_clr_csr_kernel(const IdxT* __restrict__ indptr,
+                                       const IdxT* __restrict__ indices,
+                                       const T* __restrict__ data,
+                                       T* __restrict__ out, int nrows,
+                                       int ncols, T scale) {
+    int row = blockIdx.x;
+    if (row >= nrows) return;
+
+    IdxT start = indptr[row];
+    IdxT end = indptr[row + 1];
+
+    double val = 0.0;
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
+        val += static_cast<double>(log1p(data[i] * scale));
+    T offset = static_cast<T>(block_sum_broadcast(val) / ncols);
+
+    // Zeros map to -offset; fill the row before scattering the stored values.
+    T* out_row = out + static_cast<long long>(row) * ncols;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) out_row[i] = -offset;
+    __syncthreads();
+    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
+        out_row[indices[i]] = log1p(data[i] * scale) - offset;
+}
+
+// ---------- shifted_clr_dense ----------
+// One block per row. Same transform as shifted_clr_csr for a dense row.
+template <typename T>
+__global__ void shifted_clr_dense_kernel(const T* __restrict__ data,
+                                         T* __restrict__ out, int nrows,
+                                         int ncols, T scale) {
+    int row = blockIdx.x;
+    if (row >= nrows) return;
+
+    long long row_offset = static_cast<long long>(row) * ncols;
+    double val = 0.0;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        T v = log1p(data[row_offset + i] * scale);
+        out[row_offset + i] = v;
+        val += static_cast<double>(v);
+    }
+    T offset = static_cast<T>(block_sum_broadcast(val) / ncols);
+
+    // Each thread only revisits the entries it wrote above.
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x)
+        out[row_offset + i] -= offset;
+}

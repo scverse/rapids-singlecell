@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import itertools
+from types import SimpleNamespace
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import pytest
 import scanpy.external as sce
 from anndata import AnnData
@@ -13,13 +15,18 @@ from scanpy.neighbors._connectivity import gauss as scanpy_gauss
 from scanpy.neighbors._connectivity import jaccard as scanpy_jaccard
 from scipy import sparse as sc_sparse
 
+import rapids_singlecell as rsc
 from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.pp import bbknn, neighbors
+from rapids_singlecell.preprocessing._neighbors import NeighborsResult
+from rapids_singlecell.preprocessing._neighbors._helper import _check_knn_complete
 from rapids_singlecell.preprocessing._neighbors._helper import _trimming as trimming_gpu
 from rapids_singlecell.preprocessing._neighbors._neighbors import (
     _get_connectivities_gauss,
     _get_connectivities_jaccard,
 )
+
+A = pytest.importorskip("anndata.acc").A
 
 # the input data
 X = np.array([[1, 0], [3, 0], [5, 6], [0, 4]])
@@ -57,7 +64,7 @@ def test_inner_product_connectivities_match_cosine(batch_balanced):
             adata.obs["batch"] = np.arange(adata.n_obs) % 2
             bbknn(
                 adata,
-                batch_key="batch",
+                batches=A.obs["batch"],
                 neighbors_within_batch=5,
                 trim=0,
                 metric=metric,
@@ -118,7 +125,7 @@ def test_inner_product_bbknn_preserves_cross_batch_neighbors():
     adata.obs["batch"] = ["a", "a", "b", "b"]
     bbknn(
         adata,
-        batch_key="batch",
+        batches=A.obs["batch"],
         neighbors_within_batch=1,
         metric="inner_product",
         trim=0,
@@ -135,13 +142,14 @@ def test_algo(algo):
     neighbors(adata, n_neighbors=5, algorithm=algo)
 
 
-def test_nn_descent_intermediate_graph_degree():
+@pytest.mark.parametrize("degree", [10, None])
+def test_nn_descent_intermediate_graph_degree(degree):
     adata = pbmc68k_reduced()
     neighbors(
         adata,
         n_neighbors=5,
         algorithm="nn_descent",
-        algorithm_kwds={"intermediate_graph_degree": 10},
+        algorithm_kwds={"intermediate_graph_degree": degree},
     )
 
 
@@ -190,6 +198,99 @@ def test_indices_approx_nn(algo):
     assert counter / b_stop > 0.9
 
 
+# cuVS nn_descent itself loses recall beyond a graph degree of 64 (about 0.8 here)
+@pytest.mark.parametrize(("algo", "min_recall"), [("nn_descent", 0.7), ("cagra", 0.9)])
+def test_approx_nn_beyond_default_degree(algo, min_recall):
+    # beyond cuVS's default intermediate graph degree (96) and CAGRA search width (64)
+    adata = pbmc68k_reduced()
+    brute_data = adata.copy()
+    neighbors(adata, n_neighbors=100, algorithm=algo)
+    neighbors(brute_data, n_neighbors=100, algorithm="brute")
+    D, ref = adata.obsp["distances"], brute_data.obsp["distances"]
+    shared = sum(
+        len(np.intersect1d(D.indices[D.indptr[i] : D.indptr[i + 1]], ref.indices[ref.indptr[i] : ref.indptr[i + 1]]))
+        for i in range(adata.n_obs)
+    )
+    assert shared / ref.nnz > min_recall
+
+
+def test_ivf_incomplete_neighbors_raise():
+    # probing one of 64 lists cannot fill 100 neighbor slots
+    X = np.random.default_rng(0).normal(size=(500, 20)).astype(np.float32)
+    adata = AnnData(X)
+    with pytest.raises(ValueError, match="n_probes"):
+        neighbors(adata, n_neighbors=100, algorithm="ivfflat", algorithm_kwds={"n_lists": 64, "n_probes": 1})
+    assert not adata.obsp
+
+
+@pytest.mark.parametrize(("bad_id", "bad_dist"), [(10**6, 1.0), (5, np.inf), (5, np.nan)])
+@pytest.mark.parametrize("batch_balanced", [False, True])
+def test_invalid_neighbors_raise(monkeypatch, bad_id, bad_dist, batch_balanced):
+    from rapids_singlecell.preprocessing._neighbors._neighbors import KNN_ALGORITHMS
+
+    def padded_knn(X, Y, k, **kwargs):
+        idx = (cp.arange(Y.shape[0])[:, None] + cp.arange(k)) % X.shape[0]
+        dist = cp.tile(cp.arange(k, dtype=cp.float32), (Y.shape[0], 1))
+        idx[0, -1], dist[0, -1] = bad_id, bad_dist
+        return idx, dist
+
+    monkeypatch.setitem(KNN_ALGORITHMS, "ivfflat", padded_knn)
+    adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        if batch_balanced:
+            adata.obs["batch"] = np.arange(adata.n_obs) % 2
+            bbknn(adata, batches=A.obs["batch"], neighbors_within_batch=3, algorithm="ivfflat")
+        else:
+            neighbors(adata, n_neighbors=5, algorithm="ivfflat")
+    assert not adata.obsp
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "hint"), [("brute", "NaN"), ("all_neighbors", "n_clusters"), ("cagra", "Reduce")]
+)
+def test_incomplete_search_hints(algorithm, hint):
+    with pytest.raises(ValueError, match=hint):
+        _check_knn_complete(cp.array([[0, 9]]), n_index=2, algorithm=algorithm)
+
+
+def test_brute_undefined_metric_raises():
+    # cosine distances to an all-zero row are NaN
+    X = np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32)
+    X[3] = 0
+    with pytest.raises(ValueError, match="all-zero"):
+        neighbors(AnnData(X), n_neighbors=5, metric="cosine")
+
+
+def test_brute_large_distances():
+    # an exact search pads nothing, so distances beyond the padding threshold are valid
+    adata = AnnData(np.random.default_rng(0).normal(scale=1e10, size=(40, 5)).astype(np.float32))
+    neighbors(adata, n_neighbors=5, metric="sqeuclidean", method="jaccard")
+    assert 1e18 < adata.obsp["distances"].max() < np.inf
+
+
+def test_nn_descent_invalid_ids_raise(monkeypatch):
+    from rapids_singlecell._cuda import _nn_descent_cuda
+    from rapids_singlecell.preprocessing._neighbors._algorithms import _nn_descent
+
+    # unfilled graph slots must not reach the distance kernel, which indexes X with them
+    graph = cp.full((40, 5), 2**32 - 1, dtype=cp.uint32)
+    monkeypatch.setattr(_nn_descent.nn_descent, "build", lambda *args, **kwargs: SimpleNamespace(graph=graph))
+    monkeypatch.setattr(_nn_descent_cuda, "sqeuclidean", lambda *args, **kwargs: pytest.fail("kernel reached"))
+    adata = AnnData(np.random.default_rng(0).normal(size=(40, 5)).astype(np.float32))
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        neighbors(adata, n_neighbors=5, algorithm="nn_descent")
+
+
+@pytest.mark.parametrize("algo", ["ivfpq", "mg_ivfpq"])
+def test_ivfpq_small_index_is_exact(algo):
+    # too few cells to train the PQ codebooks (cuVS >= 26.12 refuses): searched by brute force
+    adata = pbmc68k_reduced()[:300].copy()
+    brute_data = adata.copy()
+    neighbors(adata, n_neighbors=5, algorithm=algo)
+    neighbors(brute_data, n_neighbors=5, algorithm="brute")
+    assert (adata.obsp["distances"] != brute_data.obsp["distances"]).nnz == 0
+
+
 KEY = "test"
 
 
@@ -197,16 +298,54 @@ def test_neighbors_key_added():
     adata = pbmc68k_reduced()
     del adata.obsp
     neighbors(adata, n_neighbors=5, random_state=0)
-    neighbors(adata, n_neighbors=5, random_state=0, key_added=KEY)
+    with pytest.warns(FutureWarning, match="key_added"):
+        neighbors(adata, n_neighbors=5, random_state=0, key_added=KEY)
 
     conns_key = adata.uns[KEY]["connectivities_key"]
     dists_key = adata.uns[KEY]["distances_key"]
 
+    assert (conns_key, dists_key) == (f"{KEY}_connectivities", f"{KEY}_distances")
     assert adata.uns["neighbors"]["params"] == adata.uns[KEY]["params"]
     assert np.allclose(adata.obsp["connectivities"].toarray(), adata.obsp[conns_key].toarray())
     assert np.allclose(adata.obsp["distances"].toarray(), adata.obsp[dists_key].toarray())
 
 
+def test_neighbors_out():
+    adata = pbmc68k_reduced()
+    del adata.obsp
+    neighbors(adata, n_neighbors=5, random_state=0, out=A.obsp["nn"])
+    assert adata.uns["nn"]["connectivities_key"] == "nn"
+    assert adata.uns["nn"]["distances_key"] == "nn_distances"
+    assert set(adata.obsp) == {"nn", "nn_distances"}
+
+    res = neighbors(adata, n_neighbors=5, random_state=0, out=True)
+    assert isinstance(res, NeighborsResult)
+    np.testing.assert_allclose(res.connectivities.toarray(), adata.obsp["nn"].toarray())
+
+    neighbors(adata, n_neighbors=5, random_state=0, out={"connectivities": "obsp.c"})
+    assert "c_distances" not in adata.obsp
+    assert adata.uns["c"].keys() == {"connectivities_key", "params"}
+
+    # consumers take the graph
+    rsc.tl.umap(adata, use=A.obsp["nn"], rep=A.obsm["X_pca"], out=A.obsm["u"], maxiter=10)
+    rsc.tl.leiden(adata, use="obsp.c", out=A.obs["cl"])
+    assert adata.obsm["u"].shape == (adata.n_obs, 2)
+    assert "u" in adata.uns and "cl" in adata.uns
+    assert adata.obs["cl"].dtype == "category"
+    assert isinstance(rsc.tl.leiden(adata, use=A.obsp["nn"], out=True), pd.Categorical)
+
+
+def test_neighbors_obsm_named_x():
+    """`use=A.obsm['X']` reads that `.obsm` key and never `.X`, unlike the deprecated `use_rep='X'`."""
+    adata = pbmc68k_reduced()
+    with pytest.raises(KeyError, match="^'X'$"):
+        neighbors(adata, n_neighbors=5, use=A.obsm["X"], out=True)
+    adata.obsm["X"] = adata.obsm["Y"] = adata.obsm["X_pca"][:, :5]
+    res, ref = (neighbors(adata, n_neighbors=5, use=A.obsm[k], out=True) for k in "XY")
+    np.testing.assert_array_equal(res.distances.toarray(), ref.distances.toarray())
+
+
+@pytest.mark.filterwarnings("ignore:The function bbknn is deprecated:FutureWarning")
 def test_bbknn():
     """
     Test the bbknn function against the scanpy implementation. We want more than a 90% overlap between the two.
@@ -221,7 +360,7 @@ def test_bbknn():
         computation="pynndescent",
         metric="euclidean",
     )
-    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute", key_added="rapids")
+    bbknn(adata, n_pcs=15, batches=A.obs["phase"], algorithm="brute", out=A.obsp["rapids"])
     counter = 0
     for (rsc_start, rsc_stop), (b_start, b_stop) in zip(
         itertools.pairwise(adata.obsp["rapids_distances"].indptr),
@@ -241,7 +380,8 @@ def test_bbknn_distances_sorted_per_row():
     # fuzzy_simplicial_set uses the first non-zero distance per row as rho;
     # unsorted per-batch columns break sigma estimation and collapse weights.
     adata = pbmc68k_reduced()
-    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
+    with pytest.warns(FutureWarning, match="batch_key"):
+        bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
     dists = adata.obsp["distances"]
     for start, stop in itertools.pairwise(dists.indptr):
         row = dists.data[start:stop]
@@ -253,7 +393,7 @@ def test_bbknn_connectivities_not_collapsed():
     # dataset was ~0.85 with most weights pinned near 1.0. With sorted input
     # the distribution spreads out properly.
     adata = pbmc68k_reduced()
-    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
+    bbknn(adata, n_pcs=15, batches="obs.phase", algorithm="brute")
     weights = adata.obsp["connectivities"].data
     # Regression bounds chosen vs pre-fix behaviour (mean ~0.60, >0.99 frac ~0.28
     # on this dataset). Anything close to those values indicates sigma estimation
@@ -271,7 +411,7 @@ def test_bbknn_trim_default_matches_upstream():
     bbknn(
         adata,
         n_pcs=15,
-        batch_key="phase",
+        batches=A.obs["phase"],
         algorithm="brute",
         neighbors_within_batch=neighbors_within_batch,
     )

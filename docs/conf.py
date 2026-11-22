@@ -113,9 +113,7 @@ linkcheck_ignore = [
 # -- Options for HTML output -------------------------------------------------
 
 html_theme_options = {
-    # TODO: drop once scverse-doc is released with the website accents (scverse/scverse-doc#78)
-    "accent": "#76b900",  # NVIDIA green
-    "secondary_accent": "#7400ff",  # violet, used for the sidebar captions
+    "secondary_accent": True,
     "navigation_with_keys": False,
     "show_toc_level": 2,
 }
@@ -145,7 +143,7 @@ nitpick_ignore = [
     ("py:class", "rapids_singlecell.pertpy_gpu._distance.MeanVar"),
     *[
         ("py:class", f"rapids_singlecell._settings.{cls}Preset")
-        for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes"]
+        for cls in ["HVG", "BasicEmbedding", "RankGenesGroups", "Scale", "ScoreGenes", "QcMetrics"]
     ],
     ("py:data", "typing.Union"),
     ("py:class", "cuml.linear_model.LogisticRegression"),
@@ -163,6 +161,13 @@ def setup(app: Sphinx) -> None:
     """App setup hook."""
     app.add_role("small", roles.GenericRole("small", nodes.inline))
     app.add_role("smaller", roles.GenericRole("smaller", nodes.inline))
+    app.connect("autodoc-skip-member", _skip_dict_methods)
+
+
+def _skip_dict_methods(_app: Sphinx, _what: str, name: str, obj: object, *_: object) -> bool | None:
+    """Hide the inherited `dict` methods of `TypedDict` classes like `pp.NeighborsOut`."""
+    owner = getattr(obj, "__objclass__", None) or getattr(obj, "__self__", None)
+    return True if isinstance(owner, type) and issubclass(owner, dict) and name in vars(dict) else None
 
 
 # extlinks config

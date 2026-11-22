@@ -107,7 +107,8 @@ def test_masked_mean_var(array_type):
         {
             "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
             "mask": [True, True, False, True, True, False],
-        }
+        },
+        index=[str(i) for i in range(6)],
     )
     adata = ad.AnnData(X=array_type(X), obs=obs)
     rsc.get.anndata_to_GPU(adata)
@@ -189,19 +190,19 @@ def test_aggregate_entry():
         var=adata.var,
         layers={"test": adata.X.copy()},
     )
-    layer_result = rsc.get.aggregate(layer_adata, *args, layer="test")
+    layer_result = rsc.get.aggregate(layer_adata, *args, use="layers.test")
     obsm_adata = ad.AnnData(
         obs=adata.obs,
         var=adata.var,
         obsm={"test": adata.X.copy()},
     )
-    obsm_result = rsc.get.aggregate(obsm_adata, *args, obsm="test")
+    obsm_result = rsc.get.aggregate(obsm_adata, *args, use="obsm.test")
     varm_adata = ad.AnnData(
         obs=adata.var,
         var=adata.obs,
         varm={"test": adata.X.copy()},
     )
-    varm_result = rsc.get.aggregate(varm_adata, *args, varm="test")
+    varm_result = rsc.get.aggregate(varm_adata, *args, axis="var", use="varm.test")
 
     X_result_min = X_result.copy()
     del X_result_min.var
@@ -211,6 +212,10 @@ def test_aggregate_entry():
     assert_equal(X_result_min, obsm_result)
     assert_equal(X_result.layers, obsm_result.layers)
     assert_equal(X_result.layers, varm_result.T.layers)
+    with pytest.warns(FutureWarning, match="layer"):
+        assert_equal(X_result, rsc.get.aggregate(layer_adata, *args, layer="test"))
+    with pytest.warns(FutureWarning, match="acc"):
+        assert_equal(X_result, rsc.get.aggregate(layer_adata, *args, acc="layers.test"))
 
 
 def test_aggregate_incorrect_dim():
@@ -332,7 +337,7 @@ def test_aggregate_axis_specification(axis_name):
 def test_aggregate_examples(matrix, df, keys, metrics, expected):
     adata = ad.AnnData(
         X=matrix,
-        obs=df,
+        obs=df.set_axis(df.index.astype(str)),
         var=pd.DataFrame(index=[f"gene_{i}" for i in range(matrix.shape[1])]),
     )
     rsc.get.anndata_to_GPU(adata)
@@ -442,7 +447,8 @@ def test_aggregate_host_masked(array_type):
         {
             "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
             "mask": [True, True, False, True, True, False],
-        }
+        },
+        index=[str(i) for i in range(6)],
     )
     adata = ad.AnnData(X=array_type(X), obs=obs)  # host, not transferred
 

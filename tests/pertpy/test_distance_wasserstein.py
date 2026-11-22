@@ -39,7 +39,7 @@ def _make_grouped_adata(
         X[g * cells_per_group : (g + 1) * cells_per_group] += g * shift
 
     labels = [f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)]
-    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(n_groups)])})
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(n_groups)])}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = X.copy()
     return adata
@@ -607,7 +607,7 @@ def test_layer_key_matches_reference() -> None:
     ng, cpg, nf = 3, 15, 6
     data = rng.normal(size=(ng * cpg, nf)).astype(np.float64)
     labels = [f"g{i}" for i in range(ng) for _ in range(cpg)]
-    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(ng)])})
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(ng)])}).rename(str)
     adata = AnnData(np.zeros((ng * cpg, nf), np.float32), obs=obs)
     adata.layers["counts"] = data
     df = Distance(metric="wasserstein", layer_key="counts").pairwise(adata, "group")
@@ -660,7 +660,7 @@ def test_unused_categories_and_singletons() -> None:
         labels += [g] * n
     X = np.vstack(blocks)
     # categorical also lists 'gZ', which has zero cells (unused)
-    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])})
+    obs = pd.DataFrame({"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}).rename(str)
     adata = AnnData(X.copy(), obs=obs)
     adata.obsm["X_pca"] = X.copy()
     distance = Distance(metric="wasserstein")
@@ -700,7 +700,7 @@ def test_contrast_self_distance_zero_and_no_split() -> None:
     rng = np.random.default_rng(9)
     n = 12
     emb = rng.normal(size=(n * 2, 5)).astype(np.float32)
-    obs = pd.DataFrame({"treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n)})
+    obs = pd.DataFrame({"treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n)}).rename(str)
     adata = AnnData(emb.copy(), obs=obs)
     adata.obsm["X_pca"] = emb.copy()
     distance = Distance(metric="wasserstein")
@@ -721,7 +721,7 @@ def test_contrast_distances_with_split_by() -> None:
             "treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n),
             "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2),
         }
-    )
+    ).rename(str)
     adata = AnnData(emb.copy(), obs=obs)
     adata.obsm["X_pca"] = emb.copy()
     distance = Distance(metric="wasserstein")

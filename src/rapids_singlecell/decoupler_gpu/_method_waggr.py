@@ -20,7 +20,7 @@ def _ridx(
     seed: int | None,
 ):
     idx = cp.tile(cp.arange(nvar), (times, 1))
-    if seed:
+    if seed is not None:
         rng = np.random.default_rng(seed=seed)
         idx = idx.get()
         for i in idx:

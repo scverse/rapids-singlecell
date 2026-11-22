@@ -63,8 +63,8 @@ def test_highly_variable_genes_batched(client, data_kind, flavor):
     else:
         raise ValueError(f"Unknown data_kind: {data_kind}")
 
-    rsc.pp.highly_variable_genes(adata, batch_key="batch")
-    rsc.pp.highly_variable_genes(dask_data, batch_key="batch")
+    rsc.pp.highly_variable_genes(adata, batch="obs.batch")
+    rsc.pp.highly_variable_genes(dask_data, batch="obs.batch")
     cp.testing.assert_allclose(adata.var["means"], dask_data.var["means"])
     cp.testing.assert_allclose(adata.var["dispersions"], dask_data.var["dispersions"])
     cp.testing.assert_allclose(adata.var["dispersions_norm"], dask_data.var["dispersions_norm"])
@@ -120,8 +120,8 @@ def test_highly_variable_genes_seurat_v3_batched(client, data_kind, flavor):
         adata.X = cusparse.csr_matrix(adata.X)
 
     n_top_genes = 1000
-    rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=n_top_genes, batch_key="batch")
-    rsc.pp.highly_variable_genes(dask_data, flavor=flavor, n_top_genes=n_top_genes, batch_key="batch")
+    rsc.pp.highly_variable_genes(adata, flavor=flavor, n_top_genes=n_top_genes, batch="obs.batch")
+    rsc.pp.highly_variable_genes(dask_data, flavor=flavor, n_top_genes=n_top_genes, batch="obs.batch")
 
     cp.testing.assert_allclose(adata.var["means"], dask_data.var["means"])
     cp.testing.assert_allclose(adata.var["variances"], dask_data.var["variances"])

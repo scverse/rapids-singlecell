@@ -30,6 +30,7 @@ from rapids_singlecell.preprocessing._harmony import (
     _correction,
     _correction_multi,
     _rhs_bounds,
+    _segment_levels,
     _segments,
 )
 from rapids_singlecell.preprocessing._harmony._helper import (
@@ -40,19 +41,22 @@ from rapids_singlecell.preprocessing._harmony._helper import (
 )
 
 
-def _solve_spd_batched(gram, rhs, *, one_at_a_time=False):
-    # The cluster-system solve of the multi-key correction (C++).
+def _solve_spd_batched(gram, rhs, *, one_at_a_time=False, refine=1, with_info=False):
+    # The cluster-system solve of the multi-key correction (C++): float32
+    # factors, `refine` float64 refinement steps, float64 for a chunk whose
+    # float32 factorization failed. with_info: also (least squares, fell back).
     x = cp.empty_like(rhs)
-    harmony_module._correction_batched_cuda.solve_spd(
+    info = harmony_module._correction_batched_cuda.solve_spd(
         gram,
         rhs,
         x,
         one_at_a_time=one_at_a_time,
+        refine=refine,
         stream=cp.cuda.get_current_stream().ptr,
         blas=cp.cuda.device.get_cublas_handle(),
         solver=cp.cuda.device.get_cusolver_handle(),
     )
-    return x
+    return (x, info) if with_info else x
 
 
 def _get_measure(x, base, norm):
@@ -246,6 +250,74 @@ def test_harmony_large_multikey_systems_solve_one_at_a_time(one_at_a_time):
     np.testing.assert_allclose(gram[2] @ result[2], rhs[2], rtol=1e-7, atol=1e-7)
 
 
+@pytest.mark.parametrize("one_at_a_time", [False, True])
+def test_harmony_multikey_solve_refines_float32_to_float64(one_at_a_time):
+    # The systems of two keys with Zipf-distributed level sizes (plus the
+    # intercept, dynamic ridge, a pruned level): the float32 solve alone is
+    # within 1e-5, one float64 refinement step within 1e-9 of float64.
+    rng = np.random.default_rng(1)
+    L1, L2, n_cells, p = 300, 200, 200_000, 7
+    prob = [1 / np.arange(1, L + 1) for L in (L1, L2)]
+    c1, c2 = (rng.choice(L, n_cells, p=q / q.sum()) for L, q in zip((L1, L2), prob, strict=True))
+    systems = []
+    for seed in range(3):
+        r = np.random.default_rng(seed).random(n_cells)  # soft assignments
+        O = np.concatenate([np.bincount(c1, r, L1), np.bincount(c2, r, L2)])
+        C = np.bincount(c1 * L2 + c2, r, L1 * L2).reshape(L1, L2)
+        lam = 0.2 * r.sum() * np.concatenate([np.bincount(c1, minlength=L1), np.bincount(c2, minlength=L2)]) / n_cells
+        lam[-1] = 1e30  # a pruned level
+        A = np.zeros((1 + L1 + L2,) * 2)
+        A[0, 0], A[0, 1:], A[1:, 0] = r.sum(), O, O
+        A[1:, 1:][np.diag_indices(L1 + L2)] = O + lam
+        A[1 : 1 + L1, 1 + L1 :], A[1 + L1 :, 1 : 1 + L1] = C, C.T
+        systems.append(A)
+    gram = np.stack(systems)
+    rhs = rng.standard_normal((3, gram.shape[1], p)) * 100
+    expected = np.linalg.solve(gram, rhs)
+    for refine, rtol in ((0, 1e-5), (1, 1e-9)):
+        x, (n_least_squares, fell_back) = _solve_spd_batched(
+            cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time, refine=refine, with_info=True
+        )
+        assert (n_least_squares, fell_back) == (0, False)
+        np.testing.assert_allclose(cp.asnumpy(x), expected, rtol=rtol, atol=rtol * np.abs(expected).max())
+
+
+def test_harmony_refinement_steps_follow_the_ridge():
+    # The dynamic ridge keeps the systems well conditioned: one step for float32
+    # data, two for float64; a fixed ridge of 1 against levels of 1e5 cells
+    # needs four for float32 data and, for float64, more than a float64 solve
+    # costs, so float64 it is. Where the count is tight, two balanced keys with
+    # the intercept, the float32 target holds.
+    O = cp.full((4, 3), 1e5)
+    assert harmony_module._refinement_steps(O, 0.2 * O, 2, 4) == 1
+    assert harmony_module._refinement_steps(O, 0.2 * O, 2, 8) == 2
+    assert harmony_module._refinement_steps(O, cp.ones_like(O), 2, 4) == 4
+    assert harmony_module._refinement_steps(O, cp.ones_like(O), 2, 8) == -1
+    assert harmony_module._refinement_steps(O, cp.full_like(O, 1e30), 2, 4) == 0  # all suppressed
+    A = np.array(
+        [[2e5, 1e5, 1e5, 1e5, 1e5], [1e5, 1e5 + 1, 0, 5e4, 5e4], [1e5, 0, 1e5 + 1, 5e4, 5e4]]
+        + [[1e5, 5e4, 5e4, 1e5 + 1, 0], [1e5, 5e4, 5e4, 0, 1e5 + 1]]
+    )
+    rhs = np.random.default_rng(0).standard_normal((1, 5, 3)) * 1e5
+    x = _solve_spd_batched(cp.asarray(A[None]), cp.asarray(rhs), refine=4)
+    expected = np.linalg.solve(A[None], rhs)
+    assert np.abs(cp.asnumpy(x) - expected).max() <= 2**-20 * np.abs(expected).max()
+
+
+@pytest.mark.parametrize("one_at_a_time", [False, True])
+def test_harmony_multikey_solve_falls_back_to_float64(one_at_a_time):
+    # A system that is positive definite in float64 but not in float32 sends
+    # its chunk through the float64 solve.
+    gram = np.array([[[1.0, 1 - 1e-9], [1 - 1e-9, 1.0]], [[2.0, 0.5], [0.5, 2.0]]])
+    rhs = np.array([[[1.0, 2.0], [1.0, 3.0]], [[1.0, 0.0], [0.0, 1.0]]])
+    for refine in (1, -1):  # by failure, and on request
+        x, (n_least_squares, fell_back) = _solve_spd_batched(
+            cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time, refine=refine, with_info=True
+        )
+        assert (n_least_squares, fell_back) == (0, True)
+        np.testing.assert_allclose(cp.asnumpy(x), np.linalg.solve(gram, rhs), rtol=1e-9)
+
+
 def test_harmony_interrupt_during_the_solve_is_raised_after_it():
     # Ctrl-C while the main thread waits for the GPU in the C++ solve: its
     # scratch frees run no Python, so KeyboardInterrupt follows the call (a
@@ -341,12 +413,6 @@ def test_harmony1_rejects_bad_ridge_lambda(ridge_lambda, *, multikey):
         ({"block_proportion": 0}, "block_proportion"),
         ({"block_proportion": 1.5}, "block_proportion"),
         ({"block_proportion": float("nan")}, "block_proportion"),
-        ({"shuffle_chunk_size": 0}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": -2}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": 1.5}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": "8"}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": float("inf")}, "shuffle_chunk_size"),
-        ({"shuffle_chunk_size": float("nan")}, "shuffle_chunk_size"),
         ({"colsum_algo": "bogus"}, "colsum_algo"),
         ({"max_iter_harmony": 0}, "max_iter_harmony"),
         ({"n_clusters": 0}, "n_clusters"),
@@ -567,10 +633,15 @@ def test_harmony_extreme_batch_keeps_the_others(big, mixed):
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
-@pytest.mark.parametrize(("n_covariates", "n_cells"), [(2, 31), (3, 31), (4, 31), (2, 1_000_000)])
-def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n_cells, monkeypatch):
+@pytest.mark.parametrize(
+    ("levels", "n_cells"),
+    [((2, 3), 31), ((2, 3, 4), 31), ((2, 3, 4, 5), 31), ((2,) * 9, 31), ((2, 3), 1_000_000), ((300, 20), 20_000)],
+)
+def test_harmony_multikey_correction_matches_dense_design(dtype, levels, n_cells, monkeypatch):
+    # 9 keys: sums and corrections in passes of 8 keys; (300, 20): Gram matrices
+    # wider than a block and thousands of joint categories.
     rng = np.random.default_rng(734)
-    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
+    levels = np.asarray(levels, dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
     n_batches = int(levels.sum())
     n_pcs, n_clusters = 5, 3
@@ -583,7 +654,7 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
     R_np /= R_np.sum(axis=1, keepdims=True)
 
     O_np = np.zeros((n_batches, n_clusters), dtype=np_dtype)
-    for covariate in range(n_covariates):
+    for covariate in range(len(levels)):
         np.add.at(O_np, cats_np[:, covariate], R_np)
     lambda_np = rng.uniform(0.2, 1.0, size=O_np.shape).astype(np_dtype)
     lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
@@ -594,22 +665,23 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
     cats_np, X_np, R_np = cats_np[order], X_np[order], R_np[order]
     joint_codes_np = joint_codes_np[order]
     joint_offsets = np.searchsorted(joint_codes_np, np.arange(len(joint_cats_np) + 1)).astype(np.int32)
-    marginal = sorted((level, joint) for joint, levels in enumerate(joint_cats_np) for level in levels)
-    marginal_offsets = np.searchsorted([level for level, _ in marginal], np.arange(n_batches + 1)).astype(np.int32)
+    joint_cats, level_offsets = cp.asarray(joint_cats_np, dtype=cp.int32), [0, *np.cumsum(levels).tolist()]
+    seg_start, seg_group = _segments(joint_offsets)
+    seg_levels = _segment_levels(joint_cats, seg_group, level_offsets)
+    bounds = _rhs_bounds(
+        [cp.asarray(X_np)], joint_offsets, [0, n_cells], joint_cats=joint_cats, level_offsets=level_offsets
+    )
 
     def correct(normalize=False):
         return _correction_multi(
             cp.asarray(X_np),
             cp.asarray(R_np),
+            O=cp.asarray(O_np),
             lambda_kb=cp.asarray(lambda_np),
-            n_first=int(levels[0]),
-            joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
-            segments=(
-                *_segments(joint_offsets),
-                cp.asarray(_rhs_bounds([cp.asarray(X_np)], joint_offsets, [0, n_cells])),
-            ),
-            marginal_joint_offsets=cp.asarray(marginal_offsets),
-            marginal_joint_indices=cp.asarray([joint for _, joint in marginal], dtype=cp.int32),
+            joint_cats=joint_cats,
+            seg_levels=seg_levels,
+            level_offsets=level_offsets,
+            segments=(seg_start, seg_group, bounds),
             normalize=normalize,
         )
 
@@ -630,6 +702,46 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
     cp.testing.assert_allclose(chunked, cp.asarray(expected), atol=atol, rtol=atol)
     expected /= np.linalg.norm(expected, axis=1, keepdims=True)
     cp.testing.assert_allclose(correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge:UserWarning")
+@pytest.mark.parametrize(("n_pcs", "n_clusters", "n_keys"), [(64, 64, 1), (30, 23, 1), (32, 126, 1), (30, 10, 2)])
+def test_harmony_shared_memory_boundary(n_pcs, n_clusters, n_keys):
+    # Shapes whose segment-sum or apply plan fills the 48 KB of shared memory a kernel may use without opting in:
+    # the kernels' static rows have to count towards the opt-in.
+    rng = np.random.default_rng(3)
+    n_cells = 2000
+    obs = pd.DataFrame({f"b{i}": rng.integers(0, 4, n_cells).astype(str) for i in range(n_keys)}).astype("category")
+    X = cp.asarray(rng.standard_normal((n_cells, n_pcs), dtype=np.float32))
+    key = list(obs.columns) if n_keys > 1 else "b0"
+    Z = harmony_module.harmonize(X, obs, key, n_clusters=n_clusters, max_iter_harmony=2, rng=0)
+    assert cp.isfinite(Z).all()
+
+
+def test_harmony_rhs_bounds_per_level():
+    # With several keys the bound of a level is the one-key bound of its cells (those of all its joint categories),
+    # also past float64's range, and the same from any split of the cells.
+    rng = np.random.default_rng(5)
+    n_cells, n_pcs, level_offsets = 400, 4, [0, 2, 5]
+    cats = np.column_stack(
+        [rng.integers(lo, hi, n_cells) for lo, hi in zip(level_offsets[:-1], level_offsets[1:], strict=True)]
+    )
+    joint_cats, codes = np.unique(cats, axis=0, return_inverse=True)
+    order = np.argsort(codes, kind="stable")
+    X = rng.normal(size=(n_cells, n_pcs)) * 10.0 ** rng.integers(-3, 3, size=(1, n_pcs))
+    X[0, 0] = 1e307
+    X, cats, codes = X[order], cats[order], codes[order]
+    offsets = np.searchsorted(codes, np.arange(len(joint_cats) + 1)).astype(np.int32)
+    joint_cats = cp.asarray(joint_cats, dtype=cp.int32)
+    got = _rhs_bounds([cp.asarray(X)], offsets, [0, n_cells], joint_cats=joint_cats, level_offsets=level_offsets)
+    assert got.shape == (5, n_pcs)
+    for level in range(5):
+        rows = cp.asarray(X[(cats == level).any(axis=1)])
+        one_key = _rhs_bounds([rows], np.array([0, len(rows)], dtype=np.int32), [0, len(rows)])
+        cp.testing.assert_array_equal(got[level], one_key[0])
+    parts = [cp.asarray(X[:256]), cp.asarray(X[256:])]
+    split = _rhs_bounds(parts, offsets, [0, 256, n_cells], joint_cats=joint_cats, level_offsets=level_offsets)
+    cp.testing.assert_array_equal(split, got)
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -709,7 +821,7 @@ def adata_reference():
     meta = pd.read_csv(meta_file, delimiter="\t")
     return ad.AnnData(
         X=None,
-        obs=meta,
+        obs=meta.rename(index=str),
         obsm={"X_pca": X_pca.values, "harmony_org": X_pca_harmony.values},
     )
 
@@ -788,6 +900,39 @@ def test_harmony_integrate(correction_method):
         max_iter_harmony=1,
     )
     assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_integrate_use_out():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = sc.datasets.pbmc68k_reduced()
+    kw = {"dtype": cp.float32, "max_iter_harmony": 1, "rng": 0}
+    res = rsc.pp.harmony_integrate(adata, A.obs["bulk_labels"], use="obsm.X_pca", out=True, **kw)
+    assert "X_pca_harmony" not in adata.obsm
+    rsc.pp.harmony_integrate(adata, "bulk_labels", out=A.obsm["h"], **kw)
+    np.testing.assert_array_equal(adata.obsm["h"], res)
+    with pytest.warns(FutureWarning, match="key"):
+        rsc.pp.harmony_integrate(adata, key="bulk_labels", **kw)
+    with pytest.warns(FutureWarning, match="adjusted_basis"), pytest.warns(FutureWarning, match="argument basis"):
+        rsc.pp.harmony_integrate(adata, "bulk_labels", basis="X_pca", adjusted_basis="old", **kw)
+    np.testing.assert_array_equal(adata.obsm["old"], res)
+    np.testing.assert_array_equal(adata.obsm["X_pca_harmony"], res)
+
+
+@pytest.mark.filterwarnings("ignore:Harmony did not converge")
+def test_harmony_integrate_accessor_list():
+    A = pytest.importorskip("anndata.acc").A
+
+    adata = sc.datasets.pbmc68k_reduced()
+    kw = {"dtype": cp.float32, "max_iter_harmony": 1, "rng": 0, "out": True}
+    res = rsc.pp.harmony_integrate(adata, [A.obs["bulk_labels"], A.obs["phase"]], **kw)
+    np.testing.assert_array_equal(res, rsc.pp.harmony_integrate(adata, ["bulk_labels", "phase"], **kw))
+    assert not np.array_equal(res, rsc.pp.harmony_integrate(adata, A.obs["bulk_labels"], **kw))
+    with rsc.settings.override(preset=rsc.Preset.ScanpyV2Preview):
+        np.testing.assert_array_equal(res, rsc.pp.harmony_integrate(adata, ["obs.bulk_labels", "obs.phase"], **kw))
+    with pytest.raises(TypeError, match="not a mix"):
+        rsc.pp.harmony_integrate(adata, [A.obs["bulk_labels"], "phase"], **kw)
 
 
 @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
@@ -951,6 +1096,7 @@ def test_harmony2_ircolitis_reference(adata_ircolitis_harmonypy2, correction_met
     assert _get_measure(ref, result, "L2").max() < 0.1
 
 
+@pytest.mark.filterwarnings("ignore:Harmony did not converge:UserWarning")
 def test_harmony_unseeded_random_state():
     """``random_state=None`` means unseeded, not a crash."""
     rng = np.random.default_rng(734)
@@ -1117,11 +1263,16 @@ def test_harmony_tau_discounts_theta():
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
-def test_harmony_shuffle_chunk_size():
-    exact = _integrate(shuffle_chunk_size=1)
-    assert exact.tobytes() == _integrate(shuffle_chunk_size=1).tobytes()
-    assert exact.tobytes() != _integrate(shuffle_chunk_size=8).tobytes()
-    assert _integrate(shuffle_chunk_size=8.0).tobytes() == _integrate(shuffle_chunk_size=8).tobytes()
+def test_harmony_block_runs(monkeypatch):
+    # Cells join the update blocks in runs of up to _SHUFFLE_CHUNK sorted
+    # cells, at most a block's share; runs of one deal single cells.
+    assert harmony_module._block_layout(480, 20)[0] == 8
+    assert harmony_module._block_layout(100, 20)[0] == 5
+    runs = _integrate()
+    monkeypatch.setattr(harmony_module, "_SHUFFLE_CHUNK", 1)
+    single = _integrate()
+    assert single.tobytes() == _integrate().tobytes()
+    assert single.tobytes() != runs.tobytes()
 
 
 @pytest.mark.filterwarnings("ignore:Harmony did not converge")
@@ -1489,6 +1640,9 @@ def test_harmony_several_ranks_match_one(monkeypatch, *, key, n_pcs, dtype, n_cl
         assert run(devices).tobytes() == one.tobytes()
         if key[1] == "many":  # each GPU solves its share of the systems
             assert sum(solved) == on_one
+        with monkeypatch.context() as float64_solve:  # in place at each GPU's offset in the round's solutions
+            float64_solve.setattr(harmony_module, "_refinement_steps", lambda *_: -1)
+            assert run(devices).tobytes() == run([0]).tobytes()
     # Without peer copies (pinned host slots, relayed CuPy input), in several
     # upload chunks per shard: scattered rows, and runs of rows from input
     # sorted by batch.

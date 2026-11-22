@@ -12,12 +12,14 @@ from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
 from scanpy._utils import _resolve_axis
 from scanpy.get._aggregated import _combine_categories
+from scverse_misc import deprecated_arg
 
 from rapids_singlecell._compat import DaskArray, _meta_dense
 from rapids_singlecell._cuda import _aggr_cuda
 from rapids_singlecell._settings import Preset, settings
 from rapids_singlecell.preprocessing._utils import _check_gpu_X
 
+from ._out import DEPR_USE
 from ._utils import (
     AdRef,
     GraphAcc,
@@ -522,19 +524,25 @@ def _group_counts_host(categorical: pd.Categorical, mask: NDArray[np.bool_] | No
     return np.bincount(codes[selected], minlength=len(categorical.categories))
 
 
+@deprecated_arg("acc", DEPR_USE)
+@deprecated_arg("layer", DEPR_USE)
+@deprecated_arg("obsm", DEPR_USE)
+@deprecated_arg("varm", DEPR_USE)
 def aggregate(
     adata: AnnData,
     by: (str | Collection[str | AdRef[Idx2D | int, AnnData]] | AdRef[Idx2D | int, AnnData]),
     func: AggType | Iterable[AggType],
     *,
-    acc: LayerAcc | MultiAcc | GraphAcc | str | None = None,
+    use: LayerAcc | MultiAcc | GraphAcc | str | None = None,
     axis: Literal["obs", 0, "var", 1] | None = None,
     mask: NDArray[np.bool_] | AdRef[Idx2D | int, AnnData] | str | None = None,
     dof: int = 1,
+    return_sparse: bool = False,
+    # deprecated
+    acc: LayerAcc | MultiAcc | GraphAcc | str | None = None,
     layer: str | None = None,
     obsm: str | None = None,
     varm: str | None = None,
-    return_sparse: bool = False,
     **kwargs,
 ) -> AnnData:
     """Aggregate data matrix based on some categorical grouping.
@@ -545,7 +553,7 @@ def aggregate(
     list of metrics. Each metric is computed over the group and results in a new layer
     in the output `AnnData` object.
 
-    If none of `layer`, `obsm`, or `varm` are passed in, `X` will be used for aggregation data.
+    If `use` is not passed, `X` will be used for aggregation data.
     If `func` only has length 1 or is just an `AggType`, then aggregation data is written to `X`.
     Otherwise, it is written to `layers` or `xxxm` as appropriate for the dimensions of the aggregation data.
 
@@ -559,10 +567,10 @@ def aggregate(
         and :mod:`anndata.acc` references are also supported.
     func
         How to aggregate.
-    acc
+    use
         Accessor for the matrix to aggregate, such as ``A.X``,
         ``A.layers["counts"]``, ``A.obsm["pca"]``, or an observation/variable
-        graph. Replaces ``layer``, ``obsm``, and ``varm``.
+        graph. Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. ``'layers.counts'``.
     axis
         Axis on which to find the grouping column. Inferred from ``by`` when
         accessor references are used.
@@ -570,10 +578,10 @@ def aggregate(
         Boolean mask (or key to column containing mask) to apply along the axis.
     dof
         Degrees of freedom for variance. Defaults to 1.
+    acc
+        Former name of `use`.
     layer
-        If not None, key for aggregation data.
     obsm
-        If not None, key for aggregation data.
     varm
         If not None, key for aggregation data.
     return_sparse
@@ -613,11 +621,13 @@ def aggregate(
 
     Note that this filters out any combination of groups that wasn't present in the original data.
     """
-    if settings.preset is Preset.ScanpyV2Preview and any(value is not None for value in (axis, layer, obsm, varm)):
-        msg = "`acc` will replace `layer`, `obsm`, and `varm` arguments in Scanpy 2."
-        if axis is not None:
-            msg += " `axis` is no longer necessary because it is inferred from `by`."
-        warnings.warn(msg, FutureWarning, stacklevel=2)
+    if axis is not None and settings.preset is Preset.ScanpyV2Preview:
+        warnings.warn("`axis` is no longer necessary because it is inferred from `by`.", FutureWarning, stacklevel=2)
+    if acc is not None:
+        if use is not None:
+            raise TypeError("Pass either `use` or `acc`, not both.")
+        use = acc
+    acc = use
 
     by_refs, axis_name = _normalize_by(by, axis, obsm=obsm, varm=varm)
     if isinstance(by_refs[0], AdRef) and acc is None:

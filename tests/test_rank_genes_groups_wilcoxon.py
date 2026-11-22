@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import anndata as ad
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
 import numpy as np
@@ -11,10 +12,16 @@ from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
-from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
-from rapids_singlecell.tools._rank_genes_groups import _wilcoxon_host
+from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_host
+from testing.rapids_singlecell._helper import sc_use
+
+A = pytest.importorskip("anndata.acc").A
 
 MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
+
+ignore_small_groups = pytest.mark.filterwarnings(
+    "ignore:Group .* has size:RuntimeWarning", "ignore:Small groups detected:RuntimeWarning"
+)
 
 
 def _to_format(X_dense, fmt):
@@ -38,8 +45,13 @@ def _make_nonnegative(adata):
     return adata
 
 
-# Sparse Wilcoxon negative values must fall back to dense full-sort ranking.
+# Signed sparse input ranks like the dense layout (zeros form one tie block).
 # Covers Wilcoxon OVR/OVO and binned OVR; other methods accept signed sparse.
+@ignore_small_groups
+@pytest.mark.filterwarnings(
+    "ignore:invalid value encountered in log2:RuntimeWarning",
+    "ignore:wilcoxon_binned expects log-normalized data:UserWarning",
+)
 @pytest.mark.parametrize(
     ("method", "reference"),
     [("wilcoxon", "rest"), ("wilcoxon_binned", "rest"), ("wilcoxon", "b")],
@@ -57,18 +69,20 @@ def test_rank_genes_groups_sparse_negative_values_fallback(method, reference, fm
         ],
         dtype=np.float64,
     )
-    obs = pd.DataFrame({"group": pd.Categorical(list("aaabbb"), categories=["a", "b"])})
+    obs = pd.DataFrame(
+        {"group": pd.Categorical(list("aaabbb"), categories=["a", "b"])}, index=[str(i) for i in range(6)]
+    )
     var = pd.DataFrame(index=["g0", "g1", "g2"])
 
     sparse_adata = sc.AnnData(X=_to_format(X, fmt), obs=obs.copy(), var=var.copy())
     dense_fmt = "cupy_dense" if fmt.startswith("cupy") else "numpy_dense"
     dense_adata = sc.AnnData(X=_to_format(X, dense_fmt), obs=obs.copy(), var=var.copy())
 
-    kw = {"method": method, "reference": reference, "use_raw": False}
+    kw = {"method": method, "reference": reference, "use": "X"}
     rsc.tl.rank_genes_groups(sparse_adata, "group", **kw)
     rsc.tl.rank_genes_groups(dense_adata, "group", **kw)
 
-    # Sparse-with-negatives falls back to the dense ranking -> identical result.
+    # Signed sparse and dense layouts give identical results.
     sp_scores = sparse_adata.uns["rank_genes_groups"]["scores"]
     dn_scores = dense_adata.uns["rank_genes_groups"]["scores"]
     for group in sp_scores.dtype.names:
@@ -88,7 +102,7 @@ def test_device_sparse_int64_indptr_matches_scanpy(layout, reference):
     rng = np.random.default_rng(0)
     dense = np.abs(rng.standard_normal((150, 8))).astype(np.float32)
     dense[dense < 0.5] = 0.0
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])}, index=[str(i) for i in range(150)])
     var = pd.DataFrame(index=[f"g{j}" for j in range(8)])
 
     ctor = cpsp.csr_matrix if layout == "csr" else cpsp.csc_matrix
@@ -101,13 +115,12 @@ def test_device_sparse_int64_indptr_matches_scanpy(layout, reference):
     adata_cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": reference,
         "tie_correct": True,
         "n_genes": 8,
     }
-    rsc.tl.rank_genes_groups(adata, "group", **kw)
-    sc.tl.rank_genes_groups(adata_cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(adata, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g = adata.uns["rank_genes_groups"]
     c = adata_cpu.uns["rank_genes_groups"]
     for field in ("scores", "pvals", "pvals_adj"):
@@ -134,12 +147,11 @@ def test_rank_genes_groups_structured_results_get_df_and_h5ad_match_scanpy(tmp_p
         "groupby": "blobs",
         "method": "wilcoxon",
         "reference": "1",
-        "use_raw": False,
         "tie_correct": True,
         "n_genes": 4,
     }
-    rsc.tl.rank_genes_groups(adata_rsc, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata_rsc, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     rsc_result = adata_rsc.uns["rank_genes_groups"]
     assert isinstance(rsc_result["names"], np.ndarray)
@@ -152,7 +164,7 @@ def test_rank_genes_groups_structured_results_get_df_and_h5ad_match_scanpy(tmp_p
 
     h5ad_path = tmp_path / "rank_genes_groups.h5ad"
     adata_rsc.write_h5ad(h5ad_path)
-    adata_rsc = sc.read_h5ad(h5ad_path)
+    adata_rsc = ad.read_h5ad(h5ad_path)
 
     rsc_df = sc.get.rank_genes_groups_df(adata_rsc, group=None)
     scanpy_df = sc.get.rank_genes_groups_df(adata_cpu, group=None)
@@ -169,11 +181,12 @@ def test_rank_genes_groups_return_format_removed():
             adata,
             "blobs",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             return_format="arrays",
         )
 
 
+@ignore_small_groups
 @pytest.mark.parametrize("reference", ["rest", "b"])
 @pytest.mark.parametrize(
     "fmt",
@@ -194,7 +207,7 @@ def test_rank_genes_groups_wilcoxon_return_u_values(reference, fmt):
     labels = np.array(["a", "a", "b", "b", "c", "c"])
     adata = sc.AnnData(
         X=_to_format(X, fmt),
-        obs=pd.DataFrame({"group": pd.Categorical(labels)}),
+        obs=pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(6)]),
         var=pd.DataFrame(index=[f"g{i}" for i in range(X.shape[1])]),
     )
 
@@ -204,7 +217,7 @@ def test_rank_genes_groups_wilcoxon_return_u_values(reference, fmt):
         groups=["a"],
         reference=reference,
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         tie_correct=True,
         use_continuity=True,
         return_u_values=True,
@@ -235,6 +248,7 @@ def test_rank_genes_groups_wilcoxon_return_u_values(reference, fmt):
     np.testing.assert_allclose(df["scores"].to_numpy(), expected_sorted)
 
 
+@ignore_small_groups
 def test_rank_genes_groups_wilcoxon_dense_edge_cases_match_scipy():
     X = np.array(
         [
@@ -252,7 +266,7 @@ def test_rank_genes_groups_wilcoxon_dense_edge_cases_match_scipy():
     labels = np.array(["a", "a", "a", "a", "b", "b", "b", "b"])
     adata = sc.AnnData(
         X=X,
-        obs=pd.DataFrame({"group": pd.Categorical(labels)}),
+        obs=pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(8)]),
         var=pd.DataFrame(index=["no_ties", "all_ties", "zero_ties", "mixed", "pairs"]),
     )
     rsc.tl.rank_genes_groups(
@@ -261,7 +275,7 @@ def test_rank_genes_groups_wilcoxon_dense_edge_cases_match_scipy():
         groups=["a"],
         reference="b",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         tie_correct=True,
         use_continuity=True,
         return_u_values=True,
@@ -299,7 +313,7 @@ def test_rank_genes_groups_return_u_values_requires_wilcoxon():
             adata,
             "blobs",
             method="t-test",
-            use_raw=False,
+            use="X",
             return_u_values=True,
         )
 
@@ -323,7 +337,7 @@ def test_rank_genes_groups_wilcoxon_matches_scanpy(reference, tie_correct, spars
         adata_gpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         n_genes=3,
         reference=reference,
         corr_method="benjamini-hochberg",
@@ -333,7 +347,7 @@ def test_rank_genes_groups_wilcoxon_matches_scanpy(reference, tie_correct, spars
         adata_cpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         n_genes=3,
         reference=reference,
         tie_correct=tie_correct,
@@ -365,13 +379,14 @@ def test_rank_genes_groups_wilcoxon_matches_scanpy(reference, tie_correct, spars
     assert params["reference"] == reference
 
 
+@ignore_small_groups
 def test_rank_genes_groups_wilcoxon_dense_ovr_ties_match_scanpy():
     rng = np.random.default_rng(16)
     X = rng.integers(0, 40, size=(128, 7)).astype(np.float32)
     labels = rng.integers(0, 7, size=128).astype(str)
     adata_gpu = sc.AnnData(
         X=X.copy(),
-        obs=pd.DataFrame({"group": pd.Categorical(labels)}),
+        obs=pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(128)]),
         var=pd.DataFrame(index=[f"g{i}" for i in range(X.shape[1])]),
     )
     adata_cpu = adata_gpu.copy()
@@ -380,12 +395,11 @@ def test_rank_genes_groups_wilcoxon_dense_ovr_ties_match_scanpy():
         "groupby": "group",
         "method": "wilcoxon",
         "reference": "rest",
-        "use_raw": False,
         "tie_correct": True,
         "n_genes": adata_gpu.n_vars,
     }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -405,7 +419,7 @@ def test_rank_genes_groups_wilcoxon_honors_layer_and_use_raw(reference):
     base.layers["signal"] = base.X.copy()
 
     ref_adata = base.copy()
-    rsc.tl.rank_genes_groups(ref_adata, "blobs", method="wilcoxon", use_raw=False, reference=reference)
+    rsc.tl.rank_genes_groups(ref_adata, "blobs", method="wilcoxon", use="X", reference=reference)
     reference_names = ref_adata.uns["rank_genes_groups"]["names"].copy()
 
     rng = np.random.default_rng(0)
@@ -418,15 +432,14 @@ def test_rank_genes_groups_wilcoxon_honors_layer_and_use_raw(reference):
         layered,
         "blobs",
         method="wilcoxon",
-        layer="signal",
-        use_raw=False,
+        use="layers.signal",
         reference=reference,
     )
     layered_names = layered.uns["rank_genes_groups"]["names"].copy()
 
     no_layer = base.copy()
     no_layer.X = perturbed_matrix
-    rsc.tl.rank_genes_groups(no_layer, "blobs", method="wilcoxon", use_raw=False, reference=reference)
+    rsc.tl.rank_genes_groups(no_layer, "blobs", method="wilcoxon", use="X", reference=reference)
     no_layer_names = no_layer.uns["rank_genes_groups"]["names"].copy()
 
     assert layered_names.dtype.names == reference_names.dtype.names
@@ -454,7 +467,7 @@ def test_rank_genes_groups_wilcoxon_subset_and_bonferroni(reference):
         method="wilcoxon",
         groups=groups,
         reference=reference,
-        use_raw=False,
+        use="X",
         n_genes=2,
         corr_method="bonferroni",
     )
@@ -471,6 +484,7 @@ def test_rank_genes_groups_wilcoxon_subset_and_bonferroni(reference):
         assert np.all(adjusted <= 1.0)
 
 
+@ignore_small_groups
 def test_rank_genes_groups_wilcoxon_skip_empty_groups_filters_singletons():
     np.random.seed(42)
     adata = sc.datasets.blobs(n_variables=5, n_centers=2, n_observations=21)
@@ -485,7 +499,7 @@ def test_rank_genes_groups_wilcoxon_skip_empty_groups_filters_singletons():
         "target",
         method="wilcoxon",
         reference="ref",
-        use_raw=False,
+        use="X",
         n_genes=3,
         skip_empty_groups=True,
     )
@@ -509,7 +523,7 @@ def test_rank_genes_groups_wilcoxon_skip_empty_groups_all_tests_filtered():
         "target",
         method="wilcoxon",
         reference="ref",
-        use_raw=False,
+        use="X",
         skip_empty_groups=True,
     )
 
@@ -521,9 +535,12 @@ def test_rank_genes_groups_wilcoxon_skip_empty_groups_all_tests_filtered():
 @pytest.mark.parametrize(
     "fmt",
     [
+        pytest.param("numpy_dense", id="host_dense"),
         pytest.param("scipy_csr", id="host_csr"),
         pytest.param("scipy_csc", id="host_csc"),
         pytest.param("cupy_dense", id="device_dense"),
+        pytest.param("cupy_csr", id="device_csr"),
+        pytest.param("cupy_csc", id="device_csc"),
     ],
 )
 def test_wilcoxon_subset_rest_stats_match_scanpy(fmt):
@@ -538,14 +555,13 @@ def test_wilcoxon_subset_rest_stats_match_scanpy(fmt):
     kw = {
         "groupby": "blobs",
         "method": "wilcoxon",
-        "use_raw": False,
         "groups": ["0", "2"],
         "reference": "rest",
         "pts": True,
         "n_genes": 6,
     }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -568,6 +584,7 @@ def test_wilcoxon_subset_rest_stats_match_scanpy(fmt):
             np.testing.assert_allclose(gpu_pts[col].values, cpu_pts[col].values, rtol=1e-13, atol=1e-15)
 
 
+@ignore_small_groups
 @pytest.mark.parametrize("reference", ["rest", "1"])
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc"])
 def test_wilcoxon_zero_nnz_host_sparse_does_not_crash(reference, fmt):
@@ -577,7 +594,8 @@ def test_wilcoxon_zero_nnz_host_sparse_does_not_crash(reference, fmt):
                 ["0"] * 4 + ["1"] * 4 + ["2"] * 4,
                 categories=["0", "1", "2"],
             )
-        }
+        },
+        index=[str(i) for i in range(12)],
     )
     adata = sc.AnnData(
         X=_to_format(np.zeros((12, 5), dtype=np.float32), fmt),
@@ -589,7 +607,7 @@ def test_wilcoxon_zero_nnz_host_sparse_does_not_crash(reference, fmt):
         adata,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         reference=reference,
         pts=True,
     )
@@ -600,6 +618,7 @@ def test_wilcoxon_zero_nnz_host_sparse_does_not_crash(reference, fmt):
             assert np.all(np.isfinite(np.asarray(result[field][group], dtype=float)))
 
 
+@ignore_small_groups
 def test_wilcoxon_ovo_host_csr_unsorted_indices_match_sorted():
     rng = np.random.default_rng(42)
     dense = rng.poisson(1.0, size=(80, 12)).astype(np.float32)
@@ -619,7 +638,8 @@ def test_wilcoxon_ovo_host_csr_unsorted_indices_match_sorted():
                 ["ref"] * 20 + ["a"] * 20 + ["b"] * 20 + ["c"] * 20,
                 categories=["ref", "a", "b", "c"],
             )
-        }
+        },
+        index=[str(i) for i in range(80)],
     )
     var = pd.DataFrame(index=[f"g{i}" for i in range(dense.shape[1])])
     sorted_adata = sc.AnnData(X=sorted_csr, obs=obs.copy(), var=var.copy())
@@ -629,7 +649,7 @@ def test_wilcoxon_ovo_host_csr_unsorted_indices_match_sorted():
         "groupby": "group",
         "method": "wilcoxon",
         "reference": "ref",
-        "use_raw": False,
+        "use": "X",
         "tie_correct": True,
         "n_genes": dense.shape[1],
     }
@@ -647,6 +667,141 @@ def test_wilcoxon_ovo_host_csr_unsorted_indices_match_sorted():
                 atol=1e-15,
                 equal_nan=True,
             )
+
+
+# The threaded canonical-format scan agrees with scipy's on both paths (one
+# thread below CANONICAL_SCAN_SERIAL_NNZ = 2**22 stored entries, ~4.5M here).
+@pytest.mark.parametrize("n_rows", [100, 100_000])
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_has_canonical_format_host_matches_scipy(n_rows, dtype):
+    lengths = np.arange(n_rows) % 7 * 15  # includes empty rows
+    indptr = np.concatenate([[0], np.cumsum(lengths)]).astype(dtype)
+    indices = (np.arange(indptr[-1]) - np.repeat(indptr[:-1], lengths)).astype(dtype)
+    assert _wc.has_canonical_format_host(indptr, indices)
+    for row in (1, n_rows // 2, n_rows - 1):
+        p = indptr[row]
+        for a, b in ((p + 1, p), (p, p)):  # swapped pair, duplicate
+            bad = indices.copy()
+            bad[p], bad[p + 1] = indices[a], indices[b]
+            X = sp.csr_matrix((np.ones(len(bad), np.float32), bad, indptr), shape=(n_rows, 100))
+            assert not X.has_canonical_format
+            assert not _wc.has_canonical_format_host(indptr, bad)
+
+
+# scipy keeps strided index views: rows hold two reversed (unsorted) entries
+# behind a stride, and the neighbouring column (10**6) makes a unit-stride read
+# look sorted. The canonical check and multi-GPU row boundaries must not misread it.
+@pytest.mark.parametrize("reference", ["rest", "a"])
+@pytest.mark.parametrize(
+    "multi_gpu",
+    [False, pytest.param([0, 1], marks=pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="needs 2 GPUs"))],
+)
+def test_wilcoxon_host_csr_strided_indices(multi_gpu, reference, monkeypatch):
+    # Several column batches, so batch boundaries search the (sorted) rows.
+    for ovr in (True, False):
+        monkeypatch.setitem(_wilcoxon._SUB_BATCH, ("csr_host", ovr), 8)
+    rng = np.random.default_rng(7)
+    n_cells, n_genes = 120, 30
+    pairs = np.sort(np.argsort(rng.random((n_cells, n_genes)), axis=1)[:, :2], axis=1).astype(np.int32)
+    values = rng.integers(1, 5, (n_cells, 2)).astype(np.float32)
+    indptr = np.arange(0, 2 * n_cells + 1, 2, dtype=np.int32)
+    ref = sp.csr_matrix((values.ravel(), pairs.ravel(), indptr), shape=(n_cells, n_genes))
+    table = np.stack([np.full(2 * n_cells, 10**6, np.int32), pairs[:, ::-1].ravel()], axis=1)
+    strided = sp.csr_matrix((values[:, ::-1].ravel(), table[:, 1], indptr), shape=(n_cells, n_genes))
+    assert not strided.indices.flags.c_contiguous
+    obs = pd.DataFrame({"g": pd.Categorical(np.repeat(list("abcd"), 30))}, index=[str(i) for i in range(n_cells)])
+    results = []
+    for X in (ref, strided):
+        adata = sc.AnnData(X=X, obs=obs.copy())
+        rsc.tl.rank_genes_groups(
+            adata,
+            "g",
+            method="wilcoxon",
+            reference=reference,
+            tie_correct=True,
+            multi_gpu=multi_gpu,
+            use="X",
+        )
+        results.append(adata.uns["rank_genes_groups"])
+    for field in ("names", "scores", "pvals"):
+        for group in results[0][field].dtype.names:
+            np.testing.assert_array_equal(results[1][field][group], results[0][field][group])
+
+
+# Batch widths beyond the genes, free memory or the host-CSR column histogram's
+# shared memory (one int per column) are clamped and give the default result.
+@ignore_small_groups
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "cupy_dense"])
+def test_wilcoxon_wide_batches_match_default(fmt, monkeypatch):
+    rng = np.random.default_rng(8)
+    X = _to_format(rng.poisson(0.3, (40, 13_000)).astype(np.float32), fmt)
+    obs = pd.DataFrame({"g": pd.Categorical(np.repeat(list("ab"), 20))}, index=[str(i) for i in range(40)])
+    results = []
+    for wide in (False, True):
+        if wide:
+            for key in list(_wilcoxon._SUB_BATCH):
+                monkeypatch.setitem(_wilcoxon._SUB_BATCH, key, 20_000)
+        adata = sc.AnnData(X=X, obs=obs.copy())
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", multi_gpu=False, n_genes=100, use="X")
+        results.append(adata.uns["rank_genes_groups"])
+    for field in ("names", "scores", "pvals"):
+        for group in ("a", "b"):
+            np.testing.assert_array_equal(results[1][field][group], results[0][field][group])
+
+
+# Host CSC arrays that cannot be page-locked (read-only memory maps) stream
+# through pageable copies instead of failing.
+@ignore_small_groups
+def test_wilcoxon_host_csc_read_only_memmap(tmp_path):
+    rng = np.random.default_rng(9)
+    X = sp.csc_matrix(rng.poisson(1.0, (60, 8)).astype(np.float32))
+    for name in ("data", "indices", "indptr"):
+        np.save(tmp_path / f"{name}.npy", getattr(X, name))
+    arrays = tuple(np.load(tmp_path / f"{name}.npy", mmap_mode="r") for name in ("data", "indices", "indptr"))
+    obs = pd.DataFrame({"g": pd.Categorical(np.repeat(list("abc"), 20))}, index=[str(i) for i in range(60)])
+    results = []
+    for M in (X, sp.csc_matrix(arrays, shape=X.shape)):
+        adata = sc.AnnData(X=M, obs=obs.copy())
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", reference="a", use="X")
+        results.append(adata.uns["rank_genes_groups"])
+    for group in ("b", "c"):
+        np.testing.assert_array_equal(results[1]["scores"][group], results[0]["scores"][group])
+
+
+# The bindings check shapes so a bad call raises instead of indexing out of bounds.
+def test_wilcoxon_bindings_reject_inconsistent_shapes():
+    X = cp.asfortranarray(cp.ones((6, 2), dtype=cp.float32))
+    rows = cp.arange(6, dtype=cp.int32)
+    codes = cp.zeros(6, dtype=cp.int32)
+    kw = {"compute_tie_corr": True, "compute_nnz": False, "stream": cp.cuda.get_current_stream().ptr}
+    stats = (cp.zeros((2, 2)), cp.zeros((1, 1)))
+    with pytest.raises(ValueError, match="do not match"):  # per-group tie_corr expected
+        _wc.ovo_dense(
+            X, rows[:3], rows[3:], cp.asarray([0, 3], cp.int32), codes, cp.empty((1, 2)), cp.ones(1), *stats, **kw
+        )
+    with pytest.raises(ValueError, match="span"):  # offsets miss a group row
+        _wc.ovo_dense(
+            X, rows[:3], rows[3:], cp.asarray([0, 2], cp.int32), codes, cp.empty((1, 2)), cp.ones((1, 2)), *stats, **kw
+        )
+    host = sp.csr_matrix(np.ones((6, 2), np.float32))
+    with pytest.raises(ValueError, match="row spans"):
+        _wc.ovr_sparse(
+            host.data,
+            host.indices,
+            host.indptr,
+            host.indptr[:3],
+            host.indptr[1:4],
+            codes,
+            cp.ones(1),
+            cp.empty((1, 2)),
+            cp.ones(2),
+            cp.zeros((1, 2)),
+            *(cp.zeros((1, 1)),) * 3,
+            csc=False,
+            compute_tie_corr=False,
+            compute_nnz=False,
+            compute_totals=False,
+        )
 
 
 @pytest.mark.parametrize("reference", ["rest", "1"])
@@ -672,13 +827,12 @@ def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt):
     kw = {
         "groupby": "blobs",
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": reference,
         "tie_correct": True,
         "n_genes": 5,
     }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu_result = adata_gpu.uns["rank_genes_groups"]
     cpu_result = adata_cpu.uns["rank_genes_groups"]
@@ -695,6 +849,115 @@ def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt):
             )
 
 
+# Expression-space means (Scanpy 2 preset) are expm1 sums from the test pass;
+# a groups= subset against rest takes its rest from the kernel totals.
+@pytest.mark.parametrize(("groups", "reference"), [("all", "rest"), ("all", "b"), (["a", "c"], "rest")])
+@pytest.mark.parametrize("pts", [False, True])
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_dense", "cupy_csr", "cupy_csc"])
+def test_wilcoxon_expression_space_logfoldchanges(groups, reference, pts, fmt):
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(1.5, (300, 8)) * (rng.random((300, 8)) < 0.5)
+    labels = rng.choice(list("abc"), 300)
+    obs = pd.DataFrame({"g": pd.Categorical(labels)}, index=[str(i) for i in range(300)])
+    adata = sc.AnnData(X=_to_format(np.log2(1 + counts).astype(np.float32), fmt), obs=obs)
+    adata.uns["log1p"] = {"base": 2}
+    rsc.tl.rank_genes_groups(
+        adata,
+        "g",
+        method="wilcoxon",
+        groups=groups,
+        reference=reference,
+        mean_in_log_space=False,
+        pts=pts,
+        use="X",
+    )
+    result = adata.uns["rank_genes_groups"]
+    for group in result["names"].dtype.names:
+        rest = counts[labels == "b"] if reference == "b" else counts[labels != group]
+        expected = np.log2((counts[labels == group].mean(0) + 1e-9) / (rest.mean(0) + 1e-9))
+        genes = np.asarray(result["names"][group]).astype(int)
+        np.testing.assert_allclose(result["logfoldchanges"][group], expected[genes], rtol=1e-5, atol=1e-5)
+        if pts:
+            np.testing.assert_allclose(result["pts"][group].to_numpy(), (counts[labels == group] > 0).mean(0))
+            if reference == "rest":
+                np.testing.assert_allclose(result["pts_rest"][group].to_numpy(), (rest > 0).mean(0))
+
+
+# Expression-space means invert the native values: integers float32 cannot hold
+# exactly (here with a log base near 1, where they stay finite) are not rounded.
+@ignore_small_groups
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_dense"])
+def test_wilcoxon_expression_space_wide_integers(fmt):
+    X = np.array([[2**24], [2**24], [2**24 + 1], [2**24 + 1]], dtype=np.int64)
+    obs = pd.DataFrame({"g": pd.Categorical(["r", "r", "t", "t"])}, index=[str(i) for i in range(4)])
+    lfc = {}
+    for dtype in (np.int64, np.float64):
+        adata = sc.AnnData(X=_to_format(X.astype(dtype), fmt), obs=obs.copy())
+        adata.uns["log1p"] = {"base": np.exp(4e-5)}
+        kw = {"groups": ["t"], "reference": "r", "mean_in_log_space": False, "use": "X"}
+        rsc.tl.rank_genes_groups(adata, "g", method="wilcoxon", **kw)
+        lfc[dtype] = adata.uns["rank_genes_groups"]["logfoldchanges"]["t"]
+    np.testing.assert_allclose(lfc[np.int64], 4e-5 / np.log(2), rtol=1e-6)
+    np.testing.assert_array_equal(lfc[np.int64], lfc[np.float64])
+
+
+# Stream-ordered pools (CuPy MemoryAsyncPool, RMM async) allocate the kernels'
+# scratch on the caller's stream; the workers must wait for it.
+@pytest.mark.parametrize("reference", ["rest", "1"])
+@pytest.mark.parametrize(
+    "fmt", ["numpy_dense", "numpy_dense_f", "scipy_csr", "scipy_csc", "cupy_dense", "cupy_csr", "cupy_csc"]
+)
+def test_wilcoxon_async_allocator_matches_default(fmt, reference):
+    rng = np.random.default_rng(11)
+    dense = (rng.poisson(1.0, (600, 70)) * (rng.random((600, 70)) < 0.6)).astype(np.float32)
+    obs = pd.DataFrame({"g": pd.Categorical(rng.choice(list("0123"), 600))}, index=[str(i) for i in range(600)])
+    X = np.asfortranarray(dense) if fmt == "numpy_dense_f" else _to_format(dense, fmt)
+    expected, actual = sc.AnnData(X=X, obs=obs.copy()), sc.AnnData(X=X, obs=obs.copy())
+    kw = {"method": "wilcoxon", "reference": reference, "use": "X", "multi_gpu": False}
+    rsc.tl.rank_genes_groups(expected, "g", **kw)
+    allocator = cp.cuda.get_allocator()
+    cp.cuda.set_allocator(cp.cuda.MemoryAsyncPool().malloc)
+    try:
+        with cp.cuda.Stream(non_blocking=True):
+            rsc.tl.rank_genes_groups(actual, "g", **kw)
+    finally:
+        cp.cuda.set_allocator(allocator)
+    _assert_multi_gpu_wilcoxon_equal(actual, expected)
+
+
+# pts count nonzero values: explicitly stored zeros are not expressed (scanpy
+# calls eliminate_zeros() before counting).
+@pytest.mark.parametrize("mean_in_log_space", [True, False])
+@pytest.mark.parametrize("reference", ["rest", "b"])
+@pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
+def test_wilcoxon_pts_ignore_stored_zeros(fmt, reference, mean_in_log_space):
+    rng = np.random.default_rng(5)
+    dense = rng.poisson(1.0, (90, 5)).astype(np.float32)
+    labels = np.repeat(list("abc"), 30)
+    X = sp.csr_matrix(np.ones_like(dense))
+    X.data = dense.ravel()  # every entry stored, zeros explicitly
+    if fmt.endswith("csc"):
+        X = X.tocsc()
+    if fmt.startswith("cupy"):
+        X = (cpsp.csc_matrix if fmt.endswith("csc") else cpsp.csr_matrix)(X)
+    obs = pd.DataFrame({"g": pd.Categorical(labels)}, index=[str(i) for i in range(90)])
+    adata = sc.AnnData(X=X, obs=obs)
+    rsc.tl.rank_genes_groups(
+        adata,
+        "g",
+        method="wilcoxon",
+        reference=reference,
+        pts=True,
+        mean_in_log_space=mean_in_log_space,
+        use="X",
+    )
+    result = adata.uns["rank_genes_groups"]
+    for group in result["names"].dtype.names:
+        np.testing.assert_allclose(result["pts"][group].to_numpy(), (dense[labels == group] > 0).mean(0))
+        if reference == "rest":
+            np.testing.assert_allclose(result["pts_rest"][group].to_numpy(), (dense[labels != group] > 0).mean(0))
+
+
 def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
     """AnnData with exact per-group sizes (drives OVO tier selection by max size)."""
     rng = np.random.default_rng(seed)
@@ -702,7 +965,7 @@ def _make_sized_groups_adata(group_sizes, n_genes, seed=0):
     X = np.abs(rng.standard_normal((n_obs, n_genes))).astype(np.float32)
     X[X < 0.3] = 0.0  # zeros create tie groups, exercising tie correction
     labels = np.concatenate([np.full(sz, f"g{i}", dtype=object) for i, sz in enumerate(group_sizes)])
-    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    obs = pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(n_obs)])
     var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_genes)])
     adata = sc.AnnData(X=X, obs=obs, var=var)
     adata.uns["log1p"] = {"base": None}
@@ -726,13 +989,12 @@ def test_wilcoxon_ovo_large_group_tiers_match_scanpy(fmt, tie_correct, big):
     kw = {
         "groupby": "group",
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "g0",
         "tie_correct": tie_correct,
         "n_genes": 6,
     }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu = adata_gpu.uns["rank_genes_groups"]
     cpu = adata_cpu.uns["rank_genes_groups"]
@@ -760,7 +1022,7 @@ def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
             a,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=tie_correct,
             n_genes=6,
@@ -779,7 +1041,7 @@ def test_wilcoxon_ovr_many_groups_gmem_formats_agree(tie_correct):
 
 # Host-dense OVR gmem buffers are reused round-robin and must be zeroed per batch.
 # This forces enough groups and genes to wrap per-stream rank-sum buffers.
-@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 6200 tiny groups warn
+@ignore_small_groups
 def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
     adata = _make_sized_groups_adata([2] * 6200, n_genes=400, seed=7)
     ref = None
@@ -790,7 +1052,7 @@ def test_wilcoxon_ovr_dense_gmem_host_streaming_buffer_reuse():
             a,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
         )
@@ -818,7 +1080,7 @@ def test_wilcoxon_dense_nonfloat_data_matches_float32(data_dtype):
     typed = np.ascontiguousarray(counts.astype(data_dtype))
     f32 = np.ascontiguousarray(counts.astype(np.float32))
     labels = np.array([f"{i % 3}" for i in range(n_obs)])
-    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    obs = pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(n_obs)])
     var = pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])
 
     def run(arr):
@@ -828,7 +1090,7 @@ def test_wilcoxon_dense_nonfloat_data_matches_float32(data_dtype):
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
             n_genes=n_genes,
@@ -852,7 +1114,7 @@ def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
     X = np.abs(rng.standard_normal((300, 40))).astype(dtype)
     X[X < 0.3] = 0.0
     labels = rng.integers(0, 5, 300)
-    obs = pd.DataFrame({"group": pd.Categorical([f"g{c}" for c in labels])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"g{c}" for c in labels])}, index=[str(i) for i in range(300)])
     var = pd.DataFrame(index=[f"g{j}" for j in range(40)])
 
     def run(arr):
@@ -862,7 +1124,7 @@ def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
         )
@@ -882,6 +1144,7 @@ def test_wilcoxon_ovr_fortran_order_host_dense_matches_c_order(dtype):
 
 # Guards host sparse OVR smem packing for pts=True, where nnz offset once overran.
 # n_groups=50 stays on smem but reaches the formerly faulting regime.
+@pytest.mark.filterwarnings("ignore:DataFrame is highly fragmented:pandas.errors.PerformanceWarning")
 @pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
 def test_wilcoxon_ovr_pts_many_groups_match_scanpy(fmt):
     adata_gpu = _make_sized_groups_adata([40] * 50, n_genes=8, seed=4)
@@ -891,14 +1154,13 @@ def test_wilcoxon_ovr_pts_many_groups_match_scanpy(fmt):
     kw = {
         "groupby": "group",
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "rest",
         "tie_correct": True,
         "pts": True,
         "n_genes": 8,
     }
-    rsc.tl.rank_genes_groups(adata_gpu, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata_gpu, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
 
     gpu = adata_gpu.uns["rank_genes_groups"]
     cpu = adata_cpu.uns["rank_genes_groups"]
@@ -929,7 +1191,7 @@ def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
             a,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
             pts=True,
@@ -948,6 +1210,7 @@ def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
             np.testing.assert_allclose(cur[field], ref[field], rtol=1e-13, atol=1e-15, equal_nan=True)
 
 
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
 @pytest.mark.parametrize(
     ("groups", "reference"),
     [
@@ -958,11 +1221,15 @@ def test_wilcoxon_ovr_many_groups_gmem_pts_formats_agree():
     ],
 )
 @pytest.mark.parametrize("tie_correct", [False, True])
-def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie_correct):
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr"])
+def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie_correct, fmt):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=8, n_centers=5, n_observations=200)
     adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
     adata_cpu = adata_gpu.copy()
+    # Host OVO ranks only the selected cells: CSR passes just their spans, dense
+    # gathers them per gene batch when they are under half the cells.
+    adata_gpu.X = _to_format(adata_gpu.X, fmt)
 
     rsc.tl.rank_genes_groups(
         adata_gpu,
@@ -970,7 +1237,7 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
         method="wilcoxon",
         groups=groups,
         reference=reference,
-        use_raw=False,
+        use="X",
         tie_correct=tie_correct,
     )
     sc.tl.rank_genes_groups(
@@ -979,7 +1246,7 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
         method="wilcoxon",
         groups=groups,
         reference=reference,
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         tie_correct=tie_correct,
     )
 
@@ -1001,6 +1268,41 @@ def test_rank_genes_groups_wilcoxon_subset_matches_scanpy(groups, reference, tie
                     atol=1e-8,
                     err_msg=f"{field} mismatch for gene {gene} group {group}",
                 )
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("fmt", ["numpy_dense", "numpy_dense_f", "scipy_csr"])
+def test_wilcoxon_ovo_host_subset_passes_only_selected_rows(fmt, pinned, monkeypatch):
+    """Host OVO keeps the matrix whole and hands the kernels only the selected rows, staged through reused pageable
+    or pinned slots over ten 4-gene batches (the last one gene wide)."""
+    rng = np.random.default_rng(3)
+    dense = rng.integers(0, 6, size=(240, 37)).astype(np.float32)
+    dense[dense < 2] = 0.0
+    obs = pd.DataFrame({"group": pd.Categorical([str(i % 8) for i in range(240)])}, index=[str(i) for i in range(240)])
+    X = np.asfortranarray(dense) if fmt == "numpy_dense_f" else _to_format(dense, fmt)
+    host, device = sc.AnnData(X=X, obs=obs.copy()), sc.AnnData(X=cp.asarray(dense), obs=obs.copy())
+    name = "ovo_sparse" if fmt == "scipy_csr" else "ovo_dense"
+    binding, seen = getattr(_wc, name), []
+
+    def spy(*args, **kw):
+        seen.append((len(args[3]), len(args[4])) if name == "ovo_sparse" else (args[0].shape[0], len(kw["rows"])))
+        return binding(*args, **kw)
+
+    monkeypatch.setattr(_wc, name, spy)
+    monkeypatch.setitem(_wilcoxon._SUB_BATCH, ("csr_host" if fmt == "scipy_csr" else "dense", False), 4)
+    kw = {"method": "wilcoxon", "groups": ["1", "2"], "reference": "0", "use": "X", "multi_gpu": False}
+    stage_bytes = _wc._set_pageable_stage_bytes(0) if pinned else None
+    try:
+        rsc.tl.rank_genes_groups(host, "group", **kw)
+    finally:
+        if pinned:
+            _wc._set_pageable_stage_bytes(stage_bytes)
+    monkeypatch.undo()
+    rsc.tl.rank_genes_groups(device, "group", **kw)
+
+    # 3 of 8 groups of 30 cells: CSR spans or dense row ids for those 90 rows only.
+    assert seen == [(90, 90) if fmt == "scipy_csr" else (240, 90)]
+    _assert_multi_gpu_wilcoxon_equal(host, device)
 
 
 @pytest.mark.parametrize(
@@ -1082,7 +1384,7 @@ def test_rank_genes_groups_wilcoxon_pts(reference):
         adata_gpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         pts=True,
         tie_correct=False,
         reference=reference,
@@ -1091,7 +1393,7 @@ def test_rank_genes_groups_wilcoxon_pts(reference):
         adata_cpu,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         pts=True,
         tie_correct=False,
         reference=reference,
@@ -1193,7 +1495,7 @@ class TestWilcoxonAgainstScipy:
             groups=["treatment"],
             reference="control",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             tie_correct=True,
             use_continuity=True,
         )
@@ -1215,7 +1517,7 @@ class TestWilcoxonAgainstScipy:
             groups=["treatment"],
             reference="control",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             tie_correct=True,
             use_continuity=False,
         )
@@ -1239,7 +1541,7 @@ class TestWilcoxonAgainstScipy:
             "groups": ["treatment"],
             "reference": "control",
             "method": "wilcoxon",
-            "use_raw": False,
+            "use": "X",
             "tie_correct": True,
         }
         rsc.tl.rank_genes_groups(adata_dense, **kw)
@@ -1261,7 +1563,7 @@ def _make_count_adata(seed=0, n_obs=120, n_genes=6, n_groups=3):
     X = rng.integers(0, 8, size=(n_obs, n_genes)).astype(np.float64)
     X[X < 2] = 0.0  # extra zeros -> implicit-zero tie blocks
     labels = np.array([f"{i % n_groups}" for i in range(n_obs)])
-    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    obs = pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(n_obs)])
     var = pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])
     adata = sc.AnnData(X=X, obs=obs, var=var)
     adata.uns["log1p"] = {"base": None}
@@ -1281,13 +1583,12 @@ def test_wilcoxon_host_sparse_float64_data_matches_scanpy(fmt, reference):
     kw = {
         "groupby": "group",
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": reference,
         "tie_correct": True,
         "n_genes": adata.n_vars,
     }
-    rsc.tl.rank_genes_groups(adata, **kw)
-    sc.tl.rank_genes_groups(adata_cpu, **kw)
+    rsc.tl.rank_genes_groups(adata, use="X", **kw)
+    sc.tl.rank_genes_groups(adata_cpu, **sc_use(A.X, use_raw=False), **kw)
     g = adata.uns["rank_genes_groups"]
     c = adata_cpu.uns["rank_genes_groups"]
     for field in ("scores", "pvals", "pvals_adj"):
@@ -1313,7 +1614,7 @@ def test_wilcoxon_sparse_integer_bool_data_matches_float32(fmt, data_dtype):
     typed = counts.astype(data_dtype)
     f32 = counts.astype(np.float32)
     labels = np.array([f"{i % 3}" for i in range(n_obs)])
-    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    obs = pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(n_obs)])
     var = pd.DataFrame(index=[f"g{j}" for j in range(n_genes)])
 
     def run(arr):
@@ -1323,7 +1624,7 @@ def test_wilcoxon_sparse_integer_bool_data_matches_float32(fmt, data_dtype):
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="rest",
             tie_correct=True,
             n_genes=n_genes,
@@ -1344,11 +1645,13 @@ def test_wilcoxon_device_sparse_bool_data_raises():
     mat = cpsp.csr_matrix(cp.asarray(counts))
     adata = sc.AnnData(
         X=mat,
-        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(100)])}),
+        obs=pd.DataFrame(
+            {"group": pd.Categorical([f"{i % 2}" for i in range(100)])}, index=[str(i) for i in range(100)]
+        ),
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="float32 or float64"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
@@ -1361,11 +1664,11 @@ def test_wilcoxon_sparse_float16_data_raises(fmt):
     mat.data = mat.data.astype(xp.float16)
     adata = sc.AnnData(
         X=mat,
-        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(40)])}),
+        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(40)])}, index=[str(i) for i in range(40)]),
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="float32"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 @pytest.mark.parametrize("fmt", ["scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
@@ -1376,11 +1679,11 @@ def test_wilcoxon_sparse_complex_data_raises(fmt):
     mat = _to_format(dense.astype(np.complex64), fmt)
     adata = sc.AnnData(
         X=mat,
-        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(40)])}),
+        obs=pd.DataFrame({"group": pd.Categorical([f"{i % 2}" for i in range(40)])}, index=[str(i) for i in range(40)]),
         var=pd.DataFrame(index=[f"g{j}" for j in range(4)]),
     )
     with pytest.raises(TypeError, match="complex sparse data is not supported"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 @pytest.mark.parametrize("reference", ["rest", "2"])
@@ -1399,7 +1702,7 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
         adata,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         groups=groups,
         reference=reference,
     )
@@ -1407,21 +1710,24 @@ def test_wilcoxon_group_subset_column_order_matches_scanpy(reference):
         bdata,
         "blobs",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         groups=groups,
         reference=reference,
     )
     assert adata.uns["rank_genes_groups"]["names"].dtype.names == bdata.uns["rank_genes_groups"]["names"].dtype.names
 
 
-def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
+def test_wilcoxon_host_csr_signed_ovr_matches_scanpy(monkeypatch):
     """Host CSR OVR ranks signed stored values correctly."""
+    monkeypatch.setitem(_wilcoxon._SUB_BATCH, ("csr_host", True), 8)  # several batches
     rng = np.random.default_rng(0)
     n_obs, n_vars = 200, 24
     X = (rng.random((n_obs, n_vars)) * 5.0).astype(np.float64)
     X[X < 1.5] = 0.0  # structural zeros so pts < 1
-    X[rng.random((n_obs, n_vars)) < 0.01] = -0.5  # a few negatives -> fallback
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])})
+    X[rng.random((n_obs, n_vars)) < 0.01] = -0.5  # a few negatives
+    obs = pd.DataFrame(
+        {"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])}, index=[str(i) for i in range(n_obs)]
+    )
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
 
     gpu = sc.AnnData(X=sp.csr_matrix(X), obs=obs.copy(), var=var.copy())
@@ -1431,18 +1737,17 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
         gpu,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         reference="rest",
         pts=True,
         tie_correct=True,
         n_genes=n_vars,
-        chunk_size=8,  # < n_vars -> multiple chunks
     )
     sc.tl.rank_genes_groups(
         cpu,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        **sc_use(A.X, use_raw=False),
         reference="rest",
         pts=True,
         tie_correct=True,
@@ -1471,6 +1776,7 @@ def test_wilcoxon_host_csr_signed_ovr_matches_scanpy():
             )
 
 
+@pytest.mark.filterwarnings("ignore:invalid value encountered in divide:RuntimeWarning")
 def test_wilcoxon_fdr_ties_nan_match_scanpy():
     """BH FDR must match scanpy on tied, constant, and all-zero genes."""
     rng = np.random.default_rng(1)
@@ -1478,14 +1784,16 @@ def test_wilcoxon_fdr_ties_nan_match_scanpy():
     X = rng.integers(0, 3, size=(n_obs, n_vars)).astype(np.float64)  # heavy ties
     X[:, 0] = 1.0  # constant gene -> identical p across groups
     X[:, 1] = 0.0  # all-zero gene
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])})
+    obs = pd.DataFrame(
+        {"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])}, index=[str(i) for i in range(n_obs)]
+    )
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
 
     gpu = sc.AnnData(X=cp.asarray(X), obs=obs.copy(), var=var.copy())  # GPU FDR path
     cpu = sc.AnnData(X=X.copy(), obs=obs.copy(), var=var.copy())
 
-    rsc.tl.rank_genes_groups(gpu, "group", method="wilcoxon", use_raw=False, tie_correct=True)
-    sc.tl.rank_genes_groups(cpu, "group", method="wilcoxon", use_raw=False, tie_correct=True)
+    rsc.tl.rank_genes_groups(gpu, "group", method="wilcoxon", use="X", tie_correct=True)
+    sc.tl.rank_genes_groups(cpu, "group", method="wilcoxon", **sc_use(A.X, use_raw=False), tie_correct=True)
     g = gpu.uns["rank_genes_groups"]
     c = cpu.uns["rank_genes_groups"]
     for group in g["names"].dtype.names:
@@ -1518,7 +1826,7 @@ def test_host_sparse_int64_templates_match_int32(reference, layout, data_dtype):
     rng = np.random.default_rng(0)
     dense = (rng.random((150, 8)) * 4.0).astype(np.float64)
     dense[dense < 1.5] = 0.0  # nonnegative + structural zeros -> sparse fast path
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])}, index=[str(i) for i in range(150)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(8)])
 
     maker = sp.csr_matrix if layout == "csr" else sp.csc_matrix
@@ -1532,7 +1840,7 @@ def test_host_sparse_int64_templates_match_int32(reference, layout, data_dtype):
     )
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "tie_correct": True,
     }
@@ -1546,28 +1854,28 @@ def test_host_sparse_int64_templates_match_int32(reference, layout, data_dtype):
             np.testing.assert_array_equal(np.asarray(r64[fld][grp]), np.asarray(r32[fld][grp]))
 
 
-def _anndata_with_group_sizes(sizes, *, n_genes=6, seed=0):
+def _anndata_with_group_sizes(sizes, *, n_genes=6, seed=0, signed=False):
     """Dense AnnData with exact per-group sizes for OVO tier tests."""
     rng = np.random.default_rng(seed)
     labels = []
     for name, n in sizes.items():
         labels += [name] * n
-    X = rng.integers(0, 6, size=(len(labels), n_genes)).astype(np.float64)
-    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    X = rng.integers(-3 if signed else 0, 4 if signed else 6, size=(len(labels), n_genes)).astype(np.float64)
+    obs = pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(len(labels))])
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
     return sc.AnnData(X=X, obs=obs, var=var)
 
 
-def _assert_ovo_matches_scanpy(adata, reference):
+def _assert_ovo_matches_scanpy(adata, reference, fmt="numpy_dense"):
     bdata = adata.copy()
+    adata.X = _to_format(adata.X, fmt)
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": reference,
         "tie_correct": True,
     }
-    rsc.tl.rank_genes_groups(adata, "group", **kw)
-    sc.tl.rank_genes_groups(bdata, "group", **kw)
+    rsc.tl.rank_genes_groups(adata, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(bdata, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = adata.uns["rank_genes_groups"], bdata.uns["rank_genes_groups"]
     for fld in ("scores", "pvals", "pvals_adj"):
         for grp in g[fld].dtype.names:
@@ -1577,6 +1885,7 @@ def _assert_ovo_matches_scanpy(adata, reference):
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
 
+@ignore_small_groups
 @pytest.mark.parametrize(
     ("sizes", "seed"),
     [
@@ -1590,7 +1899,16 @@ def test_ovo_tier_bands_match_scanpy(sizes, seed):
     _assert_ovo_matches_scanpy(adata, reference="ref")
 
 
-@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 6200 tiny groups warn
+# Signed values with zeros: zeros rank as one tie block between negatives and
+# positives in every OVO tie band (MEDIUM, LARGE, HUGE) and layout.
+@pytest.mark.filterwarnings("ignore:invalid value encountered in log2:RuntimeWarning")
+@pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_dense", "cupy_csr", "cupy_csc"])
+def test_ovo_signed_zero_ties_match_scanpy(fmt):
+    adata = _anndata_with_group_sizes({"ref": 40, "g40": 40, "g700": 700, "g3000": 3000}, seed=4, signed=True)
+    _assert_ovo_matches_scanpy(adata, reference="ref", fmt=fmt)
+
+
+@ignore_small_groups
 def test_ovr_dense_gmem_branch_matches_scipy():
     """Dense OVR gmem branch must match scipy on sampled groups."""
     from scipy.stats import mannwhitneyu
@@ -1599,11 +1917,11 @@ def test_ovr_dense_gmem_branch_matches_scipy():
     rng = np.random.default_rng(3)
     labels = np.repeat(np.arange(n_groups), 2)  # 2 cells per group
     X = rng.integers(0, 6, size=(labels.size, n_genes)).astype(np.float64)
-    obs = pd.DataFrame({"group": pd.Categorical([str(x) for x in labels])})
+    obs = pd.DataFrame({"group": pd.Categorical([str(x) for x in labels])}, index=[str(i) for i in range(labels.size)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
     adata = sc.AnnData(X=X, obs=obs, var=var)
 
-    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, tie_correct=True)
+    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", tie_correct=True)
     res = adata.uns["rank_genes_groups"]
     for grp in ("0", "1", "250", "1000", "3057", "6112", "6199"):
         gp = dict(zip(res["names"][grp], np.asarray(res["pvals"][grp], float), strict=False))
@@ -1626,10 +1944,11 @@ def test_ovr_dense_gmem_branch_matches_scipy():
             )
 
 
+@ignore_small_groups
 def test_skip_empty_groups_vs_rest_drops_singleton():
     """skip_empty_groups=True with reference='rest' drops singleton groups."""
     adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=4)
-    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True)
+    rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", skip_empty_groups=True)
     names = set(adata.uns["rank_genes_groups"]["names"].dtype.names)
     assert names == {"a", "b"}  # singleton "c" dropped, no error
 
@@ -1642,7 +1961,7 @@ def test_skip_empty_groups_reference_too_small_raises():
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             reference="c",
             skip_empty_groups=True,
         )
@@ -1652,7 +1971,7 @@ def test_skip_empty_groups_none_remain_raises():
     """skip_empty_groups=True raises when no group has >=2 cells (vs-rest)."""
     adata = _anndata_with_group_sizes({"a": 1, "b": 1, "c": 1}, seed=4)
     with pytest.raises(ValueError, match="No groups with at least two samples remain"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, skip_empty_groups=True)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", skip_empty_groups=True)
 
 
 @pytest.mark.parametrize("fmt", ["numpy_dense", "scipy_csr", "scipy_csc", "cupy_csr", "cupy_csc"])
@@ -1662,19 +1981,20 @@ def test_ovr_tie_correct_false_tie_heavy_matches_scanpy(fmt):
     n_obs, n_genes = 180, 8
     dense = rng.integers(0, 5, size=(n_obs, n_genes)).astype(np.float64)  # ties
     dense[dense < 1.0] = 0.0  # nonnegative + structural zeros -> sparse fast path
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])})
+    obs = pd.DataFrame(
+        {"group": pd.Categorical([f"{i % 3}" for i in range(n_obs)])}, index=[str(i) for i in range(n_obs)]
+    )
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
 
     gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
     cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "rest",
         "tie_correct": False,
     }
-    rsc.tl.rank_genes_groups(gpu, "group", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
@@ -1696,7 +2016,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
     # is material. Integer values give ties (exercises the tie term too).
     dense = rng.integers(0, 4, size=(n_obs, n_genes)).astype(np.float64)
     labels = np.array([str(i % 3) for i in range(n_obs)])
-    obs = pd.DataFrame({"group": pd.Categorical(labels)})
+    obs = pd.DataFrame({"group": pd.Categorical(labels)}, index=[str(i) for i in range(n_obs)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
 
     gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
@@ -1704,7 +2024,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
         gpu,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         reference=reference,
         tie_correct=True,
         use_continuity=True,
@@ -1732,7 +2052,7 @@ def test_use_continuity_matches_scipy(fmt, reference):
 def test_rank_genes_groups_default_method_is_ttest():
     """Omitting method= defaults to t-test (rank_genes_groups path)."""
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    rsc.tl.rank_genes_groups(adata, "group", use_raw=False)
+    rsc.tl.rank_genes_groups(adata, "group", use="X")
     assert adata.uns["rank_genes_groups"]["params"]["method"] == "t-test"
 
 
@@ -1741,8 +2061,6 @@ def test_rank_genes_groups_default_method_is_ttest():
     [
         ({"method": "nope"}, ValueError, "method must be one of"),
         ({"corr_method": "foo"}, ValueError, "corr_method must be either"),
-        ({"chunk_size": 0}, ValueError, "chunk_size must be a positive integer"),
-        ({"chunk_size": -4}, ValueError, "chunk_size must be a positive integer"),
         ({"groups": "0"}, ValueError, "Specify a sequence of groups"),
         ({"reference": "ZZ"}, ValueError, "needs to be one of groupby"),
     ],
@@ -1750,25 +2068,45 @@ def test_rank_genes_groups_default_method_is_ttest():
 def test_rank_genes_groups_invalid_args_raise(override, exc, match):
     """Public-API argument validation raises (covers __init__/_core guards)."""
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    kwargs = {"method": "wilcoxon", "use_raw": False, **override}
+    kwargs = {"method": "wilcoxon", "use": "X", **override}
     with pytest.raises(exc, match=match):
         rsc.tl.rank_genes_groups(adata, "group", **kwargs)
 
 
+# chunk_size is deprecated: it warns and does not change the result.
+@ignore_small_groups
+def test_rank_genes_groups_chunk_size_deprecated():
+    adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
+    expected = adata.copy()
+    rsc.tl.rank_genes_groups(expected, "group", method="wilcoxon", use="X")
+    with pytest.warns(FutureWarning, match="chunk_size"):
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", chunk_size=8)
+    for group in ("0", "1"):
+        np.testing.assert_array_equal(
+            adata.uns["rank_genes_groups"]["scores"][group], expected.uns["rank_genes_groups"]["scores"][group]
+        )
+
+
 def test_rank_genes_groups_mask_var_missing_key_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(KeyError, match="not found in adata.var"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, mask_var="nope")
+    with (
+        pytest.warns(FutureWarning, match="mask_var"),
+        pytest.raises(ValueError, match=r"Did not find `adata\.var\['nope'\]`"),
+    ):
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", mask_var="nope")
 
 
 def test_rank_genes_groups_mask_var_wrong_shape_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(ValueError, match="mask_var has wrong shape"):
+    with (
+        pytest.warns(FutureWarning, match="mask_var"),
+        pytest.raises(ValueError, match="shape of the mask do not match"),
+    ):
         rsc.tl.rank_genes_groups(
             adata,
             "group",
             method="wilcoxon",
-            use_raw=False,
+            use="X",
             mask_var=np.ones(adata.n_vars + 3, dtype=bool),
         )
 
@@ -1776,13 +2114,16 @@ def test_rank_genes_groups_mask_var_wrong_shape_raises():
 def test_rank_genes_groups_layer_and_use_raw_conflict_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
     adata.layers["L"] = adata.X.copy()
-    with pytest.raises(ValueError, match="Cannot specify .layer. and have"):
+    with (
+        pytest.warns(FutureWarning, match="is deprecated"),
+        pytest.raises(ValueError, match="Cannot specify .layer. and have"),
+    ):
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", layer="L", use_raw=True)
 
 
 def test_rank_genes_groups_use_raw_without_raw_raises():
     adata = _anndata_with_group_sizes({"0": 10, "1": 10}, seed=5)
-    with pytest.raises(ValueError, match="is empty"):
+    with pytest.warns(FutureWarning, match="use_raw"), pytest.raises(ValueError, match="is empty"):
         rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=True)
 
 
@@ -1790,17 +2131,18 @@ def test_singleton_group_without_skip_raises():
     """Non-skip path: a <2-cell group raises in _select_groups (line 131-135)."""
     adata = _anndata_with_group_sizes({"a": 10, "b": 10, "c": 1}, seed=5)
     with pytest.raises(ValueError, match="fewer than two samples"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False)
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X")
 
 
 def test_unused_category_without_skip_raises():
     adata = _anndata_with_group_sizes({"a": 10, "b": 10}, seed=5)
     adata.obs["group"] = adata.obs["group"].cat.add_categories(["unused"])
     with pytest.raises(ValueError, match="unused"):
-        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use_raw=False, reference="a")
+        rsc.tl.rank_genes_groups(adata, "group", method="wilcoxon", use="X", reference="a")
 
 
 @pytest.mark.parametrize("use_raw", [None, True])
+@pytest.mark.filterwarnings("ignore:The argument use_raw is deprecated:FutureWarning")
 def test_rank_genes_groups_reads_raw_matches_scanpy(use_raw):
     """use_raw=None and use_raw=True both read adata.raw, matching scanpy."""
     adata = _anndata_with_group_sizes({"0": 30, "1": 30, "2": 30}, seed=6)
@@ -1809,7 +2151,8 @@ def test_rank_genes_groups_reads_raw_matches_scanpy(use_raw):
     adata.X = rng.integers(0, 6, size=adata.shape).astype(np.float64)  # noise in .X
     bdata = adata.copy()
     kw = {"method": "wilcoxon", "use_raw": use_raw, "tie_correct": True}
-    rsc.tl.rank_genes_groups(adata, "group", **kw)
+    with pytest.warns(FutureWarning, match="use_raw"):
+        rsc.tl.rank_genes_groups(adata, "group", **kw)
     sc.tl.rank_genes_groups(bdata, "group", **kw)
     g, c = adata.uns["rank_genes_groups"], bdata.uns["rank_genes_groups"]
     for grp in g["scores"].dtype.names:
@@ -1826,7 +2169,7 @@ def test_log1p_base_logfoldchanges_match_scanpy(reference, fmt):
     (_core.py:115 + the OVO host-sparse fast path _wilcoxon.py:232-234)."""
     rng = np.random.default_rng(7)
     dense = rng.integers(1, 6, size=(120, 6)).astype(np.float64)  # nonneg, finite lfc
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(120)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(120)])}, index=[str(i) for i in range(120)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(6)])
     gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
     cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
@@ -1834,12 +2177,11 @@ def test_log1p_base_logfoldchanges_match_scanpy(reference, fmt):
     cpu.uns["log1p"] = {"base": 2.0}
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": reference,
         "tie_correct": True,
     }
-    rsc.tl.rank_genes_groups(gpu, "group", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for grp in g["logfoldchanges"].dtype.names:
         gm = dict(zip(g["names"][grp], np.asarray(g["logfoldchanges"][grp], float), strict=False))
@@ -1852,24 +2194,25 @@ def test_log1p_base_logfoldchanges_match_scanpy(reference, fmt):
 
 
 def test_ovo_dense_fallback_pts_match_scanpy():
-    """OVO sparse-negative dense fallback pts must match scanpy."""
+    """OVO pts on signed sparse input must match scanpy."""
     rng = np.random.default_rng(11)
     dense = (rng.random((120, 8)) * 5.0).astype(np.float64)
     dense[dense < 1.5] = 0.0
-    dense[rng.random(dense.shape) < 0.01] = -0.5  # negatives -> dense fallback
-    obs = pd.DataFrame({"group": pd.Categorical(["a" if i % 2 else "b" for i in range(120)])})
+    dense[rng.random(dense.shape) < 0.01] = -0.5  # negatives
+    obs = pd.DataFrame(
+        {"group": pd.Categorical(["a" if i % 2 else "b" for i in range(120)])}, index=[str(i) for i in range(120)]
+    )
     var = pd.DataFrame(index=[f"g{i}" for i in range(8)])
     gpu = sc.AnnData(X=sp.csr_matrix(dense), obs=obs.copy(), var=var.copy())
     cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "b",
         "pts": True,
         "n_genes": 8,
     }
-    rsc.tl.rank_genes_groups(gpu, "group", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for col in c["pts"].columns:
         np.testing.assert_allclose(
@@ -1886,20 +2229,19 @@ def test_bonferroni_matches_scanpy(fmt):
     rng = np.random.default_rng(12)
     dense = rng.integers(0, 5, size=(150, 6)).astype(np.float64)
     dense[dense < 1.0] = 0.0
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(150)])}, index=[str(i) for i in range(150)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(6)])
     gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
     cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "1",
         "corr_method": "bonferroni",
         "tie_correct": True,
         "n_genes": 6,
     }
-    rsc.tl.rank_genes_groups(gpu, "group", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals", "pvals_adj"):
         for grp in g[fld].dtype.names:
@@ -1909,18 +2251,19 @@ def test_bonferroni_matches_scanpy(fmt):
                 np.testing.assert_allclose(val, cm[gene], rtol=1e-12, atol=1e-13, equal_nan=True)
 
 
+@ignore_small_groups
 def test_ovr_all_empty_csc_totals_runs():
     """All-zero host CSC + a groups= subset (leaves an unselected category) +
     reference='rest' + pts=True exercises the empty-column totals branch."""
     dense = np.zeros((20, 5), dtype=np.float64)
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(20)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(20)])}, index=[str(i) for i in range(20)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(5)])
     adata = sc.AnnData(X=sp.csc_matrix(dense), obs=obs, var=var)
     rsc.tl.rank_genes_groups(
         adata,
         "group",
         method="wilcoxon",
-        use_raw=False,
+        use="X",
         groups=["0", "1"],
         reference="rest",
         pts=True,
@@ -1939,18 +2282,17 @@ def test_ovr_fully_dense_column_match_scanpy(fmt):
     dense = rng.integers(0, 5, size=(90, 4)).astype(np.float64)
     dense[dense < 1.0] = 0.0
     dense[:, 0] = rng.integers(1, 6, size=90)  # column 0 strictly positive -> no zeros
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(90)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(90)])}, index=[str(i) for i in range(90)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(4)])
     gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
     cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "rest",
         "tie_correct": True,
     }
-    rsc.tl.rank_genes_groups(gpu, "group", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
@@ -1967,19 +2309,18 @@ def test_ovr_device_sparse_subset_match_scanpy(fmt):
     rng = np.random.default_rng(14)
     dense = rng.integers(0, 6, size=(160, 6)).astype(np.float64)
     dense[dense < 1.0] = 0.0
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 4}" for i in range(160)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 4}" for i in range(160)])}, index=[str(i) for i in range(160)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(6)])
     gpu = sc.AnnData(X=_to_format(dense, fmt), obs=obs.copy(), var=var.copy())
     cpu = sc.AnnData(X=dense.copy(), obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
         "groups": ["0", "2"],
         "reference": "rest",
         "tie_correct": True,
     }
-    rsc.tl.rank_genes_groups(gpu, "group", **kw)
-    sc.tl.rank_genes_groups(cpu, "group", **kw)
+    rsc.tl.rank_genes_groups(gpu, "group", use="X", **kw)
+    sc.tl.rank_genes_groups(cpu, "group", **sc_use(A.X, use_raw=False), **kw)
     g, c = gpu.uns["rank_genes_groups"], cpu.uns["rank_genes_groups"]
     for fld in ("scores", "pvals"):
         for grp in g[fld].dtype.names:
@@ -1996,7 +2337,7 @@ def test_host_sparse_mismatched_index_dtype_raises(reference, layout):
     rng = np.random.default_rng(15)
     dense = rng.integers(0, 5, size=(120, 6)).astype(np.float64)
     dense[dense < 1.0] = 0.0
-    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(120)])})
+    obs = pd.DataFrame({"group": pd.Categorical([f"{i % 3}" for i in range(120)])}, index=[str(i) for i in range(120)])
     var = pd.DataFrame(index=[f"g{i}" for i in range(6)])
     maker = sp.csr_matrix if layout == "csr" else sp.csc_matrix
     m64 = maker(dense)
@@ -2006,7 +2347,7 @@ def test_host_sparse_mismatched_index_dtype_raises(reference, layout):
     adata = sc.AnnData(X=m64, obs=obs.copy(), var=var.copy())
     kw = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "tie_correct": True,
     }
@@ -2046,19 +2387,24 @@ def _make_multi_gpu_wilcoxon_adata(fmt, *, source_device=0, all_zero=False, sign
 @pytest.mark.parametrize("empty_group", [0, 1], ids=["first", "last"])
 def test_wilcoxon_ovo_empty_group_outputs_are_initialized(empty_group):
     n_cols = 5
-    ref = cp.asfortranarray(cp.tile(cp.asarray([0, 0, 1], dtype=cp.float32)[:, None], (1, n_cols)))
-    groups = cp.asfortranarray(cp.tile(cp.asarray([0, 2, 3, 4], dtype=cp.float32)[:, None], (1, n_cols)))
+    # Rows 0-2 are the reference, rows 3-6 the (possibly empty) test groups.
+    X = cp.asfortranarray(cp.tile(cp.asarray([0, 0, 1, 0, 2, 3, 4], dtype=cp.float32)[:, None], (1, n_cols)))
     offsets = cp.asarray([0, 0, 4] if empty_group == 0 else [0, 4, 4], dtype=cp.int32)
     rank_sums = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
     tie_corr = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
 
-    _wc.ovo_rank_dense_tiered_unsorted_ref(
-        ref,
-        groups,
+    _wc.ovo_dense(
+        X,
+        cp.arange(3, dtype=cp.int32),
+        cp.arange(3, 7, dtype=cp.int32),
         offsets,
+        cp.full(7, -1, dtype=cp.int32),  # no stats rows
         rank_sums,
         tie_corr,
+        cp.zeros((3, n_cols), dtype=cp.float64),
+        cp.zeros((1, 1), dtype=cp.float64),
         compute_tie_corr=True,
+        compute_nnz=False,
         stream=cp.cuda.get_current_stream().ptr,
     )
     cp.cuda.get_current_stream().synchronize()
@@ -2075,33 +2421,38 @@ def test_wilcoxon_ovo_empty_group_outputs_are_initialized(empty_group):
 def test_wilcoxon_ovo_sparse_empty_group_outputs_are_initialized(empty_group):
     n_cols = 5
     matrix = sp.csr_matrix(np.tile(np.asarray([0, 0, 1, 0, 2, 3, 4], dtype=np.float32)[:, None], (1, n_cols)))
-    ref_rows = np.asarray([0, 1, 2], dtype=np.int32)
-    group_rows = np.asarray([3, 4, 5, 6], dtype=np.int32)
     offsets = np.asarray([0, 0, 4] if empty_group == 0 else [0, 4, 4], dtype=np.int32)
     rank_sums = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
     tie_corr = cp.full((2, n_cols), cp.nan, dtype=cp.float64)
-    group_sums = cp.full((3, n_cols), cp.nan, dtype=cp.float64)
+    group_sums = cp.zeros((3, n_cols), dtype=cp.float64)  # stats by group code
+    valid_group = 1 - empty_group
+    codes = cp.asarray([2, 2, 2, valid_group, valid_group, valid_group, valid_group], dtype=cp.int32)
+    ref_map = cp.asarray([0, 1, 2, -1, -1, -1, -1], dtype=cp.int32)
+    grp_map = cp.asarray([-1, -1, -1, 0, 1, 2, 3], dtype=cp.int32)
 
-    _wcs.ovo_streaming_csr_host(
+    _wc.ovo_sparse(
         matrix.data,
         matrix.indices,
+        matrix.indptr,
         matrix.indptr[:-1],
         matrix.indptr[1:],
-        ref_rows,
-        group_rows,
-        offsets,
+        codes,
+        ref_map,
+        grp_map,
+        cp.arange(3, dtype=cp.int32),
+        cp.arange(3, 7, dtype=cp.int32),
+        cp.asarray(offsets),
         rank_sums,
         tie_corr,
         group_sums,
-        cp.empty(1, dtype=cp.float64),
-        n_cols=n_cols,
+        cp.zeros((1, 1), dtype=cp.float64),
+        n_ref=3,
+        csc=False,
         compute_tie_corr=True,
         compute_nnz=False,
-        analytic_zeros=True,
     )
     cp.cuda.get_current_stream().synchronize()
 
-    valid_group = 1 - empty_group
     probe = cp.sum(rank_sums + tie_corr) + cp.sum(group_sums)
     assert bool(cp.isfinite(probe).item())
     cp.testing.assert_array_equal(rank_sums[empty_group], cp.zeros(n_cols))
@@ -2111,6 +2462,39 @@ def test_wilcoxon_ovo_sparse_empty_group_outputs_are_initialized(empty_group):
     cp.testing.assert_array_equal(group_sums[empty_group], cp.zeros(n_cols))
     cp.testing.assert_array_equal(group_sums[valid_group], cp.full(n_cols, 9.0))
     cp.testing.assert_array_equal(group_sums[2], cp.full(n_cols, 1.0))
+
+
+# OVO kernels put the test groups on gridDim.y (at most 65,535 on current GPUs);
+# more groups run in chunks. One cell per group ranks 1 + #less + #equal / 2.
+@pytest.mark.parametrize("tie_correct", [False, True])
+def test_wilcoxon_ovo_more_groups_than_grid_y(tie_correct):
+    n_groups, n_ref, n_cols = 70_000, 50, 2
+    rng = np.random.default_rng(6)
+    ref = rng.integers(0, 5, (n_ref, n_cols)).astype(np.float32)
+    grp = rng.integers(0, 5, (n_groups, n_cols)).astype(np.float32)
+    rank_sums = cp.empty((n_groups, n_cols), dtype=cp.float64)
+    tie_corr = cp.ones((n_groups, n_cols) if tie_correct else (1,), dtype=cp.float64)
+    _wc.ovo_dense(
+        cp.asfortranarray(cp.asarray(np.vstack([ref, grp]))),
+        cp.arange(n_ref, dtype=cp.int32),
+        cp.arange(n_ref, n_ref + n_groups, dtype=cp.int32),
+        cp.arange(n_groups + 1, dtype=cp.int32),
+        cp.full(n_ref + n_groups, -1, dtype=cp.int32),  # no stats rows
+        rank_sums,
+        tie_corr,
+        cp.zeros((n_groups + 1, n_cols), dtype=cp.float64),
+        cp.zeros((1, 1), dtype=cp.float64),
+        compute_tie_corr=tie_correct,
+        compute_nnz=False,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+    expected = 1 + (ref[None] < grp[:, None]).sum(1) + 0.5 * (ref[None] == grp[:, None]).sum(1)
+    cp.testing.assert_allclose(rank_sums, cp.asarray(expected))
+    if tie_correct:  # 1 - sum(t^3 - t) / (n^3 - n) over the tie blocks of the reference plus the group's cell
+        counts = np.stack([(ref == v).sum(0) for v in range(5)])
+        joined = counts[grp.astype(int), np.arange(n_cols)]  # reference cells tied with the group's cell
+        blocks = (counts**3 - counts).sum(0) + 3 * joined * (joined + 1)
+        cp.testing.assert_allclose(tie_corr, cp.asarray(1 - blocks / ((n_ref + 1) ** 3 - (n_ref + 1))))
 
 
 def _assert_multi_gpu_wilcoxon_equal(actual, expected):
@@ -2137,7 +2521,7 @@ def _assert_multi_gpu_wilcoxon_equal(actual, expected):
         pytest.param(("numpy_dense", "rest", False, None, [None]), id="host_ovr_default"),
         pytest.param(("numpy_dense", "1", False, None, [None]), id="host_ovo_default"),
         pytest.param(("cupy_dense", "rest", False, None, []), id="device_ovr_default"),
-        pytest.param(("cupy_dense", "1", False, None, [None]), id="device_ovo_default"),
+        pytest.param(("cupy_dense", "1", False, None, []), id="device_ovo_default"),
         pytest.param(("cupy_dense", "rest", True, False, []), id="device_force_one"),
         pytest.param(("cupy_dense", "rest", True, True, [True]), id="device_force_all"),
         pytest.param(("cupy_dense", "rest", True, "current", ["current"]), id="device_ids"),
@@ -2158,7 +2542,7 @@ def test_wilcoxon_multi_gpu_routing_policy(monkeypatch, route_case):
     adata = _make_multi_gpu_wilcoxon_adata(fmt, source_device=current_device)
     kwargs = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "n_genes": adata.n_vars,
     }
@@ -2184,7 +2568,7 @@ def test_wilcoxon_device_two_gpu_matches_single(fmt, reference, tie_correct):
         assert multi.X.indptr.dtype == cp.int64
     kwargs = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "tie_correct": tie_correct,
         "pts": True,
@@ -2225,7 +2609,7 @@ def test_wilcoxon_host_two_gpu_matches_single(fmt, reference, signed, tie_correc
     multi = _make_multi_gpu_wilcoxon_adata(fmt, signed=signed)
     kwargs = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "tie_correct": tie_correct,
         "pts": True,
@@ -2255,7 +2639,7 @@ def test_wilcoxon_device_zero_nnz_multi_gpu_matches_single(fmt, reference):
     assert multi.X.indptr.dtype == cp.int64
     kwargs = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "tie_correct": True,
         "pts": True,
@@ -2278,13 +2662,12 @@ def test_wilcoxon_ovo_exact_tier_boundaries_match_scanpy(boundary):
     expected = adata.copy()
     kwargs = {
         "method": "wilcoxon",
-        "use_raw": False,
         "reference": "ref",
         "tie_correct": True,
         "n_genes": adata.n_vars,
     }
-    rsc.tl.rank_genes_groups(adata, "group", multi_gpu=False, **kwargs)
-    sc.tl.rank_genes_groups(expected, "group", **kwargs)
+    rsc.tl.rank_genes_groups(adata, "group", multi_gpu=False, use="X", **kwargs)
+    sc.tl.rank_genes_groups(expected, "group", **sc_use(A.X, use_raw=False), **kwargs)
 
     actual_result = adata.uns["rank_genes_groups"]
     expected_result = expected.uns["rank_genes_groups"]
@@ -2331,7 +2714,7 @@ def test_wilcoxon_device_source_gpu_differs_from_caller(reference, route):
     multi = _make_multi_gpu_wilcoxon_adata("cupy_csr", source_device=source_device)
     kwargs = {
         "method": "wilcoxon",
-        "use_raw": False,
+        "use": "X",
         "reference": reference,
         "tie_correct": True,
         "pts": True,
@@ -2371,7 +2754,7 @@ def test_rank_genes_groups_runs_on_the_data_gpu(fmt, method, kwargs):
     # Kernels must run on the GPU holding X: rsc kernels cannot read another
     # GPU's memory, and CuPy's implicit peer access faults on some nodes.
     actual = _make_multi_gpu_wilcoxon_adata(fmt, source_device=1)
-    kwargs = {"method": method, "use_raw": False, "multi_gpu": False, **kwargs}
+    kwargs = {"method": method, "use": "X", "multi_gpu": False, **kwargs}
     with cp.cuda.Device(0):
         rsc.tl.rank_genes_groups(actual, "group", **kwargs)
         assert cp.cuda.Device().id == 0

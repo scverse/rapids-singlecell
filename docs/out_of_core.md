@@ -2,7 +2,6 @@
 
 Process datasets larger than GPU memory by chunking work with Dask while keeping arrays on the GPU via CuPy. Chunking also mitigates the CuPy sparse limit of `.nnz ≤ 2**31-1` by operating on smaller blocks.
 
-
 ## Quick start
 
 {func}`rapids_singlecell.dask.start_cluster` starts a local Dask cluster with one worker per GPU and settings that work out of the box,
@@ -15,7 +14,7 @@ import rapids_singlecell as rsc
 client = rsc.dask.start_cluster()  # all visible GPUs
 adata = rsc.io.read_lazy("data.zarr")  # uses the cluster
 
-rsc.pp.calculate_qc_metrics(adata)
+rsc.pp.calculate_qc_metrics(adata, out=False)
 rsc.pp.normalize_total(adata, target_sum=1e4)
 rsc.pp.log1p(adata)
 rsc.pp.highly_variable_genes(adata, flavor="cell_ranger", n_top_genes=2000)
@@ -35,15 +34,15 @@ client.close()  # once you no longer need the cluster
 client.cluster.close()
 ```
 
-* {func}`~rapids_singlecell.dask.start_cluster` uses 4 threads per worker, UCX if available (else TCP), and RMM's asynchronous allocator
+- {func}`~rapids_singlecell.dask.start_cluster` uses 4 threads per worker, UCX if available (else TCP), and RMM's asynchronous allocator
   (which does not fragment with large chunks), limited to 75% of each GPU, which leaves room for this process (e.g. the PCA) on the same GPU.
   It warns if a GPU is already busy (e.g. with another cluster). Every setting can be overridden,
   and the cluster stays usable for anything else you do with Dask.
   For capacity over speed, pass `rmm_managed_memory=True`; it then uses TCP, as UCX does not support managed memory.
-* {func}`~rapids_singlecell.io.read_lazy` picks the chunk size (`chunks="auto"`) and, if possible,
+- {func}`~rapids_singlecell.io.read_lazy` picks the chunk size (`chunks="auto"`) and, if possible,
   opens `X` to be read straight into GPU memory (see below). It needs no client:
   like any Dask array, `X` is computed on the cluster you started.
-* Persist after steps that shrink the data: without it, every later step recomputes its input from disk
+- Persist after steps that shrink the data: without it, every later step recomputes its input from disk
   (e.g. {func}`~rapids_singlecell.pp.pca` reads it twice). After filtering cells, also call
   `adata.X.compute_chunk_sizes()` if the chunk sizes became unknown (see "Persist and chunk sizes" below).
 
@@ -63,13 +62,13 @@ With [zarr-kvikio](https://github.com/scverse/zarr-kvikio), [KvikIO](https://doc
 pip install 'zarr-kvikio[cuda13]'  # or [cuda12]; or the `io` extra: rapids-singlecell-cu13[io], rapids-singlecell[io-cu13]
 ```
 
-zarr then finds a codec pipeline that reads into GPU memory, zarr-kvikio's `zarr_kvikio.KvikioCodecPipeline`,
+zarr then finds a codec pipeline that reads into GPU memory, zarr-kvikio’s `zarr_kvikio.KvikioCodecPipeline`,
 which {func}`~rapids_singlecell.io.enable` switches on. It works with any store, and the GPU decodes chunks read from
-local files (zarr's `LocalStore`) that are zstd-compressed (or uncompressed), ideally small (nvCOMP decodes every chunk
+local files (zarr’s `LocalStore`) that are zstd-compressed (or uncompressed), ideally small (nvCOMP decodes every chunk
 with one thread block) and in shards (few files per read). Other chunks, e.g. blosc-compressed ones like in most
 existing stores, are decompressed on the CPU
 and copied to the GPU, with the codec pipeline zarr was configured with before (e.g. [zarrs](https://zarrs-python.readthedocs.io)),
-or else zarr's fast fused pipeline.
+or else zarr’s fast fused pipeline.
 {func}`~rapids_singlecell.io.check` tells you whether a store is ready,
 and {func}`~rapids_singlecell.io.convert_zarr` rewrites it with the same content:
 
@@ -106,7 +105,7 @@ adata = ad.AnnData(
 Without a cluster, `rsc.io.enable()` switches GPU reads on for this process.
 Both take effect right away; used as a context manager (`with rsc.io.enable(client): ...`),
 they are undone at the end of the block, on the workers too.
-Like [zarrs](https://zarrs-python.readthedocs.io), zarr-kvikio is set up through zarr's config, so any code can switch it on
+Like [zarrs](https://zarrs-python.readthedocs.io), zarr-kvikio is set up through zarr’s config, so any code can switch it on
 with `zarr.config.set({"codec_pipeline.path": "zarr_kvikio.KvikioCodecPipeline"})` and `zarr.config.enable_gpu()`,
 and tune it with `kvikio.*` keys, e.g. `zarr.config.set({"kvikio.num_threads": 16})`
 (for a cluster, before `rsc.io.enable(client)` or {func}`~rapids_singlecell.dask.start_cluster`, which pass them on to the workers).
@@ -126,7 +125,7 @@ with the subsetting improvements of [anndata#2675](https://github.com/scverse/an
 
 Choose one of these presets:
 
----
+--------------------------------------------------------------------------------
 
 ### A) NVLink / Performance preset (UCX + RMM pool, no managed memory)
 
@@ -147,9 +146,11 @@ cluster = LocalCUDACluster(
 )
 client = Client(cluster)
 ```
+
 ### B) Capacity / Robustness preset (TCP + Managed memory)
 
 Best when you need to stretch VRAM (slower P2P, but fewer OOMs).
+
 ```python
 from dask.distributed import Client
 from dask_cuda import LocalCUDACluster
@@ -165,12 +166,13 @@ client = Client(cluster)
 ```
 
 ### Notes
-* `threads_per_worker=1` uses the least GPU memory. More threads overlap reading chunks with computing on them, which is faster,
+
+- `threads_per_worker=1` uses the least GPU memory. More threads overlap reading chunks with computing on them, which is faster,
   but increase temporary allocations, which can cause VRAM spikes/overflows; some dask-cuda releases also showed leaks with multi-threaded workers.
   {func}`~rapids_singlecell.dask.start_cluster` uses 4, which worked well in benchmarks; lower it if workers run out of memory.
-* For capacity over speed, enable RMM managed memory (see {doc}`memory_management`). For highest peer-to-peer (NVLink) performance, prefer the RMM pool allocator and avoid managed memory.
-* Multi-GPU transport: use UCX (`protocol="ucx"`) to enable NVLink. UCX typically uses more memory; TCP is more stable but slower.
-* UCX is not compatible with CUDA managed memory. For UCX/NVLink, disable managed memory. TCP can be used with managed memory.
+- For capacity over speed, enable RMM managed memory (see {doc}`memory_management`). For highest peer-to-peer (NVLink) performance, prefer the RMM pool allocator and avoid managed memory.
+- Multi-GPU transport: use UCX (`protocol="ucx"`) to enable NVLink. UCX typically uses more memory; TCP is more stable but slower.
+- UCX is not compatible with CUDA managed memory. For UCX/NVLink, disable managed memory. TCP can be used with managed memory.
 
 ## Loading AnnData lazily from Zarr (from the multi-GPU notebook)
 
@@ -239,7 +241,6 @@ adata.X.compute_chunk_sizes()
 
 Persisting loads data into GPU memory across workers. This can quickly cause OOM if the dataset does not fit. On sufficiently large clusters, persisting can be extremely fast and effective.
 
-
 ## Multi-GPU notes
 
 - Use `LocalCUDACluster(CUDA_VISIBLE_DEVICES="0,1,2,3")` to scale across GPUs.
@@ -263,7 +264,7 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.pp.pca`
 - {func}`~.tl.score_genes`
 - {func}`~.tl.score_genes_cell_cycle`
-- {func}`~.tl.louvain` (set `use_dask=True` to distribute graph clustering)
+- `tl.louvain` (deprecated; set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.leiden` (set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`

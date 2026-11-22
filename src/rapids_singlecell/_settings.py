@@ -33,7 +33,6 @@ class BasicEmbeddingPreset(NamedTuple):
 
 class RankGenesGroupsPreset(NamedTuple):
     method: DETest
-    mask_var: str | None
     mean_in_log_space: bool
 
 
@@ -43,6 +42,10 @@ class ScalePreset(NamedTuple):
 
 class ScoreGenesPreset(NamedTuple):
     ctrl_as_ref: bool
+
+
+class QcMetricsPreset(NamedTuple):
+    out: bool
 
 
 class Preset(enum.StrEnum):
@@ -115,8 +118,8 @@ class Preset(enum.StrEnum):
         `method="t-test", mean_in_log_space=True` (v1) or `method="wilcoxon", mean_in_log_space=False` (v2).
         """
         return {
-            Preset.ScanpyV1: RankGenesGroupsPreset(method="t-test", mask_var=None, mean_in_log_space=True),
-            Preset.ScanpyV2Preview: RankGenesGroupsPreset(method="wilcoxon", mask_var=None, mean_in_log_space=False),
+            Preset.ScanpyV1: RankGenesGroupsPreset(method="t-test", mean_in_log_space=True),
+            Preset.ScanpyV2Preview: RankGenesGroupsPreset(method="wilcoxon", mean_in_log_space=False),
         }[self]
 
     @property
@@ -135,11 +138,19 @@ class Preset(enum.StrEnum):
         """
         return ScoreGenesPreset(ctrl_as_ref=self is Preset.ScanpyV1)
 
+    @property
+    def calculate_qc_metrics(self) -> QcMetricsPreset:
+        """Settings for :func:`~rapids_singlecell.pp.calculate_qc_metrics`.
+
+        `out=True` (v1, return the metrics) or `out=False` (v2, write them).
+        """
+        return QcMetricsPreset(out=self is Preset.ScanpyV1)
+
     def _embedding(self, name: str) -> BasicEmbeddingPreset:
         return BasicEmbeddingPreset(key_added=None if self is Preset.ScanpyV1 else name)
 
     @contextmanager
-    def override(self, preset: Preset) -> Generator[Preset, None, None]:
+    def override(self, preset: Preset) -> Generator[Preset]:
         """Temporarily override :attr:`rapids_singlecell.settings.preset`."""
         with settings.override(preset=preset):
             yield self
