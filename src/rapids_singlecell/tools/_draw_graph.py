@@ -20,7 +20,7 @@ from rapids_singlecell._utils._random import (
 )
 from rapids_singlecell.get._out import DEPR_KEY_ADDED, _out_key
 
-from ._clustering import _create_graph
+from ._clustering import _create_graph, _import_cugraph
 from ._utils import _use_graph, _validate_init_pos
 
 if TYPE_CHECKING:
@@ -89,7 +89,7 @@ def draw_graph(
     rng = np.random.default_rng(rng)
     meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
 
-    from cugraph.layout import force_atlas2
+    force_atlas2 = _import_cugraph().layout.force_atlas2
 
     key = _out_key(out, key_added, kind="obsm", default=Default())
     if out is not False and not isinstance(key, bool):  # keys from `out` are literal, not templates
