@@ -222,6 +222,18 @@ def test_integer_csr_rebuild_checks_storage():
 
 
 @needs_native
+@pytest.mark.parametrize("device", [False, True])
+@pytest.mark.parametrize(("stored", "indptr"), [(True, [0, 1, 0]), (False, [0, 1, 0]), (False, [0, 0])])
+def test_invalid_empty_csr(device, stored, indptr):
+    a = sparse.csr_matrix([[0, 1], [1, 0]] if stored else (2, 2), dtype=np.float32)
+    if device:
+        a = cpx_sparse.csr_matrix(a)
+    a.indptr = (cp if device else np).asarray(indptr, dtype=np.int32)
+    with pytest.raises(ValueError, match="indptr"):
+        native(a)
+
+
+@needs_native
 @pytest.mark.parametrize("layout", ["strided", "mixed"])
 def test_device_csr_layout(layout):
     a = _graph("rings")
@@ -888,17 +900,19 @@ def test_bucketed_hub_rows(monkeypatch):
 @pytest.mark.parametrize(
     "adjacency",
     [
+        sparse.csr_matrix((0, 0), dtype=np.float32),
         sparse.csr_matrix((5, 5), dtype=np.float32),
         sparse.identity(5, dtype=np.float32, format="csr"),  # diagonal only
         sparse.csr_matrix((np.zeros(2, np.float32), ([0, 1], [1, 0])), shape=(5, 5)),  # explicit zeros
     ],
-    ids=["empty", "diagonal", "zeros"],
+    ids=["no_vertices", "empty", "diagonal", "zeros"],
 )
 def test_no_counted_edges(adjacency):
-    adata = AnnData(obs=pd.DataFrame(index=[f"c{i}" for i in range(5)]))
+    n = adjacency.shape[0]
+    adata = AnnData(obs=pd.DataFrame(index=[f"c{i}" for i in range(n)]))
     rsc.tl.leiden(adata, adjacency=adjacency, resolution=[0.5, 1])
     for key in ("leiden_0.5", "leiden_1"):
-        assert adata.obs[key].tolist() == ["0", "1", "2", "3", "4"]
+        assert adata.obs[key].tolist() == [str(i) for i in range(n)]
     assert adata.uns["leiden"]["modularity"] == [0.0, 0.0]
 
 
