@@ -94,7 +94,8 @@ __global__ void auto_eps_kernel(const T* __restrict__ cost,
             const T sz = (T)(size > 0 ? size : 1);
             const T mean = v1 / sz;
             const T var = fmax(v2 / sz - mean * mean, T(0));
-            eps[b] = fmax(scale * sqrt(var), floor);
+            // A NaN ground cost makes only this pair's objective undefined.
+            eps[b] = isnan(v1) ? v1 : fmax(scale * sqrt(var), floor);
         }
     }
 }

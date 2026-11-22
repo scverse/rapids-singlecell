@@ -48,11 +48,11 @@ MAX_RELAXATION = 2.0
 
 
 _scale_half_inputs = cp.ElementwiseKernel(
-    "T x, T center, int32 exponent",
+    "T x, T center, bool valid_row, int32 exponent",
     "float32 scaled, raw int32 overflow",
     """
     scaled = ldexp(x - center, exponent);
-    if (fabsf(scaled) > 65504.f) atomicExch(&overflow[0], 1);
+    if (valid_row && fabsf(scaled) > 65504.f) atomicExch(&overflow[0], 1);
     """,
     "sinkhorn_scale_half_inputs",
 )
@@ -71,20 +71,26 @@ def _cost_embedding(embedding, precision):
 
     # Estimate a typical coordinate range from a bounded sample; one outlier
     # must not set the half-precision scale for all the other cells.
-    rows, features = embedding.shape
+    _, features = embedding.shape
     if not features:
         return cp.ascontiguousarray(embedding, dtype=cp.float32), 0
     if embedding.dtype.kind != "f" or embedding.dtype == cp.float16:
         embedding = embedding.astype(cp.float64 if embedding.dtype.itemsize >= 4 else cp.float32)
+    # A cell with a missing coordinate has no defined Euclidean ground cost.
+    # Exclude it from the shared scaling statistics and range check.
+    valid = ~cp.isnan(embedding).any(axis=1)
+    valid_rows = cp.flatnonzero(valid)
+    if not valid_rows.size:
+        return cp.full(embedding.shape, cp.nan, dtype=cp.float32), 0
     sample_rows = min(256, max(1, 2**18 // features))
-    stride = max(1, -(-rows // sample_rows))
-    sample = embedding[::stride]
+    stride = -(-valid_rows.size // sample_rows)
+    sample = embedding[valid_rows[::stride]]
     center = cp.sort(sample, axis=0)[len(sample) // 2]
     radius = float(cp.nanmedian(cp.max(cp.abs(sample - center), axis=1)))
     exponent = 11 - int(np.frexp(radius)[1]) if np.isfinite(radius) and radius > 0 else 0
     scaled = cp.empty(embedding.shape, dtype=cp.float32)
     overflow = cp.zeros(1, dtype=cp.int32)
-    _scale_half_inputs(embedding, center, np.int32(exponent), scaled, overflow)
+    _scale_half_inputs(embedding, center, valid[:, None], np.int32(exponent), scaled, overflow)
     if bool(overflow[0]):
         raise ValueError("Cells exceed the float16 range after centering and scaling; use precision='float32'.")
     return scaled, exponent
@@ -849,15 +855,17 @@ class WassersteinMetric(BaseMetric):
                     cond_to_idx[key] = len(cond_to_idx)
             contrast_pairs.append((cond_to_idx[target_key], cond_to_idx[ref_key]))
 
-        # Build a unified (cat_offsets, cell_indices) layout — one "group" per
-        # unique contrast condition. Skip empty conditions safely.
+        # Validate every condition, but only pack cells that enter a transport problem.
+        active = {idx for pair in contrast_pairs if pair[0] != pair[1] for idx in pair}
         offsets_host = [0]
         all_cells: list[np.ndarray] = []
-        for key, _ in sorted(cond_to_idx.items(), key=lambda kv: kv[1]):
+        for key, idx in cond_to_idx.items():
             lookup_key = key[0] if len(key) == 1 else key
             cell_idx = group_indices.get(lookup_key)
             if cell_idx is None:
                 raise ValueError(f"No cells found for contrast condition {lookup_key}")
+            if idx not in active:
+                cell_idx = cell_idx[:0]
             all_cells.append(np.asarray(cell_idx, dtype=np.int64))
             offsets_host.append(offsets_host[-1] + len(cell_idx))
 

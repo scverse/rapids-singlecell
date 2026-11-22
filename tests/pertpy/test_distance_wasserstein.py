@@ -594,6 +594,20 @@ def test_float16_outlier_only_in_selected_groups() -> None:
             assert np.isfinite(df.to_numpy()).all()
 
 
+@pytest.mark.parametrize("nan_group_first, n_bad_cells", [(False, 18), (True, 1)])
+def test_float16_nan_group_preserves_finite_pair(nan_group_first, n_bad_cells) -> None:
+    adata = _make_grouped_adata(n_groups=3, cells_per_group=10, n_features=3)
+    categories = ["g2", "g0", "g1"] if nan_group_first else ["g0", "g1", "g2"]
+    adata.obs["group"] = pd.Categorical(["g0"] * 6 + ["g1"] * 6 + ["g2"] * 18, categories=categories)
+    adata.obsm["X_pca"][-n_bad_cells:, 0] = np.nan
+    adata.obsm["X_pca"][-1, 1] = 1e8  # The same incomplete cell must also be excluded from the range check.
+    distance = Distance(metric="wasserstein", precision="float16")
+    expected = distance.pairwise(adata, "group", groups=["g0", "g1"], multi_gpu=False)
+    result = distance.pairwise(adata, "group", multi_gpu=False)
+    assert result.loc["g0", "g1"] == pytest.approx(expected.loc["g0", "g1"], rel=5e-4)
+    assert result.loc["g2", ["g0", "g1"]].isna().all()
+
+
 def test_float32_matches_float64() -> None:
     """float32 and float64 pairwise agree within float32 precision.
 
@@ -751,6 +765,16 @@ def test_contrast_self_distance_zero_and_no_split() -> None:
     self_c = pd.DataFrame({"treatment": ["ctrl"], "reference": ["ctrl"]})
     res0 = distance.contrast_distances(adata, contrasts=self_c)
     assert res0["wasserstein"].iloc[0] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_float16_self_only_contrast_ignores_outlier() -> None:
+    adata = _make_grouped_adata(n_groups=3)
+    adata.obsm["X_pca"][-1, 0] = 1e8
+    distance = Distance(metric="wasserstein", precision="float16")
+    contrasts = pd.DataFrame({"group": ["g2", "g0"], "reference": ["g2", "g1"]})
+    expected = distance.contrast_distances(adata, contrasts.iloc[1:])["wasserstein"].iloc[0]
+    result = distance.contrast_distances(adata, contrasts)
+    np.testing.assert_array_equal(result["wasserstein"], [0.0, expected])
 
 
 @pytest.mark.parametrize("precision", ["auto", "float16"])

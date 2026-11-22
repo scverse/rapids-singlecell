@@ -72,7 +72,8 @@ def make_state(layout: dict, cost: cp.ndarray, *, epsilon_scale: float) -> dict:
         "g": cp.zeros(total_cols, dtype=dtype),
         "f_prev": cp.empty(total_rows, dtype=dtype),
         "g_prev": cp.empty(total_cols, dtype=dtype),
-        "conv": cp.zeros(B, dtype=cp.int32),
+        # Skip undefined pairs so their potentials stay zero in the batched sums.
+        "conv": cp.isnan(eps).astype(cp.int32),
     }
 
 
