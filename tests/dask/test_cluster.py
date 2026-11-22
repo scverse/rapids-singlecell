@@ -82,8 +82,9 @@ def test_read_lazy_without_gpu_reads_on_workers(tmp_path):
 
 @pytest.mark.skipif(not gpu_io_available(), reason="needs KvikIO and nvCOMP")
 @pytest.mark.parametrize("store", ["converted", "blosc"])
-def test_plain_dask_and_anndata(tmp_path, store):
+def test_plain_dask_and_anndata(tmp_path, store, monkeypatch):
     """Without rsc's helpers: dask's cluster, anndata's reader, and `rsc.io.enable(client)`."""
+    import zarr_kvikio
     from anndata.experimental import read_elem_lazy
     from dask_cuda import LocalCUDACluster
     from distributed import Client
@@ -95,19 +96,17 @@ def test_plain_dask_and_anndata(tmp_path, store):
         rsc.io.convert_zarr(path, tmp_path / "dst.zarr", chunk_bytes=4096)
         path = tmp_path / "dst.zarr"
 
-    before = zarr.config.get("codec_pipeline.path")
-    cluster = LocalCUDACluster(CUDA_VISIBLE_DEVICES="0", n_workers=1, protocol="tcp", rmm_pool_size="256MB")
-    client = Client(cluster)
-    try:
-        rsc.io.enable(client)
+    # Only the workers need the GPU I/O dependencies.
+    monkeypatch.setattr(zarr_kvikio, "available", lambda: False)
+    with (
+        LocalCUDACluster(CUDA_VISIBLE_DEVICES="0", n_workers=1, protocol="tcp", rmm_pool_size="256MB") as cluster,
+        Client(cluster) as client,
+        rsc.io.enable(client),
+    ):
         X_lazy = read_elem_lazy(zarr.open_group(path, mode="r")["X"], chunks=(100, -1))
         # the workers read every chunk into GPU memory, whatever the store
         assert isinstance(X_lazy.blocks[0].compute(), cpx.csr_matrix)
         assert (rsc.get.X_to_GPU(X_lazy).compute().get() != X).nnz == 0
-    finally:
-        client.close()
-        cluster.close()
-        zarr.config.set({"codec_pipeline.path": before})
 
 
 def test_cluster_in_spawned_process(monkeypatch):

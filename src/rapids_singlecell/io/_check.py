@@ -3,7 +3,6 @@ from __future__ import annotations
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import zarr
 from zarr.storage import LocalStore
 
@@ -55,7 +54,6 @@ def check_store(path: StoreLike) -> dict[str, Any]:
     g = zarr.open_group(path, mode="r")
     x = g["X"]
     arrays = {k: x[k] for k in ("data", "indices", "indptr")} if isinstance(x, zarr.Group) else {"X": x}
-    n_vars = _n_vars(x)
     info: dict[str, Any] = {"encoding": x.attrs.get("encoding-type"), "arrays": {}}
     problems: list[str] = []
     for name, arr in arrays.items():
@@ -63,13 +61,6 @@ def check_store(path: StoreLike) -> dict[str, Any]:
         desc = describe(arr)
         info["arrays"][name] = desc
         problems += [f"`{name}`: {p}" for p in desc["problems"]]
-        if (
-            name == "indices"
-            and n_vars is not None
-            and np.dtype(desc["dtype"]).itemsize > 2
-            and n_vars <= np.iinfo(np.uint16).max + 1
-        ):
-            problems.append(f"`indices`: stored as {desc['dtype']}, but uint16 suffices for {n_vars:,} columns")
     # (the GPU decodes chunks from local files only)
     info["gpu_readable"] = type(g.store) is LocalStore and all(d["gpu_readable"] for d in info["arrays"].values())
     info["problems"] = problems
@@ -83,13 +74,6 @@ def _zarr_kvikio() -> Any:
     import zarr_kvikio  # (raises its own error if it fails to import, e.g. with an untested zarr)
 
     return zarr_kvikio
-
-
-def _n_vars(x: zarr.Array | zarr.Group) -> int | None:
-    shape = x.attrs.get("shape")
-    if isinstance(shape, list) and len(shape) == 2:
-        return int(shape[1]) if x.attrs.get("encoding-type") == "csr_matrix" else int(shape[0])
-    return None
 
 
 def _print(report: dict[str, Any]) -> None:

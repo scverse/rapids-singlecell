@@ -33,7 +33,7 @@ def convert_zarr(
       (or row pieces, if a single row is larger than `chunk_bytes`).
     * The chunks are sharded, `chunks_per_shard` per file, so a read opens a few files
       instead of one per chunk.
-    * The `indices` of a sparse `X` get the smallest sufficient dtype, e.g. uint16 for < 65,536 genes.
+    * Sparse indices and offsets use signed 32- or 64-bit integers for SciPy compatibility.
 
     Other matrices (e.g. in `layers`, `raw`, `obsm` or `obsp`) are streamed the same way,
     so none is read into memory at once; all other elements (`obs`, `var`, `uns`, …)
@@ -121,13 +121,7 @@ def _convert_sparse(zk: Any, sx: zarr.Group, dx: zarr.Group, opts: dict) -> None
             msg = f"`{s_idx.path}` out of range in [{start}, {stop})"
             raise ValueError(msg)
 
-    zk.convert_array(sx["indptr"], dx, "indptr", **kw)
+    index_dtype = np.int32 if max(*shape, s_data.size) <= np.iinfo(np.int32).max else np.int64
+    zk.convert_array(sx["indptr"], dx, "indptr", dtype=index_dtype, **kw)
     zk.convert_array(s_data, dx, "data", **kw)
-    zk.convert_array(s_idx, dx, "indices", dtype=_index_dtype(n_minor), validate=in_range, **kw)
-
-
-def _index_dtype(n_minor: int) -> np.dtype:
-    for dt in (np.uint16, np.int32):
-        if n_minor - 1 <= np.iinfo(dt).max:
-            return np.dtype(dt)
-    return np.dtype(np.int64)
+    zk.convert_array(s_idx, dx, "indices", dtype=index_dtype, validate=in_range, **kw)

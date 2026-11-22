@@ -10,11 +10,11 @@ The codec pipeline that does so comes from zarr-kvikio (`"zarr_kvikio.KvikioCode
 .. currentmodule:: rapids_singlecell
 
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    io.read_lazy
-    io.convert_zarr
-    io.check
-    io.enable
-    io.release_memory
+   io.read_lazy
+   io.convert_zarr
+   io.check
+   io.enable
+   io.release_memory
 ```

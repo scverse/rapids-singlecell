@@ -56,11 +56,8 @@ The rest of this page shows how to set up the same things yourself.
 
 By default, the compressed chunks of `X` are decompressed on the CPU and then copied to the GPU.
 With [zarr-kvikio](https://github.com/scverse/zarr-kvikio), [KvikIO](https://docs.rapids.ai/api/kvikio/stable/) and
-[nvCOMP](https://developer.nvidia.com/nvcomp) installed, they are read straight into GPU memory and decompressed there:
-
-```bash
-pip install 'zarr-kvikio[cuda13]'  # or [cuda12]; or the `io` extra: rapids-singlecell-cu13[io], rapids-singlecell[io-cu13]
-```
+[nvCOMP](https://developer.nvidia.com/nvcomp) installed, they are read straight into GPU memory and decompressed there.
+See the {ref}`GPU I/O installation instructions <gpu-io-install>`.
 
 zarr then finds a codec pipeline that reads into GPU memory, zarr-kvikio’s `zarr_kvikio.KvikioCodecPipeline`,
 which {func}`~rapids_singlecell.io.enable` switches on. It works with any store, and the GPU decodes chunks read from
@@ -75,7 +72,7 @@ and {func}`~rapids_singlecell.io.convert_zarr` rewrites it with the same content
 ```python
 # versions, GPUDirect Storage status, and what to change in the store
 rsc.io.check("data.zarr")
-# zstd, 256 KiB chunks in shards, uint16 indices for < 65,536 genes
+# zstd, 256 KiB chunks in shards
 rsc.io.convert_zarr("data.zarr", "data_gpu.zarr")
 ```
 
@@ -118,7 +115,7 @@ fastest from the page cache; `zarr.config.set({"kvikio.fetch": "kvikio"})` reads
 For example, on an 11.4 million cell atlas (19.5 billion non-zeros) on two GPUs, the steps from
 {func}`~rapids_singlecell.pp.calculate_qc_metrics` to {func}`~rapids_singlecell.pp.pca` above took 26 s with GPU reads
 (100,000 cells per chunk), and about 95 s decompressing on the CPU (20,000 cells per chunk, the fastest setting there),
-with the subsetting improvements of [anndata#2675](https://github.com/scverse/anndata/pull/2675) and
+using a store with compact `uint16` indices and the subsetting improvements of [anndata#2675](https://github.com/scverse/anndata/pull/2675) and
 [anndata#2676](https://github.com/scverse/anndata/pull/2676).
 
 ## Start a Dask CUDA cluster yourself

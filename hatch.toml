@@ -20,8 +20,11 @@ pre-install-commands = [
 overrides.matrix.cuda.features = [
   { if = ["12"], value = "rapids-cu12" },
   { if = ["13"], value = "rapids-cu13" },
-  { if = ["12"], value = "io-cu12" },
-  { if = ["13"], value = "io-cu13" },
+]
+# Exercise the I/O extras from upstream until zarr-kvikio is published on PyPI.
+overrides.matrix.cuda.extra-dependencies = [
+  { if = ["12"], value = "zarr-kvikio[cuda12] @ git+https://github.com/scverse/zarr-kvikio.git@1004757e12a7fe8a1f90f5da96dd40593445aced" },
+  { if = ["13"], value = "zarr-kvikio[cuda13] @ git+https://github.com/scverse/zarr-kvikio.git@1004757e12a7fe8a1f90f5da96dd40593445aced" },
 ]
 
 # Python per deps

@@ -5,6 +5,7 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import anndata as ad
+import cupy as cp
 import cupyx.scipy.sparse as cpx
 import numpy as np
 import pandas as pd
@@ -61,18 +62,21 @@ def test_convert_zarr(tmp_path, fmt):
     adata = make_adata(fmt)
     dst = convert(adata, tmp_path)
 
+    x = zarr.open_group(dst, mode="r")["X"]
+    if fmt != "dense":
+        assert x["indices"].dtype == x["indptr"].dtype == np.int32
     converted = ad.io.read_zarr(dst)
     pd.testing.assert_frame_equal(converted.obs, adata.obs)
     pd.testing.assert_frame_equal(converted.var, adata.var)
 
-    x = zarr.open_group(dst, mode="r")["X"]
     if fmt == "dense":
         np.testing.assert_array_equal(converted.X, adata.X)
         # a row (300 float32) is larger than a chunk (1024 bytes): rows in pieces of 256 values
         assert x.chunks == (1, 256)
     else:
         assert (converted.X != adata.X).nnz == 0
-        assert x["indices"].dtype == np.uint16
+        rows, cols = [1, 3], [4, 2]
+        assert (converted[rows, cols].copy().X != adata[rows, cols].copy().X).nnz == 0
         assert x["data"].chunks == (256,)  # 1024 bytes of float32
         assert x["data"].shards == (256 * 4,)
 
@@ -84,10 +88,24 @@ def test_convert_zarr(tmp_path, fmt):
     assert any("cannot be decoded on the GPU" in p for p in original["problems"])
 
 
+@needs_zarr_kvikio
+def test_convert_large_sparse_indices(tmp_path):
+    col = 2**31
+    matrix = sparse.csr_matrix(([1.0], ([0], [col])), shape=(1, col + 1))
+    src = tmp_path / "src.zarr"
+    ad.io.write_elem(zarr.open_group(src, mode="w"), "X", matrix)
+    dst = tmp_path / "dst.zarr"
+    rio.convert_zarr(src, dst)
+    x = zarr.open_group(dst, mode="r")["X"]
+    assert x["indices"].dtype == x["indptr"].dtype == np.int64
+    np.testing.assert_array_equal(x["indices"][:], [col])
+
+
 @gpu_io
 @pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "not_enabled"])
-def test_read_lazy_gpu(tmp_path, enabled):
-    adata = make_adata()
+@pytest.mark.parametrize("fmt", ["csr", "dense"])
+def test_read_lazy_gpu(tmp_path, enabled, fmt):
+    adata = make_adata(fmt)
     dst = convert(adata, tmp_path)
     if enabled:
         rio.enable()
@@ -95,10 +113,14 @@ def test_read_lazy_gpu(tmp_path, enabled):
 
     lazy = rio.read_lazy(dst, chunks=100)
     assert isinstance(lazy.X, DaskArray)
-    assert isinstance(lazy.X._meta, cpx.csr_matrix)
+    assert isinstance(lazy.X._meta, cpx.csr_matrix if fmt == "csr" else cp.ndarray)
     assert lazy.X.chunks[0] == (100,) * 5
     # without `enable()`, chunks are decoded on the CPU and copied
-    assert (lazy.X.compute().get() != adata.X).nnz == 0
+    result = lazy.X.compute().get()
+    if fmt == "csr":
+        assert (result != adata.X).nnz == 0
+    else:
+        np.testing.assert_array_equal(result, adata.X)
     pd.testing.assert_frame_equal(lazy.obs, adata.obs)
     assert zarr.config.get("codec_pipeline.path") == pipeline  # no global changes
 

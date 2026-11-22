@@ -7,7 +7,7 @@ Set up a local Dask cluster with one worker per GPU, configured for out-of-core 
 .. currentmodule:: rapids_singlecell
 
 .. autosummary::
-    :toctree: generated
+   :toctree: generated
 
-    dask.start_cluster
+   dask.start_cluster
 ```
