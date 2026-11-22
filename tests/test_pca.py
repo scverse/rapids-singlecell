@@ -164,11 +164,15 @@ def test_sparse_pca_binding_dimensions():
         kernels.pca_column_sums(ptr, cols, data, cp.empty(1, dtype=cp.float64), stream)
     with pytest.raises(ValueError, match="pca_center_csr"):
         kernels.pca_center_csr(ptr[:1], cols, data, data.astype(cp.float64), tile, stream)
-    mask = cp.empty((1, 1), dtype=cp.uint32)
+    index = cp.empty((1, 1), dtype=cp.uint64)
+    partial = cp.empty((1, data.itemsize), dtype=cp.uint8)
     with pytest.raises(ValueError, match="ordered_gram"):
-        kernels.ordered_gram(ptr, cols, data, mask, cp.empty((1, 0, 1), data.dtype), stream)
+        kernels.ordered_gram(ptr, cols, data, index, partial[:, :0], tile, 0, -1, stream)
     with pytest.raises(ValueError, match="ordered_gram"):
-        kernels.ordered_gram(ptr, cols, data, mask[:, :0], tile[None], stream)
+        kernels.ordered_gram(ptr, cols, data, index[:, :0], partial, tile, 0, -1, stream)
+    unaligned = cp.empty((1, 1 + data.itemsize), dtype=cp.uint8)[:, 1:]
+    with pytest.raises(ValueError, match="ordered_gram"):
+        kernels.ordered_gram(ptr, cols, data, index, unaligned, tile, 0, -1, stream)
 
 
 def test_sparse_pca_empty_kernel_inputs():
@@ -182,11 +186,12 @@ def test_sparse_pca_empty_kernel_inputs():
     kernels.gram_bounds(data, limits, stream)
     cp.testing.assert_array_equal(limits, [0, 0])
     gram = cp.full((2, 2), cp.nan, dtype=cp.float32)
-    kernels.integer_gram(ptr, cols, data, cp.zeros((1, 3), dtype=cp.int64), gram, 0, 0, stream)
-    cp.testing.assert_array_equal(gram, cp.zeros_like(gram))
-    gram.fill(cp.nan)
-    kernels.ordered_gram(ptr, cols, data, cp.empty((2, 1), dtype=cp.uint32), gram[None], stream)
-    cp.testing.assert_array_equal(gram, cp.zeros_like(gram))
+    for bits in (-1, 0, 41, 64):
+        gram.fill(cp.nan)
+        kernels.ordered_gram(
+            ptr, cols, data, cp.empty((1, 1), cp.uint64), cp.empty((1, 48), cp.uint8), gram, 0, bits, stream
+        )
+        cp.testing.assert_array_equal(gram, cp.zeros_like(gram))
     kernels.pca_column_sums(ptr, cols, data, cp.empty((0, 2), dtype=cp.float64), stream)
     kernels.pca_center_csr(ptr, cols, data, cp.zeros(2, dtype=cp.float64), cp.empty((0, 2), data.dtype), stream)
 
@@ -355,6 +360,39 @@ def test_sparse_gram_carry_rounding(extra):
     assert _ordered_gram(gpu_x[::-1].copy())[0, 1].item() == expected
 
 
+def test_sparse_gram_cancellation_across_integer_words():
+    from rapids_singlecell.preprocessing._sparse_pca._ordered import _ordered_gram
+
+    big, small = 1.5 * 2**13, 2.0**-14
+    # The two large squares cancel. Only one ULP of small**2 survives.
+    x = np.array(
+        [
+            [big, big],
+            [2 * small, 2 * small],
+            [small, np.nextafter(small, np.inf)],
+            [small, -small],
+            [2 * small, -2 * small],
+            [big, -big],
+        ]
+    )
+    for rows in (x, x[::-1]):
+        gram = _ordered_gram(cusparse.csr_matrix(cp.asarray(rows)))
+        assert gram[0, 1].item() == 2.0**-80
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_sparse_gram_subnormal_sum(dtype):
+    from rapids_singlecell.preprocessing._sparse_pca._ordered import _ordered_gram
+
+    info = np.finfo(dtype)
+    value = dtype(2.0 ** (info.minexp // 2))
+    larger = np.nextafter(value, dtype(np.inf))
+    # Normal products cancel to a subnormal. Keep a stored negative zero.
+    data = cp.asarray([value, value, value, -larger, -0.0, value], dtype=dtype)
+    x = cusparse.csr_matrix((data, cp.asarray([0, 1] * 3), cp.asarray([0, 2, 4, 6])), shape=(3, 2))
+    assert _ordered_gram(x)[0, 1].item() == -info.smallest_subnormal
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_sparse_gram_wide_range(dtype):
     from rapids_singlecell.preprocessing._sparse_pca._ordered import _integer_scale, _ordered_gram
@@ -404,11 +442,15 @@ def test_sparse_gram_csr_fallback(dtype, index_dtype, stride):
     expected = np.triu((host.T @ host).toarray())
     tol = 2e-5 if dtype == np.float32 else 2e-12
     np.testing.assert_allclose(gram, expected, rtol=tol, atol=tol)
-    # One mask word per column forces five consecutive batches through the same buffer.
-    mask = cp.empty((x.shape[1], 1), dtype=cp.uint32)
-    partial = cp.full((1, x.shape[1], x.shape[1]), cp.nan, dtype=gpu.dtype)
-    kernels.ordered_gram(gpu.indptr, gpu.indices, gpu.data, mask, partial, cp.cuda.get_current_stream().ptr)
-    np.testing.assert_allclose(partial[0].get(), expected, rtol=tol, atol=tol)
+    # Reuse the same index across five batches, including a partial final batch.
+    p = x.shape[1]
+    index = cp.empty(((p + 31) // 32, 32), dtype=cp.uint64)
+    output = cp.empty((p, p), dtype=gpu.dtype)
+    partial = output.view(cp.uint8).reshape(1, -1)
+    kernels.ordered_gram(
+        gpu.indptr, gpu.indices, gpu.data, index, partial, output, 0, -1, cp.cuda.get_current_stream().ptr
+    )
+    np.testing.assert_allclose(output.get(), expected, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("solver", [None, "auto", "full", "jacobi"])
