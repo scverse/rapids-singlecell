@@ -348,6 +348,17 @@ def _layer_values(value, use, name):
     return values
 
 
+def _multiplex_graph_key(graph):
+    from rapids_singlecell.get._out import _resolve_obs
+    from rapids_singlecell.get._utils import A, GraphAcc
+
+    if A is None and isinstance(graph, str) and graph.startswith("obsp."):
+        return graph.removeprefix("obsp.")
+    if graph is None:
+        raise TypeError("Each graph in a multiplex sequence must be an `obsp` accessor or path.")
+    return _resolve_obs(graph, kinds=(GraphAcc,)).k
+
+
 def _leiden_layers(
     adata,
     use,
@@ -365,9 +376,6 @@ def _leiden_layers(
     initial_membership=None,
     objective_function="modularity",
 ):
-    from rapids_singlecell.get._out import _resolve_obs
-    from rapids_singlecell.get._utils import GraphAcc
-
     from ._leiden_multiplex import leiden_multiplex
 
     if len(use) < 2:
@@ -392,14 +400,14 @@ def _leiden_layers(
             names.append(name)
             if graph is None and "neighbors" not in mod.uns and "connectivities" in mod.obsp:
                 graph = "connectivities"
-            graphs.append(mod.obsp[graph] if isinstance(graph, str) and graph in mod.obsp else _use_graph(mod, graph))
-    else:
-        for graph in use:
             if graph is None:
-                raise TypeError("Each graph in a multiplex sequence must be an `obsp` accessor or path.")
-            acc = _resolve_obs(graph, kinds=(GraphAcc,))
-            names.append(acc.k)
-            graphs.append(_use_graph(adata, acc))
+                graphs.append(_use_graph(mod))
+            else:
+                key_obsp = graph if isinstance(graph, str) and graph in mod.obsp else _multiplex_graph_key(graph)
+                graphs.append(mod.obsp[key_obsp])
+    else:
+        names = [_multiplex_graph_key(graph) for graph in use]
+        graphs = [adata.obsp[name] for name in names]
 
     indices = None
     if restrict_to is not None:

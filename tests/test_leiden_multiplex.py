@@ -28,16 +28,21 @@ def _rb_quality(layer, labels, resolution):
     return quality[np.equal.outer(labels, labels)].sum()
 
 
-def test_multiplex_differs_from_summed_graph(layers):
-    acc = pytest.importorskip("anndata.acc").A
+@pytest.mark.parametrize("accessor", [False, True], ids=["paths", "accessor"])
+def test_multiplex_differs_from_summed_graph(layers, accessor):
     rna, atac = layers
-    adata = AnnData(shape=(4, 0), obsp={"rna": rna, "atac": atac, "sum": rna + atac})
-    use = [acc.obsp["rna"], "obsp.atac"]
+    adata = AnnData(
+        shape=(4, 0),
+        obsp={"expression": rna, "spatial": atac, "sum": rna + atac},
+        uns={"neighbors": {"connectivities_key": "sum"}},
+    )
+    expression = pytest.importorskip("anndata.acc").A.obsp["expression"] if accessor else "obsp.expression"
+    use = [expression, "obsp.spatial"]
     rsc.tl.leiden(adata, use=use, rng=1)
     labels = adata.obs["leiden"].cat.codes.to_numpy()
     # These are the unique optima over all 15 partitions of the four cells.
     np.testing.assert_array_equal(labels, [0, 0, 0, 0])
-    summed = rsc.tl.leiden(adata, use="obsp.sum", out=True, rng=1)
+    summed = rsc.tl.leiden(adata, out=True, rng=1)
     np.testing.assert_array_equal(summed.codes, [0, 0, 1, 1])
     assert adata.uns["leiden"]["quality"] == pytest.approx(0.0)
     np.testing.assert_array_equal(rsc.tl.leiden(adata, use=use, out=True, rng=1).codes, labels)
