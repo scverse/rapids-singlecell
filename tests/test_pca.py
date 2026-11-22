@@ -838,6 +838,19 @@ def _check_svd_results(U, s, Vt, A, k, *, atol=1e-10, rtol=1e-7):
 class TestSVDSolvers:
     """Unit tests for SVD solvers following sklearn/scipy test patterns."""
 
+    @pytest.mark.parametrize(
+        "matrix", [[[3, 4]], [[1, 2, 0, -1], [0, 3, -2, 1]], [[3], [4]]], ids=["one-row", "two-rows", "one-column"]
+    )
+    @pytest.mark.parametrize("refine_results", [False, True])
+    def test_lanczos_full_rank_rectangular(self, matrix, *, refine_results):
+        X = np.asarray(matrix, dtype=np.float64)
+        k = min(X.shape)
+        X_gpu = cusparse.csr_matrix(cp.asarray(X))
+        U, s, Vt = map(cp.asnumpy, lanczos_svd(X_gpu, k=k, refine_results=refine_results, rng=42))
+        _check_svd_results(U, s, Vt, X, k, atol=1e-12)
+        np.testing.assert_allclose(s, np.linalg.svd(X, compute_uv=False), rtol=1e-12)
+        np.testing.assert_allclose((U * s) @ Vt, X, rtol=1e-12, atol=1e-12)
+
     @pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
     @pytest.mark.parametrize("shape", [(100, 50), (50, 100), (100, 100)])
     def test_svd_shapes(self, svd_solver, shape):

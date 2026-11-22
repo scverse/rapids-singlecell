@@ -25,12 +25,13 @@ if TYPE_CHECKING:
 _kernel_axpy = cp.ElementwiseKernel("T alpha, T y", "T x", "x -= alpha * y", "lanczos_axpy")
 
 
-def _projected_svd(alphas, betas):
+def _projected_svd(alphas, betas, *, extra_right=False):
     steps = alphas.size
-    B = cp.zeros((steps, steps), dtype=alphas.dtype)
+    width = steps + int(extra_right)
+    B = cp.zeros((steps, width), dtype=alphas.dtype)
     cp.fill_diagonal(B, alphas)
-    cp.fill_diagonal(B[:-1, 1:], betas[1:steps])
-    return cp.linalg.svd(B)
+    cp.fill_diagonal(B[: width - 1, 1:], betas[1:width])
+    return cp.linalg.svd(B, full_matrices=not extra_right)
 
 
 def _restart_converged(alphas, betas, remaining):
@@ -302,15 +303,18 @@ def lanczos_svd(
 
         # cuSOLVER returns the singular values in descending order.
         steps = alphas.size
-        p, s, qt = _projected_svd(alphas, betas)
-
-        # Error estimates
-        resid = betas[-1] * cp.abs(p[-1, :])
-        max_s = s[0] if s.shape[0] > 0 else 1.0
-
-        # Transfer all convergence decisions in one synchronization per sweep.
-        converged = (resid[: k - n_locked + 2] < tol * max_s).get()
-        converged_indices = converged.nonzero()[0].tolist()
+        extra_right = m < n and n_locked + steps == m
+        p, s, qt = _projected_svd(alphas, betas, extra_right=extra_right)
+        right_basis = V_full[:, n_locked : n_locked + qt.shape[1]]
+        if extra_right:
+            # After exhausting the left space, the trailing beta belongs to
+            # the exact rectangular projection onto one more right vector.
+            converged_indices = list(range(k - n_locked))
+        else:
+            resid = betas[-1] * cp.abs(p[-1, :])
+            # Transfer all convergence decisions in one synchronization per sweep.
+            converged = (resid[: k - n_locked + 2] < tol * s[0]).get()
+            converged_indices = converged.nonzero()[0].tolist()
 
         if converged_indices:
             num_found = len(converged_indices)
@@ -325,11 +329,11 @@ def lanczos_svd(
             if end < k:
                 # The restart coefficients refer to the basis before locking.
                 best_nc = next(i for i in range(steps) if i not in converged_indices)
-                v_start = V_full[:, start : start + steps] @ qt[best_nc, :]
+                v_start = right_basis @ qt[best_nc, :]
             # Refinement reconstructs U from the final right singular vectors.
             if end < k or not refine_results:
                 U_full[:, start:end] = cp.dot(U_full[:, start : start + steps], p[:, good_idx])
-            V_full[:, start:end] = cp.dot(qt[good_idx, :], V_full[:, start : start + steps].T).T
+            V_full[:, start:end] = cp.dot(qt[good_idx, :], right_basis.T).T
             locked_S[start:end] = s[good_idx]
 
             n_locked += num_found
@@ -342,7 +346,7 @@ def lanczos_svd(
             k_mix = min(k - n_locked, steps)
             weights = cp.ones(k_mix, dtype=dtype)
             combo_small = cp.dot(qt[:k_mix, :].T, weights)
-            v_start = cp.dot(V_full[:, n_locked : n_locked + steps], combo_small)
+            v_start = cp.dot(right_basis, combo_small)
 
         v_start /= cp.linalg.norm(v_start)
         total_iter += 1
