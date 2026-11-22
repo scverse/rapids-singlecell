@@ -376,15 +376,18 @@ def test_sparse_gram_wide_range(dtype):
     np.testing.assert_array_equal(_ordered_gram(overflowing).get(), [[np.inf, 0], [0, 1]])
 
 
-@pytest.mark.parametrize("index_dtype", [cp.int32, cp.int64])
-def test_sparse_gram_csr_fallback(index_dtype):
+@pytest.mark.parametrize(
+    ("dtype", "index_dtype", "stride"),
+    [(np.float32, cp.int32, 32), (np.float32, cp.int64, 128), (np.float64, cp.int32, 128), (np.float64, cp.int64, 128)],
+)
+def test_sparse_gram_csr_fallback(dtype, index_dtype, stride):
     from rapids_singlecell._cuda import _spca_cuda as kernels
     from rapids_singlecell.preprocessing._sparse_pca._ordered import _integer_scale, _ordered_gram
 
     rng = np.random.default_rng(17)
     # Long, short and empty rows, including products across the 2048-column panel boundary.
-    x = np.zeros((137, 2051), dtype=np.float32)
-    x[:, ::32] = rng.normal(size=x[:, ::32].shape)
+    x = np.zeros((137, 2051), dtype=dtype)
+    x[:, ::stride] = rng.normal(size=x[:, ::stride].shape)
     x[::3, -40:] = rng.normal(size=x[::3, -40:].shape)
     x[1::3, :1984] = 0
     x[::7] = 0
@@ -399,12 +402,13 @@ def test_sparse_gram_csr_fallback(index_dtype):
         gram = _ordered_gram(gpu).get()
         np.testing.assert_array_equal(_ordered_gram(gpu).get(), gram)
     expected = np.triu((host.T @ host).toarray())
-    np.testing.assert_allclose(gram, expected, rtol=2e-5, atol=2e-5)
+    tol = 2e-5 if dtype == np.float32 else 2e-12
+    np.testing.assert_allclose(gram, expected, rtol=tol, atol=tol)
     # One mask word per column forces five consecutive batches through the same buffer.
     mask = cp.empty((x.shape[1], 1), dtype=cp.uint32)
-    partial = cp.zeros((1, x.shape[1], x.shape[1]), dtype=gpu.dtype)
+    partial = cp.full((1, x.shape[1], x.shape[1]), cp.nan, dtype=gpu.dtype)
     kernels.ordered_gram(gpu.indptr, gpu.indices, gpu.data, mask, partial, cp.cuda.get_current_stream().ptr)
-    np.testing.assert_allclose(partial[0].get(), expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_allclose(partial[0].get(), expected, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("solver", [None, "auto", "full", "jacobi"])

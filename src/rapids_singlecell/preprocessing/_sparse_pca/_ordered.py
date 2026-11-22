@@ -53,7 +53,7 @@ def _ordered_gram(x):
         _spca.integer_gram(x.indptr, x.indices, x.data, bins, gram, unit, bits, stream)
         return gram
     parts = min(8, max(1, (64 << 20) // max(1, p * p * x.dtype.itemsize)))
-    partial = cp.zeros((parts, p, p), dtype=x.dtype)
+    partial = cp.empty((parts, p, p), dtype=x.dtype)
     # Reuse at most 16 MiB of row-presence bits across batches of CSR rows.
     words = min((x.shape[0] + 31) // 32, max(1, (16 << 20) // (p * 4)))
     masks = cp.empty((p, words), dtype=cp.uint32)

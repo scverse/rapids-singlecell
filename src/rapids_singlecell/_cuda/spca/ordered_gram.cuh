@@ -33,36 +33,41 @@ __global__ void mark_rows(const I* ptr, const I* cols, size_t n,
 template <typename T, typename I>
 __global__ void upper(const I* row_ptr, const I* cols, const T* values,
                       const unsigned* masks, int stride, int words, T* out,
-                      int p, int width, bool accumulate) {
+                      int p, int width, bool direct, bool accumulate) {
     extern __shared__ double workspace[];
     auto* sums = reinterpret_cast<T*>(workspace);
-    int anchor = blockIdx.x, part = blockIdx.y, panel = blockIdx.z * width;
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int anchor = direct ? blockIdx.x * (blockDim.x / 32) + warp : blockIdx.x;
+    int part = blockIdx.y, panel = blockIdx.z * width;
     int low = max(anchor, panel), high = min(p, panel + width);
     if (low >= high) return;
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    T* own = sums + warp * width;
-    for (int j = low + lane; j < high; j += 32) own[j - panel] = 0;
-    __syncwarp();
-
-    int segments = gridDim.y * warps, segment = part * warps + warp;
+    T* own;
+    if (direct) {
+        // Each output row in this partition has a single writer warp.
+        own = out + (size_t(part) * p + anchor) * p;
+    } else {
+        own = sums + warp * width;
+        for (int j = low + lane; j < high; j += 32) own[j - panel] = 0;
+        __syncwarp();
+    }
+    int segments = direct ? gridDim.y : gridDim.y * warps;
+    int segment = direct ? part : part * warps + warp;
     int first = (size_t(words) * segment) / segments;
     int last = (size_t(words) * (segment + 1)) / segments;
     using U = std::make_unsigned_t<I>;
-    // Each bit identifies a CSR row that contains this anchor. Visit set
-    // bits from low to high so every warp sums its rows in a fixed order.
+    // Each lane consumes one bitmap word in ascending bit order. The warp
+    // accumulates those rows in lane order on every iteration.
     masks += size_t(anchor) * stride;
     for (int page = first; page < last; page += 32) {
         int word_index = page + lane;
         unsigned word = word_index < last ? masks[word_index] : 0u;
-        unsigned nonempty = __ballot_sync(0xffffffff, word != 0);
-        while (nonempty) {
-            int owner = __ffs(nonempty) - 1;
-            nonempty &= nonempty - 1;
-            unsigned hits = __shfl_sync(0xffffffff, word, owner);
+        unsigned hits;
+        while ((hits = __ballot_sync(0xffffffff, word != 0))) {
             I left = 0, right = 0;
             T value = 0;
-            if (hits & (1u << lane)) {
-                size_t row = size_t(page + owner) * 32 + lane;
+            if (word) {
+                size_t row = size_t(word_index) * 32 + (__ffs(word) - 1);
+                word &= word - 1;
                 right = row_ptr[row + 1];
                 left = lower_bound(cols, row_ptr[row], right, anchor);
                 value = values[left];
@@ -86,11 +91,13 @@ __global__ void upper(const I* row_ptr, const I* cols, const T* values,
             }
         }
     }
-    __syncthreads();
-    for (int j = low + threadIdx.x; j < high; j += blockDim.x) {
-        size_t pos = (size_t(part) * p + anchor) * p + j;
-        T sum = sums[j - panel] + sums[width + j - panel];
-        out[pos] = accumulate ? out[pos] + sum : sum;
+    if (!direct) {
+        __syncthreads();
+        for (int j = low + threadIdx.x; j < high; j += blockDim.x) {
+            size_t pos = (size_t(part) * p + anchor) * p + j;
+            T sum = sums[j - panel] + sums[width + j - panel];
+            out[pos] = accumulate ? out[pos] + sum : sum;
+        }
     }
 }
 
@@ -283,24 +290,27 @@ void bind(nb::module_& m) {
         size_t n = row_ptr.size() - 1;
         int p = partial.shape(1);
         if (!p) return;
-        if (!n) {
-            cuda_check(cudaMemsetAsync(partial.data(), 0, partial.nbytes(),
-                                       (cudaStream_t)stream),
-                       "zero empty-row Gram matrix");
-            return;
-        }
-        nb_require(masks.ndim() == 2 && masks.shape(0) == size_t(p) &&
-                       masks.shape(1) > 0 &&
-                       masks.shape(1) <= size_t(INT_MAX - 31),
+        nb_require(!n || (masks.ndim() == 2 && masks.shape(0) == size_t(p) &&
+                          masks.shape(1) > 0 &&
+                          masks.shape(1) <= size_t(INT_MAX - 31)),
                    "ordered_gram: incompatible row-presence masks");
+        auto s = (cudaStream_t)stream;
+        cuda_check(cudaMemsetAsync(partial.data(), 0, partial.nbytes(), s),
+                   "initialize sparse Gram matrix");
+        if (!n) return;
         int stride = masks.shape(1);
-        int width = min(p, max_columns);
-        int shared_bytes = width * warps * sizeof(T);
+        // One warp can update a wide output row directly when few of its
+        // entries are touched by each CSR row.
+        bool direct = p > max_columns && values.size() / n < 32;
+        int width = direct ? p : min(p, max_columns);
+        int shared_bytes = direct ? 0 : width * warps * sizeof(T);
         nb_require(shared_bytes <=
                        device_attribute(cudaDevAttrMaxSharedMemoryPerBlock),
                    "ordered_gram: shared memory exceeds the device limit");
-        dim3 grid(p, partial.shape(0), (p + width - 1) / width);
-        auto s = (cudaStream_t)stream;
+        int anchors_per_block = direct ? 4 : 1;
+        int threads = direct ? 32 * anchors_per_block : 32 * warps;
+        dim3 grid((p + anchors_per_block - 1) / anchors_per_block,
+                  partial.shape(0), (p + width - 1) / width);
         for (size_t start = 0; start < n; start += size_t(stride) * 32) {
             size_t count = min(n - start, size_t(stride) * 32);
             int words = (count + 31) / 32;
@@ -310,9 +320,9 @@ void bind(nb::module_& m) {
                 row_ptr.data() + start, cols.data(), count, masks.data(),
                 stride);
             CUDA_CHECK_LAST_ERROR(mark_rows);
-            upper<<<grid, warps * 32, shared_bytes, s>>>(
+            upper<<<grid, threads, shared_bytes, s>>>(
                 row_ptr.data() + start, cols.data(), values.data(),
-                masks.data(), stride, words, partial.data(), p, width,
+                masks.data(), stride, words, partial.data(), p, width, direct,
                 start != 0);
             CUDA_CHECK_LAST_ERROR(upper);
         }
