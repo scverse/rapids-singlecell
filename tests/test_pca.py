@@ -464,16 +464,27 @@ def test_dense_solver_dispatch(solver):
     assert estimator.call_args.kwargs["svd_solver"] == (solver or "auto")
 
 
-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
-@pytest.mark.parametrize("nnz", [40, 41])
-def test_centered_csr_density_cutoff(dtype, nnz):
+@pytest.mark.parametrize(
+    ("dtype", "tensor_gram", "n_cols", "direct_nnz"),
+    [
+        (np.float64, False, 10, 100),
+        (np.float32, False, 512, 5120),
+        (np.float32, True, 10, 100),
+        (np.float32, True, 512, 4000),
+        (np.float32, True, 2500, 5000),
+    ],
+)
+def test_centered_csr_density_cutoff(dtype, tensor_gram, n_cols, direct_nnz):
     from rapids_singlecell.preprocessing._sparse_pca import _sparse_pca as solver
 
-    x = np.zeros((10, 10), dtype=dtype)
-    x.flat[:nnz] = np.arange(1, nnz + 1)
-    with patch.object(solver, "_centered_covariance", wraps=solver._centered_covariance) as tiled:
-        rsc.pp.pca(cusparse.csr_matrix(cp.asarray(x)), n_comps=2, svd_solver="covariance_eigh")
-    assert tiled.called == (nnz > 40)
+    x = np.zeros((25, n_cols), dtype=dtype)
+    x.flat[:direct_nnz] = 1
+    with patch.object(solver, "_use_tensor_gram", return_value=tensor_gram):
+        for extra in (0, 1):
+            x.flat[direct_nnz] = extra
+            model = solver.CovariancePCA(n_components=2)
+            model.fit_transform(cusparse.csr_matrix(cp.asarray(x)))
+            assert model._project_centered_tiles == bool(extra)
 
 
 def test_wide_sparse_solver_dispatch():
@@ -702,20 +713,27 @@ def test_pca_shapes(solver):
 
 
 @pytest.mark.parametrize("use_csr", [False, True], ids=["dense", "csr"])
-def test_fp64_covariance_overflow_before_normalization(use_csr):
+@pytest.mark.parametrize(("dtype", "magnitude", "tol"), [(np.float32, 2.0**60, 1e-6), (np.float64, 2.0**507, 1e-12)])
+def test_native_covariance_overflow_before_normalization(use_csr, dtype, magnitude, tol):
+    from cupy._core import _routines_linalg
+
     n = 4096
-    magnitude = 2.0**507
-    x = np.tile([[1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]], (n // 4, 1))
+    x = np.tile(np.array([[1, 1], [-1, 1], [1, -1], [-1, -1]], dtype=dtype), (n // 4, 1))
     x[:, 0] *= magnitude
     data = sparse.csr_matrix(x) if use_csr else x
-    scores, components, ratio, variance = rsc.pp.pca(
-        data, n_comps=2, svd_solver="covariance_eigh", dtype="float64", return_info=True
-    )
+    previous = _routines_linalg.get_compute_type(x.dtype)
+    try:
+        _routines_linalg.set_compute_type(x.dtype, _routines_linalg.COMPUTE_TYPE_PEDANTIC)
+        scores, components, ratio, variance = rsc.pp.pca(
+            data, n_comps=2, svd_solver="covariance_eigh", dtype=dtype, return_info=True
+        )
+    finally:
+        _routines_linalg.set_compute_type(x.dtype, previous)
     correction = n / (n if use_csr else n - 1)
-    np.testing.assert_allclose(variance[0] / magnitude**2, correction, rtol=1e-12)
-    np.testing.assert_allclose(variance[1], correction, rtol=1e-12)
-    np.testing.assert_allclose(ratio[0], 1.0, rtol=1e-12)
-    np.testing.assert_allclose(scores, x @ components.T, rtol=1e-12)
+    np.testing.assert_allclose(variance[0] / magnitude**2, correction, rtol=tol)
+    np.testing.assert_allclose(variance[1], correction, rtol=tol)
+    np.testing.assert_allclose(ratio[0], 1.0, rtol=tol)
+    np.testing.assert_allclose(scores, x @ components.T, rtol=tol)
 
 
 def test_dense_covariance_input():

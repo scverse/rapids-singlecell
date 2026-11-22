@@ -13,7 +13,7 @@ from rapids_singlecell.preprocessing._utils import _get_mean_var
 
 from ._helper import _canonical_csr, _check_matrix_for_zero_genes, _compute_cov, _copy_gram, _csr_mean
 from ._ordered import _needs_centered_gram, _ordered_gram
-from ._tiled import _centered_covariance, _centered_tiles
+from ._tiled import _centered_covariance, _centered_tiles, _use_tensor_gram
 
 
 class CovariancePCA:
@@ -66,8 +66,11 @@ class CovariancePCA:
                 self.mean_ = None
                 return _ordered_gram(x)
             self.mean_ = _csr_mean(x)
-            # Above 40% occupancy, treat centered CSR input as dense row tiles.
-            if x.nnz <= 0.4 * n_rows * n_cols:
+            # Tensor Core tiles overtake CSR sooner on wide FP32 matrices.
+            direct_limit = 0.4 * n_cols
+            if _use_tensor_gram(x.dtype):
+                direct_limit = min(direct_limit, max(160, 0.08 * n_cols))
+            if x.nnz <= n_rows * direct_limit:
                 gram = _ordered_gram(x)
                 gram *= 1 / n_rows
                 if not _needs_centered_gram(gram, self.mean_):
