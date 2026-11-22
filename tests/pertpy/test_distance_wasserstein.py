@@ -81,7 +81,7 @@ def _logsumexp(x, axis):
     return np.log(np.exp(x - m).sum(axis=axis)) + np.squeeze(m, axis=axis)
 
 
-def _ragged_solve(pairs, *, eps=None, max_iter=5000, tol=1e-10, omega=1.0):
+def _ragged_solve(pairs, *, eps=None, max_iter=5000, tol=1e-10, omega=1.0, tensor_cores=False):
     """Solve a list of ``(X, Y)`` pairs through the ragged Sinkhorn path.
 
     Concatenates the pairs into one embedding (each pair is two groups), builds
@@ -122,7 +122,7 @@ def _ragged_solve(pairs, *, eps=None, max_iter=5000, tol=1e-10, omega=1.0):
     )
     cost = cp.empty(layout["total_cost"], dtype=dtype)
     stream = cp.cuda.get_current_stream()
-    _launch_build_cost(emb, layout, cost, stream.ptr)
+    _launch_build_cost(emb, layout, cost, stream.ptr, tensor_cores=tensor_cores)
     st = make_state(layout, cost, epsilon_scale=0.05)
     if eps is not None:
         st["eps"][:] = cp.asarray(eps, dtype=dtype)
@@ -141,9 +141,10 @@ def _ragged_solve(pairs, *, eps=None, max_iter=5000, tol=1e-10, omega=1.0):
 # ---------------------------------------------------------------------------
 
 
-def test_ragged_sinkhorn_matches_cpu_reference_single_pair() -> None:
+@pytest.mark.parametrize("n_b", [30, 301])
+def test_ragged_sinkhorn_matches_cpu_reference_single_pair(n_b) -> None:
     rng = np.random.default_rng(0)
-    n_a, n_b, d = 25, 30, 6
+    n_a, d = 25, 6
     X = rng.normal(size=(n_a, d)).astype(np.float64)
     Y = rng.normal(size=(n_b, d)).astype(np.float64)
     Y[:] += 0.5
@@ -188,6 +189,20 @@ def test_ragged_sinkhorn_auto_epsilon_uses_std() -> None:
     np.testing.assert_allclose(float(st["eps"][0]), expected_eps, rtol=1e-6)
     fixed_val, _ = _ragged_solve([(X, Y)], eps=expected_eps, max_iter=5000, tol=1e-10)
     np.testing.assert_allclose(float(auto_val[0]), float(fixed_val[0]), rtol=1e-10)
+
+
+def test_tensor_core_cost_ragged_tiles() -> None:
+    rng = np.random.default_rng(3)
+    pairs = []
+    expected = []
+    for n, m, offset in [(31, 37, 0), (19, 47, 2**16)]:
+        x = (rng.normal(size=(n, 73)) + offset).astype(np.float32)
+        y = (rng.normal(size=(m, 73)) + offset).astype(np.float32)
+        y[0] = x[0]
+        pairs.append((x, y))
+        expected.append(((x.astype(np.float64)[:, None] - y) ** 2).sum(axis=2).ravel())
+    _, st = _ragged_solve(pairs, tensor_cores=True, max_iter=1)
+    np.testing.assert_allclose(st["cost"].get(), np.concatenate(expected), rtol=5e-4)
 
 
 def test_ragged_sinkhorn_rejects_non_float_cost() -> None:
@@ -253,7 +268,7 @@ def test_compute_distance_matches_reference_default_config() -> None:
     rng = np.random.default_rng(1)
     X = rng.normal(size=(25, 6)).astype(np.float64)
     Y = (rng.normal(size=(30, 6)) + 0.5).astype(np.float64)
-    val = Distance(metric="wasserstein")(X, Y)  # public call -> compute_distance
+    val = Distance(metric="wasserstein")(X, Y)
     ref = _cpu_sinkhorn(X, Y, eps=_auto_eps(X, Y))
     np.testing.assert_allclose(val, ref, rtol=1e-4, atol=1e-4)
 
@@ -309,6 +324,9 @@ def test_distance_wasserstein_initialization() -> None:
     distance = Distance(metric="wasserstein")
     assert distance.metric == "wasserstein"
     assert distance.obsm_key == "X_pca"
+    for invalid in ("float8", np.dtype("float32")):
+        with pytest.raises(ValueError, match="precision"):
+            Distance(metric="wasserstein", precision=invalid)
 
 
 def test_relaxation_option() -> None:
@@ -542,18 +560,38 @@ def test_bootstrap_guards() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_pairwise_correctness_dtypes(dtype) -> None:
+@pytest.mark.parametrize("precision", ["auto", "float64", "float32", "float16"])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32])
+def test_pairwise_correctness_dtypes(dtype, precision) -> None:
     cpg = 15
-    adata = _make_grouped_adata(n_groups=3, cells_per_group=cpg, n_features=6, seed=4, dtype=dtype)
-    df = Distance(metric="wasserstein").pairwise(adata, "group")
+    adata = _make_grouped_adata(n_groups=3, cells_per_group=cpg, n_features=33, seed=4, dtype=np.float64)
+    adata.obsm["X_pca"] = adata.obsm["X_pca"].astype(dtype)
+    if dtype == np.float64 and precision == "float16":
+        adata.obsm["X_pca"] += 2**32  # center in the source dtype before rounding
+    df = Distance(metric="wasserstein", precision=precision).pairwise(adata, "group")
+    assert df.to_numpy().dtype == (np.float64 if dtype == np.float64 else np.float32)
     X = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
-    rtol = 1e-4 if dtype == np.float32 else 1e-5
+    rtol = 1e-5 if dtype == np.float64 else 1e-4
+    if precision == "float16":
+        rtol = 5e-4
     for i in range(3):
         for j in range(i + 1, 3):
             Xi, Xj = X[i * cpg : (i + 1) * cpg], X[j * cpg : (j + 1) * cpg]
             ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
             np.testing.assert_allclose(df.iloc[i, j], ref, rtol=rtol, atol=1e-4)
+
+
+def test_float16_outlier_only_in_selected_groups() -> None:
+    adata = _make_grouped_adata(n_groups=3, cells_per_group=20, n_features=33)
+    adata.obsm["X_pca"][0, 0] = 1e9
+    distance = Distance(metric="wasserstein", precision="float16")
+    for bootstrap in (False, True):
+        with pytest.raises(ValueError, match="float16"):
+            distance.pairwise(adata, "group", bootstrap=bootstrap, n_bootstrap=3)
+        result = distance.pairwise(adata, "group", groups=["g1", "g2"], bootstrap=bootstrap, n_bootstrap=3)
+        for df in result if bootstrap else (result,):
+            assert df.to_numpy().dtype == np.float32
+            assert np.isfinite(df.to_numpy()).all()
 
 
 def test_float32_matches_float64() -> None:
@@ -686,10 +724,13 @@ def test_call_api_basic_and_cupy() -> None:
 def test_call_and_bootstrap_input_handling() -> None:
     distance = Distance(metric="wasserstein")
     rng = np.random.default_rng(0)
-    X = rng.normal(size=(20, 6)).astype(np.float32)
-    Y = rng.normal(size=(25, 6)).astype(np.float64)  # different dtype -> cast internally
+    X = rng.normal(size=(20, 33)).astype(np.float32)
+    Y = rng.normal(size=(25, 33)).astype(np.float64)  # different dtype -> cast internally
     assert np.isfinite(distance(X, Y))
     assert distance.bootstrap(X, Y, n_bootstrap=10, random_state=0).variance >= 0
+    explicit = Distance(metric="wasserstein", precision="float16")
+    assert explicit(X, Y) == distance(X, Y)
+    assert explicit.bootstrap(X, Y, n_bootstrap=5) == distance.bootstrap(X, Y, n_bootstrap=5)
     with pytest.raises(ValueError):  # empty input
         distance(X[:0], Y)
     with pytest.raises(ValueError):
@@ -712,10 +753,12 @@ def test_contrast_self_distance_zero_and_no_split() -> None:
     assert res0["wasserstein"].iloc[0] == pytest.approx(0.0, abs=1e-7)
 
 
-def test_contrast_distances_with_split_by() -> None:
+@pytest.mark.parametrize("precision", ["auto", "float16"])
+def test_contrast_distances_with_split_by(precision) -> None:
     rng = np.random.default_rng(9)
     n = 12
-    emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
+    emb = rng.normal(size=(n * 4, 5))
+    emb[2 * n :] += 2**32
     obs = pd.DataFrame(
         {
             "treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n),
@@ -724,11 +767,13 @@ def test_contrast_distances_with_split_by() -> None:
     ).rename(str)
     adata = AnnData(emb.copy(), obs=obs)
     adata.obsm["X_pca"] = emb.copy()
-    distance = Distance(metric="wasserstein")
+    distance = Distance(metric="wasserstein", precision=precision)
     contrasts = Distance.create_contrasts(adata, groupby="treatment", selected_group="ctrl", split_by="celltype")
     res = distance.contrast_distances(adata, contrasts=contrasts)
     assert "wasserstein" in res.columns and len(res) == 2
-    assert np.all(np.isfinite(res["wasserstein"].values))
+    for celltype, value in zip(res["celltype"], res["wasserstein"], strict=True):
+        cells = emb[obs["celltype"] == celltype]
+        assert value == pytest.approx(distance(cells[:n], cells[n:]), rel=5e-4)
 
 
 @pytest.mark.two_gpus

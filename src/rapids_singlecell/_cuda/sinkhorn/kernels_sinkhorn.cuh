@@ -1,14 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 // Batched log-domain Sinkhorn kernels -- ragged (flat, no-padding) layout.
 // Everything is stored flat with per-pair int64 offsets (cost_off/f_off/g_off)
 // and int32 sizes (n/m); no masks. row2pair/col2pair map a flat row/column to
-// its pair so update_f runs one block per global row and update_g one thread
-// per global column. Per-pair conv[b] short-circuits converged pairs.
+// its pair. Per-pair conv[b] short-circuits converged pairs.
 
 namespace sinkhorn {
 
@@ -34,16 +36,19 @@ __device__ __forceinline__ void lse_acc(T m, T& rmax, T& rsum) {
     }
 }
 
-// Merge a second log-sum-exp state (m2, s2) into (m1, s1) in place. The
-// identity state is (sk_neg, 0). Used by the block reduction in update_f.
+// Normalize lane sums to the warp maximum, then sum into lane zero.
 template <typename T>
-__device__ __forceinline__ void lse_merge(T& m1, T& s1, T m2, T s2) {
-    T mc = m1 > m2 ? m1 : m2;
-    T sc = 0;
-    if (m1 > sk_neg<T>()) sc += s1 * exp(m1 - mc);
-    if (m2 > sk_neg<T>()) sc += s2 * exp(m2 - mc);
-    m1 = (mc <= sk_neg<T>()) ? sk_neg<T>() : mc;
-    s1 = (mc <= sk_neg<T>()) ? T(0) : sc;
+__device__ __forceinline__ void warp_lse(T& rmax, T& rsum) {
+    T warp_max = rmax;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        warp_max =
+            fmax(warp_max, __shfl_xor_sync(0xffffffff, warp_max, offset));
+    rsum *= exp(rmax - warp_max);
+    rmax = warp_max;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        rsum += __shfl_down_sync(0xffffffff, rsum, offset);
 }
 
 // eps[b] = scale * std(C) over pair b's contiguous cost block; floored.
@@ -95,10 +100,9 @@ __global__ void auto_eps_kernel(const T* __restrict__ cost,
 }
 
 // g[b, j] = eps * (log_b - LSE_i (-C[i, j] + f[i]) / eps).
-// Grid over the flat columns (one thread per global column); col2pair maps it
-// to its pair. omega is the over-relaxation factor (omega == 1 = plain
-// Sinkhorn, does not read the old g).
-template <typename T>
+// A warp shares a column in small batches. Large batches have enough columns
+// to assign one per thread and coalesce reads across neighboring columns.
+template <typename T, bool WARP_PER_COL>
 __global__ void update_g_kernel(
     const T* __restrict__ cost, const int64_t* __restrict__ cost_off,
     const int* __restrict__ n, const int* __restrict__ m,
@@ -106,8 +110,10 @@ __global__ void update_g_kernel(
     T* __restrict__ g, const int64_t* __restrict__ g_off,
     const int* __restrict__ col2pair, const T* __restrict__ eps,
     const T* __restrict__ log_b, const int* __restrict__ conv, T omega,
-    int64_t total_cols) {
-    const int64_t c = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total_cols, T* __restrict__ g_prev) {
+    constexpr int lanes = WARP_PER_COL ? 32 : 1;
+    const int lane = threadIdx.x % lanes;
+    const int64_t c = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) / lanes;
     if (c >= total_cols) return;
     const int b = col2pair[c];
     if (conv[b]) return;
@@ -117,26 +123,32 @@ __global__ void update_g_kernel(
     const T* fb = f + f_off[b];
     const T inv_eps = T(1) / eps[b];
     T rmax = sk_neg<T>(), rsum = 0;
-    for (int i = 0; i < n_b; ++i)
+    for (int i = lane; i < n_b; i += lanes)
         lse_acc<T>((-Cb[(int64_t)i * m_b + j] + fb[i]) * inv_eps, rmax, rsum);
+    if constexpr (WARP_PER_COL) {
+        warp_lse(rmax, rsum);
+        if (lane != 0) return;
+    }
     const T lse = rsum > T(0) ? log(rsum) + rmax : sk_neg<T>();
     const T new_g = eps[b] * (log_b[b] - lse);
     T* gb = g + g_off[b];
+    if (g_prev) g_prev[c] = gb[j];
     gb[j] = (omega == T(1)) ? new_g : (T(1) - omega) * gb[j] + omega * new_g;
 }
 
 // f[b, i] = eps * (log_a - LSE_j (-C[i, j] + g[j]) / eps).
-// Grid = total flat rows (one block per global row); row2pair maps it to its
-// pair; the block cooperatively reduces over that pair's m columns.
-template <typename T, int BLOCK>
+// A warp handles a short row; a full block shares the reduction for long rows.
+template <typename T, int ROW_THREADS>
 __global__ void update_f_kernel(
     const T* __restrict__ cost, const int64_t* __restrict__ cost_off,
     const int* __restrict__ m, const T* __restrict__ g,
     const int64_t* __restrict__ g_off, T* __restrict__ f,
     const int64_t* __restrict__ f_off, const int* __restrict__ row2pair,
     const T* __restrict__ eps, const T* __restrict__ log_a,
-    const int* __restrict__ conv, T omega, int64_t total_rows) {
-    const int64_t r = blockIdx.x;
+    const int* __restrict__ conv, T omega, int64_t total_rows,
+    T* __restrict__ f_prev) {
+    const int64_t r =
+        ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) / ROW_THREADS;
     if (r >= total_rows) return;
     const int b = row2pair[r];
     if (conv[b]) return;
@@ -146,54 +158,130 @@ __global__ void update_f_kernel(
     const T* gb = g + g_off[b];
     const T inv_eps = T(1) / eps[b];
     T rmax = sk_neg<T>(), rsum = 0;
-    for (int j = threadIdx.x; j < m_b; j += BLOCK)
-        lse_acc<T>((-Cbi[j] + gb[j]) * inv_eps, rmax, rsum);
-    // Block log-sum-exp reduction: warp shuffles, then one cross-warp pass.
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        T om = __shfl_down_sync(0xffffffff, rmax, offset);
-        T os = __shfl_down_sync(0xffffffff, rsum, offset);
-        lse_merge<T>(rmax, rsum, om, os);
-    }
-    __shared__ T wmax[32];
-    __shared__ T wsum[32];
-    if ((threadIdx.x & 31) == 0) {
-        wmax[threadIdx.x >> 5] = rmax;
-        wsum[threadIdx.x >> 5] = rsum;
-    }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        const int nwarps = blockDim.x >> 5;
-        T vm = (threadIdx.x < nwarps) ? wmax[threadIdx.x] : sk_neg<T>();
-        T vs = (threadIdx.x < nwarps) ? wsum[threadIdx.x] : T(0);
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            T om = __shfl_down_sync(0xffffffff, vm, offset);
-            T os = __shfl_down_sync(0xffffffff, vs, offset);
-            lse_merge<T>(vm, vs, om, os);
+    const int lane = threadIdx.x % ROW_THREADS;
+    for (int j = lane; j < m_b; j += ROW_THREADS)
+        lse_acc<T>((gb[j] - Cbi[j]) * inv_eps, rmax, rsum);
+    warp_lse(rmax, rsum);
+    if constexpr (ROW_THREADS > 32) {
+        constexpr int nwarps = ROW_THREADS / 32;
+        __shared__ T wmax[nwarps], wsum[nwarps];
+        if (lane % 32 == 0) {
+            wmax[lane / 32] = rmax;
+            wsum[lane / 32] = rsum;
         }
-        if (threadIdx.x == 0) {
-            const T lse = vs > T(0) ? log(vs) + vm : sk_neg<T>();
-            const T new_f = eps[b] * (log_a[b] - lse);
-            T* fb = f + f_off[b];
-            fb[i] = (omega == T(1)) ? new_f
-                                    : (T(1) - omega) * fb[i] + omega * new_f;
-        }
+        __syncthreads();
+        if (lane >= 32) return;
+        rmax = lane < nwarps ? wmax[lane] : sk_neg<T>();
+        rsum = lane < nwarps ? wsum[lane] : T(0);
+        warp_lse(rmax, rsum);
+    }
+    if (lane == 0) {
+        const T lse = rsum > T(0) ? log(rsum) + rmax : sk_neg<T>();
+        const T new_f = eps[b] * (log_a[b] - lse);
+        if (f_prev) f_prev[r] = f[r];
+        f[r] = (omega == T(1)) ? new_f : (T(1) - omega) * f[r] + omega * new_f;
     }
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+// Eight warps split the features of a 16x16 cost tile. Each warp stages its
+// own 16x16 half operands, then reuses the space for its FP32 dot products.
+template <typename Out>
+__device__ __forceinline__ void tensor_cost_tile(
+    const float* emb, const int* cl, const int* cr, int rows, int cols,
+    int stride, int D, Out* cost, float* scratch, int scale_exponent) {
+    namespace wmma = nvcuda::wmma;
+    const int tid = threadIdx.y * 16 + threadIdx.x;
+    const int warp = tid / 32, lane = tid % 32;
+    float* tile = scratch + warp * 256;
+    float* norms = scratch + 8 * 256;
+    auto* operands = reinterpret_cast<__half*>(tile);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
+    wmma::fill_fragment(dot, 0.f);
+    float xnorm[4]{}, ynorm[4]{};
+    const float* xp[4];
+    const float* yp[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int row = 4 * r + lane / 8;
+        xp[r] = emb + (int64_t)cl[min(row, rows - 1)] * D;
+        yp[r] = emb + (int64_t)cr[min(row, cols - 1)] * D;
+    }
+    for (int k = 16 * warp; k < D; k += 128) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int d = k + 2 * (lane % 8) + h;
+                const __half x = __float2half_rn(d < D ? xp[r][d] : 0.f);
+                const __half y = __float2half_rn(d < D ? yp[r][d] : 0.f);
+                const float xf = __half2float(x), yf = __half2float(y);
+                xnorm[r] += xf * xf;
+                ynorm[r] += yf * yf;
+                operands[2 * (32 * r + lane) + h] = x;
+                operands[256 + 2 * (32 * r + lane) + h] = y;
+            }
+        }
+        __syncwarp();
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+        wmma::load_matrix_sync(a, operands, 16);
+        wmma::load_matrix_sync(b, operands + 256, 16);
+        wmma::mma_sync(dot, a, b, dot);
+        __syncwarp();
+    }
+    wmma::store_matrix_sync(tile, dot, 16, wmma::mem_row_major);
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+#pragma unroll
+        for (int s = 4; s; s >>= 1) {
+            xnorm[r] += __shfl_down_sync(0xffffffff, xnorm[r], s, 8);
+            ynorm[r] += __shfl_down_sync(0xffffffff, ynorm[r], s, 8);
+        }
+        if (lane % 8 == 0) {
+            const int row = 4 * r + lane / 8;
+            norms[warp * 32 + row] = xnorm[r];
+            norms[warp * 32 + 16 + row] = ynorm[r];
+        }
+    }
+    __syncthreads();
+    const int i = threadIdx.y, j = threadIdx.x;
+    if (i >= rows || j >= cols) return;
+    float xy = 0.f, norm = 0.f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        xy += scratch[256 * w + tid];
+        norm += norms[32 * w + i] + norms[32 * w + 16 + j];
+    }
+    float value = norm - 2.f * xy;
+    // Use direct FP32 differences for cancellation, half overflow, and values
+    // near the half subnormal range (the smallest normal is 2^-14).
+    if (!(value > fmaxf(0.05f * norm, D * 0x1p-28f)) || !isfinite(value)) {
+        value = 0.f;
+        for (int d = 0; d < D; ++d) {
+            const float diff =
+                emb[(int64_t)cl[i] * D + d] - emb[(int64_t)cr[j] * D + d];
+            value += diff * diff;
+        }
+    }
+    cost[(int64_t)i * stride + j] =
+        ldexp(static_cast<Out>(value), -2 * scale_exponent);
+}
+#endif
 
 // Fused gather + squared-Euclidean cost: block t does the TILE x TILE tile
 // (tile_pair/tile_i0/tile_j0) of one pair, streaming D in FEAT_TILE chunks so
 // shared memory is independent of D. The shared row stride MUST be FEAT_TILE+1
 // (odd) -- a multiple-of-32 stride collapses the tile columns into one bank.
-template <typename T, int TILE, int FEAT_TILE>
+template <typename T, typename Out, int TILE, int FEAT_TILE, bool TENSOR_CORES>
 __global__ void pairwise_cost_kernel(
     const T* __restrict__ emb, const int* __restrict__ cidx_l,
     const int64_t* __restrict__ f_off, const int* __restrict__ cidx_r,
     const int64_t* __restrict__ g_off, const int* __restrict__ n,
     const int* __restrict__ m, const int64_t* __restrict__ cost_off,
     const int* __restrict__ tile_pair, const int* __restrict__ tile_i0,
-    const int* __restrict__ tile_j0, T* __restrict__ cost, int D) {
+    const int* __restrict__ tile_j0, Out* __restrict__ cost, int D,
+    int scale_exponent) {
     const int t = blockIdx.x;
     const int b = tile_pair[t];
     const int i0 = tile_i0[t];
@@ -204,7 +292,16 @@ __global__ void pairwise_cost_kernel(
     const int ti = threadIdx.y;
     const int tj = threadIdx.x;
     constexpr int FS = FEAT_TILE + 1;
-    extern __shared__ __align__(sizeof(double)) unsigned char smem_raw[];
+    extern __shared__ __align__(32) unsigned char smem_raw[];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    if constexpr (TENSOR_CORES && std::is_same_v<T, float>) {
+        static_assert(TILE == 16 && 2 * TILE * FS >= 8 * (256 + 32));
+        tensor_cost_tile(emb, cl + i0, cr + j0, n_b - i0, m_b - j0, m_b, D,
+                         cost + cost_off[b] + (int64_t)i0 * m_b + j0,
+                         reinterpret_cast<float*>(smem_raw), scale_exponent);
+        return;
+    }
+#endif
     T* Xs = reinterpret_cast<T*>(smem_raw);  // TILE * FS
     T* Ys = Xs + TILE * FS;                  // TILE * FS
     const int tid = ti * TILE + tj;
@@ -230,13 +327,17 @@ __global__ void pairwise_cost_kernel(
         }
         __syncthreads();
     }
-    if (gi < n_b && gj < m_b) cost[cost_off[b] + (int64_t)gi * m_b + gj] = s;
+    if (gi < n_b && gj < m_b) {
+        Out value = s;
+        if constexpr (TENSOR_CORES) value = ldexp(value, -2 * scale_exponent);
+        cost[cost_off[b] + (int64_t)gi * m_b + gj] = value;
+    }
 }
 
 // Per-pair convergence: one block per pair (no atomics -- each owns its
 // conv[b]). Reduces the pair's f/g segments for max single-iteration change and
-// max magnitude, sets conv[b] if change/(scale+1) < tol. Caller snapshots
-// f_prev/g_prev.
+// max magnitude, sets conv[b] if change/(scale+1) < tol. The last update in a
+// chunk saves f_prev/g_prev.
 template <typename T, int BLOCK>
 __global__ void converged_kernel(
     const T* __restrict__ f, const T* __restrict__ f_prev,

@@ -73,7 +73,7 @@ class Distance:
     - ``"wasserstein"``: Entropy-regularized 2-Wasserstein via Sinkhorn.
         Squared-Euclidean ground cost; per-pair auto-epsilon defaulting to
         ``0.05 * std(C)`` to match OTT-JAX. Returns OTT's
-        ``reg_ot_cost`` value.
+        ``reg_ot_cost`` in squared-distance units.
 
     Parameters
     ----------
@@ -87,6 +87,17 @@ class Distance:
         If neither key is specified, the PCA key of the active
         ``rapids_singlecell.settings.preset`` is used. Either spelling
         resolves to whichever one the data actually uses.
+    **kwargs
+        With ``metric="wasserstein"``, ``precision`` selects the arithmetic for
+        cell-to-cell costs in :meth:`pairwise`, :meth:`onesided_distances`
+        and :meth:`contrast_distances`, including grouped bootstrap.
+        ``"auto"`` (default) uses float64 for float64 data and float32 otherwise.
+        Set ``"float32"`` or ``"float64"`` explicitly, or use ``"float16"`` for
+        Tensor Cores with float32 accumulation on compute capability 7.5 or
+        newer. Float16 can lose accuracy and raises ``ValueError`` if centered,
+        scaled coordinates exceed its range. The Sinkhorn solver and grouped
+        results use the auto dtype in every mode. The two-array calls
+        ``distance(X, Y)`` and ``distance.bootstrap(X, Y)`` always use auto.
 
     Notes
     -----

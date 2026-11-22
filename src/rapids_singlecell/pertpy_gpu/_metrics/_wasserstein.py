@@ -7,7 +7,7 @@ batched Sinkhorn (see ``_sinkhorn`` and the ``_sinkhorn_cuda`` kernels).
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import cupy as cp
 import numpy as np
@@ -45,6 +45,57 @@ COST_TILE = 16  # must match constexpr int TILE in sinkhorn.cu
 # Over-relaxation: omega 1 = plain Sinkhorn; (1, 2) is the convergent SOR range.
 MIN_RELAXATION = 1.0
 MAX_RELAXATION = 2.0
+
+
+_scale_half_inputs = cp.ElementwiseKernel(
+    "T x, T center, int32 exponent",
+    "float32 scaled, raw int32 overflow",
+    """
+    scaled = ldexp(x - center, exponent);
+    if (fabsf(scaled) > 65504.f) atomicExch(&overflow[0], 1);
+    """,
+    "sinkhorn_scale_half_inputs",
+)
+
+
+def _result_dtype(dtype):
+    if dtype.kind not in "biuf":
+        raise ValueError(f"Unsupported dtype {dtype}")
+    return np.dtype(np.float64 if dtype == np.float64 else np.float32)
+
+
+def _cost_embedding(embedding, precision):
+    dtype = _result_dtype(embedding.dtype)
+    if precision != "float16":
+        return cp.ascontiguousarray(embedding, dtype=dtype if precision == "auto" else precision), 0
+
+    # Estimate a typical coordinate range from a bounded sample; one outlier
+    # must not set the half-precision scale for all the other cells.
+    rows, features = embedding.shape
+    if not features:
+        return cp.ascontiguousarray(embedding, dtype=cp.float32), 0
+    if embedding.dtype.kind != "f" or embedding.dtype == cp.float16:
+        embedding = embedding.astype(cp.float64 if embedding.dtype.itemsize >= 4 else cp.float32)
+    sample_rows = min(256, max(1, 2**18 // features))
+    stride = max(1, -(-rows // sample_rows))
+    sample = embedding[::stride]
+    center = cp.sort(sample, axis=0)[len(sample) // 2]
+    radius = float(cp.nanmedian(cp.max(cp.abs(sample - center), axis=1)))
+    exponent = 11 - int(np.frexp(radius)[1]) if np.isfinite(radius) and radius > 0 else 0
+    scaled = cp.empty(embedding.shape, dtype=cp.float32)
+    overflow = cp.zeros(1, dtype=cp.int32)
+    _scale_half_inputs(embedding, center, np.int32(exponent), scaled, overflow)
+    if bool(overflow[0]):
+        raise ValueError("Cells exceed the float16 range after centering and scaling; use precision='float32'.")
+    return scaled, exponent
+
+
+def _two_array_embedding(X, Y):
+    x, y = cp.asarray(X), cp.asarray(Y)
+    if len(x) == 0 or len(y) == 0:
+        raise ValueError("Neither X nor Y can be empty.")
+    dtype = np.promote_types(_result_dtype(x.dtype), _result_dtype(y.dtype))
+    return cp.ascontiguousarray(cp.concatenate((x, y), dtype=dtype)), len(x), len(y)
 
 
 def _build_ragged_layout(
@@ -142,7 +193,15 @@ def _build_ragged_layout(
     }
 
 
-def _launch_build_cost(emb: cp.ndarray, layout: dict, cost: cp.ndarray, stream_ptr: int) -> None:
+def _launch_build_cost(
+    emb: cp.ndarray,
+    layout: dict,
+    cost: cp.ndarray,
+    stream_ptr: int,
+    *,
+    tensor_cores: bool = False,
+    scale_exponent: int = 0,
+) -> None:
     """Fill the flat ``cost`` array for a ragged ``layout`` (one kernel launch)."""
     _sk.build_cost(
         emb,
@@ -158,6 +217,8 @@ def _launch_build_cost(emb: cp.ndarray, layout: dict, cost: cp.ndarray, stream_p
         layout["tile_j0"],
         cost,
         stream_ptr,
+        tensor_cores,
+        scale_exponent,
     )
 
 
@@ -253,10 +314,8 @@ class WassersteinMetric(BaseMetric):
     at convergence with uniform marginals and squared-Euclidean cost.
 
     The Sinkhorn solver configuration (auto epsilon = ``0.05 * std(C)``,
-    ``max_iter`` 2000, ``tol`` 1e-4) is fixed to the OTT-JAX / pertpy defaults
-    and is not user-tunable, matching upstream pertpy's zero-config Wasserstein.
-    The one exception is ``relaxation`` (see below), which has no pertpy
-    equivalent.
+    ``max_iter`` 2000, ``tol`` 1e-4) matches the default configuration used for
+    comparisons with OTT-JAX / pertpy.
 
     Parameters
     ----------
@@ -269,7 +328,10 @@ class WassersteinMetric(BaseMetric):
         Over-relaxation factor. ``1.0`` (default) is plain Sinkhorn and matches
         OTT-JAX. Values in ``(1, 2)`` cut the iteration count (~halved near
         ``1.5``) for a small change in the converged value; too large diverges
-        (hits the iteration cap and warns). Leave at ``1.0`` for exact results.
+        (hits the iteration cap and warns).
+    precision
+        Arithmetic of the grouped cell-to-cell costs. See
+        :class:`~rapids_singlecell.ptg.Distance`.
 
     References
     ----------
@@ -285,6 +347,7 @@ class WassersteinMetric(BaseMetric):
         layer_key: str | None = None,
         obsm_key: str | None = "X_pca",
         relaxation: float = DEFAULT_RELAXATION,
+        precision: Literal["auto", "float32", "float64", "float16"] = "auto",
     ):
         super().__init__(layer_key=layer_key, obsm_key=obsm_key)
         if not MIN_RELAXATION <= relaxation < MAX_RELAXATION:
@@ -294,6 +357,9 @@ class WassersteinMetric(BaseMetric):
         self.max_iter = DEFAULT_MAX_ITER
         self.tol = DEFAULT_TOL
         self.relaxation = relaxation
+        if not isinstance(precision, str) or precision not in ("auto", "float32", "float64", "float16"):
+            raise ValueError(f"precision must be 'auto', 'float32', 'float64' or 'float16', got {precision!r}.")
+        self.precision = precision
 
     def _solve_pairs(
         self,
@@ -303,18 +369,17 @@ class WassersteinMetric(BaseMetric):
         pair_left: list[int],
         pair_right: list[int],
         *,
-        dtype,
         device_ids: list[int] | None = None,
     ) -> cp.ndarray:
         """Solve all (i, j) Sinkhorn problems, returning a flat ``(n_pairs,)`` array.
 
         Each pair is oriented larger-group-as-columns (the OT cost is symmetric)
         so the cooperative ``update_f`` reduction runs on the big axis. Pairs are
-        split across ``device_ids`` and solved in batch-rounds, with per-iteration
-        launches interleaved across devices' streams so the GPUs overlap.
+        split across ``device_ids`` and solved in batches on each device's stream.
         """
         if device_ids is None:
             device_ids = [0]
+        dtype = _result_dtype(embedding.dtype)
         n_pairs = len(pair_left)
         if n_pairs == 0:
             return cp.zeros(0, dtype=dtype)
@@ -322,7 +387,7 @@ class WassersteinMetric(BaseMetric):
         pl_host = np.asarray(pair_left, dtype=np.int32)
         pr_host = np.asarray(pair_right, dtype=np.int32)
         # Contiguous once on the source; the per-device copies then aren't temporaries.
-        embedding = cp.ascontiguousarray(embedding)
+        embedding, exponent = _cost_embedding(embedding, self.precision)
         group_sizes = (cat_offsets[1:] - cat_offsets[:-1]).astype(cp.int32)
         # Group sizes to host (one sync) -> all batch planning is host-only.
         n_left = group_sizes[cp.asarray(pl_host)].get()
@@ -391,7 +456,14 @@ class WassersteinMetric(BaseMetric):
                         buf = cp.empty(need, dtype=dtype)
                         cost_bufs[dev] = buf
                     cost = buf[:need]
-                    _launch_build_cost(emb, layout, cost, streams[dev].ptr)
+                    _launch_build_cost(
+                        emb,
+                        layout,
+                        cost,
+                        streams[dev].ptr,
+                        tensor_cores=self.precision == "float16",
+                        scale_exponent=exponent,
+                    )
                 units.append(
                     {
                         "dev": dev,
@@ -447,7 +519,7 @@ class WassersteinMetric(BaseMetric):
         *,
         n_bootstrap: int,
         random_state: int,
-        dtype,
+        precision: str,
         device: int,
     ) -> tuple[cp.ndarray, cp.ndarray]:
         """Bootstrap per-pair mean/variance of W by resampling cells.
@@ -460,11 +532,12 @@ class WassersteinMetric(BaseMetric):
         """
         if n_bootstrap < 1:
             raise ValueError(f"n_bootstrap must be >= 1, got {n_bootstrap}")
+        dtype = _result_dtype(embedding.dtype)
         n_pairs = len(pair_left)
         if n_pairs == 0:
             empty = cp.zeros(0, dtype=dtype)
             return empty, empty
-        embedding = cp.ascontiguousarray(embedding)
+        embedding, exponent = _cost_embedding(embedding, precision)
         with cp.cuda.Device(device):
             emb = _copy_to_device(embedding, device)
             offs = _copy_to_device(cat_offsets, device)
@@ -506,7 +579,9 @@ class WassersteinMetric(BaseMetric):
                     rng=rng,
                 )
                 cost = cp.empty(layout["total_cost"], dtype=dtype)
-                _launch_build_cost(emb, layout, cost, stream.ptr)
+                _launch_build_cost(
+                    emb, layout, cost, stream.ptr, tensor_cores=precision == "float16", scale_exponent=exponent
+                )
                 st = make_state(layout, cost, epsilon_scale=self.epsilon_scale)
                 run_async(
                     [{"dev": device, "stream": stream, "state": st}],
@@ -531,14 +606,7 @@ class WassersteinMetric(BaseMetric):
         random_state: int = 0,
     ) -> tuple[float, float]:
         """Bootstrap mean/variance of W between two arrays (``Distance.bootstrap``)."""
-        Xc = cp.asarray(X)
-        Yc = cp.asarray(Y)
-        if len(Xc) == 0 or len(Yc) == 0:
-            raise ValueError("Neither X nor Y can be empty.")
-        if Xc.dtype != Yc.dtype:
-            Yc = Yc.astype(Xc.dtype)
-        n_a, n_b = Xc.shape[0], Yc.shape[0]
-        emb = cp.ascontiguousarray(cp.concatenate([Xc, Yc], axis=0))
+        emb, n_a, n_b = _two_array_embedding(X, Y)
         cat_offsets = cp.asarray([0, n_a, n_a + n_b], dtype=cp.int32)
         cell_indices = cp.arange(n_a + n_b, dtype=cp.int32)
         mean, var = self._bootstrap_solve(
@@ -549,7 +617,7 @@ class WassersteinMetric(BaseMetric):
             [1],
             n_bootstrap=n_bootstrap,
             random_state=random_state,
-            dtype=emb.dtype,
+            precision="auto",
             device=cp.cuda.runtime.getDevice(),
         )
         return float(mean[0]), float(var[0])
@@ -617,7 +685,7 @@ class WassersteinMetric(BaseMetric):
                 pair_right.append(j)
 
         def _to_matrix(flat: cp.ndarray, name: str) -> pd.DataFrame:
-            mat = cp.zeros((k, k), dtype=embedding.dtype)
+            mat = cp.zeros((k, k), dtype=flat.dtype)
             if pair_left:
                 il = cp.asarray(pair_left, dtype=cp.intp)
                 jr = cp.asarray(pair_right, dtype=cp.intp)
@@ -639,7 +707,7 @@ class WassersteinMetric(BaseMetric):
                 pair_right,
                 n_bootstrap=n_bootstrap,
                 random_state=random_state,
-                dtype=embedding.dtype,
+                precision=self.precision,
                 device=device_ids[0],
             )
             return (
@@ -653,7 +721,6 @@ class WassersteinMetric(BaseMetric):
             cell_indices,
             pair_left,
             pair_right,
-            dtype=embedding.dtype,
             device_ids=device_ids,
         )
         return _to_matrix(flat, "pairwise wasserstein")
@@ -713,7 +780,7 @@ class WassersteinMetric(BaseMetric):
                 pair_right,
                 n_bootstrap=n_bootstrap,
                 random_state=random_state,
-                dtype=embedding.dtype,
+                precision=self.precision,
                 device=device_ids[0],
             )
             mean_df, var_df = _to_df(mean), _to_df(var)
@@ -727,7 +794,6 @@ class WassersteinMetric(BaseMetric):
             cell_indices,
             pair_left,
             pair_right,
-            dtype=embedding.dtype,
             device_ids=device_ids,
         )
         df = _to_df(flat)
@@ -750,6 +816,20 @@ class WassersteinMetric(BaseMetric):
         grouped = adata.obs.groupby(all_cols, observed=True)
         group_indices = grouped.indices
 
+        # Each FP16 split has its own center and scaling, so unrelated strata
+        # cannot erase small differences or cause a range error.
+        if self.precision == "float16" and split_by:
+            partitions = contrasts.groupby(split_by, observed=True, sort=False, dropna=False).indices.values()
+        else:
+            partitions = [slice(None)]
+        distances = np.empty(len(contrasts), dtype=_result_dtype(embedding_raw.dtype))
+        for positions in partitions:
+            distances[positions] = self._contrast_costs(
+                embedding_raw, group_indices, contrasts.iloc[positions], groupby, split_by, device_ids=device_ids
+            )
+        return contrasts.assign(wasserstein=distances)
+
+    def _contrast_costs(self, embedding_raw, group_indices, contrasts, groupby, split_by, *, device_ids):
         target_vals = contrasts[groupby].values
         ref_vals = contrasts["reference"].values
         split_arrays = [contrasts[col].values for col in split_by]
@@ -783,9 +863,12 @@ class WassersteinMetric(BaseMetric):
 
         flat_cell_idx = np.concatenate(all_cells) if all_cells else np.array([], dtype=np.int64)
         cat_offsets = cp.asarray(offsets_host, dtype=cp.int32)
-        cell_indices = cp.asarray(flat_cell_idx, dtype=cp.int32)
-        embedding = cp.asarray(embedding_raw)
-        dtype = embedding.dtype
+        if self.precision == "float16":
+            embedding = cp.asarray(embedding_raw[flat_cell_idx])
+            cell_indices = cp.arange(len(embedding), dtype=cp.int32)
+        else:
+            embedding = cp.asarray(embedding_raw)
+            cell_indices = cp.asarray(flat_cell_idx, dtype=cp.int32)
 
         # Deduplicate canonical pairs (i, j) with i < j
         canon_to_flat: dict[tuple[int, int], int] = {}
@@ -806,12 +889,11 @@ class WassersteinMetric(BaseMetric):
             cell_indices,
             pair_left,
             pair_right,
-            dtype=dtype,
             device_ids=device_ids,
         )
         flat_cpu = flat.get()
 
-        distances = np.empty(len(contrast_pairs), dtype=np.float64)
+        distances = np.empty(len(contrast_pairs), dtype=flat_cpu.dtype)
         for n, (idx_a, idx_b) in enumerate(contrast_pairs):
             if idx_a == idx_b:
                 distances[n] = 0.0
@@ -819,24 +901,14 @@ class WassersteinMetric(BaseMetric):
             canon = (min(idx_a, idx_b), max(idx_a, idx_b))
             distances[n] = flat_cpu[canon_to_flat[canon]]
 
-        result = contrasts.copy()
-        result["wasserstein"] = distances
-        return result
+        return distances
 
     def compute_distance(
         self,
         X: np.ndarray | cp.ndarray,
         Y: np.ndarray | cp.ndarray,
     ) -> float:
-        Xc = cp.asarray(X)
-        Yc = cp.asarray(Y)
-        if len(Xc) == 0 or len(Yc) == 0:
-            raise ValueError("Neither X nor Y can be empty.")
-        if Xc.dtype != Yc.dtype:
-            Yc = Yc.astype(Xc.dtype)
-
-        n_a, n_b = int(Xc.shape[0]), int(Yc.shape[0])
-        emb = cp.ascontiguousarray(cp.concatenate([Xc, Yc], axis=0))
+        emb, n_a, n_b = _two_array_embedding(X, Y)
         cat_offsets = cp.asarray([0, n_a, n_a + n_b], dtype=cp.int32)
         cell_indices = cp.arange(n_a + n_b, dtype=cp.int32)
         # Single pair (groups 0 and 1), smaller group oriented as rows.
