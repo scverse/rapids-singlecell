@@ -827,7 +827,10 @@ __device__ const int* move_hub_buckets(const MoveEval<K>& a, int v, i64 b,
     for (u64 k = threadIdx.x; k < nb; k += blockDim.x) cnt[k] = 0;
     __syncthreads();
     const i64 at = *s_at;
-    if (at < 0) return nullptr;  // block-uniform
+    if (at < 0) {  // the fallback reuses cnt as the hash table's keys
+        for (u64 k = threadIdx.x; k < nb; k += blockDim.x) cnt[k] = kEmptySlot;
+        return nullptr;
+    }
     int* off = hs.base + at;
     int* pos = off + nb + 1;
     for (i64 j = b + threadIdx.x; j < e; j += blockDim.x) {

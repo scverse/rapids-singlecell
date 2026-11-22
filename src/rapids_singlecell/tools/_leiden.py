@@ -139,13 +139,13 @@ def leiden(
         Defaults to the connectivities written by :func:`~rapids_singlecell.pp.neighbors`.
         ``flavor='rapids'`` sums duplicate entries, clusters
         an asymmetric matrix as A + A.T (with a warning) and ignores the
-        diagonal (self-loops); every stored weight must be finite and
-        non-negative.
+        diagonal (self-loops).
     directed
         Must not be ``True``: the graph is treated as undirected.
     use_weights
-        If ``True``, edge weights from the graph are used in the computation
-        (placing more emphasis on stronger edges).
+        If ``True``, use the graph's edge weights. Native Leiden requires every
+        stored weight to be finite and non-negative in this mode. If ``False``,
+        native Leiden counts each nonzero off-diagonal entry as a unit-weight edge.
     n_iterations
         How many iterations of the Leiden algorithm to perform, as in
         ``scanpy.tl.leiden``; each iteration restarts from the partition of the
