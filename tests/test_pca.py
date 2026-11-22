@@ -238,16 +238,75 @@ def test_sparse_solver_complex_projection_and_variance(svd_solver, dtype):
 
 @pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
 def test_centered_sparse_solver_variance_large_offset(svd_solver):
+    from rapids_singlecell.preprocessing._sparse_pca._sparse_svd_pca import PCA_sparse_svd
+
     rng = np.random.default_rng(43)
     X = rng.binomial(1, 0.25, (48, 16)).astype(np.float64)
-    X[:, 0] = 1e10 + np.tile([-1, 0, 1], 16)
-    X[:, 1] = 1e10
-    csr = sparse.csr_matrix(X)
-    _, _, ratio, variance = rsc.pp.pca(csr, n_comps=4, svd_solver=svd_solver, dtype=X.dtype, rng=42, return_info=True)
-    total_variance = X.var(axis=0, ddof=1).sum()
-    variance = cp.asnumpy(variance)
-    assert np.all(np.isfinite(variance) & (variance > 0))
-    np.testing.assert_allclose(cp.asnumpy(ratio), variance / total_variance, rtol=1e-12)
+    X[:, 0] = 1e16 + np.tile([0, 2], 24)  # The exact mean is halfway between representable values.
+    X[:, 1] = 1e16
+    shifted = X - X[0]
+    offset = shifted.mean(axis=0)
+    centered = shifted - offset
+    model = PCA_sparse_svd(4, svd_solver=svd_solver, n_oversamples=X.shape[1], rng=42)
+    scores = model.fit_transform(cusparse.csr_matrix(sparse.csr_matrix(X))).get()
+    loadings = model.components_.get().T
+    variance = model.explained_variance_.get()
+    singular = np.linalg.svd(centered, compute_uv=False)[:4]
+    np.testing.assert_allclose(variance, singular**2 / (X.shape[0] - 1), rtol=1e-10)
+    np.testing.assert_allclose(scores, centered @ loadings, atol=1e-12)
+    np.testing.assert_allclose(centered.T @ scores, loadings * variance * (X.shape[0] - 1), atol=1e-10)
+    total_variance = np.square(centered).sum() / (X.shape[0] - 1)
+    np.testing.assert_allclose(model.explained_variance_ratio_.get(), variance / total_variance, rtol=1e-12)
+
+    holdout = X[:3].copy()
+    holdout[0, 0] += 4
+    holdout[1, 0] = 0
+    holdout[2] = 0
+    expected = ((holdout - X[0]) - offset) @ loadings
+    stored_zero = sparse.csr_matrix(([0.0], [0], [0, 1]), shape=(1, X.shape[1]))
+    sparse_holdout = sparse.vstack((sparse.csr_matrix(holdout[:2]), stored_zero), format="csr")
+    for values in (cp.asarray(holdout), cusparse.csr_matrix(sparse_holdout)):
+        np.testing.assert_allclose(model.transform(values).get(), expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
+@pytest.mark.parametrize(
+    ("shift", "offsets", "dtype"),
+    [
+        (0, [0, 2], np.float64),
+        (1e16, [0, 2], np.float64),
+        (1e8 + 8, [0, 8], np.float32),
+        (1e8, [0, 24, 56], np.float32),
+    ],
+)
+def test_centered_single_feature(svd_solver, shift, offsets, dtype):
+    from rapids_singlecell.preprocessing._sparse_pca._sparse_svd_pca import PCA_sparse_svd
+
+    offsets = np.asarray(offsets, dtype=np.float64)
+    X = cusparse.csr_matrix(cp.asarray((shift + offsets)[:, None], dtype=dtype))
+    model = PCA_sparse_svd(1, svd_solver=svd_solver, rng=42)
+    scores = model.fit_transform(X)
+    np.testing.assert_allclose((scores @ model.components_).get().ravel(), offsets - offsets.mean(), rtol=1e-6)
+    np.testing.assert_allclose(model.explained_variance_.get(), [offsets.var(ddof=1)], rtol=1e-6)
+    np.testing.assert_allclose(model.explained_variance_ratio_.get(), [1], rtol=1e-6)
+
+    holdout_offset = 2 * offsets[-1]
+    holdout = cusparse.csr_matrix(cp.array([[shift + holdout_offset]], dtype=dtype))
+    projected = model.transform(holdout) @ model.components_
+    np.testing.assert_allclose(projected.get(), [[holdout_offset - offsets.mean()]], rtol=1e-6)
+
+
+@pytest.mark.parametrize("svd_solver", ["lanczos", "randomized"])
+@pytest.mark.parametrize("scale", [np.float32(1e19), np.complex64(1.2e19 + 1.6e19j)])
+def test_uncentered_sparse_solver_large_energy(svd_solver, scale):
+    n = 100
+    X = sparse.eye(n, format="csr", dtype=scale.dtype) * scale
+    _, _, ratio, variance = rsc.pp.pca(
+        X, n_comps=3, svd_solver=svd_solver, zero_center=False, dtype=X.dtype, rng=42, return_info=True
+    )
+    expected_variance = abs(complex(scale)) ** 2 / (n - 1)
+    np.testing.assert_allclose(cp.asnumpy(variance), expected_variance, rtol=1e-5)
+    np.testing.assert_allclose(cp.asnumpy(ratio), 1 / n, rtol=1e-5)
 
 
 # =============================================================================

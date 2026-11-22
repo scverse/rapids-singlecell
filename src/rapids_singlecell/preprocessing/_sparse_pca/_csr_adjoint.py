@@ -101,12 +101,26 @@ _first_row = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
 
 _column_mean = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
     "float64 shifted_sum, float64 count, X reference, int64 nrows",
-    "float64 mean, float64 offset, float64 zero_energy",
+    "float64 mean, float64 offset, float64 low, float64 zero_energy, int32 sensitive",
     """
     const double missing = nrows - count;
-    offset = (shifted_sum - missing * double(reference)) / nrows;
-    mean = missing > count ? (shifted_sum + count * double(reference)) / nrows : double(reference) + offset;
+    const double shifted = fma(-missing, double(reference), shifted_sum);
+    offset = shifted / nrows;
+    if (missing > count) {
+        const double total = fma(count, double(reference), shifted_sum);
+        mean = total / nrows;
+        low = fma(-double(nrows), mean, total) / nrows;
+    } else {
+        mean = double(reference) + offset;
+        const double y = mean - double(reference);
+        // Recover the rounding errors in both the addition and the division.
+        low = (double(reference) - (mean - y)) + (offset - y) + fma(-double(nrows), offset, shifted) / nrows;
+    }
     zero_energy = (missing * mean) * mean;
+    // Missing zeros provide an ordinary-scale deviation for sparse columns.
+    // A fully populated column can lose half its input precision when centering.
+    const double tol = sizeof(X) == 4 ? sqrt(0x1p-23) : 0x1p-26;
+    sensitive = count == nrows && reference != 0 && fabs(offset) <= tol * fabs(double(reference));
     """,
     "svd_csr_column_mean",
 )
@@ -114,19 +128,58 @@ _column_mean = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
 _centered_energy = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
     "raw X data, raw I cols, raw X reference, raw float64 offset, raw float64 zeros, "
     "int64 nnz, int64 ncols, int64 stride",
-    "float64 partial",
+    "float64 partial, raw int32 sensitive",
     """
     double energy = 0;
     for (ptrdiff_t col = i; col < ncols; col += stride) energy += zeros[col];
     for (ptrdiff_t j = i; j < nnz; j += stride) {
         const I col = cols[j];
         const double delta = (double(data[j]) - double(reference[col])) - offset[col];
+        // Implicitly subtracting two products loses at least half of double
+        // precision when this entry nearly equals its nonzero column mean.
+        if (data[j] != 0 && fabs(delta) <= 0x1p-26 * fabs(double(data[j])))
+            atomicExch(&sensitive[col], 1);
         energy += delta * delta;
     }
     partial = energy;
     """,
     "svd_csr_centered_energy",
 )
+
+_centered_panel = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
+    "raw I rows, raw J cols, raw X data, raw K selected, raw float64 mean, raw float64 low, int64 row0, int64 width",
+    "T value",
+    """
+    const ptrdiff_t row = row0 + i / width, k = i % width;
+    const K col = selected[k];
+    const I end = rows[row + 1], j = gene_lower_bound(cols, rows[row], end, col);
+    const T x = j < end && cols[j] == col ? T(data[j]) : T(0);
+    value = (x - T(mean[k])) - T(low[k]);
+    """,
+    "svd_centered_panel",
+    preamble=_lower_bound,
+)
+
+_screen_centered = cp.ElementwiseKernel(  # type: ignore[attr-defined]  # cupy-stubs
+    "X x, raw I cols, raw float64 mean, raw float64 low, raw M rounded, int64 dense_width",
+    "raw int32 sensitive",
+    """
+    const ptrdiff_t col = dense_width ? i % dense_width : ptrdiff_t(cols[i]);
+    const double delta = (double(x) - mean[col]) - low[col];
+    const double mean_error = (mean[col] - double(rounded[col])) + low[col];
+    const double tol = sizeof(M) == 4 ? sqrt(0x1p-23) : 0x1p-26;
+    if (x != 0 && (fabs(delta) <= 0x1p-26 * fabs(double(x)) || fabs(mean_error) > tol * fabs(delta)))
+        atomicExch(&sensitive[col], 1);
+    """,
+    "svd_screen_centered",
+)
+
+
+def _select_center(sensitive, mean, low):
+    selected = cp.flatnonzero(sensitive)
+    if selected.size:
+        return selected, mean[selected], low[selected]
+    return None
 
 
 # Each warp owns its counters. When lanes handle different rows, they take
@@ -290,7 +343,10 @@ class _CSRAdjoint:
                 block_size=threads,
             )
             count = min(width, cols - start)
-            out[:, start : start + count] = parts.sum(axis=0)[:, :count]
+            if cols == width:
+                parts.sum(axis=0, dtype=acc_dtype, out=out)
+            else:
+                out[:, start : start + count] = parts.sum(axis=0)[:, :count]
         return out
 
     def dot(self, V):
@@ -305,14 +361,19 @@ class _CSRAdjoint:
     def centered_stats(self):
         X = self.X
         nrows, ncols = X.shape
+        self.precise_center = None
+        self.center = None
         if not nrows:
             return cp.full(ncols, cp.nan, dtype=cp.float64), cp.asarray(0, dtype=cp.float64)
         # Center relative to an observed row to retain small differences even
         # when a column's mean lies between two representable values.
         reference = _first_row(X.indptr, X.indices, X.data, size=ncols)
         sums, counts = self._run(reference, moments=True).T
-        mean, offset, zeros = _column_mean(sums, counts, reference, nrows)
+        mean, offset, low, zeros, sensitive = _column_mean(sums, counts, reference, nrows)
         # Coalesced partial sums bound the reduction workspace to 2 MiB.
         stride = min(1 << 18, (max(X.nnz, ncols) + 15) // 16)
-        energy = _centered_energy(X.data, X.indices, reference, offset, zeros, X.nnz, ncols, stride, size=stride)
+        energy = cp.empty(stride, dtype=cp.float64)
+        _centered_energy(X.data, X.indices, reference, offset, zeros, X.nnz, ncols, stride, energy, sensitive)
+        self.center = mean, low, sensitive
+        self.precise_center = _select_center(sensitive, mean, low)
         return mean, energy.sum()

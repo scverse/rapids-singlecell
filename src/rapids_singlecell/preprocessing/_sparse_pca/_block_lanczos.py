@@ -27,6 +27,16 @@ from ._operators import _svd_flip, mean_centered_operator
 if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
+_valid_pivots = cp.ReductionKernel(
+    "T pivot, float64 tol",
+    "bool valid",
+    "isfinite(pivot) && pivot >= tol",
+    "a && b",
+    "valid = a",
+    "true",
+    "svd_valid_pivots",
+)
+
 
 def _cholesky_qr2(Q: cp.ndarray) -> cp.ndarray:
     """Orthonormalize a block with two Cholesky passes, falling back to Householder QR."""
@@ -36,9 +46,8 @@ def _cholesky_qr2(Q: cp.ndarray) -> cp.ndarray:
             L = cp.linalg.cholesky(Q.T.conj() @ Q)
         except cp.linalg.LinAlgError:
             return cp.linalg.qr(Q, mode="reduced")[0]
-        # A failed potrf can return a NaN or nonpositive pivot with CuPy's
-        # default error mode. Check all pivots with one host synchronization.
-        if not cp.all(L.diagonal().real >= tol):
+        # The Gram matrix may overflow even when the input block is finite.
+        if not _valid_pivots(L.diagonal().real, tol):
             return cp.linalg.qr(Q, mode="reduced")[0]
         Q = cpla.solve_triangular(L.conj(), Q.T, lower=True, overwrite_b=True).T
     return Q

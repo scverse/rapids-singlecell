@@ -2,29 +2,45 @@
 
 from __future__ import annotations
 
-from functools import cache
+from functools import cache, partial
 
 import cupy as cp
-from cupyx.scipy.sparse import csr_matrix
+from cupyx.scipy.sparse import csr_matrix, issparse
 from cupyx.scipy.sparse.linalg import LinearOperator
 
-from ._csr_adjoint import _CSRAdjoint
+from ._csr_adjoint import _centered_panel, _CSRAdjoint, _screen_centered, _select_center
 
 _accumulator = """
 template <typename T> struct SvdAccumulator { using type = T; };
 template <> struct SvdAccumulator<float> { using type = double; };
 """
 
+_squared_magnitude = """
+__device__ double squared_magnitude(double x) { return x * x; }
+template <typename T> __device__ double squared_magnitude(complex<T> x) {
+    return squared_magnitude(double(x.real())) + squared_magnitude(double(x.imag()));
+}
+"""
 _sum_squares = cp.ReductionKernel(
     "T x",
-    "T out",
-    "x * x",
+    "float64 out",
+    "squared_magnitude(x)",
     "a + b",
     "out = a",
     "0",
     "svd_sum_squares",
-    reduce_type="typename SvdAccumulator<T>::type",
-    preamble=_accumulator,
+    preamble=_squared_magnitude,
+)
+_column_norm = cp.ReductionKernel(
+    "T x",
+    "R out",
+    "squared_magnitude(x)",
+    "a + b",
+    "out = sqrt(a)",
+    "0",
+    "svd_column_norm",
+    reduce_type="double",
+    preamble=_squared_magnitude,
 )
 
 
@@ -171,27 +187,90 @@ def _csr_dot(X, V):
     return out
 
 
-def mean_centered_operator(X, mean: cp.ndarray | None = None, *, adjoint=None) -> LinearOperator:
+def _add_centered_columns(X, V, out, precise_center, *, adjoint):
+    """Multiply sensitive columns after centering individual values in bounded tiles."""
+    columns, mean, low = precise_center
+    # The tile has at most 2 MiB of float64 entries.
+    capacity = 1 << 18
+    for col in range(0, columns.size, capacity):
+        sel = columns[col : col + capacity]
+        hi, lo = mean[col : col + capacity], low[col : col + capacity]
+        step = max(1, capacity // sel.size)
+        if adjoint:
+            total = cp.zeros((sel.size, *V.shape[1:]), dtype=out.dtype)
+        else:
+            weights = V[sel]
+        for start in range(0, X.shape[0], step):
+            stop = min(start + step, X.shape[0])
+            if issparse(X):
+                panel = cp.empty((stop - start, sel.size), dtype=cp.result_type(X.dtype, cp.float64))
+                _centered_panel(X.indptr, X.indices, X.data, sel, hi, lo, start, sel.size, panel)
+            else:
+                panel = (X[start:stop, sel] - hi) - lo
+            if adjoint:
+                total += panel.T @ V[start:stop]
+            else:
+                out[start:stop] += panel @ weights
+        if adjoint:
+            out[sel] = total
+
+
+def _centered_dot(X, V, mean, precise_center):
+    rhs = V
+    if precise_center is not None:
+        rhs = V.copy()
+        rhs[precise_center[0]] = 0
+    out = _csr_dot(X, rhs) if issparse(X) else X.dot(rhs)
+    if mean is not None:
+        out = out - mean @ rhs
+    if precise_center is not None:
+        _add_centered_columns(X, V, out, precise_center, adjoint=False)
+    return out
+
+
+def _transform_center(X, center, rounded):
+    """Find held-out values whose projection needs elementwise centering."""
+    if center is None:
+        return None
+    mean, low, fitted_sensitive = center
+    if X.ndim != 2 or X.shape[1] != mean.size:
+        raise ValueError("dimension mismatch")
+    sensitive = fitted_sensitive.copy()
+    if issparse(X):
+        _screen_centered(X.data.real, X.indices, mean, low, rounded, 0, sensitive)
+    else:
+        _screen_centered(X.real, cp.empty(0, dtype=cp.int32), mean, low, rounded, X.shape[1], sensitive)
+    return _select_center(sensitive, mean, low)
+
+
+def mean_centered_operator(X, mean: cp.ndarray | None = None, *, adjoint=None, precise_center=None) -> LinearOperator:
     """Apply X and its adjoint from the same CSR data, optionally subtracting the column means."""
     X = _canonical_csr(X)
     if adjoint is None:
         adjoint = _CSRAdjoint(X)
-    adjoint_mean = mean.conj() if mean is not None else None
+    if mean is None:
+        matmat = partial(_csr_dot, X)
+        rmatmat = adjoint.dot
+    else:
+        adjoint_mean = mean.conj()
+        if precise_center is None:
 
-    def matmat(V):
-        result = _csr_dot(X, V)
-        if mean is not None:
-            result = result - (mean @ V)
-        return result
+            def matmat(V):
+                return _csr_dot(X, V) - mean @ V
 
-    def rmatmat(V):
-        result = adjoint.dot(V)
-        if adjoint_mean is not None:
+        else:
+
+            def matmat(V):
+                return _centered_dot(X, V, mean, precise_center)
+
+        def rmatmat(V):
             offset = adjoint_mean[:, None] if V.ndim == 2 else adjoint_mean
             sum_dtype = cp.float64 if V.dtype == cp.float32 else V.dtype
             sums = V.sum(axis=0, dtype=sum_dtype).astype(V.dtype, copy=False)
-            result = result - offset * sums
-        return result
+            result = adjoint.dot(V) - offset * sums
+            if precise_center is not None:
+                _add_centered_columns(X, V, result, precise_center, adjoint=True)
+            return result
 
     return LinearOperator(
         shape=X.shape,

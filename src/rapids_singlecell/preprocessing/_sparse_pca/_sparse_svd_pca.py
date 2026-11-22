@@ -14,7 +14,7 @@ from cupyx.scipy.sparse import issparse
 
 from ._block_lanczos import randomized_svd
 from ._csr_adjoint import _CSRAdjoint
-from ._operators import _canonical_csr, _csr_dot, _sum_squares, mean_centered_operator
+from ._operators import _canonical_csr, _centered_dot, _sum_squares, _transform_center, mean_centered_operator
 from ._svd_lanczos import lanczos_svd
 
 if TYPE_CHECKING:
@@ -25,6 +25,17 @@ if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
 
 SVDSolver = Literal["lanczos", "randomized"]
+
+_explained_variance = cp.ElementwiseKernel(
+    "T singular, int64 dof, float64 total_energy",
+    "T variance, R ratio",
+    """
+    const double component_variance = double(singular) * double(singular) / dof;
+    variance = component_variance;
+    ratio = component_variance / (total_energy / dof);
+    """,
+    "svd_explained_variance",
+)
 
 
 class PCA_sparse_svd:
@@ -91,7 +102,7 @@ class PCA_sparse_svd:
         self._fit(X)
         return self
 
-    def _fit(self, X):
+    def _fit(self, X, *, return_scores=False):
         from ._helper import _check_matrix_for_zero_genes
 
         if self.n_components is None:
@@ -108,31 +119,34 @@ class PCA_sparse_svd:
         self.dtype = X.dtype
 
         adjoint = _CSRAdjoint(X)
+        self._center = None
+        precise_center = None
         if self.zero_center:
             if X.dtype.kind == "c":
                 raise TypeError("Centered sparse PCA requires real-valued input.")
-            mean, centered_energy = adjoint.centered_stats()
+            mean, total_energy = adjoint.centered_stats()
             self.mean_ = mean.astype(X.dtype, copy=False)
-            total_variance = centered_energy / (self.n_samples_ - 1)
+            self._center = adjoint.center
+            precise_center = adjoint.precise_center
         else:
             self.mean_ = None
-            values = X.data
-            if values.dtype.kind == "c":
-                # Sum real and imaginary squares with the same real-valued reduction.
-                values = cp.ascontiguousarray(values).view(values.real.dtype)
-            total_variance = _sum_squares(values) / (self.n_samples_ - 1)
+            total_energy = _sum_squares(X.data)
 
-        X_op = mean_centered_operator(X, self.mean_, adjoint=adjoint)
+        X_op = mean_centered_operator(X, self.mean_, adjoint=adjoint, precise_center=precise_center)
         left, S, Vt = self._run_svd(X_op)
 
         # Store results
         self.components_ = Vt
-        self.explained_variance_ = (S**2) / (self.n_samples_ - 1)
+        self.explained_variance_ = cp.empty_like(S)
+        self.explained_variance_ratio_ = cp.empty_like(S, dtype=cp.float64 if self.zero_center else S.dtype)
+        _explained_variance(
+            S, self.n_samples_ - 1, total_energy, self.explained_variance_, self.explained_variance_ratio_
+        )
 
-        self.explained_variance_ratio_ = self.explained_variance_ / total_variance
-
-        # Lanczos refinement already computed the projected scores.
-        return left if self.svd_solver == "lanczos" else None
+        if return_scores:
+            # Lanczos refinement already computed the projected scores.
+            return left if self.svd_solver == "lanczos" else X_op.dot(Vt.T.conj())
+        return None
 
     def _run_svd(self, X_op):
         """Run the selected SVD solver."""
@@ -170,13 +184,10 @@ class PCA_sparse_svd:
             Transformed data of shape (n_samples, n_components).
         """
         V = self.components_.T.conj()
-        X_transformed = _csr_dot(_canonical_csr(X), V) if issparse(X) else X.dot(V)
-        if self.mean_ is not None:
-            X_transformed -= self.mean_ @ V
-        return X_transformed
+        X = _canonical_csr(X) if issparse(X) else cp.asarray(X)
+        precise_center = _transform_center(X, getattr(self, "_center", None), self.mean_)
+        return _centered_dot(X, V, self.mean_, precise_center)
 
     def fit_transform(self, X: spmatrix, y=None) -> cp.ndarray:
         """Fit the model and apply dimensionality reduction."""
-        X = _canonical_csr(X)
-        scores = self._fit(X)
-        return self.transform(X) if scores is None else scores
+        return self._fit(X, return_scores=True)

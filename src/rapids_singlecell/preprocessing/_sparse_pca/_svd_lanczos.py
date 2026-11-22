@@ -16,7 +16,7 @@ from cupyx.scipy.sparse.linalg import LinearOperator
 
 from rapids_singlecell._utils._random import _seed_from_rng
 
-from ._operators import _svd_flip, mean_centered_operator
+from ._operators import _column_norm, _svd_flip, mean_centered_operator
 
 if TYPE_CHECKING:
     from rapids_singlecell._utils._random import RNGLike, SeedLike
@@ -171,7 +171,10 @@ def _lanczos_bidiag(
         u = cp.divide(u, alpha_val, out=U_full[:, idx_u])
 
         # v = A.H @ u
-        if i < ncv:
+        if idx_v + 1 == n:
+            # The right basis spans the feature space. Its residual is zero.
+            betas[i + 1] = 0
+        else:
             v = adjoint_dot(u)
             _kernel_axpy(alphas[i], V_full[:, idx_v], v)
 
@@ -249,6 +252,8 @@ def lanczos_svd(
         A = mean_centered_operator(A)
     m, n = A.shape
     dtype = A.dtype
+    if not 1 <= k <= min(m, n):
+        raise ValueError("k must be between 1 and the smaller matrix dimension.")
 
     automatic_sweep = ncv is None and m > 100000 and dtype.kind == "f" and tol >= cp.finfo(dtype).eps
     if ncv is None:
@@ -265,7 +270,7 @@ def lanczos_svd(
         else:
             ncv = min(max(3 * k, 50), min(m, n))
 
-    ncv = max(ncv, k + 10)
+    ncv = min(max(ncv, k + 10), m, n)
 
     # CuPy generators are seeded, so this is where the host generator
     # collapses into an integer.
@@ -285,7 +290,7 @@ def lanczos_svd(
     while n_locked < k and total_iter < max_iter:
         alphas, betas = _lanczos_bidiag(
             A,
-            ncv=ncv,
+            ncv=min(ncv, m - n_locked, n - n_locked),
             v_start=v_start,
             U_full=U_full,
             V_full=V_full,
@@ -295,15 +300,9 @@ def lanczos_svd(
             remaining=k - n_locked if automatic_sweep and n_locked else 0,
         )
 
-        # SVD of Bidiagonal Matrix
+        # cuSOLVER returns the singular values in descending order.
         steps = alphas.size
         p, s, qt = _projected_svd(alphas, betas)
-
-        # Sort descending
-        idx = cp.argsort(s)[::-1]
-        s = s[idx]
-        p = p[:, idx]
-        qt = qt[idx, :]
 
         # Error estimates
         resid = betas[-1] * cp.abs(p[-1, :])
@@ -353,7 +352,7 @@ def lanczos_svd(
     if refine_results:
         del U_full, V_full
         final_U = A.dot(final_V)
-        final_S = cp.linalg.norm(final_U, axis=0)
+        final_S = _column_norm(final_U, axis=0, out=locked_S)
         if not _return_scores:
             final_U /= final_S[None, :]
     else:
