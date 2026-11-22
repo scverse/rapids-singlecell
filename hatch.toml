@@ -70,17 +70,20 @@ overrides.matrix.deps.extra-dependencies = [
   ], value = "numba-cuda<0.30" },
 ]
 # RAPIDS pins depend on both `deps` and `cuda`, so they key off the env name
+# Match the nvCOMP bindings to libcudf 26.10's native library across Hatch's two install steps.
 overrides.name."(stable|dev)-12$".extra-dependencies = [
   "cuml-cu12<26.12",
   "cudf-cu12<26.12",
   "cugraph-cu12<26.12",
   "cuvs-cu12<26.12",
+  "nvidia-nvcomp-cu12==5.3.0.16",
 ]
 overrides.name."(stable|dev)-13$".extra-dependencies = [
   "cuml-cu13<26.12",
   "cudf-cu13<26.12",
   "cugraph-cu13<26.12",
   "cuvs-cu13<26.12",
+  "nvidia-nvcomp-cu13==5.3.0.16",
 ]
 
 # uv honours prerelease markers only on direct requirements, so list the whole RAPIDS

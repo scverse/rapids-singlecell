@@ -140,8 +140,11 @@ with [zarr-kvikio](https://github.com/scverse/zarr-kvikio), KvikIO and nvCOMP (s
 For the development version, install zarr-kvikio from GitHub in your rapids-singlecell environment:
 
 ```bash
-[uv] pip install 'zarr-kvikio[cuda13] @ git+https://github.com/scverse/zarr-kvikio.git'  # or [cuda12]
+[uv] pip install -c <([uv] pip freeze | grep '^nvidia-libnvcomp-') \
+    'zarr-kvikio[cuda13] @ git+https://github.com/scverse/zarr-kvikio.git'  # or [cuda12]
 ```
+
+The constraint preserves the native nvCOMP version required by an existing pip installation of libcudf.
 
 Once zarr-kvikio is on PyPI, the CUDA wheels provide the `io` extra and the source distribution provides
 `io-cu12` and `io-cu13`. With pip-installed CUDA-X Data Science, this needs version 26.06 or newer (for nvCOMP ≥ 5.2).
