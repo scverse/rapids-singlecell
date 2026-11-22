@@ -162,8 +162,9 @@ def leiden(
         (slower, with a warning). ``'rapids'`` needs about 140 bytes of
         device memory per cell plus what its coarser levels hold, allocated
         as they need it: on k-NN graphs 14-18 bytes per stored entry at the
-        peak (about 22 at 100M cells), in all 2.5-3.5x the float32 CSR, which
-        is also copied to the GPU if it is on the host. If that does not fit,
+        peak (about 22 at 100M cells), in all 2.5-3.5x the float32 CSR.
+        GPUs that cannot read host memory directly also need a device copy
+        of host input. If that does not fit,
         it raises :class:`MemoryError` (RMM managed memory can exceed the
         GPU). Under an allocator that does not pool (the default of
         rapids-singlecell), it keeps the per-cell workspace for the next call
