@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import _warnings
 import contextlib
+import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -557,6 +558,29 @@ def test_rapids_unavailable(adata_neighbors, monkeypatch, native_module):
     # flavor='cugraph' still runs
     rsc.tl.leiden(adata_neighbors, flavor="cugraph", resolution=0.5)
     assert type(adata_neighbors.uns["leiden"]["modularity"]) is float
+
+
+@pytest.mark.parametrize(
+    ("func", "kwargs"),
+    [
+        (rsc.tl.draw_graph, {}),
+        (rsc.tl.louvain, {}),
+        (rsc.tl.louvain, {"use_dask": True}),
+        (rsc.tl.leiden, {"flavor": "cugraph"}),
+        (rsc.tl.leiden, {"use_dask": True}),
+    ],
+)
+def test_missing_cugraph(adata_neighbors, monkeypatch, func, kwargs):
+    monkeypatch.setitem(sys.modules, "cugraph", None)
+    with pytest.raises(ModuleNotFoundError, match=r"rapids-singlecell-cu13\[cugraph\]"):
+        func(adata_neighbors, **kwargs)
+
+
+@needs_native
+def test_native_without_cugraph(adata_neighbors, monkeypatch):
+    monkeypatch.setitem(sys.modules, "cugraph", None)
+    labels = rsc.tl.leiden(adata_neighbors, out=True)
+    assert len(labels) == adata_neighbors.n_obs
 
 
 def _record_flavor_calls(monkeypatch) -> list[str]:

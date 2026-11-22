@@ -71,6 +71,21 @@ def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
         raise ValueError("dtype must be one of ['float32', 'float64']")
 
 
+def _import_cugraph(*, use_dask=False):
+    try:
+        import cugraph
+    except ModuleNotFoundError as exc:
+        if exc.name != "cugraph":
+            raise
+        msg = "Install the optional cuGraph dependency for your CUDA version: rapids-singlecell-cu12[cugraph] or rapids-singlecell-cu13[cugraph]."
+        raise ModuleNotFoundError(msg, name="cugraph") from exc
+    if use_dask:
+        from cugraph import dask
+
+        return dask
+    return cugraph
+
+
 def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
     from cugraph import Graph
 
@@ -256,14 +271,9 @@ def louvain(
             adjacency=adjacency,
         )
     # Cluster
-    if use_dask:
-        from cugraph.dask import louvain as culouvain
-
-        g = _create_graph_dask(adjacency, dtype, use_weights=use_weights)
-    else:
-        from cugraph import louvain as culouvain
-
-        g = _create_graph(adjacency, dtype, use_weights=use_weights)
+    culouvain = _import_cugraph(use_dask=use_dask).louvain
+    create_graph = _create_graph_dask if use_dask else _create_graph
+    g = create_graph(adjacency, dtype, use_weights=use_weights)
 
     if isinstance(resolution, float | int):
         resolutions = [resolution]
