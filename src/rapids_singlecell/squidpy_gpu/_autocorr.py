@@ -10,6 +10,7 @@ from typing import (
 import cupy as cp
 import numpy as np
 import pandas as pd
+from anndata.abc import CSCDataset, CSRDataset
 from cupyx.scipy import sparse as sparse_gpu
 from dask.array import Array as DaskArray
 from scipy import sparse
@@ -58,16 +59,22 @@ def _csr_chunks(matrix, size):
 
 
 def _to_gpu_csr(matrix, dtype):
-    if not sparse.issparse(matrix):
-        if isinstance(matrix, np.ndarray):
+    device = cp.cuda.Device().id
+    if sparse.issparse(matrix):
+        matrix = matrix.tocsr()
+        arrays = (cp.asarray(matrix.data, dtype=dtype), cp.asarray(matrix.indices), cp.asarray(matrix.indptr))
+    elif sparse_gpu.issparse(matrix) and matrix.data.device.id != device:
+        with cp.cuda.Device(matrix.data.device.id):
+            matrix = matrix.tocsr()
+        arrays = tuple(_copy_to_device(a, device) for a in (matrix.data, matrix.indices, matrix.indptr))
+    else:
+        if isinstance(matrix, cp.ndarray):
+            matrix = _copy_to_device(matrix, device)
+        elif isinstance(matrix, np.ndarray):
             matrix = cp.asarray(matrix, dtype=dtype)
         return sparse_gpu.csr_matrix(matrix, dtype=dtype)
-    host = matrix.tocsr()
-    result = sparse_gpu.csr_matrix(
-        (cp.asarray(host.data, dtype=dtype), cp.asarray(host.indices), cp.asarray(host.indptr)),
-        shape=host.shape,
-    )
-    if getattr(host, "_has_canonical_format", False):
+    result = sparse_gpu.csr_matrix(arrays, shape=matrix.shape, dtype=dtype)
+    if getattr(matrix, "_has_canonical_format", False):
         result.has_canonical_format = True
     return result
 
@@ -179,6 +186,20 @@ def _gene_source(source, cols, width, dtype):
                     pack_rows(source.blocks[i, j].compute(), row_start, col_start)
                     row_start += height
             col_start = col_stop
+    elif isinstance(source, (CSRDataset, CSCDataset)):
+        # Slice the compressed axis on disk. A row slice of backed CSC reads all columns.
+        by_row = isinstance(source, CSRDataset)
+        minor = n_vars if by_row else n
+        step = max(1, chunk_bytes // (minor * (source.dtype.itemsize + 8) + 8))
+        if by_row:
+            for start in range(0, n, step):
+                pack_rows(source[start : start + step], start, 0)
+        else:
+            for first in range(0, len(cols), step):
+                selected = cols[first : first + step]
+                lookup = cp.arange(first, first + len(selected), dtype=cp.int32)
+                for start, chunk in _csr_chunks(source[:, selected].tocsr(), chunk_bytes):
+                    pack(chunk, start, lookup)
     else:
         pack_rows(source, 0, 0)
     return blocks
@@ -206,15 +227,7 @@ def _gene_block(source, cols, block_id, *, dtype, n, device_id):
 
 def _csr_gene_blocks(matrix, cols, width, dtype):
     """Expand contiguous genes in bounded tiles laid out for the scoring kernels."""
-    device = cp.cuda.Device().id
-    if sparse_gpu.issparse(matrix) and matrix.data.device.id != device:
-        # Transfer the three CSR arrays once, before expanding any tiles.
-        arrays = tuple(_copy_to_device(a, device) for a in (matrix.data, matrix.indices, matrix.indptr))
-        local = sparse_gpu.csr_matrix(arrays, shape=matrix.shape, dtype=dtype)
-        if getattr(matrix, "_has_canonical_format", False):
-            local.has_canonical_format = True
-    else:
-        local = _to_gpu_csr(matrix, dtype)
+    local = _to_gpu_csr(matrix, dtype)
     if not local.has_canonical_format:
         local = local.copy()
         local.sum_duplicates()
@@ -236,9 +249,13 @@ def _block_scores(x, graph, row, col, keys, *, total, uniform, geary, permutatio
     """Return the observed scores and the change under each permutation of graph rows."""
     n, n_genes = x.shape
     stream = cp.cuda.get_current_stream().ptr
-    z = None if keys is None else cp.empty_like(x)
+    # Keep the accumulated lag in float64 so rounding does not break permutation ties.
+    z = None if keys is None else cp.empty(x.shape, dtype=cp.float64)
     stats = cp.zeros((4, n_genes))
-    _ac.observed(*graph, x, row, col, lag=z, stats=stats, geary=geary, stream=stream)
+    # Preserve structural zeros in sparse genes. Fully nonzero genes use a data
+    # value as origin to retain small variations on large expression offsets.
+    offsets = cp.where(cp.all(x, axis=0), x[0], 0)
+    _ac.observed(*graph, x, row, col, offsets=offsets, lag=z, stats=stats, geary=geary, stream=stream)
     sum_x, sum_x2, weighted_x, numerator = stats
     mean = sum_x / n
     ss = sum_x2 - mean * sum_x
@@ -246,14 +263,17 @@ def _block_scores(x, graph, row, col, keys, *, total, uniform, geary, permutatio
         scale = (n - 1) / (2 * total * ss)
         observed = numerator * scale
     else:
-        observed = (numerator + mean * (mean * total - weighted_x)) / ss
+        scale = (n / total) / ss
+        observed = (numerator + mean * (mean * total - weighted_x)) * scale
     if keys is None:
         return observed, None
     out = cp.zeros((len(keys), 1 if uniform else 2, n_genes))
-    _ac.sums(x, z, row, keys, out=out, geary=geary, uniform=uniform, stream=stream, permutation=permutation)
+    _ac.sums(
+        x, z, row, keys, offsets=offsets, out=out, geary=geary, uniform=uniform, stream=stream, permutation=permutation
+    )
     a = out[:, 0]
     b = 0 if uniform else out[:, 1]
-    change = (b - 2 * a) * scale if geary else (a - mean * b) / ss
+    change = (b - 2 * a if geary else a - mean * b) * scale
     return observed, change
 
 
@@ -320,12 +340,14 @@ def spatial_autocorr(
             Spatial autocorrelation method to use, either "moran" or "geary", by default "moran".
         transformation
             If True, row-normalize the connectivity matrix, by default True.
+            Moran's I includes the factor `n_obs / sum(weights)` after this optional normalization.
         n_perms
             Number of permutations for calculating p-values, by default None.
         two_tailed
             If True, calculate two-tailed p-values, by default False.
         corr_method
-            Multiple testing correction method to use, by default "fdr_bh".
+            Multiple testing correction method, by default "fdr_bh". Each p-value column
+            is corrected over the genes with a finite p-value in that column.
         layer
             Layer in the AnnData object to use, by default None.
         use_raw
@@ -402,6 +424,8 @@ def spatial_autocorr(
         # The wrapper owns its data attribute even when the original CSR storage is shared.
         adj.data = normalized
     row, col, moments = _g_moments(adj)
+    if not np.isfinite(moments[0]) or moments[0] == 0:
+        raise ValueError("Spatial autocorrelation requires a finite, nonzero sum of connectivity weights.")
     uniform = bool(n_perms) and bool(cp.all(row == row[0]))
     graph = (adj.indptr, adj.indices.astype(cp.int32, copy=False), adj.data)
 
@@ -414,7 +438,8 @@ def spatial_autocorr(
     n_genes = len(cols)
     itemsize = compute_dtype.itemsize
     free = min((cp.cuda.Device(d).mem_info[0] for d in devices), default=0)
-    width = int(max(1, min(32, _BLOCK_FRACTION * free // (2 * n * itemsize))))
+    bytes_per_cell = itemsize + (np.dtype(np.float64).itemsize if keys is not None else 0)
+    width = int(max(1, min(32, _BLOCK_FRACTION * free // (n * bytes_per_cell))))
     blocks = range((n_genes + width - 1) // width)
     if perm_counts is None:
         devices = devices[: len(blocks)]
@@ -429,6 +454,7 @@ def spatial_autocorr(
         and n_genes > width
         and 8 * n_genes >= source.shape[1]
         and cols[-1] - cols[0] + 1 == n_genes
+        and (sparse.issparse(source) or sparse_gpu.issparse(source))
         and getattr(source, "format", None) == "csr"
         and source.shape[1] < 2**31
         and source.nnz * (itemsize + source.indices.itemsize) + source.indptr.nbytes + 2 * _CHUNK_BYTES < free // 4
@@ -620,7 +646,11 @@ def spatial_autocorr(
 
     if corr_method is not None and len(df):
         for pv in filter(lambda x: "pval" in x, df.columns):
-            _, pvals_adj, _, _ = multipletests(df[pv].values, alpha=0.05, method=corr_method)
+            pvalues = df[pv].to_numpy()
+            finite = np.isfinite(pvalues)
+            pvals_adj = np.full(len(pvalues), np.nan)
+            if finite.any():
+                pvals_adj[finite] = multipletests(pvalues[finite], alpha=0.05, method=corr_method)[1]
             df[f"{pv}_{corr_method}"] = pvals_adj
 
     df.sort_values(by=params["stat"], ascending=params["ascending"], inplace=True)

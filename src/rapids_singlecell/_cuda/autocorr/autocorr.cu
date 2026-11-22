@@ -34,9 +34,10 @@ template <typename T, typename Device>
 void def_sums(nb::module_& m) {
     m.def(
         "sums",
-        [](gpu_array_c<const T, Device> x, gpu_array_c<const T, Device> z,
+        [](gpu_array_c<const T, Device> x, gpu_array_c<const double, Device> z,
            gpu_array_c<const double, Device> r,
            gpu_array_c<const unsigned int, Device> keys,
+           gpu_array_c<const T, Device> offsets,
            gpu_array_c<double, Device> out, bool geary, bool uniform,
            std::uintptr_t stream,
            std::optional<gpu_array_c<const int, Device>> permutation) {
@@ -44,7 +45,8 @@ void def_sums(nb::module_& m) {
             const int n_perms = keys.shape(0);
             nb_require(n_genes <= 32 && z.shape(0) == (size_t)n &&
                            z.shape(1) == (size_t)n_genes &&
-                           r.shape(0) == (size_t)n,
+                           r.shape(0) == (size_t)n &&
+                           offsets.size() == (size_t)n_genes,
                        "sums: x, z (n, <= 32 genes) and r (n) must match");
             nb_require(keys.shape(1) == AUTOCORR_ROUNDS,
                        "sums: each permutation needs six round keys");
@@ -67,15 +69,15 @@ void def_sums(nb::module_& m) {
                 dim3 blocks(grid,
                             strided_grid_y(n_perms - first, AUTOCORR_BATCH));
                 kernel<<<blocks, AUTOCORR_BLOCK, 0, (cudaStream_t)stream>>>(
-                    x.data(), z.data(), r.data(), n, n_genes, keys.data(),
-                    permutation ? permutation->data() : nullptr, n_perms, first,
-                    out.data());
+                    x.data(), z.data(), r.data(), offsets.data(), n, n_genes,
+                    keys.data(), permutation ? permutation->data() : nullptr,
+                    n_perms, first, out.data());
                 CUDA_CHECK_LAST_ERROR(autocorr_sums_kernel);
             }
         },
         "x"_a.noconvert(), "z"_a.noconvert(), "r"_a.noconvert(),
-        "keys"_a.noconvert(), nb::kw_only(), "out"_a.noconvert(), "geary"_a,
-        "uniform"_a = false, "stream"_a = 0,
+        "keys"_a.noconvert(), nb::kw_only(), "offsets"_a.noconvert(),
+        "out"_a.noconvert(), "geary"_a, "uniform"_a = false, "stream"_a = 0,
         "permutation"_a.noconvert().none() = nb::none());
 }
 
@@ -126,13 +128,15 @@ void def_graph_ops(nb::module_& m) {
            gpu_array_c<const T, Device> weights, gpu_array_c<const T, Device> x,
            gpu_array_c<const double, Device> row,
            gpu_array_c<const double, Device> col,
-           std::optional<gpu_array_c<T, Device>> lag,
+           gpu_array_c<const T, Device> offsets,
+           std::optional<gpu_array_c<double, Device>> lag,
            gpu_array_c<double, Device> stats, bool geary,
            std::uintptr_t stream) {
             const int n = x.shape(0), n_genes = x.shape(1);
             nb_require(n_genes <= 32 && indptr.size() == (size_t)n + 1 &&
                            indices.size() == weights.size() &&
                            row.size() == (size_t)n && col.size() == (size_t)n &&
+                           offsets.size() == (size_t)n_genes &&
                            (!lag || lag->size() == x.size()) &&
                            stats.shape(0) == 4 &&
                            stats.shape(1) == (size_t)n_genes,
@@ -148,14 +152,15 @@ void def_graph_ops(nb::module_& m) {
                              : autocorr_observed_kernel<T, P, false, false>);
             kernel<<<grid, AUTOCORR_BLOCK, 0, (cudaStream_t)stream>>>(
                 indptr.data(), indices.data(), weights.data(), x.data(),
-                row.data(), col.data(), n, n_genes, lag ? lag->data() : nullptr,
-                stats.data());
+                row.data(), col.data(), offsets.data(), n, n_genes,
+                lag ? lag->data() : nullptr, stats.data());
             CUDA_CHECK_LAST_ERROR(autocorr_observed_kernel);
         },
         "indptr"_a.noconvert(), "indices"_a.noconvert(),
         "weights"_a.noconvert(), "x"_a.noconvert(), "row"_a.noconvert(),
-        "col"_a.noconvert(), nb::kw_only(), "lag"_a.noconvert().none(),
-        "stats"_a.noconvert(), "geary"_a, "stream"_a = 0);
+        "col"_a.noconvert(), nb::kw_only(), "offsets"_a.noconvert(),
+        "lag"_a.noconvert().none(), "stats"_a.noconvert(), "geary"_a,
+        "stream"_a = 0);
 }
 
 template <typename T, typename P, typename Device>

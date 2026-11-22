@@ -55,8 +55,9 @@ __global__ void autocorr_permutation_kernel(const unsigned int* keys, int n,
 // Each grid row scores up to BATCH permutations with their own round keys.
 template <typename T, bool GEARY, bool UNIFORM, int BATCH>
 __global__ void autocorr_sums_kernel(const T* __restrict__ x,
-                                     const T* __restrict__ z,
-                                     const double* __restrict__ r, int n,
+                                     const double* __restrict__ z,
+                                     const double* __restrict__ r,
+                                     const T* __restrict__ offsets, int n,
                                      int n_genes, const unsigned int* keys,
                                      const int* permutation, int n_scores,
                                      int start, double* __restrict__ out) {
@@ -69,7 +70,7 @@ __global__ void autocorr_sums_kernel(const T* __restrict__ x,
         block_sums[t] = 0.0;
     __syncthreads();
     const int lane = threadIdx.x & 31;
-    const double offset = lane < n_genes ? x[lane] : 0;
+    const double offset = lane < n_genes ? offsets[lane] : 0;
     double a[BATCH] = {}, b[BATCH] = {};
     const int warps = (gridDim.x * blockDim.x) >> 5;
     for (long long i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
@@ -163,13 +164,14 @@ template <typename T, typename P, bool GEARY, bool SAVE_LAG>
 __global__ void autocorr_observed_kernel(
     const P* __restrict__ indptr, const int* __restrict__ indices,
     const T* __restrict__ weights, const T* __restrict__ x,
-    const double* __restrict__ row, const double* __restrict__ col, int n,
-    int n_genes, T* __restrict__ z, double* __restrict__ stats) {
+    const double* __restrict__ row, const double* __restrict__ col,
+    const T* __restrict__ offsets, int n, int n_genes, double* __restrict__ z,
+    double* __restrict__ stats) {
     const int lane = threadIdx.x & 31;
     const int warps = (gridDim.x * blockDim.x) >> 5;
     double s[4] = {};
     if (lane < n_genes) {
-        const double offset = x[lane];
+        const double offset = offsets[lane];
         for (long long i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; i < n;
              i += warps) {
             const double v = x[i * n_genes + lane] - offset;
@@ -262,7 +264,7 @@ __global__ void autocorr_sparse_observed_kernel(
     }
     if (threadIdx.x == 0)
         out[g] = geary ? (n - 1) * diff2 / (2 * total * ss)
-                       : (weighted_ss - diff2) / (2 * ss);
+                       : (n / total) * ((weighted_ss - diff2) / (2 * ss));
 }
 
 // sum w, sum w^2 and sum_ij w_ij w_ji of a canonical CSR matrix (sorted,

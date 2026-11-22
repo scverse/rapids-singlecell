@@ -918,7 +918,7 @@ def test_autocorr_graph_kernels(dtype, idx_dtype):
     _ac.normalize(adj.indptr, adj.data, out=normalized, stream=_stream())
     _eq(normalized, cp.full_like(adj.data, 0.5))
     x = cp.asarray(_make_dense_cpu(dtype, cols=7))
-    z = cp.empty_like(x)
+    z = cp.empty(x.shape, dtype=cp.float64)
     row = cp.empty(N_ROWS, cp.float64)
     col = cp.zeros_like(row)
     moments = cp.zeros(3, cp.float64)
@@ -927,7 +927,9 @@ def test_autocorr_graph_kernels(dtype, idx_dtype):
     _eq(col, row)
     _eq(moments, cp.array([N_ROWS, N_ROWS / 2, N_ROWS / 2]))
     stats = cp.zeros((4, x.shape[1]), cp.float64)
-    _ac.observed(adj.indptr, indices, normalized, x, row, col, lag=z, stats=stats, geary=False, stream=_stream())
+    _ac.observed(
+        adj.indptr, indices, normalized, x, row, col, offsets=x[0], lag=z, stats=stats, geary=False, stream=_stream()
+    )
     x = x - x[0]
     _close(z, (cp.roll(x, 1, axis=0) + cp.roll(x, -1, axis=0)) * 0.5)
     _close(stats[3], (x * z).sum(axis=0))

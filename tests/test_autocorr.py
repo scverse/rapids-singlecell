@@ -297,7 +297,7 @@ def _reference(x, w, mode):
     n = x.shape[0]
     if mode == "moran":
         xc = x - x.mean(axis=0)
-        return (xc * (w @ xc)).sum(axis=0) / (xc * xc).sum(axis=0)
+        return (n / w.sum()) * (xc * (w @ xc)).sum(axis=0) / (xc * xc).sum(axis=0)
     rows, cols = w.nonzero()
     diff = x[rows] - x[cols]
     num = (np.asarray(w[rows, cols]).ravel()[:, None] * diff * diff).sum(axis=0)
@@ -394,6 +394,47 @@ def test_autocorr_permutation_ties(mode):
     np.testing.assert_allclose(df["var_sim"], 0, atol=1e-29)
 
 
+@pytest.mark.parametrize("geary", [False, True])
+def test_permuting_unexpressed_cells_preserves_score(geary):
+    from rapids_singlecell._cuda import _autocorr_cuda as _ac
+    from rapids_singlecell.squidpy_gpu._autocorr import _block_scores
+
+    rng = np.random.default_rng(13)
+    n = 97
+    x = np.zeros((n, 3))
+    x[::7] = rng.random(x[::7].shape)
+    w = sparse.diags(rng.random(n - 1), offsets=1, format="csr")
+    adj = sparse_gpu.csr_matrix(w)
+    pi = np.arange(n, dtype=np.int32)
+    zero = x[:, 0] == 0
+    pi[zero] = rng.permutation(pi[zero])
+    _, change = _block_scores(
+        cp.asarray(x),
+        (adj.indptr, adj.indices, adj.data),
+        cp.asarray(np.asarray(w.sum(1)).ravel()),
+        cp.asarray(np.asarray(w.sum(0)).ravel()),
+        cp.zeros((1, _ac.ROUNDS), dtype=cp.uint32),
+        total=w.sum(),
+        uniform=False,
+        geary=geary,
+        permutation=cp.asarray(pi),
+    )
+    np.testing.assert_array_equal(change.get(), 0)
+
+
+def test_geary_float32_weighted_ties():
+    # Each row connects equally to both expression levels. Moving any row leaves C unchanged.
+    x = np.array([0, 1.25, 0, 1.25], dtype=np.float32)
+    weights = np.zeros((4, 4), dtype=np.float32)
+    weights[:, 0] = weights[:, 1] = [1.25, 2.7, 3.1, 4.3]
+    adata = AnnData(x[:, None])
+    adata.obsp["spatial_connectivities"] = sparse.csr_matrix(weights)
+    df = spatial_autocorr(adata, mode="geary", transformation=False, n_perms=101, seed=2, copy=True)
+    np.testing.assert_allclose(df["C"], 0.75)
+    np.testing.assert_array_equal(df["pval_sim"], 1 / 102)
+    np.testing.assert_array_equal(df["var_sim"], 0)
+
+
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
 def test_autocorr_one_permutation_sparse(mode, stat, monkeypatch):
     from rapids_singlecell._cuda import _autocorr_cuda as _ac
@@ -425,6 +466,37 @@ def test_autocorr_one_permutation_sparse(mode, stat, monkeypatch):
         np.testing.assert_array_equal(result["var_sim"], 0)
         np.testing.assert_array_equal(result["pval_sim"], 0.5)
         np.testing.assert_equal(result["pval_z_sim"].to_numpy(), np.where(tied[cols], np.nan, 0.0))
+        np.testing.assert_equal(result["pval_z_sim_fdr_bh"].to_numpy(), np.where(tied[cols], np.nan, 0.0))
+
+
+def test_autocorr_moran_weight_scaling():
+    adata = AnnData(np.array([[0.0], [0.0], [1.0], [1.0]]))
+    pairs = np.array([1, 0, 3, 2])
+    adata.obsp["spatial_connectivities"] = sparse.csr_matrix((np.full(4, 7.0), (np.arange(4), pairs)), shape=(4, 4))
+    result = spatial_autocorr(adata, mode="moran", n_perms=19, seed=0, transformation=False, copy=True)
+    np.testing.assert_allclose(result["I"], 1.0)
+    adata.obsp["spatial_connectivities"].data[:] = 1.0
+    unit_weights = spatial_autocorr(adata, mode="moran", n_perms=19, seed=0, transformation=False, copy=True)
+    pd.testing.assert_frame_equal(result, unit_weights, rtol=1e-12, atol=1e-14)
+    adata.obsp["spatial_connectivities"].data[-1] = 0.0  # One isolated row after normalization.
+    np.testing.assert_allclose(spatial_autocorr(adata, copy=True)["I"], 1.0)
+    adata.obsp["spatial_connectivities"].data[:] = 0.0
+    with pytest.raises(ValueError, match="nonzero sum of connectivity weights"):
+        spatial_autocorr(adata, copy=True)
+
+
+@pytest.mark.two_gpus
+@pytest.mark.parametrize("kind", ["dense", "csr", "csc"])
+def test_autocorr_remote_graph(kind, peer):
+    from rapids_singlecell.squidpy_gpu._autocorr import _to_gpu_csr
+
+    host = sparse.diags([2.0], [1], shape=(7, 7), format="csr")
+    with cp.cuda.Device(1), cp.cuda.Stream(non_blocking=True):
+        graph = cp.asarray(host.toarray()) if kind == "dense" else sparse_gpu.csr_matrix(host).asformat(kind)
+        with cp.cuda.Device(0):
+            local = _to_gpu_csr(graph, host.dtype)
+            assert all(a.device.id == 0 for a in (local.indptr, local.indices, local.data))
+            np.testing.assert_array_equal(local.toarray().get(), host.toarray())
 
 
 @pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
@@ -524,6 +596,38 @@ def test_host_csr_chunks_share_entries():
         assert np.shares_memory(chunk.data, x.data)
         assert np.shares_memory(chunk.indices, x.indices)
         np.testing.assert_array_equal(chunk.toarray(), x[start : start + chunk.shape[0]].toarray())
+
+
+@pytest.mark.parametrize("fmt", ["csr", "csc"])
+def test_autocorr_backed_sparse(fmt, tmp_path, monkeypatch):
+    x = sparse.random(51, 65, density=0.15, format=fmt, dtype=np.float64, random_state=17)
+    adata = AnnData(x)
+    adata.obsp["spatial_connectivities"] = sparse.random(51, 51, density=0.25, format="csr", random_state=31)
+    kwargs = {"genes": adata.var_names[3:62], "n_perms": 7, "seed": 13, "multi_gpu": False, "copy": True}
+    expected = spatial_autocorr(adata, **kwargs)
+    path = tmp_path / "backed.h5ad"
+    adata.write_h5ad(path)
+    backed = read_h5ad(path, backed="r")
+    monkeypatch.setattr("rapids_singlecell.squidpy_gpu._autocorr._CHUNK_BYTES", 4096)
+    dataset = type(backed.X)
+    read = dataset.__getitem__
+    loaded = []
+
+    def record(source, index):
+        if fmt == "csc":
+            assert index[0] == slice(None)
+        part = read(source, index)
+        loaded.append(part.shape[0 if fmt == "csr" else 1])
+        return part
+
+    monkeypatch.setattr(dataset, "__getitem__", record)
+    try:
+        actual = spatial_autocorr(backed, **kwargs)
+    finally:
+        backed.file.close()
+    assert len(loaded) > 1
+    assert sum(loaded) == (adata.n_obs if fmt == "csr" else len(kwargs["genes"]))
+    pd.testing.assert_frame_equal(actual, expected, rtol=1e-10, atol=1e-12)
 
 
 @pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="Requires >= 2 GPUs")
