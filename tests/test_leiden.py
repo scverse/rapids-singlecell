@@ -572,7 +572,7 @@ def test_rapids_unavailable(adata_neighbors, monkeypatch, native_module):
 )
 def test_missing_cugraph(adata_neighbors, monkeypatch, func, kwargs):
     monkeypatch.setitem(sys.modules, "cugraph", None)
-    with pytest.raises(ModuleNotFoundError, match=r"rapids-singlecell-cu13\[cugraph\]"):
+    with pytest.raises(ModuleNotFoundError, match="cugraph-cu12 or cugraph-cu13"):
         func(adata_neighbors, **kwargs)
 
 
