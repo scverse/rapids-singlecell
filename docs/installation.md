@@ -132,6 +132,23 @@ No CUDA-X Data Science C++ package is needed at build time, so the default isola
 on both CUDA 12 and CUDA 13 without `--no-build-isolation`.
 ```
 
+(gpu-io-install)=
+### Reading data straight into GPU memory (optional)
+
+For out-of-core analysis, {mod}`rapids_singlecell.io` can read zarr data straight into GPU memory and decompress it there,
+with [zarr-kvikio](https://github.com/scverse/zarr-kvikio), KvikIO and nvCOMP (see {doc}`out_of_core`).
+For the development version, install zarr-kvikio from GitHub in your rapids-singlecell environment:
+
+```bash
+[uv] pip install -c <([uv] pip freeze | grep '^nvidia-libnvcomp-') \
+    'zarr-kvikio[cuda13] @ git+https://github.com/scverse/zarr-kvikio.git'  # or [cuda12]
+```
+
+The constraint preserves the native nvCOMP version required by an existing pip installation of libcudf.
+
+Once zarr-kvikio is on PyPI, the CUDA wheels provide the `io` extra and the source distribution provides
+`io-cu12` and `io-cu13`. With pip-installed CUDA-X Data Science, this needs version 26.06 or newer (for nvCOMP ≥ 5.2).
+
 ### Install from GitHub
 
 To install the latest development version directly from GitHub:

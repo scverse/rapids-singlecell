@@ -21,6 +21,11 @@ overrides.matrix.cuda.features = [
   { if = ["12"], value = "rapids-cu12" },
   { if = ["13"], value = "rapids-cu13" },
 ]
+# Exercise the I/O extras from upstream until zarr-kvikio is published on PyPI.
+overrides.matrix.cuda.extra-dependencies = [
+  { if = ["12"], value = "zarr-kvikio[cuda12] @ git+https://github.com/scverse/zarr-kvikio.git@1004757e12a7fe8a1f90f5da96dd40593445aced" },
+  { if = ["13"], value = "zarr-kvikio[cuda13] @ git+https://github.com/scverse/zarr-kvikio.git@1004757e12a7fe8a1f90f5da96dd40593445aced" },
+]
 
 # Python per deps
 overrides.matrix.deps.python = [
@@ -65,17 +70,20 @@ overrides.matrix.deps.extra-dependencies = [
   ], value = "numba-cuda<0.30" },
 ]
 # RAPIDS pins depend on both `deps` and `cuda`, so they key off the env name
+# Match the nvCOMP bindings to libcudf 26.10's native library across Hatch's two install steps.
 overrides.name."(stable|dev)-12$".extra-dependencies = [
   "cuml-cu12<26.12",
   "cudf-cu12<26.12",
   "cugraph-cu12<26.12",
   "cuvs-cu12<26.12",
+  "nvidia-nvcomp-cu12==5.3.0.16",
 ]
 overrides.name."(stable|dev)-13$".extra-dependencies = [
   "cuml-cu13<26.12",
   "cudf-cu13<26.12",
   "cugraph-cu13<26.12",
   "cuvs-cu13<26.12",
+  "nvidia-nvcomp-cu13==5.3.0.16",
 ]
 
 # uv honours prerelease markers only on direct requirements, so list the whole RAPIDS
@@ -88,6 +96,7 @@ overrides.name."rapids_prerelease-12$".extra-dependencies = [
   "cuvs-cu12>=26.12.0a0",
   "dask-cudf-cu12>=26.12.0a0",
   "distributed-ucxx-cu12>=0.53.0a0",
+  "kvikio-cu12>=26.12.0a0",
   "libcudf-cu12>=26.12.0a0",
   "libcugraph-cu12>=26.12.0a0",
   "libcuml-cu12>=26.12.0a0",
@@ -116,6 +125,7 @@ overrides.name."rapids_prerelease-13$".extra-dependencies = [
   "cuvs-cu13>=26.12.0a0",
   "dask-cudf-cu13>=26.12.0a0",
   "distributed-ucxx-cu13>=0.53.0a0",
+  "kvikio-cu13>=26.12.0a0",
   "libcudf-cu13>=26.12.0a0",
   "libcugraph-cu13>=26.12.0a0",
   "libcuml-cu13>=26.12.0a0",
