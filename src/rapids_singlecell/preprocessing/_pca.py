@@ -159,6 +159,11 @@ def pca(
 
     rng
         Random seed or :class:`~numpy.random.Generator` for initialization.
+        For repeatable sparse Lanczos or randomized SVD, pass the same integer
+        seed on each call (e.g. `rng=42`). Reusing a generator advances its state.
+        Both solvers compute transpose products directly from CSR rows using
+        a compact index of column ranges. For bitwise repeatability, use the
+        same input, GPU and software versions and run on a single stream.
         The superseded `random_state` argument is still accepted.
 
     mask
@@ -168,6 +173,8 @@ def pca(
 
     dtype
         Numpy data type string to which to convert the result.
+        For uncentered complex sparse SVD, use `"complex64"` or `"complex128"`
+        to retain the imaginary part of the scores.
 
     chunked
         If `True`, perform an incremental PCA on segments of `chunk_size`.
@@ -285,9 +292,12 @@ def pca(
     )
 
     loadings = _as_numpy(pca_func.components_.T)
+    if loadings.dtype.kind == "c":
+        loadings = loadings.conj()
     if mask_var is not None:
-        loadings = np.zeros(shape=(adata.n_vars, n_comps))
-        loadings[mask_var] = _as_numpy(pca_func.components_.T)
+        padded = np.zeros((adata.n_vars, n_comps), dtype=np.result_type(loadings.dtype, np.float64))
+        padded[mask_var] = loadings
+        loadings = padded
     vals = PcaResult(X_pca, loadings)
     if dests is True:
         return vals
@@ -428,13 +438,8 @@ def _run_sparse_svd_pca(
 ):
     """Run PCA using SVD solvers (lanczos, randomized)."""
     if issparse(X):
-        X = X_to_GPU(X)
+        X = X_to_GPU(X.tocsr())
     from ._sparse_pca._sparse_svd_pca import PCA_sparse_svd
-
-    if not isspmatrix_csr(X):
-        X = X.tocsr()
-    if issparse_cupy(X):
-        X.sort_indices()
 
     # Build kwargs for PCA_sparse_svd
     kwargs = {
