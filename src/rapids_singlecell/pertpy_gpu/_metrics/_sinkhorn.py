@@ -1,10 +1,8 @@
 """Batched log-domain Sinkhorn solver over a ragged (flat, no-padding) layout.
 
 Pairs of point clouds are stored flat with per-pair int64 offsets; the CUDA
-kernels (``_sinkhorn_cuda``: build_cost, auto_eps, update_g, update_f,
-check_convergence) solve a whole batch at once. The Python iteration loop
-(:func:`run_async`) dispatches per-iteration launches to several devices'
-streams and reads per-pair convergence at the end of each ``check_every``-step.
+kernels build the costs and solve a whole batch at once. :func:`run_async`
+queues a chunk of iterations on each device and checks convergence between chunks.
 The per-pair return matches OTT-JAX's ``reg_ot_cost = f@a + g@b + eps*(log n_a +
 log n_b)`` for uniform marginals.
 """
@@ -72,27 +70,11 @@ def make_state(layout: dict, cost: cp.ndarray, *, epsilon_scale: float) -> dict:
         "dtype": dtype,
         "f": cp.zeros(total_rows, dtype=dtype),
         "g": cp.zeros(total_cols, dtype=dtype),
-        "f_prev": cp.zeros(total_rows, dtype=dtype),
-        "g_prev": cp.zeros(total_cols, dtype=dtype),
-        "conv": cp.zeros(B, dtype=cp.int32),
+        "f_prev": cp.empty(total_rows, dtype=dtype),
+        "g_prev": cp.empty(total_cols, dtype=dtype),
+        # Skip undefined pairs so their potentials stay zero in the batched sums.
+        "conv": cp.isnan(eps).astype(cp.int32),
     }
-
-
-def _step(st, *, will_check, tol, omega=DEFAULT_RELAXATION):
-    """Queue one Sinkhorn iteration (no host sync). omega in [1, 2) over-relaxes."""
-    f, g = st["f"], st["g"]
-    cost, conv, eps = st["cost"], st["conv"], st["eps"]
-    co, fo, go = st["cost_off"], st["f_off"], st["g_off"]
-    n, m, r2p, c2p = st["n"], st["m"], st["row2pair"], st["col2pair"]
-    sp = cp.cuda.get_current_stream().ptr
-    if will_check:
-        # Snapshot for the single-iteration change measured by check_convergence.
-        cp.copyto(st["f_prev"], f)
-        cp.copyto(st["g_prev"], g)
-    _sk.update_g(cost, co, n, m, f, fo, g, go, c2p, eps, st["log_b"], conv, omega, sp)
-    _sk.update_f(cost, co, m, g, go, f, fo, r2p, eps, st["log_a"], conv, omega, sp)
-    if will_check:
-        _sk.check_convergence(f, st["f_prev"], fo, n, g, st["g_prev"], go, m, float(tol), conv, sp)
 
 
 def _segment_sum(values: cp.ndarray, starts: cp.ndarray, total: int) -> cp.ndarray:
@@ -125,11 +107,31 @@ def run_async(units, *, max_iter, tol, check_every, omega=DEFAULT_RELAXATION):
     it = 0
     while it < max_iter:
         n = min(cev, max_iter - it)
-        for k in range(n):
-            will_check = k == n - 1
-            for u in units:
-                with cp.cuda.Device(u["dev"]), u["stream"]:
-                    _step(u["state"], will_check=will_check, tol=tol, omega=omega)
+        for u in units:
+            st = u["state"]
+            with cp.cuda.Device(u["dev"]), u["stream"]:
+                _sk.iterate(
+                    st["cost"],
+                    st["cost_off"],
+                    st["n"],
+                    st["m"],
+                    st["f"],
+                    st["f_off"],
+                    st["g"],
+                    st["g_off"],
+                    st["row2pair"],
+                    st["col2pair"],
+                    st["eps"],
+                    st["log_a"],
+                    st["log_b"],
+                    st["conv"],
+                    st["f_prev"],
+                    st["g_prev"],
+                    n,
+                    tol,
+                    omega,
+                    u["stream"].ptr,
+                )
         it += n
         for u in units:
             with cp.cuda.Device(u["dev"]):
