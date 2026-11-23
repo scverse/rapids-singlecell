@@ -17,7 +17,6 @@ from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
-    _LegacyRng,
     _seed_from_rng,
 )
 from rapids_singlecell.get._out import (
@@ -62,10 +61,29 @@ def _check_dtype(dtype: str | np.dtype) -> str | np.dtype:
             raise ValueError("dtype must be one of ['float32', 'float64']")
         else:
             return dtype
-    elif dtype is np.float32 or dtype is np.float64:
+    elif (
+        dtype is np.float32
+        or dtype is np.float64
+        or (isinstance(dtype, np.dtype) and dtype in (np.float32, np.float64))
+    ):
         return dtype
     else:
         raise ValueError("dtype must be one of ['float32', 'float64']")
+
+
+def _import_cugraph(*, use_dask=False):
+    try:
+        import cugraph
+    except ModuleNotFoundError as exc:
+        if exc.name != "cugraph":
+            raise
+        msg = "Install the optional cuGraph package for your CUDA version (cugraph-cu12 or cugraph-cu13)."
+        raise ModuleNotFoundError(msg, name="cugraph") from exc
+    if use_dask:
+        from cugraph import dask
+
+        return dask
+    return cugraph
 
 
 def _create_graph(adjacency, dtype=np.float64, *, use_weights=True):
@@ -158,167 +176,6 @@ def _create_graph_dask(adjacency, dtype=np.float64, *, use_weights=True):
             Comms.destroy()
         raise
     return g
-
-
-@_accepts_legacy_random_state(0)
-@deprecated_arg("key_added", DEPR_KEY_ADDED)
-@deprecated_arg("adjacency", _DEPR_ADJACENCY)
-@deprecated_arg("neighbors_key", DEPR_NEIGHBORS_KEY)
-@deprecated_arg("obsp", DEPR_OBSP)
-@deprecated_copy
-def leiden(
-    adata: AnnData,
-    resolution: float | list[float] = 1.0,
-    *,
-    rng: SeedLike | RNGLike | None = None,
-    theta: float = 1.0,
-    restrict_to: tuple[str, Sequence[str]] | None = None,
-    n_iterations: int = 100,
-    use_weights: bool = True,
-    dtype: str | np.dtype = np.float32,
-    use_dask: bool = False,
-    use: GraphAcc | str | None = None,
-    out: AdRef | str | bool = False,
-    # deprecated
-    key_added: str | None = None,
-    adjacency: sparse.spmatrix | None = None,
-    neighbors_key: str | None = None,
-    obsp: str | None = None,
-    copy: bool = False,
-) -> AnnData | pd.Categorical | dict[float, pd.Categorical] | None:
-    """
-    Cluster cells into subgroups using the Leiden algorithm :cite:p:`Traag2019`.
-
-    Performs Leiden clustering using cuGraph, an improved version of the
-    Louvain algorithm :cite:p:`Blondel2008`.
-
-    Parameters
-    ----------
-        adata :
-            annData object
-
-        resolution
-            A parameter value or a list of parameter values controlling the coarseness of the clustering.
-            (called gamma in the modularity formula). Higher values lead to
-            more clusters. If a list of values is provided, the Leiden algorithm will be run for each value in the list.
-
-        rng
-            Random seed or :class:`~numpy.random.Generator` changing the
-            initialization of the optimization. Defaults to 0.
-            The superseded `random_state` argument is still accepted.
-
-        theta
-            Called theta in the Leiden algorithm, this is used to scale modularity
-            gain in Leiden refinement phase, to compute the probability of joining
-            a random leiden community.
-
-        restrict_to
-            Restrict the clustering to the categories within the key for
-            sample annotation, tuple needs to contain
-            `(obs_key, list_of_categories)`.
-
-
-        n_iterations
-            This controls the maximum number of levels/iterations of the
-            Leiden algorithm. When specified, the algorithm will terminate
-            after no more than the specified number of iterations. No error
-            occurs when the algorithm terminates early in this manner.
-
-        use_weights
-            If `True`, edge weights from the graph are used in the
-            computation (placing more emphasis on stronger edges).
-
-        dtype
-            Data type to use for the adjacency matrix.
-
-        use_dask
-            If `True`, use Dask to create the graph and cluster. This will use all GPUs available. This feature is experimental. For datasets with less than 10 Million cells, it is recommended to use `use_dask=False`.
-
-        use
-            The neighborhood graph (connectivities) to cluster, e.g. `A.obsp['k']`.
-            Strings are resolved by :meth:`anndata.acc.AdAcc.resolve`, e.g. `'obsp.k'`.
-            If `None`, the one :func:`~rapids_singlecell.pp.neighbors` wrote by default.
-
-        out
-            Where to write the cluster labels, e.g. `A.obs['clusters']`; the parameters go to `.uns` under the same key.
-            If `True`, the labels are returned instead (a dict by resolution for several resolutions).
-            If `False`, they are written to `.obs['leiden']` and `.uns['leiden']` (`'leiden_R'` with `restrict_to`).
-            Several resolutions are written to `.obs[f'{key}_{resolution}']`.
-    """
-    # Adjacency graph
-
-    rng = np.random.default_rng(rng)
-    meta_random_state = {"random_state": rng.arg} if isinstance(rng, _LegacyRng) else {}
-
-    dtype = _check_dtype(dtype)
-    key = _out_key(out, key_added, kind="obs", default="leiden")
-    # like `key_added`, the default key gets a suffix, keys from `out` are literal
-    col = f"{key}_R" if restrict_to is not None and key == "leiden" and out is False else key
-    adjacency = _use_graph(adata, use, adjacency=adjacency, obsp=obsp, neighbors_key=neighbors_key)
-    if restrict_to is not None:
-        restrict_key, restrict_categories = restrict_to
-        adjacency, restrict_indices = restrict_adjacency(
-            adata=adata,
-            restrict_key=restrict_key,
-            restrict_categories=restrict_categories,
-            adjacency=adjacency,
-        )
-    if use_dask:
-        from cugraph.dask import leiden as culeiden
-
-        g = _create_graph_dask(adjacency, dtype, use_weights=use_weights)
-    else:
-        from cugraph import leiden as culeiden
-
-        g = _create_graph(adjacency, dtype, use_weights=use_weights)
-    # Cluster
-    if isinstance(resolution, float | int):
-        resolutions = [resolution]
-    else:
-        resolutions = resolution
-    modularities, labels = [], {}
-    try:
-        for resolution in resolutions:
-            leiden_parts, modularity = culeiden(
-                g,
-                resolution=resolution,
-                # cuGraph's leiden is seeded, so draw the seed right here
-                random_state=_seed_from_rng(rng),
-                theta=theta,
-                max_iter=n_iterations,
-            )
-            if use_dask:
-                leiden_parts = leiden_parts.to_backend("pandas").compute()
-            else:
-                leiden_parts = leiden_parts.to_pandas()
-            modularities.append(modularity)
-
-            # Format output
-            groups = leiden_parts.sort_values("vertex")[["partition"]].to_numpy().ravel()
-            if restrict_to is not None:
-                groups = _rename_groups(
-                    adata,
-                    restrict_key=restrict_key,
-                    restrict_categories=restrict_categories,
-                    restrict_indices=restrict_indices,
-                    groups=groups,
-                )
-            labels[resolution] = pd.Categorical(
-                values=groups.astype("U"),
-                categories=natsorted(map(str, np.unique(groups))),
-            )
-    finally:
-        # Always tear down the raft/NCCL comms, even if clustering raised, so a
-        # single failure can't leak the global cugraph communicator and make
-        # every later dask clustering call fail with "already initialized".
-        if use_dask:
-            import cugraph.dask.comms.comms as Comms
-
-            Comms.destroy()
-    params = {**meta_random_state, "n_iterations": n_iterations}
-    return _cluster_labels(
-        (col, key), resolutions, labels, out=out, adata=adata, params=params, modularities=modularities
-    )
 
 
 @deprecated(Deprecation("0.19.0", "Use `rapids_singlecell.tl.leiden` instead."))
@@ -414,14 +271,9 @@ def louvain(
             adjacency=adjacency,
         )
     # Cluster
-    if use_dask:
-        from cugraph.dask import louvain as culouvain
-
-        g = _create_graph_dask(adjacency, dtype, use_weights=use_weights)
-    else:
-        from cugraph import louvain as culouvain
-
-        g = _create_graph(adjacency, dtype, use_weights=use_weights)
+    culouvain = _import_cugraph(use_dask=use_dask).louvain
+    create_graph = _create_graph_dask if use_dask else _create_graph
+    g = create_graph(adjacency, dtype, use_weights=use_weights)
 
     if isinstance(resolution, float | int):
         resolutions = [resolution]

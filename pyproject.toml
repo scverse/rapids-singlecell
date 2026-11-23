@@ -41,17 +41,17 @@ dependencies = [
   "statsmodels>=0.12",
   "tqdm",
 ]
+optional-dependencies.cugraph-cu12 = [ "cugraph-cu12>=25.12" ]
+optional-dependencies.cugraph-cu13 = [ "cugraph-cu13>=25.12" ]
 optional-dependencies.rapids-cu12 = [
   "cudf-cu12>=25.12",
-  "cugraph-cu12>=25.12",
-  "cuml-cu12>=25.12",
+  "cuml-cu12[dask]>=25.12",
   "cupy-cuda12x[ctk]>=14",
   "cuvs-cu12>=25.12",
 ]
 optional-dependencies.rapids-cu13 = [
   "cudf-cu13>=25.12",
-  "cugraph-cu13>=25.12",
-  "cuml-cu13>=25.12",
+  "cuml-cu13[dask]>=25.12",
   "cupy-cuda13x[ctk]>=14",
   "cuvs-cu13>=25.12",
 ]
@@ -328,6 +328,7 @@ module = [
   "rapids_singlecell.tools._draw_graph",
   "rapids_singlecell.tools._embedding_density",
   "rapids_singlecell.tools._ingest",
+  "rapids_singlecell.tools._leiden",
   "rapids_singlecell.tools._rank_genes_groups",
   "rapids_singlecell.tools._rank_genes_groups._core",
   "rapids_singlecell.tools._rank_genes_groups._logreg",

@@ -6,7 +6,7 @@
 ## Conda
 
 The easiest way to install *rapids-singlecell* is to use one of the *yaml* files provided in the [conda](https://github.com/scverse/rapids-singlecell/tree/main/conda) folder.
-These *yaml* files install everything needed to run the example notebooks and get you started.
+These *yaml* files install the full RAPIDS stack, including cuGraph, to run the example notebooks.
 Download the matching file or run the commands below from a repository checkout.
 
 `````{tab-set}
@@ -108,6 +108,15 @@ This requires the `--extra-index-url` flag for the NVIDIA PyPI index:
 ````
 `````
 
+cuGraph is optional. To use ForceAtlas2 ({func}`~rapids_singlecell.tl.draw_graph`),
+{func}`~rapids_singlecell.tl.louvain`, or `tl.leiden(flavor="cugraph")`, add the `cugraph` extra:
+
+```bash
+[uv] pip install 'rapids-singlecell-cu13[rapids,cugraph]' --extra-index-url=https://pypi.nvidia.com
+```
+
+For CUDA 12, use `rapids-singlecell-cu12[rapids,cugraph]`.
+
 ### Source distribution (self-compile)
 
 The `rapids-singlecell` package on PyPI contains the source distribution.
@@ -123,6 +132,8 @@ You can select CUDA-X Data Science dependencies with the `rapids-cu12` or `rapid
 ```bash
 [uv] pip install 'rapids-singlecell[rapids-cu12]' --extra-index-url=https://pypi.nvidia.com
 ```
+
+For cuGraph, select both matching extras, for example `rapids-singlecell[rapids-cu12,cugraph-cu12]`.
 
 ```{note}
 Building from source requires the CUDA toolkit (nvcc) and CMake >= 3.24 to be available in your environment.
