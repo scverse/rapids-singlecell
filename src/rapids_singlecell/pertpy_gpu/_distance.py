@@ -87,6 +87,17 @@ class Distance:
         If neither key is specified, the PCA key of the active
         ``rapids_singlecell.settings.preset`` is used. Either spelling
         resolves to whichever one the data actually uses.
+    **kwargs
+        Options of the metric. ``metric="edistance"`` takes ``precision``, the
+        arithmetic of the cell-to-cell distances in :meth:`pairwise`,
+        :meth:`onesided_distances` and :meth:`contrast_distances` (not in
+        ``distance(X, Y)`` and ``bootstrap(X, Y)``): ``"auto"`` (default;
+        ``"float64"`` for float64 data, else ``"float32"``), ``"float32"``
+        (loses accuracy for tight clusters far from the center of the cells a
+        call reads), ``"float64"`` or ``"float16"`` (tensor cores: the fastest on
+        large inputs, with larger errors, and ``ValueError`` for data beyond the
+        float16 range after centering and scaling). Data other than float64 is
+        cast to float32, so results are float32 unless the data is float64.
 
     Notes
     -----
@@ -647,7 +658,9 @@ class Distance:
             Annotated data matrix
         contrasts
             DataFrame with a groupby column, a ``reference`` column,
-            and optional split columns.
+            and optional split columns. With ``metric="edistance"`` the
+            cells of each combination of the split columns are centered
+            on their own.
         multi_gpu
             GPU selection:
             - None: Use all GPUs if metric supports it, else GPU 0 (default)
