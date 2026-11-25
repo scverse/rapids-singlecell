@@ -30,9 +30,9 @@ _INT32_MAX = np.iinfo(np.int32).max
 
 # Per precision: kernel, A-tile rows, features per step, dtype of the norms, shared-memory element.
 _MATH = {
-    "float64": (_ed.pair_sums_f64, 64, 2, np.float64, np.float64),
-    "float32": (_ed.pair_sums_f32, 128, 4, np.float32, np.float32),
-    "float16": (_ed.pair_sums_f16, 128, 16, np.float32, np.float16),
+    "float64": ("pair_sums_f64", 64, 2, np.float64, np.float64),
+    "float32": ("pair_sums_f32", 128, 4, np.float32, np.float32),
+    "float16": ("pair_sums_f16", 128, 16, np.float32, np.float16),
 }
 _TILE_B = 128  # B-tile rows
 _PAIR_CHUNK = 1 << 20  # pairs per kernel launch
@@ -93,8 +93,9 @@ def _center(X, precision: str, slots, rows=None) -> tuple[cp.ndarray, np.ndarray
     The kernels get a distance from ``|a|² + |b|² - 2ab``, which needs centered
     rows to be accurate, and float16 needs them scaled into its range. The mean
     is taken over a sample of rows without its outlier rows; ``sc`` is the power
-    of two (exact to undo) that puts the largest centered sample value in
-    ``[2**10, 2**11)`` and ``nm = -mean * sc``. Split ``s`` is the cells at
+    of two used to scale up small spreads and keep the arithmetic in range.
+    Float16 targets the spread of the retained sample; float32/64 also account
+    for unsampled cells so that squared distances stay finite. Split ``s`` is the cells at
     positions ``slots[s]`` up to ``slots[s + 1]`` of the cells a call reads: the
     rows of ``X``, or those the int32 device array ``rows`` lists when a call
     reads part of a dense ``X``. Its sample is at most ``_SAMPLE_ROWS`` strided
@@ -112,38 +113,39 @@ def _center(X, precision: str, slots, rows=None) -> tuple[cp.ndarray, np.ndarray
     first = np.concatenate([[0], np.cumsum(-(-n // step))])  # split s is sampled rows first[s] up to first[s + 1]
     sample = cp.asarray(np.stack([first, slots, np.append(step, 0)]), dtype=cp.int32)
     stream = cp.cuda.get_current_stream()
-    r, total = cp.zeros(int(first[-1]), dtype=dtype), cp.zeros((n.size, d), dtype=cp.float64)
-    kept, shift = cp.zeros(n.size, dtype=cp.int32), cp.zeros(n.size, dtype=cp.int32)
+    r = cp.zeros(int(first[-1]), dtype=dtype)
+    mu = cp.zeros((n.size, d), dtype=cp.float64)
     big, top = cp.zeros(n.size, dtype=dtype), cp.zeros(n.size, dtype=dtype)
     reader = (*map(cp.ascontiguousarray, (X.indptr, X.indices, X.data)),) if cpsp.issparse(X) else (X, rows)
 
     def run(what):
-        _ed.center(*reader, sample, shift, what, r, total, top, stream=stream.ptr)
-        stream.synchronize()  # the rows stay referenced until the kernel has finished
+        _ed.center(*reader, sample, int(slots[-1]), what, r, mu, top, stream=stream.ptr)
 
-    run(0)  # r = the largest |value| of each row
-    # Left out: rows with a non-finite value or above _TRIM times the median row of their split. r = whether a
-    # row is kept, kept = how many of a split are, big = the largest |value| of these
-    _ed.trim(sample[0], _TRIM, r, kept, big, stream=stream.ptr)
-    # The column sums add integers, exact in float64 in any order: dense and CSR input get the same mean
-    cp.subtract(min(np.finfo(dtype).nmant, 52 - _SAMPLE_ROWS.bit_length()), cp.frexp(big)[1], out=shift)
-    run(1)  # total = the column sums of rint(value * 2**shift) over the kept rows
-    total /= cp.maximum(kept, 1)[:, None]
-    mu = cp.ldexp(total, -shift[:, None], out=total)
-    run(2)  # top = the largest |value - mu| of the kept rows, mu in the dtype of the values
-    top = top.get().tolist()
-    r = None  # not held while nm is built
-    work = np.result_type(dtype, _MATH[precision][3])  # the kernels center in it: sc has to stay finite there
-    limit = np.finfo(work).maxexp - 2
-    sc = [math.ldexp(1.0, min(10 - math.floor(math.log2(t)), limit)) if 0 < t < math.inf else 1.0 for t in top]
-    nm = mu.astype(dtype, copy=False).astype(work, copy=False)  # -mu * sc in place, with +0.0 for a zero mean
+    run(0)  # largest |value| of each sampled row
+    _ed.trim(sample[0], _TRIM, r, big, stream=stream.ptr)
+    run(1)  # per-feature mean of the retained rows
+    run(2 if precision == "float16" else 3)
+    magnitude, spread = cp.stack((big, top)).get()
+    acc = _MATH[precision][3]
+    work = np.result_type(dtype, acc)
+    exp = np.frexp(spread)[1]
+    exp[np.isinf(spread)] = np.finfo(dtype).maxexp + 1
+    power = np.where(spread > 0, 11 - exp, 0)
+    if precision != "float16":
+        # Even 4*d*coordinate² must fit the accumulator. Scale down only if needed.
+        safe_exp = (np.finfo(acc).maxexp - 2 - (max(d, 1) - 1).bit_length()) // 2
+        power = np.minimum(np.maximum(power, 0), safe_exp - exp)
+    # The retained rows bound their mean. Both the scale and mean * scale must fit.
+    limit = np.finfo(work).maxexp - np.maximum(1, np.frexp(magnitude)[1])
+    sc = np.ldexp(np.ones(n.size), np.minimum(power, limit))
+    nm = mu.astype(dtype, copy=False).astype(work, copy=False)
     nm *= cp.asarray(sc, dtype=work)[:, None]
     cp.subtract(0.0, nm, out=nm)
-    total = mu = None  # the float64 sums are not held while nm is snapped
+    mu = r = None
     if precision == "float16":  # a zero then centers to an exact float16
         snap = nm.astype(np.float32).astype(np.float16)
         nm = cp.where(cp.isfinite(snap), snap.astype(nm.dtype), nm)
-    return nm, np.array(sc)
+    return nm, sc
 
 
 @dataclass(eq=False)
@@ -182,7 +184,7 @@ class _Source:
         """Copy the cells to a device and compute their row norms there, once."""
         if device_id in self._devices:
             return
-        fn, tile_a, step, acc, elem = _MATH[self.precision]
+        kernel, tile_a, step, acc, elem = _MATH[self.precision]
         n, d = self.shape
         kp = -(-d // step) * step
         with cp.cuda.Device(device_id):
@@ -204,7 +206,7 @@ class _Source:
             blocks = np.concatenate([[0], np.cumsum(-(-np.diff(self.slots) // tile_a))])
             tiles = (norms, unused, rows, unused, unused, cp.asarray(blocks, dtype=cp.int32), int(blocks[-1]))
             stream = cp.cuda.get_current_stream()
-            fn(*args, *tiles, cp.zeros(1), norms_only=True, stream=stream.ptr)
+            getattr(_ed, kernel)(*args, *tiles, cp.zeros(1), norms_only=True, stream=stream.ptr)
             stream.synchronize()
             # The norm of a cell the call reads is still -1: the kernels did not run
             if self.precision == "float16" and self.slots[-1] and float(norms[0 if rows is None else rows[0]]) < 0:
@@ -224,7 +226,8 @@ class _Source:
         pair_right: cp.ndarray,
     ) -> cp.ndarray:
         """Distance sums of the pairs on one device, at most ``_PAIR_CHUNK`` pairs per kernel launch."""
-        fn, tile_a = _MATH[self.precision][:2]
+        kernel, tile_a = _MATH[self.precision][:2]
+        fn = getattr(_ed, kernel)
         args, norms, n_sm, overflow, inner, scale = self._devices[device_id]
         with cp.cuda.Device(device_id):
             stream = cp.cuda.get_current_stream()
@@ -313,6 +316,13 @@ def _build_csr_source(embedding_raw, selector):
     return _sort_indices(X)
 
 
+def _csr_center_width(X, precision: str) -> int:
+    """Number of center values per split, padded to whole CUDA feature windows."""
+    elem = _float_dtype(X.dtype) if precision == "auto" else np.dtype(_MATH[precision][4])
+    window = 128 // elem.itemsize
+    return X.shape[1] + (-X.shape[1] % window)
+
+
 def _materialize_source(embedding_raw, selector, precision: str, rows=None, slots=None) -> _Source:
     """Materialize the subset on GPU as a :class:`_Source`: C-contiguous rows (dense input) or sorted CSR (sparse).
 
@@ -334,8 +344,8 @@ def _materialize_source(embedding_raw, selector, precision: str, rows=None, slot
         slots = np.array([0, X.shape[0]]) if slots is None else slots
         center = _center(X, precision, slots)  # of the loaded cells, before the copies below
         # nm with zeros up to whole shared-memory windows: a column index of invalid input in the last window reads a 0
-        width = 128 // np.dtype(_MATH[precision][4]).itemsize
-        center = cp.pad(center[0], ((0, 0), (0, -X.shape[1] % width))), center[1]
+        padding = _csr_center_width(X, precision) - X.shape[1]
+        center = cp.pad(center[0], ((0, 0), (0, padding))), center[1]
         indptr = X.indptr.astype(cp.int64 if X.nnz > _INT32_MAX else cp.int32, copy=False)
         arrays = tuple(cp.ascontiguousarray(a) for a in (indptr, X.indices.astype(cp.int32, copy=False), X.data))
     else:
@@ -788,13 +798,15 @@ class EDistanceMetric(BaseMetric):
         # CSR (the kernel densifies on the fly); for dense input subset when fewer
         # than 70 % of the cells are used, else load the whole array and read the
         # used cells through cell_indices.
-        in_place = not _is_sparse(embedding_raw) and len(original_indices) >= int(len(embedding_raw) * 0.7)
+        sparse = _is_sparse(embedding_raw)
+        in_place = not sparse and len(original_indices) >= int(len(embedding_raw) * 0.7)
         # A source holds a center per combination: with many combinations of many features the call takes several
         # sources in turn, of step combinations each. An array read in place and a sparse matrix are loaded once.
-        values, d = _CENTER_VALUES, max(embedding_raw.shape[1], 1)
+        width = _csr_center_width(embedding_raw, self.precision) if sparse else embedding_raw.shape[1]
+        values, d = _CENTER_VALUES, max(width, 1)
         if in_place:
             embedding_raw = _rows(embedding_raw)
-        elif _is_sparse(embedding_raw) and len(rows) * d > values:  # uploaded, cast or converted once
+        elif sparse and len(rows) * d > values:  # uploaded, cast or converted once
             with embedding_raw.data.device if cpsp.issparse(embedding_raw) else cp.cuda.Device():
                 embedding_raw = _device_csr(embedding_raw)
                 # A source reads its own rows of a matrix, which leaves room for more centers: a quarter of

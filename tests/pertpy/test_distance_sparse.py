@@ -58,6 +58,57 @@ def _halves(m: csr_matrix) -> csr_matrix:
     return csr_matrix((np.repeat(m.data / 2, 2), np.repeat(m.indices, 2), 2 * m.indptr), shape=m.shape)
 
 
+def test_two_array_distance_without_native_extension(monkeypatch) -> None:
+    import sys
+
+    from rapids_singlecell import _cuda
+    from rapids_singlecell.pertpy_gpu import _metrics
+
+    monkeypatch.setattr(_cuda, "_edistance_cuda", None)
+    monkeypatch.delitem(sys.modules, _metrics._edistance.__name__)
+    monkeypatch.delattr(_metrics, "_edistance")
+    assert Distance()(np.array([[1.0]]), np.array([[2.0]])) == 2.0
+
+
+def test_sparse_contrasts_budget_padded_centers(monkeypatch) -> None:
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
+
+    obs = pd.DataFrame({"group": np.tile(["a", "b"], 5), "split": np.repeat(np.arange(5), 2)}).rename(str)
+    adata = AnnData(csr_matrix(np.tile([[0], [1]], (5, 1)), dtype=np.float32), obs=obs)
+    contrasts = pd.DataFrame({"group": "a", "reference": "b", "split": np.arange(5)})
+    monkeypatch.setattr(_edistance, "_CENTER_VALUES", 128)  # room for two padded float16 centers
+
+    def load(*args):
+        source = _materialize_source(*args)
+        assert source.nm.size <= _edistance._CENTER_VALUES
+        return source
+
+    monkeypatch.setattr(_edistance, "_materialize_source", load)
+    result = Distance(layer_key="X", precision="float16").contrast_distances(adata, contrasts)
+    np.testing.assert_array_equal(result["edistance"], np.full(5, 2.0))
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.float32([[2.0**120, -1], [2.0**120, 1]]),
+        np.float64([[2.0**1020, -1], [2.0**1020, 1]]),
+        np.float64([[2.0**40 + 1, -(2.0**-30)], [2.0**40 + 1, 2.0**-30]]),
+        np.float32([[0], [2.0**-60], [2.0**-59], [1]]),
+    ],
+    ids=["large-f32-center", "large-f64-center", "constant-feature", "unsampled-outlier"],
+)
+def test_pairwise_preserves_singleton_distances(values, sparse, monkeypatch) -> None:
+    from rapids_singlecell.pertpy_gpu._metrics import _edistance
+
+    monkeypatch.setattr(_edistance, "_SAMPLE_ROWS", 2)
+    obs = pd.DataFrame({"group": pd.Categorical(range(len(values)))}).rename(str)
+    adata = AnnData(csr_matrix(values) if sparse else values, obs=obs)
+    got = Distance(layer_key="X").pairwise(adata, groupby="group", multi_gpu=False)
+    np.testing.assert_allclose(got, 2 * cdist(values, values), rtol=2e-6, atol=0)
+
+
 @pytest.mark.parametrize("precision", ["float32", "float64", "float16"])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_sparse_equals_dense_bitwise(precision, dtype) -> None:

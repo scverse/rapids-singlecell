@@ -161,30 +161,40 @@ static void def_math(nb::module_& m, const char* name) {
 }
 
 #define ED_CENTER_ARGS                                                      \
-    arr<const int, Device> sample, arr<const int, Device> shift, int pass,  \
+    arr<const int, Device> sample, int rows_read, int pass,                 \
         arr<In, Device> out, arr<double, Device> sums, arr<In, Device> top, \
         std::uintptr_t stream
-#define ED_CENTER_NAMES                                                 \
-    "sample"_a.noconvert(), "shift"_a.noconvert(), "pass"_a,            \
-        "out"_a.noconvert(), "sums"_a.noconvert(), "top"_a.noconvert(), \
-        "stream"_a = 0
+#define ED_CENTER_NAMES                                                   \
+    "sample"_a.noconvert(), "rows_read"_a, "pass"_a, "out"_a.noconvert(), \
+        "sums"_a.noconvert(), "top"_a.noconvert(), "stream"_a = 0
 
 // One pass of the center kernel over the sampled rows i < out.size() of the
 // splits (the rows of sums), in windows of R::CW columns
 template <typename In, class R, typename Device>
 static void center(const R& rd, ED_CENTER_ARGS) {
-    const int m = static_cast<int>(out.size());
+    const int m = pass == 3 ? rows_read : static_cast<int>(out.size());
     nb_require(sums.ndim() == 2 && sample.size() == 3 * (sums.shape(0) + 1) &&
-                   shift.size() == sums.shape(0) && top.size() == sums.shape(0),
-               "center: sample / shift / top do not match sums");
+                   top.size() == sums.shape(0),
+               "center: sample / top do not match sums");
     const int d = static_cast<int>(sums.shape(1));
     if (m == 0 || d == 0) return;
+    if (pass == 1) {
+        const int n = static_cast<int>(sums.shape(0));
+        const int warps = n * ((d - 1) / 8 + 1);
+        constexpr int per_block = ED_THREADS / WARP_SIZE;
+        edistance_mean_kernel<In, R>
+            <<<(warps + per_block - 1) / per_block, ED_THREADS, 0,
+               reinterpret_cast<cudaStream_t>(stream)>>>(
+                rd, sample.data(), n, d, out.data(), sums.data());
+        CUDA_CHECK_LAST_ERROR(edistance_mean_kernel);
+        return;
+    }
     const long long units = (long long)m * ((d - 1) / R::CW + 1);
     edistance_center_kernel<In, R>
         <<<(unsigned)((units + ED_THREADS - 1) / ED_THREADS), ED_THREADS, 0,
            reinterpret_cast<cudaStream_t>(stream)>>>(
             rd, sample.data(), static_cast<int>(sums.shape(0)), m, d, R::CW,
-            pass, shift.data(), out.data(), sums.data(), top.data());
+            pass, out.data(), sums.data(), top.data());
     CUDA_CHECK_LAST_ERROR(edistance_center_kernel);
 }
 
@@ -199,7 +209,7 @@ static void def_center(nb::module_& m) {
            ED_CENTER_ARGS) {
             center<In>(
                 EdCenterDense<In>{X.data(), (long long)X.shape(1), rows.data()},
-                sample, shift, pass, out, sums, top, stream);
+                sample, rows_read, pass, out, sums, top, stream);
         },
         "X"_a.noconvert(), "rows"_a.noconvert().none(), ED_CENTER_NAMES);
     auto csr = [&](auto ptag, auto itag) {
@@ -211,7 +221,7 @@ static void def_center(nb::module_& m) {
                arr<const In, Device> data, ED_CENTER_ARGS) {
                 center<In>(EdCenterCsr<In, P, I>{data.data(), indices.data(),
                                                  indptr.data()},
-                           sample, shift, pass, out, sums, top, stream);
+                           sample, rows_read, pass, out, sums, top, stream);
             },
             "indptr"_a.noconvert(), "indices"_a.noconvert(),
             "data"_a.noconvert(), ED_CENTER_NAMES);
@@ -223,19 +233,18 @@ static void def_center(nb::module_& m) {
     m.def(
         "trim",
         [](arr<const int, Device> first, In trim, arr<In, Device> out,
-           arr<int, Device> kept, arr<In, Device> top, std::uintptr_t stream) {
-            nb_require(
-                first.size() == kept.size() + 1 && top.size() == kept.size(),
-                "trim: first / top do not match kept");
-            if (kept.size() == 0) return;
+           arr<In, Device> top, std::uintptr_t stream) {
+            nb_require(first.size() == top.size() + 1,
+                       "trim: first and top do not match");
+            if (top.size() == 0) return;
             edistance_trim_kernel<In>
-                <<<(unsigned)kept.size(), ED_THREADS, 0,
+                <<<(unsigned)top.size(), ED_THREADS, 0,
                    reinterpret_cast<cudaStream_t>(stream)>>>(
-                    first.data(), trim, out.data(), kept.data(), top.data());
+                    first.data(), trim, out.data(), top.data());
             CUDA_CHECK_LAST_ERROR(edistance_trim_kernel);
         },
         "first"_a.noconvert(), "trim"_a, "out"_a.noconvert(),
-        "kept"_a.noconvert(), "top"_a.noconvert(), "stream"_a = 0);
+        "top"_a.noconvert(), "stream"_a = 0);
 }
 
 template <typename Device>

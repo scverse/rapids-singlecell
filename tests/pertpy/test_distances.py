@@ -868,11 +868,13 @@ def test_contrast_distances_centers_each_split(precision: str, atol: float, monk
     assert len(empty) == 0 and empty["edistance"].dtype == np.float32
     if precision == "float16":  # a cell beyond the float16 range of its combination: the error names the combination
         X[-1] += 1e5
+        X[-1, 1] = np.nan  # its NaN norm must still report overflow in the same row
         for values in (_edistance._CENTER_VALUES, 2 * X.shape[1]):  # z in the only source, and in the second one
             monkeypatch.setattr(_edistance, "_CENTER_VALUES", values)
-            with pytest.raises(ValueError, match="float16 range") as error:
-                distance.contrast_distances(AnnData(X, obs=obs), contrasts)
-            assert "'celltype': 'z'" in error.value.__notes__[0]
+            for container in (np.asarray, csr_matrix):
+                with pytest.raises(ValueError, match="float16 range") as error:
+                    distance.contrast_distances(AnnData(container(X), obs=obs), contrasts)
+                assert "'celltype': 'z'" in error.value.__notes__[0]
 
 
 def test_contrast_distances_sparse_takes_fewer_sources(monkeypatch) -> None:

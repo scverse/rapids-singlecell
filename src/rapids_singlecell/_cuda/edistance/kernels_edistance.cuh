@@ -584,9 +584,32 @@ __global__ void __launch_bounds__(ED_THREADS, 1)
         typename M::Frag f;
         edistance_tile<M>(f, l, smem, ED_PITCH, smem + TA * ED_PITCH, s_rows,
                           kp, false, m, m);
+        bool has_nan = false;
         M::each(f, [&](int i, int j, int, typename M::Acc v) {
-            if (i == j && i < m) norms[s_rows[i]] = v;
+            if (i == j && i < m) {
+                norms[s_rows[i]] = v;
+                if constexpr (std::is_same_v<M, EdMma16>) has_nan |= isnan(v);
+            }
         });
+        if constexpr (std::is_same_v<M, EdMma16>) {
+            // A NaN norm can hide an overflowing feature in the same row.
+            if (__syncthreads_or(has_nan)) {
+                constexpr int KW = ED_WB / sizeof(__half);
+                bool overflow = false;
+                for (int w = 0; w * KW < kp; ++w) {
+                    l.load(smem, ED_PITCH, s_rows, 0, m, w);
+                    __syncthreads();
+                    if (threadIdx.x < m) {
+                        const auto* row = reinterpret_cast<const __half*>(
+                            smem + threadIdx.x * ED_PITCH);
+                        for (int c = 0; c < KW; ++c)
+                            overflow |= __hisinf(row[c]) != 0;
+                    }
+                    __syncthreads();
+                }
+                if (overflow) norms[s_rows[threadIdx.x]] = INFINITY;
+            }
+        }
     }
 }
 
@@ -597,10 +620,9 @@ __global__ void __launch_bounds__(ED_THREADS, 1)
 //   pass 0: out[i] = the row's largest |x|, compared as bit patterns (a NaN
 //           of either sign ranks last)
 //   trim:   out[i] = whether the row is kept (edistance_trim_kernel)
-//   pass 1: over the kept rows (finite values) of split s: sums[s][c] +=
-//           rint(ldexp(x, shift[s])), integers, exact in float64 in any order
-//   pass 2: top[s] = the largest |x - mu| of the kept rows, with sums[s][c]
-//           (by then the mean) as mu in the type of x
+//   pass 1: per-feature mean of the kept rows (edistance_mean_kernel)
+//   pass 2: largest centered magnitude on the kept sample (float16)
+//   pass 3: largest centered magnitude on all read rows (float32/64)
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ unsigned int edistance_bits(float x) {
@@ -648,52 +670,94 @@ struct EdCenterCsr {
     }
 };
 
+// Interpolate without overflowing opposite-sign finite endpoints. Equal values
+// stay exact, including when a constant column is far from zero.
+__device__ inline double edistance_lerp(double a, double b, double t) {
+    return signbit(a) == signbit(b) ? fma(t, b - a, a) : (1 - t) * a + t * b;
+}
+
+// One warp computes eight column means in a fixed reduction order for both
+// layouts. Each thread averages its own retained rows, then merges by count.
+template <typename In, class R>
+__global__ void edistance_mean_kernel(R rd, const int* sample, int n, int d,
+                                      const In* kept, double* means) {
+    constexpr int CW = 8;
+    const int warp =
+        blockIdx.x * (ED_THREADS / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int windows = (d - 1) / CW + 1, s = warp / windows;
+    if (s >= n) return;
+    const int c0 = (warp % windows) * CW, nw = min(CW, d - c0);
+    const int* slots = sample + n + 1;
+    const int lane = threadIdx.x % WARP_SIZE;
+    int count = 0;
+    double mean[CW] = {};
+    for (int i = sample[s] + lane; i < sample[s + 1]; i += WARP_SIZE) {
+        if (!kept[i]) continue;
+        In win[CW];
+        rd.fill(win, slots[s] + (long long)(i - sample[s]) * slots[n + 1 + s],
+                c0, nw);
+        const double weight = 1.0 / ++count;
+        for (int c = 0; c < nw; ++c)
+            mean[c] = count == 1 ? double(win[c])
+                                 : edistance_lerp(mean[c], win[c], weight);
+    }
+    for (int step = WARP_SIZE / 2; step; step >>= 1) {
+        const int other = __shfl_down_sync(0xffffffff, count, step);
+        const double weight = other ? double(other) / (count + other) : 0;
+        for (int c = 0; c < nw; ++c) {
+            const double v = __shfl_down_sync(0xffffffff, mean[c], step);
+            if (other) mean[c] = count ? edistance_lerp(mean[c], v, weight) : v;
+        }
+        count += other;
+    }
+    if (!lane)
+        for (int c = 0; c < nw; ++c) means[(size_t)s * d + c0 + c] = mean[c];
+}
+
 // sample holds first, slots and step of the n splits, n + 1 values each:
 // sampled row i is cell slots[s] + (i - first[s]) * step[s] of split s, the
 // last one with first[s] <= i.
 template <typename In, class R>
-__global__ void edistance_center_kernel(
-    const R rd, const int* __restrict__ sample, int n, int m, int d, int cw,
-    int pass, const int* __restrict__ shift, In* __restrict__ out,
-    double* __restrict__ sums, In* __restrict__ top) {
+__global__ void edistance_center_kernel(const R rd,
+                                        const int* __restrict__ sample, int n,
+                                        int m, int d, int cw, int pass,
+                                        In* __restrict__ out,
+                                        double* __restrict__ sums,
+                                        In* __restrict__ top) {
     const long long u = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const int i = u % m;
     const long long c0 = u / m * cw;
-    if (c0 >= d || (pass && !out[i])) return;
+    if (c0 >= d || (pass == 2 && !out[i])) return;
     const int nw = min((long long)cw, d - c0);
     const int* slots = sample + n + 1;
-    const int s = edistance_last(sample, 0, n - 1, i);
+    const int s = edistance_last(pass == 3 ? slots : sample, 0, n - 1, i);
     In win[R::CW];
-    rd.fill(win, slots[s] + (long long)(i - sample[s]) * slots[n + 1 + s],
+    rd.fill(win,
+            pass == 3
+                ? i
+                : slots[s] + (long long)(i - sample[s]) * slots[n + 1 + s],
             (int)c0, nw);
     sums += (long long)s * d + c0;
     auto big = edistance_bits(In(0));
-    // the threads of a warp (rows i, i + 1, ...) start at different columns, so
-    // they do not add to one sum at a time
-    for (int k = 0, c = i % nw; k < nw; ++k, c = c + 1 < nw ? c + 1 : 0) {
-        if (pass == 1) {
-            const In q = rint(ldexp(win[c], shift[s]));
-            if (q != 0) atomicAdd(sums + c, (double)q);
-        } else {
-            const In x = pass ? win[c] - In(sums[c]) : win[c];
-            big = max(big, edistance_bits(fabs(x)));
-        }
+    for (int c = 0; c < nw; ++c) {
+        if (pass == 3 && !isfinite(win[c])) continue;
+        const In x = pass ? win[c] - In(sums[c]) : win[c];
+        big = max(big, edistance_bits(fabs(x)));
     }
     // a plain read first: only a value above the stored one issues an atomic
     auto* to = reinterpret_cast<decltype(big)*>(pass ? top + s : out + i);
-    if (pass != 1 && big > *to) atomicMax(to, big);
+    if (big > *to) atomicMax(to, big);
 }
 
 // The outlier rows of the sample: block s keeps the rows of split s, out[i]
 // for i from first[s] up to first[s + 1] (their largest |x| from pass 0), that
 // are finite and at most trim times the median of those in (0, inf) -
 // NumPy's, the mean of the two middle ones of an even number. out[i] becomes
-// 1 for a kept row and 0 for another, kept[s] the number of kept rows and
+// 1 for a kept row and 0 for another, and
 // top[s] their largest |x|.
 template <typename In>
 __global__ void edistance_trim_kernel(const int* __restrict__ first, In trim,
                                       In* __restrict__ out,
-                                      int* __restrict__ kept,
                                       In* __restrict__ top) {
     using K = decltype(edistance_bits(In(0)));
     const int s = blockIdx.x, m = first[s + 1] - first[s];
@@ -726,17 +790,13 @@ __global__ void edistance_trim_kernel(const int* __restrict__ first, In trim,
         med = nth((n - 1) / 2);
         if (n % 2 == 0) med = (med + nth(n / 2)) / 2;
     }
-    int c = 0;
     K big = 0;
     for (int i = threadIdx.x; i < m; i += blockDim.x) {
         const K k = key[i];
         const bool keep =
             k < inf && *reinterpret_cast<const In*>(&k) / trim <= med;
-        if (keep) ++c, big = max(big, k);
+        if (keep) big = max(big, k);
         out[first[s] + i] = keep;
     }
-    if (c) {
-        atomicAdd(kept + s, c);
-        atomicMax(reinterpret_cast<K*>(top) + s, big);
-    }
+    if (big) atomicMax(reinterpret_cast<K*>(top) + s, big);
 }
