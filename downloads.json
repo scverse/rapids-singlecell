@@ -4,19 +4,19 @@
   "packages": {
     "rapids-singlecell": {
       "total": 311734,
-      "last_30_days": 8344
+      "last_30_days": 8058
     },
     "rapids-singlecell-cu12": {
       "total": 19226,
-      "last_30_days": 2203
+      "last_30_days": 2165
     },
     "rapids-singlecell-cu13": {
       "total": 16876,
-      "last_30_days": 1824
+      "last_30_days": 1792
     }
   },
   "combined": {
     "total": 347836,
-    "last_30_days": 12371
+    "last_30_days": 12015
   }
 }
