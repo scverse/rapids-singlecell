@@ -240,7 +240,7 @@ def _run_dask_wilcoxon(rg, **options):
         target_bytes = min(limit, parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=limit)))
     row_csr = cpsp.isspmatrix_csr(X._meta) and X.numblocks[0] > 1 and X.numblocks[1] == 1
     fits_records = X.dtype == np.float32 and X.shape[0] < 2**31 and len(rg.group_sizes) < 2**16
-    if workers and row_csr and fits_records and options["multi_gpu"] in (None, False):
+    if workers and row_csr and X.shape[1] > 0 and fits_records and options["multi_gpu"] in (None, False):
         from ._wilcoxon_dask import rank_csr_windows
 
         with suppress(MemoryError):
@@ -259,12 +259,13 @@ def _run_dask_wilcoxon(rg, **options):
     # Even a large Dask byte target should leave the next genes on disk.
     window_width = max(1, min(width * n_workers, (X.shape[1] + 1) // 2))
     width = (window_width + n_workers - 1) // n_workers
-    for start in range(0, X.shape[1], window_width):
+    for start in range(0, max(1, X.shape[1]), window_width):
         window = X[:, start : start + window_width]
         batches = _rank_dask_window(
             window, width, template, options, client=client, workers=workers, compute_kw=compute_kw
         )
-        for offset, batch in zip(range(start, start + window.shape[1], width), batches, strict=True):
+        for i, batch in enumerate(batches):
+            offset = start + i * width
             for name, values in batch.items():
                 if name not in stats:
                     stats[name] = np.empty((values.shape[0], X.shape[1]), dtype=values.dtype)

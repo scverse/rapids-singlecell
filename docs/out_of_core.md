@@ -159,7 +159,7 @@ For row-chunked float32 GPU CSR, workers keep lossless expression and group reco
 only for the active genes. Distributed GPU batches use up to a quarter of device
 memory per worker. Set Dask’s `rapids-singlecell.wilcoxon.batch-size` to a smaller
 byte limit as needed. Input chunks, sorting and group results need additional memory.
-Host arrays and local schedulers use Dask’s `array.chunk-size`.
+Host arrays and local schedulers use Dask’s `array.chunk-size`. A worker must be able to rank at least one gene.
 Each window covers at most half the genes, rounded up. Lazy row-wise normalization
 and log1p run again from the source for each window. The client holds the
 group-by-gene results, including expression fractions when `pts=True`.
