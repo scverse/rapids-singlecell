@@ -153,12 +153,14 @@ For Dask inputs, {func}`~.pp.normalize_total` does not support
 `covariance_eigh` solver by default; `chunked=True`, `lanczos`, and `randomized` are not
 supported.
 
-Exact `wilcoxon` accepts Dask arrays backed by row-chunked CSR Zarr. Distributed
-workers can stream float32 CSR chunks once with `pts=False`. They pool each
-gene’s original values across all cells and include implicit zeros in tied ranks.
-For other inputs, Dask’s `array.chunk-size` controls the full-height gene batches.
+Exact `wilcoxon` supports dense and sparse Dask arrays, including row-chunked
+CSR Zarr. Each worker ranks a batch of genes across all cells, including tied
+values and implicit zeros. Dask’s `array.chunk-size` controls the batch width. A window covers at most
+half the genes, rounded up.
+With lazy {func}`~.pp.normalize_total` and {func}`~.pp.log1p`, full-width row
+chunks are read and transformed again for each window of gene batches.
 One gene and its sorting workspace must fit on a worker. The client holds the
-group-by-gene results for ranking and multiple-testing correction.
+group-by-gene results, including expression fractions when `pts=True`.
 
 ## Troubleshooting
 

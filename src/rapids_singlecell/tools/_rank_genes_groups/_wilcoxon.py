@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import warnings
 from copy import copy
-from functools import partial
-from itertools import batched
+from itertools import batched, chain
+from operator import methodcaller
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -165,9 +165,16 @@ def wilcoxon(
     )
 
 
-def _rank_dask_batch(X, template, sparse_format, options):
+def _rank_dask_batch(rows, template, sparse_format, options):
     rg = copy(template)
-    with _data_device(X):
+    with _data_device(rows[0]):
+        if len(rows) == 1:
+            X = rows[0]
+        elif sparse_format:
+            sparse = cpsp if cpsp.issparse(rows[0]) else sp
+            X = sparse.vstack(rows, format=sparse_format)
+        else:
+            X = cp.get_array_module(rows[0]).concatenate(rows, axis=0)
         if sparse_format:
             X = X.asformat(sparse_format)  # stacked CuPy CSC chunks can become COO
             _validate_wilcoxon_sparse_dtype(X)
@@ -181,60 +188,30 @@ def _rank_dask_batch(X, template, sparse_format, options):
         return stats | {k: v for k in ("means", "means_rest", "pts", "pts_rest") if (v := getattr(rg, k)) is not None}
 
 
-def _available_device_bytes():
-    free, total = cp.cuda.runtime.memGetInfo()
-    allocator = cp.cuda.get_allocator()
-    pool = getattr(allocator, "__self__", None)
-    if isinstance(pool, cp.cuda.MemoryPool):
-        available = free + pool.free_bytes()
-        limit = pool.get_limit()
-        return min(available, limit - pool.used_bytes()) if limit else available
+def _rank_dask_window(window, width, template, fmt, options, *, client, workers, compute_kw):
+    import dask
 
-    try:
-        from rmm import mr
-        from rmm.allocators.cupy import rmm_cupy_allocator
-    except ImportError:
-        return free
-    if allocator is not rmm_cupy_allocator:
-        return free
+    # Detach projections: a narrow dense slice can keep its full-width parent alive.
+    parts = window.rechunk({1: width}, method="tasks").map_blocks(methodcaller("copy"), meta=window._meta)
+    panels = [[] for _ in range(parts.numblocks[1])]
+    for row_wave in batched(parts.to_delayed(), max(1, len(workers)), strict=False):
+        pending = list(chain.from_iterable(row_wave))
+        if workers:
+            from distributed import wait
 
-    resource = mr.get_current_device_resource()
-    live = 0
-    limit = total
-    while isinstance(resource, mr.UpstreamResourceAdaptor):
-        if isinstance(resource, mr.PoolMemoryResource):
-            # A bare RMM pool exposes only its reserved size. Use that ceiling
-            # for planning; the allocator can still reject a busy or fragmented pool.
-            if isinstance(resource.get_upstream(), mr.CudaMemoryResource):
-                free += max(0, resource.pool_size() - live)
-            break
-        if isinstance(resource, (mr.TrackingResourceAdaptor, mr.LimitingResourceAdaptor)):
-            used = resource.get_allocated_bytes()
-            live = max(live, used)
-            if isinstance(resource, mr.LimitingResourceAdaptor):
-                limit = min(limit, resource.get_allocation_limit() - used)
-        elif isinstance(resource, mr.StatisticsResourceAdaptor):
-            live = max(live, resource.allocation_counts.current_bytes)
+            projected = client.compute(pending)
+            wait(projected)  # Release this wave's full-width input before reading more rows.
         else:
-            break
-        resource = resource.get_upstream()
-    return min(free, limit)
-
-
-def _row_readers(X):
-    from dask.blockwise import Blockwise
-
-    if X.numblocks[0] < 2 or X.numblocks[1] != 1 or not cpsp.isspmatrix_csr(X._meta) or X.dtype != np.float32:
-        return None
-    # Leave persisted data, shuffles and annotated tasks to the scheduler.
-    layers = getattr(X.dask, "layers", {})
-    if not layers or any(not isinstance(layer, Blockwise) or layer.annotations for layer in layers.values()):
-        return None
-    blocks = X.to_delayed()[:, 0]
-    tasks = [blocks[0].dask[b.key] for b in blocks]
-    if all(callable(task) and getattr(task, "dependencies", None) == frozenset() for task in tasks):
-        return [partial(task) for task in tasks]
-    return None
+            projected = dask.compute(*pending, **compute_kw)
+        for i, panel in enumerate(panels):
+            panel.extend(projected[i :: len(panels)])
+    if workers:
+        ranks = [
+            client.submit(_rank_dask_batch, panel, template, fmt, options, workers=[worker], pure=False)
+            for panel, worker in zip(panels, workers, strict=False)
+        ]
+        return client.gather(ranks)
+    return [_rank_dask_batch(panels[0], template, fmt, options)]
 
 
 def _run_dask_wilcoxon(rg, **options):
@@ -255,14 +232,6 @@ def _run_dask_wilcoxon(rg, **options):
     fmt = getattr(X._meta, "format", None)
     entry_bytes = X.itemsize + (X._meta.indices.itemsize if fmt else 0)
     width = max(1, parse_bytes(dask.config.get("array.chunk-size")) // (max(1, X.shape[0]) * entry_bytes))
-    if workers and width < X.shape[1] and (readers := _row_readers(X)) is not None:
-        from ._wilcoxon_dask import try_streamed
-
-        if (result := try_streamed(rg, client, workers, options, readers)) is not None:
-            return groups, *result
-
-    # Split columns before stacking rows. Panels in one compute share their source reads.
-    panels = X.rechunk({1: width}, method="tasks").rechunk({0: -1}, method="tasks").to_delayed()[0]
     template = copy(rg)
     del template.X, template.labels, template._aggregation_groupby, template.var_names
     if workers:
@@ -272,9 +241,16 @@ def _run_dask_wilcoxon(rg, **options):
     compute_kw = {"num_workers": 1} if scheduler is threaded.get else {}
     stats = {}
     offset = 0
-    for wave in batched(panels, max(1, len(workers)), strict=False):
-        tasks = [dask.delayed(_rank_dask_batch)(panel, template, fmt, options) for panel in wave]
-        for batch in dask.compute(*tasks, **compute_kw):
+    n_workers = max(1, len(workers))
+    # Even a large Dask byte target should leave the next genes on disk.
+    window_width = max(1, min(width * n_workers, (X.shape[1] + 1) // 2))
+    width = (window_width + n_workers - 1) // n_workers
+    for start in range(0, X.shape[1], window_width):
+        window = X[:, start : start + window_width]
+        batches = _rank_dask_window(
+            window, width, template, fmt, options, client=client, workers=workers, compute_kw=compute_kw
+        )
+        for batch in batches:
             stop = offset + batch["scores"].shape[1]
             for name, values in batch.items():
                 if name not in stats:

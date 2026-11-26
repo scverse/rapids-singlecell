@@ -113,9 +113,9 @@ def rank_genes_groups(
     bin correctly.)
 
     .. note::
-        All methods support Dask arrays. Exact `'wilcoxon'` can stream row-chunked
-        float32 GPU CSR in one pass or rank full-height gene batches sized by
-        Dask's ``array.chunk-size``.
+        All methods support Dask arrays. Exact `'wilcoxon'` ranks dense and sparse
+        inputs in full-height gene batches sized by Dask's ``array.chunk-size``.
+        A distributed client processes one batch per worker at a time.
 
     .. note::
         **Exact Wilcoxon ranking precision:** `'wilcoxon'`
