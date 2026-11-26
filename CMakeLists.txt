@@ -115,6 +115,7 @@ if (RSC_BUILD_EXTENSIONS)
   add_nb_cuda_module(_sepal_cuda        src/rapids_singlecell/_cuda/sepal/sepal.cu)
   add_rmm_cuda_module(_spatial_cuda     src/rapids_singlecell/_cuda/spatial/spatial.cu)
   add_rmm_cuda_module(_wilcoxon_cuda        src/rapids_singlecell/_cuda/wilcoxon/wilcoxon.cu)
+  target_sources(_wilcoxon_cuda PRIVATE src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_panel.cu)
   add_nb_cuda_module(_rank_stats_cuda   src/rapids_singlecell/_cuda/rank_genes/rank_stats.cu)
   add_rmm_cuda_module(_rank_stream_cuda src/rapids_singlecell/_cuda/rank_genes/rank_stream.cu)
   # Harmony CUDA modules

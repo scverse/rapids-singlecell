@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from typing import TYPE_CHECKING, Literal, assert_never
 
 import cupy as cp
@@ -398,7 +399,11 @@ class _RankGenes:
         return indices
 
     @staticmethod
-    def _fdr_bh_matrix(pvals: np.ndarray) -> np.ndarray:
+    def _fdr_bh_matrix(pvals: np.ndarray, *, gpu: bool = False) -> np.ndarray:
+        if gpu:
+            with suppress(MemoryError, cp.cuda.runtime.CUDARuntimeError):
+                if cp.cuda.runtime.memGetInfo()[0] >= 8 * pvals.nbytes:
+                    return _RankGenes._fdr_bh_matrix_gpu(cp.asarray(pvals)).get()
         pvals_clean = np.array(pvals, copy=True)
         pvals_clean[np.isnan(pvals_clean)] = 1.0
         order = np.argsort(pvals_clean, axis=1)
@@ -470,7 +475,7 @@ class _RankGenes:
         if pvals is not None:
             arrays["pvals"] = np.take_along_axis(pvals, top_idx, axis=1)
             if corr_method == "benjamini-hochberg":
-                pvals_adj = self._fdr_bh_matrix(pvals)
+                pvals_adj = self._fdr_bh_matrix(pvals, gpu=wilcoxon_result is not None)
             elif corr_method == "bonferroni":
                 pvals_adj = np.minimum(pvals * n_genes, 1.0)
             else:

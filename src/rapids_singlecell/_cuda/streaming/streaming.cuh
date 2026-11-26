@@ -552,8 +552,8 @@ struct PinnedRing {
 
 /** Fill linear segment offsets [0, stride, ..., n_segments*stride] on-device.
  */
-__global__ void fill_linear_offsets_kernel(int* __restrict__ out,
-                                           int n_segments, int stride) {
+static __global__ void fill_linear_offsets_kernel(int* __restrict__ out,
+                                                  int n_segments, int stride) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i <= n_segments) out[i] = i * stride;
 }

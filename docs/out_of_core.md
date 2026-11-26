@@ -153,13 +153,15 @@ For Dask inputs, {func}`~.pp.normalize_total` does not support
 `covariance_eigh` solver by default; `chunked=True`, `lanczos`, and `randomized` are not
 supported.
 
-Exact `wilcoxon` supports dense and sparse Dask arrays, including row-chunked
-CSR Zarr. Each worker ranks a batch of genes across all cells, including tied
-values and implicit zeros. Dask’s `array.chunk-size` controls the batch width. A window covers at most
-half the genes, rounded up.
-With lazy {func}`~.pp.normalize_total` and {func}`~.pp.log1p`, full-width row
-chunks are read and transformed again for each window of gene batches.
-One gene and its sorting workspace must fit on a worker. The client holds the
+Exact `wilcoxon` ranks dense and sparse Dask arrays in gene windows across all cells.
+It assigns tied values their average rank and includes implicit sparse zeros.
+For row-chunked float32 GPU CSR, workers keep lossless expression and group records
+only for the active genes. Distributed GPU batches use up to a quarter of device
+memory per worker. Set Dask’s `rapids-singlecell.wilcoxon.batch-size` to a smaller
+byte limit as needed. Input chunks, sorting and group results need additional memory.
+Host arrays and local schedulers use Dask’s `array.chunk-size`.
+Each window covers at most half the genes, rounded up. Lazy row-wise normalization
+and log1p run again from the source for each window. The client holds the
 group-by-gene results, including expression fractions when `pts=True`.
 
 ## Troubleshooting

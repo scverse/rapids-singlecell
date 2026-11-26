@@ -15,10 +15,21 @@ from rapids_singlecell.tools._rank_genes_groups import _wilcoxon
 
 
 @pytest.mark.parametrize("reference", ["rest", "b"])
-@pytest.mark.parametrize("kind", ["dense", "csr"])
-@pytest.mark.parametrize("lognorm", [False, True], ids=["host", "gpu-lognorm"])
-def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, lognorm, reference):
-    request.getfixturevalue("dist_client" if lognorm else "client")
+@pytest.mark.parametrize(
+    "kind,mode",
+    [
+        ("dense", "host"),
+        ("csr", "host"),
+        ("dense", "gpu-lognorm"),
+        ("csr", "gpu-lognorm"),
+        ("csr", "gpu"),
+        ("csr", "gpu-infinite"),
+        ("csr", "gpu-float64"),
+    ],
+)
+def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, reference):
+    lognorm = mode == "gpu-lognorm"
+    request.getfixturevalue("client" if mode == "host" else "dist_client")
     rng = np.random.default_rng(42)
     X = rng.choice(np.array([0, 0, 1, 2, 32, 67], dtype=np.float32), size=(117, 13))
     labels = pd.Categorical(["a", "b", "c"] * 38 + [None] * 3)
@@ -28,13 +39,17 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, lognorm, re
     X[0, :] = 0
     if not lognorm:
         X[1, 0], X[2, 2] = -0.0, -0.125
+    if mode == "gpu-infinite":
+        X[4, 3] = np.inf
+    if mode == "gpu-float64":
+        X = X.astype(np.float64)
     data = csr_matrix(X) if kind == "csr" else X
     if kind == "csr" and not lognorm:
         # Preserve unsorted duplicate entries and an explicit signed zero in the physical CSR store.
         data = csr_matrix(
             (
-                np.r_[[-0.0, 1, -1], data.data].astype(X.dtype),
-                np.r_[[0, 2, 2], data.indices],
+                np.r_[[1, -0.0, -1], data.data].astype(X.dtype),
+                np.r_[[2, 0, 2], data.indices],
                 np.r_[0, data.indptr[1:] + 3],
             ),
             shape=X.shape,
@@ -45,8 +60,9 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, lognorm, re
     eager = AnnData(csr_matrix(X) if kind == "csr" else X.copy())
     for adata in (eager, lazy):
         adata.obs["group"] = labels
-        if lognorm:
+        if mode != "host":
             adata.X = rsc.get.X_to_GPU(adata.X)
+        if lognorm:
             rsc.pp.normalize_total(adata, target_sum=10_000)
             rsc.pp.log1p(adata)
     kwargs = {
@@ -57,13 +73,13 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, lognorm, re
         "tie_correct": True,
         "pts": True,
         "use_continuity": True,
-        "return_u_values": reference == "b",
+        "return_u_values": True,
         "mean_in_log_space": reference == "rest",
         "out": True,
     }
     expected = rsc.tl.rank_genes_groups(eager, "group", multi_gpu=False, **kwargs)
     width = 3 if reference == "rest" else 100
-    if not lognorm:
+    if mode == "host":
         rank = _wilcoxon._rank_dask_batch
 
         def check_rank(rows, *args):
@@ -75,7 +91,8 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, lognorm, re
 
         monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", check_rank)
     entry_bytes = X.itemsize * (2 if kind == "csr" else 1)
-    with dask.config.set({"array.chunk-size": width * len(X) * entry_bytes}):
+    budget = width * len(X) * entry_bytes
+    with dask.config.set({"array.chunk-size": budget, "rapids-singlecell.wilcoxon.batch-size": budget}):
         actual = rsc.tl.rank_genes_groups(lazy, "group", **kwargs)
     np.testing.assert_array_equal(actual["names"], expected["names"])
     for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
@@ -90,11 +107,13 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, lognorm, re
         np.testing.assert_array_equal(actual["pts"][group], np.count_nonzero(X[mask], axis=0) / mask.sum())
         if reference == "rest":
             np.testing.assert_array_equal(actual["pts_rest"][group], np.count_nonzero(X[~mask], axis=0) / (~mask).sum())
-    if reference == "b":
-        column = eager.X[:, 1:2]
-        if hasattr(column, "get"):
-            column = column.get()
-        if hasattr(column, "toarray"):
-            column = column.toarray()
-        pos = np.flatnonzero(actual["names"]["a"] == eager.var_names[1]).item()
-        assert actual["scores"]["a"][pos] == mannwhitneyu(column[labels == "a"], column[labels == "b"]).statistic.item()
+    column = eager.X[:, 1:2]
+    if hasattr(column, "get"):
+        column = column.get()
+    if hasattr(column, "toarray"):
+        column = column.toarray()
+    group = labels == "a"
+    control = ~group if reference == "rest" else labels == reference
+    pos = np.flatnonzero(actual["names"]["a"] == eager.var_names[1]).item()
+    u = mannwhitneyu(column[group].astype(np.float64), column[control].astype(np.float64)).statistic.item()
+    assert actual["scores"]["a"][pos] == u

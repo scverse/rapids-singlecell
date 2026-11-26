@@ -114,7 +114,8 @@ def rank_genes_groups(
 
     .. note::
         All methods support Dask arrays. Exact `'wilcoxon'` ranks dense and sparse
-        inputs in full-height gene batches sized by Dask's ``array.chunk-size``.
+        inputs in bounded gene windows. Distributed GPU batches default to a quarter
+        of each worker's device memory.
         A distributed client processes one batch per worker at a time.
 
     .. note::

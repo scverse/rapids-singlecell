@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from contextlib import suppress
 from copy import copy
 from itertools import batched, chain
 from operator import methodcaller
@@ -165,18 +166,17 @@ def wilcoxon(
     )
 
 
-def _rank_dask_batch(rows, template, sparse_format, options):
+def _rank_dask_batch(rows, template, fmt, options):
+    from dask.array.dispatch import concatenate_lookup
+
     rg = copy(template)
     with _data_device(rows[0]):
-        if len(rows) == 1:
-            X = rows[0]
-        elif sparse_format:
-            sparse = cpsp if cpsp.issparse(rows[0]) else sp
-            X = sparse.vstack(rows, format=sparse_format)
-        else:
-            X = cp.get_array_module(rows[0]).concatenate(rows, axis=0)
-        if sparse_format:
-            X = X.asformat(sparse_format)  # stacked CuPy CSC chunks can become COO
+        first = rows[0]
+        # Dask registers CuPy's spmatrix but not its newer sparse array classes.
+        join = concatenate_lookup.dispatch(cpsp.spmatrix if cpsp.issparse(first) else type(first))
+        X = first if len(rows) == 1 else join(rows, axis=0)
+        if fmt:
+            X = X.asformat(fmt)  # stacked CuPy CSC chunks can become COO
             _validate_wilcoxon_sparse_dtype(X)
             if not X.has_canonical_format:
                 X = _canonicalize_sparse(X.copy())
@@ -188,13 +188,15 @@ def _rank_dask_batch(rows, template, sparse_format, options):
         return stats | {k: v for k in ("means", "means_rest", "pts", "pts_rest") if (v := getattr(rg, k)) is not None}
 
 
-def _rank_dask_window(window, width, template, fmt, options, *, client, workers, compute_kw):
+def _rank_dask_window(window, width, template, options, *, client, workers, compute_kw):
     import dask
 
     # Detach projections: a narrow dense slice can keep its full-width parent alive.
     parts = window.rechunk({1: width}, method="tasks").map_blocks(methodcaller("copy"), meta=window._meta)
+    fmt = getattr(window._meta, "format", None)
     panels = [[] for _ in range(parts.numblocks[1])]
-    for row_wave in batched(parts.to_delayed(), max(1, len(workers)), strict=False):
+    row_limit = max(1, min(len(workers), (parts.numblocks[0] + 1) // 2))
+    for row_wave in batched(parts.to_delayed(), row_limit, strict=False):
         pending = list(chain.from_iterable(row_wave))
         if workers:
             from distributed import wait
@@ -231,7 +233,20 @@ def _run_dask_wilcoxon(rg, **options):
     workers = client.nthreads() if hasattr(client, "nthreads") else {}
     fmt = getattr(X._meta, "format", None)
     entry_bytes = X.itemsize + (X._meta.indices.itemsize if fmt else 0)
-    width = max(1, parse_bytes(dask.config.get("array.chunk-size")) // (max(1, X.shape[0]) * entry_bytes))
+    target_bytes = parse_bytes(dask.config.get("array.chunk-size"))
+    if workers and (isinstance(X._meta, cp.ndarray) or cpsp.issparse(X._meta)):
+        devices = client.run(cp.cuda.runtime.memGetInfo, workers=list(workers))
+        limit = min(total for _, total in devices.values()) // 4
+        target_bytes = min(limit, parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=limit)))
+    row_csr = cpsp.isspmatrix_csr(X._meta) and X.numblocks[0] > 1 and X.numblocks[1] == 1
+    fits_records = X.dtype == np.float32 and X.shape[0] < 2**31 and len(rg.group_sizes) < 2**16
+    if workers and row_csr and fits_records and options["multi_gpu"] in (None, False):
+        from ._wilcoxon_dask import rank_csr_windows
+
+        with suppress(MemoryError):
+            if (result := rank_csr_windows(rg, options, client, workers, target_bytes)) is not None:
+                return groups, *result
+    width = max(1, target_bytes // (max(1, X.shape[0]) * entry_bytes))
     template = copy(rg)
     del template.X, template.labels, template._aggregation_groupby, template.var_names
     if workers:
@@ -240,7 +255,6 @@ def _run_dask_wilcoxon(rg, **options):
         options["multi_gpu"] = False
     compute_kw = {"num_workers": 1} if scheduler is threaded.get else {}
     stats = {}
-    offset = 0
     n_workers = max(1, len(workers))
     # Even a large Dask byte target should leave the next genes on disk.
     window_width = max(1, min(width * n_workers, (X.shape[1] + 1) // 2))
@@ -248,15 +262,13 @@ def _run_dask_wilcoxon(rg, **options):
     for start in range(0, X.shape[1], window_width):
         window = X[:, start : start + window_width]
         batches = _rank_dask_window(
-            window, width, template, fmt, options, client=client, workers=workers, compute_kw=compute_kw
+            window, width, template, options, client=client, workers=workers, compute_kw=compute_kw
         )
-        for batch in batches:
-            stop = offset + batch["scores"].shape[1]
+        for offset, batch in zip(range(start, start + window.shape[1], width), batches, strict=True):
             for name, values in batch.items():
                 if name not in stats:
                     stats[name] = np.empty((values.shape[0], X.shape[1]), dtype=values.dtype)
-                stats[name][:, offset:stop] = values
-            offset = stop
+                stats[name][:, offset : offset + values.shape[1]] = values
     rg.means, rg.means_rest = stats.get("means"), stats.get("means_rest")
     rg.pts, rg.pts_rest = stats.get("pts"), stats.get("pts_rest")
     return groups, stats["scores"], stats["pvals"], stats.get("logfoldchanges")
