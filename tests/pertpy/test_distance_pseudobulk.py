@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 from anndata import AnnData
 from scipy import sparse
+from scipy.stats import kendalltau, spearmanr
 
 from rapids_singlecell.pertpy_gpu import Distance
 
@@ -15,6 +16,8 @@ PSEUDOBULK_METRICS = (
     "mse",
     "mean_absolute_error",
     "pearson_distance",
+    "spearman_distance",
+    "kendalltau_distance",
     "cosine_distance",
     "r2_distance",
 )
@@ -35,6 +38,11 @@ def _pseudobulk_reference(metric: str, mu_X: np.ndarray, mu_Y: np.ndarray) -> fl
         return float(np.mean(np.abs(mu_X - mu_Y)))
     if metric == "pearson_distance":
         return float(1 - np.corrcoef(mu_X, mu_Y)[0, 1])
+    if metric == "spearman_distance":
+        return 1 - spearmanr(mu_X, mu_Y).statistic
+    if metric == "kendalltau_distance":
+        n = len(mu_X)
+        return (1 - kendalltau(mu_X, mu_Y).statistic) * (n * (n - 1) / 4)
     if metric == "cosine_distance":
         nx = float(np.linalg.norm(mu_X))
         ny = float(np.linalg.norm(mu_Y))
@@ -53,6 +61,15 @@ def _group_means(X: np.ndarray, groups: np.ndarray) -> tuple[np.ndarray, list[st
     df["__g"] = groups
     g = df.groupby("__g").mean().sort_index()
     return g.to_numpy(), list(g.index)
+
+
+@pytest.mark.parametrize("metric", ["spearman_distance", "kendalltau_distance"])
+def test_rank_distances_handle_ties_and_constants(metric):
+    x = np.array([[0.0, 3, 3, 2, 0, 1]] * 2)
+    y = np.array([[2.0, 1, 3, 3, 2, 3]] * 3)
+    distance = Distance(metric)
+    assert distance(x, y) == pytest.approx(_pseudobulk_reference(metric, x[0], y[0]))
+    assert np.isnan(distance(x, np.ones_like(y)))
 
 
 @pytest.fixture

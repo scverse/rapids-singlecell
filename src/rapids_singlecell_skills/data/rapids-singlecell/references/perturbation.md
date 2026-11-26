@@ -1,7 +1,7 @@
 # Perturbation analysis
 
-`rsc.ptg` ports pertpy’s `Distance`, `GuideAssignment`, `Mixscape` and `Mixscale`.
-Use pertpy itself for everything else (Augur, Milo, scCODA, E-test, DE wrappers, embedding-space methods).
+`rsc.ptg` ports pertpy’s `Distance`, `DistanceTest`, `GuideAssignment`, `Mixscape` and `Mixscale`.
+Use pertpy itself for everything else (Augur, Milo, scCODA, DE wrappers, embedding-space methods).
 
 ## Guides and perturbation signatures
 
@@ -16,7 +16,7 @@ Use pertpy itself for everything else (Augur, Milo, scCODA, E-test, DE wrappers,
 ## Effects and distances
 
 - Rank perturbations by a transcriptome-wide distance to controls, not by DEG counts, because most perturbations shift only a few dozen genes.
-- Keep only perturbations that differ from controls (pertpy E-test) before embedding or clustering perturbations.
+- Use `rsc.ptg.DistanceTest("edistance")` to test each perturbation against a control by permuting cell labels.
 - Compare signatures against the average perturbed cell as well as against controls.
   Programs shared by most perturbations (stress, cell cycle) are systematic, not perturbation-specific.
 - For DE, pseudobulk per perturbation and replicate against non-targeting controls, and check calibration with non-targeting-versus-non-targeting tests.

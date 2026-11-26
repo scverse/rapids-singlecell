@@ -746,9 +746,7 @@ class WassersteinMetric(BaseMetric):
         groupby, split_by = self._parse_contrasts(adata, contrasts)
         embedding_raw = self._get_embedding(adata)
 
-        all_cols = [groupby, *split_by]
-        grouped = adata.obs.groupby(all_cols, observed=True)
-        group_indices = grouped.indices
+        group_indices = self._contrast_indices(adata.obs, contrasts, groupby, split_by)
 
         target_vals = contrasts[groupby].values
         ref_vals = contrasts["reference"].values

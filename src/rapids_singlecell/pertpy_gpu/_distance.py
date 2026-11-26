@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 from rapids_singlecell._keys import _embedding_keys
 
@@ -28,22 +28,24 @@ Metric = Literal[
     "mse",
     "mean_absolute_error",
     "pearson_distance",
+    "spearman_distance",
+    "kendalltau_distance",
     "cosine_distance",
     "r2_distance",
+    "mean_pairwise",
+    "mmd",
     "wasserstein",
+    "sym_kldiv",
+    "t_test",
+    "ks_test",
+    "nb_ll",
+    "classifier_proba",
+    "classifier_cp",
+    "mean_var_distribution",
+    "mahalanobis",
 ]
 
-SUPPORTED_METRICS = [
-    "edistance",
-    "euclidean",
-    "root_mean_squared_error",
-    "mse",
-    "mean_absolute_error",
-    "pearson_distance",
-    "cosine_distance",
-    "r2_distance",
-    "wasserstein",
-]
+SUPPORTED_METRICS = list(get_args(Metric))
 
 
 class Distance:
@@ -67,13 +69,39 @@ class Distance:
     - ``"mean_absolute_error"``: Mean absolute distance between group mean
         vectors.
     - ``"pearson_distance"``: Pearson distance between group mean vectors.
+    - ``"spearman_distance"``: One minus the Spearman rank correlation of
+        group mean vectors. Tied features receive average ranks.
+    - ``"kendalltau_distance"``: Kendall's tau-b distance between group mean
+        vectors, scaled by the number of feature pairs as in pertpy.
     - ``"cosine_distance"``: Cosine distance between group mean vectors.
     - ``"r2_distance"``: One minus the coefficient of determination between
         group mean vectors.
+    - ``"mean_pairwise"``: Mean cell-to-cell distance across groups.
+        Set ``cell_wise_metric`` to select the ground distance (default
+        ``"euclidean"``).
+    - ``"mmd"``: Squared maximum mean discrepancy. Set ``kernel`` to
+        ``"linear"`` (default), ``"rbf"`` or ``"poly"``. The nonlinear kernels
+        accept ``gamma`` (default 1) and the polynomial accepts ``degree``
+        (default 2).
     - ``"wasserstein"``: Entropy-regularized 2-Wasserstein via Sinkhorn.
         Squared-Euclidean ground cost; per-pair auto-epsilon defaulting to
         ``0.05 * std(C)`` to match OTT-JAX. Returns OTT's
         ``reg_ot_cost`` value.
+    - ``"sym_kldiv"``: Mean symmetric KL divergence between per-feature
+        Gaussian approximations.
+    - ``"t_test"`` and ``"ks_test"``: Mean absolute Welch t-statistic and
+        mean two-sample Kolmogorov–Smirnov statistic across features.
+    - ``"nb_ll"``: Mean negative log likelihood of counts in the second
+        group under per-feature negative binomial fits to the first.
+    - ``"classifier_proba"``: Mean predicted class probability on a held-out
+        sample from the second group in a binary logistic regression.
+    - ``"classifier_cp"``: One-sided class projection. Trains on
+        ``adata.X`` for all nonreference groups and scores reference cells.
+        Supports ``onesided_distances`` without bootstrapping.
+    - ``"mean_var_distribution"``: Mean squared difference between kernel
+        density estimates of the groups' gene mean–variance profiles.
+    - ``"mahalanobis"``: Distance between group means using the first
+        group's covariance, which must be invertible.
 
     Parameters
     ----------
@@ -108,11 +136,7 @@ class Distance:
     and leverages multi-GPU parallelism for each bootstrap iteration.
 
     ``"edistance"`` and ``"wasserstein"`` use multi-GPU (pairs are split across
-    devices). Pseudobulk metrics aggregate cells into K group-mean vectors
-    before computing distances, and the resulting K×K kernel is cheap enough on
-    a single GPU that distributing it is not worth the cost. Passing
-    ``multi_gpu=True`` for those metrics falls back to a single device with a
-    warning.
+    devices). The other metrics run on the current GPU.
 
     Examples
     --------
@@ -176,11 +200,12 @@ class Distance:
                 **self._metric_kwargs,
             )
         elif self.metric in SUPPORTED_METRICS:
-            from rapids_singlecell.pertpy_gpu._metrics._pseudobulk import (
-                PSEUDOBULK_METRICS,
-            )
+            from ._metrics._distribution import DISTRIBUTION_METRICS
+            from ._metrics._model import MODEL_METRICS
+            from ._metrics._pseudobulk import PSEUDOBULK_METRICS
 
-            self._metric_impl = PSEUDOBULK_METRICS[self.metric](
+            metrics = PSEUDOBULK_METRICS | DISTRIBUTION_METRICS | MODEL_METRICS
+            self._metric_impl = metrics[self.metric](
                 metric_name=self.metric,
                 layer_key=self.layer_key,
                 obsm_key=obsm_key,
@@ -673,6 +698,11 @@ class Distance:
         -------
         pd.DataFrame
             Copy of the input DataFrame with an added distance column.
+
+        See Also
+        --------
+        rapids_singlecell.ptg.DistanceTest.contrast_distances
+            Test the same table with cell-label permutations within each contrast.
 
         Examples
         --------
