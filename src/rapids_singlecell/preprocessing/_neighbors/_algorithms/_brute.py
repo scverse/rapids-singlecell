@@ -20,15 +20,18 @@ def _brute_knn(
     metric_kwds: Mapping,
     algorithm_kwds: Mapping,
 ) -> tuple[cp.ndarray, cp.ndarray]:
+    nn = _fit_brute_knn(X, k, metric=metric, metric_kwds=metric_kwds)
+    distances, neighbors = nn.kneighbors(Y)
+    return neighbors, distances
+
+
+def _fit_brute_knn(X, k, *, metric, metric_kwds):
     from cuml.neighbors import NearestNeighbors
 
-    nn = NearestNeighbors(
+    return NearestNeighbors(
         n_neighbors=k,
         algorithm="brute",
         metric=metric,
         output_type="cupy",
         metric_params=metric_kwds,
-    )
-    nn.fit(X)
-    distances, neighbors = nn.kneighbors(Y)
-    return neighbors, distances
+    ).fit(X)

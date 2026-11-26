@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from itertools import groupby
+from operator import itemgetter
 from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
 import pandas as pd
 
-from rapids_singlecell.get import X_to_GPU, _get_obs_rep
+from rapids_singlecell.get import _get_obs_rep
 
-from ._base import PerturbationEfficacyAnalyzer, _to_dense_gpu
+from ._base import (
+    PerturbationEfficacyAnalyzer,
+    _get_scoring_matrix,
+    _target_jobs,
+    _to_dense_gpu,
+    _with_marker_blocks,
+)
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -47,6 +55,7 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         iter_num: int = 10,
         scale: bool = True,
         split_by: str | None = None,
+        signature_kwargs: dict | None = None,
         pval_cutoff: float = 5e-2,
         perturbation_type: str = "KO",
         random_state: int = 0,
@@ -85,7 +94,8 @@ class Mixscape(PerturbationEfficacyAnalyzer):
             Layer used for differential expression. ``None`` uses ``.X``.
         test_method
             Differential-expression test passed to
-            :func:`rapids_singlecell.tl.rank_genes_groups`.
+            :func:`rapids_singlecell.tl.rank_genes_groups`. Use ``"t-test"``
+            for Dask expression with dense, CSR or CSC chunks.
         iter_num
             Maximum number of refinement iterations.
         scale
@@ -93,6 +103,12 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         split_by
             ``.obs`` column with a condition/cell-type annotation if
             perturbations are condition specific.
+        signature_kwargs
+            Compute signatures directly from unscaled, log-normalized ``.X`` for
+            each target's marker genes. Pass ``{}`` for defaults or supply neighbor
+            and reference options from :meth:`perturbation_signature`. The
+            method uses ``split_by`` for both scoring and reference selection.
+            This skips storing ``X_pert`` and requires ``layer=None``.
         pval_cutoff
             Adjusted p-value cutoff for differentially expressed genes.
         perturbation_type
@@ -113,6 +129,8 @@ class Mixscape(PerturbationEfficacyAnalyzer):
         ``adata.obs[f"{new_class_name}_p_{perturbation_type.lower()}"]``
         (posterior probability) and ``adata.uns["mixscape"]``.
         """
+        if layer is not None and signature_kwargs is not None:
+            raise ValueError("Pass either layer or signature_kwargs.")
         if copy:
             adata = adata.copy()
 
@@ -136,102 +154,23 @@ class Mixscape(PerturbationEfficacyAnalyzer):
             logfc_threshold=logfc_threshold,
             test_method=test_method,
         )
-
-        if layer is not None:
-            X = X_to_GPU(adata.layers[layer])
-        else:
-            try:
-                X = X_to_GPU(adata.layers["X_pert"])
-            except KeyError:
-                raise KeyError(
-                    "No 'X_pert' found in .layers! Please run perturbation_signature "
-                    "first to calculate the perturbation signature!"
-                ) from None
-        X = _to_dense_gpu(X)
+        X = _get_scoring_matrix(
+            adata, pert_key, control, layer=layer, signature_kwargs=signature_kwargs, split_by=split_by
+        )
 
         p_col = f"{new_class_name}_p_{perturbation_type.lower()}"
         gv_list: dict[str, dict] = {}
 
-        var_names = np.asarray(adata.var_names)
-        # name -> column index, so per-gene DE markers map to indices in O(k)
-        # instead of an O(n_vars) ``np.isin`` scan per gene.
-        var_to_idx = {name: i for i, name in enumerate(var_names)}
-        # Integer codes let every per-gene cell mask be built with a fast integer
-        # comparison over the full obs instead of an object-dtype string compare,
-        # and no cells are ever copied/subsetted out of ``adata``.
-        pert_cat = adata.obs[pert_key].astype("category")
-        codes = pert_cat.cat.codes.to_numpy()
-        cat_names = [str(c) for c in pert_cat.cat.categories]
-        control_code = {name: i for i, name in enumerate(cat_names)}.get(control, -1)
         obs_names_arr = adata.obs_names.to_numpy()
-
-        # Results accumulate in flat arrays and are written to ``adata.obs`` once
-        # at the end, instead of per-gene ``.loc`` assignments into object Series.
         class_arr = np.asarray(adata.obs[pert_key].astype(str), dtype=object).copy()
+        # Targets without enough markers or controls retain their NP classification.
+        for mask in split_masks:
+            class_arr[mask & (class_arr != control)] += " NP"
         p_arr = np.zeros(adata.n_obs, dtype=float)
 
-        for split, split_mask in enumerate(split_masks):
-            category = categories[split]
-            nt_mask = (codes == control_code) & split_mask
-            split_gene_codes = sorted(set(codes[split_mask].tolist()) - {control_code})
-
-            # Build one job per gene with enough DE markers and control cells,
-            # then refine all of them together (one GMM kernel launch per outer
-            # iteration) instead of a per-gene Python loop of GMM fits.
-            gene_jobs: list[dict] = []
-            for gene_code in split_gene_codes:
-                gene = cat_names[gene_code]
-                orig_mask = (codes == gene_code) & split_mask
-
-                de_genes = perturbation_markers[category, gene]
-                if len(de_genes) == 0:
-                    class_arr[orig_mask] = f"{gene} NP"
-                    continue
-
-                all_mask = orig_mask | nt_mask
-                nt_in_all_np = nt_mask[all_mask]
-                if not nt_in_all_np.any():
-                    # No control cells in this split: cannot define a
-                    # perturbation direction, so leave every guide cell NP.
-                    class_arr[orig_mask] = f"{gene} NP"
-                    continue
-
-                de_genes_indices = np.fromiter(
-                    (var_to_idx[g] for g in de_genes if g in var_to_idx),
-                    dtype=np.int64,
-                )
-                if de_genes_indices.size == 0:
-                    class_arr[orig_mask] = f"{gene} NP"
-                    continue
-                # Gather the (n_all, k) sub-matrix directly; X[all_mask][:, de]
-                # would first materialize the full (n_all, n_vars) row slice.
-                all_idx = cp.asarray(np.flatnonzero(all_mask))
-                dat = X[all_idx[:, None], cp.asarray(de_genes_indices)[None, :]]
-                if scale:
-                    dat = _scale_gpu(dat)
-                orig_in_all_np = orig_mask[all_mask]
-                nt_in_all = cp.asarray(nt_in_all_np)
-                gene_jobs.append(
-                    {
-                        "gene": gene,
-                        "category": category,
-                        "orig_mask": orig_mask,
-                        "dat": dat,
-                        "nt_in_all": nt_in_all,
-                        "orig_in_all": cp.asarray(orig_in_all_np),
-                        "orig_in_all_np": orig_in_all_np,
-                        "nt_cells_mean": dat[nt_in_all].mean(axis=0),
-                        "n_all": int(orig_in_all_np.shape[0]),
-                        "n_orig": int(orig_in_all_np.sum()),
-                        "all_index": obs_names_arr[all_mask],
-                        "orig_index": obs_names_arr[orig_mask],
-                    }
-                )
-
-            if not gene_jobs:
-                continue
+        def fit_jobs(jobs):
             self._fit_genes_batched(
-                gene_jobs,
+                jobs,
                 iter_num=iter_num,
                 min_cells=min_cells,
                 perturbation_type=perturbation_type,
@@ -239,9 +178,38 @@ class Mixscape(PerturbationEfficacyAnalyzer):
                 control=control,
                 gv_list=gv_list,
             )
-            for job in gene_jobs:
-                class_arr[job["orig_mask"]] = job["labels"]
-                p_arr[job["orig_mask"]] = job["post_prob"]
+            for job in jobs:
+                class_arr[job["guide_rows"]] = job["labels"]
+                p_arr[job["guide_rows"]] = job["post_prob"]
+
+        targets = _target_jobs(adata, pert_key, control, split_masks, categories, markers=perturbation_markers)
+        for split, jobs in groupby(_with_marker_blocks(X, targets), key=itemgetter("split")):
+            gene_jobs = []
+            for job in jobs:
+                rows, is_guide = job["row_ids"], job["is_guide"]
+                dat = job.pop("dat")
+                if scale:
+                    dat = _scale_gpu(dat)
+                nt_in_all = cp.asarray(~is_guide)
+                gene_jobs.append(
+                    {
+                        "gene": job["gene"],
+                        "category": categories[split],
+                        "guide_rows": rows[is_guide],
+                        "dat": dat,
+                        "nt_in_all": nt_in_all,
+                        "orig_in_all_np": is_guide,
+                        "nt_cells_mean": dat[nt_in_all].mean(axis=0),
+                        "n_all": rows.size,
+                        "all_index": obs_names_arr[rows],
+                    }
+                )
+                del dat
+                if not isinstance(X, cp.ndarray):
+                    fit_jobs(gene_jobs)
+                    gene_jobs.clear()
+            if gene_jobs:
+                fit_jobs(gene_jobs)
 
         adata.obs[new_class_name] = class_arr
         adata.obs[p_col] = p_arr

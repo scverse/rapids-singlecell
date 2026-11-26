@@ -149,9 +149,6 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         adata = pbmc68k_reduced()
         cpu_dask = adata.copy()
         X = as_dense_dask_array(cpu_dask.X)
-        # Rechunk to only have row-wise chunks (matching GPU dask array convention)
-        X = X.rechunk((X.shape[0] // 2, X.shape[1]))
-        cpu_dask.X = X.persist()
         # Convert original to GPU for reference comparison
         rsc.get.anndata_to_GPU(adata)
         groupby = "bulk_labels"
@@ -162,12 +159,12 @@ def test_rank_genes_groups_ttest_cpu_dask(client, data_kind, method, mean_in_log
         adata = adata[:, org_var_names].copy()
         cpu_dask = adata.copy()
         X = as_sparse_dask_matrix(cpu_dask.X)
-        # Rechunk to only have row-wise chunks (matching GPU dask array convention)
-        X = X.rechunk((X.shape[0] // 2, X.shape[1]))
-        cpu_dask.X = X.persist()
         # Convert original to GPU for reference comparison
         rsc.get.anndata_to_GPU(adata)
         groupby = "louvain"
+
+    assert X.numblocks[1] > 1
+    cpu_dask.X = X.persist()
 
     # Run rsc on GPU cupy array for reference
     rsc.tl.rank_genes_groups(

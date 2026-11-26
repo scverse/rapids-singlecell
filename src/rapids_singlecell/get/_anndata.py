@@ -9,15 +9,15 @@ from cupyx.scipy.sparse import coo_matrix as coo_matrix_gpu
 from cupyx.scipy.sparse import csc_matrix as csc_matrix_gpu
 from cupyx.scipy.sparse import csr_matrix as csr_matrix_gpu
 from dask.array import Array as DaskArray
+from scipy.sparse import coo_array as coo_array_cpu
+from scipy.sparse import coo_matrix as coo_matrix_cpu
 from scipy.sparse import csc_array as csc_array_cpu
 from scipy.sparse import csc_matrix as csc_matrix_cpu
 from scipy.sparse import csr_array as csr_array_cpu
 from scipy.sparse import csr_matrix as csr_matrix_cpu
 
 from rapids_singlecell._compat import (
-    _meta_dense,
     _meta_dense_cpu,
-    _meta_sparse,
     _meta_sparse_csc_cpu,
     _meta_sparse_csr_cpu,
 )
@@ -28,7 +28,9 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu, coo_matrix_gpu]  # noqa: UP007
-CPU_ARRAY_TYPE = Union[np.ndarray, csr_matrix_cpu, csc_matrix_cpu]  # noqa: UP007
+CPU_ARRAY_TYPE = Union[  # noqa: UP007
+    np.ndarray, csr_matrix_cpu, csr_array_cpu, csc_matrix_cpu, csc_array_cpu, coo_matrix_cpu, coo_array_cpu
+]
 
 
 def anndata_to_GPU(
@@ -92,13 +94,15 @@ def X_to_GPU(X: CPU_ARRAY_TYPE | DaskArray, warning: str = "X") -> GPU_ARRAY_TYP
     if isinstance(X, GPU_ARRAY_TYPE):
         pass
     elif isinstance(X, DaskArray):
-        if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu | np.ndarray):
-            meta = _meta_sparse if isinstance(X._meta, csr_matrix_cpu | csr_array_cpu) else _meta_dense
-            X = X.map_blocks(X_to_GPU, meta=meta(X.dtype))
+        if isinstance(X._meta, CPU_ARRAY_TYPE):
+            X = X.map_blocks(X_to_GPU, meta=X_to_GPU(X._meta))
     elif isinstance(X, csr_array_cpu | csr_matrix_cpu):
         X = csr_matrix_gpu((X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape)
     elif isinstance(X, csc_array_cpu | csc_matrix_cpu):
         X = csc_matrix_gpu((X_to_GPU(X.data), X_to_GPU(X.indices), X_to_GPU(X.indptr)), shape=X.shape)
+    elif isinstance(X, coo_array_cpu | coo_matrix_cpu):
+        # Dask can return COO blocks when it joins sparse chunks.
+        X = X_to_GPU(X.tocsr())
     elif isinstance(X, np.ndarray):
         X = cp.array(X)
     else:

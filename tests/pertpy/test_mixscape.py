@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import anndata
 import cupy as cp
+import dask
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
+from cupyx.scipy.sparse import csc_matrix as cp_csc_matrix
+from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+from dask.callbacks import Callback
 from scipy import sparse
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 import rapids_singlecell as rsc
+from rapids_singlecell.pertpy_gpu import _base
 from rapids_singlecell.pertpy_gpu._mixscape import _lda_fit_transform_gpu
 
 NUM_CELLS_PER_GROUP = 10
@@ -117,6 +123,209 @@ def test_perturbation_signature_deterministic(mode):
     assert np.allclose(xp[obs["cell_class"] == "NT"], 0, atol=1e-4)
     assert np.allclose(xp[obs["cell_class"] == "NP"], 0, atol=1e-4)
     assert np.allclose(xp[obs["cell_class"] == "KO"], expected_ko, atol=1e-4)
+
+
+def test_sparse_nn_signature_averages_controls_before_log():
+    counts = np.array([[0, 8, 0], [2, 0, 0], [0, 0, 3]])
+    logged = np.log1p(counts)
+    adata = anndata.AnnData(sparse.csr_matrix(logged))
+    adata.obs["target"] = ["NT", "NT", "A"]
+    rsc.ptg.Mixscape().perturbation_signature(adata, "target", "NT", use_rep="X", n_neighbors=2)
+    expected = np.log1p(counts[:2].mean(axis=0)) - logged
+    np.testing.assert_allclose(adata.layers["X_pert"].get(), expected, atol=1e-12)
+
+
+@pytest.fixture
+def perturbation_screen():
+    rng = np.random.default_rng(42)
+    targets = np.tile(["NT", "A", "B"], 64)
+    splits = np.repeat(["s1", "s2"], len(targets) // 2)
+    X = np.clip(rng.normal(0.0, 0.6, (len(targets), 64)), 0, None)
+    X[splits == "s2", :16] *= 2
+    responders = rng.random(len(targets)) < 0.7
+    X[(targets == "A") & responders, :8] += 3
+    X[(targets == "B") & responders, 8:16] += 3
+    obs = pd.DataFrame({"target": targets, "split": splits}, index=np.arange(len(targets)).astype(str))
+    return anndata.AnnData(X, obs=obs)
+
+
+@pytest.mark.parametrize("method", ["mixscape", "mixscale"])
+@pytest.mark.parametrize(
+    ("signature_kwargs", "sparse_format"),
+    [
+        ({"use_rep": "X", "n_neighbors": 5, "n_dims": None}, sparse.csr_matrix),
+        ({"ref_selection_mode": "split_by"}, sparse.csc_matrix),
+    ],
+    ids=["nn-csr", "split-by-csc"],
+)
+def test_score_from_sparse_counts(method, signature_kwargs, sparse_format, perturbation_screen, monkeypatch):
+    reference = perturbation_screen
+    input_matrix = sparse_format(reference.X)
+    adata = anndata.AnnData(input_matrix, obs=reference.obs.copy())
+    analyzer = rsc.ptg.Mixscape() if method == "mixscape" else rsc.ptg.Mixscale()
+    score = getattr(analyzer, method)
+    kwargs = {"pert_key": "target", "control": "NT", "split_by": "split"}
+    analyzer.perturbation_signature(reference, **kwargs, **signature_kwargs)
+    score(reference, **kwargs)
+
+    def guard_toarray(toarray):
+        def check_shape(matrix, *args, **kwargs):
+            assert matrix.shape != adata.shape
+            return toarray(matrix, *args, **kwargs)
+
+        return check_shape
+
+    for cls in (cp_csr_matrix, cp_csc_matrix):
+        monkeypatch.setattr(cls, "toarray", guard_toarray(cls.toarray))
+    score(adata, **kwargs, signature_kwargs=signature_kwargs)
+    assert adata.X is input_matrix
+    assert "X_pert" not in adata.layers
+    _assert_scores_match(adata, reference, method)
+
+
+@pytest.mark.parametrize("method", ["mixscape", "mixscale"])
+@pytest.mark.parametrize(
+    ("mode", "array_type", "chunk_cols"),
+    [
+        ("raw", sparse.csr_matrix, -1),
+        ("pca", sparse.csc_matrix, 7),
+        ("split_by", np.asarray, -1),
+        ("nn", sparse.csc_matrix, 7),
+        ("stored", sparse.csr_matrix, -1),
+    ],
+    ids=["raw-nn-scipy-csr", "masked-pca-tiled-coo", "split-by-numpy", "nn-tiled-scipy-csc", "stored-cupy-csr"],
+)
+def test_score_from_dask_chunks(perturbation_screen, method, mode, array_type, chunk_cols):
+    def chunk_array(values):
+        chunks = da.from_array(array_type(values), chunks=(31, chunk_cols))
+        if mode == "pca":
+            # Dask joins can yield COO chunks even with CSR metadata.
+            return chunks.map_blocks(sparse.coo_matrix, meta=sparse.csr_matrix((0, 0), dtype=values.dtype))
+        return rsc.get.X_to_GPU(chunks) if mode == "stored" else chunks
+
+    reference = perturbation_screen
+    expression = chunk_array(reference.X)
+    adata = anndata.AnnData(expression, obs=reference.obs.copy())
+    signature = {"ref_selection_mode": "split_by"}
+    if mode == "nn":
+        embedding = np.random.default_rng(1).normal(size=(adata.n_obs, 4)).astype(np.float32)
+        reference.obsm["embedding"] = adata.obsm["embedding"] = embedding
+        signature = {"use_rep": "embedding", "n_neighbors": 5}
+    elif mode == "raw":
+        signature = {"use_rep": "X", "n_neighbors": 5, "n_dims": adata.n_vars - 1}
+    elif mode == "pca":
+        reference.var["highly_variable"] = adata.var["highly_variable"] = np.arange(adata.n_vars) % 3 != 0
+        signature = {"n_pcs": 4, "n_neighbors": 5}
+    analyzer = rsc.ptg.Mixscape() if method == "mixscape" else rsc.ptg.Mixscale()
+    score = getattr(analyzer, method)
+    kwargs = {"pert_key": "target", "control": "NT", "split_by": "split"}
+    analyzer.perturbation_signature(reference, **kwargs, **signature)
+    score(reference, **kwargs, test_method="t-test")
+    options = {"signature_kwargs": signature}
+    if mode == "stored":
+        stored = chunk_array(reference.layers["X_pert"].get())
+        adata.layers["custom"] = stored
+        options = {"layer": "custom"}
+
+    def check_chunk(key, result, dask_graph, state, worker):
+        assert getattr(result, "shape", None) not in (adata.shape, (adata.n_obs, adata.n_vars - 1))
+
+    with dask.config.set(scheduler="synchronous"), Callback(posttask=check_chunk):
+        score(adata, **kwargs, test_method="t-test", **options)
+    assert adata.X is expression
+    assert "X_pert" not in adata.layers
+    _assert_scores_match(adata, reference, method)
+
+
+def test_dask_marker_batches_share_source_reads(monkeypatch):
+    values = np.arange(48, dtype=np.float32).reshape(8, 6)
+    reads = np.zeros(4, dtype=int)
+
+    @dask.delayed
+    def read_chunk(i):
+        reads[i] += 1
+        return sparse.csr_matrix(values[2 * i : 2 * i + 2])
+
+    meta = sparse.csr_matrix((0, 0), dtype=values.dtype)
+    expression = da.concatenate([da.from_delayed(read_chunk(i), (2, 6), values.dtype, meta=meta) for i in range(4)])
+    jobs = [
+        {"row_ids": np.array(rows), "col_ids": np.array(cols)}
+        for rows, cols in [([0, 2, 4], [5, 0]), ([1, 3, 5], [2, 4]), ([0, 3, 4], [3, 1])]
+    ]
+    monkeypatch.setattr(_base, "_MARKER_BLOCK_BYTES", 2 * 3 * 2 * values.itemsize)
+    with dask.config.set(scheduler="synchronous"):
+        for job, count in zip(_base._with_marker_blocks(expression, jobs), [1, 1, 2], strict=True):
+            np.testing.assert_array_equal(job["dat"].get(), values[np.ix_(job["row_ids"], job["col_ids"])])
+            np.testing.assert_array_equal(reads, [count, count, count, 0])
+
+
+@pytest.mark.parametrize(
+    "n_cells,budget,gpu,targets,expected_reads",
+    [
+        (32, 1600, False, "ABC", [2, 2, 2, 1]),  # Share all three panels.
+        (32, 128, False, "ABC", [4, 4, 2, 1]),  # Every sparse stage exceeds the budget.
+        (17, 1600, True, "ABC", [3, 3, 2]),  # The third panel would stage the full matrix.
+        (32, 1600, False, "A", [1, 1, 0, 0]),  # No other target can share this read.
+    ],
+)
+def test_wide_sparse_dask_marker_batches(n_cells, budget, gpu, targets, expected_reads, *, monkeypatch):
+    labels = np.array("NT A B NT NT C NT A NT B NT C NT A B NT C".split() + ["other"] * (n_cells - 17))
+    values = np.eye(n_cells, 64, dtype=np.float32)
+    values[np.arange(n_cells), np.arange(n_cells) + 32] = np.arange(n_cells) + 2
+    reads = np.zeros((len(expected_reads), 2), dtype=int)
+    csr = cp_csr_matrix if gpu else sparse.csr_matrix
+    meta = csr((0, 0), dtype=values.dtype)
+
+    @dask.delayed
+    def read_tile(i, j):
+        reads[i, j] += 1
+        tile = values[8 * i : 8 * i + 8, 32 * j : 32 * j + 32]
+        tile = csr(cp.asarray(tile) if gpu else tile)
+        return tile.asformat(("csr", "csc", "coo")[i % 3])
+
+    expression = da.block(
+        [
+            [da.from_delayed(read_tile(i, j), (min(8, n_cells - 8 * i), 32), values.dtype, meta=meta) for j in range(2)]
+            for i in range(len(expected_reads))
+        ]
+    ).map_blocks(lambda tile: tile, meta=meta)  # da.block drops sparse CuPy metadata.
+    adata = anndata.AnnData(
+        expression, obs=pd.DataFrame({"target": labels, "batch": "all"}, index=np.arange(n_cells).astype(str))
+    )
+    signature = _base._PerturbationSignature(adata, "target", "NT", split_by="batch", ref_selection_mode="split_by")
+    jobs = []
+    for i, target in enumerate(targets):
+        rows = np.flatnonzero((labels == target) | (labels == "NT"))
+        cols = np.roll(np.arange(54, dtype=np.int32)[::-1], i)
+        jobs.append({"split": 0, "row_ids": rows, "col_ids": cols, "is_guide": labels[rows] == target})
+
+    monkeypatch.setattr(_base, "_MARKER_BLOCK_BYTES", budget)
+    with dask.config.set(scheduler="synchronous"):
+        for job in _base._with_marker_blocks(signature, jobs):
+            rows, cols = job["row_ids"], job["col_ids"]
+            expected = values[labels == "NT"][:, cols].mean(axis=0) - values[np.ix_(rows, cols)]
+            np.testing.assert_array_equal(job.pop("dat").get(), expected)
+    np.testing.assert_array_equal(reads, np.broadcast_to(np.asarray(expected_reads)[:, None], reads.shape))
+
+
+def _assert_scores_match(adata, reference, method):
+    if method == "mixscape":
+        for column in ("mixscape_class", "mixscape_class_global"):
+            np.testing.assert_array_equal(adata.obs[column], reference.obs[column])
+        assert {"KO", "NP"} <= set(adata.obs["mixscape_class_global"])
+        column = "mixscape_class_p_ko"
+    else:
+        column = "mixscale_score"
+    for target in ("A", "B"):
+        assert adata.obs.loc[adata.obs["target"] == target, column].abs().max() > 0.5
+    np.testing.assert_allclose(adata.obs[column], reference.obs[column], atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("analyzer, method", [(rsc.ptg.Mixscape, "mixscape"), (rsc.ptg.Mixscale, "mixscale")])
+def test_signature_options_conflict_with_layer(mixscape_adata, analyzer, method):
+    mixscape_adata.layers["custom"] = mixscape_adata.X.copy()
+    with pytest.raises(ValueError, match="layer"):
+        getattr(analyzer(), method)(mixscape_adata, "gene_target", "NT", layer="custom", signature_kwargs={})
 
 
 def test_lda(mixscape_adata):

@@ -80,6 +80,22 @@
 
 ## Mixscape
 
+Mixscape and Mixscale can score Dask-backed, log-normalized expression directly.
+Use `test_method="t-test"` for marker discovery and pass `signature_kwargs` to compute
+the signature for each target’s marker genes. This example uses the existing embedding in `adata.obsm["X_pca"]`.
+
+```python
+import rapids_singlecell as rsc
+
+opts = dict(pert_key="gene_target", control="NT", test_method="t-test", signature_kwargs={"use_rep": "X_pca"})
+rsc.ptg.Mixscape().mixscape(adata, **opts)
+rsc.ptg.Mixscale().mixscale(adata, **opts)
+```
+
+The t-test aggregates gene statistics by perturbation across chunks. Size the scoring GPU for
+the largest dense panel of selected markers across a target and its controls, plus fitting workspace
+and the control-neighbor graph when using nearest neighbors.
+
 ```{eval-rst}
 .. autosummary::
    :toctree: generated
