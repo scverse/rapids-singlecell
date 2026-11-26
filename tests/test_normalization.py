@@ -142,7 +142,12 @@ def test_log1p_base(use_array, dtype, sparse, base):
 
     if use_array:
         # feeding the matrix directly should match feeding the AnnData
-        out = rsc.pp.log1p(X.copy(), base=base)
+        out = rsc.pp.log1p(X, base=base)
+        if sparse:
+            for field in ("data", "indices", "indptr"):
+                assert not cp.may_share_memory(getattr(X, field), getattr(out, field))
+        else:
+            assert not cp.may_share_memory(X, out)
         result = out.toarray() if hasattr(out, "toarray") else out
     else:
         rsc.pp.log1p(cudata, base=base)

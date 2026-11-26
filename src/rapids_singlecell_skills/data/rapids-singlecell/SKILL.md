@@ -132,7 +132,7 @@ rsc.tl.rank_genes_groups(adata, "leiden_1.0", method="wilcoxon", pts=True)
 
 - `rsc.pp.neighbors` defaults to exact `brute`, which is fine up to about 500k cells.
   Above that use `algorithm="nn_descent"` (5x faster at 2M cells, recall 0.99), not `ivfflat` (recall 0.72 by default).
-- Use `rank_genes_groups(method="wilcoxon_binned")` for Dask input or tens of millions of cells.
+- Use `rank_genes_groups(method="wilcoxon")` for exact ranks on in-memory and Dask input. The approximate `"wilcoxon_binned"` method is deprecated.
 - Do not rerun steps on CPU to validate or benchmark them unless asked.
 
 ## Outside rsc

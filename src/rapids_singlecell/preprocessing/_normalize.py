@@ -401,7 +401,6 @@ def _calc_log1p(X: ArrayTypesDask, base: float | None = None) -> ArrayTypesDask:
         meta = _meta_sparse if isinstance(X._meta, csr_matrix) else _meta_dense
         X = X.map_blocks(partial(_calc_log1p, base=base), meta=meta(X.dtype))
     else:
-        X = X.copy()
         if sparse.issparse(X):
             X = X.log1p()
             if base is not None:

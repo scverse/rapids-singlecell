@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import warnings
+from copy import copy
+from functools import partial
+from itertools import batched
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -9,9 +12,10 @@ import cupyx.scipy.special as cupyx_special
 import numpy as np
 import scipy.sparse as sp
 
+from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 
-from ._utils import EPS, MIN_GROUP_SIZE_WARNING
+from ._utils import EPS, MIN_GROUP_SIZE_WARNING, _canonicalize_sparse, _data_device
 from ._wilcoxon_host import _build_ovo_host_context, _kernel_dtype, _OvoHostContext, _run_sharded_wilcoxon
 
 if TYPE_CHECKING:
@@ -33,6 +37,7 @@ _SUB_BATCH = {
 }
 
 _WilcoxonResult = tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None]
+_DaskWilcoxonResult = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]
 
 
 def _log1p_scale(rg: _RankGenes) -> float:
@@ -138,10 +143,10 @@ def wilcoxon(
     use_continuity: bool = False,
     multi_gpu: bool | list[int] | str | None = None,
     return_u_values: bool = False,
-) -> _WilcoxonResult | None:
+) -> _WilcoxonResult | _DaskWilcoxonResult | None:
     """Compute Wilcoxon rank-sum test statistics."""
     X = rg.X
-    _validate_wilcoxon_sparse_dtype(X)
+    _validate_wilcoxon_sparse_dtype(X._meta if isinstance(X, DaskArray) else X)
     rg.means = rg.vars = rg.pts = None
     rg.means_rest = rg.vars_rest = rg.pts_rest = None
     if rg.ireference is None:
@@ -149,7 +154,8 @@ def wilcoxon(
     else:
         _warn_small_ovo_groups(rg, rg.group_sizes)
 
-    return _run_sharded_wilcoxon(
+    run = _run_dask_wilcoxon if isinstance(X, DaskArray) else _run_sharded_wilcoxon
+    return run(
         rg,
         tie_correct=tie_correct,
         use_continuity=use_continuity,
@@ -157,6 +163,127 @@ def wilcoxon(
         return_u_values=return_u_values,
         shard_runner=_run_wilcoxon_shard,
     )
+
+
+def _rank_dask_batch(X, template, sparse_format, options):
+    rg = copy(template)
+    with _data_device(X):
+        if sparse_format:
+            X = X.asformat(sparse_format)  # stacked CuPy CSC chunks can become COO
+            _validate_wilcoxon_sparse_dtype(X)
+            if not X.has_canonical_format:
+                X = _canonicalize_sparse(X.copy())
+        rg.X = X
+        _, scores, pvals, lfc = _run_sharded_wilcoxon(rg, **options)
+        stats = {"scores": cp.asnumpy(scores), "pvals": cp.asnumpy(pvals)}
+        if lfc is not None:
+            stats["logfoldchanges"] = cp.asnumpy(lfc)
+        return stats | {k: v for k in ("means", "means_rest", "pts", "pts_rest") if (v := getattr(rg, k)) is not None}
+
+
+def _available_device_bytes():
+    free, total = cp.cuda.runtime.memGetInfo()
+    allocator = cp.cuda.get_allocator()
+    pool = getattr(allocator, "__self__", None)
+    if isinstance(pool, cp.cuda.MemoryPool):
+        available = free + pool.free_bytes()
+        limit = pool.get_limit()
+        return min(available, limit - pool.used_bytes()) if limit else available
+
+    try:
+        from rmm import mr
+        from rmm.allocators.cupy import rmm_cupy_allocator
+    except ImportError:
+        return free
+    if allocator is not rmm_cupy_allocator:
+        return free
+
+    resource = mr.get_current_device_resource()
+    live = 0
+    limit = total
+    while isinstance(resource, mr.UpstreamResourceAdaptor):
+        if isinstance(resource, mr.PoolMemoryResource):
+            # A bare RMM pool exposes only its reserved size. Use that ceiling
+            # for planning; the allocator can still reject a busy or fragmented pool.
+            if isinstance(resource.get_upstream(), mr.CudaMemoryResource):
+                free += max(0, resource.pool_size() - live)
+            break
+        if isinstance(resource, (mr.TrackingResourceAdaptor, mr.LimitingResourceAdaptor)):
+            used = resource.get_allocated_bytes()
+            live = max(live, used)
+            if isinstance(resource, mr.LimitingResourceAdaptor):
+                limit = min(limit, resource.get_allocation_limit() - used)
+        elif isinstance(resource, mr.StatisticsResourceAdaptor):
+            live = max(live, resource.allocation_counts.current_bytes)
+        else:
+            break
+        resource = resource.get_upstream()
+    return min(free, limit)
+
+
+def _row_readers(X):
+    from dask.blockwise import Blockwise
+
+    if X.numblocks[0] < 2 or X.numblocks[1] != 1 or not cpsp.isspmatrix_csr(X._meta) or X.dtype != np.float32:
+        return None
+    # Leave persisted data, shuffles and annotated tasks to the scheduler.
+    layers = getattr(X.dask, "layers", {})
+    if not layers or any(not isinstance(layer, Blockwise) or layer.annotations for layer in layers.values()):
+        return None
+    blocks = X.to_delayed()[:, 0]
+    tasks = [blocks[0].dask[b.key] for b in blocks]
+    if all(callable(task) and getattr(task, "dependencies", None) == frozenset() for task in tasks):
+        return [partial(task) for task in tasks]
+    return None
+
+
+def _run_dask_wilcoxon(rg, **options):
+    import dask
+    from dask import threaded
+    from dask.base import get_scheduler
+    from dask.utils import parse_bytes
+
+    X = rg.X
+    groups = np.arange(len(rg.groups_order), dtype=np.intp)
+    if rg.ireference is not None:
+        groups = np.delete(groups, rg.ireference)
+    if not groups.size:
+        return None
+    scheduler = get_scheduler(collections=[X])
+    client = getattr(scheduler, "__self__", None)
+    workers = client.nthreads() if hasattr(client, "nthreads") else {}
+    fmt = getattr(X._meta, "format", None)
+    entry_bytes = X.itemsize + (X._meta.indices.itemsize if fmt else 0)
+    width = max(1, parse_bytes(dask.config.get("array.chunk-size")) // (max(1, X.shape[0]) * entry_bytes))
+    if workers and width < X.shape[1] and (readers := _row_readers(X)) is not None:
+        from ._wilcoxon_dask import try_streamed
+
+        if (result := try_streamed(rg, client, workers, options, readers)) is not None:
+            return groups, *result
+
+    # Split columns before stacking rows. Panels in one compute share their source reads.
+    panels = X.rechunk({1: width}, method="tasks").rechunk({0: -1}, method="tasks").to_delayed()[0]
+    template = copy(rg)
+    del template.X, template.labels, template._aggregation_groupby, template.var_names
+    if workers:
+        template = client.scatter(template, broadcast=True, hash=False)
+    if options["multi_gpu"] is None:
+        options["multi_gpu"] = False
+    compute_kw = {"num_workers": 1} if scheduler is threaded.get else {}
+    stats = {}
+    offset = 0
+    for wave in batched(panels, max(1, len(workers)), strict=False):
+        tasks = [dask.delayed(_rank_dask_batch)(panel, template, fmt, options) for panel in wave]
+        for batch in dask.compute(*tasks, **compute_kw):
+            stop = offset + batch["scores"].shape[1]
+            for name, values in batch.items():
+                if name not in stats:
+                    stats[name] = np.empty((values.shape[0], X.shape[1]), dtype=values.dtype)
+                stats[name][:, offset:stop] = values
+            offset = stop
+    rg.means, rg.means_rest = stats.get("means"), stats.get("means_rest")
+    rg.pts, rg.pts_rest = stats.get("pts"), stats.get("pts_rest")
+    return groups, stats["scores"], stats["pvals"], stats.get("logfoldchanges")
 
 
 def _run_wilcoxon_shard(

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
+import scverse_misc
 from scverse_misc import Deprecation, deprecated, deprecated_arg
 
+import rapids_singlecell as rsc
 from rapids_singlecell._settings import Default, resolve_default, settings
 from rapids_singlecell.get import _check_mask
 from rapids_singlecell.get._out import (
@@ -110,13 +113,13 @@ def rank_genes_groups(
     bin correctly.)
 
     .. note::
-        **Dask support:** `'t-test'`, `'t-test_overestim_var'`,
-        `'wilcoxon_binned'`, and `'logreg'` support Dask arrays. The
-        `'wilcoxon'` method does not support Dask arrays.
+        All methods support Dask arrays. Exact `'wilcoxon'` can stream row-chunked
+        float32 GPU CSR in one pass or rank full-height gene batches sized by
+        Dask's ``array.chunk-size``.
 
     .. note::
-        **Wilcoxon ranking precision:** `'wilcoxon'` and `'wilcoxon_binned'`
-        rank values in float32 on every code path, while means and log fold
+        **Exact Wilcoxon ranking precision:** `'wilcoxon'`
+        ranks values in float32 on every code path, while means and log fold
         changes are computed in float64. This only diverges from Scanpy when the
         **preprocessing itself ran in float64** — i.e. normalization/log1p
         produced values carrying sub-float32 precision. If preprocessing was
@@ -161,9 +164,9 @@ def rank_genes_groups(
         `'t-test'` uses Welch's t-test (default),
         `'t-test_overestim_var'` overestimates variance of each group,
         `'wilcoxon'` uses Wilcoxon rank-sum,
-        `'wilcoxon_binned'` uses histogram-based approximate Wilcoxon rank-sum
-        (faster for large datasets, supports Dask arrays),
         `'logreg'` uses logistic regression.
+        `'wilcoxon_binned'` is the deprecated histogram approximation.
+        Use `'wilcoxon'` for exact ranks on in-memory and Dask inputs.
     corr_method
         p-value correction method. Used only for `'t-test'`,
         `'t-test_overestim_var'`, `'wilcoxon'`, and `'wilcoxon_binned'`.
@@ -195,7 +198,9 @@ def rank_genes_groups(
         GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
         and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
         visible GPUs for host input, while device input stays on its owning
-        GPU. For the streaming t-test/binned paths, ``None``
+        GPU. For Dask input, each exact Wilcoxon batch uses its worker's GPU
+        by default. Explicit device selections apply within each worker.
+        For the streaming t-test/binned paths, ``None``
         and ``False`` use the current GPU. ``True`` uses all visible GPUs, and a
         list or comma-separated string selects device IDs. Streaming multi-GPU
         is host-only: CSR/dense input is sharded by cell rows, CSC by gene
@@ -267,6 +272,13 @@ def rank_genes_groups(
 
     if method is None:
         method = settings.preset.rank_genes_groups.method
+
+    if method == "wilcoxon_binned":
+        warnings.warn(
+            "method='wilcoxon_binned' is deprecated. Use method='wilcoxon' for exact ranks.",
+            FutureWarning,
+            skip_file_prefixes=(*rsc.__path__, *scverse_misc.__path__),
+        )
 
     if method not in {
         "logreg",

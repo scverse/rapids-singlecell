@@ -143,7 +143,7 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.tl.score_genes_cell_cycle`
 - `tl.louvain` (deprecated; set `use_dask=True` to distribute graph clustering)
 - {func}`~.tl.leiden` (set `use_dask=True` to distribute graph clustering)
-- {func}`~.tl.rank_genes_groups` (methods: `logreg`, `t-test`, `t-test_overestim_var`, `wilcoxon_binned`; not exact `wilcoxon`)
+- {func}`~.tl.rank_genes_groups` (all methods, including exact `wilcoxon`)
 - {func}`~rapids_singlecell.get.aggregate`
 - {func}`~rapids_singlecell.dcg.aucell`, {func}`~rapids_singlecell.dcg.gsea`, {func}`~rapids_singlecell.dcg.mlm`, {func}`~rapids_singlecell.dcg.ora`, {func}`~rapids_singlecell.dcg.ulm`, {func}`~rapids_singlecell.dcg.waggr` and {func}`~rapids_singlecell.dcg.zscore`
 - {func}`~rapids_singlecell.dcg.gsva` (computes Dask input into memory first)
@@ -152,6 +152,13 @@ For Dask inputs, {func}`~.pp.normalize_total` does not support
 `exclude_highly_expressed=True`. {func}`~.pp.pca` uses the
 `covariance_eigh` solver by default; `chunked=True`, `lanczos`, and `randomized` are not
 supported.
+
+Exact `wilcoxon` accepts Dask arrays backed by row-chunked CSR Zarr. Distributed
+workers can stream float32 CSR chunks once with `pts=False`. They pool each
+gene’s original values across all cells and include implicit zeros in tied ranks.
+For other inputs, Dask’s `array.chunk-size` controls the full-height gene batches.
+One gene and its sorting workspace must fit on a worker. The client holds the
+group-by-gene results for ranking and multiple-testing correction.
 
 ## Troubleshooting
 
