@@ -97,11 +97,10 @@ __global__ void finish_runs(const ZeroRun* zeros, const int* sizes,
         if (g == ref) continue;
         size_t out = (size_t)col * width + g;
         Rank size = sizes[g];
-        // Named-reference contributions are twice U. Add back the target's self
-        // ranks.
-        Rank rank2 =
-            (Rank)ranks[out] + size * (zero.rank2 + (ref < 0 ? 1 : size + 1));
-        ranks[out] = __double_as_longlong(0.5 * rank2);
+        // For one-vs-rest, remove the target's self ranks before conversion to
+        // float64. A large, imbalanced group can otherwise lose a half-rank.
+        ranks[out] =
+            (Rank)ranks[out] + size * (zero.rank2 - (ref < 0 ? size : 0));
         if (ref >= 0) {
             double tie = correct ? ties[out] + ties[(size_t)col * width + ref] +
                                        tie3(zero.count + size - nonzero[out])
@@ -254,9 +253,14 @@ __global__ void transpose_tile(const int* ptr, const int* indices,
             if (bits < 0 || !present[j][lane]) continue;
             int pos = base + __popc(lanes & ((1u << lane) - 1));
             unsigned key = tile[j][lane], group = labels[row0 + lane];
-            if (bits)
-                key = dictionary_slot(key, table, mask, failed) << bits | group;
-            else
+            if (bits) {
+                // A single word holds a range base, larger tables hold
+                // dictionary entries.
+                unsigned index = mask
+                                     ? dictionary_slot(key, table, mask, failed)
+                                     : key - table[0];
+                key = index << bits | group;
+            } else
                 groups[pos] = group;
             words[pos] = key;
         }
@@ -323,11 +327,14 @@ __global__ void gather_keys(const unsigned* words, const unsigned* table,
          i += gridDim.x * blockDim.x) {
         unsigned word = words[i],
                  group = bits ? word & ((1u << bits) - 1) : codes[i];
-        if (group >= groups || (bits && (word >> bits) >= slots)) {
+        if (group >= groups || (bits && slots > 1 && (word >> bits) >= slots)) {
             atomicExch(invalid, 1);
             continue;
         }
-        unsigned value = bits ? table[word >> bits] : word;
+        unsigned value = word;
+        if (bits)
+            value =
+                slots == 1 ? table[0] + (word >> bits) : table[word >> bits];
         if (!isfinite(__uint_as_float(value))) atomicExch(invalid, 1);
         if (!(value << 1)) value = 0;
         unsigned order = value ^ (value >> 31 ? ~0u : 0x80000000u);

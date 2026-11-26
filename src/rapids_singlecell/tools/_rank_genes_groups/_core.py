@@ -93,9 +93,6 @@ class _RankGenes:
             reference=reference,
             skip_empty_groups=skip_empty_groups,
         )
-        # Scanpy groups omitted categories and missing labels into one remainder.
-        self._aggregation_groupby = pd.Categorical(self.group_codes, categories=range(len(self.groups_order) + 1))
-
         if layer is not None:
             if use_raw is True:
                 msg = "Cannot specify `layer` and have `use_raw=True`."
@@ -158,7 +155,9 @@ class _RankGenes:
         X = self.X
         if isinstance(X, np.ndarray) or sp.issparse(X):
             return self._stream_planes()
-        agg = Aggregate(groupby=self._aggregation_groupby, data=X)
+        # Scanpy groups omitted categories and missing labels into one remainder.
+        groupby = pd.Categorical(self.group_codes, categories=range(len(self.groups_order) + 1))
+        agg = Aggregate(groupby=groupby, data=X)
         funcs = {"sum", "sq_sum"}
         if self.comp_pts:
             funcs.add("count_nonzero")

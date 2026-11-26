@@ -10,7 +10,17 @@ from cupyx.scipy.sparse import isspmatrix_csr
 
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 
-from ._wilcoxon import _finish_wilcoxon, _log1p_scale, _logfoldchanges_from_means
+from ._wilcoxon import _log1p_scale, _logfoldchanges_from_means, _wilcoxon_z_p
+
+
+def range_base(data, bits):
+    """Return the base when the value bits and a group code fit losslessly in one word."""
+    if data.dtype != cp.float32 or not data.size or not 1 <= bits <= 6:
+        return None
+    values = data.view(cp.uint32)
+    extrema = cp.stack((values.min(), values.max()))
+    low, high = map(int, extrema.get())
+    return extrema[:1] if high - low < 1 << (32 - bits) else None
 
 
 def pack_records(csr, labels, bounds):
@@ -55,8 +65,14 @@ def pack_records(csr, labels, bounds):
     cp.cumsum(active.ravel(), dtype=cp.int32, out=active.ravel())
     offsets = np.r_[np.int32(0), active[:, -1].get()]
     shard_entries = np.diff(offsets[np.asarray(bounds) - begin])
-    for mode in (bits, 0) if (slots * 4 <= 2 * shard_entries.astype(np.int64)).all() else (0,):
-        table = cp.zeros(slots, cp.uint32) if mode else empty
+    modes = (bits, 0) if (slots * 4 <= 2 * shard_entries.astype(np.int64)).all() else (0,)
+    base = range_base(csr.data, bits)
+    if base is not None:
+        modes = (bits,)
+    for mode in modes:
+        table = empty
+        if mode:
+            table = base if base is not None else cp.zeros(slots, cp.uint32)
         pieces = []
         for lo, hi in shards:
             ptr = offsets[lo - begin : hi - begin + 1] - offsets[lo - begin]
@@ -65,7 +81,7 @@ def pack_records(csr, labels, bounds):
             if lo < hi:
                 transpose(lo, hi, offsets[lo - begin], words, codes, table, mode, stream)
             pieces.append((ptr, words, table if mode else codes, mode))
-        if not mode:
+        if not mode or base is not None:
             cp.cuda.get_current_stream().synchronize()  # Dask can transfer these arrays on another stream.
             return pieces
         if not failed.item():
@@ -109,7 +125,7 @@ def rank_records(blocks, lo, hi, rg, options):
     if keys is None:
         return None
     sums = cp.zeros(shape, cp.float64)
-    ranks = cp.zeros_like(sums)
+    twice_u = cp.zeros(shape, cp.int64)
     ties = cp.zeros(shape[0] if ref is None else shape, cp.float64)
     need_counts = rg.comp_pts or (ref is not None and options["tie_correct"])
     nonzero = cp.zeros(shape if need_counts else 0, cp.int32)
@@ -119,7 +135,7 @@ def rank_records(blocks, lo, hi, rg, options):
         cp.asarray(indptr, cp.int32),
         cp.asarray(all_sizes, cp.int32),
         sums,
-        ranks.view(cp.uint64),
+        twice_u.view(cp.uint64),
         ties,
         nonzero,
         rg.n_obs if ref is None else int(sizes[ref]),
@@ -131,19 +147,17 @@ def rank_records(blocks, lo, hi, rg, options):
 
     groups = np.arange(len(sizes), dtype=np.intp)
     targets = slice(len(sizes)) if ref is None else groups[groups != ref]
-    n = cp.asarray(sizes[targets], cp.float64)[:, None]
+    n = cp.asarray(sizes[targets], cp.int64)[:, None]
     other = rg.n_obs - n if ref is None else int(sizes[ref])
     selected = sums[:, targets].T
     reference = (sums.sum(axis=1) - selected) / other if ref is None else sums[:, ref] / other
     variance = (ties if ref is None else ties[:, targets].T) * n * other * ((n + other + 1) / 12)
-    result = _finish_wilcoxon(
-        ranks[:, targets].T,
-        n * (n + other + 1) / 2,
-        variance,
-        n[:, 0],
+    u2 = twice_u[:, targets].T
+    z, p = _wilcoxon_z_p((u2 - n * other) * 0.5, variance, use_continuity=options["use_continuity"])
+    result = (
         groups[targets],
-        use_continuity=options["use_continuity"],
-        return_u_values=options["return_u_values"],
-        logfoldchanges_gpu=_logfoldchanges_from_means(rg, selected / n, reference),
+        u2 * 0.5 if options["return_u_values"] else z,
+        p,
+        _logfoldchanges_from_means(rg, selected / n, reference),
     )
     return (*result, nonzero.T) if rg.comp_pts else result

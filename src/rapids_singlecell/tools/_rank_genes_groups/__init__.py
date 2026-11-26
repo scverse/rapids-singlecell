@@ -298,6 +298,10 @@ def rank_genes_groups(
         msg = "return_u_values is only supported for method='wilcoxon'."
         raise ValueError(msg)
 
+    if method == "wilcoxon" and adata.n_obs >= 2**31:
+        msg = "Wilcoxon currently supports fewer than 2**31 cells per input."
+        raise ValueError(msg)
+
     if (
         multi_gpu is not None
         and multi_gpu is not False

@@ -161,8 +161,12 @@ memory per worker. Set Dask’s `rapids-singlecell.wilcoxon.batch-size` to a sma
 byte limit as needed. Input chunks, sorting and group results need additional memory.
 Host arrays and local schedulers use Dask’s `array.chunk-size`. A worker must be able to rank at least one gene.
 Each window covers at most half the genes, rounded up. Lazy row-wise normalization
-and log1p run again from the source for each window. The client holds the
-group-by-gene results, including expression fractions when `pts=True`.
+and log1p run again from the source for each window. If a window exceeds the
+budget, the CSR ranker samples row chunks to estimate the storage per gene and
+divide the next windows across GPUs. The ranking still uses every cell. The
+client holds the cell labels and group-by-gene results, including fractions for
+`pts=True`. The current kernels support fewer than `2**31` cells. For very
+large comparisons, the returned float64 U can round half-integers above `2**52`.
 
 ## Troubleshooting
 

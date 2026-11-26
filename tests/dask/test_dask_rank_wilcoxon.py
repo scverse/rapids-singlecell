@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import cupy as cp
+import cupyx.scipy.sparse as cpsp
 import dask
 import numpy as np
 import pandas as pd
@@ -12,6 +16,84 @@ from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon
+from rapids_singlecell.tools._rank_genes_groups._wilcoxon_dask import (
+    _project_window,
+    _sample_gene_sizes,
+    rank_large_groups,
+)
+from rapids_singlecell.tools._rank_genes_groups._wilcoxon_records import (
+    _gather_keys,
+    pack_records,
+    range_base,
+    rank_records,
+)
+
+
+def test_range_packing_preserves_float_bits_and_group_codes():
+    low = 0x3E000000
+    patterns = np.array([[low, low + 1], [low + 33, low + 2**26 - 1]], dtype=np.uint32)
+    x = cp.asarray(patterns).view(cp.float32)
+    groups = np.array([63, 17], dtype=np.uint16)
+    (part,) = pack_records(cpsp.csr_matrix(x), groups, np.array([0, 2]))
+    assert part[1].nbytes == x.nbytes
+    assert part[2].size == 1 and part[2].item() == low
+    assert part[3] == 6
+    _, keys = _gather_keys([part], 0, 2, 64)
+    unpacked = keys.get()
+    np.testing.assert_array_equal((unpacked >> 6).astype(np.uint32) ^ 0x80000000, patterns.T.ravel())
+    np.testing.assert_array_equal(unpacked & 63, np.tile(groups, 2))
+    assert range_base(cp.asarray([low, low + 2**26], cp.uint32).view(cp.float32), 6) is None
+
+
+@pytest.mark.parametrize("reference", [None, 1])
+def test_large_group_keeps_half_integer_u(reference):
+    # One positive in each group, all other values are implicit zeros.
+    size = 100_000_001
+    rg = SimpleNamespace(
+        group_sizes=np.array([size, 3]),
+        n_obs=size + 3,
+        ireference=reference,
+        comp_pts=True,
+        mean_in_log_space=True,
+        _log1p_base=None,
+    )
+    block = (np.array([0, 2], np.int32), cp.ones(2, cp.float32).view(cp.uint32), cp.arange(2, dtype=cp.uint16), 0)
+    opts = {"tie_correct": True, "use_continuity": False, "return_u_values": True}
+    _, scores, _, _, counts = rank_records([block], 0, 1, rg, opts)
+    # Each target zero ties two reference zeros. Its positive wins twice and ties once.
+    assert scores[0, 0].item() == size - 1 + 2.5
+    np.testing.assert_array_equal(counts.get(), [[1], [1]])
+
+
+@pytest.mark.parametrize("reference", [None, 1])
+def test_dense_integer_rank_rows(reference):
+    sizes = np.array([8, 3, 4, 2])
+    labels = np.repeat(np.arange(5), [*sizes, 3])
+    x = np.random.default_rng(18).integers(-2, 3, (len(labels), 4)).astype(np.float32)
+    rg = SimpleNamespace(
+        group_codes=labels,
+        group_sizes=sizes,
+        ireference=reference,
+        comp_pts=True,
+        mean_in_log_space=True,
+        _log1p_base=None,
+        pts_rest=None,
+    )
+    opts = {"tie_correct": True, "use_continuity": False, "return_u_values": True}
+    stats = rank_large_groups([x[:8], x[8:]], rg, opts)
+    ref = labels != 0 if reference is None else labels == reference
+    expected = mannwhitneyu(
+        x[labels == 0].astype(np.float64), x[ref].astype(np.float64), method="asymptotic", use_continuity=False
+    )
+    np.testing.assert_array_equal(stats["scores"][0], expected.statistic)
+    np.testing.assert_allclose(stats["pvals"][0], expected.pvalue)
+    np.testing.assert_array_equal(stats["pts"][0], (x[labels == 0] != 0).mean(axis=0))
+    compact, positions = _wilcoxon._compact_rank_groups(rg, np.array([0, 2]))
+    np.testing.assert_array_equal(positions, [0, 2] if reference is None else [0, 1])
+    np.testing.assert_array_equal(compact.group_codes[labels >= 3], len(compact.group_sizes))
+    partial = rank_large_groups([x[:8], x[8:]], compact, opts)
+    for name in ("scores", "pvals"):
+        np.testing.assert_array_equal(partial[name], stats[name][positions])
 
 
 @pytest.mark.parametrize("reference", ["rest", "b"])
@@ -80,6 +162,8 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     expected = rsc.tl.rank_genes_groups(eager, "group", multi_gpu=False, **kwargs)
     width = 3 if reference == "rest" else 100
     if mode == "host":
+        monkeypatch.setattr(_wilcoxon, "_HALF_INTEGER_LIMIT", 10)
+        monkeypatch.setattr(_wilcoxon, "_MAX_RECORD_GROUPS", 1)
         rank = _wilcoxon._rank_dask_batch
 
         def check_rank(rows, *args):
@@ -117,3 +201,32 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     pos = np.flatnonzero(actual["names"]["a"] == eager.var_names[1]).item()
     u = mannwhitneyu(column[group].astype(np.float64), column[control].astype(np.float64)).statistic.item()
     assert actual["scores"]["a"][pos] == u
+
+
+def test_project_window_retries_with_all_rows(dist_client):
+    row_sizes = [64, 65, 66, 67]
+    width = 64
+    budget = 32 * 1024
+    rows = [dask.delayed(rsc.get.X_to_GPU)(csr_matrix(np.ones((n, width), np.float32))) for n in row_sizes]
+    codes = [np.zeros(n, np.uint16) for n in row_sizes]
+    options = {"client": dist_client, "workers": list(dist_client.nthreads())[:1], "concurrency": 2, "budget": budget}
+    columns, retry_width = _project_window(rows, codes, np.array([0, width]), **options)
+    assert columns == []
+    assert 1 <= retry_width < width
+
+    columns, _ = _project_window(rows, codes, np.array([0, retry_width]), **options)
+    (column,) = columns
+    parts = dist_client.gather(column)
+    assert sum(ptr.nbytes + words.nbytes + aux.nbytes for ptr, words, aux, _ in parts) <= budget
+    # Each source block has a distinct row count and contributes a value to every gene.
+    assert sorted(int(ptr[-1]) for ptr, *_ in parts) == [n * retry_width for n in row_sizes]
+
+
+def test_sample_gene_sizes_counts_stored_entries(dist_client):
+    # Every block has an empty gene and a gene expressed in half the cells.
+    X = csr_matrix(np.array([[0, 1, 2], [0, 0, 2]] * 8, np.float32))
+    rows = [dask.delayed(rsc.get.X_to_GPU)(X) for _ in range(4)]
+    codes = [np.zeros(X.shape[0], np.uint16)] * len(rows)
+    prefix = _sample_gene_sizes(dist_client, rows, codes, concurrency=2)
+    expected = 4 * len(rows) * (np.array([0, 8, 16]) + 1)
+    np.testing.assert_array_equal(np.diff(prefix), expected)
