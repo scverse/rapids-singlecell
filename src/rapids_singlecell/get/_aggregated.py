@@ -224,18 +224,19 @@ class Aggregate:
         i_count = plane_order.index("count") if need_count else None
         i_sqsum = plane_order.index("sqsum") if need_sqsum else None
 
-        is_sparse = not isinstance(self.data._meta, cp.ndarray)
         n_groups = self.n_cells.shape[0]
 
         def __aggregate_dask(X_part, mask_part, groupby_part):
-            out = cp.zeros((1, n_planes, n_groups, self.data.shape[1]), dtype=cp.float64)
+            out = cp.zeros((1, n_planes, n_groups, X_part.shape[1]), dtype=cp.float64)
             gb = groupby_part.ravel()
             mk = mask_part.ravel()
             out_sum = out[0, i_sum] if need_sum else None
             out_count = out[0, i_count] if need_count else None
             out_sqsum = out[0, i_sqsum] if need_sqsum else None
 
-            if is_sparse:
+            if cp_sparse.issparse(X_part):
+                if X_part.format == "coo":
+                    X_part = X_part.tocsr()
                 _aggr_cuda.sparse_aggr(
                     X_part.indptr,
                     X_part.indices,
@@ -247,10 +248,12 @@ class Aggregate:
                     mask=mk,
                     n_cells=X_part.shape[0],
                     n_genes=X_part.shape[1],
-                    is_csc=False,
+                    is_csc=X_part.format == "csc",
                     stream=cp.cuda.get_current_stream().ptr,
                 )
             else:
+                if not (X_part.flags.c_contiguous or X_part.flags.f_contiguous):
+                    X_part = cp.ascontiguousarray(X_part)
                 _aggr_cuda.dense_aggr(
                     X_part,
                     out_sum=out_sum,
@@ -284,10 +287,10 @@ class Aggregate:
             dtype=cp.float64,
             new_axis=(1, 2),
             chunks=(
-                (1,) * self.data.blocks.size,
+                (1,) * self.data.numblocks[0],
                 (n_planes,),
                 (n_groups,),
-                (self.data.shape[1],),
+                self.data.chunks[1],
             ),
         )
 

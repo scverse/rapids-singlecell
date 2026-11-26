@@ -102,12 +102,13 @@ def test_mixscale_requires_signature(mixscale_adata):
 
 
 def test_mixscale_sparse_input(mixscale_adata):
-    """Sparse layers score the same as dense (matrix is densified internally)."""
+    """A stored sparse signature gives the same scores as its dense equivalent."""
     adata = mixscale_adata
+    score = rsc.ptg.Mixscale().mixscale
+    reference = score(adata, pert_key="gene_target", control="NT", test_method="t-test", copy=True)
     adata.layers["X_pert"] = sparse.csr_matrix(adata.layers["X_pert"])
-    rsc.ptg.Mixscale().mixscale(adata, pert_key="gene_target", control="NT", test_method="t-test")
-    pert = adata.obs.loc[adata.obs["gene_target"] != "NT", "mixscale_score"]
-    assert not np.isnan(pert.to_numpy()).any()
+    score(adata, pert_key="gene_target", control="NT", test_method="t-test")
+    np.testing.assert_allclose(adata.obs["mixscale_score"], reference.obs["mixscale_score"], atol=1e-6)
 
 
 def test_mixscale_matches_pertpy(mixscape_adata):

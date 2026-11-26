@@ -228,10 +228,10 @@ def pca(
         X = data
         mask = _mask_arg(mask, mask_var, dim="var")
         mask = None if isinstance(mask, Default) else _check_mask(X, mask, "var")
-        X = X[:, mask] if mask is not None else X
         pca_func, X_pca, _ = _pca_compute(
             X,
             n_comps,
+            mask=mask,
             zero_center=zero_center,
             svd_solver=svd_solver,
             rng=rng,
@@ -270,11 +270,10 @@ def pca(
         hvg = not multi and "highly_variable" in adata.var.columns
         mask = _mask_arg(None, "highly_variable", dim="var") if hvg else None
     mask_param, mask_var = _ref_to_json(mask), _check_mask(adata, mask, "var")
-    X = X[:, mask_var] if mask_var is not None else X
-
     pca_func, X_pca, n_comps = _pca_compute(
         X,
         n_comps,
+        mask=mask_var,
         zero_center=zero_center,
         svd_solver=svd_solver,
         rng=rng,
@@ -311,6 +310,7 @@ def _pca_compute(
     X,
     n_comps,
     *,
+    mask,
     zero_center: bool,
     svd_solver: str | None,
     rng: np.random.Generator,
@@ -319,6 +319,10 @@ def _pca_compute(
     dtype: str,
     kwargs: dict,
 ):
+    if isinstance(X, DaskArray):
+        X = _gpu_row_chunks(X)
+    if mask is not None:
+        X = X[:, mask]
     if n_comps is None:
         min_dim = min(X.shape[0], X.shape[1])
         if settings.N_PCS >= min_dim:
@@ -398,6 +402,14 @@ def _as_numpy(X):
         return X.get()
     else:
         return X
+
+
+def _gpu_row_chunks(X):
+    X = X_to_GPU(X).rechunk({1: -1})
+    if cpissparse(X._meta):
+        # Joining sparse feature chunks can produce COO, even with CSR metadata.
+        X = X.map_blocks(lambda block: block.tocsr(), meta=X._meta.tocsr())
+    return X
 
 
 def _run_covariance_pca(X, n_comps, zero_center):

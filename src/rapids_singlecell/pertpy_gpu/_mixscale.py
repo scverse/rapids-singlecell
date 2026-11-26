@@ -5,9 +5,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from rapids_singlecell.get import X_to_GPU
-
-from ._base import PerturbationEfficacyAnalyzer, _to_dense_gpu
+from ._base import PerturbationEfficacyAnalyzer, _get_scoring_matrix, _target_jobs, _with_marker_blocks
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -40,6 +38,7 @@ class Mixscale(PerturbationEfficacyAnalyzer):
         test_method: str = "wilcoxon",
         scale: bool = True,
         split_by: str | None = None,
+        signature_kwargs: dict | None = None,
         pval_cutoff: float = 5e-2,
         perturbation_type: str = "KO",
         copy: bool = False,
@@ -86,12 +85,19 @@ class Mixscale(PerturbationEfficacyAnalyzer):
             Layer used for differential expression. ``None`` uses ``.X``.
         test_method
             Differential-expression test passed to
-            :func:`rapids_singlecell.tl.rank_genes_groups`.
+            :func:`rapids_singlecell.tl.rank_genes_groups`. Use ``"t-test"``
+            for Dask expression with dense, CSR or CSC chunks.
         scale
             Scale the per-gene sub-matrix before computing scores.
         split_by
             ``.obs`` column with a condition/cell-type annotation if
             perturbations are condition specific.
+        signature_kwargs
+            Compute signatures directly from unscaled, log-normalized ``.X`` for
+            each target's marker genes. Pass ``{}`` for defaults or supply neighbor
+            and reference options from :meth:`perturbation_signature`. The
+            method uses ``split_by`` for both scoring and reference selection.
+            This skips storing ``X_pert`` and requires ``layer=None``.
         pval_cutoff
             Adjusted p-value cutoff for differentially expressed genes.
         perturbation_type
@@ -107,6 +113,8 @@ class Mixscale(PerturbationEfficacyAnalyzer):
         absolute values indicate a stronger perturbation effect; control cells
         and any gene that cannot be scored receive 0.
         """
+        if layer is not None and signature_kwargs is not None:
+            raise ValueError("Pass either layer or signature_kwargs.")
         if copy:
             adata = adata.copy()
 
@@ -130,73 +138,28 @@ class Mixscale(PerturbationEfficacyAnalyzer):
             logfc_threshold=logfc_threshold,
             test_method=test_method,
         )
+        X = _get_scoring_matrix(
+            adata, pert_key, control, layer=layer, signature_kwargs=signature_kwargs, split_by=split_by
+        )
 
-        if layer is not None:
-            X = X_to_GPU(adata.layers[layer])
-        else:
-            try:
-                X = X_to_GPU(adata.layers["X_pert"])
-            except KeyError:
-                raise KeyError(
-                    "No 'X_pert' found in .layers! Please run perturbation_signature "
-                    "first to calculate the perturbation signature!"
-                ) from None
-        X = _to_dense_gpu(X)
-
-        var_names = np.asarray(adata.var_names)
-        var_to_idx = {name: i for i, name in enumerate(var_names)}
-        # Integer codes let every per-gene cell mask be built with a fast integer
-        # comparison over the full obs, and no cells are ever copied out of adata.
-        pert_cat = adata.obs[pert_key].astype("category")
-        codes = pert_cat.cat.codes.to_numpy()
-        cat_names = [str(c) for c in pert_cat.cat.categories]
-        control_code = {name: i for i, name in enumerate(cat_names)}.get(control, -1)
-
-        # One job per scorable gene (indices + masks, cheap host work); the
-        # gather, scaling, projection and z-score for all genes then run in a
-        # single batched kernel that reads each block straight from X.
-        gene_jobs: list[dict] = []
-        for split, split_mask in enumerate(split_masks):
-            category = categories[split]
-            nt_mask = (codes == control_code) & split_mask
-            split_gene_codes = sorted(set(codes[split_mask].tolist()) - {control_code})
-
-            for gene_code in split_gene_codes:
-                gene = cat_names[gene_code]
-                de_genes = perturbation_markers[category, gene]
-                if len(de_genes) == 0:
-                    continue
-                # Keep only the top-ranked DE genes (markers are score-ranked).
-                if len(de_genes) > max_de_genes:
-                    de_genes = de_genes[:max_de_genes]
-                de_genes_indices = np.fromiter(
-                    (var_to_idx[g] for g in de_genes if g in var_to_idx),
-                    dtype=np.int32,
-                )
-                if de_genes_indices.size == 0:
-                    continue
-
-                orig_mask = (codes == gene_code) & split_mask
-                all_mask = orig_mask | nt_mask
-                nt_in_all_np = nt_mask[all_mask]
-                if not nt_in_all_np.any():
-                    # No control cells: cannot define a perturbation direction.
-                    continue
-
-                gene_jobs.append(
-                    {
-                        "row_ids": np.flatnonzero(all_mask).astype(np.int32),
-                        "col_ids": de_genes_indices,
-                        "is_guide": orig_mask[all_mask],
-                        "nt_in_all": nt_in_all_np,
-                    }
-                )
-
-        # Control cells stay 0; the kernel writes only guide cells. float64
-        # output matches pertpy's ``obs[...] = 0.0`` column.
+        jobs = _target_jobs(
+            adata, pert_key, control, split_masks, categories, markers=perturbation_markers, max_de_genes=max_de_genes
+        )
         scores_gpu = cp.zeros(adata.n_obs, dtype=X.dtype)
-        if gene_jobs:
-            _project_scores_batched(X, gene_jobs, scores_gpu, do_scale=scale)
+        if isinstance(X, cp.ndarray):
+            gene_jobs = list(jobs)
+            if gene_jobs:
+                _project_scores_batched(X, gene_jobs, scores_gpu, do_scale=scale)
+        else:
+            for job in _with_marker_blocks(X, jobs):
+                block = job.pop("dat")
+                rows = job["row_ids"]
+                job["row_ids"] = np.arange(block.shape[0], dtype=np.int32)
+                job["col_ids"] = np.arange(block.shape[1], dtype=np.int32)
+                block_scores = cp.zeros(block.shape[0], dtype=X.dtype)
+                _project_scores_batched(block, [job], block_scores, do_scale=scale)
+                scores_gpu[cp.asarray(rows)] = block_scores
+                del block
         adata.obs[new_class_name] = cp.asnumpy(scores_gpu).astype(np.float64, copy=False)
 
         if copy:
@@ -224,10 +187,10 @@ def _project_scores_batched(X: cp.ndarray, gene_jobs: list[dict], scores_gpu: cp
     feat_off = np.concatenate([[0], np.cumsum(k_list)]).astype(np.int32)
     max_k = int(k_list.max())
 
-    row_ids = cp.asarray(np.concatenate([job["row_ids"] for job in gene_jobs]))
+    row_ids = cp.asarray(np.concatenate([job["row_ids"] for job in gene_jobs]), dtype=cp.int32)
     col_ids = cp.asarray(np.concatenate([job["col_ids"] for job in gene_jobs]))
     is_guide = cp.asarray(np.concatenate([job["is_guide"] for job in gene_jobs]))
-    nt_flat = cp.asarray(np.concatenate([job["nt_in_all"] for job in gene_jobs]))
+    nt_flat = ~is_guide
     # double scratch: the kernel accumulates projections/stats in 64-bit so
     # float32 inputs keep full precision (matches mean_var's accumulation).
     pvec_scratch = cp.empty(int(cell_off[-1]), dtype=cp.float64)
