@@ -717,11 +717,7 @@ class EDistanceMetric(BaseMetric):
         if not len(contrasts):  # nothing to load
             return contrasts.assign(edistance=np.empty(0, dtype=_float_dtype(embedding_raw.dtype)))
 
-        all_cols = [groupby, *split_by]
-
-        # Single groupby to get cell indices for all combinations
-        grouped = adata.obs.groupby(all_cols, observed=True)
-        group_indices = grouped.indices
+        group_indices = self._contrast_indices(adata.obs, contrasts, groupby, split_by)
 
         # Build conditions from lists (a scalar read of a pandas array costs microseconds)
         target_vals = contrasts[groupby].tolist()

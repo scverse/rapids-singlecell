@@ -9,11 +9,11 @@ from anndata import AnnData
 from cupyx.scipy import sparse as cp_sparse
 
 from rapids_singlecell._utils import _create_category_index_mapping
-from rapids_singlecell.get import X_to_GPU, aggregate
+from rapids_singlecell.get import aggregate
 from rapids_singlecell.preprocessing._utils import _get_mean_var
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
-from ._base_metric import BaseMetric
+from ._base_metric import BaseMetric, _as_gpu_data, _check_n_bootstrap, _subset_data
 from ._utils._pseudobulk import (
     paired_abs_mean,
     paired_squared,
@@ -24,33 +24,7 @@ from ._utils._pseudobulk import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from scipy.sparse import csc_matrix as csc_matrix_cpu
-    from scipy.sparse import csr_matrix as csr_matrix_cpu
-
-    type _MatrixLike = (
-        np.ndarray | cp.ndarray | csr_matrix_cpu | csc_matrix_cpu | cp_sparse.csr_matrix | cp_sparse.csc_matrix
-    )
-    type _GPUMatrixLike = cp.ndarray | cp_sparse.csr_matrix | cp_sparse.csc_matrix
-
-
-def _as_gpu_data(data: pd.DataFrame | _MatrixLike) -> _GPUMatrixLike:
-    """Unwrap pandas DataFrames before delegating to :func:`X_to_GPU`."""
-    if isinstance(data, pd.DataFrame):
-        data = data.to_numpy()
-    return X_to_GPU(data)
-
-
-def _subset_data(data, mask: np.ndarray):
-    if isinstance(data, pd.DataFrame):
-        return data.iloc[mask]
-    if isinstance(data, cp.ndarray) or cp_sparse.issparse(data):
-        return data[cp.asarray(mask)]
-    return data[mask]
-
-
-def _check_n_bootstrap(n_bootstrap: int) -> None:
-    if n_bootstrap < 1:
-        raise ValueError("n_bootstrap must be a positive integer.")
+    from ._base_metric import _GPUMatrixLike
 
 
 def _pairwise_squared_euclidean(
@@ -578,6 +552,60 @@ class PearsonDistance(PseudobulkMetric):
         return 1 - numerator / denominator
 
 
+class SpearmanDistance(PearsonDistance):
+    """Pearson distance on average feature ranks."""
+
+    @staticmethod
+    def _ranks(means):
+        from rapids_singlecell.decoupler_gpu._method_viper import _rankdata
+
+        return cp.where(cp.isnan(means).any(axis=1, keepdims=True), cp.nan, _rankdata(means))
+
+    def _distance_between_means(self, X_mean, Y_mean):
+        X = self._ranks(X_mean)
+        Y = X if X_mean is Y_mean else self._ranks(Y_mean)
+        return super()._distance_between_means(X, Y)
+
+    def _distance_between_pairs(self, X_mean, Y_mean):
+        return super()._distance_between_pairs(self._ranks(X_mean), self._ranks(Y_mean))
+
+
+_kendall_counts = cp.ElementwiseKernel(
+    "raw T X, raw U Y, T x, U y, int64 features",
+    "float64 concordance, float64 untied_x, float64 untied_y",
+    """
+    const auto start = i / features * features;
+    concordance = isnan(x) || isnan(y) ? nan("") : 0.0;
+    untied_x = untied_y = 0.0;
+    for (auto j = start; j < i; ++j) {
+        const int dx = (x > X[j]) - (x < X[j]);
+        const int dy = (y > Y[j]) - (y < Y[j]);
+        concordance += dx * dy;
+        untied_x += dx != 0;
+        untied_y += dy != 0;
+    }
+    """,
+    "kendall_counts",
+)
+
+
+class KendallTauDistance(PseudobulkMetric):
+    """Tie-corrected Kendall distance in units of discordant feature pairs."""
+
+    def _distance_between_pairs(self, X_mean, Y_mean):
+        X, Y = cp.broadcast_arrays(X_mean, Y_mean)
+        n = X.shape[1]
+        concordance, untied_x, untied_y = _kendall_counts(X, Y, X, Y, n)
+        tau = concordance.sum(axis=1) / cp.sqrt(untied_x.sum(axis=1) * untied_y.sum(axis=1))
+        return (1 - tau) * (n * (n - 1) / 4)
+
+    def _distance_between_means(self, X_mean, Y_mean):
+        result = cp.empty((len(X_mean), len(Y_mean)))
+        for i, x in enumerate(X_mean):
+            result[i] = self._distance_between_pairs(x[None, :], Y_mean)
+        return result
+
+
 class CosineDistance(PseudobulkMetric):
     """Cosine distance between grouped mean vectors.
 
@@ -650,6 +678,8 @@ PSEUDOBULK_METRICS = {
     "mse": MeanSquaredDistance,
     "mean_absolute_error": MeanAbsoluteDistance,
     "pearson_distance": PearsonDistance,
+    "spearman_distance": SpearmanDistance,
+    "kendalltau_distance": KendallTauDistance,
     "cosine_distance": CosineDistance,
     "r2_distance": R2ScoreDistance,
 }

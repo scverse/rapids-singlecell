@@ -5,15 +5,48 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
+import pandas as pd
+from cupyx.scipy import sparse as cp_sparse
 
 from rapids_singlecell._keys import _preset_obsm_names, _resolve_obsm_key
 from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
+from rapids_singlecell.get import X_to_GPU
 from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anndata import AnnData
+    from scipy.sparse import csc_matrix as csc_matrix_cpu
+    from scipy.sparse import csr_matrix as csr_matrix_cpu
+
+    type _MatrixLike = (
+        np.ndarray | cp.ndarray | csr_matrix_cpu | csc_matrix_cpu | cp_sparse.csr_matrix | cp_sparse.csc_matrix
+    )
+    type _GPUMatrixLike = cp.ndarray | cp_sparse.csr_matrix | cp_sparse.csc_matrix
+
+
+def _as_gpu_data(data: pd.DataFrame | _MatrixLike) -> _GPUMatrixLike:
+    """Unwrap pandas DataFrames before delegating to :func:`X_to_GPU`."""
+    if isinstance(data, pd.DataFrame):
+        data = data.to_numpy()
+    if _is_sparse(data) and data.dtype.kind in "iu":
+        data = data.astype(np.float64)
+    return X_to_GPU(data)
+
+
+def _subset_data(data, mask: np.ndarray):
+    if isinstance(data, pd.DataFrame):
+        return data.iloc[mask]
+    if isinstance(data, cp.ndarray) or cp_sparse.issparse(data):
+        return data[cp.asarray(mask)]
+    return data[mask]
+
+
+def _check_n_bootstrap(n_bootstrap: int) -> None:
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be a positive integer.")
+
 
 # Re-export for backwards compatibility
 __all__ = ["BaseMetric", "parse_device_ids"]
@@ -171,6 +204,23 @@ class BaseMetric(ABC):
         groupby = contrasts.columns[0]
         split_by = [c for c in contrasts.columns if c not in (groupby, "reference")]
         return groupby, split_by
+
+    @staticmethod
+    def _contrast_indices(obs, contrasts, groupby, splits):
+        """Index cells by condition, restricting the groupby to requested strata."""
+        by = [groupby, *splits]
+        rows = None
+        for col in splits:
+            column = obs[col] if rows is None else obs[col].iloc[rows]
+            levels = contrasts[col].unique()
+            keep = column == levels[0] if len(levels) == 1 else column.isin(levels)
+            mask = keep.to_numpy(dtype=bool, na_value=False)
+            if not mask.all():
+                rows = np.flatnonzero(mask) if rows is None else rows[mask]
+        if rows is None:
+            return obs.groupby(by, sort=False, observed=True).indices
+        local = obs[by].iloc[rows].groupby(by, sort=False, observed=True).indices
+        return {key: rows[positions] for key, positions in local.items()}
 
     def _resolve_onesided_inputs(
         self,
