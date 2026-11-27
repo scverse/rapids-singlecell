@@ -7,7 +7,20 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ._wilcoxon_records import pack_records, range_base, rank_records
+from ._wilcoxon_records import _on_device, pack_records, range_base, rank_records
+
+
+def _pack_host_records(csr, labels, edges):
+    parts = pack_records(csr, labels, edges)
+    if parts is None:
+        return None
+
+    def to_host(a):
+        return a.get(out=np.empty(a.shape, dtype=a.dtype))
+
+    # All gene shards of a dictionary-encoded row share its lookup table.
+    table = to_host(parts[0][2]) if parts[0][3] else None
+    return [(ptr, to_host(words), table if bits else to_host(aux), bits) for ptr, words, aux, bits in parts]
 
 
 def _record_sizes(parts):
@@ -42,6 +55,14 @@ def _rank_columns(blocks, context, options, budget):
     start = 0
     max_entries = max(1, min(2**28, budget // 16))
     max_cols = max(1, min(4096, budget // (128 * len(context.group_sizes))))
+    if isinstance(blocks[0][1], np.ndarray) and (ptr[-1] > max_entries or n_cols > max_cols):
+        # Reuse row dictionaries across sort panels. Keep packed expression in RAM.
+        blocks = list(blocks)
+        remaining = budget
+        for i, (offsets, words, aux, bits) in enumerate(blocks):
+            if bits and aux.nbytes <= remaining:
+                remaining -= aux.nbytes
+                blocks[i] = offsets, words, _on_device(aux), bits
     while start < n_cols:
         end = int(np.searchsorted(ptr, ptr[start] + max_entries, side="right") - 1)
         end = min(start + max_cols, max(start + 1, end))
@@ -96,7 +117,7 @@ def rank_large_groups(rows, rg, options):
     return stats | {name: v for name in ("pts", "pts_rest") if (v := getattr(rg, name)) is not None}
 
 
-def _project_window(rows, codes, edges, *, client, workers, concurrency, budget):
+def _project_window(rows, codes, edges, *, client, workers, concurrency, budget, on_host=False):
     import dask
     from dask.local import identity  # type: ignore[import-not-found]
     from distributed import as_completed, wait  # type: ignore[import-not-found]
@@ -106,11 +127,12 @@ def _project_window(rows, codes, edges, *, client, workers, concurrency, budget)
     pending = {}
     todo = iter(zip(rows, codes, strict=True))
     completed = as_completed(loop=client.loop)
+    pack = _pack_host_records if on_host else pack_records
 
     def submit():
         if (item := next(todo, None)) is not None:
             row, labels = item
-            task = client.compute(dask.delayed(pack_records)(row, labels, edges))
+            task = client.compute(dask.delayed(pack)(row, labels, edges))
             receipt = client.submit(_record_sizes, task)
             pending[receipt] = task
             completed.add(receipt)
@@ -143,7 +165,8 @@ def _project_window(rows, codes, edges, *, client, workers, concurrency, budget)
     return columns, max(width, min(2 * width, estimate))
 
 
-def rank_csr_windows(rg, options, client, workers, budget):
+def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
+    window_budget = host_budget or budget
     X = rg.X
     concurrency = min(sum(min(n, 3) for n in workers.values()), (X.numblocks[0] + 1) // 2)
     workers = list(workers)
@@ -156,7 +179,7 @@ def rank_csr_windows(rg, options, client, workers, budget):
     max_width = (X.shape[1] + 1) // 2
     width = max_width
     prefix = None
-    capacity = 0.93 * budget
+    capacity = 0.93 * window_budget
     while start < X.shape[1]:
         stop = min(start + width, X.shape[1])
         if prefix is None:
@@ -168,7 +191,14 @@ def rank_csr_windows(rg, options, client, workers, budget):
             cuts = np.linspace(prefix[start], prefix[stop], min(len(workers), stop - start) + 1)
             edges = np.unique(np.searchsorted(prefix, cuts))
         columns, next_width = _project_window(
-            rows, codes, edges, client=client, workers=workers, concurrency=concurrency, budget=budget
+            rows,
+            codes,
+            edges,
+            client=client,
+            workers=workers,
+            concurrency=concurrency,
+            budget=window_budget,
+            on_host=bool(host_budget),
         )
         if columns is None or (not columns and stop - start == 1):
             return None
@@ -180,7 +210,9 @@ def rank_csr_windows(rg, options, client, workers, budget):
                 width = next_width
             continue
         width = max_width
-        capacity = min(0.93 * budget, capacity * next_width / (stop - start))
+        # The sample may price each entry at six bytes while packed words use four.
+        # Actual projected bytes are checked on every window.
+        capacity = min(1.5 * window_budget, capacity * next_width / (stop - start))
         jobs = [
             client.submit(_rank_columns, column, context, options, budget, workers=[worker], pure=False)
             for column, worker in zip(columns, workers, strict=False)

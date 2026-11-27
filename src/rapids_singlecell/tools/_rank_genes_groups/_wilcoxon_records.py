@@ -44,7 +44,6 @@ def pack_records(csr, labels, bounds):
     stripes = (tiles + tiles_per - 1) // tiles_per
     prefix = cp.empty((cols, stripes), cp.int32)
     bits = max(1, int(labels.max(initial=0)).bit_length())
-    slots = 1 << min(32 - bits, 22, max(1, (csr.nnz // 64).bit_length()))
     stream = cp.cuda.get_current_stream().ptr
     failed = cp.zeros(1, cp.int32)
     transpose = partial(
@@ -64,6 +63,7 @@ def pack_records(csr, labels, bounds):
     active = prefix[begin:end]
     cp.cumsum(active.ravel(), dtype=cp.int32, out=active.ravel())
     offsets = np.r_[np.int32(0), active[:, -1].get()]
+    slots = 1 << min(32 - bits, 22, max(1, (int(offsets[-1]) // 64).bit_length()))
     shard_entries = np.diff(offsets[np.asarray(bounds) - begin])
     modes = (bits, 0) if (slots * 4 <= 2 * shard_entries.astype(np.int64)).all() else (0,)
     base = range_base(csr.data, bits)
@@ -89,6 +89,15 @@ def pack_records(csr, labels, bounds):
         del pieces, words, codes, table  # Release the failed dictionary before allocating raw shards.
 
 
+def _on_device(a):
+    if isinstance(a, np.ndarray):
+        # The source stays live in blocks until the gather stream synchronizes.
+        out = cp.empty(a.shape, dtype=a.dtype)
+        out.set(a)
+        return out
+    return a
+
+
 def _gather_keys(blocks, lo, hi, group_count):
     source = np.stack([b[0][lo : hi + 1] for b in blocks])
     cumulative = np.cumsum(np.diff(source), axis=0, dtype=np.int64)
@@ -104,10 +113,10 @@ def _gather_keys(blocks, lo, hi, group_count):
     no_codes = no_table.view(cp.uint16)
     for i, (_, words, aux, bits) in enumerate(blocks):
         span = slice(source[i, 0], source[i, -1])
-        table = aux if bits else no_table
-        labels = no_codes if bits else aux[span]
+        table = _on_device(aux) if bits else no_table
+        labels = no_codes if bits else _on_device(aux[span])
         _wc.gather_rank_keys(
-            words[span], table, labels, bits, offsets[i], dest[i], keys, invalid, group_count, stream.ptr
+            _on_device(words[span]), table, labels, bits, offsets[i], dest[i], keys, invalid, group_count, stream.ptr
         )
     return ptr.astype(np.int32), None if invalid.item() else keys
 

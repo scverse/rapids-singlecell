@@ -283,8 +283,12 @@ def _run_dask_wilcoxon(rg, **options):
     if workers and row_csr and X.shape[1] > 0 and fits_records and options["multi_gpu"] in (None, False):
         from ._wilcoxon_dask import rank_csr_windows
 
+        host_bytes = parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.host-batch-size", default=0))
+        if host_bytes < 0:
+            raise ValueError("Wilcoxon host-batch-size must be nonnegative.")
         with suppress(MemoryError):
-            if (result := rank_csr_windows(rg, options, client, workers, target_bytes)) is not None:
+            result = rank_csr_windows(rg, options, client, workers, target_bytes, host_budget=host_bytes)
+            if result is not None:
                 return groups, *result
     width = max(1, target_bytes // (max(1, X.shape[0]) * entry_bytes))
     template = copy(rg)

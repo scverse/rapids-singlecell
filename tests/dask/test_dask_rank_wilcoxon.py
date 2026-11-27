@@ -15,7 +15,7 @@ from scipy.sparse import csr_matrix
 from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
-from rapids_singlecell.tools._rank_genes_groups import _wilcoxon
+from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_dask
 from rapids_singlecell.tools._rank_genes_groups._wilcoxon_dask import (
     _project_window,
     _sample_gene_sizes,
@@ -105,6 +105,7 @@ def test_dense_integer_rank_rows(reference):
         ("dense", "gpu-lognorm"),
         ("csr", "gpu-lognorm"),
         ("csr", "gpu"),
+        ("csr", "gpu-host-window"),
         ("csr", "gpu-infinite"),
         ("csr", "gpu-float64"),
     ],
@@ -121,6 +122,10 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     X[0, :] = 0
     if not lognorm:
         X[1, 0], X[2, 2] = -0.0, -0.125
+    if mode == "gpu-host-window":
+        # The second row block fits a value dictionary; the first needs raw values and group codes.
+        X[23:46, 1:] = 1
+        X[23, [1, 7]] = -1
     if mode == "gpu-infinite":
         X[4, 3] = np.inf
     if mode == "gpu-float64":
@@ -176,7 +181,21 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", check_rank)
     entry_bytes = X.itemsize * (2 if kind == "csr" else 1)
     budget = width * len(X) * entry_bytes
-    with dask.config.set({"array.chunk-size": budget, "rapids-singlecell.wilcoxon.batch-size": budget}):
+    config = {"array.chunk-size": budget, "rapids-singlecell.wilcoxon.batch-size": budget}
+    if mode == "gpu-host-window":
+        config["rapids-singlecell.wilcoxon.host-batch-size"] = 4096
+        config["rapids-singlecell.wilcoxon.batch-size"] = 512
+        rank_columns = _wilcoxon_dask._rank_columns
+
+        def check_host_blocks(blocks, *args):
+            assert all(isinstance(a, np.ndarray) for ptr, words, aux, _ in blocks for a in (ptr, words, aux))
+            assert any(bits and aux.size > 1 for _, _, aux, bits in blocks)
+            assert any(not bits for *_, bits in blocks)
+            return rank_columns(blocks, *args)
+
+        monkeypatch.setattr(_wilcoxon_dask, "_rank_columns", check_host_blocks)
+        monkeypatch.setattr(_wilcoxon, "_rank_dask_window", lambda *a, **kw: pytest.fail("expected CSR rank path"))
+    with dask.config.set(config):
         actual = rsc.tl.rank_genes_groups(lazy, "group", **kwargs)
     np.testing.assert_array_equal(actual["names"], expected["names"])
     for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
@@ -203,18 +222,19 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     assert actual["scores"]["a"][pos] == u
 
 
-def test_project_window_retries_with_all_rows(dist_client):
+@pytest.mark.parametrize("on_host", [False, True])
+def test_project_window_retries_with_all_rows(dist_client, *, on_host):
     row_sizes = [64, 65, 66, 67]
     width = 64
     budget = 32 * 1024
     rows = [dask.delayed(rsc.get.X_to_GPU)(csr_matrix(np.ones((n, width), np.float32))) for n in row_sizes]
     codes = [np.zeros(n, np.uint16) for n in row_sizes]
     options = {"client": dist_client, "workers": list(dist_client.nthreads())[:1], "concurrency": 2, "budget": budget}
-    columns, retry_width = _project_window(rows, codes, np.array([0, width]), **options)
+    columns, retry_width = _project_window(rows, codes, np.array([0, width]), on_host=on_host, **options)
     assert columns == []
     assert 1 <= retry_width < width
 
-    columns, _ = _project_window(rows, codes, np.array([0, retry_width]), **options)
+    columns, _ = _project_window(rows, codes, np.array([0, retry_width]), on_host=on_host, **options)
     (column,) = columns
     parts = dist_client.gather(column)
     assert sum(ptr.nbytes + words.nbytes + aux.nbytes for ptr, words, aux, _ in parts) <= budget

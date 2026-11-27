@@ -116,7 +116,12 @@ def rank_genes_groups(
         All methods support Dask arrays. Exact `'wilcoxon'` ranks dense and sparse
         inputs in bounded gene windows. Distributed GPU batches default to a quarter
         of each worker's device memory.
-        A distributed client processes one batch per worker at a time.
+        For distributed float32 GPU CSR, set the Dask option
+        ``rapids-singlecell.wilcoxon.host-batch-size`` to keep a larger gene window
+        in worker RAM and reduce source scans. The size limits packed records
+        assigned to each worker per window. Input chunks and transfers need
+        additional memory. ``rapids-singlecell.wilcoxon.batch-size`` sizes the
+        panels sorted on the GPU. Host staging defaults to off.
 
     .. note::
         **Exact Wilcoxon ranking precision:** `'wilcoxon'`
