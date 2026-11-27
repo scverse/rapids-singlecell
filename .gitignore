@@ -4,6 +4,7 @@ __pycache__/
 /*cache/
 .ipynb_checkpoints/
 /data/
+/benchmarks/
 test-data/
 .vscode/
 PanGPA.log
@@ -54,8 +55,7 @@ AGENTS.md
 
 # tmp_scripts
 tmp_scripts/
-/benchmarks/*
-!/benchmarks/wilcoxon.py
+/benchmarks/
 
 # From the scverse cookiecutter template
 *~
