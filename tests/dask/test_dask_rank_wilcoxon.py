@@ -185,7 +185,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         nrows = lazy.X.numblocks[0]
         rows = set(range(nrows))
         if host_reuse:
-            tail = nrows - max(1, nrows // 4)
+            tail = nrows - max(1, nrows // 8)
             split = (X.shape[1] + 3) // 4
             plans = [(rows, budgets[1] // 2), (set(range(tail, nrows)), budgets[1] // 2)]
         elif explicit_large_batch:

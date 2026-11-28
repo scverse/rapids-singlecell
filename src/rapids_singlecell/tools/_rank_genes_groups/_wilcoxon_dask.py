@@ -14,7 +14,7 @@ import numpy as np
 from ._wilcoxon_records import _on_device, csc_records, pack_records, range_base, rank_records
 
 
-def _pack_row(x, codes, *, edges, on_host, owners, short_from, block_id=None):
+def _pack_row(x, codes, *, edges, on_host, short_from, block_id=None):
     def to_host(a):
         return a.get(out=np.empty(a.shape, dtype=a.dtype))
 
@@ -23,13 +23,6 @@ def _pack_row(x, codes, *, edges, on_host, owners, short_from, block_id=None):
     parts = pack_records(x, codes[:, 0], edges)
     if parts is None:
         parts = [None] * (len(edges) - 1)
-    elif owners:
-        from distributed import get_worker  # type: ignore[import-not-found]
-
-        source = get_worker().address
-        for j, owner in enumerate(owners[: len(parts)]):
-            if source == owner:
-                parts[j] = _host_part(parts[j])
     elif on_host:
         # The gene shards of a row share its lookup table.
         table = to_host(parts[0][2]) if parts[0][3] else None
@@ -59,7 +52,7 @@ def _host_part(part):
         return ptr, *pool.map(copy_array, (words, groups)), bits
 
 
-def _record_sizes(parts, *_previous):
+def _record_sizes(parts, *_drained):
     return None if parts[0] is None else [sum(a.nbytes for a in part[:3]) for part in parts]
 
 
@@ -147,39 +140,45 @@ def _project_window(
 ):
     import dask  # type: ignore[import-not-found]
     from dask.local import identity  # type: ignore[import-not-found]
-    from distributed import as_completed, wait
+    from distributed import as_completed, wait  # type: ignore[import-not-found]
 
     columns = [[] for _ in range(len(edges) - 1)]
     retained = np.zeros(len(columns), np.int64)
     sources = list(dict.fromkeys(workers)) if isinstance(X._meta, cp.ndarray) else []
     shuffle = on_host and bool(sources)
 
-    pack = partial(_pack_row, edges=edges, owners=workers if shuffle else (), on_host=on_host, short_from=short_from)
+    pack = partial(_pack_row, edges=edges, on_host=on_host and not shuffle, short_from=short_from)
     packed = X.map_blocks(pack, codes, chunks=(1, 1), meta=np.empty((0, 0), object))
     (packed,) = dask.optimize(packed)
     rows = range(X.numblocks[0]) if selected is None else selected
-    active = min((len(rows) + 1) // 2, concurrency)
+    active = min(len(rows), concurrency)
     sources = sources[:active]
     lanes = [iter(rows[i :: len(sources)]) for i in range(len(sources))] if sources else [iter(rows)]
-    previous = [[] for _ in lanes]
     completed = as_completed(loop=client.loop, with_results=True)
     pending = {}
+    previous = [[] for _ in lanes]
 
     def submit(i):
         if (row := next(lanes[i], None)) is not None:
             source = [sources[i]] if sources else None
             short = short_from is not None and row >= short_from
             task = client.compute(packed[row, 0].to_delayed().item(), workers=source)
-            # Start the next read when this row is packed and the preceding row's transfers finish.
-            receipt = client.submit(_record_sizes, task, *previous[i], workers=source)
-            parts, previous[i] = [], []
+            parts, arrived, drained = [], [], []
             for j, owner in enumerate(workers[: len(columns) // 2 if short else len(columns)]):
                 piece = client.submit(getitem, task, j, workers=source)
-                if not source or owner != source[0]:
-                    piece = client.submit(_host_part if shuffle else identity, piece, workers=[owner], pure=False)
-                    if shuffle:
-                        previous[i].append(client.submit(bool, piece, workers=[owner]))
+                remote = not source or owner != source[0]
+                if remote:
+                    piece = client.submit(identity, piece, workers=[owner], pure=False)
+                if shuffle:
+                    if remote:
+                        arrived.append(client.submit(bool, piece, workers=[owner]))
+                    piece = client.submit(_host_part, piece, workers=[owner])
+                    done = client.submit(bool, piece, workers=[owner])
+                    (drained if remote else arrived).append(done)
                 parts.append(piece)
+            # Reuse the source after its transfers arrive. The previous row’s remote host copies can overlap the next read.
+            receipt = client.submit(_record_sizes, task, *previous[i], *arrived, workers=source)
+            previous[i] = drained
             pending[receipt] = parts, i
             completed.add(receipt)
 
@@ -199,7 +198,7 @@ def _project_window(
                 column.append(part)
             submit(lane)
     finally:
-        wait([*pending, *(ack for lane in previous for ack in lane)])
+        wait([*pending, *(f for group in previous for f in group)])
     width = int(edges[-1] - edges[0])
     estimate = max(1, int(width * 0.9 * (budget / max(1, retained.max())) * observed / len(rows)))
     if retained.max() > budget:
@@ -240,7 +239,7 @@ def rank_record_windows(rg, options, client, workers, budget, *, host_budget):
         rows = np.arange(X.numblocks[0])
         split = (X.shape[1] + 3) // 4 if host_budget else max_width
         reserve = host_budget // 2 if host_budget else 2 * budget // 3
-        reread = rows[-max(1, len(rows) // 4) :] if host_budget else rows[::3]
+        reread = rows[-max(1, len(rows) // 8) :] if host_budget else rows[::3]
         left = np.linspace(0, split, len(workers) + 1, dtype=int)
         right = np.linspace(split, X.shape[1], len(workers) + 1, dtype=int)
         edges = np.r_[left, right[1:]]
