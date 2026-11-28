@@ -104,19 +104,25 @@ def rank_genes_groups(
     """
     Rank genes for characterizing groups using GPU acceleration.
 
-    Use log1p-normalized expression for log fold changes. ``wilcoxon`` ranks
-    float32 values exactly, including signed values and implicit sparse zeros.
-    Values that tie at float32 precision receive their average rank, even if
-    they were distinct in float64. Means and log fold changes use float64.
-    Two-sided Wilcoxon p-values use the normal approximation.
-    ``wilcoxon_binned`` rejects negative Dask sparse input.
+    Log1p/log-normalized data is expected for biologically meaningful log fold
+    changes. Exact sparse ``wilcoxon`` versus rest ranks signed stored values
+    and implicit zeros directly. In memory, sparse ``wilcoxon`` with an explicit reference
+    uses sign-safe dense ranking in bounded CUDA streamer tiles. Dense inputs
+    are ranked directly and support any sign.
+    (``wilcoxon_binned`` rejects negative Dask sparse input, which it cannot
+    bin correctly.)
 
     .. note::
-        All methods support Dask arrays. Exact ``wilcoxon`` ranks dense and
-        sparse inputs in bounded gene windows. With distributed float32 GPU
-        CSR, workers may keep a window of packed expression and group labels
-        in host RAM to reduce source reads. See :ref:`out-of-core-wilcoxon`
-        for a lazy CSR Zarr example and per-worker memory settings.
+        All methods support Dask arrays. For exact ranks on lazy dense or CSR data,
+        see :ref:`out-of-core-wilcoxon` for an example and per-worker memory settings.
+
+    .. note::
+        **Wilcoxon ranking precision:** The exact Wilcoxon kernels
+        rank values in float32 on every code path, while means and log fold
+        changes are computed in float64. Distinct float64 values can tie when
+        **preprocessing itself ran in float64** — i.e. normalization/log1p
+        produced values carrying sub-float32 precision. Ties receive their
+        average rank. Two-sided p-values use the normal approximation.
 
     Parameters
     ----------
@@ -150,9 +156,9 @@ def rank_genes_groups(
         `'t-test'` uses Welch's t-test (default),
         `'t-test_overestim_var'` overestimates variance of each group,
         `'wilcoxon'` uses Wilcoxon rank-sum,
+        `'wilcoxon_binned'` uses histogram-based approximate Wilcoxon rank-sum
+        (deprecated in favor of `'wilcoxon'`),
         `'logreg'` uses logistic regression.
-        `'wilcoxon_binned'` is the deprecated histogram approximation.
-        Use `'wilcoxon'` for exact ranks on in-memory and Dask inputs.
     corr_method
         p-value correction method. Used only for `'t-test'`,
         `'t-test_overestim_var'`, `'wilcoxon'`, and `'wilcoxon_binned'`.
@@ -184,15 +190,15 @@ def rank_genes_groups(
         GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
         and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
         visible GPUs for host input, while device input stays on its owning
-        GPU. For Dask input, each exact Wilcoxon batch uses its worker's GPU
-        by default. Explicit device selections apply within each worker.
-        For the streaming t-test/binned paths, ``None``
+        GPU. For the streaming t-test/binned paths, ``None``
         and ``False`` use the current GPU. ``True`` uses all visible GPUs, and a
         list or comma-separated string selects device IDs. Streaming multi-GPU
         is host-only: CSR/dense input is sharded by cell rows, CSC by gene
         columns, and results are gathered on the current device. Device-resident
         t-test/binned input runs on its owning GPU. On small host inputs the
         sharding overhead can make multi-GPU slower than a single GPU.
+        Exact Wilcoxon on Dask uses each worker's GPU by default.
+        Explicit device selections apply within each worker.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000

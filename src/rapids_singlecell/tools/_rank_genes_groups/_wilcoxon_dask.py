@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
+from functools import partial
 from operator import getitem
 from types import SimpleNamespace
 
@@ -166,12 +168,22 @@ def _project_window(rows, codes, edges, *, client, workers, concurrency, budget,
 
 
 def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
+    import dask
+
     window_budget = host_budget or budget
     X = rg.X
-    concurrency = min(sum(min(n, 3) for n in workers.values()), (X.numblocks[0] + 1) // 2)
+    lookahead = (
+        not host_budget
+        and budget >= 16 * 2**30
+        and X.numblocks[0] >= 4
+        and X.shape[1] >= 2 * len(workers)
+        and dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=None) is None
+    )
+    concurrency = min(sum(min(n, 7 if lookahead else 3) for n in workers.values()), (X.numblocks[0] + 1) // 2)
     workers = list(workers)
     rows = X.to_delayed()[:, 0]
     codes = np.split(rg.group_codes.astype(np.uint16), np.cumsum(X.chunks[0])[:-1])
+    project = partial(_project_window, client=client, concurrency=concurrency, on_host=bool(host_budget))
     fields = ("group_sizes", "ireference", "mean_in_log_space", "_log1p_base", "comp_pts")
     context = SimpleNamespace(n_obs=X.shape[0], **{name: getattr(rg, name) for name in fields})
     results = []
@@ -180,6 +192,13 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
     width = max_width
     prefix = None
     capacity = 0.93 * window_budget
+    saved = None
+    if lookahead:
+        # Project two gene windows for at most half the rows. A worker holds at most half a batch per shard.
+        left = np.linspace(0, max_width, len(workers) + 1, dtype=int)
+        right = np.linspace(max_width, X.shape[1], len(workers) + 1, dtype=int)
+        with suppress(MemoryError):
+            saved, _ = project(rows[1::2], codes[1::2], np.r_[left, right[1:]], workers=workers * 2, budget=budget // 2)
     while start < X.shape[1]:
         stop = min(start + width, X.shape[1])
         if prefix is None:
@@ -190,16 +209,17 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
             stop = min(stop, max(start + 1, int(np.searchsorted(prefix, upper, side="right")) - 1))
             cuts = np.linspace(prefix[start], prefix[stop], min(len(workers), stop - start) + 1)
             edges = np.unique(np.searchsorted(prefix, cuts))
-        columns, next_width = _project_window(
-            rows,
-            codes,
-            edges,
-            client=client,
-            workers=workers,
-            concurrency=concurrency,
-            budget=window_budget,
-            on_host=bool(host_budget),
-        )
+        columns = None
+        if saved:
+            with suppress(MemoryError):
+                columns, next_width = project(rows[::2], codes[::2], edges, workers=workers, budget=budget // 2)
+            if columns:
+                columns = [old + new for old, new in zip(saved[: len(columns)], columns, strict=True)]
+                saved = saved[len(columns) :]
+            else:
+                saved = None
+        if not columns:
+            columns, next_width = project(rows, codes, edges, workers=workers, budget=window_budget)
         if columns is None or (not columns and stop - start == 1):
             return None
         if not columns:

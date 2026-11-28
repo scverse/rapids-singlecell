@@ -156,11 +156,8 @@ supported.
 (out-of-core-wilcoxon)=
 ## Exact Wilcoxon on log-normalized CSR
 
-Use the Zarr example above with `chunks=(100_000, -1)` for 100,000 cells per CSR chunk.
-For KvikIO reads from local sharded Zstd stores, import `zarr_kvikio.dask`, set
-`zarr.config.set({"kvikio.fetch": "kvikio"})`, and call `zarr_kvikio.dask.enable(client)` before opening the store.
-Start with raw counts. If `adata.X` already contains log-normalized values, skip the two preprocessing calls.
-This example compares each group in `adata.obs["cell_type"]` with the remaining cells.
+Open the CSR Zarr store as above with `chunks=(100_000, -1)`. For KvikIO reads from local sharded Zstd stores, first import `zarr_kvikio.dask`, set `zarr.config.set({"kvikio.fetch": "kvikio"})`, and call `zarr_kvikio.dask.enable(client)`.
+This example compares each cell type with the remaining cells. Skip the two preprocessing calls if `adata.X` is already log-normalized.
 
 ```python
 import rapids_singlecell as rsc
@@ -172,32 +169,15 @@ rsc.tl.rank_genes_groups(adata, "cell_type", method="wilcoxon", use="X", tie_cor
 results = adata.uns["rank_genes_groups"]
 ```
 
-With a fixed `target_sum`, GPU transfer, normalization and `log1p` are lazy.
-The ranking call runs the graph. For each window of genes it reads the CSR row
-chunks and includes every cell in the comparison. It ranks float32 expression
-values directly, gives ties their average rank and includes implicit zeros.
-Two-sided p-values use the normal approximation. Set `return_u_values=True` to
-store the Mann–Whitney U statistic in `scores`. The client holds the cell labels
-and group-by-gene results, including expression fractions when `pts=True`.
+With a fixed `target_sum`, GPU transfer and preprocessing stay lazy until ranking. For each gene, Wilcoxon ranks the float32 values across the comparison cells, including implicit zeros, and gives ties their average rank. Two-sided p-values use the normal approximation.
+Set `return_u_values=True` to store Mann–Whitney U in `scores`. The client holds cell labels and group-by-gene results, including expression fractions with `pts=True`. Inputs must have fewer than `2**31` cells. Float64 U statistics can round half-integers above `2**52`.
 
-On distributed float32 GPU CSR, workers retain lossless values and group labels
-for the current gene window. A larger window uses more memory and reduces
-rereads and repeated normalization. GPU sort panels default to 25% of device
-memory, capped at 30% of a configured RMM pool maximum. When worker RAM can
-hold a substantially larger window, Wilcoxon can use up to a quarter of each
-worker’s host memory allowance, subject to available RAM on the node.
-For a 10 GB pool per GPU, set `rmm_pool_size="10 GB"` and `rmm_maximum_pool_size="10 GB"`
-on `LocalCUDACluster` with CuPy using RMM. CUDA and I/O can allocate additional memory outside the pool.
+Workers process a window of genes at a time and release the original CSR chunks after packing their expression values and group labels. When the automatic GPU sort budget is at least 16 GiB per worker and records stay on the GPU, workers can also pack the next window for up to half the row chunks on the first read. They retain at most half a batch per worker for that next window, saving a reread and normalization of those chunks.
+With a smaller GPU pool, workers can keep a larger window in host RAM when space permits. By default, this uses at most a quarter of each worker’s host memory allowance, subject to available RAM on the node.
 
-Two Dask options override the automatic sizing. `rapids-singlecell.wilcoxon.batch-size`
-sets the GPU sort-panel target in bytes per worker. `rapids-singlecell.wilcoxon.host-batch-size`
-limits packed records assigned to each worker in host RAM per window. Set it to
-`0` to keep the records on the GPU. Each worker also needs room for a source
-chunk, transfers and sorting workspace. Host arrays and local schedulers use
-Dask’s `array.chunk-size`.
-
-The kernels support fewer than `2**31` cells. Returned float64 U statistics
-can round half-integers above `2**52`.
+For a 10 GB pool per GPU, set both `rmm_pool_size="10 GB"` and `rmm_maximum_pool_size="10 GB"` on `LocalCUDACluster` with CuPy using RMM. The default GPU batch is 25% of device memory, capped at 30% of the configured pool maximum (3 GB for a 10 GB pool). CUDA and I/O can allocate outside the pool.
+On the 11.44-million-cell atlas we used two GPU workers with `protocol="ucx"`, `threads_per_worker=7`, and 82 GiB for both RMM pool settings on each worker. We set `zarr.config.set({"kvikio.decoders": 2, "kvikio.max_decode_bytes": 2**30})` before enabling KvikIO and left Wilcoxon’s memory settings at their automatic defaults.
+To override those defaults, use `rapids-singlecell.wilcoxon.batch-size` for the per-worker GPU sort budget and `rapids-singlecell.wilcoxon.host-batch-size` for packed records in host RAM (`0` keeps them on the GPU). Leave room for source chunks, transfers and sorting. Host arrays and local schedulers use `array.chunk-size`.
 
 ## Troubleshooting
 

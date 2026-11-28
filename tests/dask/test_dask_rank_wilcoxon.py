@@ -11,22 +11,12 @@ import pytest
 import zarr
 from anndata import AnnData, io
 from anndata.experimental import read_elem_lazy
+from anndata.utils import asarray
 from scipy.sparse import csr_matrix
 from scipy.stats import mannwhitneyu
 
 import rapids_singlecell as rsc
-from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_dask
-from rapids_singlecell.tools._rank_genes_groups._wilcoxon_dask import (
-    _project_window,
-    _sample_gene_sizes,
-    rank_large_groups,
-)
-from rapids_singlecell.tools._rank_genes_groups._wilcoxon_records import (
-    _gather_keys,
-    pack_records,
-    range_base,
-    rank_records,
-)
+from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_dask, _wilcoxon_records
 
 
 def test_rank_budgets_respect_worker_and_shared_memory():
@@ -72,15 +62,15 @@ def test_range_packing_preserves_float_bits_and_group_codes():
     patterns = np.array([[low, low + 1], [low + 33, low + 2**26 - 1]], dtype=np.uint32)
     x = cp.asarray(patterns).view(cp.float32)
     groups = np.array([63, 17], dtype=np.uint16)
-    (part,) = pack_records(cpsp.csr_matrix(x), groups, np.array([0, 2]))
+    (part,) = _wilcoxon_records.pack_records(cpsp.csr_matrix(x), groups, np.array([0, 2]))
     assert part[1].nbytes == x.nbytes
     assert part[2].size == 1 and part[2].item() == low
     assert part[3] == 6
-    _, keys = _gather_keys([part], 0, 2, 64)
+    _, keys = _wilcoxon_records._gather_keys([part], 0, 2, 64)
     unpacked = keys.get()
     np.testing.assert_array_equal((unpacked >> 6).astype(np.uint32) ^ 0x80000000, patterns.T.ravel())
     np.testing.assert_array_equal(unpacked & 63, np.tile(groups, 2))
-    assert range_base(cp.asarray([low, low + 2**26], cp.uint32).view(cp.float32), 6) is None
+    assert _wilcoxon_records.range_base(cp.asarray([low, low + 2**26], cp.uint32).view(cp.float32), 6) is None
 
 
 @pytest.mark.parametrize("reference", [None, 1])
@@ -97,7 +87,7 @@ def test_large_group_keeps_half_integer_u(reference):
     )
     block = (np.array([0, 2], np.int32), cp.ones(2, cp.float32).view(cp.uint32), cp.arange(2, dtype=cp.uint16), 0)
     opts = {"tie_correct": True, "use_continuity": False, "return_u_values": True}
-    _, scores, _, _, counts = rank_records([block], 0, 1, rg, opts)
+    _, scores, _, _, counts = _wilcoxon_records.rank_records([block], 0, 1, rg, opts)
     # Each target zero ties two reference zeros. Its positive wins twice and ties once.
     assert scores[0, 0].item() == size - 1 + 2.5
     np.testing.assert_array_equal(counts.get(), [[1], [1]])
@@ -118,7 +108,7 @@ def test_dense_integer_rank_rows(reference):
         pts_rest=None,
     )
     opts = {"tie_correct": True, "use_continuity": False, "return_u_values": True}
-    stats = rank_large_groups([x[:8], x[8:]], rg, opts)
+    stats = _wilcoxon_dask.rank_large_groups([x[:8], x[8:]], rg, opts)
     ref = labels != 0 if reference is None else labels == reference
     expected = mannwhitneyu(
         x[labels == 0].astype(np.float64), x[ref].astype(np.float64), method="asymptotic", use_continuity=False
@@ -129,7 +119,7 @@ def test_dense_integer_rank_rows(reference):
     compact, positions = _wilcoxon._compact_rank_groups(rg, np.array([0, 2]))
     np.testing.assert_array_equal(positions, [0, 2] if reference is None else [0, 1])
     np.testing.assert_array_equal(compact.group_codes[labels >= 3], len(compact.group_sizes))
-    partial = rank_large_groups([x[:8], x[8:]], compact, opts)
+    partial = _wilcoxon_dask.rank_large_groups([x[:8], x[8:]], compact, opts)
     for name in ("scores", "pvals"):
         np.testing.assert_array_equal(partial[name], stats[name][positions])
 
@@ -219,17 +209,27 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", check_rank)
     entry_bytes = X.itemsize * (2 if kind == "csr" else 1)
     budget = width * len(X) * entry_bytes
-    config = {"array.chunk-size": budget, "rapids-singlecell.wilcoxon.batch-size": budget}
-    if mode == "gpu":
+    explicit_large_batch = kind == "csr" and lognorm and reference == "b"
+    config = {"array.chunk-size": budget}
+    if mode != "gpu":
+        config["rapids-singlecell.wilcoxon.batch-size"] = 16 * 2**30 if explicit_large_batch else budget
+    if mode == "gpu" or explicit_large_batch:
         config["rapids-singlecell.wilcoxon.host-batch-size"] = 0
-        monkeypatch.setattr(_wilcoxon, "_rank_budgets", lambda *args: (budget, 4096))
-        rank = _wilcoxon_dask.rank_csr_windows
+        monkeypatch.setattr(_wilcoxon, "_rank_budgets", lambda *args: (16 * 2**30, 4096))
+        project = _wilcoxon_dask._project_window
+        projections = []
 
-        def check_opt_out(*args, host_budget):
-            assert host_budget == 0
-            return rank(*args, host_budget=host_budget)
+        def check_project(rows, codes, edges, **opts):
+            assert not opts.get("on_host", False)
+            assert (edges[0] == 0 and edges[-1] == X.shape[1]) == (mode == "gpu" and not projections)
+            assert opts["concurrency"] <= (lazy.X.numblocks[0] + 1) // 2
+            assert opts["budget"] == (8 if mode == "gpu" and len(projections) < 3 else 16) * 2**30
+            projections.append({row.key for row in rows})
+            if len(projections) == 3 and reference == "b":
+                opts["budget"] = 1  # Reject the remaining rows of the second window.
+            return project(rows, codes, edges, **opts)
 
-        monkeypatch.setattr(_wilcoxon_dask, "rank_csr_windows", check_opt_out)
+        monkeypatch.setattr(_wilcoxon_dask, "_project_window", check_project)
     if mode == "gpu-host-window":
         config["rapids-singlecell.wilcoxon.host-batch-size"] = 4096
         config["rapids-singlecell.wilcoxon.batch-size"] = 512
@@ -245,6 +245,14 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         monkeypatch.setattr(_wilcoxon, "_rank_dask_window", lambda *a, **kw: pytest.fail("expected CSR rank path"))
     with dask.config.set(config):
         actual = rsc.tl.rank_genes_groups(lazy, "group", **kwargs)
+    if mode == "gpu":
+        first, rest, *later = projections
+        assert len(first) <= lazy.X.numblocks[0] // 2 and first.isdisjoint(rest)
+        assert len(first | rest) == lazy.X.numblocks[0]
+        assert later == ([rest, first | rest] if reference == "b" else [rest])
+    if explicit_large_batch:
+        assert len(projections) == 2 and projections[0] == projections[1]
+        assert len(projections[0]) == lazy.X.numblocks[0]
     np.testing.assert_array_equal(actual["names"], expected["names"])
     for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
         for group in expected[field].dtype.names:
@@ -258,11 +266,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         np.testing.assert_array_equal(actual["pts"][group], np.count_nonzero(X[mask], axis=0) / mask.sum())
         if reference == "rest":
             np.testing.assert_array_equal(actual["pts_rest"][group], np.count_nonzero(X[~mask], axis=0) / (~mask).sum())
-    column = eager.X[:, 1:2]
-    if hasattr(column, "get"):
-        column = column.get()
-    if hasattr(column, "toarray"):
-        column = column.toarray()
+    column = asarray(eager.X[:, 1:2])
     group = labels == "a"
     control = ~group if reference == "rest" else labels == reference
     pos = np.flatnonzero(actual["names"]["a"] == eager.var_names[1]).item()
@@ -278,11 +282,11 @@ def test_project_window_retries_with_all_rows(dist_client, *, on_host):
     rows = [dask.delayed(rsc.get.X_to_GPU)(csr_matrix(np.ones((n, width), np.float32))) for n in row_sizes]
     codes = [np.zeros(n, np.uint16) for n in row_sizes]
     options = {"client": dist_client, "workers": list(dist_client.nthreads())[:1], "concurrency": 2, "budget": budget}
-    columns, retry_width = _project_window(rows, codes, np.array([0, width]), on_host=on_host, **options)
+    columns, retry_width = _wilcoxon_dask._project_window(rows, codes, np.array([0, width]), on_host=on_host, **options)
     assert columns == []
     assert 1 <= retry_width < width
 
-    columns, _ = _project_window(rows, codes, np.array([0, retry_width]), on_host=on_host, **options)
+    columns, _ = _wilcoxon_dask._project_window(rows, codes, np.array([0, retry_width]), on_host=on_host, **options)
     (column,) = columns
     parts = dist_client.gather(column)
     assert sum(ptr.nbytes + words.nbytes + aux.nbytes for ptr, words, aux, _ in parts) <= budget
@@ -295,6 +299,6 @@ def test_sample_gene_sizes_counts_stored_entries(dist_client):
     X = csr_matrix(np.array([[0, 1, 2], [0, 0, 2]] * 8, np.float32))
     rows = [dask.delayed(rsc.get.X_to_GPU)(X) for _ in range(4)]
     codes = [np.zeros(X.shape[0], np.uint16)] * len(rows)
-    prefix = _sample_gene_sizes(dist_client, rows, codes, concurrency=2)
+    prefix = _wilcoxon_dask._sample_gene_sizes(dist_client, rows, codes, concurrency=2)
     expected = 4 * len(rows) * (np.array([0, 8, 16]) + 1)
     np.testing.assert_array_equal(np.diff(prefix), expected)
