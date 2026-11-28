@@ -29,6 +29,44 @@ from rapids_singlecell.tools._rank_genes_groups._wilcoxon_records import (
 )
 
 
+def test_rank_budgets_respect_worker_and_shared_memory():
+    gib = 2**30
+    # Two workers on one node with 96 GiB each and 10 GB RMM pools.
+    workers = [(96 * gib, 10**10, "node", 24 * gib, 256 * gib)] * 2
+    assert _wilcoxon._rank_budgets(workers, 10**13) == (3 * 10**9, 24 * gib)
+    assert _wilcoxon._rank_budgets(workers, 10**6) == (3 * 10**9, 0)
+    workers[1] = (*workers[1][:4], 64 * gib)
+    assert _wilcoxon._rank_budgets(workers, 10**13)[1] == 8 * gib
+    workers[1] = (96 * gib, 10**10, "other", 24 * gib, 64 * gib)
+    assert _wilcoxon._rank_budgets(workers, 10**13)[1] == 16 * gib
+    with dask.config.set({"rapids-singlecell.wilcoxon.batch-size": "2 GB"}):
+        assert _wilcoxon._rank_budgets(workers, 10**13)[0] == 2 * 10**9
+    for pool in (82 * gib, None):
+        assert _wilcoxon._rank_budgets([(96 * gib, pool, "node", 32 * gib, 256 * gib)], 10**13) == (24 * gib, 0)
+    small_gpu = (8 * gib, None, "node")
+    assert _wilcoxon._rank_budgets([(*small_gpu, 24 * gib, 128 * gib)], 10**13) == (2 * gib, 24 * gib)
+    assert _wilcoxon._rank_budgets([(*small_gpu, 3 * gib, 128 * gib)], 10**13) == (2 * gib, 0)
+
+
+def test_worker_memory_without_dask_limits(monkeypatch):
+    import psutil
+    from distributed import system
+
+    gib = 2**30
+    monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (4 * gib, 8 * gib))
+    monkeypatch.setattr(system, "MEMORY_LIMIT", 64 * gib)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=40 * gib))
+    worker = SimpleNamespace(
+        plugins={"rmm": type("RMMSetup", (), {})()},  # Older plugin without a configured pool.
+        memory_manager=SimpleNamespace(memory_limit=None),
+        monitor=SimpleNamespace(get_process_memory=lambda: gib),
+        host="node",
+    )
+    assert _wilcoxon._worker_rank_memory(worker) == (8 * gib, None, "node", 16 * gib, 40 * gib)
+    worker.memory_manager.memory_limit = gib
+    assert _wilcoxon._worker_rank_memory(worker)[3] == 0
+
+
 def test_range_packing_preserves_float_bits_and_group_codes():
     low = 0x3E000000
     patterns = np.array([[low, low + 1], [low + 33, low + 2**26 - 1]], dtype=np.uint32)
@@ -182,6 +220,16 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     entry_bytes = X.itemsize * (2 if kind == "csr" else 1)
     budget = width * len(X) * entry_bytes
     config = {"array.chunk-size": budget, "rapids-singlecell.wilcoxon.batch-size": budget}
+    if mode == "gpu":
+        config["rapids-singlecell.wilcoxon.host-batch-size"] = 0
+        monkeypatch.setattr(_wilcoxon, "_rank_budgets", lambda *args: (budget, 4096))
+        rank = _wilcoxon_dask.rank_csr_windows
+
+        def check_opt_out(*args, host_budget):
+            assert host_budget == 0
+            return rank(*args, host_budget=host_budget)
+
+        monkeypatch.setattr(_wilcoxon_dask, "rank_csr_windows", check_opt_out)
     if mode == "gpu-host-window":
         config["rapids-singlecell.wilcoxon.host-batch-size"] = 4096
         config["rapids-singlecell.wilcoxon.batch-size"] = 512

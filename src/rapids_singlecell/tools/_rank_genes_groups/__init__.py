@@ -104,39 +104,19 @@ def rank_genes_groups(
     """
     Rank genes for characterizing groups using GPU acceleration.
 
-    Log1p/log-normalized data is expected for biologically meaningful log fold
-    changes. Exact sparse ``wilcoxon`` versus rest ranks signed stored values
-    and implicit zeros directly. Sparse ``wilcoxon`` with an explicit reference
-    uses sign-safe dense ranking in bounded CUDA streamer tiles. Dense inputs
-    are ranked directly and support any sign.
-    (``wilcoxon_binned`` rejects negative Dask sparse input, which it cannot
-    bin correctly.)
+    Use log1p-normalized expression for log fold changes. ``wilcoxon`` ranks
+    float32 values exactly, including signed values and implicit sparse zeros.
+    Values that tie at float32 precision receive their average rank, even if
+    they were distinct in float64. Means and log fold changes use float64.
+    Two-sided Wilcoxon p-values use the normal approximation.
+    ``wilcoxon_binned`` rejects negative Dask sparse input.
 
     .. note::
-        All methods support Dask arrays. Exact `'wilcoxon'` ranks dense and sparse
-        inputs in bounded gene windows. Distributed GPU batches default to a quarter
-        of each worker's device memory.
-        For distributed float32 GPU CSR, set the Dask option
-        ``rapids-singlecell.wilcoxon.host-batch-size`` to keep a larger gene window
-        in worker RAM and reduce source scans. The size limits packed records
-        assigned to each worker per window. Input chunks and transfers need
-        additional memory. ``rapids-singlecell.wilcoxon.batch-size`` sizes the
-        panels sorted on the GPU. Host staging defaults to off.
-
-    .. note::
-        **Exact Wilcoxon ranking precision:** `'wilcoxon'`
-        ranks values in float32 on every code path, while means and log fold
-        changes are computed in float64. This only diverges from Scanpy when the
-        **preprocessing itself ran in float64** — i.e. normalization/log1p
-        produced values carrying sub-float32 precision. If preprocessing was
-        done in float32 (the common case), the values are float32-exact and
-        ranking is bit-identical to Scanpy (~1e-13), even if they are afterward
-        stored as float64. For a fully float64 pipeline the rank-derived scores
-        and p-values still match Scanpy-on-float64 to ~1e-4 on log-normalized
-        data — below any significance threshold and changing no DE calls —
-        because the rank-sum normal approximation is insensitive to sub-float32
-        tie jitter. If exact float64 ranking matters for your workflow, please
-        open an issue at https://github.com/scverse/rapids_singlecell/issues.
+        All methods support Dask arrays. Exact ``wilcoxon`` ranks dense and
+        sparse inputs in bounded gene windows. With distributed float32 GPU
+        CSR, workers may keep a window of packed expression and group labels
+        in host RAM to reduce source reads. See :ref:`out-of-core-wilcoxon`
+        for a lazy CSR Zarr example and per-worker memory settings.
 
     Parameters
     ----------

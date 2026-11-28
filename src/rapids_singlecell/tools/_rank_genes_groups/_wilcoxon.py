@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from collections import Counter
 from contextlib import suppress
 from copy import copy
 from itertools import batched, chain
@@ -256,6 +257,43 @@ def _rank_dask_window(window, width, template, options, *, client, workers, comp
     return [_rank_dask_batch(panels[0], template, fmt, options)]
 
 
+def _worker_rank_memory(dask_worker):
+    import psutil
+    from distributed.system import MEMORY_LIMIT
+
+    _, device = cp.cuda.runtime.memGetInfo()
+    pool = next(
+        (
+            getattr(p, "maximum_pool_size", None)
+            for p in dask_worker.plugins.values()
+            if type(p).__name__ == "RMMSetup"
+            and (getattr(p, "initial_pool_size", None) is not None or getattr(p, "async_alloc", False))
+        ),
+        None,
+    )
+    limit = dask_worker.memory_manager.memory_limit or MEMORY_LIMIT
+    remaining = max(0, limit // 2 - dask_worker.monitor.get_process_memory())
+    available = min(MEMORY_LIMIT, psutil.virtual_memory().available)
+    return device, pool, dask_worker.host, min(limit // 4, remaining), available
+
+
+def _rank_budgets(memory, input_bytes):
+    import dask
+    from dask.utils import parse_bytes
+
+    hosts = Counter(host for _, _, host, _, _ in memory)
+    limit = min(device // 4 for device, *_ in memory)
+    # Leave room in a capped pool for reading, normalizing and sorting a CSR chunk.
+    pool = min(pool or device for device, pool, *_ in memory)
+    default = min(limit, 3 * pool // 10)
+    target = min(limit, pool, parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=default)))
+    host = min(min(worker, available // (4 * hosts[name])) for _, _, name, worker, available in memory)
+    # Host transfers pay off when they avoid multiple full CSR scans.
+    if host < (2 if default < limit else 4) * target or input_bytes <= target * len(memory):
+        host = 0
+    return target, host
+
+
 def _run_dask_wilcoxon(rg, **options):
     import dask
     from dask import threaded
@@ -274,20 +312,24 @@ def _run_dask_wilcoxon(rg, **options):
     fmt = getattr(X._meta, "format", None)
     entry_bytes = X.itemsize + (X._meta.indices.itemsize if fmt else 0)
     target_bytes = parse_bytes(dask.config.get("array.chunk-size"))
+    host_bytes = 0
     if workers and (isinstance(X._meta, cp.ndarray) or cpsp.issparse(X._meta)):
-        devices = client.run(cp.cuda.runtime.memGetInfo, workers=list(workers))
-        limit = min(total for _, total in devices.values()) // 4
-        target_bytes = min(limit, parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=limit)))
+        memory = client.run(_worker_rank_memory, workers=list(workers))
+        target_bytes, host_bytes = _rank_budgets(memory.values(), X.nbytes)
     row_csr = cpsp.isspmatrix_csr(X._meta) and X.numblocks[0] > 1 and X.numblocks[1] == 1
     fits_records = X.dtype == np.float32 and X.shape[0] < 2**31 and len(rg.group_sizes) <= _MAX_RECORD_GROUPS
     if workers and row_csr and X.shape[1] > 0 and fits_records and options["multi_gpu"] in (None, False):
         from ._wilcoxon_dask import rank_csr_windows
 
-        host_bytes = parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.host-batch-size", default=0))
+        host_config = dask.config.get("rapids-singlecell.wilcoxon.host-batch-size", default=None)
+        if host_config is not None:
+            host_bytes = parse_bytes(host_config)
         if host_bytes < 0:
             raise ValueError("Wilcoxon host-batch-size must be nonnegative.")
+        # Concurrent full-width CSR reads also draw from a small device pool.
+        rank_workers = dict.fromkeys(workers, 1) if host_bytes and host_config is None else workers
         with suppress(MemoryError):
-            result = rank_csr_windows(rg, options, client, workers, target_bytes, host_budget=host_bytes)
+            result = rank_csr_windows(rg, options, client, rank_workers, target_bytes, host_budget=host_bytes)
             if result is not None:
                 return groups, *result
     width = max(1, target_bytes // (max(1, X.shape[0]) * entry_bytes))

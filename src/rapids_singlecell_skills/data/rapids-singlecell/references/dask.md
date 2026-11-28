@@ -49,6 +49,7 @@ rsc.get.anndata_to_GPU(adata)
 
 ## Execute
 
+- For exact ranks on CSR Zarr, call `rsc.pp.normalize_total(adata, target_sum=10_000)`, `rsc.pp.log1p(adata)`, then `rsc.tl.rank_genes_groups(adata, groupby, method="wilcoxon", use="X")` on the lazy GPU array above. The ranking call evaluates the chunks and sizes its gene windows automatically. See the [out-of-core Wilcoxon guide](https://rapids-singlecell.readthedocs.io/en/latest/out_of_core.html#exact-wilcoxon-on-log-normalized-csr).
 - `persist()` after filtering only if the result fits across workers, and call `adata.X.compute_chunk_sizes()` after row filtering.
 - `compute()` only reduced results, because it gathers everything onto the client GPU.
 - On OOM, shrink chunks and task concurrency before adding workers.

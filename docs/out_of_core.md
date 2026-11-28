@@ -107,7 +107,7 @@ X_gpu = adata.X.compute()
 
 ## Persist and chunk sizes
 
-- Persist after major transformations or filtering to materialize results in worker memory and shorten later graphs.
+- Persist a transformed matrix only if it fits across workers. For out-of-core Wilcoxon, pass the lazy matrix directly.
 - Recompute chunk sizes to help Dask plan evenly across workers.
 
 ```python
@@ -153,20 +153,51 @@ For Dask inputs, {func}`~.pp.normalize_total` does not support
 `covariance_eigh` solver by default; `chunked=True`, `lanczos`, and `randomized` are not
 supported.
 
-Exact `wilcoxon` ranks dense and sparse Dask arrays in gene windows across all cells.
-It assigns tied values their average rank and includes implicit sparse zeros.
-For row-chunked float32 GPU CSR, workers keep lossless expression and group records
-only for the active genes. Distributed GPU batches use up to a quarter of device
-memory per worker. Set Dask’s `rapids-singlecell.wilcoxon.batch-size` to a smaller
-byte limit as needed. Input chunks, sorting and group results need additional memory.
-Host arrays and local schedulers use Dask’s `array.chunk-size`. A worker must be able to rank at least one gene.
-Each window covers at most half the genes, rounded up. Lazy row-wise normalization
-and log1p run again from the source for each window. If a window exceeds the
-budget, the CSR ranker samples row chunks to estimate the storage per gene and
-divide the next windows across GPUs. The ranking still uses every cell. The
-client holds the cell labels and group-by-gene results, including fractions for
-`pts=True`. The current kernels support fewer than `2**31` cells. For very
-large comparisons, the returned float64 U can round half-integers above `2**52`.
+(out-of-core-wilcoxon)=
+## Exact Wilcoxon on log-normalized CSR
+
+Use the Zarr example above with `chunks=(100_000, -1)` for 100,000 cells per CSR chunk.
+For KvikIO reads from local sharded Zstd stores, import `zarr_kvikio.dask`, set
+`zarr.config.set({"kvikio.fetch": "kvikio"})`, and call `zarr_kvikio.dask.enable(client)` before opening the store.
+Start with raw counts. If `adata.X` already contains log-normalized values, skip the two preprocessing calls.
+This example compares each group in `adata.obs["cell_type"]` with the remaining cells.
+
+```python
+import rapids_singlecell as rsc
+
+rsc.get.anndata_to_GPU(adata)
+rsc.pp.normalize_total(adata, target_sum=10_000)
+rsc.pp.log1p(adata)
+rsc.tl.rank_genes_groups(adata, "cell_type", method="wilcoxon", use="X", tie_correct=True, pts=True)
+results = adata.uns["rank_genes_groups"]
+```
+
+With a fixed `target_sum`, GPU transfer, normalization and `log1p` are lazy.
+The ranking call runs the graph. For each window of genes it reads the CSR row
+chunks and includes every cell in the comparison. It ranks float32 expression
+values directly, gives ties their average rank and includes implicit zeros.
+Two-sided p-values use the normal approximation. Set `return_u_values=True` to
+store the Mann–Whitney U statistic in `scores`. The client holds the cell labels
+and group-by-gene results, including expression fractions when `pts=True`.
+
+On distributed float32 GPU CSR, workers retain lossless values and group labels
+for the current gene window. A larger window uses more memory and reduces
+rereads and repeated normalization. GPU sort panels default to 25% of device
+memory, capped at 30% of a configured RMM pool maximum. When worker RAM can
+hold a substantially larger window, Wilcoxon can use up to a quarter of each
+worker’s host memory allowance, subject to available RAM on the node.
+For a 10 GB pool per GPU, set `rmm_pool_size="10 GB"` and `rmm_maximum_pool_size="10 GB"`
+on `LocalCUDACluster` with CuPy using RMM. CUDA and I/O can allocate additional memory outside the pool.
+
+Two Dask options override the automatic sizing. `rapids-singlecell.wilcoxon.batch-size`
+sets the GPU sort-panel target in bytes per worker. `rapids-singlecell.wilcoxon.host-batch-size`
+limits packed records assigned to each worker in host RAM per window. Set it to
+`0` to keep the records on the GPU. Each worker also needs room for a source
+chunk, transfers and sorting workspace. Host arrays and local schedulers use
+Dask’s `array.chunk-size`.
+
+The kernels support fewer than `2**31` cells. Returned float64 U statistics
+can round half-integers above `2**52`.
 
 ## Troubleshooting
 
