@@ -167,6 +167,6 @@ def rank_records(blocks, lo, hi, rg, options):
         groups[targets],
         u2 * 0.5 if options["return_u_values"] else z,
         p,
-        _logfoldchanges_from_means(rg, selected / n, reference),
+        _logfoldchanges_from_means(rg, selected / n, reference).astype(cp.float32),
     )
     return (*result, nonzero.T) if rg.comp_pts else result

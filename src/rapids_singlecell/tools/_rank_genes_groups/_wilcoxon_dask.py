@@ -12,17 +12,18 @@ import numpy as np
 from ._wilcoxon_records import _on_device, pack_records, range_base, rank_records
 
 
-def _pack_host_records(csr, labels, edges):
-    parts = pack_records(csr, labels, edges)
-    if parts is None:
-        return None
-
+def _pack_row(csr, codes, *, edges, on_host):
     def to_host(a):
         return a.get(out=np.empty(a.shape, dtype=a.dtype))
 
-    # All gene shards of a dictionary-encoded row share its lookup table.
-    table = to_host(parts[0][2]) if parts[0][3] else None
-    return [(ptr, to_host(words), table if bits else to_host(aux), bits) for ptr, words, aux, bits in parts]
+    parts = pack_records(csr, codes[:, 0], edges)
+    if on_host and parts is not None:
+        # The gene shards of a row share its lookup table.
+        table = to_host(parts[0][2]) if parts[0][3] else None
+        parts = [(ptr, to_host(words), table if bits else to_host(aux), bits) for ptr, words, aux, bits in parts]
+    block = np.empty((1, 1), dtype=object)
+    block[0, 0] = parts
+    return block
 
 
 def _record_sizes(parts):
@@ -34,20 +35,19 @@ def _gene_bytes(csr, labels):
 
     bits = max(1, int(labels.max(initial=0)).bit_length())
     record_bytes = 4 if range_base(csr.data, bits) is not None else 6
-    return cp.bincount(csr.indices, minlength=csr.shape[1]).get() * record_bytes
+    return cp.bincount(csr.indices, minlength=csr.shape[1]).get()[None, :] * record_bytes
 
 
-def _sample_gene_sizes(client, rows, codes, concurrency):
-    import dask  # type: ignore[import-not-found]
-
+def _sample_gene_sizes(client, X, codes, concurrency):
     # One bounded wave of row chunks estimates how many records each gene contributes.
-    nonempty = np.flatnonzero([len(c) for c in codes])
+    heights = np.asarray(X.chunks[0])
+    nonempty = np.flatnonzero(heights)
     n = min(len(nonempty), concurrency)
     sample = nonempty[(2 * np.arange(n) + 1) * len(nonempty) // (2 * n)]
-    tasks = [dask.delayed(_gene_bytes)(rows[i], codes[i]) for i in sample]
+    sizes = X.map_blocks(_gene_bytes, codes, chunks=(1, X.chunks[1]), meta=np.empty((0, 0), np.int64))
+    tasks = sizes.to_delayed()[sample, 0].tolist()
     sampled = sum(client.gather(client.compute(tasks)))
-    scale = sum(map(len, codes)) / sum(len(codes[i]) for i in sample)
-    return np.r_[0.0, np.cumsum(sampled * scale + 4 * len(rows))]
+    return np.r_[0.0, np.cumsum(sampled * (X.shape[0] / heights[sample].sum()) + 4 * len(heights))]
 
 
 def _rank_columns(blocks, context, options, budget):
@@ -119,31 +119,32 @@ def rank_large_groups(rows, rg, options):
     return stats | {name: v for name in ("pts", "pts_rest") if (v := getattr(rg, name)) is not None}
 
 
-def _project_window(rows, codes, edges, *, client, workers, concurrency, budget, on_host=False):
-    import dask
+def _project_window(X, codes, edges, *, client, workers, concurrency, budget, on_host=False, selected=None):
+    import dask  # type: ignore[import-not-found]
     from dask.local import identity  # type: ignore[import-not-found]
     from distributed import as_completed, wait  # type: ignore[import-not-found]
 
     columns = [[] for _ in range(len(edges) - 1)]
     retained = np.zeros(len(columns), np.int64)
     pending = {}
-    todo = iter(zip(rows, codes, strict=True))
-    completed = as_completed(loop=client.loop)
-    pack = _pack_host_records if on_host else pack_records
+    packed = X.map_blocks(_pack_row, codes, edges=edges, on_host=on_host, chunks=(1, 1), meta=np.empty((0, 0), object))
+    (packed,) = dask.optimize(packed)
+    rows = range(X.numblocks[0]) if selected is None else selected
+    todo = iter(rows)
+    completed = as_completed(loop=client.loop, with_results=True)
 
     def submit():
-        if (item := next(todo, None)) is not None:
-            row, labels = item
-            task = client.compute(dask.delayed(pack)(row, labels, edges))
+        if (row := next(todo, None)) is not None:
+            # Unbox the native arrays on the worker so Dask accounts for their bytes.
+            task = client.compute(packed[row, 0].to_delayed().item())
             receipt = client.submit(_record_sizes, task)
             pending[receipt] = task
             completed.add(receipt)
 
-    for _ in range(min(len(rows), concurrency)):
+    for _ in range(min((len(rows) + 1) // 2, concurrency)):
         submit()
     observed = 0
-    for receipt in completed:
-        sizes = receipt.result()
+    for receipt, sizes in completed:
         part = pending.pop(receipt)
         if sizes is None:
             wait(list(pending))
@@ -169,6 +170,7 @@ def _project_window(rows, codes, edges, *, client, workers, concurrency, budget,
 
 def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
     import dask
+    import dask.array as da  # type: ignore[import-not-found]
 
     window_budget = host_budget or budget
     X = rg.X
@@ -181,9 +183,8 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
     )
     concurrency = min(sum(min(n, 7 if lookahead else 3) for n in workers.values()), (X.numblocks[0] + 1) // 2)
     workers = list(workers)
-    rows = X.to_delayed()[:, 0]
-    codes = np.split(rg.group_codes.astype(np.uint16), np.cumsum(X.chunks[0])[:-1])
-    project = partial(_project_window, client=client, concurrency=concurrency, on_host=bool(host_budget))
+    codes = da.from_array(rg.group_codes.astype(np.uint16)[:, None], chunks=(X.chunks[0], 1))
+    project = partial(_project_window, X, codes, client=client, concurrency=concurrency, on_host=bool(host_budget))
     fields = ("group_sizes", "ireference", "mean_in_log_space", "_log1p_base", "comp_pts")
     context = SimpleNamespace(n_obs=X.shape[0], **{name: getattr(rg, name) for name in fields})
     results = []
@@ -194,11 +195,14 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
     capacity = 0.93 * window_budget
     saved = None
     if lookahead:
-        # Project two gene windows for at most half the rows. A worker holds at most half a batch per shard.
+        # Reuse two windows for up to two thirds of the row chunks, with a byte cap on each shard.
+        rows = np.arange(X.numblocks[0])
+        reserve = 2 * budget // 3
         left = np.linspace(0, max_width, len(workers) + 1, dtype=int)
         right = np.linspace(max_width, X.shape[1], len(workers) + 1, dtype=int)
+        edges = np.r_[left, right[1:]]
         with suppress(MemoryError):
-            saved, _ = project(rows[1::2], codes[1::2], np.r_[left, right[1:]], workers=workers * 2, budget=budget // 2)
+            saved, _ = project(edges, workers=workers * 2, budget=reserve, selected=rows[rows % 3 != 0])
     while start < X.shape[1]:
         stop = min(start + width, X.shape[1])
         if prefix is None:
@@ -212,19 +216,19 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
         columns = None
         if saved:
             with suppress(MemoryError):
-                columns, next_width = project(rows[::2], codes[::2], edges, workers=workers, budget=budget // 2)
+                columns, next_width = project(edges, workers=workers, budget=budget - reserve, selected=rows[::3])
             if columns:
                 columns = [old + new for old, new in zip(saved[: len(columns)], columns, strict=True)]
                 saved = saved[len(columns) :]
             else:
                 saved = None
         if not columns:
-            columns, next_width = project(rows, codes, edges, workers=workers, budget=window_budget)
+            columns, next_width = project(edges, workers=workers, budget=window_budget)
         if columns is None or (not columns and stop - start == 1):
             return None
         if not columns:
             if prefix is None:
-                prefix = _sample_gene_sizes(client, rows, codes, concurrency)
+                prefix = _sample_gene_sizes(client, X, codes, concurrency)
             else:
                 capacity *= min(0.9, next_width / (stop - start))
                 width = next_width

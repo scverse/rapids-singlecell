@@ -1,7 +1,7 @@
 #include <cuda/std/algorithm>
-#include <thrust/sort.h>
-#include <thrust/transform_scan.h>
-#include <thrust/system/cuda/execution_policy.h>
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_scan.cuh>
+#include <thrust/iterator/transform_iterator.h>
 
 #include "wilcoxon_common.cuh"
 
@@ -110,17 +110,6 @@ __global__ void finish_runs(const ZeroRun* zeros, const int* sizes,
     }
 }
 
-// Keep Thrust's sort and scan temporaries in the worker's active CuPy/RMM pool.
-struct Scratch {
-    using value_type = char;
-    RmmScratchPool& pool;
-    char* allocate(size_t n) {
-        return pool.alloc<char>(n);
-    }
-    void deallocate(char*, size_t) {
-    }
-};
-
 template <typename T, typename Device>
 using Array = gpu_array_c<T, Device>;
 
@@ -163,27 +152,41 @@ void rank_panel(Array<Key, Device> keys, Array<const int, Device> ptr,
                "invalid packed Wilcoxon output, reference or key width");
     auto stream = (cudaStream_t)stream_ptr;
     RmmScratchPool pool;
-    Scratch scratch{pool};
-    auto policy = thrust::cuda::par_nosync(scratch).on(stream);
     int* reference = ref < 0 ? nullptr : pool.alloc<int>((size_t)nnz + 1);
     if (reference)
         cuda_check(cudaMemsetAsync(reference, 0, sizeof(int), stream),
                    "reference prefix");
+    Key* sorted = keys.data();
     if (nnz) {
-        thrust::sort(policy, keys.data(), keys.data() + nnz);
-        if (reference)
-            thrust::transform_inclusive_scan(
-                policy, keys.data(), keys.data() + nnz, reference + 1,
-                IsReference{(1 << group_bits) - 1, ref}, thrust::plus<int>{});
+        cub::DoubleBuffer<Key> buffers(sorted, pool.alloc<Key>(nnz));
+        size_t sort_bytes = 0, scan_bytes = 0;
+        const int bits = key_bits(cols) + 32 + group_bits;
+        auto sort_and_scan = [&](void* workspace) {
+            cuda_check(
+                cub::DeviceRadixSort::SortKeys(workspace, sort_bytes, buffers,
+                                               nnz, 0, bits, stream),
+                "Wilcoxon sort");
+            if (reference) {
+                auto flags = thrust::make_transform_iterator(
+                    buffers.Current(), IsReference{(1 << group_bits) - 1, ref});
+                cuda_check(
+                    cub::DeviceScan::InclusiveSum(workspace, scan_bytes, flags,
+                                                  reference + 1, nnz, stream),
+                    "reference scan");
+            }
+        };
+        sort_and_scan(nullptr);
+        sort_and_scan(pool.alloc<char>(std::max(sort_bytes, scan_bytes)));
+        sorted = buffers.Current();
     }
     ZeroRun* zeros = pool.alloc<ZeroRun>(cols);
     find_zeros<<<strided_grid(cols, 256), 256, 0, stream>>>(
-        keys.data(), ptr.data(), reference, n, cols, group_bits, zeros);
+        sorted, ptr.data(), reference, n, cols, group_bits, zeros);
     CUDA_CHECK_LAST_ERROR(find_zeros);
     if (nnz) {
         accumulate_runs<<<strided_grid(nnz, 256), 256, 0, stream>>>(
-            keys.data(), ptr.data(), reference, zeros, nnz, width, group_bits,
-            ref, correct, scale, ranks.data(), sums.data(), ties.data(),
+            sorted, ptr.data(), reference, zeros, nnz, width, group_bits, ref,
+            correct, scale, ranks.data(), sums.data(), ties.data(),
             counts.size() ? counts.data() : nullptr);
         CUDA_CHECK_LAST_ERROR(accumulate_runs);
     }
