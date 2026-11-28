@@ -15,18 +15,16 @@ from ._wilcoxon_records import _on_device, csc_records, pack_records, range_base
 
 
 def _pack_row(x, codes, *, edges, on_host, short_from, block_id=None):
-    def to_host(a):
-        return a.get(out=np.empty(a.shape, dtype=a.dtype))
-
     if short_from is not None and block_id[0] >= short_from:
         edges = edges[: len(edges) // 2 + 1]
     parts = pack_records(x, codes[:, 0], edges)
     if parts is None:
         parts = [None] * (len(edges) - 1)
-    elif on_host:
-        # The gene shards of a row share its lookup table.
-        table = to_host(parts[0][2]) if parts[0][3] else None
-        parts = [(ptr, to_host(words), table if bits else to_host(aux), bits) for ptr, words, aux, bits in parts]
+    elif on_host and parts[0][3]:
+        # Each gene shard uses the same immutable dictionary from this CSR row chunk.
+        lookup = parts[0][2]
+        table = lookup.get(out=np.empty(lookup.shape, lookup.dtype))
+        parts = [(ptr, words, table, bits) for ptr, words, _, bits in parts]
     block = np.empty((1, 1), dtype=object)
     block[0, 0] = parts
     return block
@@ -38,6 +36,8 @@ def _host_part(part):
     ptr, words, groups, bits = part
 
     def copy_array(a):
+        if isinstance(a, np.ndarray):
+            return a
         out = np.empty(a.shape, a.dtype)
         if a.size:
             with a.device:
@@ -144,10 +144,9 @@ def _project_window(
 
     columns = [[] for _ in range(len(edges) - 1)]
     retained = np.zeros(len(columns), np.int64)
-    sources = list(dict.fromkeys(workers)) if isinstance(X._meta, cp.ndarray) else []
-    shuffle = on_host and bool(sources)
+    sources = list(dict.fromkeys(workers)) if on_host or isinstance(X._meta, cp.ndarray) else []
 
-    pack = partial(_pack_row, edges=edges, on_host=on_host and not shuffle, short_from=short_from)
+    pack = partial(_pack_row, edges=edges, on_host=on_host, short_from=short_from)
     packed = X.map_blocks(pack, codes, chunks=(1, 1), meta=np.empty((0, 0), object))
     (packed,) = dask.optimize(packed)
     rows = range(X.numblocks[0]) if selected is None else selected
@@ -169,7 +168,7 @@ def _project_window(
                 remote = not source or owner != source[0]
                 if remote:
                     piece = client.submit(identity, piece, workers=[owner], pure=False)
-                if shuffle:
+                if on_host:
                     if remote:
                         arrived.append(client.submit(bool, piece, workers=[owner]))
                     piece = client.submit(_host_part, piece, workers=[owner])
@@ -182,7 +181,7 @@ def _project_window(
             previous[i] = drained
             completed.add(receipt)
 
-    for i in range(min(active, len(lanes)) if shuffle else active):
+    for i in range(min(active, len(lanes)) if on_host else active):
         submit(i % len(lanes))
     observed = 0
     try:
@@ -215,7 +214,7 @@ def rank_record_windows(rg, options, client, workers, budget, *, host_budget):
     window_budget = host_budget or budget
     X = rg.X
     lookahead = (
-        (host_budget >= 12 * 2**30 and isinstance(X._meta, cp.ndarray) if host_budget else budget >= 16 * 2**30)
+        (host_budget >= 12 * 2**30 if host_budget else budget >= 16 * 2**30)
         and X.numblocks[0] >= 4
         and X.shape[1] >= (4 if host_budget else 2) * len(workers)
         and dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=None) is None

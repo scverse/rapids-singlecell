@@ -61,14 +61,14 @@ def test_worker_memory_without_dask_limits(monkeypatch):
 def test_range_packing_preserves_float_bits_and_group_codes():
     low = 0x3E000000
     patterns = np.array([[low, low + 1], [low + 33, low + 2**26 - 1]], dtype=np.uint32)
-    x = cp.asarray(patterns).view(cp.float32)
+    x = cpsp.csr_matrix(cp.asarray(patterns).view(cp.float32))
     groups = np.array([63, 17], dtype=np.uint16)
-    (part,) = _wilcoxon_records.pack_records(cpsp.csr_matrix(x), groups, np.array([0, 2]))
-    assert part[1].nbytes == x.nbytes
-    assert part[2].size == 1 and part[2].item() == low
-    assert part[3] == 6
-    _, keys = _wilcoxon_records._gather_keys([part], 0, 2, 64)
-    unpacked = keys.get()
+    parts = _wilcoxon_dask._pack_row(x, groups[:, None], edges=[0, 1, 2], on_host=True, short_from=None).item()
+    table = parts[0][2]
+    assert isinstance(table, np.ndarray) and table is parts[1][2]
+    assert table.shape == (1,) and table.item() == low
+    assert all(bits == 6 and words.nbytes == patterns[:, 0].nbytes for _, words, _, bits in parts)
+    unpacked = np.concatenate([_wilcoxon_records._gather_keys([part], 0, 1, 64)[1].get() for part in parts])
     np.testing.assert_array_equal((unpacked >> 6).astype(np.uint32) ^ 0x80000000, patterns.T.ravel())
     np.testing.assert_array_equal(unpacked & 63, np.tile(groups, 2))
     assert _wilcoxon_records.range_base(cp.asarray([low, low + 2**26], cp.uint32).view(cp.float32), 6) is None
@@ -171,7 +171,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", check_rank)
     budget = width * len(X) * X.itemsize * (2 if kind == "csr" else 1)
     gpu_batch = 16 * 2**30
-    host_reuse = lognorm and kind == "dense" and reference == "rest"
+    host_reuse = lognorm and reference == "rest"
     explicit_large_batch = lognorm and reference == "b"
     config = {"array.chunk-size": budget}
     if mode != "gpu" and not host_reuse:
