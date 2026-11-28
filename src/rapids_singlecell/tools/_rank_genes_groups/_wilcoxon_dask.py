@@ -156,12 +156,21 @@ def _project_window(
     completed = as_completed(loop=client.loop, with_results=True)
     pending = {}
     previous = [[] for _ in lanes]
+    wave = on_host and getattr(X._meta, "format", None) == "csr"
 
-    def submit(i):
-        if (row := next(lanes[i], None)) is not None:
+    def submit(slots):
+        batch = []
+        for i in slots:
+            if (row := next(lanes[i], None)) is None:
+                continue
             source = [sources[i]] if sources else None
-            short = short_from is not None and row >= short_from
             task = client.compute(packed[row, 0].to_delayed().item(), workers=source)
+            batch.append((i, row, source, task))
+        if wave:
+            # Peer transfers must not overlap the full-width sparse read or log1p on any owner.
+            wait([task for *_, task in batch])
+        for i, row, source, task in batch:
+            short = short_from is not None and row >= short_from
             parts, arrived, drained = [], [], []
             for j, owner in enumerate(workers[: len(columns) // 2 if short else len(columns)]):
                 piece = client.submit(getitem, task, j, workers=source)
@@ -169,34 +178,41 @@ def _project_window(
                 if remote:
                     piece = client.submit(identity, piece, workers=[owner], pure=False)
                 if on_host:
-                    if remote:
+                    if remote and not wave:
                         arrived.append(client.submit(bool, piece, workers=[owner]))
                     piece = client.submit(_host_part, piece, workers=[owner])
                     done = client.submit(bool, piece, workers=[owner])
-                    (drained if remote else arrived).append(done)
+                    (drained if remote and not wave else arrived).append(done)
                 parts.append(piece)
-            # Reuse the source after its transfers arrive. The previous row’s remote host copies can overlap the next read.
+            # Dense rows can start once remote transfers arrive, while their host copies finish.
             receipt = client.submit(_record_sizes, task, *previous[i], *arrived, workers=source)
-            pending[receipt] = parts, i, previous[i]
+            pending[receipt] = parts, i, previous[i], X.chunks[0][row]
             previous[i] = drained
             completed.add(receipt)
 
-    for i in range(min(active, len(lanes)) if on_host else active):
-        submit(i % len(lanes))
-    observed = 0
+    submit(i % len(lanes) for i in range(min(active, len(lanes)) if on_host else active))
+    observed = full_cells = full_rows = 0
+    target_cells = sum(X.chunks[0][:short_from]) if short_from is not None else 0
     try:
         for receipt, sizes in completed:
-            parts, lane, _ = pending[receipt]
+            parts, lane, _, height = pending[receipt]
             if sizes is None:
                 return None, 0
             retained[: len(sizes)] += sizes
             observed += 1
+            if target_cells and height and len(sizes) == len(columns):
+                full_cells += height
+                full_rows += 1
+                # Stop a speculative prefetch only when projected bytes exceed even the entire host budget.
+                if full_rows >= 4 and retained[len(columns) // 2 :].max() / full_cells > 2 * budget / target_cells:
+                    return [], 1
             if retained.max() > budget:
                 break
             for column, part in zip(columns, parts, strict=False):
                 column.append(part)
             del pending[receipt]
-            submit(lane)
+            if not wave or not pending:
+                submit(range(len(lanes)) if wave else [lane])
     finally:
         # A failed receipt can finish before sibling copies. Drain their concrete futures before retrying.
         wait([*pending, *pending.values(), previous, columns if pending else ()])

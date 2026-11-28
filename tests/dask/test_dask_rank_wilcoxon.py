@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
@@ -20,42 +21,39 @@ from scipy.stats import mannwhitneyu
 import rapids_singlecell as rsc
 from rapids_singlecell.tools._rank_genes_groups import _wilcoxon, _wilcoxon_dask, _wilcoxon_records
 
+GIB = 2**30
+U_OPTIONS = {"tie_correct": True, "return_u_values": True, "use_continuity": False}
+
 
 def test_rank_budgets_respect_worker_and_shared_memory():
-    gib = 2**30
     # Two workers on one node with 96 GiB each and 10 GB RMM pools.
-    workers = [(96 * gib, 10**10, "node", 24 * gib, 256 * gib)] * 2
-    assert _wilcoxon._rank_budgets(workers, 10**13) == (3 * 10**9, 24 * gib)
+    workers = [(96 * GIB, 10**10, "node", 24 * GIB, 256 * GIB)] * 2
+    assert _wilcoxon._rank_budgets(workers, 10**13) == (3 * 10**9, 24 * GIB)
     assert _wilcoxon._rank_budgets(workers, 10**6) == (3 * 10**9, 0)
     for host, host_gib in [("node", 8), ("other", 16)]:
-        workers[1] = (96 * gib, 10**10, host, 24 * gib, 64 * gib)
-        assert _wilcoxon._rank_budgets(workers, 10**13)[1] == host_gib * gib
+        workers[1] = (96 * GIB, 10**10, host, 24 * GIB, 64 * GIB)
+        assert _wilcoxon._rank_budgets(workers, 10**13)[1] == host_gib * GIB
     with dask.config.set({"rapids-singlecell.wilcoxon.batch-size": "2 GB"}):
         assert _wilcoxon._rank_budgets(workers, 10**13)[0] == 2 * 10**9
-    for pool in (82 * gib, None):
-        assert _wilcoxon._rank_budgets([(96 * gib, pool, "node", 32 * gib, 256 * gib)], 10**13) == (24 * gib, 0)
-    small_gpu = (8 * gib, None, "node")
-    assert _wilcoxon._rank_budgets([(*small_gpu, 24 * gib, 128 * gib)], 10**13) == (2 * gib, 24 * gib)
-    assert _wilcoxon._rank_budgets([(*small_gpu, 3 * gib, 128 * gib)], 10**13) == (2 * gib, 0)
+    for pool in (82 * GIB, None):
+        assert _wilcoxon._rank_budgets([(96 * GIB, pool, "node", 32 * GIB, 256 * GIB)], 10**13) == (24 * GIB, 0)
+    small_gpu = (8 * GIB, None, "node")
+    assert _wilcoxon._rank_budgets([(*small_gpu, 24 * GIB, 128 * GIB)], 10**13) == (2 * GIB, 24 * GIB)
+    assert _wilcoxon._rank_budgets([(*small_gpu, 3 * GIB, 128 * GIB)], 10**13) == (2 * GIB, 0)
 
 
 def test_worker_memory_without_dask_limits(monkeypatch):
     import psutil
     from distributed import system
 
-    gib = 2**30
-    monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (4 * gib, 8 * gib))
-    monkeypatch.setattr(system, "MEMORY_LIMIT", 64 * gib)
-    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=40 * gib))
-    worker = SimpleNamespace(
-        plugins={"rmm": type("RMMSetup", (), {})()},  # Older plugin without a configured pool.
-        memory_manager=SimpleNamespace(memory_limit=None),
-        monitor=SimpleNamespace(get_process_memory=lambda: gib),
-        host="node",
-    )
-    assert _wilcoxon._worker_rank_memory(worker) == (8 * gib, None, "node", 16 * gib, 40 * gib)
-    worker.memory_manager.memory_limit = gib
-    assert _wilcoxon._worker_rank_memory(worker)[3] == 0
+    monkeypatch.setattr(cp.cuda.runtime, "memGetInfo", lambda: (4 * GIB, 8 * GIB))
+    monkeypatch.setattr(system, "MEMORY_LIMIT", 64 * GIB)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=40 * GIB))
+    worker = Mock(host="node", plugins={"rmm": type("RMMSetup", (), {})()})  # Older plugin without a pool.
+    worker.monitor.get_process_memory.return_value = GIB
+    for limit, headroom in [(None, 16 * GIB), (GIB, 0)]:
+        worker.memory_manager.memory_limit = limit
+        assert _wilcoxon._worker_rank_memory(worker) == (8 * GIB, None, "node", headroom, 40 * GIB)
 
 
 def test_range_packing_preserves_float_bits_and_group_codes():
@@ -74,9 +72,6 @@ def test_range_packing_preserves_float_bits_and_group_codes():
     assert _wilcoxon_records.range_base(cp.asarray([low, low + 2**26], cp.uint32).view(cp.float32), 6) is None
 
 
-U_OPTIONS = {"tie_correct": True, "return_u_values": True, "use_continuity": False}
-
-
 @pytest.fixture(params=[None, 1])
 def rg(request):
     return SimpleNamespace(ireference=request.param, comp_pts=True, mean_in_log_space=True, _log1p_base=None)
@@ -84,13 +79,12 @@ def rg(request):
 
 def test_large_group_keeps_half_integer_u(rg):
     # One positive in each group, all other values are implicit zeros.
-    size = 100_000_001
-    rg.group_sizes = np.array([size, 3])
-    rg.n_obs = size + 3
+    rg.group_sizes = np.array([100_000_001, 3])
+    rg.n_obs = int(rg.group_sizes.sum())
     block = (np.array([0, 2], np.int32), cp.ones(2, cp.float32).view(cp.uint32), cp.arange(2, dtype=cp.uint16), 0)
     scores, _, _, counts = _wilcoxon_records.rank_records([block], 0, 1, rg, U_OPTIONS)
     # Each target zero ties two reference zeros. Its positive wins twice and ties once.
-    assert scores[0, 0].item() == size - 1 + 2.5
+    assert scores[0, 0].item() == rg.group_sizes[0] - 1 + 2.5
     np.testing.assert_array_equal(counts.get(), [[1], [1]])
 
 
@@ -102,8 +96,7 @@ def test_dense_integer_rank_rows(rg):
     rank = partial(_wilcoxon_dask.rank_large_groups, [x[:8], x[8:]], options=U_OPTIONS)
     stats = rank(rg)
     ref = labels != 0 if rg.ireference is None else labels == rg.ireference
-    values = x.astype(np.float64)
-    expected = mannwhitneyu(values[labels == 0], values[ref], method="asymptotic", use_continuity=False)
+    expected = mannwhitneyu(x[labels == 0], x[ref], method="asymptotic", use_continuity=False)
     np.testing.assert_array_equal(stats["scores"][0], expected.statistic)
     np.testing.assert_allclose(stats["pvals"][0], expected.pvalue)
     np.testing.assert_array_equal(stats["pts"][0], (x[labels == 0] != 0).mean(axis=0))
@@ -124,8 +117,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     dtype = np.float64 if mode == "gpu-float64" else np.float32
     X = np.random.default_rng(42).choice([0, 0, 1, 2, 32, 67], size=(117, 13)).astype(dtype)
     labels = pd.Categorical(["a", "b", "c"] * 38 + [None] * 3)
-    X[:, 0] = 0
-    X[:, 1] = 1
+    X[:, :2] = [0, 1]
     X[labels == "a", 1] = 2 if lognorm else np.nextafter(np.float32(1), np.float32(2))
     X[0, :] = 0
     if not lognorm:
@@ -159,40 +151,31 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
     if mode == "host":
         monkeypatch.setattr(_wilcoxon, "_HALF_INTEGER_LIMIT", 10)
         monkeypatch.setattr(_wilcoxon, "_MAX_RECORD_GROUPS", 1)
-        rank = _wilcoxon._rank_dask_batch
-
-        def check_rank(rows, *args):
-            assert all(row.shape[1] <= min(width, (X.shape[1] + 1) // 2) for row in rows)
-            assert sum(row.shape[0] for row in rows) == len(X)
-            if kind == "dense":
-                assert all(row.base is None for row in rows)
-            return rank(rows, *args)
-
-        monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", check_rank)
+        rank_batch = Mock(wraps=_wilcoxon._rank_dask_batch)
+        monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", rank_batch)
     budget = width * len(X) * X.itemsize * (2 if kind == "csr" else 1)
-    gpu_batch = 16 * 2**30
+    gpu_batch = 16 * GIB
     host_reuse = lognorm and reference == "rest"
     explicit_large_batch = lognorm and reference == "b"
     config = {"array.chunk-size": budget}
     if mode != "gpu" and not host_reuse:
         config["rapids-singlecell.wilcoxon.batch-size"] = gpu_batch if explicit_large_batch else budget
     projections = iter(())
-    if mode == "gpu" or explicit_large_batch or host_reuse:
+    if mode == "gpu" or lognorm:
         if not host_reuse:
             config["rapids-singlecell.wilcoxon.host-batch-size"] = 0
-        budgets = (512, 12 * 2**30) if host_reuse else (gpu_batch, 4096)
+        budgets = (512, 12 * GIB) if host_reuse else (gpu_batch, 4096)
         monkeypatch.setattr(_wilcoxon, "_rank_budgets", lambda *args: budgets)
-        nrows = lazy.X.numblocks[0]
-        rows = set(range(nrows))
+        rows = set(range(lazy.X.numblocks[0]))
         if host_reuse:
-            tail = nrows - max(1, nrows // 8)
+            tail = len(rows) - max(1, len(rows) // 8)
             split = (X.shape[1] + 3) // 4
-            plans = [(rows, budgets[1] // 2), (set(range(tail, nrows)), budgets[1] // 2)]
+            plans = [(rows, budgets[1] // 2), (set(range(tail, len(rows))), budgets[1] // 2)]
         elif explicit_large_batch:
             plans = [(rows, gpu_batch)] * 2
         else:
             reserve = 2 * gpu_batch // 3
-            reread = set(range(0, nrows, 3))
+            reread = set(range(0, len(rows), 3))
             plans = [(rows - reread, reserve)] + [(reread, gpu_batch - reserve)] * 2
             if reference == "b":
                 plans.append((rows, gpu_batch))
@@ -204,7 +187,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
             assert codes.chunks == (matrix.chunks[0], (1,))
             i, expected_call = next(projections)
             assert (rows if selected is None else set(selected), opts["budget"]) == expected_call
-            assert opts["concurrency"] <= (nrows + 1) // 2
+            assert opts["concurrency"] <= (len(rows) + 1) // 2
             assert (edges[0] == 0 and edges[-1] == X.shape[1]) == (i == 0 and not explicit_large_batch)
             if host_reuse:
                 assert edges[len(edges) // 2 if i == 0 else 0] == split
@@ -215,8 +198,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
 
         monkeypatch.setattr(_wilcoxon_dask, "_project_window", check_project)
     if mode == "gpu-host-window":
-        config["rapids-singlecell.wilcoxon.host-batch-size"] = 4096
-        config["rapids-singlecell.wilcoxon.batch-size"] = 512
+        config |= {"rapids-singlecell.wilcoxon.host-batch-size": 4096, "rapids-singlecell.wilcoxon.batch-size": 512}
         rank_columns = _wilcoxon_dask._rank_columns
 
         def check_host_blocks(blocks, *args):
@@ -228,28 +210,31 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         monkeypatch.setattr(_wilcoxon_dask, "_rank_columns", check_host_blocks)
         monkeypatch.setattr(_wilcoxon, "_rank_dask_window", lambda *a, **kw: pytest.fail("expected record rank path"))
     if mode == "gpu-float64":
-        monkeypatch.setattr(
-            _wilcoxon_dask, "_project_window", lambda *a, **kw: pytest.fail("expected float64 fallback")
-        )
+        monkeypatch.setattr(_wilcoxon_dask, "_project_window", lambda *a, **kw: pytest.fail("float64 used packing"))
     with dask.config.set(config):
         actual = rsc.tl.rank_genes_groups(lazy, "group", **kwargs)
+    if mode == "host":
+        assert rank_batch.called
+        for call in rank_batch.call_args_list:
+            rows = call.args[0]
+            assert sum(row.shape[0] for row in rows) == len(X)
+            assert all(row.shape[1] <= min(width, (X.shape[1] + 1) // 2) for row in rows)
+            assert kind == "csr" or all(row.base is None for row in rows)
     assert next(projections, None) is None
     np.testing.assert_array_equal(actual["names"], expected["names"])
     for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
-        for group in expected[field].dtype.names:
-            np.testing.assert_allclose(actual[field][group], expected[field][group], rtol=1e-6, atol=1e-12)
+        pd.testing.assert_frame_equal(pd.DataFrame(actual[field]), pd.DataFrame(expected[field]), rtol=1e-6, atol=1e-12)
     assert actual.keys() == expected.keys()
     for field in expected.keys() & {"pts", "pts_rest"}:
         pd.testing.assert_frame_equal(actual[field], expected[field])
         for group in actual[field]:
             mask = labels == group if field == "pts" else labels != group
             np.testing.assert_array_equal(actual[field][group], (X[mask] != 0).mean(axis=0))
-    column = asarray(eager.X[:, 1:2])
+    column = asarray(eager.X[:, 1:2]).astype(np.float64)
     group = labels == "a"
     control = ~group if reference == "rest" else labels == reference
     pos = np.flatnonzero(actual["names"]["a"] == eager.var_names[1]).item()
-    u = mannwhitneyu(column[group].astype(np.float64), column[control].astype(np.float64)).statistic.item()
-    assert actual["scores"]["a"][pos] == u
+    assert actual["scores"]["a"][pos] == mannwhitneyu(column[group], column[control]).statistic.item()
 
 
 @pytest.mark.parametrize("on_host", [False, True])
