@@ -91,9 +91,9 @@ def test_large_group_keeps_half_integer_u(rg):
 def test_dense_integer_rank_rows(rg):
     sizes = np.array([8, 3, 4, 2])
     labels = np.repeat(np.arange(5), [*sizes, 3])
-    x = np.random.default_rng(18).integers(-2, 3, (len(labels), 4)).astype(np.float32)
+    x = np.random.default_rng(18).integers(-2, 3, (len(labels), 4)).astype(np.float64)
     rg.group_codes, rg.group_sizes, rg.pts_rest = labels, sizes, None
-    rank = partial(_wilcoxon_dask.rank_large_groups, [x[:8], x[8:]], options=U_OPTIONS)
+    rank = partial(_wilcoxon_dask.rank_large_groups, np.split(x.astype(np.float32), [8]), options=U_OPTIONS)
     stats = rank(rg)
     ref = labels != 0 if rg.ireference is None else labels == rg.ireference
     expected = mannwhitneyu(x[labels == 0], x[ref], method="asymptotic", use_continuity=False)
