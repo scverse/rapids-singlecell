@@ -264,6 +264,7 @@ The functions below are implemented to run on Dask‑backed `AnnData` with GPU a
 - {func}`~.pp.scale`
 - {func}`~.pp.regress_out`
 - {func}`~.pp.pca`
+- {func}`~.pp.scrublet` with a capture annotation such as `batch="obs.library"`. Each library, its simulated doublets, and its PCA and neighbor-search intermediates must fit on one worker. Storing cells from the same library in contiguous rows reduces data movement.
 - {func}`~.tl.score_genes`
 - {func}`~.tl.score_genes_cell_cycle`
 - `tl.louvain` (deprecated; set `use_dask=True` to distribute graph clustering)
