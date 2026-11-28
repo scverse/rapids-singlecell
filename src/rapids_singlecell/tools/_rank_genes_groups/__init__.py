@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
+import scverse_misc
 from scverse_misc import Deprecation, deprecated, deprecated_arg
 
+import rapids_singlecell as rsc
 from rapids_singlecell._settings import Default, resolve_default, settings
 from rapids_singlecell.get import _check_mask
 from rapids_singlecell.get._out import (
@@ -103,31 +106,23 @@ def rank_genes_groups(
 
     Log1p/log-normalized data is expected for biologically meaningful log fold
     changes. Exact sparse ``wilcoxon`` versus rest ranks signed stored values
-    and implicit zeros directly. Sparse ``wilcoxon`` with an explicit reference
+    and implicit zeros directly. In memory, sparse ``wilcoxon`` with an explicit reference
     uses sign-safe dense ranking in bounded CUDA streamer tiles. Dense inputs
     are ranked directly and support any sign.
     (``wilcoxon_binned`` rejects negative Dask sparse input, which it cannot
     bin correctly.)
 
     .. note::
-        **Dask support:** `'t-test'`, `'t-test_overestim_var'`,
-        `'wilcoxon_binned'`, and `'logreg'` support Dask arrays. The
-        `'wilcoxon'` method does not support Dask arrays.
+        All methods support Dask arrays. For exact ranks on lazy dense or CSR data,
+        see :ref:`out-of-core-wilcoxon` for an example and per-worker memory settings.
 
     .. note::
-        **Wilcoxon ranking precision:** `'wilcoxon'` and `'wilcoxon_binned'`
+        **Wilcoxon ranking precision:** The exact Wilcoxon kernels
         rank values in float32 on every code path, while means and log fold
-        changes are computed in float64. This only diverges from Scanpy when the
+        changes are computed in float64. Distinct float64 values can tie when
         **preprocessing itself ran in float64** — i.e. normalization/log1p
-        produced values carrying sub-float32 precision. If preprocessing was
-        done in float32 (the common case), the values are float32-exact and
-        ranking is bit-identical to Scanpy (~1e-13), even if they are afterward
-        stored as float64. For a fully float64 pipeline the rank-derived scores
-        and p-values still match Scanpy-on-float64 to ~1e-4 on log-normalized
-        data — below any significance threshold and changing no DE calls —
-        because the rank-sum normal approximation is insensitive to sub-float32
-        tie jitter. If exact float64 ranking matters for your workflow, please
-        open an issue at https://github.com/scverse/rapids_singlecell/issues.
+        produced values carrying sub-float32 precision. Ties receive their
+        average rank. Two-sided p-values use the normal approximation.
 
     Parameters
     ----------
@@ -162,7 +157,7 @@ def rank_genes_groups(
         `'t-test_overestim_var'` overestimates variance of each group,
         `'wilcoxon'` uses Wilcoxon rank-sum,
         `'wilcoxon_binned'` uses histogram-based approximate Wilcoxon rank-sum
-        (faster for large datasets, supports Dask arrays),
+        (deprecated in favor of `'wilcoxon'`),
         `'logreg'` uses logistic regression.
     corr_method
         p-value correction method. Used only for `'t-test'`,
@@ -202,6 +197,8 @@ def rank_genes_groups(
         columns, and results are gathered on the current device. Device-resident
         t-test/binned input runs on its owning GPU. On small host inputs the
         sharding overhead can make multi-GPU slower than a single GPU.
+        Exact Wilcoxon on Dask uses each worker's GPU by default.
+        Explicit device selections apply within each worker.
     n_bins
         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
         a better approximation at slightly increased cost. Default is 1000
@@ -268,6 +265,13 @@ def rank_genes_groups(
     if method is None:
         method = settings.preset.rank_genes_groups.method
 
+    if method == "wilcoxon_binned":
+        warnings.warn(
+            "method='wilcoxon_binned' is deprecated. Use method='wilcoxon' for exact ranks.",
+            FutureWarning,
+            skip_file_prefixes=(*rsc.__path__, *scverse_misc.__path__),
+        )
+
     if method not in {
         "logreg",
         "t-test",
@@ -283,6 +287,10 @@ def rank_genes_groups(
 
     if return_u_values and method != "wilcoxon":
         msg = "return_u_values is only supported for method='wilcoxon'."
+        raise ValueError(msg)
+
+    if method == "wilcoxon" and adata.n_obs >= 2**31:
+        msg = "Wilcoxon currently supports fewer than 2**31 cells per input."
         raise ValueError(msg)
 
     if (

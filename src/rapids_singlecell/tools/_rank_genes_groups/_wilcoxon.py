@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import warnings
+from collections import Counter
+from contextlib import suppress
+from copy import copy
+from operator import methodcaller
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -9,9 +13,10 @@ import cupyx.scipy.special as cupyx_special
 import numpy as np
 import scipy.sparse as sp
 
+from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 
-from ._utils import EPS, MIN_GROUP_SIZE_WARNING
+from ._utils import EPS, MIN_GROUP_SIZE_WARNING, _canonicalize_sparse, _data_device
 from ._wilcoxon_host import _build_ovo_host_context, _kernel_dtype, _OvoHostContext, _run_sharded_wilcoxon
 
 if TYPE_CHECKING:
@@ -33,6 +38,9 @@ _SUB_BATCH = {
 }
 
 _WilcoxonResult = tuple[np.ndarray, cp.ndarray, cp.ndarray, cp.ndarray | None]
+_DaskWilcoxonResult = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]
+_HALF_INTEGER_LIMIT = 2**52  # Above this magnitude float64 can lose half-ranks.
+_MAX_RECORD_GROUPS = 2**16 - 1  # Reserve a uint16 code for unselected cells.
 
 
 def _log1p_scale(rg: _RankGenes) -> float:
@@ -55,6 +63,14 @@ def _logfoldchanges_from_means(
     return cp.log2((group_expr + EPS) / (reference_expr + EPS))
 
 
+def _wilcoxon_z_p(diff, variance, *, use_continuity):
+    if use_continuity:
+        diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
+    z = diff / cp.sqrt(variance)
+    cp.nan_to_num(z, copy=False)
+    return z, cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
+
+
 def _finish_wilcoxon(
     rank_sums: cp.ndarray,
     expected: cp.ndarray,
@@ -67,12 +83,7 @@ def _finish_wilcoxon(
     logfoldchanges_gpu: cp.ndarray | None,
 ) -> _WilcoxonResult:
     """Compute the shared normal approximation and return its GPU result."""
-    diff = rank_sums - expected
-    if use_continuity:
-        diff = cp.sign(diff) * cp.maximum(cp.abs(diff) - 0.5, 0.0)
-    z = diff / cp.sqrt(variance)
-    cp.nan_to_num(z, copy=False)
-    p_values = cupyx_special.erfc(cp.abs(z) * cp.float64(cp.sqrt(0.5)))
+    z, p_values = _wilcoxon_z_p(rank_sums - expected, variance, use_continuity=use_continuity)
     scores = rank_sums - sizes[:, None] * (sizes[:, None] + 1.0) / 2.0 if return_u_values else z
     return (
         group_indices,
@@ -138,10 +149,10 @@ def wilcoxon(
     use_continuity: bool = False,
     multi_gpu: bool | list[int] | str | None = None,
     return_u_values: bool = False,
-) -> _WilcoxonResult | None:
+) -> _WilcoxonResult | _DaskWilcoxonResult | None:
     """Compute Wilcoxon rank-sum test statistics."""
     X = rg.X
-    _validate_wilcoxon_sparse_dtype(X)
+    _validate_wilcoxon_sparse_dtype(X._meta if isinstance(X, DaskArray) else X)
     rg.means = rg.vars = rg.pts = None
     rg.means_rest = rg.vars_rest = rg.pts_rest = None
     if rg.ireference is None:
@@ -149,7 +160,8 @@ def wilcoxon(
     else:
         _warn_small_ovo_groups(rg, rg.group_sizes)
 
-    return _run_sharded_wilcoxon(
+    run = _run_dask_wilcoxon if isinstance(X, DaskArray) else _run_sharded_wilcoxon
+    return run(
         rg,
         tie_correct=tie_correct,
         use_continuity=use_continuity,
@@ -157,6 +169,182 @@ def wilcoxon(
         return_u_values=return_u_values,
         shard_runner=_run_wilcoxon_shard,
     )
+
+
+def _compact_rank_groups(rg, targets):
+    """Give large targets, the reference and the remainder distinct uint16 codes."""
+    ref = rg.ireference
+    selected = targets if ref is None else np.union1d(targets, [ref])
+    codes = np.full(len(rg.group_sizes) + 1, len(selected), dtype=np.uint16)
+    codes[selected] = np.arange(len(selected), dtype=np.uint16)
+    subset = copy(rg)
+    subset.group_codes = codes[rg.group_codes]
+    subset.group_sizes = rg.group_sizes[selected]
+    subset.ireference = None if ref is None else int(codes[ref])
+    subset.comp_pts = False
+    return subset, targets if ref is None else targets - (targets > ref)
+
+
+def _rank_dask_batch(rows, template, fmt, options):
+    from dask.array.dispatch import concatenate_lookup
+
+    rg = copy(template)
+    with _data_device(rows[0]):
+        first = rows[0]
+        exact = None
+        positions = slice(None)
+        if first.shape[1] and len(rg.group_codes) * int(rg.group_sizes.max()) > _HALF_INTEGER_LIMIT:
+            from ._wilcoxon_dask import rank_large_groups
+
+            if len(rg.group_sizes) <= _MAX_RECORD_GROUPS:
+                exact = rank_large_groups(rows, rg, options)
+                if exact is not None and first.dtype == np.float32:
+                    return exact
+            else:
+                # Under the int32 cell limit at most 1,023 targets need integer rank sums.
+                targets = np.flatnonzero(len(rg.group_codes) * rg.group_sizes > _HALF_INTEGER_LIMIT)
+                if rg.ireference is not None:
+                    targets = targets[targets != rg.ireference]
+                if targets.size:
+                    subset, positions = _compact_rank_groups(rg, targets)
+                    exact = rank_large_groups(rows, subset, options)
+        # Dask registers CuPy's spmatrix but not its newer sparse array classes.
+        join = concatenate_lookup.dispatch(cpsp.spmatrix if cpsp.issparse(first) else type(first))
+        X = first if len(rows) == 1 else join(rows, axis=0)
+        if fmt:
+            X = X.asformat(fmt)  # stacked CuPy CSC chunks can become COO
+            _validate_wilcoxon_sparse_dtype(X)
+            if not X.has_canonical_format:
+                X = _canonicalize_sparse(X.copy())
+        rg.X = X
+        _, scores, pvals, lfc = _run_sharded_wilcoxon(rg, **options)
+        # Keep expression summaries in the input's native precision.
+        stats = {"scores": cp.asnumpy(scores), "pvals": cp.asnumpy(pvals)}
+        if exact is not None:
+            for field in stats:
+                stats[field][positions] = exact[field]
+        if lfc is not None:
+            stats["logfoldchanges"] = cp.asnumpy(lfc)
+        return stats | {k: v for k in ("means", "means_rest", "pts", "pts_rest") if (v := getattr(rg, k)) is not None}
+
+
+def _rank_dask_window(window, width, template, options, *, client, workers, compute_kw):
+    # Detach projections: a narrow dense slice can keep its full-width parent alive.
+    parts = window.rechunk({1: width}, method="tasks").map_blocks(methodcaller("copy"), meta=window._meta)
+    fmt = getattr(window._meta, "format", None)
+    tasks = parts.to_delayed()
+    if not workers:
+        rows = [task.compute(**compute_kw) for task in tasks[:, 0]]
+        return [_rank_dask_batch(rows, template, fmt, options)]
+    from distributed import wait
+
+    row_limit = min(len(workers), (len(tasks) + 1) // 2)
+    for start in range(0, len(tasks), row_limit):
+        wave = tasks[start : start + row_limit]
+        projected = client.compute(wave.ravel().tolist())
+        wait(projected)  # Release this wave's full-width input before reading more rows.
+        wave.flat = projected
+    ranks = [
+        client.submit(_rank_dask_batch, panel, template, fmt, options, workers=[worker], pure=False)
+        for panel, worker in zip(tasks.T.tolist(), workers, strict=False)
+    ]
+    return client.gather(ranks)
+
+
+def _worker_rank_memory(dask_worker):
+    import psutil
+    from distributed.system import MEMORY_LIMIT
+
+    _, device = cp.cuda.runtime.memGetInfo()
+    rmm = next((p for p in dask_worker.plugins.values() if type(p).__name__ == "RMMSetup"), None)
+    pooled = getattr(rmm, "initial_pool_size", None) is not None or getattr(rmm, "async_alloc", False)
+    pool = getattr(rmm, "maximum_pool_size", None) if pooled else None
+    limit = dask_worker.memory_manager.memory_limit or MEMORY_LIMIT
+    remaining = max(0, limit // 2 - dask_worker.monitor.get_process_memory())
+    available = min(MEMORY_LIMIT, psutil.virtual_memory().available)
+    return device, pool, dask_worker.host, min(limit // 4, remaining), available
+
+
+def _rank_budgets(memory, input_bytes):
+    import dask
+    from dask.utils import parse_bytes
+
+    hosts = Counter(host for _, _, host, _, _ in memory)
+    limit = min(device // 4 for device, *_ in memory)
+    # Leave room in a capped pool for reading, normalizing and sorting a CSR chunk.
+    pool = min(pool or device for device, pool, *_ in memory)
+    default = min(limit, 3 * pool // 10)
+    target = min(limit, pool, parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=default)))
+    host = min(min(worker, available // (4 * hosts[name])) for _, _, name, worker, available in memory)
+    # Host transfers pay off when they avoid multiple full CSR scans.
+    use_host = host >= (2 if default < limit else 4) * target and input_bytes > target * len(memory)
+    return target, host if use_host else 0
+
+
+def _run_dask_wilcoxon(rg, **options):
+    import dask
+    from dask import threaded
+    from dask.base import get_scheduler
+    from dask.utils import parse_bytes
+
+    X = rg.X
+    groups = np.asarray([i for i in range(len(rg.groups_order)) if i != rg.ireference], dtype=np.intp)
+    if not groups.size:
+        return None
+    scheduler = get_scheduler(collections=[X])
+    client = getattr(scheduler, "__self__", None)
+    workers = client.nthreads() if hasattr(client, "nthreads") else {}
+    fmt = getattr(X._meta, "format", None)
+    entry_bytes = X.itemsize + (X._meta.indices.itemsize if fmt else 0)
+    target_bytes = parse_bytes(dask.config.get("array.chunk-size"))
+    host_bytes = 0
+    if workers and (isinstance(X._meta, cp.ndarray) or cpsp.issparse(X._meta)):
+        memory = client.run(_worker_rank_memory, workers=list(workers))
+        target_bytes, host_bytes = _rank_budgets(memory.values(), X.nbytes)
+    row_blocks = (
+        (isinstance(X._meta, cp.ndarray) or cpsp.isspmatrix_csr(X._meta)) and X.numblocks[0] > 1 and X.numblocks[1] == 1
+    )
+    fits_records = X.dtype == np.float32 and X.shape[0] < 2**31 and len(rg.group_sizes) <= _MAX_RECORD_GROUPS
+    if workers and row_blocks and X.shape[1] > 0 and fits_records and options["multi_gpu"] in (None, False):
+        from ._wilcoxon_dask import rank_record_windows
+
+        host_config = dask.config.get("rapids-singlecell.wilcoxon.host-batch-size", default=None)
+        host_bytes = host_bytes if host_config is None else parse_bytes(host_config)
+        if host_bytes < 0:
+            raise ValueError("Wilcoxon host-batch-size must be nonnegative.")
+        # Concurrent full-width reads also draw from a small device pool.
+        rank_workers = dict.fromkeys(workers, 1) if host_bytes and host_config is None else workers
+        with suppress(MemoryError):
+            result = rank_record_windows(rg, options, client, rank_workers, target_bytes, host_budget=host_bytes)
+            if result is not None:
+                return groups, *result
+    width = max(1, target_bytes // (max(1, X.shape[0]) * entry_bytes))
+    template = copy(rg)
+    del template.X, template.labels, template.var_names
+    if workers:
+        template = client.scatter(template, broadcast=True, hash=False)
+    if options["multi_gpu"] is None:
+        options["multi_gpu"] = False
+    compute_kw = {"num_workers": 1} if scheduler is threaded.get else {}
+    stats = {}
+    n_workers = max(1, len(workers))
+    # Even a large Dask byte target should leave the next genes on disk.
+    window_width = max(1, min(width * n_workers, (X.shape[1] + 1) // 2))
+    width = (window_width + n_workers - 1) // n_workers
+    for start in range(0, max(1, X.shape[1]), window_width):
+        window = X[:, start : start + window_width]
+        batches = _rank_dask_window(
+            window, width, template, options, client=client, workers=workers, compute_kw=compute_kw
+        )
+        for i, batch in enumerate(batches):
+            offset = start + i * width
+            for name, values in batch.items():
+                if name not in stats:
+                    stats[name] = np.empty((values.shape[0], X.shape[1]), dtype=values.dtype)
+                stats[name][:, offset : offset + values.shape[1]] = values
+    rg.means, rg.means_rest = stats.get("means"), stats.get("means_rest")
+    rg.pts, rg.pts_rest = stats.get("pts"), stats.get("pts_rest")
+    return groups, stats["scores"], stats["pvals"], stats.get("logfoldchanges")
 
 
 def _run_wilcoxon_shard(

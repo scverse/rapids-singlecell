@@ -835,7 +835,10 @@ void register_bindings(nb::module_& m) {
     def_csr_column_range_gather_device<double, int64_t, int64_t, Device>(m);
 }
 
+void register_wilcoxon_panel(nb::module_& m);
+
 NB_MODULE(_wilcoxon_cuda, m) {
+    register_wilcoxon_panel(m);
     m.def("_set_host_worker_limit", &set_host_worker_limit, "limit"_a);
     m.def(
         "_set_pageable_stage_bytes",

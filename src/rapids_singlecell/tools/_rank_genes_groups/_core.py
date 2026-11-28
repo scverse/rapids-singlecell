@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from typing import TYPE_CHECKING, Literal, assert_never
 
 import cupy as cp
@@ -25,6 +26,21 @@ from ._utils import (
 
 _RANK_SORT_MIN_ELEMENTS = 1_000_000
 _RANK_SORT_MAX_WORKERS = 64
+
+
+def _take_ranked(values, indices):
+    if indices.size < _RANK_SORT_MIN_ELEMENTS or len(indices) < 64:
+        return np.take_along_axis(values, indices, axis=1)
+    # Each public record is one gene across all groups. Gather into that layout once.
+    out = np.empty(indices.shape, dtype=values.dtype, order="F")
+
+    def gather(start):
+        rows = slice(start, start + 64)
+        out[rows] = np.take_along_axis(values[rows], indices[rows], axis=1)
+
+    with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
+        list(pool.map(gather, range(0, len(indices), 64)))
+    return out
 
 
 def _apply_expm1_preserving_sparsity(X, scale: float):
@@ -92,9 +108,6 @@ class _RankGenes:
             reference=reference,
             skip_empty_groups=skip_empty_groups,
         )
-        # Scanpy groups omitted categories and missing labels into one remainder.
-        self._aggregation_groupby = pd.Categorical(self.group_codes, categories=range(len(self.groups_order) + 1))
-
         if layer is not None:
             if use_raw is True:
                 msg = "Cannot specify `layer` and have `use_raw=True`."
@@ -157,7 +170,9 @@ class _RankGenes:
         X = self.X
         if isinstance(X, np.ndarray) or sp.issparse(X):
             return self._stream_planes()
-        agg = Aggregate(groupby=self._aggregation_groupby, data=X)
+        # Scanpy groups omitted categories and missing labels into one remainder.
+        groupby = pd.Categorical(self.group_codes, categories=range(len(self.groups_order) + 1))
+        agg = Aggregate(groupby=groupby, data=X)
         funcs = {"sum", "sq_sum"}
         if self.comp_pts:
             funcs.add("count_nonzero")
@@ -311,9 +326,6 @@ class _RankGenes:
         elif method == "wilcoxon":
             from ._wilcoxon import wilcoxon
 
-            if isinstance(self.X, DaskArray):
-                msg = "Wilcoxon test is not supported for Dask arrays. Please convert your data to CuPy arrays."
-                raise ValueError(msg)
             self._score_dtype = np.dtype(np.float64 if return_u_values else np.float32)
             wilcoxon_result = wilcoxon(
                 self,
@@ -346,7 +358,7 @@ class _RankGenes:
             }
             return
 
-        if wilcoxon_result is not None:
+        if wilcoxon_result is not None and isinstance(wilcoxon_result[1], cp.ndarray):
             group_indices, scores_gpu, pvals_gpu, logfoldchanges_gpu = wilcoxon_result
             with cp.cuda.Device(scores_gpu.device.id):
                 self._compute_statistics_gpu_arrays(
@@ -363,6 +375,7 @@ class _RankGenes:
 
         self._compute_statistics_arrays(
             test_results,
+            wilcoxon_result=wilcoxon_result,
             corr_method=corr_method,
             n_genes_user=n_genes_user,
             n_genes=n_genes,
@@ -400,7 +413,11 @@ class _RankGenes:
         return indices
 
     @staticmethod
-    def _fdr_bh_matrix(pvals: np.ndarray) -> np.ndarray:
+    def _fdr_bh_matrix(pvals: np.ndarray, *, gpu: bool = False) -> np.ndarray:
+        if gpu:
+            with suppress(MemoryError, cp.cuda.runtime.CUDARuntimeError):
+                if cp.cuda.runtime.memGetInfo()[0] >= 8 * pvals.nbytes:
+                    return _RankGenes._fdr_bh_matrix_gpu(cp.asarray(pvals)).get()
         pvals_clean = np.array(pvals, copy=True)
         pvals_clean[np.isnan(pvals_clean)] = 1.0
         order = np.argsort(pvals_clean, axis=1)
@@ -445,13 +462,19 @@ class _RankGenes:
         self,
         test_results: list[tuple[int, NDArray, NDArray]],
         *,
+        wilcoxon_result,
         corr_method: _CorrMethod,
         n_genes_user: int,
         n_genes: int,
         rankby_abs: bool,
     ) -> None:
-        group_indices = np.asarray([r[0] for r in test_results], dtype=np.intp)
-        scores = np.vstack([r[1] for r in test_results])
+        if wilcoxon_result is None:
+            group_indices = np.asarray([r[0] for r in test_results], dtype=np.intp)
+            scores = np.vstack([r[1] for r in test_results])
+            pvals = np.vstack([r[2] for r in test_results]) if test_results[0][2] is not None else None
+            logfoldchanges = None
+        else:
+            group_indices, scores, pvals, logfoldchanges = wilcoxon_result
         sort_scores = np.abs(scores) if rankby_abs else scores
         top_idx = self._rank_indices_matrix(sort_scores, n_genes_user)
 
@@ -460,22 +483,24 @@ class _RankGenes:
             "group_names": np.asarray([str(self.groups_order[i]) for i in group_indices], dtype=object),
             "var_names": np.asarray(self.var_names),
             "gene_indices": top_idx.astype(np.intp, copy=False),
-            "scores": np.take_along_axis(scores, top_idx, axis=1).astype(self._score_dtype, copy=False),
+            "scores": _take_ranked(scores, top_idx).astype(self._score_dtype, copy=False),
         }
 
-        if test_results[0][2] is not None:
-            pvals = np.vstack([r[2] for r in test_results])
-            arrays["pvals"] = np.take_along_axis(pvals, top_idx, axis=1)
+        if pvals is not None:
+            arrays["pvals"] = _take_ranked(pvals, top_idx)
             if corr_method == "benjamini-hochberg":
-                pvals_adj = self._fdr_bh_matrix(pvals)
+                pvals_adj = self._fdr_bh_matrix(pvals, gpu=wilcoxon_result is not None)
             elif corr_method == "bonferroni":
                 pvals_adj = np.minimum(pvals * n_genes, 1.0)
             else:
                 msg = f"Unsupported correction method: {corr_method!r}."
                 raise ValueError(msg)
-            arrays["pvals_adj"] = np.take_along_axis(pvals_adj, top_idx, axis=1)
+            arrays["pvals_adj"] = _take_ranked(pvals_adj, top_idx)
 
-        if self.means is not None:
+        if logfoldchanges is not None:
+            sorted_lfc = _take_ranked(logfoldchanges, top_idx)
+            arrays["logfoldchanges"] = sorted_lfc.astype(np.float32, copy=False)
+        elif self.means is not None:
             self._logfoldchanges_into(arrays, group_indices, top_idx)
 
         self.stats_arrays = arrays

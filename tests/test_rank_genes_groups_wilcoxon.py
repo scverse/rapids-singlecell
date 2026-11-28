@@ -816,13 +816,17 @@ def test_wilcoxon_bindings_reject_inconsistent_shapes():
         "cupy_csc",
     ],
 )
-def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_wilcoxon_all_public_formats_match_scanpy(reference, fmt, chunked):
     np.random.seed(42)
     adata_gpu = sc.datasets.blobs(n_variables=5, n_centers=3, n_observations=120)
     _make_nonnegative(adata_gpu)
     adata_gpu.obs["blobs"] = adata_gpu.obs["blobs"].astype("category")
     adata_cpu = adata_gpu.copy()
     adata_gpu.X = _to_format(adata_gpu.X, fmt)
+    if chunked:
+        da = pytest.importorskip("dask.array")
+        adata_gpu.X = da.from_array(adata_gpu.X, chunks=(31, 2), asarray=False)
 
     kw = {
         "groupby": "blobs",

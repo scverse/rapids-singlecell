@@ -119,8 +119,7 @@ def test_rank_genes_groups_ttest_dask(client, data_kind, dtype, method, mean_in_
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
-def test_rank_genes_groups_wilcoxon_dask_errors(client, data_kind):
-    """Test that wilcoxon raises an error with dask arrays."""
+def test_rank_genes_groups_wilcoxon_persisted_dask(client, data_kind):
     if data_kind == "dense":
         adata = pbmc68k_reduced()
         adata.X = as_dense_cupy_dask_array(adata.X).persist()
@@ -133,8 +132,8 @@ def test_rank_genes_groups_wilcoxon_dask_errors(client, data_kind):
         adata.X = as_sparse_cupy_dask_array(adata.X).persist()
         groupby = "louvain"
 
-    with pytest.raises(ValueError, match="Wilcoxon test is not supported for Dask"):
-        rsc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", use=A.X)
+    result = rsc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", use=A.X, out=True)
+    assert len(result["scores"]) == adata.n_vars
 
 
 @pytest.mark.parametrize("data_kind", ["sparse", "dense"])

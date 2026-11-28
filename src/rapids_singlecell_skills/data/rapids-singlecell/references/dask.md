@@ -41,7 +41,7 @@ rsc.get.anndata_to_GPU(adata)
 
 ## Supported steps
 
-- Dask-capable: `calculate_qc_metrics`, `filter_cells`, `filter_genes`, `normalize_total` (without `exclude_highly_expressed`), `log1p`, `highly_variable_genes` (not `pearson_residuals`), `scale`, `pca` (`covariance_eigh` only), `score_genes`, `rank_genes_groups` (`wilcoxon_binned` or t-test, not exact `wilcoxon`), `rsc.get.aggregate` and every `rsc.dcg` method except `gsva`, which computes Dask input into memory.
+- Dask-capable: `calculate_qc_metrics`, `filter_cells`, `filter_genes`, `normalize_total` (without `exclude_highly_expressed`), `log1p`, `highly_variable_genes` (not `pearson_residuals`), `scale`, `pca` (`covariance_eigh` only), `score_genes`, `rank_genes_groups` (all methods, including exact `wilcoxon`), `rsc.get.aggregate` and every `rsc.dcg` method except `gsva`, which computes Dask input into memory.
 - `rsc.tl.leiden(..., use_dask=True)` distributes clustering, but it only pays off above about 10 million cells.
 - After PCA the embedding is small: `.compute()` it if `obsm["X_pca"]` is a Dask array, then run neighbors, Leiden and UMAP in memory.
 - Stop and reduce the data for steps without Dask support.
@@ -49,6 +49,7 @@ rsc.get.anndata_to_GPU(adata)
 
 ## Execute
 
+- For exact ranks on dense or CSR Zarr, call `rsc.pp.normalize_total(adata, target_sum=10_000)`, `rsc.pp.log1p(adata)`, then `rsc.tl.rank_genes_groups(adata, groupby, method="wilcoxon", use="X")` on the lazy GPU array above. The ranking call evaluates the chunks and sizes its gene windows automatically. See the [out-of-core Wilcoxon guide](https://rapids-singlecell.readthedocs.io/en/latest/out_of_core.html#out-of-core-wilcoxon).
 - `persist()` after filtering only if the result fits across workers, and call `adata.X.compute_chunk_sizes()` after row filtering.
 - `compute()` only reduced results, because it gathers everything onto the client GPU.
 - On OOM, shrink chunks and task concurrency before adding workers.

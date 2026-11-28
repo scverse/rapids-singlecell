@@ -88,6 +88,7 @@ class TestWilcoxonBinned:
 class TestWilcoxonBinnedMatchesExact:
     """Test that binned results agree with exact Wilcoxon."""
 
+    @pytest.mark.filterwarnings("error:.*wilcoxon_binned.*deprecated:FutureWarning")
     def test_matches_exact_wilcoxon_rankings(self, adata_blobs, array_type):
         """Top-ranked genes should mostly agree with exact Wilcoxon."""
         adata_binned = adata_blobs.copy()
@@ -95,7 +96,8 @@ class TestWilcoxonBinnedMatchesExact:
 
         adata_binned.X = array_type(adata_binned.X)
 
-        rsc.tl.rank_genes_groups(adata_binned, "blobs", method="wilcoxon_binned", use="X")
+        with pytest.warns(FutureWarning, match="method='wilcoxon_binned' is deprecated.*method='wilcoxon'"):
+            rsc.tl.rank_genes_groups(adata_binned, "blobs", method="wilcoxon_binned", use="X")
         rsc.tl.rank_genes_groups(adata_exact, "blobs", method="wilcoxon", use="X")
 
         _compare_gene_rankings(
