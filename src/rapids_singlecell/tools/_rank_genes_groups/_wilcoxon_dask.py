@@ -1,4 +1,4 @@
-"""Distributed exact ranking of bounded windows from row-chunked GPU CSR."""
+"""Distributed exact ranking of bounded windows from row-chunked GPU arrays."""
 
 from __future__ import annotations
 
@@ -7,16 +7,17 @@ from functools import partial
 from operator import getitem
 from types import SimpleNamespace
 
+import cupy as cp
 import numpy as np
 
-from ._wilcoxon_records import _on_device, pack_records, range_base, rank_records
+from ._wilcoxon_records import _on_device, csc_records, pack_records, range_base, rank_records
 
 
-def _pack_row(csr, codes, *, edges, on_host):
+def _pack_row(x, codes, *, edges, on_host):
     def to_host(a):
         return a.get(out=np.empty(a.shape, dtype=a.dtype))
 
-    parts = pack_records(csr, codes[:, 0], edges)
+    parts = pack_records(x, codes[:, 0], edges)
     if on_host and parts is not None:
         # The gene shards of a row share its lookup table.
         table = to_host(parts[0][2]) if parts[0][3] else None
@@ -30,16 +31,15 @@ def _record_sizes(parts):
     return None if parts is None else [words.nbytes + aux.nbytes + offsets.nbytes for offsets, words, aux, _ in parts]
 
 
-def _gene_bytes(csr, labels):
-    import cupy as cp
-
+def _gene_bytes(x, labels):
+    if isinstance(x, cp.ndarray):
+        return cp.count_nonzero(x, axis=0).get()[None, :] * 6
     bits = max(1, int(labels.max(initial=0)).bit_length())
-    record_bytes = 4 if range_base(csr.data, bits) is not None else 6
-    return cp.bincount(csr.indices, minlength=csr.shape[1]).get()[None, :] * record_bytes
+    record_bytes = 4 if range_base(x.data, bits) is not None else 6
+    return cp.bincount(x.indices, minlength=x.shape[1]).get()[None, :] * record_bytes
 
 
 def _sample_gene_sizes(client, X, codes, concurrency):
-    # One bounded wave of row chunks estimates how many records each gene contributes.
     heights = np.asarray(X.chunks[0])
     nonempty = np.flatnonzero(heights)
     n = min(len(nonempty), concurrency)
@@ -72,8 +72,8 @@ def _rank_columns(blocks, context, options, budget):
         if ranked is None:
             return None
         if not results:
-            results = [np.empty((a.shape[0], n_cols), dtype=a.dtype, order="F") for a in ranked[1:]]
-        for result, values in zip(results, ranked[1:], strict=True):
+            results = [np.empty((a.shape[0], n_cols), dtype=a.dtype, order="F") for a in ranked]
+        for result, values in zip(results, ranked, strict=True):
             values.get(out=result[:, start:end])
         start = end
     return results
@@ -88,9 +88,6 @@ def _set_pts(rg, counts, n_obs):
 
 def rank_large_groups(rows, rg, options):
     """Use integer rank counts when a float64 rank sum can lose a half-rank."""
-    import cupy as cp
-    import cupyx.scipy.sparse as cpsp
-
     width = rows[0].shape[1]
     step = max(1, 2**26 // width)
     blocks = []
@@ -100,15 +97,9 @@ def rank_large_groups(rows, rg, options):
             chunk = row[i : i + step]
             if chunk.dtype.kind in "biu":
                 chunk = chunk.astype(np.float64)
-            part = cpsp.csc_matrix(cp.asarray(chunk) if isinstance(chunk, np.ndarray) else chunk)
-            if not part.has_canonical_format:
-                part = part.copy()
-                part.sum_duplicates()
-            labels = cp.asarray(rg.group_codes[start : start + part.shape[0]], cp.uint16)
-            offsets = part.indptr.get().astype(np.int32, copy=False)
-            words = part.data.astype(cp.float32, copy=False).view(cp.uint32)
-            blocks.append((offsets, words, labels[part.indices], 0))
-            start += part.shape[0]
+            labels = cp.asarray(rg.group_codes[start : start + chunk.shape[0]], cp.uint16)
+            blocks.append(csc_records(chunk, labels))
+            start += chunk.shape[0]
     rg.n_obs = start
     arrays = _rank_columns(blocks, rg, options, start * width * np.dtype(np.float32).itemsize)
     if arrays is None:
@@ -126,6 +117,7 @@ def _project_window(X, codes, edges, *, client, workers, concurrency, budget, on
 
     columns = [[] for _ in range(len(edges) - 1)]
     retained = np.zeros(len(columns), np.int64)
+    sources = list(dict.fromkeys(workers)) if isinstance(X._meta, cp.ndarray) else []
     pending = {}
     packed = X.map_blocks(_pack_row, codes, edges=edges, on_host=on_host, chunks=(1, 1), meta=np.empty((0, 0), object))
     (packed,) = dask.optimize(packed)
@@ -136,7 +128,8 @@ def _project_window(X, codes, edges, *, client, workers, concurrency, budget, on
     def submit():
         if (row := next(todo, None)) is not None:
             # Unbox the native arrays on the worker so Dask accounts for their bytes.
-            task = client.compute(packed[row, 0].to_delayed().item())
+            source = [sources[row % len(sources)]] if sources else None
+            task = client.compute(packed[row, 0].to_delayed().item(), workers=source)
             receipt = client.submit(_record_sizes, task)
             pending[receipt] = task
             completed.add(receipt)
@@ -159,8 +152,7 @@ def _project_window(X, codes, edges, *, client, workers, concurrency, budget, on
             # Place only the projected piece on the GPU that will rank its genes.
             column.append(client.submit(identity, piece, workers=[worker], pure=False))
         submit()
-    # Estimate the next width from measured bytes, including dictionaries. The
-    # budget check above still applies when later genes or row blocks are denser.
+    # Predict the next width from the actual sizes of the completed rows.
     width = int(edges[-1] - edges[0])
     estimate = max(1, int(width * (0.9 * budget / max(1, retained.max())) * (observed / len(rows))))
     if retained.max() > budget:
@@ -168,7 +160,7 @@ def _project_window(X, codes, edges, *, client, workers, concurrency, budget, on
     return columns, max(width, min(2 * width, estimate))
 
 
-def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
+def rank_record_windows(rg, options, client, workers, budget, *, host_budget):
     import dask
     import dask.array as da  # type: ignore[import-not-found]
 
@@ -181,7 +173,11 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
         and X.shape[1] >= 2 * len(workers)
         and dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=None) is None
     )
-    concurrency = min(sum(min(n, 7 if lookahead else 3) for n in workers.values()), (X.numblocks[0] + 1) // 2)
+    per_worker = 7 if lookahead else 3
+    if isinstance(X._meta, cp.ndarray):
+        row_bytes = max(X.chunks[0]) * X.shape[1] * X.itemsize
+        per_worker = min(per_worker, max(1, budget // max(1, 2 * row_bytes)))
+    concurrency = min(sum(min(n, per_worker) for n in workers.values()), (X.numblocks[0] + 1) // 2)
     workers = list(workers)
     codes = da.from_array(rg.group_codes.astype(np.uint16)[:, None], chunks=(X.chunks[0], 1))
     project = partial(_project_window, X, codes, client=client, concurrency=concurrency, on_host=bool(host_budget))
@@ -234,8 +230,6 @@ def rank_csr_windows(rg, options, client, workers, budget, *, host_budget):
                 width = next_width
             continue
         width = max_width
-        # The sample may price each entry at six bytes while packed words use four.
-        # Actual projected bytes are checked on every window.
         capacity = min(1.5 * window_budget, capacity * next_width / (stop - start))
         jobs = [
             client.submit(_rank_columns, column, context, options, budget, workers=[worker], pure=False)

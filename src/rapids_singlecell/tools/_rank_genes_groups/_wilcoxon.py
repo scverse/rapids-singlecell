@@ -316,20 +316,22 @@ def _run_dask_wilcoxon(rg, **options):
     if workers and (isinstance(X._meta, cp.ndarray) or cpsp.issparse(X._meta)):
         memory = client.run(_worker_rank_memory, workers=list(workers))
         target_bytes, host_bytes = _rank_budgets(memory.values(), X.nbytes)
-    row_csr = cpsp.isspmatrix_csr(X._meta) and X.numblocks[0] > 1 and X.numblocks[1] == 1
+    row_blocks = (
+        (isinstance(X._meta, cp.ndarray) or cpsp.isspmatrix_csr(X._meta)) and X.numblocks[0] > 1 and X.numblocks[1] == 1
+    )
     fits_records = X.dtype == np.float32 and X.shape[0] < 2**31 and len(rg.group_sizes) <= _MAX_RECORD_GROUPS
-    if workers and row_csr and X.shape[1] > 0 and fits_records and options["multi_gpu"] in (None, False):
-        from ._wilcoxon_dask import rank_csr_windows
+    if workers and row_blocks and X.shape[1] > 0 and fits_records and options["multi_gpu"] in (None, False):
+        from ._wilcoxon_dask import rank_record_windows
 
         host_config = dask.config.get("rapids-singlecell.wilcoxon.host-batch-size", default=None)
         if host_config is not None:
             host_bytes = parse_bytes(host_config)
         if host_bytes < 0:
             raise ValueError("Wilcoxon host-batch-size must be nonnegative.")
-        # Concurrent full-width CSR reads also draw from a small device pool.
+        # Concurrent full-width reads also draw from a small device pool.
         rank_workers = dict.fromkeys(workers, 1) if host_bytes and host_config is None else workers
         with suppress(MemoryError):
-            result = rank_csr_windows(rg, options, client, rank_workers, target_bytes, host_budget=host_bytes)
+            result = rank_record_windows(rg, options, client, rank_workers, target_bytes, host_budget=host_bytes)
             if result is not None:
                 return groups, *result
     width = max(1, target_bytes // (max(1, X.shape[0]) * entry_bytes))

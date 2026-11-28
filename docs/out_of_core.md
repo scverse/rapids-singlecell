@@ -82,8 +82,11 @@ import rapids_singlecell as rsc
 
 rsc.get.anndata_to_GPU(adata)
 # Normalize and transform
-rsc.pp.normalize_total(adata)
+rsc.pp.normalize_total(adata, target_sum=10_000)
 rsc.pp.log1p(adata)
+
+# Rank all genes for each cell type against the remaining cells
+rsc.tl.rank_genes_groups(adata, "cell_type", method="wilcoxon", use="X", tie_correct=True, pts=True)
 
 # HVG selection
 rsc.pp.highly_variable_genes(adata)
@@ -154,25 +157,13 @@ For Dask inputs, {func}`~.pp.normalize_total` does not support
 supported.
 
 (out-of-core-wilcoxon)=
-## Exact Wilcoxon on log-normalized CSR
+## Exact Wilcoxon on log-normalized dense or CSR data
 
-Open the CSR Zarr store as above with `chunks=(100_000, -1)`. For KvikIO reads from local sharded Zstd stores, first import `zarr_kvikio.dask`, set `zarr.config.set({"kvikio.fetch": "kvikio"})`, and call `zarr_kvikio.dask.enable(client)`.
-This example compares each cell type with the remaining cells. Skip the two preprocessing calls if `adata.X` is already log-normalized.
+Open a dense or CSR Zarr matrix with 100,000 cells and all genes per Dask chunk (`chunks=(100_000, -1)`). For KvikIO reads from local sharded Zstd stores, first import `zarr_kvikio.dask`, set `zarr.config.set({"kvikio.fetch": "kvikio"})`, and call `zarr_kvikio.dask.enable(client)`.
+Skip the two preprocessing calls in the example above if the input is already log-normalized. With a fixed `target_sum`, GPU transfer and preprocessing stay lazy until ranking. For each gene, Wilcoxon ranks the float32 values across the comparison cells, including implicit zeros, and gives ties their average rank. Two-sided p-values use the normal approximation.
+Set `return_u_values=True` to store Mann–Whitney U in `scores`. The client holds cell labels and the group-by-gene results in `adata.uns["rank_genes_groups"]`, including expression fractions with `pts=True`. Inputs must have fewer than `2**31` cells. Float64 U statistics can round half-integers above `2**52`.
 
-```python
-import rapids_singlecell as rsc
-
-rsc.get.anndata_to_GPU(adata)
-rsc.pp.normalize_total(adata, target_sum=10_000)
-rsc.pp.log1p(adata)
-rsc.tl.rank_genes_groups(adata, "cell_type", method="wilcoxon", use="X", tie_correct=True, pts=True)
-results = adata.uns["rank_genes_groups"]
-```
-
-With a fixed `target_sum`, GPU transfer and preprocessing stay lazy until ranking. For each gene, Wilcoxon ranks the float32 values across the comparison cells, including implicit zeros, and gives ties their average rank. Two-sided p-values use the normal approximation.
-Set `return_u_values=True` to store Mann–Whitney U in `scores`. The client holds cell labels and group-by-gene results, including expression fractions with `pts=True`. Inputs must have fewer than `2**31` cells. Float64 U statistics can round half-integers above `2**52`.
-
-Workers use Dask `map_blocks` to pack expression values and group labels from each CSR chunk, then release that chunk. They rank each gene across all row chunks in its window. When the automatic GPU sort budget is at least 16 GiB per worker and records stay on the GPU, workers can also pack the next window for up to two thirds of the row chunks on the first read. They retain at most two thirds of the GPU sort budget per worker for that next window, saving a reread and normalization of those chunks.
+For float32 GPU row chunks, Dask `map_blocks` collects expression values and group labels for the active genes. Dense chunks contribute their nonzero entries. The same ranking kernel combines all row chunks for each gene and includes the remaining cells in its zero tie group. When the automatic GPU sort budget is at least 16 GiB per worker and records stay on the GPU, workers can also pack the next window for up to two thirds of the row chunks on the first read. They retain at most two thirds of the GPU sort budget per worker for that next window, saving a reread and normalization of those chunks.
 With a smaller GPU pool, workers can keep a larger window in host RAM when space permits. By default, this uses at most a quarter of each worker’s host memory allowance, subject to available RAM on the node.
 
 For a 10 GB pool per GPU, set both `rmm_pool_size="10 GB"` and `rmm_maximum_pool_size="10 GB"` on `LocalCUDACluster` with CuPy using RMM. The default GPU batch is 25% of device memory, capped at 30% of the configured pool maximum (3 GB for a 10 GB pool). CUDA and I/O can allocate outside the pool.

@@ -28,6 +28,21 @@ _RANK_SORT_MIN_ELEMENTS = 1_000_000
 _RANK_SORT_MAX_WORKERS = 64
 
 
+def _take_ranked(values, indices):
+    if indices.size < _RANK_SORT_MIN_ELEMENTS or len(indices) < 64:
+        return np.take_along_axis(values, indices, axis=1)
+    # Each public record is one gene across all groups. Gather into that layout once.
+    out = np.empty(indices.shape, dtype=values.dtype, order="F")
+
+    def gather(start):
+        rows = slice(start, start + 64)
+        out[rows] = np.take_along_axis(values[rows], indices[rows], axis=1)
+
+    with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
+        list(pool.map(gather, range(0, len(indices), 64)))
+    return out
+
+
 def _apply_expm1_preserving_sparsity(X, scale: float):
     """Apply the inverse log1p transform without densifying sparse arrays."""
     if isinstance(X, DaskArray):
@@ -468,11 +483,11 @@ class _RankGenes:
             "group_names": np.asarray([str(self.groups_order[i]) for i in group_indices], dtype=object),
             "var_names": np.asarray(self.var_names),
             "gene_indices": top_idx.astype(np.intp, copy=False),
-            "scores": np.take_along_axis(scores, top_idx, axis=1).astype(self._score_dtype, copy=False),
+            "scores": _take_ranked(scores, top_idx).astype(self._score_dtype, copy=False),
         }
 
         if pvals is not None:
-            arrays["pvals"] = np.take_along_axis(pvals, top_idx, axis=1)
+            arrays["pvals"] = _take_ranked(pvals, top_idx)
             if corr_method == "benjamini-hochberg":
                 pvals_adj = self._fdr_bh_matrix(pvals, gpu=wilcoxon_result is not None)
             elif corr_method == "bonferroni":
@@ -480,10 +495,10 @@ class _RankGenes:
             else:
                 msg = f"Unsupported correction method: {corr_method!r}."
                 raise ValueError(msg)
-            arrays["pvals_adj"] = np.take_along_axis(pvals_adj, top_idx, axis=1)
+            arrays["pvals_adj"] = _take_ranked(pvals_adj, top_idx)
 
         if logfoldchanges is not None:
-            sorted_lfc = np.take_along_axis(logfoldchanges, top_idx, axis=1)
+            sorted_lfc = _take_ranked(logfoldchanges, top_idx)
             arrays["logfoldchanges"] = sorted_lfc.astype(np.float32, copy=False)
         elif self.means is not None:
             self._logfoldchanges_into(arrays, group_indices, top_idx)

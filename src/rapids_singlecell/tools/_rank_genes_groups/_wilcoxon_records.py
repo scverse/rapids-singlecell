@@ -6,7 +6,7 @@ from functools import partial
 
 import cupy as cp
 import numpy as np
-from cupyx.scipy.sparse import isspmatrix_csr
+from cupyx.scipy.sparse import csc_matrix, isspmatrix_csr
 
 from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
 
@@ -23,17 +23,36 @@ def range_base(data, bits):
     return extrema[:1] if high - low < 1 << (32 - bits) else None
 
 
-def pack_records(csr, labels, bounds):
-    """Pack canonical CSR directly into independent gene shards with bounded scratch."""
-    if _wc is None or not isspmatrix_csr(csr) or csr.dtype != cp.float32:
+def csc_records(chunk, labels):
+    """Gather raw float32 words and row group codes in column order."""
+    part = csc_matrix(cp.asarray(chunk) if isinstance(chunk, np.ndarray) else chunk)
+    if not isinstance(chunk, np.ndarray | cp.ndarray) and not part.has_canonical_format:
+        part = part.copy()
+        part.sum_duplicates()
+    offsets = part.indptr.get().astype(np.int32, copy=False)
+    words = part.data.astype(cp.float32, copy=False).view(cp.uint32)
+    return offsets, words, labels[part.indices], 0
+
+
+def pack_records(x, labels, bounds):
+    """Pack a GPU row block into independent gene shards with bounded scratch."""
+    rows, cols = x.shape
+    if _wc is None or x.dtype != cp.float32 or labels.dtype != np.uint16 or len(labels) != rows or rows >= 2**31:
         return None
-    rows, cols = csr.shape
-    if labels.dtype != np.uint16 or len(labels) != rows or max(csr.nnz, rows) >= 2**31 or cols > 128 * 65535:
+    shards = list(zip(bounds[:-1], bounds[1:], strict=True))
+    if isinstance(x, cp.ndarray):
+        if any(rows * int(hi - lo) >= 2**31 for lo, hi in shards):
+            return None
+        labels = cp.asarray(labels)
+        pieces = [csc_records(x[:, lo:hi], labels) for lo, hi in shards]
+        cp.cuda.get_current_stream().synchronize()  # Dask can transfer these arrays on another stream.
+        return pieces
+    csr = x
+    if not isspmatrix_csr(csr) or csr.nnz >= 2**31 or cols > 128 * 65535:
         return None
     if not csr.has_canonical_format:
         csr = csr.copy()
         csr.sum_duplicates()
-    shards = list(zip(bounds[:-1], bounds[1:], strict=True))
     empty = cp.empty(0, cp.uint32)
     no_codes = empty.view(cp.uint16)
     if not csr.nnz:
@@ -154,8 +173,7 @@ def rank_records(blocks, lo, hi, rg, options):
         cp.cuda.get_current_stream().ptr,
     )
 
-    groups = np.arange(len(sizes), dtype=np.intp)
-    targets = slice(len(sizes)) if ref is None else groups[groups != ref]
+    targets = slice(len(sizes)) if ref is None else np.delete(np.arange(len(sizes)), ref)
     n = cp.asarray(sizes[targets], cp.int64)[:, None]
     other = rg.n_obs - n if ref is None else int(sizes[ref])
     selected = sums[:, targets].T
@@ -164,7 +182,6 @@ def rank_records(blocks, lo, hi, rg, options):
     u2 = twice_u[:, targets].T
     z, p = _wilcoxon_z_p((u2 - n * other) * 0.5, variance, use_continuity=options["use_continuity"])
     result = (
-        groups[targets],
         u2 * 0.5 if options["return_u_values"] else z,
         p,
         _logfoldchanges_from_means(rg, selected / n, reference).astype(cp.float32),

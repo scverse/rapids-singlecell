@@ -74,40 +74,32 @@ def test_range_packing_preserves_float_bits_and_group_codes():
     assert _wilcoxon_records.range_base(cp.asarray([low, low + 2**26], cp.uint32).view(cp.float32), 6) is None
 
 
-@pytest.mark.parametrize("reference", [None, 1])
-def test_large_group_keeps_half_integer_u(reference):
+@pytest.fixture(params=[None, 1])
+def rank_context(request):
+    return SimpleNamespace(ireference=request.param, comp_pts=True, mean_in_log_space=True, _log1p_base=None)
+
+
+def test_large_group_keeps_half_integer_u(rank_context):
     # One positive in each group, all other values are implicit zeros.
     size = 100_000_001
-    rg = SimpleNamespace(
-        group_sizes=np.array([size, 3]),
-        n_obs=size + 3,
-        ireference=reference,
-        comp_pts=True,
-        mean_in_log_space=True,
-        _log1p_base=None,
-    )
+    rg = rank_context
+    rg.group_sizes = np.array([size, 3])
+    rg.n_obs = size + 3
     block = (np.array([0, 2], np.int32), cp.ones(2, cp.float32).view(cp.uint32), cp.arange(2, dtype=cp.uint16), 0)
     opts = {"tie_correct": True, "use_continuity": False, "return_u_values": True}
-    _, scores, _, _, counts = _wilcoxon_records.rank_records([block], 0, 1, rg, opts)
+    scores, _, _, counts = _wilcoxon_records.rank_records([block], 0, 1, rg, opts)
     # Each target zero ties two reference zeros. Its positive wins twice and ties once.
     assert scores[0, 0].item() == size - 1 + 2.5
     np.testing.assert_array_equal(counts.get(), [[1], [1]])
 
 
-@pytest.mark.parametrize("reference", [None, 1])
-def test_dense_integer_rank_rows(reference):
+def test_dense_integer_rank_rows(rank_context):
     sizes = np.array([8, 3, 4, 2])
     labels = np.repeat(np.arange(5), [*sizes, 3])
     x = np.random.default_rng(18).integers(-2, 3, (len(labels), 4)).astype(np.float32)
-    rg = SimpleNamespace(
-        group_codes=labels,
-        group_sizes=sizes,
-        ireference=reference,
-        comp_pts=True,
-        mean_in_log_space=True,
-        _log1p_base=None,
-        pts_rest=None,
-    )
+    rg = rank_context
+    rg.group_codes, rg.group_sizes, rg.pts_rest = labels, sizes, None
+    reference = rg.ireference
     opts = {"tie_correct": True, "use_continuity": False, "return_u_values": True}
     stats = _wilcoxon_dask.rank_large_groups([x[:8], x[8:]], rg, opts)
     ref = labels != 0 if reference is None else labels == reference
@@ -126,19 +118,8 @@ def test_dense_integer_rank_rows(reference):
 
 
 @pytest.mark.parametrize("reference", ["rest", "b"])
-@pytest.mark.parametrize(
-    "kind,mode",
-    [
-        ("dense", "host"),
-        ("csr", "host"),
-        ("dense", "gpu-lognorm"),
-        ("csr", "gpu-lognorm"),
-        ("csr", "gpu"),
-        ("csr", "gpu-host-window"),
-        ("csr", "gpu-infinite"),
-        ("csr", "gpu-float64"),
-    ],
-)
+@pytest.mark.parametrize("kind", ["dense", "csr"])
+@pytest.mark.parametrize("mode", ["host", "gpu-lognorm", "gpu", "gpu-host-window", "gpu-infinite", "gpu-float64"])
 def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, reference):
     lognorm = mode == "gpu-lognorm"
     request.getfixturevalue("client" if mode == "host" else "dist_client")
@@ -210,7 +191,7 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
         monkeypatch.setattr(_wilcoxon, "_rank_dask_batch", check_rank)
     budget = width * len(X) * X.itemsize * (2 if kind == "csr" else 1)
     gpu_batch = 16 * 2**30
-    explicit_large_batch = kind == "csr" and lognorm and reference == "b"
+    explicit_large_batch = lognorm and reference == "b"
     config = {"array.chunk-size": budget}
     if mode != "gpu":
         config["rapids-singlecell.wilcoxon.batch-size"] = gpu_batch if explicit_large_batch else budget
@@ -241,12 +222,16 @@ def test_dask_wilcoxon_zarr(request, monkeypatch, tmp_path, *, kind, mode, refer
 
         def check_host_blocks(blocks, *args):
             assert all(isinstance(a, np.ndarray) for ptr, words, aux, _ in blocks for a in (ptr, words, aux))
-            assert any(bits and aux.size > 1 for _, _, aux, bits in blocks)
+            assert any(bits and aux.size > 1 for _, _, aux, bits in blocks) == (kind == "csr")
             assert any(not bits for *_, bits in blocks)
             return rank_columns(blocks, *args)
 
         monkeypatch.setattr(_wilcoxon_dask, "_rank_columns", check_host_blocks)
-        monkeypatch.setattr(_wilcoxon, "_rank_dask_window", lambda *a, **kw: pytest.fail("expected CSR rank path"))
+        monkeypatch.setattr(_wilcoxon, "_rank_dask_window", lambda *a, **kw: pytest.fail("expected record rank path"))
+    if mode == "gpu-float64":
+        monkeypatch.setattr(
+            _wilcoxon_dask, "_project_window", lambda *a, **kw: pytest.fail("expected float64 fallback")
+        )
     with dask.config.set(config):
         actual = rsc.tl.rank_genes_groups(lazy, "group", **kwargs)
     if mode == "gpu":
@@ -292,18 +277,17 @@ def test_project_window_retries_with_all_rows(dist_client, *, on_host):
     assert 1 <= retry_width < width
 
     columns, _ = _wilcoxon_dask._project_window(X, codes, np.array([0, retry_width]), on_host=on_host, **options)
-    (column,) = columns
-    parts = dist_client.gather(column)
+    (parts,) = dist_client.gather(columns)
     assert sum(ptr.nbytes + words.nbytes + aux.nbytes for ptr, words, aux, _ in parts) <= budget
     # Each source block has a distinct row count and contributes a value to every gene.
     assert sorted(int(ptr[-1]) for ptr, *_ in parts) == [n * retry_width for n in row_sizes]
 
 
-def test_sample_gene_sizes_counts_stored_entries(dist_client):
-    # Every block has an empty gene and a gene expressed in half the cells.
-    matrix = csr_matrix(np.array([[0, 1, 2], [0, 0, 2]] * 32, np.float32))
-    X = rsc.get.X_to_GPU(da.from_array(matrix, chunks=(16, -1)))
+@pytest.mark.parametrize("sparse", [False, True])
+def test_sample_gene_sizes_counts_stored_entries(dist_client, *, sparse):
+    matrix = np.array([[0, 1, 2], [0, 0, 2]] * 32, np.float32)
+    X = rsc.get.X_to_GPU(da.from_array(csr_matrix(matrix) if sparse else matrix, chunks=(16, -1)))
     codes = da.zeros((X.shape[0], 1), dtype=np.uint16, chunks=(16, 1))
     prefix = _wilcoxon_dask._sample_gene_sizes(dist_client, X, codes, concurrency=2)
-    expected = 4 * X.numblocks[0] * (np.array([0, 8, 16]) + 1)
+    expected = X.numblocks[0] * ((4 if sparse else 6) * np.array([0, 8, 16]) + 4)
     np.testing.assert_array_equal(np.diff(prefix), expected)

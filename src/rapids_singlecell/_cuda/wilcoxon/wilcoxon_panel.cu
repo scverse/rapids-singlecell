@@ -110,8 +110,8 @@ __global__ void finish_runs(const ZeroRun* zeros, const int* sizes,
     }
 }
 
-template <typename T, typename Device>
-using Array = gpu_array_c<T, Device>;
+template <typename T, typename Device, int N = 1>
+using Array = nb::ndarray<T, Device, nb::c_contig, nb::ndim<N>>;
 
 template <typename... Arrays>
 void check_current_device(const Arrays&... arrays) {
@@ -127,9 +127,9 @@ int key_bits(int n) {
 
 template <typename Device>
 void rank_panel(Array<Key, Device> keys, Array<const int, Device> ptr,
-                Array<const int, Device> sizes, Array<double, Device> sums,
-                Array<Key, Device> ranks, Array<double, Device> ties,
-                Array<int, Device> counts, int n, int ref, bool correct,
+                Array<const int, Device> sizes, Array<double, Device, 2> sums,
+                Array<Key, Device, 2> ranks, gpu_array_c<double, Device> ties,
+                gpu_array_c<int, Device> counts, int n, int ref, bool correct,
                 double scale, std::uintptr_t stream_ptr) {
     check_current_device(keys, ptr, sizes, sums, ranks, ties, counts);
     nb_require(keys.size() <= INT_MAX && ptr.size() >= 2 &&
@@ -139,17 +139,15 @@ void rank_panel(Array<Key, Device> keys, Array<const int, Device> ptr,
     int cols = ptr.size() - 1, width = sizes.size(), nnz = keys.size();
     int group_bits = std::max(1, key_bits(width));
     size_t cells = (size_t)cols * width;
-    nb_require(keys.ndim() == 1 && ptr.ndim() == 1 && sizes.ndim() == 1 &&
-                   sums.ndim() == 2 && sums.shape(0) == ptr.size() - 1 &&
-                   sums.shape(1) == sizes.size() && ranks.ndim() == 2 &&
-                   ranks.shape(0) == sums.shape(0) &&
-                   ranks.shape(1) == sums.shape(1) && ref >= -1 &&
-                   ref < width &&
-                   ties.size() == (ref >= 0 ? cells : (size_t)cols) &&
-                   (counts.size() == cells ||
-                    (!counts.size() && !(ref >= 0 && correct))) &&
-                   group_bits + key_bits(cols) <= 32,
-               "invalid packed Wilcoxon output, reference or key width");
+    nb_require(
+        sums.shape(0) == ptr.size() - 1 && sums.shape(1) == sizes.size() &&
+            ranks.shape(0) == sums.shape(0) &&
+            ranks.shape(1) == sums.shape(1) && ref >= -1 && ref < width &&
+            ties.size() == (ref >= 0 ? cells : (size_t)cols) &&
+            (counts.size() == cells ||
+             (!counts.size() && !(ref >= 0 && correct))) &&
+            group_bits + key_bits(cols) <= 32,
+        "invalid packed Wilcoxon output, reference or key width");
     auto stream = (cudaStream_t)stream_ptr;
     RmmScratchPool pool;
     int* reference = ref < 0 ? nullptr : pool.alloc<int>((size_t)nnz + 1);
@@ -273,20 +271,14 @@ __global__ void transpose_tile(const int* ptr, const int* indices,
         prefix[k] = cursor[threadIdx.x];
 }
 
-template <typename T, typename Device, int N = 1>
-using Contiguous = nb::ndarray<T, Device, nb::c_contig, nb::ndim<N>>;
-
 template <typename Device>
-void transpose_csr(Contiguous<const int, Device> ptr,
-                   Contiguous<const int, Device> indices,
-                   Contiguous<const float, Device> data,
-                   Contiguous<const uint16_t, Device> labels, int tiles_per,
-                   Contiguous<int, Device, 2> prefix,
-                   Contiguous<int, Device> failed, int first, int stop,
-                   int offset, Contiguous<unsigned, Device> words,
-                   Contiguous<uint16_t, Device> groups,
-                   Contiguous<unsigned, Device> table, int bits,
-                   std::uintptr_t stream) {
+void transpose_csr(
+    Array<const int, Device> ptr, Array<const int, Device> indices,
+    Array<const float, Device> data, Array<const uint16_t, Device> labels,
+    int tiles_per, Array<int, Device, 2> prefix, Array<int, Device> failed,
+    int first, int stop, int offset, Array<unsigned, Device> words,
+    Array<uint16_t, Device> groups, Array<unsigned, Device> table, int bits,
+    std::uintptr_t stream) {
     check_current_device(ptr, indices, data, labels, prefix, failed, words,
                          groups, table);
     size_t rows = labels.size(), slots = table.size();
@@ -347,18 +339,18 @@ __global__ void gather_keys(const unsigned* words, const unsigned* table,
 }
 
 template <typename Device>
-void gather_rank_keys(Contiguous<const unsigned, Device> words,
-                      Contiguous<const unsigned, Device> table,
-                      Contiguous<const uint16_t, Device> codes, int bits,
-                      Contiguous<const int, Device> src,
-                      Contiguous<const int, Device> dst,
-                      Contiguous<Key, Device> keys,
-                      Contiguous<int, Device> invalid, int groups,
+void gather_rank_keys(Array<const unsigned, Device> words,
+                      Array<const unsigned, Device> table,
+                      Array<const uint16_t, Device> codes, int bits,
+                      Array<const int, Device> src,
+                      Array<const int, Device> dst, Array<Key, Device> keys,
+                      Array<int, Device> invalid, int groups,
                       std::uintptr_t stream) {
     check_current_device(words, table, codes, src, dst, keys, invalid);
+    const int group_bits = std::max(1, key_bits(groups));
     nb_require(
         src.size() == dst.size() + 1 && dst.size() && dst.size() <= 65535 &&
-            key_bits(dst.size()) + std::max(1, key_bits(groups)) <= 32 &&
+            key_bits(dst.size()) + group_bits <= 32 &&
             words.size() <= keys.size() && keys.size() <= INT_MAX &&
             invalid.size() == 1 && groups > 0 && groups <= 65536 && bits >= 0 &&
             bits <= 16 &&
@@ -367,8 +359,8 @@ void gather_rank_keys(Contiguous<const unsigned, Device> words,
         "invalid Wilcoxon gather buffers");
     gather_keys<<<dim3(32, dst.size()), 256, 0, (cudaStream_t)stream>>>(
         words.data(), table.data(), codes.data(), bits, src.data(), dst.data(),
-        keys.data(), invalid.data(), groups, std::max(1, key_bits(groups)),
-        words.size(), keys.size(), table.size());
+        keys.data(), invalid.data(), groups, group_bits, words.size(),
+        keys.size(), table.size());
     CUDA_CHECK_LAST_ERROR(gather_keys);
 }
 
