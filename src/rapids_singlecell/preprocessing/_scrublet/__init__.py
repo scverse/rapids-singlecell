@@ -11,13 +11,14 @@ from scanpy import logging as logg
 from scverse_misc import deprecated_arg
 
 from rapids_singlecell import preprocessing as pp
+from rapids_singlecell._compat import DaskArray
 from rapids_singlecell._utils._random import (
     RNGLike,
     SeedLike,
     _accepts_legacy_random_state,
     _LegacyRng,
 )
-from rapids_singlecell.get import _get_arr
+from rapids_singlecell.get import X_to_GPU, _get_arr
 from rapids_singlecell.get._out import (
     DEPR_BATCH_KEY,
     DEPR_USE,
@@ -26,7 +27,6 @@ from rapids_singlecell.get._out import (
     _use_args,
     _write_dests,
     deprecated_copy,
-    own_deprecations,
 )
 from rapids_singlecell.get._utils import AdRef, LayerAcc, _get_vec, _to_numpy_1d
 
@@ -110,6 +110,9 @@ def scrublet(
         filtering genes and cells and selecting highly-variable genes.
     batch
         Optional annotation discriminating between batches, e.g. `A.obs['batch']` (or `'obs.batch'`).
+        Required with Dask counts. Each capture library is processed on one GPU and must
+        fit there together with its simulated doublets and scoring intermediates.
+        Dask inputs must use internally simulated doublets.
     sim_doublet_ratio
         Number of doublets to simulate relative to the number of observed
         transcriptomes.
@@ -229,6 +232,12 @@ def scrublet(
         obs=pd.DataFrame(index=adata.obs_names),
         var=pd.DataFrame(index=adata.var_names),
     )
+    is_dask = isinstance(adata_obs.X, DaskArray)
+    if is_dask and batch is None:
+        raise ValueError("Dask counts require a `batch` annotation identifying capture libraries.")
+    if is_dask and adata_sim is not None:
+        raise ValueError("Passing `adata_sim` with Dask counts is unsupported.")
+    keep_uns = dests is not True
 
     def _run_scrublet(
         ad_obs: AnnData,
@@ -240,43 +249,28 @@ def scrublet(
         # counts and simulating doublets
 
         if ad_sim is None:
-            with own_deprecations():
-                pp.filter_genes(ad_obs, min_cells=3, verbose=False)
-                pp.filter_cells(ad_obs, min_genes=3, verbose=False)
+            pp.filter_genes(ad_obs, min_cells=3, verbose=False)
+            pp.filter_cells(ad_obs, min_genes=3, verbose=False)
 
-                # Doublet simulation will be based on the un-normalised counts, but on the
-                # selection of genes following normalisation and variability filtering. So
-                # we need to save the raw and subset at the same time.
+            # Select genes on log-normalized counts, then simulate from the matching raw counts.
+            ad_obs.layers["raw"] = ad_obs.X.copy()
+            pp.normalize_total(ad_obs)
+            logged = AnnData(pp.log1p(ad_obs.X), obs=ad_obs.obs, var=ad_obs.var)
+            hvg = pp.highly_variable_genes(logged, flavor="seurat", out=True)
+            del logged
+            ad_obs = ad_obs[:, hvg["highly_variable"]].copy()
+            ad_sim = scrublet_simulate_doublets(
+                AnnData(ad_obs.layers.pop("raw"), obs=ad_obs.obs, var=ad_obs.var),
+                sim_doublet_ratio=sim_doublet_ratio,
+                synthetic_doublet_umi_subsampling=synthetic_doublet_umi_subsampling,
+                rng=rng,
+            )
 
-                ad_obs.layers["raw"] = ad_obs.X.copy()
-                pp.normalize_total(ad_obs)
-
-                # HVG process needs log'd data.
-
-                ad_obs.layers["logged"] = pp.log1p(ad_obs, inplace=False)
-                pp.highly_variable_genes(ad_obs, layer="logged", flavor="seurat")
-                del ad_obs.layers["logged"]
-                ad_obs = ad_obs[:, ad_obs.var["highly_variable"]].copy()
-
-                # Simulate the doublets based on the raw expressions from the normalised
-                # and filtered object.
-
-                ad_sim = scrublet_simulate_doublets(
-                    ad_obs,
-                    layer="raw",
-                    sim_doublet_ratio=sim_doublet_ratio,
-                    synthetic_doublet_umi_subsampling=synthetic_doublet_umi_subsampling,
-                    rng=rng,
-                )
-
-                if log_transform:
-                    pp.log1p(ad_obs)
-                    pp.log1p(ad_sim)
-                del ad_obs.layers["raw"]
-                # Now normalise simulated and observed in the same way
-
-                pp.normalize_total(ad_obs, target_sum=1e6)
-                pp.normalize_total(ad_sim, target_sum=1e6)
+            if log_transform:
+                pp.log1p(ad_obs)
+                pp.log1p(ad_sim)
+            pp.normalize_total(ad_obs, target_sum=1e6)
+            pp.normalize_total(ad_sim, target_sum=1e6)
 
         ad_obs = _scrublet_call_doublets(
             adata_obs=ad_obs,
@@ -295,7 +289,7 @@ def scrublet(
             verbose=verbose,
         )
 
-        return {"obs": ad_obs.obs, "uns": ad_obs.uns["scrublet"]}
+        return {"obs": ad_obs.obs[list(ScrubletResult._fields)], "uns": ad_obs.uns["scrublet"] if keep_uns else None}
 
     if batch is not None:
         try:
@@ -306,18 +300,16 @@ def scrublet(
         # Run Scrublet independently on batches and return just the
         # scrublet-relevant parts of the objects to add to the input object
 
-        batches = np.unique(batch_info)
-        # spawn sub-rngs so this can maybe be parallelized without changing
-        # random number generation
-        sub_rngs = rng.spawn(len(batches))
-        scrubbed = [
-            _run_scrublet(
-                adata_obs[batch_info == batch].copy(),
-                adata_sim,
-                rng=sub_rng,
+        if is_dask:
+            batches, scrubbed = _scrublet_dask_batches(
+                adata_obs.X, batch_info, _run_scrublet, rng, subsampling=synthetic_doublet_umi_subsampling < 1
             )
-            for batch, sub_rng in zip(batches, sub_rngs, strict=True)
-        ]
+        else:
+            batches = np.unique(batch_info)
+            scrubbed = [
+                _run_scrublet(adata_obs[batch_info == batch].copy(), adata_sim, rng=sub_rng)
+                for batch, sub_rng in zip(batches, rng.spawn(len(batches)), strict=True)
+            ]
         scrubbed_obs = pd.concat([scrub["obs"] for scrub in scrubbed])
         # Save the .uns from each batch separately, and record that we've done
         # batched analysis, so e.g. the plotting function knows what to do.
@@ -331,7 +323,7 @@ def scrublet(
 
     logg.info("    Scrublet finished", time=start)
     # Copy outcomes in input order (cells filtered out in preprocessing get NaN)
-    scrubbed_obs = scrubbed_obs.reindex(adata.obs_names)
+    scrubbed_obs = scrubbed_obs.reindex(pd.RangeIndex(adata.n_obs) if is_dask else adata.obs_names)
     vals = ScrubletResult(*(scrubbed_obs[name].to_numpy() for name in ScrubletResult._fields))
     if dests is True:
         return vals
@@ -339,6 +331,49 @@ def scrublet(
     _write_dests(adata, vals, dests)
     adata.uns[uns_key] = uns
     return None
+
+
+def _scrublet_dask_batches(X, batch_info, run, rng, *, subsampling):
+    """Score each capture on a worker and map its surviving cells back to input row positions."""
+    from copy import copy
+
+    import dask
+
+    if len(batch_info) == 0 or pd.isna(batch_info).any():
+        raise ValueError("Dask counts require a capture library label for every cell in `batch`.")
+    groups = pd.Series(batch_info).groupby(batch_info, sort=True).indices
+    legacy = isinstance(rng, _LegacyRng)
+    legacy_seed = rng.arg if legacy and isinstance(rng.arg, int | np.integer) else None
+    # A mutable legacy seed or UMI subsampling advances the same RandomState across captures.
+    carry_state = legacy and (legacy_seed is None or subsampling)
+    state = rng.state if carry_state else None
+
+    @dask.delayed(nout=2)
+    def score(matrix, batch_rng):
+        if legacy:
+            rs = copy(batch_rng) if carry_state else None
+            batch_rng = _LegacyRng(legacy_seed if legacy_seed is not None else rs, rs)
+        return run(AnnData(X_to_GPU(matrix)), rng=batch_rng), batch_rng.state if carry_state else None
+
+    tasks = []
+    for rows, child in zip(groups.values(), rng.spawn(len(groups)), strict=True):
+        index = slice(rows[0], rows[-1] + 1) if rows[-1] - rows[0] + 1 == len(rows) else rows
+        # Keep source chunks shared across captures until the whole graph is optimized.
+        block = X[index].rechunk((-1, -1)).to_delayed(optimize_graph=False).item()
+        result, next_state = score(block, state if legacy else child)
+        tasks.append(result)
+        if carry_state:
+            state = next_state
+
+    results, state = dask.compute(tasks, state)
+    if carry_state:
+        rng.state.set_state(state.get_state())
+    for rows, result in zip(groups.values(), results, strict=True):
+        obs = result["obs"]
+        obs.index = rows[obs.index.to_numpy(dtype=np.intp)]
+        if carry_state and result["uns"] is not None:
+            result["uns"]["parameters"]["random_state"] = rng.arg
+    return batch_info[[rows[0] for rows in groups.values()]], results
 
 
 def _ref_to_uns(ref: AdRef | str, vals: np.ndarray) -> str | np.ndarray:
