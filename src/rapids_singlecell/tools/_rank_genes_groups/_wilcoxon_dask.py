@@ -178,8 +178,8 @@ def _project_window(
                 parts.append(piece)
             # Reuse the source after its transfers arrive. The previous row’s remote host copies can overlap the next read.
             receipt = client.submit(_record_sizes, task, *previous[i], *arrived, workers=source)
+            pending[receipt] = parts, i, previous[i]
             previous[i] = drained
-            pending[receipt] = parts, i
             completed.add(receipt)
 
     for i in range(min(active, len(lanes)) if shuffle else active):
@@ -187,7 +187,7 @@ def _project_window(
     observed = 0
     try:
         for receipt, sizes in completed:
-            parts, lane = pending.pop(receipt)
+            parts, lane, _ = pending[receipt]
             if sizes is None:
                 return None, 0
             retained[: len(sizes)] += sizes
@@ -196,9 +196,11 @@ def _project_window(
                 break
             for column, part in zip(columns, parts, strict=False):
                 column.append(part)
+            del pending[receipt]
             submit(lane)
     finally:
-        wait([*pending, *(f for group in previous for f in group)])
+        # A failed receipt can finish before sibling copies. Drain their concrete futures before retrying.
+        wait([*pending, *pending.values(), previous, columns if pending else ()])
     width = int(edges[-1] - edges[0])
     estimate = max(1, int(width * 0.9 * (budget / max(1, retained.max())) * observed / len(rows)))
     if retained.max() > budget:
