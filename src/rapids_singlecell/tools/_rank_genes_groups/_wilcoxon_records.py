@@ -63,55 +63,47 @@ def pack_records(x, labels, bounds):
     stripes = (tiles + tiles_per - 1) // tiles_per
     prefix = cp.empty((cols, stripes), cp.int32)
     bits = max(1, int(labels.max(initial=0)).bit_length())
-    stream = cp.cuda.get_current_stream().ptr
+    stream = cp.cuda.get_current_stream()
     failed = cp.zeros(1, cp.int32)
-    transpose = partial(
-        _wc.transpose_csr,
-        cp.ascontiguousarray(csr.indptr, dtype=cp.int32),
-        cp.ascontiguousarray(csr.indices, dtype=cp.int32),
-        cp.ascontiguousarray(csr.data),
-        cp.asarray(labels, dtype=cp.uint16, order="C"),
-        tiles_per,
-        prefix,
-        failed,
-    )
+    indptr = cp.ascontiguousarray(csr.indptr, dtype=cp.int32)
+    indices = cp.ascontiguousarray(csr.indices, dtype=cp.int32)
+    values = cp.ascontiguousarray(csr.data)
+    labels = cp.asarray(labels, order="C")
+    transpose = partial(_wc.transpose_csr, indptr, indices, values, labels, tiles_per, prefix, failed)
     begin, end = (int(bounds[0]), int(bounds[-1]))
     if begin:
         prefix[begin - 1, -1] = 0
-    transpose(begin, end, 0, empty, no_codes, empty, -1, stream)
+    transpose(begin, end, 0, empty, no_codes, empty, -1, stream.ptr)
     active = prefix[begin:end]
     cp.cumsum(active.ravel(), dtype=cp.int32, out=active.ravel())
     offsets = np.r_[np.int32(0), active[:, -1].get()]
-    slots = 1 << min(32 - bits, 22, max(1, (int(offsets[-1]) // 64).bit_length()))
-    shard_entries = np.diff(offsets[np.asarray(bounds) - begin])
-    modes = (bits, 0) if (slots * 4 <= 2 * shard_entries.astype(np.int64)).all() else (0,)
-    base = range_base(csr.data, bits)
-    if base is not None:
-        modes = (bits,)
-    for mode in modes:
-        table = empty
-        if mode:
-            table = base if base is not None else cp.zeros(slots, cp.uint32)
+    table = range_base(csr.data, bits)
+    if table is None:
+        slots = 1 << min(32 - bits, 22, max(1, (int(offsets[-1]) // 64).bit_length()))
+        shard_entries = np.diff(offsets[np.asarray(bounds) - begin])
+        table = cp.zeros(slots, cp.uint32) if (shard_entries >= 2 * slots).all() else empty
+    while True:
+        mode = bits if table.size else 0
         pieces = []
         for lo, hi in shards:
             ptr = offsets[lo - begin : hi - begin + 1] - offsets[lo - begin]
             words = cp.empty(int(ptr[-1]), cp.uint32)
             codes = no_codes if mode else cp.empty(words.size, cp.uint16)
             if lo < hi:
-                transpose(lo, hi, offsets[lo - begin], words, codes, table, mode, stream)
+                transpose(lo, hi, offsets[lo - begin], words, codes, table, mode, stream.ptr)
             pieces.append((ptr, words, table if mode else codes, mode))
-        if not mode or base is not None:
-            cp.cuda.get_current_stream().synchronize()  # Dask can transfer these arrays on another stream.
-            return pieces
-        if not failed.item():
-            return pieces
-        del pieces, words, codes, table  # Release the failed dictionary before allocating raw shards.
+        if table.size <= 1:
+            stream.synchronize()  # Dask can transfer these arrays on another stream.
+        elif failed.item():
+            del pieces, words, codes  # Release the failed dictionary before allocating raw shards.
+            table = empty
+            continue
+        return pieces
 
 
 def _on_device(a):
     if isinstance(a, np.ndarray):
-        # The source stays live in blocks until the gather stream synchronizes.
-        out = cp.empty(a.shape, dtype=a.dtype)
+        out = cp.empty(a.shape, a.dtype)
         out.set(a)
         return out
     return a
@@ -119,11 +111,12 @@ def _on_device(a):
 
 def _gather_keys(blocks, lo, hi, group_count):
     source = np.stack([b[0][lo : hi + 1] for b in blocks])
-    cumulative = np.cumsum(np.diff(source), axis=0, dtype=np.int64)
+    counts = np.diff(source)
+    cumulative = counts.cumsum(axis=0, dtype=np.int64)
     ptr = np.r_[0, cumulative[-1].cumsum()]
     if ptr[-1] > np.iinfo(np.int32).max:
         return None, None
-    dest = cp.asarray(ptr[:-1] + cumulative - np.diff(source), dtype=cp.int32)
+    dest = cp.asarray(ptr[:-1] + cumulative - counts, dtype=cp.int32)
     offsets = cp.asarray(source - source[:, :1])
     keys = cp.empty(int(ptr[-1]), cp.uint64)
     invalid = cp.zeros(1, cp.int32)
@@ -153,37 +146,29 @@ def rank_records(blocks, lo, hi, rg, options):
     if keys is None:
         return None
     sums = cp.zeros(shape, cp.float64)
-    twice_u = cp.zeros(shape, cp.int64)
+    twice_u = cp.zeros(shape, cp.uint64)
     ties = cp.zeros(shape[0] if ref is None else shape, cp.float64)
-    need_counts = rg.comp_pts or (ref is not None and options["tie_correct"])
+    correct = options["tie_correct"]
+    need_counts = rg.comp_pts or (ref is not None and correct)
     nonzero = cp.zeros(shape if need_counts else 0, cp.int32)
     scale = 0.0 if rg.mean_in_log_space else _log1p_scale(rg)
+    population = rg.n_obs if ref is None else int(sizes[ref])
+    ref_code = -1 if ref is None else int(ref)
+    indptr = cp.asarray(indptr, cp.int32)
+    group_sizes = cp.asarray(all_sizes, cp.int32)
+    stream = cp.cuda.get_current_stream().ptr
     _wc.rank_panel(
-        keys,
-        cp.asarray(indptr, cp.int32),
-        cp.asarray(all_sizes, cp.int32),
-        sums,
-        twice_u.view(cp.uint64),
-        ties,
-        nonzero,
-        rg.n_obs if ref is None else int(sizes[ref]),
-        -1 if ref is None else int(ref),
-        options["tie_correct"],
-        scale,
-        cp.cuda.get_current_stream().ptr,
+        keys, indptr, group_sizes, sums, twice_u, ties, nonzero, population, ref_code, correct, scale, stream
     )
 
     targets = slice(len(sizes)) if ref is None else np.delete(np.arange(len(sizes)), ref)
     n = cp.asarray(sizes[targets], cp.int64)[:, None]
-    other = rg.n_obs - n if ref is None else int(sizes[ref])
+    other = population - n if ref is None else population
     selected = sums[:, targets].T
     reference = (sums.sum(axis=1) - selected) / other if ref is None else sums[:, ref] / other
     variance = (ties if ref is None else ties[:, targets].T) * n * other * ((n + other + 1) / 12)
-    u2 = twice_u[:, targets].T
+    u2 = twice_u.view(cp.int64)[:, targets].T
     z, p = _wilcoxon_z_p((u2 - n * other) * 0.5, variance, use_continuity=options["use_continuity"])
-    result = (
-        u2 * 0.5 if options["return_u_values"] else z,
-        p,
-        _logfoldchanges_from_means(rg, selected / n, reference).astype(cp.float32),
-    )
+    logfoldchanges = _logfoldchanges_from_means(rg, selected / n, reference).astype(cp.float32)
+    result = (u2 * 0.5 if options["return_u_values"] else z, p, logfoldchanges)
     return (*result, nonzero.T) if rg.comp_pts else result

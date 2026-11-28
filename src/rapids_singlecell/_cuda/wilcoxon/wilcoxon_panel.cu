@@ -137,17 +137,17 @@ void rank_panel(Array<Key, Device> keys, Array<const int, Device> ptr,
                    sizes.size() <= 65536 && n > 0,
                "invalid packed Wilcoxon panel");
     int cols = ptr.size() - 1, width = sizes.size(), nnz = keys.size();
-    int group_bits = std::max(1, key_bits(width));
+    int group_bits = std::max(1, key_bits(width)),
+        panel_bits = key_bits(cols) + group_bits;
     size_t cells = (size_t)cols * width;
-    nb_require(
-        sums.shape(0) == ptr.size() - 1 && sums.shape(1) == sizes.size() &&
-            ranks.shape(0) == sums.shape(0) &&
-            ranks.shape(1) == sums.shape(1) && ref >= -1 && ref < width &&
-            ties.size() == (ref >= 0 ? cells : (size_t)cols) &&
-            (counts.size() == cells ||
-             (!counts.size() && !(ref >= 0 && correct))) &&
-            group_bits + key_bits(cols) <= 32,
-        "invalid packed Wilcoxon output, reference or key width");
+    nb_require(sums.shape(0) == cols && sums.shape(1) == width &&
+                   ranks.shape(0) == cols && ranks.shape(1) == width &&
+                   ref >= -1 && ref < width &&
+                   ties.size() == (ref >= 0 ? cells : (size_t)cols) &&
+                   (counts.size() == cells ||
+                    (!counts.size() && !(ref >= 0 && correct))) &&
+                   panel_bits <= 32,
+               "invalid packed Wilcoxon output, reference or key width");
     auto stream = (cudaStream_t)stream_ptr;
     RmmScratchPool pool;
     int* reference = ref < 0 ? nullptr : pool.alloc<int>((size_t)nnz + 1);
@@ -158,11 +158,10 @@ void rank_panel(Array<Key, Device> keys, Array<const int, Device> ptr,
     if (nnz) {
         cub::DoubleBuffer<Key> buffers(sorted, pool.alloc<Key>(nnz));
         size_t sort_bytes = 0, scan_bytes = 0;
-        const int bits = key_bits(cols) + 32 + group_bits;
         auto sort_and_scan = [&](void* workspace) {
             cuda_check(
                 cub::DeviceRadixSort::SortKeys(workspace, sort_bytes, buffers,
-                                               nnz, 0, bits, stream),
+                                               nnz, 0, 32 + panel_bits, stream),
                 "Wilcoxon sort");
             if (reference) {
                 auto flags = thrust::make_transform_iterator(
@@ -320,16 +319,14 @@ __global__ void gather_keys(const unsigned* words, const unsigned* table,
     }
     for (Rank i = start + (Rank)blockIdx.x * blockDim.x + threadIdx.x; i < stop;
          i += gridDim.x * blockDim.x) {
-        unsigned word = words[i],
-                 group = bits ? word & ((1u << bits) - 1) : codes[i];
-        if (group >= groups || (bits && slots > 1 && (word >> bits) >= slots)) {
+        unsigned word = words[i], index = word >> bits;
+        unsigned group = bits ? word & ((1u << bits) - 1) : codes[i];
+        if (group >= groups || (bits && slots > 1 && index >= slots)) {
             atomicExch(invalid, 1);
             continue;
         }
         unsigned value = word;
-        if (bits)
-            value =
-                slots == 1 ? table[0] + (word >> bits) : table[word >> bits];
+        if (bits) value = slots == 1 ? table[0] + index : table[index];
         if (!isfinite(__uint_as_float(value))) atomicExch(invalid, 1);
         if (!(value << 1)) value = 0;
         unsigned order = value ^ (value >> 31 ? ~0u : 0x80000000u);
@@ -366,12 +363,10 @@ void gather_rank_keys(Array<const unsigned, Device> words,
 
 template <typename Device>
 void define_panel(nb::module_& m) {
-    m.def("transpose_csr", &transpose_csr<Device>,
-          nb::call_guard<nb::gil_scoped_release>());
-    m.def("gather_rank_keys", &gather_rank_keys<Device>,
-          nb::call_guard<nb::gil_scoped_release>());
-    m.def("rank_panel", &rank_panel<Device>,
-          nb::call_guard<nb::gil_scoped_release>());
+    nb::call_guard<nb::gil_scoped_release> release;
+    m.def("transpose_csr", &transpose_csr<Device>, release);
+    m.def("gather_rank_keys", &gather_rank_keys<Device>, release);
+    m.def("rank_panel", &rank_panel<Device>, release);
 }
 }  // namespace
 

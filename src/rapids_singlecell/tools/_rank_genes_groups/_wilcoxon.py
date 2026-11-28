@@ -4,7 +4,6 @@ import warnings
 from collections import Counter
 from contextlib import suppress
 from copy import copy
-from itertools import batched, chain
 from operator import methodcaller
 from typing import TYPE_CHECKING
 
@@ -230,31 +229,26 @@ def _rank_dask_batch(rows, template, fmt, options):
 
 
 def _rank_dask_window(window, width, template, options, *, client, workers, compute_kw):
-    import dask
-
     # Detach projections: a narrow dense slice can keep its full-width parent alive.
     parts = window.rechunk({1: width}, method="tasks").map_blocks(methodcaller("copy"), meta=window._meta)
     fmt = getattr(window._meta, "format", None)
-    panels = [[] for _ in range(parts.numblocks[1])]
-    row_limit = max(1, min(len(workers), (parts.numblocks[0] + 1) // 2))
-    for row_wave in batched(parts.to_delayed(), row_limit, strict=False):
-        pending = list(chain.from_iterable(row_wave))
-        if workers:
-            from distributed import wait
+    tasks = parts.to_delayed()
+    if not workers:
+        rows = [task.compute(**compute_kw) for task in tasks[:, 0]]
+        return [_rank_dask_batch(rows, template, fmt, options)]
+    from distributed import wait
 
-            projected = client.compute(pending)
-            wait(projected)  # Release this wave's full-width input before reading more rows.
-        else:
-            projected = dask.compute(*pending, **compute_kw)
-        for i, panel in enumerate(panels):
-            panel.extend(projected[i :: len(panels)])
-    if workers:
-        ranks = [
-            client.submit(_rank_dask_batch, panel, template, fmt, options, workers=[worker], pure=False)
-            for panel, worker in zip(panels, workers, strict=False)
-        ]
-        return client.gather(ranks)
-    return [_rank_dask_batch(panels[0], template, fmt, options)]
+    row_limit = min(len(workers), (len(tasks) + 1) // 2)
+    for start in range(0, len(tasks), row_limit):
+        wave = tasks[start : start + row_limit]
+        projected = client.compute(wave.ravel().tolist())
+        wait(projected)  # Release this wave's full-width input before reading more rows.
+        wave.flat = projected
+    ranks = [
+        client.submit(_rank_dask_batch, panel, template, fmt, options, workers=[worker], pure=False)
+        for panel, worker in zip(tasks.T.tolist(), workers, strict=False)
+    ]
+    return client.gather(ranks)
 
 
 def _worker_rank_memory(dask_worker):
@@ -262,15 +256,9 @@ def _worker_rank_memory(dask_worker):
     from distributed.system import MEMORY_LIMIT
 
     _, device = cp.cuda.runtime.memGetInfo()
-    pool = next(
-        (
-            getattr(p, "maximum_pool_size", None)
-            for p in dask_worker.plugins.values()
-            if type(p).__name__ == "RMMSetup"
-            and (getattr(p, "initial_pool_size", None) is not None or getattr(p, "async_alloc", False))
-        ),
-        None,
-    )
+    rmm = next((p for p in dask_worker.plugins.values() if type(p).__name__ == "RMMSetup"), None)
+    pooled = getattr(rmm, "initial_pool_size", None) is not None or getattr(rmm, "async_alloc", False)
+    pool = getattr(rmm, "maximum_pool_size", None) if pooled else None
     limit = dask_worker.memory_manager.memory_limit or MEMORY_LIMIT
     remaining = max(0, limit // 2 - dask_worker.monitor.get_process_memory())
     available = min(MEMORY_LIMIT, psutil.virtual_memory().available)
@@ -289,9 +277,8 @@ def _rank_budgets(memory, input_bytes):
     target = min(limit, pool, parse_bytes(dask.config.get("rapids-singlecell.wilcoxon.batch-size", default=default)))
     host = min(min(worker, available // (4 * hosts[name])) for _, _, name, worker, available in memory)
     # Host transfers pay off when they avoid multiple full CSR scans.
-    if host < (2 if default < limit else 4) * target or input_bytes <= target * len(memory):
-        host = 0
-    return target, host
+    use_host = host >= (2 if default < limit else 4) * target and input_bytes > target * len(memory)
+    return target, host if use_host else 0
 
 
 def _run_dask_wilcoxon(rg, **options):
@@ -301,9 +288,7 @@ def _run_dask_wilcoxon(rg, **options):
     from dask.utils import parse_bytes
 
     X = rg.X
-    groups = np.arange(len(rg.groups_order), dtype=np.intp)
-    if rg.ireference is not None:
-        groups = np.delete(groups, rg.ireference)
+    groups = np.asarray([i for i in range(len(rg.groups_order)) if i != rg.ireference], dtype=np.intp)
     if not groups.size:
         return None
     scheduler = get_scheduler(collections=[X])
@@ -324,8 +309,7 @@ def _run_dask_wilcoxon(rg, **options):
         from ._wilcoxon_dask import rank_record_windows
 
         host_config = dask.config.get("rapids-singlecell.wilcoxon.host-batch-size", default=None)
-        if host_config is not None:
-            host_bytes = parse_bytes(host_config)
+        host_bytes = host_bytes if host_config is None else parse_bytes(host_config)
         if host_bytes < 0:
             raise ValueError("Wilcoxon host-batch-size must be nonnegative.")
         # Concurrent full-width reads also draw from a small device pool.
